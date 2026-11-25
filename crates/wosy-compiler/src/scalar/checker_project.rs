@@ -1354,10 +1354,9 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                     if body.contextual_formal() != Some((&context.formal, &context.ty)) {
                         return Err(ProjectCheck::Unsupported);
                     }
-                    // The reached exact-row lane binds entry-dependent amounts.
-                    // This symbolic profile has no general binary relation.
-                    let super::contextual::ContextualProofAmount::Literal(amount) = &context.amount else {
-                        return Err(ProjectCheck::Unsupported);
+                    let amount = match &context.amount {
+                        super::contextual::ContextualProofAmount::Literal(amount) => Some(amount),
+                        super::contextual::ContextualProofAmount::EntryParameter(_) => None,
                     };
                     let (observed, refuted) = super::checker_flow::check_symbolic_contextual_unit(
                         body, amount, context.add, &mut |failure| {
@@ -24755,6 +24754,54 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 "core.context.credit == core.old(core.context.credit) + 0");
             let main = check(&bad, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!main.active && main.contextual_diagnostic.is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_entry_dependent_contextual_proof_retains_exact_partition_witness() {
+        let app = source("src/main.w", "dormant-entry-dependent-context-credit");
+        let program = r#"%%start
+            unit() type_provider = fn {
+                u8 core.context.credit = 7;
+                if (core.context.credit == 7) {};
+            };
+            unit(u8) debit = fn(cost) {
+                core.narrow(core.context.credit == 7, { .stdout = ""; .stderr = ""; .code = 151; .files = []; });
+                core.narrow(cost <= 2, { .stdout = ""; .stderr = ""; .code = 152; .files = []; });
+                if (cost < 2) {
+                    if (cost == 0) { core.context.credit = core.context.credit - cost; }
+                    else { core.context.credit = core.context.credit - cost; };
+                } else { core.context.credit = core.context.credit - cost; };
+            };
+            proof contract for debit(amount) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - amount) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let check = |text: &str, scope| {
+                let (_, proof) = crate::parse_configured_root_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(proof, Vec::new())],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let valid = check(program, package).unwrap();
+            assert!(valid.active && valid.directives.is_empty() && valid.contextual_diagnostic.is_none());
+            let bad = program.replacen("else { core.context.credit = core.context.credit - cost; };",
+                "else { core.context.credit = core.context.credit - 3; };", 1)
+                .replace("} else { core.context.credit = core.context.credit - cost; };",
+                    "} else { core.context.credit = core.context.credit - 4; };");
+            let failed = check(&bad, package).unwrap();
+            let failure = failed.contextual_diagnostic.unwrap();
+            assert!(failure.symbolic && failed.directives.is_empty() && failed.additional_contextual_diagnostics.is_empty());
+            assert_eq!((failure.entry, failure.exit), (7.into(), 4.into()));
+            assert_eq!(failure.explicit_entry, Some(("amount".into(), 1.into())));
+            assert_eq!(failure.goal.source, app);
+            assert_eq!(&bad[failure.goal.range.start as usize..failure.goal.range.end as usize],
+                "core.context.credit == core.old(core.context.credit) - amount");
+            let main = check(&bad, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.directives.is_empty() && main.contextual_diagnostic.is_none());
+            let broad = program.replace("cost <= 2", "cost <= 3");
+            assert!(matches!(check(&broad, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 

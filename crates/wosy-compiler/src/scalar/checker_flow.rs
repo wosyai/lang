@@ -1890,6 +1890,8 @@ struct IntegerRoots<'a> {
     unit_pair_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     symbolic_context_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    symbolic_context_entry_amount: bool,
     affine_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     named_pair_rectangles: bool,
@@ -3364,7 +3366,7 @@ pub(super) struct ContextualUnitRefutation {
 /// and contextual entry even if the body subsequently changes either place.
 #[cfg(feature = "internal-checker")]
 pub(super) fn check_symbolic_contextual_unit(
-    calls: &FunctionCallSites, amount: &BigInt, add: bool,
+    calls: &FunctionCallSites, amount: Option<&BigInt>, add: bool,
     sink: &mut dyn for<'row> FnMut(IntegerCheckFailure<'row>),
 ) -> Option<(bool, Option<ContextualUnitRefutation>)> {
     let (formal, ty) = calls.contextual_formal()?;
@@ -3383,6 +3385,9 @@ pub(super) fn check_symbolic_contextual_unit(
         }
         _ => return None,
     };
+    if amount.is_none() && !explicit.as_ref().is_some_and(|(_, argument_ty, _)| *argument_ty == ty) {
+        return None;
+    }
     let snapshots = ReferenceBindingId {
         kind: super::ReferenceBindingKind::CheckerSnapshotField(0), ..formal.clone()
     };
@@ -3390,6 +3395,7 @@ pub(super) fn check_symbolic_contextual_unit(
         allow_ordinary_contextual_places: true,
         allow_extended_scalar_locals: true,
         symbolic_context_work: Some(0),
+        symbolic_context_entry_amount: amount.is_none(),
         ..IntegerRoots::default()
     };
     let mut rows = IntegerInputs(vec![IntegerRow::new(vec![Rc::new(IntegerSet::from_type(ty)?)])]);
@@ -3418,7 +3424,6 @@ pub(super) fn check_symbolic_contextual_unit(
     let active = roots.reached_obligation || !rows.is_unreachable();
     let work = roots.symbolic_context_work.as_mut()?;
     let (type_min, type_max) = super::typecheck::integer_bounds(ty)?;
-    let expected_at = |entry: &BigInt| if add { entry + amount } else { entry - amount };
     let mut first_refutation = None;
     let width = if explicit.is_some() { 4 } else { 2 };
     for row in rows.0 {
@@ -3426,6 +3431,22 @@ pub(super) fn check_symbolic_contextual_unit(
         // This profile retains only equality copies and independent cells;
         // refusing unmodeled relations avoids comparing loose marginals.
         if row.len() != width || row.affine.is_some() || row.entry.is_some() { return None; }
+        let Some(amount) = amount else {
+            // Nothing is projected independently: all three concrete
+            // coordinates come from exactly this solver-produced row.
+            let entry = row.get(1)?.singleton_value()?;
+            let explicit = row.get(3)?.singleton_value()?;
+            let exit = row.first()?.singleton_value()?;
+            let expected = if add { entry + explicit } else { entry - explicit };
+            if expected < type_min || expected > type_max { return None; }
+            if first_refutation.is_none() && &expected != exit {
+                first_refutation = Some(ContextualUnitRefutation {
+                    entry: entry.clone(), exit: exit.clone(), explicit: Some(explicit.clone()),
+                });
+            }
+            continue;
+        };
+        let expected_at = |entry: &BigInt| if add { entry + amount } else { entry - amount };
         let (old_min, old_max) = row.get(1)?.extremes()?;
         // Translation is monotone, even for a disconnected row. Check both
         // extrema of every surviving entry domain before exposing a result.
@@ -7142,7 +7163,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         }
         let region = structure.blocks.get(block.0)?;
         #[cfg(feature = "internal-checker")]
-        if Authored::OBSERVE_RUNTIME_FIXED_INDEX && region.unsafe_context { return None; }
+        if (Authored::OBSERVE_RUNTIME_FIXED_INDEX || roots.symbolic_context_entry_amount) && region.unsafe_context { return None; }
         let items = &region.items;
         #[cfg(feature = "internal-checker")]
         let guard_pending = guard.is_some();
@@ -7686,6 +7707,23 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         let amount = match &update.amount {
                             Literal(value) => value,
                             Lexical(binding) => {
+                                if roots.symbolic_context_entry_amount {
+                                    let (argument, actual_ty) = roots.lookup(binding)?;
+                                    if actual_ty != ty || argument == axis { return None; }
+                                    let operation = AuthoredIntegerOperation::checked(&update.operator)?;
+                                    let (min, max) = super::typecheck::integer_bounds(ty)?;
+                                    let work = roots.symbolic_context_work.as_mut()?;
+                                    for row in &mut path.0 {
+                                        if row.affine.is_some() || row.entry.is_some() { return None; }
+                                        charge_call_work(work, row.len().checked_add(row.equal_axes().len())?.checked_add(5)?)?;
+                                        let entry = row.get(axis)?.singleton_value()?;
+                                        let amount = row.get(argument)?.singleton_value()?;
+                                        let exit = operation.apply(Cow::Borrowed(entry), Cow::Borrowed(amount), &min, &max)?;
+                                        if exit < min || exit > max { return None; }
+                                        row.overwrite(axis, Rc::new(IntegerSet::singleton(&exit)), false);
+                                    }
+                                    continue;
+                                }
                                 // One original checked actual row only. Do not
                                 // project a symbolic operand independently of
                                 // its contextual entry or reuse across calls.
