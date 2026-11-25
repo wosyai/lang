@@ -2353,7 +2353,7 @@ core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
 
         fs::write(root.join("wosy.toml"), app + "\n[dependencies.remote]\ngit = \"https://example.invalid/pkg\"\n").unwrap();
         assert!(matches!(check_target_with_dependencies(root, None, "dev", ScalarCheckerScope::CurrentPackage),
-            Err(ConfiguredCheckLoadError::Dependency(error)) if error.contains("independent checking of managed Git dependency remote is unsupported")));
+            Err(ConfiguredCheckLoadError::Dependency(error)) if error.contains("Git dependencies require wosy.lock; dep sync does not select revisions")));
         assert!(!root.join(".wosy").exists());
         fs::remove_dir_all(root).unwrap();
     }

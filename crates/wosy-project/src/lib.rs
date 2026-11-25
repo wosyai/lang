@@ -520,6 +520,7 @@ pub struct ProjectConfiguration {
 #[doc(hidden)]
 pub struct DirectDependencyCheckTarget {
     pub source_directory: PackageRelativePath,
+    pub git_checkout: Option<packages::GitDirectory>,
     pub project: ProjectContext,
     pub configuration: ProjectConfiguration,
     pub layout: TargetLayout,
@@ -536,8 +537,8 @@ impl ProjectConfiguration {
     }
 
     fn load_snapshot(
-        root: &Path, selected: Option<&str>, capture_all_local: bool,
-    ) -> Result<(Self, toml_edit::ImDocument<String>, BTreeMap<String, packages::SelectedLocalManifest>), String> {
+        root: &Path, selected: Option<&str>, capture_all: bool,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, BTreeMap<String, packages::SelectedDependencyManifest>), String> {
         let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
             toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
@@ -565,7 +566,7 @@ impl ProjectConfiguration {
             }
         }
         let (resolved_packages, selected) =
-            packages::resolve_installed(&snapshot, root, &package_name, &dependencies, selected, capture_all_local)?;
+            packages::resolve_installed(&snapshot, root, &package_name, &dependencies, selected, capture_all)?;
         let configuration = Self::configure(&document, module_source_root, dependencies, resolved_packages)?;
         Ok((configuration, document, selected))
     }
@@ -657,9 +658,9 @@ impl ProjectConfiguration {
 
     #[cfg(feature = "internal-checker")]
     fn select_resolved_dependency(
-        &self, dependency: &str, captured: packages::SelectedLocalManifest, target: Option<&str>, profile: Option<&str>,
+        &self, dependency: &str, captured: packages::SelectedDependencyManifest, target: Option<&str>, profile: Option<&str>,
     ) -> Result<DirectDependencyCheckTarget, String> {
-        let packages::SelectedLocalManifest { root: child_root, document: child, dependencies } = captured;
+        let packages::SelectedDependencyManifest { root: child_root, document: child, dependencies } = captured;
         let resolved = self.resolved_packages.get(dependency)
             .ok_or_else(|| format!("direct dependency {dependency} is missing"))?;
         let source_directory = resolved.identity.path.clone();
@@ -680,7 +681,8 @@ impl ProjectConfiguration {
             .ok_or_else(|| format!("target {target} has no declared default_profile"))?;
         let (_, _, artifact, _) = child_configuration.artifact_profile(&target, profile)?;
         let layout = artifact.target_layout()?;
-        Ok(DirectDependencyCheckTarget { source_directory, project, configuration: child_configuration, layout })
+        let git_checkout = self.git_package(dependency)?.map(|(_, checkout)| checkout.clone());
+        Ok(DirectDependencyCheckTarget { source_directory, git_checkout, project, configuration: child_configuration, layout })
     }
 
     pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
@@ -1327,6 +1329,11 @@ impl ProjectContext {
     #[doc(hidden)]
     pub fn read_package_identity(manifest: &Path) -> Result<String, String> {
         let content = fs::read_to_string(manifest).map_err(|error| error.to_string())?;
+        Self::package_identity_from_text(content)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn package_identity_from_text(content: String) -> Result<String, String> {
         let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
         let package = document.get("package").and_then(Item::as_table)
             .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;

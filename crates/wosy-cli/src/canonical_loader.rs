@@ -30,7 +30,7 @@ pub(crate) enum CanonicalLoadPurpose {
     #[allow(dead_code)]
     LocalProofs,
     #[cfg(feature = "internal-checker")]
-    PackageProofs(HashSet<PackageRelativePath>),
+    PackageProofs(HashSet<PackageRelativePath>, Option<wosy_project::packages::GitDirectory>),
 }
 
 enum CanonicalSourceDeclarations {
@@ -171,6 +171,7 @@ impl<'a> DormantSourceBoundaries<'a> {
 pub(crate) fn load_explicit_dormant_proof_sources(
     root: &std::path::Path, project: &ProjectContext, configuration: &ProjectConfiguration,
     paths: Vec<PackageRelativePath>, texts: &mut BTreeMap<ProjectSourceIdentity, String>,
+    checkout: Option<&wosy_project::packages::GitDirectory>,
 ) -> Result<Vec<wosy_compiler::ScalarProofDeclarations>, CanonicalLoadFailure> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -187,16 +188,26 @@ pub(crate) fn load_explicit_dormant_proof_sources(
         }
     }
     identities.into_iter().map(|identity| {
-        let path = root.join(identity.path.as_path());
-        let resolved = path.canonicalize().map_err(|error|
-            format!("failed to resolve dormant source {}: {error}", identity.path.as_path().display())
-        )?;
-        if resolved != path || !resolved.is_file() {
-            return Err(format!("dormant source must be a regular non-aliased file: {}", identity.path.as_path().display()).into());
-        }
-        let text = fs::read_to_string(&resolved).map_err(|error|
-            format!("failed to read dormant source {}: {error}", identity.path.as_path().display())
-        )?;
+        let text = if let Some(checkout) = checkout {
+            let mut file = checkout.source(identity.path.as_path())?
+                .ok_or_else(|| format!("missing declared Git source {}", identity.path.as_path().display()))?;
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(|error|
+                format!("failed to read declared Git source {}: {error}", identity.path.as_path().display())
+            )?;
+            text
+        } else {
+            let path = root.join(identity.path.as_path());
+            let resolved = path.canonicalize().map_err(|error|
+                format!("failed to resolve dormant source {}: {error}", identity.path.as_path().display())
+            )?;
+            if resolved != path || !resolved.is_file() {
+                return Err(format!("dormant source must be a regular non-aliased file: {}", identity.path.as_path().display()).into());
+            }
+            fs::read_to_string(&resolved).map_err(|error|
+                format!("failed to read dormant source {}: {error}", identity.path.as_path().display())
+            )?
+        };
         let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
         let (text, proof) = wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
             .map_err(canonical_syntax_failure)?;
@@ -208,7 +219,7 @@ pub(crate) fn load_explicit_dormant_proof_sources(
 #[cfg(feature = "internal-checker")]
 pub(crate) fn declared_package_proof_paths(
     root: &std::path::Path, project: &ProjectContext, configuration: &ProjectConfiguration,
-    directory: &PackageRelativePath,
+    directory: &PackageRelativePath, checkout: Option<&wosy_project::packages::GitDirectory>,
 ) -> Result<Vec<PackageRelativePath>, CanonicalLoadFailure> {
     use std::io::ErrorKind;
     use std::path::Component;
@@ -216,6 +227,11 @@ pub(crate) fn declared_package_proof_paths(
     let boundaries = DormantSourceBoundaries::new(root, project, configuration);
     let identity = |path| ProjectSourceIdentity::new(root.to_string_lossy().into_owned(), project.package.clone(), path);
     boundaries.validate(&identity(directory.clone()))?;
+    if let Some(checkout) = checkout {
+        let paths = checkout.declared_checker_sources(directory)?;
+        for path in &paths { boundaries.validate(&identity(path.clone()))?; }
+        return Ok(paths);
+    }
     let source_root = directory.as_path();
     let reserved = |name: &std::ffi::OsStr| matches!(name.to_str(), Some(".git" | ".wosy" | "deps" | "patches" | "references"));
     if source_root.components().any(|part| matches!(part, Component::Normal(name) if reserved(name))) {
@@ -301,7 +317,17 @@ pub(crate) fn load_canonical_project_inputs(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
     )]);
-    let mut pending = VecDeque::from([(project.package.as_str(), root_path, None::<fs::File>)]);
+    #[cfg(feature = "internal-checker")]
+    let own_checkout = match &purpose {
+        CanonicalLoadPurpose::PackageProofs(_, checkout) => checkout.as_ref(),
+        _ => None,
+    };
+    #[cfg(not(feature = "internal-checker"))]
+    let own_checkout: Option<&wosy_project::packages::GitDirectory> = None;
+    let root_file = own_checkout.map(|checkout| {
+        checkout.source(root_path.as_path())?.ok_or_else(|| "managed Git primary source is missing".to_owned())
+    }).transpose()?;
+    let mut pending = VecDeque::from([(project.package.as_str(), root_path, root_file)]);
     let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
@@ -322,10 +348,11 @@ pub(crate) fn load_canonical_project_inputs(
         };
         let source_path = package_root.join(path.as_path());
         #[cfg(feature = "internal-checker")]
-        if let CanonicalLoadPurpose::PackageProofs(sources) = &purpose {
+        if let CanonicalLoadPurpose::PackageProofs(sources, checkout) = &purpose {
             if package == project.package
                 && (!sources.contains(&path)
-                    || source_path.canonicalize().ok().as_ref() != Some(&source_path))
+                    || if checkout.is_some() { checked_git_source.is_none() }
+                       else { source_path.canonicalize().ok().as_ref() != Some(&source_path) })
             {
                 return Err(format!("reachable source is outside the declared package source tree or aliased: {}",
                     path.as_path().display()).into());
@@ -344,14 +371,14 @@ pub(crate) fn load_canonical_project_inputs(
         let source = canonical_source_identity(project_identity.to_owned(), package, &path, &text);
         #[cfg(feature = "internal-checker")]
         let parse_proofs = match &purpose {
-            CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_) => package == project.package,
+            CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(..) => package == project.package,
             CanonicalLoadPurpose::Proof(selected) => package == project.package && selected.contains(&path),
             _ => false,
         };
         let (text, declarations) = match &purpose {
             #[cfg(feature = "internal-checker")]
             _ if parse_proofs => {
-                let parse = if matches!(&purpose, CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_)) {
+                let parse = if matches!(&purpose, CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(..)) {
                     if root_node.is_some() {
                         wosy_compiler::parse_configured_proof_source
                     } else {
@@ -368,12 +395,12 @@ pub(crate) fn load_canonical_project_inputs(
                     source, text, &project.comment_categories,
                     matches!(&purpose, CanonicalLoadPurpose::Build(_)),
                     #[cfg(feature = "internal-checker")]
-                    matches!(&purpose, CanonicalLoadPurpose::Check | CanonicalLoadPurpose::PackageProofs(_) | CanonicalLoadPurpose::LocalProofs),
+                    matches!(&purpose, CanonicalLoadPurpose::Check | CanonicalLoadPurpose::PackageProofs(..) | CanonicalLoadPurpose::LocalProofs),
                     match &purpose {
                         CanonicalLoadPurpose::Build(persist) => persist.map(|persist| (root, persist)),
                         #[cfg(feature = "internal-checker")]
                         CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) | CanonicalLoadPurpose::LocalProofs
-                            | CanonicalLoadPurpose::PackageProofs(_) => None,
+                            | CanonicalLoadPurpose::PackageProofs(..) => None,
                     },
                 )?;
                 (text, CanonicalSourceDeclarations::Ordinary(declarations))
@@ -393,7 +420,9 @@ pub(crate) fn load_canonical_project_inputs(
                 .get(target_package)
                 .is_some_and(|paths| paths.contains(module.path.as_ref()));
             if !already_discovered {
-                let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
+                let checkout = if target_package == project.package { own_checkout }
+                    else { configuration.git_package(target_package)?.map(|(_, checkout)| checkout) };
+                let available = if let Some(checkout) = checkout {
                     checkout.source(module.path.as_path())?.map(Some)
                 } else {
                     let target_root = module.dependency.map_or(root, |resolved| resolved.project_root.as_path());

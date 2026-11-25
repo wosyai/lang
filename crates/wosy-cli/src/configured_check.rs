@@ -252,7 +252,7 @@ fn configured_target_from_manifest(
             ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
         ),
     };
-    check_configured_proof_scope(&project, configuration, layout, scope, selection)
+    check_configured_proof_scope(&project, configuration, layout, scope, selection, None)
 }
 
 pub(crate) fn check_target_with_dependencies(
@@ -286,13 +286,14 @@ fn check_resolved_dependency_primary(
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     check_configured_proof_scope(
         &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
-        DormantSelection::DeclaredPackage(selection.source_directory.clone()),
+        DormantSelection::DeclaredPackage(selection.source_directory.clone()), selection.git_checkout.as_ref(),
     )
 }
 
 fn check_configured_proof_scope(
     project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
     scope: ScalarCheckerScope, selection: DormantSelection<'_>,
+    checkout: Option<&wosy_project::packages::GitDirectory>,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = project.root.as_path();
@@ -301,6 +302,7 @@ fn check_configured_proof_scope(
     };
     let (purpose, dormant_paths) = match selection {
         DormantSelection::Explicit(paths) => {
+            if checkout.is_some() { return Err(LoadError::DormantPath); }
             let paths = if scope == ScalarCheckerScope::CurrentPackage {
                 paths.into_iter().map(|path| PackageRelativePath::new(path.into()))
                     .collect::<Result<Vec<_>, _>>().map_err(|_| LoadError::DormantPath)?
@@ -310,10 +312,10 @@ fn check_configured_proof_scope(
             (CanonicalLoadPurpose::LocalProofs, (paths, false))
         }
         DormantSelection::DeclaredPackage(directory) => {
-            let paths = declared_package_proof_paths(root, project, configuration, &directory)
+            let paths = declared_package_proof_paths(root, project, configuration, &directory, checkout)
                 .map_err(LoadError::Dormant)?;
             let sources = paths.iter().cloned().collect();
-            (CanonicalLoadPurpose::PackageProofs(sources), (paths, true))
+            (CanonicalLoadPurpose::PackageProofs(sources, checkout.cloned()), (paths, true))
         }
     };
     let mut loaded = load_canonical_project_inputs(root, project, configuration, purpose, || {})
@@ -322,7 +324,7 @@ fn check_configured_proof_scope(
     if discovered {
         paths.retain(|path| !loaded.proofs.contains_key(path));
     }
-    let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts)
+    let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts, checkout)
         .map_err(LoadError::Dormant)?;
     let outcome = check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
