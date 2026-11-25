@@ -700,10 +700,16 @@ fn prepare_project_contextual_types_with_targets(
     )
 }
 
-/// Admit just `current == core.old(current) +/- literal` from the
-/// existing CST. No general expression derivation or recursive walk.
 #[cfg(feature = "internal-checker")]
-pub(super) fn contextual_proof_delta(goal: &CstNode) -> Option<(CstToken, bool, BigInt)>
+pub(super) enum ContextualProofAmount {
+    Literal(BigInt),
+    EntryParameter(CstToken),
+}
+
+/// Recognizes a literal or an authored entry binder, not a general
+/// expression. Prepared theorem selection authenticates the binder and type.
+#[cfg(feature = "internal-checker")]
+pub(super) fn contextual_proof_delta(goal: &CstNode) -> Option<(CstToken, bool, ContextualProofAmount)>
 {
     type Element = NodeOrToken<CstNode, CstToken>;
     // The canonical grammar flattens empty operator tiers. Cap both
@@ -785,5 +791,10 @@ pub(super) fn contextual_proof_delta(goal: &CstNode) -> Option<(CstToken, bool, 
         return None;
     }
     if place(argument)?.text() != name.text() { return None; }
-    Some((name, add, literal(amount)?))
+    let amount = match unwrap(amount)? {
+        NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier =>
+            ContextualProofAmount::EntryParameter(token),
+        element => ContextualProofAmount::Literal(literal(element)?),
+    };
+    Some((name, add, amount))
 }

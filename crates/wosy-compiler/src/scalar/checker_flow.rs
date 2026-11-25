@@ -1902,6 +1902,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_exact_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
+    allow_exact_contextual_counter_argument: bool,
+    #[cfg(feature = "internal-checker")]
     allow_symbolic_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
     allow_real_integer_tail_call: bool,
@@ -7648,9 +7650,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         {
                             return None;
                         }
+                        use super::reference::CheckerContextualCounterOperand::{Lexical, Literal};
+                        let exact;
+                        let amount = match &update.amount {
+                            Literal(value) => value,
+                            Lexical(binding) => {
+                                // One original checked actual row only. Do not
+                                // project a symbolic operand independently of
+                                // its contextual entry or reuse across calls.
+                                if !SUSPEND_CALL || !roots.allow_exact_contextual_counter_argument { return None; }
+                                let (binding_axis, binding_ty) = roots.lookup(binding)?;
+                                let [row] = path.0.as_slice() else { return None; };
+                                if binding_ty != ty || binding_axis == axis { return None; }
+                                charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1)?;
+                                exact = row.get(binding_axis)?.singleton_value()?.clone();
+                                &exact
+                            }
+                        };
                         path = path.finite_ordinary_calculation(
                             AuthoredIntegerOperation::checked(&update.operator)?, (None, Some(axis)),
-                            (Some(&update.literal), None), ty, FiniteIntegerInstall::OverwriteSource,
+                            (Some(amount), None), ty, FiniteIntegerInstall::OverwriteSource,
                             roots.ordinary_local_work.get_or_insert(0),
                         )?;
                         continue;
@@ -8928,6 +8947,7 @@ impl<'a> ExactCallCursor<'a> {
         self.roots.add(binding, ty);
         self.block.depth = self.roots.axes.len();
         self.contextual_entry = Some((axis, entry));
+        self.roots.allow_exact_contextual_counter_argument = axis == 1;
         Some(())
     }
 
@@ -10126,6 +10146,7 @@ pub(super) fn exact_contextual_summary_leaf(calls: &FunctionCallSites) -> bool {
         let (binding, target_type, rhs, destination) = checked_scalar_assignment(calls, group)?;
         (binding == formal && target_type == ty && rhs == update.rhs
             && matches!(update.operator, BinaryOperator::Add | BinaryOperator::Subtract)
+            && matches!(update.amount, super::reference::CheckerContextualCounterOperand::Literal(_))
             && structure.checker_contextual_occurrences.contains(&destination)).then_some(())
     }
     eligible(calls).is_some()

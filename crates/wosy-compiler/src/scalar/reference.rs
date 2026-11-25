@@ -6361,7 +6361,14 @@ pub(super) struct CheckerOrdinaryDirectiveCall {
 pub(super) struct CheckerContextualCounterUpdate {
     pub(super) rhs: OccurrenceOrdinal,
     pub(super) operator: BinaryOperator,
-    pub(super) literal: BigInt,
+    pub(super) amount: CheckerContextualCounterOperand,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerContextualCounterOperand {
+    Literal(BigInt),
+    Lexical(ReferenceBindingId),
 }
 
 /// A typed fixed-array return producer, either constructed at the return
@@ -9593,9 +9600,20 @@ impl StructuralWalker<'_, '_> {
         let ScalarExpression::Binary { left, .. } = value else { return None; };
         let ScalarExpression::Contextual { binding, .. } = left.as_ref() else { return None; };
         if binding != destination || self.structure.checked_types.expressions.get(&rhs)? != ty { return None; }
-        let (operator, [(_, None), (_, Some(literal))]) =
+        let (operator, [(_, None), (operand, literal)]) =
             self.simple_integer_operation_with_context(rhs, value, false, true)? else { return None; };
-        Some(CheckerContextualCounterUpdate { rhs, operator, literal: literal.into_owned() })
+        let amount = if let Some(literal) = literal {
+            CheckerContextualCounterOperand::Literal(literal.into_owned())
+        } else {
+            let ScalarExpression::Binary { right, .. } = value else { return None; };
+            if !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+                || !matches!(right.as_ref(), ScalarExpression::Name { .. })
+                || self.structure.checked_types.expressions.get(&operand)? != ty { return None; }
+            let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
+            let PlainNameIdentity::Lexical(binding) = names.get(&operand)? else { return None; };
+            CheckerContextualCounterOperand::Lexical(binding.clone())
+        };
+        Some(CheckerContextualCounterUpdate { rhs, operator, amount })
     }
 
     fn binding_region(

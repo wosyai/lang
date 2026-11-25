@@ -690,7 +690,7 @@ struct ReachedContextualProof {
     ty: ScalarType,
     goal: ByteSpan,
     add: bool,
-    amount: BigInt,
+    amount: super::contextual::ContextualProofAmount,
     observations: Vec<ContextualProofOccurrence>,
     retain_observations: bool,
     explicit: Option<String>,
@@ -744,7 +744,12 @@ impl ReachedContextualProof {
             }
             true
         } else {
-            let expected = if self.add { entry + &self.amount } else { entry - &self.amount };
+            let amount = match &self.amount {
+                super::contextual::ContextualProofAmount::Literal(amount) => amount,
+                super::contextual::ContextualProofAmount::EntryParameter(_) =>
+                    explicit.map(|(_, value)| value).ok_or(ProjectCheck::Unsupported)?,
+            };
+            let expected = if self.add { entry + amount } else { entry - amount };
             if !integer_literal_fits_type(&expected, ty) { return Err(ProjectCheck::Unsupported); }
             &expected == exit
         };
@@ -794,7 +799,7 @@ struct ContextualProofHeader {
     proof: ByteSpan,
     goal: ByteSpan,
     add: bool,
-    amount: BigInt,
+    amount: super::contextual::ContextualProofAmount,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -850,6 +855,9 @@ fn contextual_proof_header(declaration: &CstNode, allow_explicit: bool) -> Resul
     if namespace.is_some() { return Err(ProjectCheck::Unsupported); }
     let goal = child(&child(&declaration, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
     let (place, add, amount) = super::contextual::contextual_proof_delta(&goal).ok_or(ProjectCheck::Unsupported)?;
+    if let super::contextual::ContextualProofAmount::EntryParameter(parameter) = &amount {
+        if explicit.as_deref() != Some(parameter.text()) { return Err(ProjectCheck::Unsupported); }
+    }
     Ok(ContextualProofHeader { name, explicit, place, proof: wosy_syntax::byte_span(&declaration),
         goal: wosy_syntax::byte_span(&goal), add, amount })
 }
@@ -916,7 +924,12 @@ fn prepare_contextual_effects(
         {
             return Err(ProjectCheck::Unsupported);
         }
-        if header.place.text() != context.name.as_ref() || !integer_literal_fits_type(&header.amount, ty) {
+        let valid_amount = match &header.amount {
+            super::contextual::ContextualProofAmount::Literal(amount) => integer_literal_fits_type(amount, ty),
+            super::contextual::ContextualProofAmount::EntryParameter(_) =>
+                matches!(body.boundary.parameters.as_slice(), [slot] if &slot.ty == ty),
+        };
+        if header.place.text() != context.name.as_ref() || !valid_amount {
             return Err(ProjectCheck::Unsupported);
         }
         let target = (module_index, item);
@@ -1337,8 +1350,13 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                     if body.contextual_formal() != Some((&context.formal, &context.ty)) {
                         return Err(ProjectCheck::Unsupported);
                     }
+                    // The reached exact-row lane binds entry-dependent amounts.
+                    // This symbolic profile has no general binary relation.
+                    let super::contextual::ContextualProofAmount::Literal(amount) = &context.amount else {
+                        return Err(ProjectCheck::Unsupported);
+                    };
                     let (observed, refuted) = super::checker_flow::check_symbolic_contextual_unit(
-                        body, &context.amount, context.add, &mut |failure| {
+                        body, amount, context.add, &mut |failure| {
                             if body.structure.checker_selected_snapshots.is_empty() {
                                 effects.snapshot_records.push(effects.records.len());
                             }
@@ -24561,6 +24579,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert_eq!(&stale[after.start as usize..after.end as usize], "core.context.credit == 3");
                 let unmatched = provider.split_once("proof debit").unwrap().0.to_owned() + "%%end";
                 assert!(matches!(run(&root, &unmatched, scope), Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn library_credit_proof_debits_the_exact_authored_entry_amount() {
+        let app = source("src/main.w", "contextual-argument-debit-root");
+        let lib = source("src/credit.w", "contextual-argument-debit-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend(2);
+                core.require(core.context.credit == 1, OUTPUT);
+                u8 final_cost = 1;
+                accounting.spend(final_cost);
+                core.require(core.context.credit == 0, OUTPUT);
+            };
+            entry();
+        %%end"#.replace("OUTPUT", OUTPUT);
+        let provider = r#"%%start
+            unit(u8) spend = fn(charged) { core.context.credit = core.context.credit - charged; };
+            proof debit for spend(cost) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - cost) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, provider: &str, scope| {
+                let (_, root_proof) = crate::parse_configured_root_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+                let (_, lib_proof) = crate::parse_configured_proof_source(lib.clone(), provider.to_owned(), &[]).ok().unwrap();
+                let import = ScalarNamespaceBinding { binding: "accounting".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(lib_proof, Vec::new()), (root_proof, vec![import])],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let pass = run(&root, provider, scope).unwrap();
+                assert!(pass.active && pass.directives.is_empty() && pass.contextual_diagnostic.is_none());
+                let wrong = provider.replace("credit - charged", "credit - 1").replace(
+                    "fn(charged) {", "fn(charged) { if (charged == 2) {}; ");
+                let refuted = run(&root, &wrong, scope).unwrap().contextual_diagnostic.unwrap();
+                assert_eq!((refuted.entry, refuted.exit), (3.into(), 2.into()));
+                assert_eq!(refuted.explicit_entry, Some(("cost".into(), 2.into())));
+                assert_eq!(refuted.call.source, app);
+                assert_eq!(&root[refuted.call.range.start as usize..refuted.call.range.end as usize], "accounting.spend(2)");
+                let stale = run(&root.replace("credit == 0", "credit == 1"), provider, scope).unwrap();
+                assert!(stale.contextual_diagnostic.is_none());
+                assert_eq!(stale.directives.len(), 1);
+                assert!(matches!(run(&root.replace("spend(2)", "spend(4)"), provider, scope),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
     }
