@@ -15166,19 +15166,33 @@ u8[](u64) _right = fn(count) { u8[count] fresh; fresh };
 u64(bool, u64) replace = fn(first, count) {
     u8[] target = [11, 13];
     u64 previous = core.array_len(&target);
+    u64 selected = 1;
+    *u8 loan = &target[selected];
+    u8 old_value = *loan;
     target = if (first) { _left(count) } else { _right(4) };
+    *u8 new_cell = &target[previous];
+    u8 new_value = *new_cell;
+    if (old_value != 13 || new_value != 23) { core.system_panic(); };
     previous * 10 + core.array_len(&target)
 };
+u64(bool, u64) terminal = fn(first, count) {
+    u8[] destination = [11, 13];
+    destination = if (first) { _left(count) } else { _right(4) };
+    core.array_len(&destination)
+};
 if (replace(true, 3) != 23 || replace(false, 3) != 24) { core.system_panic(); };
-replace(true, 5);
+terminal(true, 5);
 %%end";
-    let live = text.replace("    target = if", "    *u8 loan = &target[0];\n    target = if")
-        .replace("    previous * 10", "    *loan;\n    previous * 10");
+    let live = text.replace("    u8 old_value = *loan;\n", "")
+        .replace("    *u8 new_cell", "    u8 old_value = *loan;\n    *u8 new_cell");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let negative = prepare_initializer_test(&live, layout);
         let rejected = analyze_scalar_build(&negative);
         assert!(rejected.diagnostics().iter().any(|diagnostic|
-            diagnostic.labels.iter().any(|label| label.span.range.start == live.find("&target[0]").unwrap() as u32)),
+            diagnostic.message.contains("read or move of unavailable place")
+                && diagnostic.labels.iter().any(|label| label.kind == crate::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == live.find("&target[selected]").unwrap() as u32
+                    && label.message == "origin of conflicting place or loan")),
             "{:?}", rejected.diagnostics());
         let prepared = prepare_initializer_test(text, layout);
         let source = prepared.project().modules[0].source.clone();
@@ -15215,7 +15229,28 @@ replace(true, 5);
             let absent = blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.array_absent").unwrap();
             assert_eq!(free[0].get_parent(), Some(*present));
             assert_eq!(absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
-            if let Some(out) = std::env::var_os("WOSY_RUNTIME_DESCRIPTOR_REPLACE_IR_DIR") {
+            let terminal = module.get_function(&self_tail_test_symbol(&source, project, "terminal")).unwrap();
+            let terminal_absent = terminal.get_basic_blocks().into_iter()
+                .find(|block| block.get_name().to_bytes() == b"ordinary.array_absent").unwrap();
+            let panic = CallSiteValue::try_from(terminal_absent.get_first_instruction().unwrap()).unwrap();
+            assert_eq!(panic.get_called_fn_value(), module.get_function("__wosy_core_system_panic"));
+            assert_eq!(terminal_absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+            let extent_checks = if route == "release-project" {
+                let helper_source = release.project().modules.iter()
+                    .find(|module| module.source != source).map(|module| &module.source).unwrap();
+                calls(module.get_function(&project_function_name(helper_source, "check_index_in_extent")).unwrap())
+            } else {
+                blocks.iter().flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                    |instruction| instruction.get_next_instruction())).filter(|instruction|
+                    instruction.get_icmp_predicate() == Some(inkwell::IntPredicate::UGE)).collect()
+            };
+            let [prior, replacement] = extent_checks.as_slice() else { panic!("{llvm}") };
+            let prior_extent = known_field_operand(*prior, 1).unwrap().into_int_value();
+            let replacement_extent = known_field_operand(*replacement, 1).unwrap().into_int_value();
+            assert_eq!(prior_extent.get_zero_extended_constant(), Some(2));
+            assert_eq!(replacement_extent.get_type().get_bit_width(), 64);
+            assert_eq!(replacement_extent.as_instruction_value().unwrap().get_indices(), vec![1]);
+            if let Some(out) = std::env::var_os("WOSY_WIDENED_ELEMENT_BORROW_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);

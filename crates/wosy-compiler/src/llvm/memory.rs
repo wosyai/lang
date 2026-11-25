@@ -420,9 +420,10 @@ pub(super) fn place_pointer<'ctx, 'module>(
             } else {
                 None
             };
-            let ordinary_descriptor = runtime_extent.is_some()
+            let checked_lexical_descriptor = runtime_extent.is_some()
                 && state.local_runtime_extents.get(&base_pointer)
-                    .is_some_and(|(_, extent, _)| matches!(extent, LocalRuntimeExtent::OrdinaryDescriptor(_)));
+                    .is_some_and(|(_, extent, _)| matches!(extent,
+                        LocalRuntimeExtent::OrdinaryDescriptor(_) | LocalRuntimeExtent::WidenedLiteral(_)));
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = guarded_extent {
@@ -436,7 +437,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     }
                 }
                 if let Some(extent) = runtime_extent {
-                    if ordinary_descriptor {
+                    if checked_lexical_descriptor {
                         check_array_extent(context, state, index, extent, Some((
                             "ordinary_array_index_out_of_bounds", "ordinary_array_index_panic", "ordinary_array_index_continue",
                         )))?;
@@ -447,7 +448,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     return Err("sealed returned array index lost its paired extent".into());
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
-                let index = if guarded_extent.is_some() || ordinary_descriptor {
+                let index = if guarded_extent.is_some() || checked_lexical_descriptor {
                     array_address_index(context, state, index)?
                 } else { index };
                 return unsafe {

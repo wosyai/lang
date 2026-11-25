@@ -3250,6 +3250,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 && projections.is_empty()
                                 && matches!(proof_place.as_ref(), ScalarPlace::Name { .. })
                                 && *mutability == ScalarReferenceMutability::Shared)
+                        && !(*mutability == ScalarReferenceMutability::Shared && parent_loan.is_none()
+                            && self.exact_widened_element_borrow(place, place_ordinal, ordinal, &binding))
                     {
                         return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
                     }
@@ -5067,6 +5069,36 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } {
             self.local_borrow = None;
         }
+    }
+
+    fn exact_widened_element_borrow(
+        &self, place: &ScalarPlace, ordinal: OccurrenceOrdinal, address: OccurrenceOrdinal,
+        owner: &ReferenceBindingId,
+    ) -> bool {
+        let ScalarPlace::Index { base, index, .. } = place else { return false };
+        let ScalarPlace::Name { span, .. } = base.as_ref() else { return false };
+        let Some(ty @ ScalarType::RuntimeArray { element, .. }) = self.binding_types.get(owner)
+            else { return false };
+        let parent = OccurrenceParent::Place(ordinal);
+        let base = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
+        let selector = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
+        let types = &self.call_sites.structure.checked_types;
+        // Only non-mutating selectors can retain this exact backing while
+        // indexing. Ownership and last-use still come from ordinary loan replay.
+        aggregate::ordinary_value(element)
+            && matches!(self.prepared_place_root(base, *span), Ok(Some(PreparedPlaceRoot::Lexical(binding))) if binding == owner)
+            && types.places.get(&base) == Some(ty)
+            && types.places.get(&ordinal) == Some(element.as_ref())
+            && types.expressions.get(&selector) == Some(&ScalarType::U64)
+            && matches!(types.expressions.get(&address), Some(ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared, inner,
+            }) if inner == element)
+            && match index.as_ref() {
+                ScalarExpression::Integer { .. } => true,
+                ScalarExpression::Name { .. } => matches!(self.call_sites.prepared_plain_name(selector),
+                    Some(PlainNameIdentity::Lexical(_))),
+                _ => false,
+            }
     }
 
     fn exact_guarded_index<'b>(
