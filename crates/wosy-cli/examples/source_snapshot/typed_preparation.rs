@@ -144,6 +144,7 @@ fn report_build(
     }
     Ok(serde_json::json!({
         "snapshot": analysis.source_root.hex(), "prepared_identity": analysis.preparation.hex(),
+        "analysis_key": analysis.key.digest().hex(), "analysis_disposition": format!("{:?}", analysis.disposition),
         "target_layout": view.target_layout(), "phase": format!("{:?}", analysis.phase),
         "diagnostics": analysis.diagnostics, "preparation_diagnostics": view.authored_diagnostics()?,
         "preparation_ms": preparation_ms, "reused_live": view.report.reused_live_preparation,
@@ -169,12 +170,33 @@ pub(super) async fn run(
         }
         let elapsed = milliseconds(start);
         if mode == Some("--build-held") {
-            return Ok(serde_json::json!([report_build(&first, elapsed, None)?, report_build(&second, elapsed, None)?]));
+            // Independent callers share only equal semantic preparations.
+            // Inspection must not seed either analysis query.
+            first.authored_diagnostics()?;
+            second.authored_diagnostics()?;
+            let ready = std::sync::Barrier::new(2);
+            let (one, two) = std::thread::scope(|scope| -> Result<_> {
+                let first = scope.spawn(|| {
+                    ready.wait();
+                    report_build(&first, elapsed, None)
+                });
+                ready.wait();
+                let second = report_build(&second, elapsed, None);
+                Ok((first.join().map_err(|_| "fixture Build analysis panicked")??, second?))
+            })?;
+            return Ok(serde_json::json!([one, two]));
         }
         return Ok(serde_json::json!([report(&first, elapsed)?, report(&second, elapsed)?]));
     }
     let first = store.rooted_prepared_project(root, profile).await?.ok_or("unknown rooted preparation")?;
     let elapsed = milliseconds(start);
+    if mode == Some("--build-released") {
+        let first_report = report_build(&first, elapsed, None)?;
+        drop(first);
+        let start = Instant::now();
+        let next = store.rooted_prepared_project(root, profile).await?.ok_or("reopen rooted preparation")?;
+        return Ok(serde_json::json!([first_report, report_build(&next, milliseconds(start), None)?]));
+    }
     if matches!(mode, Some("--build" | "--build-oracle")) {
         return report_build(&first, elapsed, (mode == Some("--build-oracle")).then_some((project, profile)));
     }

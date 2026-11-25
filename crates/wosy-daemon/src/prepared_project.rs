@@ -1,10 +1,10 @@
 //! Real compiler preparation and separately requested Build analysis.
 use super::{
     base_declarations::Flights, read_comments, ProjectDeclarationModule, ProjectDeclarationsView,
-    Result, SourceStore,
+    QueryDisposition, Result, SourceStore,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
 use wosy_compiler::{
@@ -17,6 +17,7 @@ use wosy_protocol::NodeId;
 use wosy_syntax::{AuthoredSpanMap, SourceIdentity};
 
 const PREPARED_PROJECT_ABI: &str = "wosy rooted typed project preparation v1";
+const BUILD_ANALYSIS_ABI: &str = "wosy rooted ordinary build diagnostics v1";
 
 #[derive(Default)]
 pub(super) struct PreparationCache {
@@ -42,8 +43,13 @@ enum PreparationOutcome {
 }
 
 struct CanonicalPreparation {
+    identity: NodeId,
+    target_layout: ScalarTargetLayout,
     owners: HashMap<SourceIdentity, SourceNodeId>,
     outcome: PreparationOutcome,
+    // Only a Build-analysis request initializes this projection. The weak
+    // preparation registry never extends the lifetime of its diagnostics.
+    build_analysis: OnceLock<CanonicalBuildAnalysis>,
 }
 
 #[derive(Default)]
@@ -61,12 +67,32 @@ pub enum BuildAnalysisPhase {
     Analyzed,
 }
 
+/// Identity of the diagnostic-only Build query for a canonical preparation.
+/// Not a Check key, a Build result, or authority to use any compiled artifact.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BuildAnalysisKey(NodeId);
+
+impl BuildAnalysisKey {
+    pub fn digest(self) -> NodeId {
+        self.0
+    }
+}
+
+struct CanonicalBuildAnalysis {
+    key: BuildAnalysisKey,
+    phase: BuildAnalysisPhase,
+    diagnostics: Vec<Diagnostic>,
+}
+
 /// Ordinary Build analysis diagnostics, without an emitter or artifact result.
 pub struct RootedBuildAnalysis {
     pub source_root: NodeId,
     pub preparation: NodeId,
+    pub key: BuildAnalysisKey,
     pub phase: BuildAnalysisPhase,
+    pub disposition: QueryDisposition,
     pub diagnostics: Vec<Diagnostic>,
+    /// Time to obtain the canonical outcome, including another caller's wait.
     pub analysis_elapsed: Duration,
     pub authored_projection_elapsed: Duration,
 }
@@ -78,18 +104,16 @@ pub struct RootedPreparedProject<'a> {
     store: &'a SourceStore,
     declarations: ProjectDeclarationsView<'a>,
     canonical: Arc<CanonicalPreparation>,
-    identity: NodeId,
-    target_layout: ScalarTargetLayout,
     pub report: ProjectPreparationReport,
 }
 
 impl RootedPreparedProject<'_> {
     pub fn identity(&self) -> NodeId {
-        self.identity
+        self.canonical.identity
     }
 
     pub fn target_layout(&self) -> ScalarTargetLayout {
-        self.target_layout
+        self.canonical.target_layout
     }
 
     pub fn declarations(&self) -> &ProjectDeclarationsView<'_> {
@@ -118,23 +142,31 @@ impl RootedPreparedProject<'_> {
     }
 
     /// Opt in explicitly. The exact canonical preparation is borrowed, not
-    /// rebuilt, and its executable identities never become artifact inputs.
+    /// rebuilt. Its diagnostic derivation is shared only by live holders of
+    /// that preparation; each holder projects its own authored revision.
     pub fn build_analysis(&self) -> Result<RootedBuildAnalysis> {
         let start = Instant::now();
-        let (phase, diagnostics) = match &self.canonical.outcome {
-            PreparationOutcome::Ready(prepared) => (
-                BuildAnalysisPhase::Analyzed, analyze_scalar_build(prepared).diagnostics().to_vec(),
-            ),
-            PreparationOutcome::Rejected(rejection) => (
-                BuildAnalysisPhase::PreparationRejected, rejection.ordered_build_diagnostics(),
-            ),
-        };
+        let mut disposition = QueryDisposition::Reused;
+        let canonical = self.canonical.build_analysis.get_or_init(|| {
+            disposition = QueryDisposition::Derived;
+            let (phase, diagnostics) = match &self.canonical.outcome {
+                PreparationOutcome::Ready(prepared) => (
+                    BuildAnalysisPhase::Analyzed, analyze_scalar_build(prepared).diagnostics().to_vec(),
+                ),
+                PreparationOutcome::Rejected(rejection) => (
+                    BuildAnalysisPhase::PreparationRejected, rejection.ordered_build_diagnostics(),
+                ),
+            };
+            let key = BuildAnalysisKey(NodeId(blake3::derive_key(BUILD_ANALYSIS_ABI, &self.canonical.identity.0)));
+            CanonicalBuildAnalysis { key, phase, diagnostics }
+        });
         let analysis_elapsed = start.elapsed();
         let start = Instant::now();
-        let diagnostics = self.project_diagnostics(diagnostics)?;
+        let diagnostics = self.project_diagnostics(canonical.diagnostics.clone())?;
         Ok(RootedBuildAnalysis {
-            source_root: self.declarations.snapshot, preparation: self.identity,
-            phase, diagnostics, analysis_elapsed, authored_projection_elapsed: start.elapsed(),
+            source_root: self.declarations.snapshot, preparation: self.identity(),
+            key: canonical.key, phase: canonical.phase, disposition, diagnostics,
+            analysis_elapsed, authored_projection_elapsed: start.elapsed(),
         })
     }
 
@@ -237,10 +269,12 @@ impl SourceStore {
             report.compiler_preparation = start.elapsed();
             let owners = owners.into_iter().enumerate()
                 .map(|(ordinal, identity)| (identity, SourceNodeId(ordinal))).collect();
-            let canonical = Arc::new(CanonicalPreparation { owners, outcome });
+            let canonical = Arc::new(CanonicalPreparation {
+                identity, target_layout, owners, outcome, build_analysis: OnceLock::new(),
+            });
             self.prepared_projects.remember(identity, &canonical);
             canonical
         };
-        Ok(Some(RootedPreparedProject { store: self, declarations, canonical, identity, target_layout, report }))
+        Ok(Some(RootedPreparedProject { store: self, declarations, canonical, report }))
     }
 }

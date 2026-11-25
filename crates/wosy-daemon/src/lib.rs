@@ -51,7 +51,9 @@ pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
-pub use prepared_project::{BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject};
+pub use prepared_project::{
+    BuildAnalysisKey, BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
+};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 
