@@ -240,6 +240,54 @@ impl OwnedIntegerUnion {
     }
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) struct IndexedIntegerOrigins<T> {
+    owners: Vec<T>,
+    intervals: Vec<(Interval, usize, usize)>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<T> Default for IndexedIntegerOrigins<T> {
+    fn default() -> Self { Self { owners: Vec::new(), intervals: Vec::new() } }
+}
+
+#[cfg(feature = "internal-checker")]
+impl<T> IndexedIntegerOrigins<T> {
+    pub(super) fn push(&mut self, domain: IntegerSet, owner: T) {
+        let id = self.owners.len();
+        self.owners.push(owner);
+        self.intervals.extend(domain.0.into_iter().map(|interval| (interval, id, 0)));
+    }
+
+    pub(super) fn finish(&mut self) -> Option<IntegerSet> {
+        if self.intervals.is_empty() { return None; }
+        // One sort gives both the exact merged exclusion set and a bounded
+        // predecessor query into the original contributing intervals.
+        self.intervals.sort_unstable_by(|a, b| a.0.first.cmp(&b.0.first).then(a.1.cmp(&b.1)));
+        let mut prefix_max = 0;
+        let mut union: Vec<Interval> = Vec::new();
+        for i in 0..self.intervals.len() {
+            if self.intervals[i].0.last > self.intervals[prefix_max].0.last { prefix_max = i; }
+            self.intervals[i].2 = prefix_max;
+            let interval = &self.intervals[i].0;
+            if let Some(prior) = union.last_mut().filter(|prior| overlapping_or_adjacent(&interval.first, &prior.last)) {
+                if interval.last > prior.last { prior.last.clone_from(&interval.last); }
+            } else {
+                union.push(interval.clone());
+            }
+        }
+        Some(IntegerSet(union))
+    }
+
+    pub(super) fn interval_count(&self) -> usize { self.intervals.len() }
+
+    pub(super) fn containing_origin(&self, value: &BigInt) -> Option<&T> {
+        let prior = self.intervals.partition_point(|(range, ..)| range.first <= *value).checked_sub(1)?;
+        let (range, id, _) = self.intervals.get(self.intervals[prior].2)?;
+        (range.last >= *value).then(|| &self.owners[*id])
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum IntegerIntersection {
     Unchanged,

@@ -45,7 +45,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{holds_actual_mixed_entry, evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualFlatShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::{IntegerIntersection, IntegerShowConstraints, OwnedIntegerUnion}, typecheck::integer_bounds};
+use super::{checker_flow::{holds_actual_mixed_entry, evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualFlatShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::{IndexedIntegerOrigins, IntegerIntersection, IntegerShowConstraints, OwnedIntegerUnion}, typecheck::integer_bounds};
 #[cfg(feature = "internal-checker")]
 use super::checker_flow::{named_exact_mixed_pair, named_nested_scalar_parameters, named_stack_parameters};
 #[cfg(not(feature = "internal-checker"))]
@@ -5495,7 +5495,8 @@ impl SelectedSymbolicProof<'_, '_> {
         let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
         let mut hidden = false;
         let mut diagnostic = SymbolicProofDiagnostic {
-            quantified_witness: proof.bound.quantified_witness().cloned(),
+            quantified_witness: proof.bound.quantified_rejection_coordinate(&failure.returned, &mut self.snapshot_work)
+                .ok_or(ProjectCheck::Unsupported)?,
             proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failed_step.map(proof_span),
             callable: callable_span(function.name_span), output: callable_span(failure.output), other_output: None,
             directive_position: position,
@@ -6772,6 +6773,7 @@ enum MainFlowProofBound<'a> {
     Quantified {
         claim: super::checker_flow::QuantifiedIntegerReturn<'a>, failed_step: Option<ByteSpan>,
         original_witness: Option<&'a (String, BigInt)>,
+        exclusion_origins: Option<&'a QuantifiedExclusionOrigins>,
     },
     ResultPair(&'a super::checker_flow::ResultPairProof),
     Literal(&'a BigInt),
@@ -6786,6 +6788,28 @@ impl<'a> MainFlowProofBound<'a> {
             Self::Quantified { original_witness, .. } => *original_witness,
             _ => None,
         }
+    }
+
+    fn quantified_rejection_coordinate(&self, returned: &BigInt, work: &mut usize) -> Option<Option<(String, BigInt)>> {
+        if let Some(known) = self.quantified_witness() { return Some(Some(known.clone())); }
+        let Self::Quantified { claim, exclusion_origins: Some(origins), .. } = self else { return Some(None); };
+        let origin = match origins {
+            QuantifiedExclusionOrigins::Single(origin) => {
+                let excluded = claim.exclusions()?;
+                let depth = (usize::BITS - excluded.interval_count().leading_zeros()) as usize + 1;
+                super::checker_flow::charge_call_work(work, depth.checked_add(2)?)?;
+                excluded.covers_closed(returned, returned).then_some(origin)
+            }
+            QuantifiedExclusionOrigins::Indexed(index) => {
+                let depth = (usize::BITS - index.interval_count().leading_zeros()) as usize + 1;
+                super::checker_flow::charge_call_work(work, depth.checked_add(3)?)?;
+                index.containing_origin(returned)
+            }
+        };
+        Some(origin.map(|origin| (origin.name.clone(), match &origin.shift {
+            Some(shift) => returned - shift,
+            None => returned.clone(),
+        })))
     }
 
     fn literal(&self) -> Option<&'a BigInt> {
@@ -7040,7 +7064,8 @@ impl<'a> MainFlowProofCase<'a> {
             return Ok((Self {
                 proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
                 goal: wosy_syntax::byte_span(&goal), guard, filter, relation: None,
-                bound: MainFlowProofBound::Quantified { claim, failed_step, original_witness }, qualified_leaf, literal_leaf: None,
+                bound: MainFlowProofBound::Quantified { claim, failed_step, original_witness,
+                    exclusion_origins: plan.typed.exclusion_origins.as_ref() }, qualified_leaf, literal_leaf: None,
             }, None));
         }
         if let TypedProofGoal::ResultPair(pair) = &plan.typed.goal {
@@ -7729,13 +7754,14 @@ fn literal_proof_failure(
 #[cfg(feature = "internal-checker")]
 fn make_main_flow_proof_failure(
     proof: &MainFlowProofCase<'_>, failed_step: Option<ByteSpan>, invocation: Rc<MainFlowProofInvocation>,
+    quantified_witness: Option<(String, BigInt)>,
 ) -> MainFlowProofDiagnostic {
     MainFlowProofDiagnostic {
         proof: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.proof },
         goal: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.goal },
         failed_step: failed_step.map(|range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range }),
         entry_dependent_witness: matches!(proof.bound, MainFlowProofBound::Quantified { claim, .. } if claim.uses_entry()),
-        quantified_witness: proof.bound.quantified_witness().cloned(),
+        quantified_witness,
         invocation,
     }
 }
@@ -7792,7 +7818,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                     created
                 }
             };
-            self.diagnostics.push(make_main_flow_proof_failure(proof, failure.step, invocation));
+            self.diagnostics.push(make_main_flow_proof_failure(proof, failure.step, invocation, None));
         }
         group.seen = true;
         Ok(returned)
@@ -7823,7 +7849,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
             }
         }
         let mut invocation: Option<Rc<MainFlowProofInvocation>> = None;
-        let mut emit = |proof: &MainFlowProofCase<'_>, failed_step: Option<ByteSpan>| {
+        let mut emit = |proof: &MainFlowProofCase<'_>, failed_step: Option<ByteSpan>, coordinate: Option<(String, BigInt)>| {
             let invoked = if let Some(invoked) = &invocation {
                 Rc::clone(invoked)
             } else {
@@ -7832,7 +7858,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 invocation = Some(Rc::clone(&invoked));
                 invoked
             };
-            self.diagnostics.push(make_main_flow_proof_failure(proof, failed_step, invoked));
+            self.diagnostics.push(make_main_flow_proof_failure(proof, failed_step, invoked, coordinate));
             true
         };
         match &proofs.cases {
@@ -7854,7 +7880,11 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         };
                         if let Some(witness_outside) = failure {
                             let step = failed_step.filter(|_| !claim.uses_entry() || witness_outside);
-                            if !emit(proof, step) {
+                            let Some(coordinate) = proof.bound.quantified_rejection_coordinate(value, &mut self.named_exact_work) else {
+                                self.incomplete = true;
+                                return;
+                            };
+                            if !emit(proof, step, coordinate) {
                                 self.incomplete = true;
                                 return;
                             }
@@ -7866,7 +7896,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         self.incomplete = true;
                         return;
                     };
-                    if !relation.accepts(value.cmp(bound.as_ref())) && !emit(proof, None) {
+                    if !relation.accepts(value.cmp(bound.as_ref())) && !emit(proof, None, None) {
                         self.incomplete = true;
                         return;
                     }
@@ -7948,7 +7978,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if let Some((cohort, points)) = &case_points {
                                 if index != cohort.consumer {
                                     if points[index].established { continue; }
-                                    if !emit(proof, points[index].failed_step) { self.incomplete = true; return; }
+                                    if !emit(proof, points[index].failed_step, None) { self.incomplete = true; return; }
                                     continue;
                                 }
                             }
@@ -8094,7 +8124,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             None
                         }
                     };
-                    if !emit(proof, failed_step) {
+                    if !emit(proof, failed_step, None) {
                         self.incomplete = true;
                         return;
                     }
@@ -11385,6 +11415,7 @@ fn typed_universal_output_goal(
     inputs: &[String],
     output_type: &ScalarType,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_equality: bool,
+    #[cfg(feature = "internal-checker")] origin: Option<&mut Option<QuantifiedExclusionOrigins>>,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(forall, output, inputs, output_type)?;
     let ScalarExpression::Binary { operator, left, right, .. } = ensures else {
@@ -11402,6 +11433,9 @@ fn typed_universal_output_goal(
             return Err(ProjectCheck::Unsupported);
         }
         if *operator == BinaryOperator::NotEqual {
+            if let Some(origin) = origin {
+                *origin = Some(QuantifiedExclusionOrigins::Single(QuantifiedOrigin { name: binder, shift: None }));
+            }
             return Ok(TypedProofGoal::UniversalNotEqual(domain));
         }
         return Ok(match domain.into_singleton() {
@@ -11426,6 +11460,7 @@ fn typed_universal_output_goal(
 #[cfg(feature = "internal-checker")]
 fn typed_named_universal_conjunction(
     forall: &CstNode, ensures: &ScalarExpression, output: &str, inputs: &[String], output_type: &ScalarType,
+    origin: Option<&mut Option<QuantifiedExclusionOrigins>>,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let (ty, binder) = typed_quantifier_binder(forall, output, inputs, output_type)?;
@@ -11459,6 +11494,9 @@ fn typed_named_universal_conjunction(
         (false, false, true) if minimum == maximum => minimum,
         (false, false, _) => return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible)),
         (true, true, false) => {
+            if let Some(origin) = origin {
+                *origin = Some(QuantifiedExclusionOrigins::Single(QuantifiedOrigin { name: binder, shift: None }));
+            }
             return if saw_literal {
                 output_bounds.normalize();
                 Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::OutputAvoiding(Box::new((output_bounds, domain)))))
@@ -11477,6 +11515,7 @@ fn typed_named_universal_conjunction(
 fn typed_named_repeated_universal<const DEPENDENT: bool>(
     foralls: impl Iterator<Item = CstNode>, ensures: &ScalarExpression,
     output: &str, inputs: &[String], ty: &ScalarType, dependent: Option<(&CstNode, &ScalarBlock)>,
+    origin: Option<&mut Option<QuantifiedExclusionOrigins>>,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     if !matches!(ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
@@ -11557,11 +11596,12 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     let mut impossible = false;
     let mut outside_domain = None;
     let mut forbidden = OwnedIntegerUnion::default();
+    let mut indexed = origin.as_ref().map(|_| IndexedIntegerOrigins::default());
     let charge_translated_union = admission.as_ref().is_some_and(|(_, _, translation)| translation.is_some());
     let mut exclusion_intervals = 0usize;
     let mut exclusion_charge = 0usize;
     let mut work = 0;
-    let mut apply_relation = |domain: IntegerSet, relation: IntegerRelation, work: &mut usize| -> Result<bool, ProjectCheck> {
+    let mut apply_relation = |domain: IntegerSet, relation: IntegerRelation, name: &str, shift: Option<&BigInt>, work: &mut usize| -> Result<bool, ProjectCheck> {
         let (minimum, maximum) = domain.extremes().ok_or(ProjectCheck::Unsupported)?;
         let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
             (true, false, _) => Some(true),
@@ -11576,17 +11616,22 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
             output_bounds.add(relation, Cow::Owned(bound));
             has_output_bounds = true;
         } else {
-            if charge_translated_union {
+            if charge_translated_union || indexed.is_some() {
                 // Preflight each append and the eventual normalization,
                 // charging only the increase from the previous union size.
                 exclusion_intervals = exclusion_intervals.checked_add(domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
-                let factor = (usize::BITS - exclusion_intervals.leading_zeros()) as usize + 1;
+                let extra = if indexed.is_some() { 3 } else { 1 };
+                let factor = (usize::BITS - exclusion_intervals.leading_zeros()) as usize + extra;
                 let total = exclusion_intervals.checked_mul(factor).ok_or(ProjectCheck::Unsupported)?;
                 let increase = total.checked_sub(exclusion_charge).ok_or(ProjectCheck::Unsupported)?;
                 super::checker_flow::charge_call_work(work, increase).ok_or(ProjectCheck::Unsupported)?;
                 exclusion_charge = total;
             }
-            forbidden.push(domain);
+            if let Some(indexed) = &mut indexed {
+                indexed.push(domain, QuantifiedOrigin { name: name.to_owned(), shift: shift.cloned() });
+            } else {
+                forbidden.push(domain);
+            }
         }
         Ok(true)
     };
@@ -11613,6 +11658,7 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
             if let Some(missing) = image.as_ref().unwrap_or(&domain).first_uncovered_from(existential) {
                 let original = if let Some(shift) = translation { missing - shift } else { missing };
                 outside_domain = Some((binder, original));
+                continue;
             }
         }
         if unavailable || impossible || outside_domain.is_some() { continue; }
@@ -11620,10 +11666,10 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
         // conjunction distributes over these distinct pointwise predicates.
         // Their rows must not be intersected as if the coordinates were equal.
         if let Some(relation) = relation {
-            impossible |= !apply_relation(domain, relation, &mut work)?;
+            impossible |= !apply_relation(domain, relation, &binder, None, &mut work)?;
         }
         if let Some(image) = image {
-            impossible |= !apply_relation(image, translated_relation.ok_or(ProjectCheck::Unsupported)?, &mut work)?;
+            impossible |= !apply_relation(image, translated_relation.ok_or(ProjectCheck::Unsupported)?, &binder, translation, &mut work)?;
         }
     }
     if unavailable {
@@ -11647,7 +11693,12 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
             TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible)
         });
     }
-    if let Some(forbidden) = forbidden.finish() {
+    let set = if let (Some(mut indexed), Some(origin)) = (indexed, origin) {
+        let set = indexed.finish();
+        if set.is_some() { *origin = Some(QuantifiedExclusionOrigins::Indexed(indexed)); }
+        set
+    } else { forbidden.finish() };
+    if let Some(forbidden) = set {
         if !has_output_bounds {
             return Ok(if DEPENDENT {
                 TypedProofGoal::DependentWitness(DependentWitness::Avoiding(forbidden))
@@ -11870,6 +11921,7 @@ fn checked_quantified_witness_translation<'a>(
 #[cfg(feature = "internal-checker")]
 fn typed_named_dependent_witness(
     forall: &CstNode, exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
+    origin: Option<&mut Option<QuantifiedExclusionOrigins>>,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (_, universal) = typed_quantifier_binder(forall, output, inputs, ty)?;
     let (_, existential) = typed_quantifier_binder(exists, output, inputs, ty)?;
@@ -11877,7 +11929,7 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::InvalidProof);
     }
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
-    let witness_domain = || -> Result<Result<IntegerSet, (String, BigInt)>, ProjectCheck> {
+    let witness_domain = || -> Result<Result<(IntegerSet, Option<BigInt>), (String, BigInt)>, ProjectCheck> {
         let argument = authored_witness_argument(steps)?;
         let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
         let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
@@ -11891,15 +11943,20 @@ fn typed_named_dependent_witness(
             let original = if let Some(shift) = shift { missing - shift } else { missing };
             return Ok(Err((universal.clone(), original)));
         }
-        Ok(Ok(match image { Cow::Borrowed(_) => universal_domain, Cow::Owned(image) => image }))
+        Ok(Ok((match image { Cow::Borrowed(_) => universal_domain, Cow::Owned(image) => image }, shift)))
     };
     if matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
         let (relation, output_bounds) = typed_existential_conjuncts(&predicate, &existential, output, inputs, ty)?;
-        let image = match witness_domain()? {
+        let (image, shift) = match witness_domain()? {
             Ok(image) => image,
             Err(original) => return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(original))),
         };
         if image.is_empty() { return Ok(TypedProofGoal::DependentWitness(DependentWitness::Vacuous)); }
+        if relation == IntegerRelation::from_operator(&BinaryOperator::NotEqual).ok_or(ProjectCheck::Unsupported)? {
+            if let Some(origin) = origin {
+                *origin = Some(QuantifiedExclusionOrigins::Single(QuantifiedOrigin { name: universal, shift }));
+            }
+        }
         return Ok(TypedProofGoal::DependentWitness(dependent_witness_conjunction(relation, output_bounds, image)?));
     }
     let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
@@ -11911,7 +11968,7 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::Unsupported);
     }
     let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
-    let image = match witness_domain()? {
+    let (image, shift) = match witness_domain()? {
         Ok(image) => image,
         Err(original) => return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(original))),
     };
@@ -11923,7 +11980,12 @@ fn typed_named_dependent_witness(
         match operator {
             BinaryOperator::Equal => image.into_singleton()
                 .map_or(DependentWitness::Unavailable, |bound| DependentWitness::Comparison(relation, bound)),
-            BinaryOperator::NotEqual => DependentWitness::Avoiding(image),
+            BinaryOperator::NotEqual => {
+                if let Some(origin) = origin {
+                    *origin = Some(QuantifiedExclusionOrigins::Single(QuantifiedOrigin { name: universal, shift }));
+                }
+                DependentWitness::Avoiding(image)
+            },
             BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual => {
                 let lower = matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual);
                 let bound = image.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
@@ -12029,6 +12091,18 @@ fn checked_existential_formal(
     Ok(slot)
 }
 
+#[cfg(feature = "internal-checker")]
+struct QuantifiedOrigin {
+    name: String,
+    shift: Option<BigInt>,
+}
+
+#[cfg(feature = "internal-checker")]
+enum QuantifiedExclusionOrigins {
+    Single(QuantifiedOrigin),
+    Indexed(IndexedIntegerOrigins<QuantifiedOrigin>),
+}
+
 struct TypedProofPostcondition<'a> {
     target: &'a ScalarModule,
     body: &'a FunctionCallSites,
@@ -12036,6 +12110,8 @@ struct TypedProofPostcondition<'a> {
     input_names: Vec<String>,
     output: String,
     goal: TypedProofGoal,
+    #[cfg(feature = "internal-checker")]
+    exclusion_origins: Option<QuantifiedExclusionOrigins>,
     #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
     measure: Option<TypedInductionRank<'a>>,
 }
@@ -12643,6 +12719,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] qualified_owner: Option<usize>,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
+    #[cfg(feature = "internal-checker")]
+    let mut exclusion_origins = None;
     let pattern = child(declaration, SyntaxKind::ProofTarget)?;
     let input_names = if matches!(body.boundary.results.as_slice(),
         [_, _]) || matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Bool | ScalarType::Char)) {
@@ -12698,6 +12776,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             return Ok(TypedProofPostcondition {
                 target, body, result_type: &left.ty, input_names, output: first.clone(),
                 goal: TypedProofGoal::ResultPair(super::checker_flow::ResultPairProof { terminal, show, same_literal }), measure,
+                exclusion_origins: None,
             });
         }
         #[cfg(not(feature = "internal-checker"))]
@@ -12740,10 +12819,11 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                     let predicate = derive_expression(&child(&exists, SyntaxKind::Expression)?);
                     typed_named_repeated_universal::<true>(
                         [forall, second].into_iter().chain(foralls), &predicate, output, &input_names, &result.ty,
-                        Some((&exists, steps)),
+                        Some((&exists, steps)), qualified_owner.map(|_| &mut exclusion_origins),
                     )?
                 } else {
-                    typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty)?
+                    typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty,
+                        qualified_owner.map(|_| &mut exclusion_origins))?
                 }
             }
             #[cfg(not(feature = "internal-checker"))]
@@ -12761,7 +12841,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                 if foralls.next().is_some() {
                     return Err(ProjectCheck::Unsupported);
                 }
-                typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty, false)?
+                typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty, false,
+                    #[cfg(feature = "internal-checker")] None)?
             } else if let Some(second) = foralls.next() {
                 #[cfg(feature = "internal-checker")]
                 {
@@ -12769,7 +12850,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                         return Err(ProjectCheck::Unsupported);
                     }
                     typed_named_repeated_universal::<false>(
-                        [forall, second].into_iter().chain(foralls), &ensures, output, &input_names, &result.ty, None,
+                        [forall, second].into_iter().chain(foralls), &ensures, output, &input_names, &result.ty, None, qualified_owner.map(|_| &mut exclusion_origins),
                     )?
                 }
                 #[cfg(not(feature = "internal-checker"))]
@@ -12782,7 +12863,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                 let conjunction = if allow_named_entry_facts && steps.items.is_empty()
                     && matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. })
                 {
-                    Some(typed_named_universal_conjunction(&forall, &ensures, output, &input_names, &result.ty)?)
+                    Some(typed_named_universal_conjunction(&forall, &ensures, output, &input_names, &result.ty,
+                        qualified_owner.map(|_| &mut exclusion_origins))?)
                 } else {
                     None
                 };
@@ -12792,6 +12874,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                     Some(goal) => goal,
                     None => typed_universal_output_goal(
                         &forall, &ensures, output, &input_names, &result.ty, allow_named_entry_facts && steps.items.is_empty(),
+                        #[cfg(feature = "internal-checker")] qualified_owner.map(|_| &mut exclusion_origins),
                     )?,
                 }
             }
@@ -12853,6 +12936,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
         input_names,
         output: output.clone(),
         goal,
+        #[cfg(feature = "internal-checker")]
+        exclusion_origins,
         measure,
     })
 }
@@ -21559,6 +21644,48 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_quantified_sparse_refutation_selects_a_real_original_coordinate() {
+        let source = r#"%%start
+            u8(u8) checked = fn(value) { value };
+            proof sparse for checked(entry) -> (out) where (entry == 6)
+                forall (u8 seed where seed == 1 || seed == 3)
+                forall (u8 other where other == 5 || other == 7)
+                ensures (exists (u8 candidate where candidate == 2 || candidate == 4) {
+                    out != seed && out != candidate && out != other && out < 8
+                })
+                { core.witness(seed + 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str, n| text.replace("%%end", &format!("u8 first = checked({n}); u8 second = checked({n}); %%end"));
+        let pass = check_array_proof_cohort(source, package).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none());
+        for (returned, origin) in [(3, Some(("seed", 3))), (4, Some(("seed", 3))), (7, Some(("other", 7))), (8, None)] {
+            let input = source.replace("entry == 6", &format!("entry == {returned}"));
+            let expected = origin.map(|(name, original)| (name.to_owned(), BigInt::from(original)));
+            let failed = check_array_proof_cohort(&input, package).unwrap().symbolic_diagnostic.unwrap();
+            assert_eq!(failed.returned, BigInt::from(returned));
+            assert_eq!(failed.quantified_witness, expected);
+            assert!(failed.failed_step.is_none());
+            let reached = check_array_proof_cohort(&actual(&input, returned), main).unwrap();
+            let [first, second] = reached.diagnostics.as_slice() else { panic!("two distinct reaching occurrences"); };
+            assert_ne!(first.invocation.call, second.invocation.call);
+            for failure in [first, second] {
+                assert_eq!(failure.quantified_witness, expected);
+                assert_eq!(failure.invocation.returned, BigInt::from(returned));
+                assert!(failure.failed_step.is_none());
+            }
+        }
+        let solo = source.replace("entry == 6", "entry == 4")
+            .replace("                forall (u8 other where other == 5 || other == 7)
+", "")
+            .replace("out != seed && out != candidate && out != other && out < 8", "out != candidate");
+        let failed = check_array_proof_cohort(&solo, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failed.quantified_witness, Some(("seed".into(), BigInt::from(3))));
     }
 
     #[cfg(feature = "internal-checker")]

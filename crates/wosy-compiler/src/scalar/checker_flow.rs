@@ -625,12 +625,19 @@ pub(super) enum QuantifiedIntegerReturn<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl QuantifiedIntegerReturn<'_> {
+impl<'a> QuantifiedIntegerReturn<'a> {
+    pub(super) fn exclusions(self) -> Option<&'a IntegerSet> {
+        match self {
+            Self::Avoiding(_, excluded) => Some(excluded),
+            _ => None,
+        }
+    }
+
     pub(super) fn uses_entry(self) -> bool { matches!(self, Self::EntryWitness { .. }) }
 
-    fn witness_value<'a>(
-        original: &'a BigInt, translation: Option<(&BigInt, &ScalarType)>, work: &mut usize,
-    ) -> Option<Cow<'a, BigInt>> {
+    fn witness_value<'point>(
+        original: &'point BigInt, translation: Option<(&BigInt, &ScalarType)>, work: &mut usize,
+    ) -> Option<Cow<'point, BigInt>> {
         let Some((offset, ty)) = translation else { return Some(Cow::Borrowed(original)); };
         charge_call_work(work, 1)?;
         let translated = original + offset;
@@ -654,8 +661,8 @@ impl QuantifiedIntegerReturn<'_> {
         Some(self.rejected_point(returned, returned, work)?.map(|_| false))
     }
 
-    pub(super) fn rejected_point<'a>(self, low: &'a BigInt, high: &'a BigInt, work: &mut usize) -> Option<Option<&'a BigInt>>
-    where Self: 'a,
+    pub(super) fn rejected_point<'point>(self, low: &'point BigInt, high: &'point BigInt, work: &mut usize) -> Option<Option<&'point BigInt>>
+    where Self: 'point,
     {
         let failure = match self {
             Self::EntryWitness { .. } => return None,
