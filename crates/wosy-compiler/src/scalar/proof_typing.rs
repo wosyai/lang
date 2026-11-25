@@ -120,8 +120,13 @@ pub(super) fn validate_build_proofs(
                 check.check_cst(&node(&ensures, SyntaxKind::Expression), Some(&ScalarType::Bool), &scope);
                 None
             };
-            let body = derive_block(&node(proof, SyntaxKind::Block));
-            check.steps(&body, &scope, witness_type.as_ref());
+            if let Some(body) = optional_node(proof, SyntaxKind::Block) {
+                check.steps(&derive_block(&body), &scope, witness_type.as_ref());
+            } else if let Some(matching) = optional_node(proof, SyntaxKind::ProofMatchBlock) {
+                check.error(&matching, "authored match is not yet supported by Build proof typing");
+            } else {
+                check.error(proof, "missing proof body");
+            }
         }
     }
 }
