@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use wosy_project::{ProjectConfiguration, ProjectContext, SourceGraph};
 use wosy_protocol::{
-    Delta, FileEntry, FileKey, FileMetadata, Kind, Namespace, NodeId, ParserPolicy, SourceConfig,
+    imports_from_cst, source_preparation_schema, Delta, FileEntry, FileKey, FileMetadata, Kind,
+    Namespace, NodeId, ParserPolicy, SourceConfig,
 };
 use wosy_syntax::{CstNode, SyntaxKind};
 
@@ -75,8 +76,10 @@ fn parse_file(
     if !diagnostics.is_empty() {
         return Err(format!("{}:{}: {diagnostics:?}", result.source.package, result.source.path));
     }
-    let decl = wosy_compiler::derive_scalar_declarations_from_cst(result.canonical_cst());
-    let metadata = FileMetadata { imports: crate::project_sources::imports(&decl)?, ..metadata };
+    let metadata = FileMetadata {
+        imports: imports_from_cst(&result.canonical_cst().root)?,
+        ..metadata
+    };
     let (authored, executable) = pack_cst(&result.canonical_cst().root, delta);
     let annotation = delta.add(Kind::Annotations, json(&result.comments), vec![]);
     let file = delta.add(Kind::File, json(&metadata), vec![authored, executable, annotation]);
@@ -176,6 +179,6 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
     let annotation = delta.add(Kind::AnnotationTree, vec![], by_location.values().map(|v| v.2).collect());
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
-    let root = delta.add(Kind::SourcePreparation, wosy_syntax::base_cst_schema().to_vec(), roots);
+    let root = delta.add(Kind::SourcePreparation, source_preparation_schema().to_vec(), roots);
     Ok(PreparedSources { root, delta, parsed, reused })
 }

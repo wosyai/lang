@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
     let files: Vec<_> = view.files.iter().map(|(key, f)| serde_json::json!({
         "package": key.package, "path": key.path, "module": view.modules[key].hex(),
         "authored": f.authored.hex(), "executable": f.executable.hex(),
+        "imports": f.metadata.imports,
     })).collect();
     let read_index_ms = milliseconds(start);
     let (executable, annotation) = (view.executable, view.annotation);
@@ -76,7 +77,8 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let result = serde_json::json!({
         "source_root": prepared.root.hex(), "parsed": prepared.parsed, "reused": prepared.reused,
-        "written": writes, "executable": executable.hex(), "annotations": annotation.hex(),
+        "written": writes.written, "namespace_derived": writes.namespace_derived,
+        "namespace_reused": writes.namespace_reused, "executable": executable.hex(), "annotations": annotation.hex(),
         "files": files, "startup_ms": startup_ms, "open_ms": open_ms, "load_base_ms": load_base_ms,
         "observe_ms": observe_ms, "publish_ms": publish_ms, "read_index_ms": read_index_ms,
     });

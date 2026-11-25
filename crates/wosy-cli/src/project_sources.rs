@@ -5,26 +5,16 @@ use std::io::Read;
 use std::path::Path;
 use wosy_compiler::ScalarSourceDeclarations;
 use wosy_project::{
-    load_reachable_source_graph, ByteSpan, ContentRevision, GraphLoadError, NamespaceEdgeInput,
+    load_reachable_source_graph, ContentRevision, GraphLoadError, NamespaceEdgeInput,
     NamespacePackages, PackageRelativePath, ProjectConfiguration, ProjectContext, SourceGraph,
     SourceIdentity, SourceNodeInput, SourceSpan,
 };
 use wosy_protocol::Import;
 
 pub fn imports(declarations: &ScalarSourceDeclarations) -> Result<Vec<Import>, String> {
-    declarations
-        .namespaces()
-        .map(|namespace| {
-            let path: String = serde_json::from_str(&namespace.path)
-                .map_err(|error| format!("invalid namespace path: {error}"))?;
-            Ok(Import {
-                origin: namespace.package.clone(),
-                path: PackageRelativePath::new(path.into())?,
-                binding: namespace.binding.clone(),
-                span: ByteSpan::new(namespace.span.start, namespace.span.end),
-            })
-        })
-        .collect()
+    declarations.namespaces().map(|ns| Import::from_tokens(
+        &ns.package, &ns.path, &ns.binding, ns.span.start, ns.span.end,
+    )).collect()
 }
 
 /// Each source is read and observed once. The observer supplies imports from

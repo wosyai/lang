@@ -33,6 +33,7 @@ pub enum Kind {
     Module,
     Config,
     SourcePreparation,
+    NamespaceFacts,
 }
 
 impl Kind {
@@ -40,7 +41,7 @@ impl Kind {
         use Kind::*;
         let tags = [
             Token, Syntax, Annotations, File, ExecutableFile, AnnotationFile, Executables,
-            AnnotationTree, Dependencies, Module, Config, SourcePreparation,
+            AnnotationTree, Dependencies, Module, Config, SourcePreparation, NamespaceFacts,
         ];
         tags.get(tag.checked_sub(1)? as usize).copied()
     }
@@ -110,7 +111,7 @@ impl From<&SourceIdentity> for FileKey {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Import {
     pub origin: String,
@@ -119,6 +120,41 @@ pub struct Import {
     pub span: ByteSpan,
 }
 
+impl Import {
+    pub fn from_tokens(
+        origin: &str, path: &str, binding: &str, start: u32, end: u32,
+    ) -> Result<Self, String> {
+        let path: String = serde_json::from_str(path)
+            .map_err(|error| format!("invalid namespace path: {error}"))?;
+        Ok(Self {
+            origin: origin.to_owned(),
+            path: PackageRelativePath::new(path.into())?,
+            binding: binding.to_owned(),
+            span: ByteSpan::new(start, end),
+        })
+    }
+}
+
+/// Fetch hint projection and canonical namespace facts use the same typed CST
+/// access as ordinary compiler namespace declaration derivation.
+pub fn imports_from_cst(root: &wosy_syntax::CstNode) -> Result<Vec<Import>, String> {
+    wosy_syntax::namespace_nodes(root)
+        .map(|node| {
+            let ns = wosy_syntax::NamespaceCst::from_node(&node)
+                .ok_or("namespace declaration tokens are missing")?;
+            Import::from_tokens(ns.package.text(), ns.path.text(), ns.binding.text(),
+                ns.span.start, ns.span.end)
+        })
+        .collect()
+}
+
+pub fn source_preparation_schema() -> &'static [u8; 32] {
+    static ID: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    ID.get_or_init(|| blake3::derive_key(
+        "wosy source preparation with canonical namespace authority v1",
+        wosy_syntax::base_cst_schema(),
+    ))
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParserPolicy {

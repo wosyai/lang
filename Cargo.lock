@@ -1800,6 +1800,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wosy-project",
+ "wosy-syntax",
 ]
 
 [[package]]

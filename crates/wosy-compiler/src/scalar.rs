@@ -3145,22 +3145,15 @@ pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidatio
 }
 
 fn derive_namespace(node: &CstNode) -> ScalarNamespace {
-    let identifiers: Vec<CstToken> = node
-        .children_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
-            _ => None,
-        })
-        .collect();
-    let path = direct_token(node, SyntaxKind::String).expect("namespace path");
+    let ns = wosy_syntax::NamespaceCst::from_node(node).expect("namespace declaration tokens");
     ScalarNamespace {
-        binding: identifiers[0].text().to_owned(),
-        package: identifiers[1].text().to_owned(),
-        path: path.text().to_owned(),
-        binding_span: token_span(&identifiers[0]),
-        package_span: token_span(&identifiers[1]),
-        path_span: token_span(&path),
-        span: wosy_syntax::byte_span(node),
+        binding: ns.binding.text().to_owned(),
+        package: ns.package.text().to_owned(),
+        path: ns.path.text().to_owned(),
+        binding_span: token_span(&ns.binding),
+        package_span: token_span(&ns.package),
+        path_span: token_span(&ns.path),
+        span: ns.span,
     }
 }
 

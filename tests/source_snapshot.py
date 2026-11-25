@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,11 +12,11 @@ binary = Path(sys.argv[1]).resolve()
 template = Path(__file__).parent / "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml"
 
 
-def measured_run(*args):
+def measured_run(*args, executable=binary):
     # Per-child rusage, not the largest of all preceding child processes.
     with tempfile.TemporaryFile() as stdout:
         start = time.perf_counter()
-        child = subprocess.Popen([binary, *args], stdout=stdout)
+        child = subprocess.Popen([executable, *args], stdout=stdout)
         _, status, usage = os.wait4(child.pid, 0)
         child.returncode = os.waitstatus_to_exitcode(status)
         if child.returncode:
@@ -38,8 +39,10 @@ with tempfile.TemporaryDirectory() as work:
     if sys.platform.startswith("linux"):
         names.append("nested\\view.w")
     names.extend(f"module{n:02}.w" for n in range(32))
-    entry = "%%start\n" + "".join(
-        f"module{n} = namespace std {json.dumps(name)};\n" for n, name in enumerate(names)
+    entry = "%%start\n# WHY: entry context\n" + "".join(
+        f"module{n} = namespace std {json.dumps(name)};# WHY: after this import\n"
+        if n == 0 else f"module{n} = namespace std {json.dumps(name)};\n"
+        for n, name in enumerate(names)
     ) + "%%end\n"
     (root / "src/main.w").write_text(entry)
     src = "%%start\n# WHY: first\nu8 sample = 17;\n%%end\n"
@@ -51,10 +54,10 @@ with tempfile.TemporaryDirectory() as work:
         )
     files_total = 1 + len(names)
 
-    def snapshot(name, *args):
-        response, elapsed, rss = measured_run(root, store, *args)
+    def snapshot(name, *args, project=root, database=store):
+        response, elapsed, rss = measured_run(project, database, *args)
         data = response["snapshot"]
-        size = sum(p.stat().st_size for p in store.rglob("*") if p.is_file())
+        size = sum(p.stat().st_size for p in database.rglob("*") if p.is_file())
         stats = {key: value for key, value in data.items() if key != "files"}
         print(name, {"process_wall_ms": elapsed, "store_bytes": size, "peak_child_kib": rss,
                      "close_ms": response["close_ms"], **stats}, flush=True)
@@ -73,8 +76,10 @@ with tempfile.TemporaryDirectory() as work:
     cold = snapshot("cold")
     warm = snapshot("reopen", cold["source_root"])
     assert cold["parsed"] == files_total and cold["written"] > 0
+    assert cold["namespace_derived"] == files_total and cold["namespace_reused"] == 0
     assert warm["source_root"] == cold["source_root"]
     assert (warm["parsed"], warm["reused"], warm["written"]) == (0, files_total, 0)
+    assert (warm["namespace_derived"], warm["namespace_reused"]) == (0, 0)
     assert bypath(warm)["src/nested/view.w"]["path"] == "src/nested/view.w"
     if sys.platform.startswith("linux"):
         assert bypath(warm)["src/nested\\view.w"]["module"] != bypath(warm)["src/nested/view.w"]["module"]
@@ -85,6 +90,7 @@ with tempfile.TemporaryDirectory() as work:
     changed = snapshot("dependency", warm["source_root"])
     assert (changed["parsed"], changed["reused"]) == (1, files_total - 1)
     assert 0 < changed["written"] < cold["written"]
+    assert (changed["namespace_derived"], changed["namespace_reused"]) == (1, 0)
     assert cold["executable"] != changed["executable"]
     unaffected = (set(bypath(cold)) - {"src/main.w", "src/leaf.w"})
     assert all(bypath(changed)[p] == bypath(cold)[p] for p in unaffected)
@@ -97,8 +103,44 @@ with tempfile.TemporaryDirectory() as work:
     note = snapshot("typed-comment", changed["source_root"])
     assert (note["parsed"], note["reused"]) == (1, files_total - 1)
     assert note["executable"] == changed["executable"] and note["annotations"] != changed["annotations"]
+    assert (note["namespace_derived"], note["namespace_reused"]) == (0, 1)
     assert authored(note["source_root"], "src/leaf.w", oracle=True)["comments"][0]["raw_payload"].strip() == "amended"
+    main = root / "src/main.w"
+    before = main.read_text()
+    main.write_text(before.replace("entry context", "more detailed entry context"))
+    annotation_edit = snapshot("comment-shifts-import-span", note["source_root"])
+    assert (annotation_edit["namespace_derived"], annotation_edit["namespace_reused"]) == (0, 1)
+    assert annotation_edit["executable"] == note["executable"]
+    older, current = bypath(note)["src/main.w"], bypath(annotation_edit)["src/main.w"]
+    assert older["module"] == current["module"] and older["imports"] != current["imports"]
+    for state, text in ((older, before), (current, main.read_text())):
+        first_import = state["imports"][0]["span"]
+        assert text[first_import["start"]:first_import["end"]] == 'module0 = namespace std "leaf.w";'
+
     (root / "wosy.toml").write_text(manifest.replace('["WHY"]', '["WHY", "INTENT"]'))
-    policy = snapshot("category-policy", note["source_root"])
-    assert policy["source_root"] != note["source_root"] and policy["parsed"] == files_total
-    assert policy["executable"] == note["executable"] and policy["annotations"] == note["annotations"]
+    policy = snapshot("category-policy", annotation_edit["source_root"])
+    assert policy["source_root"] != annotation_edit["source_root"] and policy["parsed"] == files_total
+    assert policy["executable"] == annotation_edit["executable"] and policy["annotations"] == annotation_edit["annotations"]
+    assert (policy["namespace_derived"], policy["namespace_reused"]) == (0, files_total)
+
+    other_project = Path(work) / "another-consumer"
+    shutil.copytree(root, other_project)
+    other = snapshot("equal-content second project", project=other_project)
+    assert other["source_root"] != policy["source_root"]
+    assert other["executable"] == policy["executable"]
+    assert other["parsed"] == files_total
+    assert (other["namespace_derived"], other["namespace_reused"]) == (0, files_total)
+
+    if len(sys.argv) == 3:
+        # Only when the original release binary is already available: verify
+        # schema migration with the actual previous writer, not graph stubs.
+        previous = Path(sys.argv[2]).resolve()
+        legacy_store = Path(work) / "legacy-store"
+        old_reply, _, _ = measured_run(root, legacy_store, executable=previous)
+        legacy = old_reply["snapshot"]
+        migrated = snapshot("legacy schema migration", legacy["source_root"], database=legacy_store)
+        assert migrated["source_root"] != legacy["source_root"]
+        assert migrated["executable"] == legacy["executable"]
+        assert (migrated["parsed"], migrated["reused"]) == (files_total, 0)
+        assert migrated["namespace_derived"] == files_total
+        assert migrated["written"] == files_total + 1  # one new rooted authority schema and its namespace facts

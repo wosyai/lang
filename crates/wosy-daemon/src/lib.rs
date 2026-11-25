@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use surrealkv::{Durability, Mode, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
-use wosy_protocol::{Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{
+    imports_from_cst, source_preparation_schema, Delta, FileEntry, FileKey, Import, Kind, Node,
+    NodeId, SourceConfig,
+};
 use wosy_syntax::{
     typed_comment_from_token, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind, TypedComment,
 };
@@ -14,6 +17,8 @@ const INTERN: u8 = 2;
 const EDGES_OUT: u8 = 3;
 const EDGES_IN: u8 = 4;
 const SNAPSHOT_ROOTS: u8 = 5;
+const NAMESPACE_QUERIES: u8 = 11;
+const FILE_AUTHORITY: u8 = 12;
 
 fn key(tag: u8, node: NodeId) -> [u8; 33] {
     let mut key = [0; 33];
@@ -36,6 +41,13 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub struct SourceStore(Tree);
 
+#[derive(Default)]
+pub struct PublishReport {
+    pub written: usize,
+    pub namespace_derived: usize,
+    pub namespace_reused: usize,
+}
+
 impl SourceStore {
     pub fn open(dir: &Path, block_cache_bytes: u64) -> Result<Self> {
         let tree = TreeBuilder::new()
@@ -53,18 +65,18 @@ impl SourceStore {
     }
 
     /// A race restarts publication against a complete committed snapshot.
-    pub async fn publish(&self, root: NodeId, delta: &Delta) -> Result<usize> {
+    pub async fn publish(&self, root: NodeId, delta: &Delta) -> Result<PublishReport> {
         loop {
             let mut tx = self.0.begin()?;
             tx.set_durability(Durability::Eventual);
             if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_some() {
-                return Ok(0);
+                return Ok(PublishReport::default());
             }
-            let (inserted, new_files) = intern_closure(&mut tx, root, delta)?;
-            validate_snapshot(&tx, root, &new_files)?;
+            let mut report = PublishReport { written: intern_closure(&mut tx, root, delta)?, ..Default::default() };
+            validate_snapshot(&mut tx, root, &mut report)?;
             tx.set(&key(SNAPSHOT_ROOTS, root), &root.0)?;
             match tx.commit().await {
-                Ok(()) => return Ok(inserted),
+                Ok(()) => return Ok(report),
                 Err(surrealkv::Error::TransactionWriteConflict) => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -93,11 +105,10 @@ impl SourceStore {
 
 fn intern_closure(
     tx: &mut Transaction, root: NodeId, delta: &Delta,
-) -> Result<(usize, BTreeSet<NodeId>)> {
+) -> Result<usize> {
     let mut work = vec![(root, Expected::Exact(Kind::SourcePreparation))];
     let mut visited = HashMap::new();
     let mut inserted = 0;
-    let mut new_files = BTreeSet::new();
     while let Some((id, expected)) = work.pop() {
         if let Some(&kind) = visited.get(&id) {
             expected.check(kind)?;
@@ -116,21 +127,28 @@ fn intern_closure(
         let node = Node::decode(bytes).ok_or("invalid source delta node encoding")?;
         expected.check(node.kind)?;
         validate_shape(&node)?;
-        if node.kind == Kind::File {
-            new_files.insert(id);
-        }
         visited.insert(id, node.kind);
-        tx.set(&key(NODES, id), bytes.as_slice())?;
-        tx.set(&key(INTERN, id), &id.0)?;
+        write_node(tx, id, bytes)?;
         for (i, &child) in node.children.iter().enumerate() {
             let (role, expected) = child_edge(node.kind, i);
-            tx.set(&edge(EDGES_OUT, id, role, child), &[])?;
-            tx.set(&edge(EDGES_IN, child, role, id), &[])?;
+            write_edge(tx, id, role, child)?;
             work.push((child, expected));
         }
         inserted += 1;
     }
-    Ok((inserted, new_files))
+    Ok(inserted)
+}
+
+fn write_node(tx: &mut Transaction, id: NodeId, bytes: &[u8]) -> Result<()> {
+    tx.set(&key(NODES, id), bytes)?;
+    tx.set(&key(INTERN, id), &id.0)?;
+    Ok(())
+}
+
+fn write_edge(tx: &mut Transaction, from: NodeId, role: Edge, to: NodeId) -> Result<()> {
+    tx.set(&edge(EDGES_OUT, from, role, to), &[])?;
+    tx.set(&edge(EDGES_IN, to, role, from), &[])?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -161,6 +179,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         ExecutableFile | AnnotationFile => count == 1,
         Executables | AnnotationTree | Dependencies => node.data.is_empty(),
         SourcePreparation => supported_top(node),
+        NamespaceFacts => count == 1,
     };
     if good { Ok(()) } else { Err("invalid base source schema or node shape".into()) }
 }
@@ -168,7 +187,7 @@ fn validate_shape(node: &Node) -> Result<()> {
 fn supported_top(node: &Node) -> bool {
     node.kind == Kind::SourcePreparation
         && node.children.len() >= 5
-        && node.data == wosy_syntax::base_cst_schema()
+        && node.data == source_preparation_schema()
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +203,8 @@ enum Edge {
     ProjectionEntry,
     LocalExecutable,
     Imports,
+    NamespaceSource,
+    NamespaceAuthority,
 }
 
 fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
@@ -210,6 +231,7 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
             3 => (Edge::Dependencies, Exact(Dependencies)),
             _ => (Edge::Files, Exact(File)),
         },
+        NamespaceFacts => (Edge::NamespaceSource, Exact(Syntax)),
         Token | Annotations | Config => unreachable!("validated leaf"),
     }
 }
@@ -292,7 +314,7 @@ fn check_path(path: &PackageRelativePath) -> Result<()> {
     Ok(())
 }
 
-fn validate_snapshot(tx: &Transaction, root: NodeId, new_files: &BTreeSet<NodeId>) -> Result<()> {
+fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishReport) -> Result<()> {
     // The newly interned root has already passed the schema boundary.
     let index = read_index(tx, read_node(tx, root)?)?;
     let config: SourceConfig = serde_json::from_slice(&read_node(tx, index.config)?.data)?;
@@ -326,17 +348,14 @@ fn validate_snapshot(tx: &Transaction, root: NodeId, new_files: &BTreeSet<NodeId
         {
             return Err("source provenance does not match the projections".into());
         }
-        // Imports come from the client’s canonical namespace declarations.
-        // Verify that they describe this rooted closure, not their derivation.
+        admit_namespace_authority(tx, file, &config.parser.categories, report)?;
+        // The file's imports now have exact canonical CST authority, including
+        // their authored positions. Use the same verified order for module edges.
         let edges = index.module_edges.get(&key).ok_or("missing module for source")?;
         if source.imports.len() != edges.len() {
             return Err("module edges do not match source imports".into());
         }
         for (import, dependency) in source.imports.iter().zip(edges) {
-            check_path(&import.path)?;
-            if import.span.start > import.span.end || import.span.end > source.bytes {
-                return Err("import outside source provenance".into());
-            }
             let ns = config.namespaces.get(&import.origin).ok_or("unknown import namespace")?;
             let imported = FileKey {
                 package: import.origin.clone(),
@@ -349,9 +368,6 @@ fn validate_snapshot(tx: &Transaction, root: NodeId, new_files: &BTreeSet<NodeId
             }
             pending.push(imported);
         }
-        if new_files.contains(&file.file) {
-            validate_file(tx, file, &config.parser.categories)?;
-        }
     }
     if reachable.len() != index.files.len() {
         return Err("source index contains unreachable files".into());
@@ -363,7 +379,88 @@ fn read_comments(tx: &Transaction, id: NodeId) -> Result<Vec<TypedComment>> {
     Ok(serde_json::from_slice(&read_node(tx, id)?.data)?)
 }
 
-fn validate_file(tx: &Transaction, file: &FileEntry, configured: &[String]) -> Result<()> {
+fn authority_key(tag: u8, source: NodeId) -> [u8; 65] {
+    let mut bytes = [0; 65];
+    bytes[0] = tag;
+    bytes[1..33].copy_from_slice(source_preparation_schema());
+    bytes[33..].copy_from_slice(&source.0);
+    bytes
+}
+
+fn admit_namespace_authority(
+    tx: &mut Transaction,
+    file: &FileEntry,
+    configured: &[String],
+    report: &mut PublishReport,
+) -> Result<()> {
+    let provenance = authority_key(FILE_AUTHORITY, file.file);
+    if tx.get(&provenance)?.is_some() {
+        return Ok(());
+    }
+    let query = authority_key(NAMESPACE_QUERIES, file.executable);
+    let existing = tx.get(&query)?;
+    let (executable, comments) = validate_file(tx, file, configured, existing.is_none())?;
+    let (fact, mut imports) = if let Some(id) = existing {
+        let id = NodeId(id.as_slice().try_into()?);
+        let facts = read_node(tx, id)?;
+        let imports = serde_json::from_slice(&facts.data)?;
+        report.namespace_reused += 1;
+        (id, imports)
+    } else {
+        let imports = imports_from_cst(&executable.expect("requested executable tree"))?;
+        let facts = Node {
+            kind: Kind::NamespaceFacts,
+            data: serde_json::to_vec(&imports)?,
+            children: vec![file.executable],
+        };
+        let bytes = facts.encode();
+        let id = Node::id(&bytes);
+        if tx.get(&key(INTERN, id))?.is_none() {
+            write_node(tx, id, &bytes)?;
+            write_edge(tx, id, Edge::NamespaceSource, file.executable)?;
+            report.written += 1;
+        }
+        tx.set(&query, &id.0)?;
+        report.namespace_derived += 1;
+        (id, imports)
+    };
+    restore_authored_spans(&mut imports, &comments);
+    if imports != file.metadata.imports {
+        return Err("source namespace hints differ from canonical declarations".into());
+    }
+    tx.set(&provenance, &fact.0)?;
+    write_edge(tx, file.file, Edge::NamespaceAuthority, fact)?;
+    Ok(())
+}
+
+fn restore_authored_spans(imports: &mut [Import], comments: &[TypedComment]) {
+    if comments.is_empty() || imports.is_empty() {
+        return;
+    }
+    // Canonical declarations are in source order and cannot overlap. At an
+    // equal removal boundary, starts are right-biased, exclusive ends left.
+    let mut removed = 0;
+    let mut rest = comments.iter().peekable();
+    let mut expand = |position: u32, include_equal: bool| {
+        while let Some(comment) = rest.peek() {
+            let offset = comment.span.start - removed;
+            if offset > position || (offset == position && !include_equal) {
+                break;
+            }
+            removed += comment.span.end - comment.span.start;
+            rest.next();
+        }
+        position + removed
+    };
+    for import in imports {
+        import.span.start = expand(import.span.start, true);
+        import.span.end = expand(import.span.end, false);
+    }
+}
+
+fn validate_file(
+    tx: &Transaction, file: &FileEntry, configured: &[String], build_executable: bool,
+) -> Result<(Option<CstNode>, Vec<TypedComment>)> {
     let comments = read_comments(tx, file.annotation)?;
     let mut position = 0u32;
     let mut hasher = blake3::Hasher::new();
@@ -372,10 +469,19 @@ fn validate_file(tx: &Transaction, file: &FileEntry, configured: &[String]) -> R
     if authored.kind != Kind::Syntax || syntax_kind(&authored)? != SyntaxKind::Root {
         return Err("invalid canonical Rowan root".into());
     }
-    let mut stack = vec![(file.authored, authored, Some(file.executable))];
-    while let Some((id, node, projection)) = stack.pop() {
+    let mut builder = build_executable.then(GreenNodeBuilder::new);
+    let mut stack = vec![Some((file.authored, authored, Some(file.executable)))];
+    while let Some(event) = stack.pop() {
+        let Some((id, node, projection)) = event else {
+            builder.as_mut().expect("requested executable tree").finish_node();
+            continue;
+        };
         match node.kind {
             Kind::Syntax => {
+                if let Some(builder) = builder.as_mut() {
+                    builder.start_node(rowan::SyntaxKind(syntax_kind(&node)? as u16));
+                    stack.push(None);
+                }
                 let projected = if projection == Some(id) {
                     node.children.clone()
                 } else {
@@ -398,7 +504,7 @@ fn validate_file(tx: &Transaction, file: &FileEntry, configured: &[String]) -> R
                 if next.next().is_some() {
                     return Err("extra executable syntax nodes".into());
                 }
-                stack.extend(pairs.into_iter().rev());
+                stack.extend(pairs.into_iter().rev().map(Some));
             }
             Kind::Token => {
                 let text = token_text(&node)?;
@@ -409,8 +515,13 @@ fn validate_file(tx: &Transaction, file: &FileEntry, configured: &[String]) -> R
                     if next_comment.next() != Some(&canonical) {
                         return Err("typed comment does not match source provenance".into());
                     }
-                } else if projection != Some(id) {
-                    return Err("executable token differs from authored source".into());
+                } else {
+                    if projection != Some(id) {
+                        return Err("executable token differs from authored source".into());
+                    }
+                    if let Some(builder) = builder.as_mut() {
+                        builder.token(rowan::SyntaxKind(syntax_kind(&node)? as u16), text);
+                    }
                 }
                 hasher.update(text.as_bytes());
                 position = end;
@@ -423,7 +534,7 @@ fn validate_file(tx: &Transaction, file: &FileEntry, configured: &[String]) -> R
     {
         return Err("file observation does not match its authored CST".into());
     }
-    Ok(())
+    Ok((builder.map(|tree| CstNode::new_root(tree.finish())), comments))
 }
 
 pub struct SourceView {

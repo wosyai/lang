@@ -207,6 +207,41 @@ impl SyntaxKind {
 pub type CstNode = SyntaxNode<WosyLanguage>;
 pub type CstToken = SyntaxToken<WosyLanguage>;
 
+pub struct NamespaceCst {
+    pub binding: CstToken,
+    pub package: CstToken,
+    pub path: CstToken,
+    pub span: ByteSpan,
+}
+
+impl NamespaceCst {
+    /// Exact direct tokens of the parser's NamespaceDecl node.
+    pub fn from_node(node: &CstNode) -> Option<Self> {
+        let mut tokens = node.children_with_tokens().filter_map(rowan::NodeOrToken::into_token);
+        let binding = tokens.find(|token| token.kind() == SyntaxKind::Identifier)?;
+        let package = tokens.find(|token| token.kind() == SyntaxKind::Identifier)?;
+        let path = tokens.find(|token| token.kind() == SyntaxKind::String)?;
+        Some(Self { binding, package, path, span: byte_span(node) })
+    }
+}
+
+/// Namespace declaration positions are the source body and its item wrappers,
+/// not arbitrary descendants such as recovery or nested executable syntax.
+pub fn namespace_nodes(root: &CstNode) -> impl Iterator<Item = CstNode> {
+    root.children()
+        .find(|node| node.kind() == SyntaxKind::Root)
+        .into_iter()
+        .flat_map(|source| source.children())
+        .flat_map(|node| {
+            let item = (node.kind() == SyntaxKind::Item).then(|| node.children());
+            (node.kind() == SyntaxKind::NamespaceDecl)
+                .then_some(node)
+                .into_iter()
+                .chain(item.into_iter().flatten().filter(|child| child.kind() == SyntaxKind::NamespaceDecl))
+        })
+}
+
+
 #[derive(Clone, Debug)]
 pub struct CanonicalCstRoot {
     pub source: SourceIdentity,
