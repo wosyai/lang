@@ -149,6 +149,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = false;
     #[cfg(feature = "internal-checker")]
     fn allows_extended_scalar_locals(self) -> bool { false }
+    #[cfg(feature = "internal-checker")]
+    fn allows_imported_condition_comparisons(self) -> bool { false }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -4718,14 +4720,28 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct ImportedRequirementConditions(bool);
+
+impl<'a> ScopedAuthoredReturn<'a> for ImportedRequirementConditions {
+    const ENABLED: bool = false;
+    #[cfg(feature = "internal-checker")]
+    fn allows_imported_condition_comparisons(self) -> bool { self.0 }
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> { None }
+}
+
 pub(super) fn collect_ordered_imported_root_locals<'a>(
-    calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+    calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], prepared_comparisons: bool,
+    sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
     let mut failures = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
-        calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, (),
+        calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, ImportedRequirementConditions(prepared_comparisons),
     )?.ok()? else { return None; };
     Some(active)
 }
@@ -6429,7 +6445,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         allow_ordinary_contextual_places: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
             && calls.structure.has_ordinary_contextual_places(),
         #[cfg(feature = "internal-checker")]
-        ordinary_comparison_work: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+        ordinary_comparison_work: ((Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+            || authored_return.allows_imported_condition_comparisons())
             && calls.structure.has_ordinary_predicates()).then_some(0),
         #[cfg(feature = "internal-checker")]
         symbolic_context_work: Authored::OBSERVE_FIXED_ARRAY.then_some(0),

@@ -68,13 +68,37 @@ struct Job<'proof, 'run, 'case> {
     origins: Vec<RankedScalarOrigin<'run>>,
 }
 
+fn qualified_boolean_condition(
+    predicate: &super::super::reference::CheckerOrdinaryBoolean,
+    allowed: &impl Fn(&ReferenceBindingId, &ScalarType) -> bool,
+) -> Option<()> {
+    use super::super::reference::CheckerOrdinaryBoolean as Bool;
+    const MAX_BOOLEAN_NODES: usize = 16;
+    let mut pending = vec![predicate];
+    let mut nodes = 0;
+    while let Some(node) = pending.pop() {
+        nodes += 1;
+        if nodes > MAX_BOOLEAN_NODES { return None; }
+        match node {
+            Bool::Constant(_) => {}
+            Bool::Integer(integer) if allowed(&integer.binding, &integer.ty) => {}
+            Bool::Lexical(comparison) if !comparison.contextual
+                && comparison.operands.iter().all(|operand| allowed(operand, &comparison.ty)) => {}
+            Bool::Not(operand) => pending.push(operand),
+            Bool::And(operands) | Bool::Or(operands) => pending.extend(operands.iter()),
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
 // Preflight only the bounded obligations and canonical Unit control regions
 // dominated by the imported prefix. The integer walker, not this shape check,
 // selects rows and visits actual reachable requirements in checker order.
 fn qualified_requirement_suffix(
     calls: &FunctionCallSites, root_items: &[BlockItem],
-    origin_binding: impl Fn(&super::super::checker_flow::IntegerPredicate) -> bool,
-) -> Option<()> {
+    origin_binding: impl Fn(&ReferenceBindingId, &ScalarType) -> bool,
+) -> Option<bool> {
     const MAX_REQUIREMENTS: usize = 4;
     const MAX_CONDITIONALS: usize = 4;
     let body = &calls.structure;
@@ -85,12 +109,13 @@ fn qualified_requirement_suffix(
     let mut blocks = HashSet::new();
     let mut obligations = HashSet::new();
     let mut branches = 0;
+    let mut prepared_comparisons = false;
     while let Some(items) = remaining.last_mut() {
         let Some(item) = items.next() else { remaining.pop(); continue; };
         let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
         if let Some(directive) = body.checker_directives.get(&expression) {
             let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return None; };
-            if directive.operation != CheckerOperation::Require || !origin_binding(predicate)
+            if directive.operation != CheckerOperation::Require || !origin_binding(&predicate.binding, &predicate.ty)
                 || !obligations.insert(expression)
             {
                 return None;
@@ -106,8 +131,25 @@ fn qualified_requirement_suffix(
                 (*condition, *then_block, Some(*else_block)),
             _ => return None,
         };
-        let CheckerPredicate::Integer(predicate) = body.checker_branches.get(&condition)? else { return None; };
-        if !origin_binding(predicate) { return None; }
+        // Validate the same prepared predicate the metered walker selects,
+        // including when another condition has enabled ordinary comparisons.
+        let ordinary = if let Some(compound) = body.checker_ordinary_booleans.get(&condition) {
+            qualified_boolean_condition(compound, &origin_binding)?;
+            true
+        } else if let Some(comparison) = body.checker_ordinary_integer_comparisons.get(&condition) {
+            if comparison.contextual || !comparison.operands.iter().all(|operand| origin_binding(operand, &comparison.ty)) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        match body.checker_branches.get(&condition) {
+            Some(CheckerPredicate::Integer(predicate))
+                if origin_binding(&predicate.binding, &predicate.ty) => {}
+            _ if ordinary => prepared_comparisons = true,
+            _ => return None,
+        }
         for arm in else_block.into_iter().chain([then_block]) {
             if arm == body.root || !blocks.insert(arm) { return None; }
             let block = body.blocks.get(arm.0)?;
@@ -115,7 +157,7 @@ fn qualified_requirement_suffix(
             remaining.push(block.items.iter());
         }
     }
-    (obligations.len() == body.checker_directives.len()).then_some(())
+    (obligations.len() == body.checker_directives.len()).then_some(prepared_comparisons)
 }
 
 impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
@@ -441,11 +483,11 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             origins.push(((callee, binding.position, origin, occurrence), &receiver.ty));
         }
-        if qualified_requirement_suffix(calls, requirements, |predicate| {
-            origins.iter().any(|((_, _, origin, _), ty)| predicate.binding == origin.binding && &predicate.ty == *ty)
-        }).is_none() {
+        let Some(prepared_comparisons) = qualified_requirement_suffix(calls, requirements, |binding, predicate_type| {
+            origins.iter().any(|((_, _, origin, _), ty)| binding == &origin.binding && predicate_type == *ty)
+        }) else {
             return Ok(None);
-        }
+        };
         let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
         if owner.source != *source { return Err(ProjectCheck::Unsupported); }
         // Inspect each demand's verdict before touching a later edge.
@@ -468,7 +510,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             imports.push(Some(import));
         }
         let active = super::super::checker_flow::collect_ordered_imported_root_locals(
-            calls, &mut imports, &mut |failure| effects.push_callable(calls, source, failure),
+            calls, &mut imports, prepared_comparisons, &mut |failure| effects.push_callable(calls, source, failure),
         ).ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }
@@ -657,6 +699,16 @@ mod tests {
                 assert_eq!(failure.source, app);
                 assert_eq!(&wrong_branch_and_join[failure.condition.start as usize..failure.condition.end as usize], text);
             }
+            let compound = branched.replace("if (first_value == 2)",
+                "if (first_value < second_value && !(second_value != 3 || first_value > 4))");
+            let both_bindings = run(&compound, &mixed, increment, &wide, package).unwrap();
+            assert!(both_bindings.active && both_bindings.directives.is_empty());
+            let alternate = compound.replace("first_value < second_value", "first_value > second_value");
+            let actual = run(&alternate, &mixed, increment, &wide, package).unwrap();
+            let [failure] = actual.directives.as_slice() else { panic!("only alternate arm with compound guard"); };
+            assert_eq!(failure.code(), &BigInt::from(74));
+            assert_eq!(failure.source, app);
+            assert_eq!(&alternate[failure.condition.start as usize..failure.condition.end as usize], "second_value == 99");
             let dormant_branch = run(&wrong_branch_and_join, &mixed, increment, &wide, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_branch.active && dormant_branch.directives.is_empty());
             let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");
