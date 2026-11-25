@@ -17140,6 +17140,97 @@ if (replace(7) != 37) { core.system_panic(); };
 }
 
 #[test]
+fn closed_private_runtime_formal_indexes_replayed_lexical_pairs() {
+    let text = "%%start
+u64(u64) select = fn(index) { index };
+u16(*(u16[]), u64) _read = fn(view,index) { (*view)[select(index)] };
+u16(u64,u64,u64) observe = fn(length,other_length,index) {
+    u16[length] cells;
+    cells[0] = 9;
+    cells[index] = 37;
+    u16[other_length] other;
+    other[index] = 71;
+    u16 first = _read(&cells, 0);
+    u16 second = _read(&other, index);
+    u16 replay = _read(&cells, index);
+    if (first != 9 || second != 71 || replay != 37) { core.system_panic(); };
+    first + second + replay
+};
+if (observe(3, 5, 1) != 117) { core.system_panic(); };
+%%end";
+    let public = text.replace("_read", "read");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (accepted, authored) in [(true, text), (false, public.as_str())] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+            let parsed = parse_source(source.clone(), authored.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            if !accepted {
+                assert_eq!(checked.diagnostics().len(), 1, "{:?}", checked.diagnostics());
+                assert!(format!("{:?}", checked.diagnostics()[0]).contains("requires the extent of the dereferenced backing"));
+                continue;
+            }
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let helper = prepared.checked_access_source().unwrap();
+            let symbol = project_function_name(&source, "_read");
+            let reader = self_tail_test_body(&ir, "internal i16", &symbol);
+            let owner = self_tail_test_body(&ir, "i16", &project_function_name(&source, "observe"));
+            let null = format!("call void @{}(", project_function_name(helper, "check_non_null_address"));
+            let bounds = format!("call void @{}(", project_function_name(helper, "check_index_in_extent"));
+            let selector = format!("call i64 @{}(", project_function_name(&source, "select"));
+            let parts = [
+                "extractvalue", null.as_str(), "inttoptr", selector.as_str(), bounds.as_str(),
+                "getelementptr inbounds i16",
+            ].map(|part| reader.find(part).unwrap_or_else(|| panic!("{part}: {reader}")));
+            assert!(parts.windows(2).all(|pair| pair[0] < pair[1]), "{reader}");
+            assert!(reader.lines().any(|line| line.contains(&bounds) && line.contains("%borrowed_array_extent")), "{reader}");
+            let address = if layout == ScalarTargetLayout::WASM32 { "i32" } else { "i64" };
+            assert!(ir.contains(&format!("define internal i16 @{symbol}({{ {address}, i64 }}")), "{reader}");
+            let call = format!("call i16 @{symbol}({{ {address}, i64 }} ");
+            let definition = |value: &str| {
+                let prefix = format!("{value} = ");
+                owner.lines().find_map(|line| line.trim_start().strip_prefix(&prefix))
+                    .unwrap_or_else(|| panic!("missing SSA {value}: {owner}"))
+            };
+            let args: Vec<_> = owner.lines().filter_map(|line| line.split_once(&call))
+                .map(|(_, actuals)| {
+                    let (pair, index) = actuals.split_once(", i64 ").unwrap();
+                    let (head, length) = definition(pair).rsplit_once(", i64 ").unwrap();
+                    let length = length.strip_suffix(", 1").unwrap();
+                    let (_, seed) = head.rsplit_once(' ').unwrap();
+                    let address_value = definition(seed).rsplit_once(&format!(", {address} ")).unwrap()
+                        .1.strip_suffix(", 0").unwrap();
+                    let backing = definition(address_value).strip_prefix("ptrtoint ptr ").unwrap()
+                        .split_once(" to ").unwrap().0;
+                    (backing, length, index.strip_suffix(')').unwrap())
+                }).collect();
+            let [first, second, replay] = args.as_slice() else { panic!("expected three mapped calls: {owner}") };
+            assert_eq!((first.0, first.1), (replay.0, replay.1), "{owner}");
+            assert_ne!(first.0, second.0, "{owner}");
+            assert_ne!(first.1, second.1, "{owner}");
+            assert_eq!(first.2, "0", "{owner}");
+            for (backing, length, _) in [first, second] {
+                assert!(definition(backing).starts_with("call ptr @__wosy_core_alloc("), "{owner}");
+                assert!(owner.lines().any(|line| line.contains(&bounds) && line.contains(&format!(", i64 {length})"))), "{owner}");
+                assert_eq!(owner.matches(&format!("call void @__wosy_core_free(ptr {backing})")).count(), 1, "{owner}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_CLOSED_PRIVATE_RUNTIME_READ_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, ir);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
     for (body, output) in [
         ("values[index]", "u8"),

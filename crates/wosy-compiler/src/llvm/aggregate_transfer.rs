@@ -91,6 +91,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     pub(super) fallible_relay_next: usize,
     pub(super) fallible_relay_unwind: Option<inkwell::basic_block::BasicBlock<'ctx>>,
     pub(super) borrowed_extent: Option<inkwell::values::IntValue<'ctx>>,
+    pub(super) private_runtime_read_pair: Option<(inkwell::values::IntValue<'ctx>, inkwell::values::IntValue<'ctx>)>,
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     local_choice_destination: Option<PointerValue<'ctx>>,
@@ -235,6 +236,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             fallible_relay_next: 0,
             fallible_relay_unwind: None,
             borrowed_extent: None,
+            private_runtime_read_pair: None,
             inputs,
             destination,
             ordinary_destination,
@@ -284,7 +286,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
     plan.filter(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
-        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some())
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some() || body.private_runtime_read_formal.is_some())
         .map(|_| Linkage::Internal)
 }
 
@@ -336,8 +338,67 @@ pub(super) fn extract_borrowed_extent_formal<'ctx>(
     }
     let address = state.builder.build_extract_value(pair, 0, "borrowed_array_address").map_err(builder_error)?;
     let count = state.builder.build_extract_value(pair, 1, "borrowed_array_extent").map_err(builder_error)?;
-    state.aggregate.as_mut().expect("sealed borrowed extent observer").borrowed_extent = Some(count.into_int_value());
+    let aggregate = state.aggregate.as_mut().expect("sealed borrowed extent formal");
+    if aggregate.plan.private_runtime_read_formal.is_some() {
+        aggregate.private_runtime_read_pair = Some((address.into_int_value(), count.into_int_value()));
+    } else {
+        aggregate.borrowed_extent = Some(count.into_int_value());
+    }
     Ok(address)
+}
+
+pub(super) fn emit_private_runtime_read_call<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, expression: &ScalarExpression,
+    symbol: &str, arguments: &[ScalarExpression], parameters: &[ScalarType],
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(calls) = state.aggregate.as_ref().map(|aggregate| &aggregate.plan.private_runtime_read_calls)
+        .filter(|calls| !calls.is_empty()) else { return Ok(None) };
+    let nodes = state.body_call_nodes.ok_or("private runtime array call lacks prepared occurrences")?;
+    let Some(occurrence) = nodes.expression_ordinal(expression) else { return Ok(None) };
+    let Some(&declaration) = calls.get(&occurrence) else { return Ok(None) };
+    let [ScalarExpression::CheckedAddress { mutability: crate::scalar::ScalarReferenceMutability::Shared,
+        place: place @ ScalarPlace::Name { .. }, .. }, selector] = arguments
+        else { return Err("private runtime array call changed its exact arguments".into()); };
+    let [ScalarType::CheckedReference { inner, .. }, ScalarType::U64] = parameters
+        else { return Err("private runtime array call changed its exact parameter types".into()); };
+    let ScalarType::RuntimeArray { element, .. } = inner.as_ref()
+        else { return Err("private runtime array call changed its scalar element type".into()); };
+    if nodes.lexical_place_declaration(place) != Some(declaration) {
+        return Err("private runtime array call changed its exact owner".into());
+    }
+    let pointer = memory::place_pointer(context, state, place, project)?;
+    let Some(&(owner, LocalRuntimeExtent::Construction { length, signed: Some(domain) }, true)) =
+        state.local_runtime_extents.get(&pointer)
+        else { return Err("private runtime array call lacks its original signed backing and extent".into()); };
+    if owner != declaration || !domain.matches_consumer(state.target_layout, element) {
+        return Err("private runtime array call changed its prepared extent domain".into());
+    }
+    let address = state.builder.build_ptr_to_int(pointer, memory::pointer_integer_type(context, state.target_layout),
+        "private_runtime_address").map_err(builder_error)?;
+    let descriptor = borrowed_extent_type(context, state.target_layout);
+    let pair = state.builder.build_insert_value(descriptor.get_undef(), address, 0, "private_runtime_argument_address")
+        .map_err(builder_error)?.into_struct_value();
+    let pair = state.builder.build_insert_value(pair, length, 1, "private_runtime_argument")
+        .map_err(builder_error)?.into_struct_value();
+    let function = *state.functions.get(symbol).ok_or("missing private runtime array reader")?;
+    let output = match state.signatures.get(symbol) {
+        Some(ScalarType::Callable { outputs, .. }) if outputs.outputs.len() == 1 => &outputs.outputs[0].ty,
+        _ => return Err("private runtime array reader lost its scalar output".into()),
+    };
+    if function.get_linkage() != Linkage::Internal || function.get_type().get_param_types().as_slice()
+        != [descriptor.into(), context.i64_type().into()]
+        || function.get_type().get_return_type() != Some(basic_type(context, output, state.target_layout)?)
+    {
+        return Err("private runtime array reader changed its sealed ABI".into());
+    }
+    let values = super::expression::emit_contextual_arguments(context, state,
+        std::slice::from_ref(selector), &parameters[1..], project)?;
+    let [EmitValue::Basic(BasicValueEnum::IntValue(index))] = values.as_slice()
+        else { return Err("private runtime array call lacks its full-width selector".into()); };
+    let value = state.builder.build_call(function, &[pair.into(), (*index).into()], "private_runtime_read")
+        .map_err(builder_error)?.try_as_basic_value().basic().ok_or("private runtime reader returned no scalar")?;
+    Ok(Some(EmitValue::Basic(value)))
 }
 
 pub(super) fn emit_borrowed_extent_call<'ctx>(
@@ -698,6 +759,16 @@ pub(super) fn definition_type<'ctx>(
             return Err("invalid sealed fallible allocation signature".into());
         }
         return Ok(fallible_allocation_result_type(context, payload)?.fn_type(&[context.i64_type().into()], false));
+    }
+    if plan.is_some_and(|body| body.private_runtime_read_formal.is_some()) {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("private runtime array reader is not callable".into());
+        };
+        if !crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs) {
+            return Err("private runtime array reader changed its prepared signature".into());
+        }
+        return Ok(basic_type(context, &outputs.outputs[0].ty, layout)?
+            .fn_type(&[borrowed_extent_type(context, layout).into(), context.i64_type().into()], false));
     }
     if plan.is_some_and(|body| body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some()) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {

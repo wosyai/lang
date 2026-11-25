@@ -406,6 +406,7 @@ const MAX_JOINED_REBORROW_ALIASES: usize = 8;
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    capture_private_runtime_reads: bool,
     capture_private_scalar_tail: bool,
     private_scalar_tail_active: bool,
     root_return_points: std::ops::Range<usize>,
@@ -550,6 +551,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
         Self {
             capture_call_points: false,
+            capture_private_runtime_reads: false,
             // Store only exact CFG call ordinals during the traversal already
             // required for this body. The typed proof is built on demand.
             capture_private_scalar_tail: super::typecheck::is_module_private_name(&function.name)
@@ -2549,7 +2551,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if let Some(read_call) = read_call {
                     self.aggregate_facts.read_calls.insert(id, read_call);
                 }
-                if self.capture_call_points || self.private_scalar_tail_active {
+                let capture_runtime_pair = self.capture_private_runtime_reads && !self.capture_call_points
+                    && matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
+                        output: 0, target: ResolvedCallTarget::ModuleCallable {
+                            concrete: ConcreteCallSelection::Declaration, .. }, argument_points, ..
+                    } if matches!(argument_points.as_slice(), [borrow, _]
+                        if self.borrowed_extent_argument(*borrow, 0).is_some()))
+                    && !calls.declared_unsafe_calls.contains(&ordinal.0)
+                    && signature.is_some_and(|signature|
+                        aggregate::private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs));
+                if self.capture_call_points || self.private_scalar_tail_active || capture_runtime_pair {
                     let previous = self.cfg.primary_call_points.insert(ordinal, id);
                     assert!(previous.is_none(), "duplicate CFG call for {ordinal:?}");
                 }
@@ -11179,7 +11190,7 @@ fn transfer_reference_facts(
             } = &mut point.kind
             {
                 let site = cfg.runtime_array_read_sites.as_deref_mut().and_then(|sites| sites.get_mut(&id));
-                let mut common = None::<(ReferenceOriginId, &ReferenceBindingId)>;
+                let mut common = None::<(ReferenceOriginId, &ReferenceBindingId, bool)>;
                 let mut compatible = site.is_some() && !*reads_origin;
                 let mut reached = false;
                 if let Some(origins) = place_read_pointer {
@@ -11201,8 +11212,19 @@ fn transfer_reference_facts(
                                     {
                                         let owner = &loan.origin_place.binding;
                                         match common {
-                                            Some((_, expected)) => compatible = owner == expected,
-                                            None => common = Some((origin, owner)),
+                                            Some((_, expected, formal)) => compatible = !formal && owner == expected,
+                                            None => common = Some((origin, owner, false)),
+                                        }
+                                    }
+                                    ReferenceOrigin::BorrowedFrom { loan, .. }
+                                        if loan.mode == ScalarReferenceMutability::Shared
+                                            && loan.parent.is_none()
+                                            && loan.origin_place.projections.is_empty() =>
+                                    {
+                                        let owner = &loan.origin_place.binding;
+                                        match common {
+                                            Some((expected, _, formal)) => compatible = formal && origin == expected,
+                                            None => common = Some((origin, owner, true)),
                                         }
                                     }
                                     _ => compatible = false,
@@ -11257,7 +11279,8 @@ fn transfer_reference_facts(
                     let next = match common {
                         _ if !reached || !compatible => Refused,
                         None => Null,
-                        Some((origin, owner)) if cfg.allocations.contains(owner) => Local(origin),
+                        Some((origin, _, true)) => Formal(origin),
+                        Some((origin, owner, false)) if cfg.allocations.contains(owner) => Local(origin),
                         _ => Refused,
                     };
                     // The existing transfer can visit a point for several
@@ -11267,6 +11290,7 @@ fn transfer_reference_facts(
                         (Refused, _) | (_, Refused) => Refused,
                         (Unseen | Null, next) => next,
                         (earlier, Unseen | Null) => earlier,
+                        (earlier @ Formal(id), Formal(later)) if id == later => earlier,
                         (earlier @ Local(id), Local(later)) => {
                             match (&cfg.facts[id.0], &cfg.facts[later.0]) {
                                 (ReferenceOrigin::Fresh { loan: lhs, .. }, ReferenceOrigin::Fresh { loan: rhs, .. })
@@ -11274,6 +11298,7 @@ fn transfer_reference_facts(
                                 _ => Refused,
                             }
                         }
+                        _ => Refused,
                     };
                 }
             }
@@ -16146,6 +16171,12 @@ impl MixedReceiptPlan<'_> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct ReferenceCapture {
+    pub(super) call_points: bool,
+    pub(super) private_runtime_reads: bool,
+}
+
 struct MixedReceiptCohort {
     module_names: HashSet<String>,
     callers: Vec<usize>,
@@ -16234,7 +16265,7 @@ impl MixedReceiptCohort {
     fn select(
         self, source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
         updates: &mut [(usize, FunctionReferenceResult)], owners: &MixedReceiptAuthority,
-        structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
+        structs: &[ScalarStruct], enums: &[ScalarEnum], capture: ReferenceCapture,
         errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for position in self.callers {
@@ -16242,7 +16273,7 @@ impl MixedReceiptCohort {
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
             result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &self.module_names,
                 structs, enums, source, &call_sites.shared_scalar_read_effects, owners, owners.is_forwarder(source, &function.name_span),
-                capture_call_points, errors);
+                capture, errors);
         }
     }
 }
@@ -16252,8 +16283,9 @@ fn derive_module_reference_origins(
     structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
 ) -> (Vec<(usize, FunctionReferenceResult)>, Vec<ReferenceAnalysisError>) {
     let mut targets = HashMap::new();
+    let capture = ReferenceCapture { call_points: capture_call_points, private_runtime_reads: false };
     let (mut updates, mut errors, cohort) =
-        derive_module_reference_cohort(source, items, call_sites, structs, enums, capture_call_points, &mut targets);
+        derive_module_reference_cohort(source, items, call_sites, structs, enums, capture, &mut targets, |_| {});
     if errors.is_empty() {
         if let Some(cohort) = cohort {
             let owners = cohort.grounds(source, items, call_sites, &mut updates, &targets);
@@ -16262,7 +16294,7 @@ fn derive_module_reference_origins(
                 let mut edges = HashMap::new();
                 cohort.index_forwarders(source, items, call_sites, &updates, &mut edges);
                 let authority = MixedReceiptPlan { roots: grounds, users: edges }.resolve();
-                cohort.select(source, items, call_sites, &mut updates, &authority, structs, enums, capture_call_points, &mut errors);
+                cohort.select(source, items, call_sites, &mut updates, &authority, structs, enums, capture, &mut errors);
             }
         }
     }
@@ -16271,8 +16303,9 @@ fn derive_module_reference_origins(
 
 fn derive_module_reference_cohort(
     source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
-    structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
+    structs: &[ScalarStruct], enums: &[ScalarEnum], capture: ReferenceCapture,
     mixed_targets: &mut MixedReceiptTargets,
+    mut pending_runtime_read: impl FnMut(usize),
 ) -> (Vec<(usize, FunctionReferenceResult)>, Vec<ReferenceAnalysisError>, Option<MixedReceiptCohort>) {
     #[cfg(test)]
     stage_observations::record_reference_origins();
@@ -16295,8 +16328,14 @@ fn derive_module_reference_cohort(
         if let ScalarItem::Function(function) = item {
             let result = derive_function_reference_result(
                 source, function, &module_names, &call_sites.functions[&index],
-                structs, enums, Some(&call_sites.shared_scalar_read_effects), capture_call_points, &mut errors,
+                structs, enums, Some(&call_sites.shared_scalar_read_effects), capture, &mut errors,
             );
+            if capture.private_runtime_reads && !result.cfg.runtime_array_read_sites.is_empty()
+                && aggregate::private_runtime_read_declaration(function)
+                && result.cfg.runtime_array_read_sites.keys().any(|&point| result.cfg.pending_runtime_array_formal(point).is_some())
+            {
+                pending_runtime_read(index);
+            }
             let position = updates.len();
             if result.collect_mixed_targets(mixed_targets) {
                 mixed_callers.push(position);
@@ -16400,6 +16439,7 @@ pub(super) fn record_project_reference_origins(
 }
 
 pub(super) struct ProjectReferenceResults {
+    pending_runtime_reads: Vec<(usize, usize)>,
     updates: Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     errors: Vec<ReferenceAnalysisError>,
 }
@@ -16465,16 +16505,16 @@ pub(super) fn analyze_project_references(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
 ) -> ProjectReferenceResults {
-    analyze_project_references_with_call_points(modules, call_sites, false)
+    analyze_project_references_with_call_points(modules, call_sites, ReferenceCapture::default())
 }
 
 pub(super) fn analyze_project_references_with_call_points(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
-    capture_call_points: bool,
+    capture: ReferenceCapture,
 ) -> ProjectReferenceResults {
-    let (mut updates, mut errors, inventory) =
-        derive_and_converge_project_references(modules, call_sites, capture_call_points);
+    let (mut updates, mut errors, inventory, pending_runtime_reads) =
+        derive_and_converge_project_references(modules, call_sites, capture);
     if errors.is_empty() && !modules.is_empty() {
         let (structs, enums) =
             inventory.expect("successful module call lookup built aggregate inventory");
@@ -16488,20 +16528,21 @@ pub(super) fn analyze_project_references_with_call_points(
             .collect::<Vec<_>>();
         errors.extend(specialize_reference_results(&mut views, &structs, &enums));
     }
-    ProjectReferenceResults { updates, errors }
+    ProjectReferenceResults { updates, errors, pending_runtime_reads }
 }
 
 fn derive_and_converge_project_references(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
-    capture_call_points: bool,
+    capture: ReferenceCapture,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
     Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
+    Vec<(usize, usize)>,
 ) {
-    let (mut updates, mut errors, inventory) =
-        derive_project_reference_origins(modules, call_sites, capture_call_points);
+    let (mut updates, mut errors, inventory, pending_runtime_reads) =
+        derive_project_reference_origins(modules, call_sites, capture);
     if errors.is_empty() {
         let mut views = updates
             .iter_mut()
@@ -16513,19 +16554,21 @@ fn derive_and_converge_project_references(
             .collect::<Vec<_>>();
         errors.extend(resolve_reference_output_contracts(&mut views));
     }
-    (updates, errors, inventory)
+    (updates, errors, inventory, pending_runtime_reads)
 }
 
 fn derive_project_reference_origins(
     modules: &[ScalarModule],
     call_sites: &ProjectCallSiteResults,
-    capture_call_points: bool,
+    capture: ReferenceCapture,
 ) -> (
     Vec<(usize, Vec<(usize, FunctionReferenceResult)>)>,
     Vec<ReferenceAnalysisError>,
     Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
+    Vec<(usize, usize)>,
 ) {
     let mut inventory = None;
+    let mut pending_runtime_reads = Vec::new();
     let mut targets = HashMap::new();
     let mut cohorts = Vec::new();
     let mut updates = Vec::new();
@@ -16551,8 +16594,9 @@ fn derive_project_reference_origins(
                     sites,
                     structs,
                     enums,
-                    capture_call_points,
+                    capture,
                     &mut targets,
+                    |item| pending_runtime_reads.push((index, item)),
                 );
                 if let Some(cohort) = cohort {
                     cohorts.push((updates.len(), cohort));
@@ -16575,7 +16619,7 @@ fn derive_project_reference_origins(
                 source_span: SourceSpan::new(source.clone(), *span),
                 reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
             });
-            return (updates, errors, inventory);
+            return (updates, errors, inventory, pending_runtime_reads);
         }
         let grounds = cohorts.iter().filter_map(|(position, cohort)| {
             let (index, results) = &mut updates[*position];
@@ -16600,11 +16644,11 @@ fn derive_project_reference_origins(
                 let module = &modules[*index];
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
                 cohort.select(&module.source, &module.items, sites, results, &authority,
-                    structs, enums, capture_call_points, &mut errors);
+                    structs, enums, capture, &mut errors);
             }
         }
     }
-    (updates, errors, inventory)
+    (updates, errors, inventory, pending_runtime_reads)
 }
 
 struct ModuleReferenceView<'a> {
@@ -17512,11 +17556,11 @@ impl FunctionReferenceResult {
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
         structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity,
         effects: &HashMap<ByteSpan, SharedScalarReadEffect>, owners: &MixedReceiptAuthority,
-        forwards: bool, capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
+        forwards: bool, capture: ReferenceCapture, errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, effects, owners,
-                false, capture_call_points, errors);
+                false, ReferenceCapture { private_runtime_reads: false, ..capture }, errors);
         }
         if !self.mixed_targets().any(|(target, declaration)| owners.contains(target, &declaration))
             && !self.multi_targets().any(|(target, declaration)| owners.is_multi(target, &declaration))
@@ -17524,7 +17568,8 @@ impl FunctionReferenceResult {
             return;
         }
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
-        builder.capture_call_points = capture_call_points;
+        builder.capture_call_points = capture.call_points;
+        builder.capture_private_runtime_reads = capture.private_runtime_reads && function.overload_arms.is_empty();
         builder.mixed_owners = Some(owners);
         builder.aggregate_facts.multi_forwarder = owners.is_multi_forwarder(source, &function.name_span);
         builder.shared_scalar_read_effects = Some(effects);
@@ -17582,7 +17627,7 @@ pub(super) fn record_function_reference_origins(
         structs,
         enums,
         None,
-        false,
+        ReferenceCapture::default(),
         &mut errors,
     );
     result.install(function);
@@ -17735,7 +17780,7 @@ fn derive_function_reference_result(
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
     effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
-    capture_call_points: bool,
+    capture: ReferenceCapture,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) -> FunctionReferenceResult {
     let entry_errors = errors.len();
@@ -17750,13 +17795,14 @@ fn derive_function_reference_result(
             structs,
             enums,
             effects,
-            capture_call_points,
+            ReferenceCapture { private_runtime_reads: false, ..capture },
             errors,
         ));
     }
     let mut builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
-    builder.capture_call_points = capture_call_points;
+    builder.capture_call_points = capture.call_points;
+    builder.capture_private_runtime_reads = capture.private_runtime_reads;
     builder.shared_scalar_read_effects = effects;
     let (cfg, current_errors, proof_points, aggregate, checked_contract_returns) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
@@ -18093,8 +18139,13 @@ fn build_function_reference_cfg(
         drop(provisional_origin_index);
         // The ordinary reference transfer has now resolved the actual reaching
         // loan. A type or a reference name is not an extent authority.
+        let eligible_private_runtime_read = builder.capture_private_runtime_reads
+            && !builder.cfg.runtime_array_read_sites.is_empty()
+            && aggregate::private_runtime_read_declaration(function);
         let mut rejected_runtime_reads: Vec<_> = builder.cfg.runtime_array_read_sites.keys().copied()
-            .filter(|&point| builder.cfg.runtime_array_read_origin(point).is_none()).collect();
+            .filter(|&point| builder.cfg.runtime_array_read_origin(point).is_none()
+                && !(eligible_private_runtime_read && builder.cfg.pending_runtime_array_formal(point).is_some()))
+            .collect();
         rejected_runtime_reads.sort_unstable();
         for point in rejected_runtime_reads {
             errors.push(ReferenceAnalysisError::MissingContext {

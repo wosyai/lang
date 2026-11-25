@@ -691,7 +691,7 @@ bool() unknown_effect = fn { true };
             }
             let mut result = derive_function_reference_result(
                 &source, function, &HashSet::from(["captured".to_owned()]), prepared.function_calls(0, item),
-                &module.structs, &module.enums, None, true, &mut Vec::new(),
+                &module.structs, &module.enums, None, ReferenceCapture { call_points: true, ..Default::default() }, &mut Vec::new(),
             );
             assert!(!result.aggregate.checked_producer_authoritative);
             let contracts = ReferenceOutputContracts::default();
@@ -900,7 +900,7 @@ fn verify_mixed_tail_branch_route(source: &SourceIdentity, text: &str, forwarded
         }).expect("real prepared conditional producer");
         let calls = prepared.function_calls(0, item);
         let result = derive_function_reference_result(
-            source, function, &HashSet::new(), calls, &module.structs, &module.enums, None, true, &mut Vec::new(),
+            source, function, &HashSet::new(), calls, &module.structs, &module.enums, None, ReferenceCapture { call_points: true, ..Default::default() }, &mut Vec::new(),
         );
         let [MixedArmBacking::Exact(left), MixedArmBacking::Exact(right)] = result.aggregate.mixed_arm_backings
             else { panic!("{:?}", result.aggregate.mixed_arm_backings) };

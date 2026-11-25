@@ -637,6 +637,7 @@ pub(super) enum RuntimeArrayReadOrigin {
     Unseen,
     Null,
     Local(ReferenceOriginId),
+    Formal(ReferenceOriginId),
     Refused,
 }
 
@@ -702,6 +703,23 @@ impl ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
             runtime_array_read_sites: HashMap::new(),
         }
+    }
+
+    /// A direct formal loan origin, not an extent. The private call cohort
+    /// must supply the extent before this pending read can be admitted.
+    pub(super) fn pending_runtime_array_formal(
+        &self, id: CfgPointId,
+    ) -> Option<(usize, &ReferenceBindingId)> {
+        let CfgPointKind::ReadPlace { pointer_point: Some(pointer), reads_origin: false, .. } =
+            &self.points.get(id.0)?.kind else { return None };
+        let RuntimeArrayReadOrigin::Formal(origin) = self.runtime_array_read_sites.get(&id)?.origin
+        else { return None; };
+        if !self.points.get(id.0)?.possible_origins.as_ref()?.contains(&origin) { return None; }
+        let ReferenceOrigin::BorrowedFrom { parameter, loan } = self.facts.get(origin.0)? else { return None; };
+        let CfgPointKind::Read { binding } = &self.points.get(pointer.0)?.kind else { return None; };
+        (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+            && loan.origin_place.projections.is_empty() && loan.origin_place.binding == *binding)
+            .then_some((*parameter, binding))
     }
 
     pub(crate) fn runtime_array_read_origin(&self, id: CfgPointId) -> Option<&ReferenceBindingId> {
@@ -3893,7 +3911,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
+pub(crate) use reference::aggregate::{private_runtime_read_signature, mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,

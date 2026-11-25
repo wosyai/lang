@@ -3112,6 +3112,10 @@ pub(crate) struct ClosedBody {
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
     pub(crate) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
+    pub(crate) private_runtime_read_formal: Option<ByteSpan>,
+    pub(crate) private_runtime_reads: HashSet<usize>,
+    pub(crate) private_runtime_read_calls: HashMap<usize, ByteSpan>,
+    pub(crate) private_runtime_read_owners: HashSet<ByteSpan>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
@@ -9331,6 +9335,211 @@ fn closed_aggregates<'a>(
     finalize_cohorts(result)
 }
 
+#[derive(Default)]
+pub(in crate::scalar) struct PrivateRuntimeReadPlans {
+    bodies: BTreeMap<BodyKey, PrivateRuntimeReadPlan>,
+}
+
+#[derive(Default)]
+struct PrivateRuntimeReadPlan {
+    formal: Option<ByteSpan>,
+    accesses: HashSet<usize>,
+    calls: HashMap<usize, ByteSpan>,
+    owners: HashSet<ByteSpan>,
+}
+
+impl ClosedAggregates {
+    pub(in crate::scalar) fn install_private_runtime_reads(
+        &mut self, plans: &PrivateRuntimeReadPlans, reservations: &AggregateReservations,
+    ) -> Result<(), String> {
+        for (&key, plan) in &plans.bodies {
+            if reservations.bodies.get(&key) != Some(&true) {
+                return Err("private runtime array access lost its exact reserved declaration".into());
+            }
+            let body = self.bodies.entry(key).or_default();
+            if plan.formal.is_some() && (body.borrowed_extent_observer.is_some()
+                || body.borrowed_extent_forward.is_some() || body.returning.is_some() || !body.inputs.is_empty()
+                || body.array_descriptor_identity || body.array_descriptor_return || body.fallible_allocation_leaf
+                || body.fallible_allocation_relay || body.checked_backing_producer.is_some()
+                || body.checked_backing_wrapper.is_some())
+            {
+                return Err("private runtime array access has a competing callable protocol".into());
+            }
+            body.private_runtime_read_formal = plan.formal;
+            body.private_runtime_reads.clone_from(&plan.accesses);
+            body.private_runtime_read_calls.clone_from(&plan.calls);
+            body.private_runtime_read_owners.clone_from(&plan.owners);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn private_runtime_read_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
+    matches!(parameters, [ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Shared, inner,
+    }, ScalarType::U64] if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+        if ordinary_value(element)))
+        && matches!(outputs, [output] if ordinary_value(&output.ty))
+}
+
+pub(super) fn private_runtime_read_declaration(function: &ScalarFunction) -> bool {
+    function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+        && crate::scalar::typecheck::is_module_private_name(&function.name)
+        && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
+            if private_runtime_read_signature(parameters, &outputs.outputs))
+}
+
+impl ProjectReferenceResults {
+    pub(in crate::scalar) fn finalize_private_runtime_reads(
+        &self, project: &ScalarProject, calls: &ProjectCallSiteResults, checked_access: bool,
+    ) -> (PrivateRuntimeReadPlans, Vec<ReferenceAnalysisError>) {
+        let mut plans = PrivateRuntimeReadPlans::default();
+        if self.pending_runtime_reads.is_empty() { return (plans, Vec::new()); }
+        let pending: BTreeMap<BodyKey, Vec<_>> = self.pending_runtime_reads.iter().filter_map(|&(module, item)| {
+            let cfg = self.reference_cfg(module, item, None)?;
+            let reads: Vec<_> = cfg.runtime_array_read_sites.iter().filter_map(|(&point, site)| {
+                let (parameter, binding) = cfg.pending_runtime_array_formal(point)?;
+                Some((point, site.occurrence, parameter, binding.declaration_span))
+            }).collect();
+            (!reads.is_empty()).then_some(((module, item, None), reads))
+        }).collect();
+        if pending.is_empty() { return (plans, Vec::new()); }
+        let module_at = |module: usize| {
+            let row = project.modules.get(module)?;
+            let sites = calls.modules.get(module)?.as_ref().ok()?;
+            Some(ModuleInput { source: &row.source, items: &row.items, structs: &row.structs, calls: sites })
+        };
+        let mut census = OrdinaryCohorts::default();
+        let mut reservations = AggregateReservations::default();
+        let mut declarations = HashMap::new();
+        let function = |module: usize, item: usize| match project.modules.get(module)?.items.get(item)? {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        };
+        let normal = |function: &ScalarFunction| function.generic_parameters.is_empty()
+            && function.overload_arms.is_empty();
+        if checked_access && self.errors.is_empty() {
+            for (module, row) in project.modules.iter().enumerate() {
+                reservations.modules.push(module);
+                for (item, entry) in row.items.iter().enumerate() {
+                    let ScalarItem::Function(function) = entry else { continue };
+                    declarations.insert((&row.source, function.name_span), (module, item));
+                    reservations.bodies.insert((module, item, None), normal(function));
+                    for arm in 0..function.overload_arms.len() {
+                        reservations.bodies.insert((module, item, Some(arm)), false);
+                    }
+                }
+            }
+            for (&key @ (module, item, arm), reads) in &pending {
+                let Some(function) = function(module, item) else { continue };
+                if arm.is_none() && private_runtime_read_declaration(function)
+                    && reads.iter().all(|(_, _, parameter, formal)| *parameter == 0 && *formal == reads[0].3)
+                {
+                    let Some(cfg) = self.reference_cfg(module, item, arm) else { continue };
+                    let allowed: HashSet<_> = reads.iter().filter_map(|(point, ..)| match cfg.points[point.0].kind {
+                        CfgPointKind::ReadPlace { pointer_point, .. } => pointer_point,
+                        _ => None,
+                    }).collect();
+                    let formal = reads[0].3;
+                    if cfg.points.iter().all(|point| match &point.kind {
+                        CfgPointKind::Read { binding } if binding.declaration_span == formal => allowed.contains(&point.id),
+                        CfgPointKind::Assign { target, .. } => target.binding.declaration_span != formal,
+                        CfgPointKind::Borrow { place, .. } => place.binding.declaration_span != formal,
+                        CfgPointKind::Move { owner, .. } => owner.declaration_span != formal,
+                        CfgPointKind::AssignThrough { candidates, .. } | CfgPointKind::Invalidate { candidates, .. }
+                        | CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } } =>
+                            !candidates.iter().any(|target| target.place.binding.declaration_span == formal),
+                        _ => true,
+                    }) {
+                        census.transport_uses.insert(key, Some(Vec::new()));
+                    }
+                }
+            }
+            census.census(&reservations, &module_at, &declarations);
+        }
+        let mut immutable_owners = HashMap::<BodyKey, HashSet<ReferenceBindingId>>::new();
+        for (target, uses) in census.transport_uses {
+            let Some(uses) = uses.filter(|uses| !uses.is_empty()) else { continue };
+            let Some(ScalarType::Callable { parameters: target_parameters, outputs: target_outputs }) =
+                function(target.0, target.1).map(|function| &function.signature) else { continue };
+            let classify = |caller: BodyKey, occurrence: usize, owners: &mut HashMap<BodyKey, HashSet<ReferenceBindingId>>| {
+                let input = module_at(caller.0)?;
+                let cfg = self.reference_cfg(caller.0, caller.1, caller.2)?;
+                let sites = input.calls.function_body(caller.1, caller.2)?;
+                let ordinal = OccurrenceOrdinal(occurrence);
+                let signature = sites.checked_call_signatures.get(&ordinal)?;
+                let ([ScalarType::CheckedReference { inner, .. }, ScalarType::U64],
+                    [ScalarType::CheckedReference { inner: expected, .. }, ScalarType::U64])
+                    = (signature.parameters.as_slice(), target_parameters.as_slice()) else { return None };
+                if !private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
+                    || !same_runtime_array_type(inner, expected)
+                    || signature.outputs.outputs.first()?.ty != target_outputs.outputs.first()?.ty
+                { return None; }
+                let call = cfg.primary_call_point(ordinal)?;
+                if target_body(&declarations, cfg, call) != Some(target) { return None; }
+                let CfgPointKind::Call { argument_points, .. } = &cfg.points.get(call.0)?.kind else { return None };
+                let [borrow, _] = argument_points.as_slice() else { return None };
+                let CfgPointKind::Borrow { place, loan } = &cfg.points.get(borrow.0)?.kind else { return None };
+                if loan.mode != ScalarReferenceMutability::Shared || loan.parent.is_some()
+                    || &loan.origin_place.binding != &place.binding || !place.projections.is_empty()
+                    || !matches!(place.place, ScalarPlace::Name { .. })
+                { return None; }
+                let immutable = owners.entry(caller).or_insert_with(|| {
+                    let mut remaining: HashSet<_> = cfg.allocations.iter().cloned().collect();
+                    for guarded in cfg.guarded_scalar_allocations() { remaining.remove(&guarded.binding); }
+                    for point in &cfg.points {
+                        match &point.kind {
+                            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
+                                remaining.remove(&target.binding);
+                            }
+                            CfgPointKind::AssignThrough { candidates, .. } => {
+                                for target in candidates {
+                                    if target.place.projections.is_empty() { remaining.remove(&target.place.binding); }
+                                }
+                            }
+                            CfgPointKind::Move { owner, place, .. } if place.projections.is_empty() => {
+                                remaining.remove(owner);
+                            }
+                            CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
+                            | CfgPointKind::Invalidate { candidates, .. } => {
+                                for target in candidates { remaining.remove(&target.place.binding); }
+                            }
+                            _ => {}
+                        }
+                    }
+                    remaining
+                });
+                immutable.contains(&place.binding).then_some(place.binding.declaration_span)
+            };
+            let Some(accepted) = uses.into_iter().map(|(caller, occurrence)|
+                classify(caller, occurrence, &mut immutable_owners).map(|owner| (caller, occurrence, owner))
+            ).collect::<Option<Vec<_>>>() else { continue };
+            let plan = plans.bodies.entry(target).or_default();
+            let reads = &pending[&target];
+            plan.formal = Some(reads[0].3);
+            plan.accesses.extend(reads.iter().map(|(_, access, _, _)| *access));
+            for (caller, occurrence, owner) in accepted {
+                let caller = plans.bodies.entry(caller).or_default();
+                caller.calls.insert(occurrence, owner);
+                caller.owners.insert(owner);
+            }
+        }
+        let mut errors = Vec::new();
+        for ((module, item, arm), mut reads) in pending {
+            if plans.bodies.get(&(module, item, arm)).is_some_and(|plan| plan.formal.is_some()) { continue; }
+            let cfg = self.reference_cfg(module, item, arm).expect("pending checked array body");
+            reads.sort_unstable_by_key(|(point, _, _, _)| point.0);
+            for (point, _, _, _) in reads {
+                errors.push(ReferenceAnalysisError::MissingContext {
+                    source_span: cfg.points[point.0].source_span.clone(),
+                    reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
+                });
+            }
+        }
+        (plans, errors)
+    }
+}
+
 pub(in crate::scalar) fn close_installed(
     reservations: &AggregateReservations,
     program: &ScalarProgram,
@@ -9442,7 +9651,7 @@ mod tests {
             let sites = prepared.function_calls(0, item);
             let mut errors = Vec::new();
             let result = derive_function_reference_result(&source, function, &HashSet::new(), sites,
-                &module.structs, &module.enums, None, true, &mut errors);
+                &module.structs, &module.enums, None, ReferenceCapture { call_points: true, ..Default::default() }, &mut errors);
             assert!(errors.is_empty(), "{errors:?}");
             results.insert(key, (result, sites));
             lookup.insert(function.name.as_str(), key);

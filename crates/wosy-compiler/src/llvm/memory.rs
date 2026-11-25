@@ -389,7 +389,25 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let borrowed_extent = match (&base_type, base.as_ref()) {
+            let formal_receipt = state.aggregate.as_ref().filter(|aggregate| !aggregate.plan().private_runtime_reads.is_empty())
+                .and_then(|aggregate| {
+                    let nodes = state.body_call_nodes?;
+                    let ordinal = nodes.place_ordinal(place)?;
+                    aggregate.plan().private_runtime_reads.contains(&ordinal).then_some((aggregate, nodes))
+                });
+            let formal_pair = if let Some((aggregate, nodes)) = formal_receipt {
+                let (ScalarType::RuntimeArray { element, .. }, ScalarPlace::Dereference { pointer, .. }) =
+                    (&base_type, base.as_ref())
+                    else { return Err("private runtime index lost its exact dereferenced formal".into()); };
+                if !state.require_release_checked_access
+                    || nodes.lexical_expression_declaration(pointer) != aggregate.plan().private_runtime_read_formal
+                    || signed_runtime_scalar_element(element).is_none()
+                {
+                    return Err("private runtime index changed its prepared formal or scalar element".into());
+                }
+                Some(aggregate.private_runtime_read_pair.ok_or("missing authenticated private runtime array formal")?)
+            } else { None };
+            let borrowed_extent = if let Some((_, count)) = formal_pair { Some(count) } else { match (&base_type, base.as_ref()) {
                 (ScalarType::RuntimeArray { element, .. }, crate::ScalarPlace::Dereference { pointer, .. })
                     if !index_has_raw_root(state, base) =>
                 {
@@ -417,7 +435,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     Some(*length)
                 }
                 _ => None,
-            };
+            }};
             // A guarded lexical array stores its original backing directly,
             // not an ordinary runtime-array pointer slot. Authenticate and
             // retain that backing and extent before evaluating the selector.
@@ -433,6 +451,11 @@ pub(super) fn place_pointer<'ctx, 'module>(
             };
             let (base_pointer, guarded_extent) = if let Some((backing, extent)) = guarded {
                 (backing, Some(extent))
+            } else if let Some((address, _)) = formal_pair {
+                emit_checked_dereference_guard(context, state, address)?;
+                let pointer = state.builder.build_int_to_ptr(address,
+                    context.ptr_type(AddressSpace::default()), "private_runtime_backing").map_err(builder_error)?;
+                (pointer, None)
             } else {
                 (place_pointer(context, state, base, project)?, None)
             };

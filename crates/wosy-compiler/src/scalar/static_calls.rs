@@ -427,8 +427,19 @@ impl PreparedScalarProject {
         reference::analyze_project_references(&self.project.modules, &self.calls)
     }
 
-    pub(super) fn finish(self) -> ScalarProjectValidation {
-        finish_project_validation(self.project, &self.calls)
+    pub(super) fn finish(mut self) -> ScalarProjectValidation {
+        if self.checked_access.is_none() {
+            return finish_project_validation(self.project, &self.calls);
+        }
+        let results = reference::analyze_project_references_with_call_points(&self.project.modules, &self.calls,
+            reference::ReferenceCapture { call_points: false, private_runtime_reads: true });
+        let (_, pending_errors) = results.finalize_private_runtime_reads(&self.project, &self.calls, true);
+        let mut errors = results.install(&mut self.project.modules);
+        errors.extend(pending_errors);
+        ScalarProjectValidation {
+            project: self.project,
+            diagnostics: errors.iter().map(ReferenceAnalysisError::diagnostic).collect(),
+        }
     }
 }
 
@@ -450,13 +461,15 @@ fn finish_project_validation(
 pub struct ScalarBuildValidation<'a> {
     prepared: &'a PreparedScalarProject,
     results: reference::ProjectReferenceResults,
+    private_runtime_reads: reference::aggregate::PrivateRuntimeReadPlans,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> ScalarBuildValidation<'a> {
     pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
-        self.results
-            .closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)
+        let mut result = self.results.closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)?;
+        result.install_private_runtime_reads(&self.private_runtime_reads, reservations)?;
+        Ok(result)
     }
 
     pub fn prepared(&self) -> &'a PreparedScalarProject {
@@ -528,16 +541,17 @@ pub fn analyze_scalar_build(prepared: &PreparedScalarProject) -> ScalarBuildVali
     let results = reference::analyze_project_references_with_call_points(
         &prepared.project.modules,
         &prepared.calls,
-        true,
+        reference::ReferenceCapture { call_points: true, private_runtime_reads: prepared.checked_access.is_some() },
     );
-    let diagnostics = results
-        .errors()
-        .iter()
-        .map(ReferenceAnalysisError::diagnostic)
-        .collect();
+    let (private_runtime_reads, pending_errors) = results.finalize_private_runtime_reads(
+        &prepared.project, &prepared.calls, prepared.checked_access.is_some(),
+    );
+    let diagnostics = results.errors().iter().chain(&pending_errors)
+        .map(ReferenceAnalysisError::diagnostic).collect();
     ScalarBuildValidation {
         prepared,
         results,
+        private_runtime_reads,
         diagnostics,
     }
 }
