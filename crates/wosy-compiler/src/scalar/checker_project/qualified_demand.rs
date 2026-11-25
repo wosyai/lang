@@ -85,7 +85,16 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
         let ScalarItem::Function(function) = owner.items.get(target.1)? else { return None; };
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
         let body = runtime.calls.function_body(target.0, target.1, None)?;
-        let origins = ranked_scalar_return_origins(body)?;
+        let origins = if body.call_occurrences.is_empty() {
+            if !group.qualified_closed_leaf || !body.checker_pure_calling_frame()
+                || !body.structure.checker_direct_targets.is_empty() || !valid_arbitrary_proof_body(body)
+            {
+                return None;
+            }
+            Vec::new()
+        } else {
+            ranked_scalar_return_origins(body)?
+        };
         if origins.iter().any(|(callee, _, _, _)| callee.0 == target.0) {
             return None;
         }
@@ -241,7 +250,12 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             Evaluation::Checked { active, .. } if failure.is_some() => (active, Evidence::Refuted),
             Evaluation::Checked { active, reusable } => {
                 let certified = reusable && job.summary().is_some_and(|summary| {
-                    self.qualified.verified.insert_dependency_links(summary, job.origins.iter().map(|provider| provider.0), true).is_some()
+                    if job.origins.is_empty() {
+                        self.qualified.verified.insert(summary);
+                        true
+                    } else {
+                        self.qualified.verified.insert_dependency_links(summary, job.origins.iter().map(|provider| provider.0), true).is_some()
+                    }
                 });
                 (active, if certified { Evidence::Certified } else { Evidence::Unavailable })
             }
@@ -250,6 +264,22 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             return Err(ProjectCheck::Unsupported);
         }
         Ok(())
+    }
+
+    pub(super) fn try_collect_in_catalog(
+        &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        if self.watched.qualified_catalog || !ranked.is_empty() {
+            if let Some(active) = self.try_collect_qualified_provider(target, calls, source, effects, runtime, ranked)? {
+                return Ok(Some(active));
+            }
+            if let Some(active) = self.try_collect_qualified_requirement(target, calls, source, effects, runtime, ranked)? {
+                return Ok(Some(active));
+            }
+        }
+        self.try_collect_legacy(target, calls, function, source, effects, runtime)
     }
 
     pub(super) fn try_collect_qualified_requirement(
@@ -311,6 +341,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         let watched = self.watched;
         let Some(job) = Job::discover(watched, target, runtime) else { return Ok(None); };
         if !std::ptr::eq(job.body, calls) || job.owner.source != *source { return Err(ProjectCheck::Unsupported); }
+        if job.origins.is_empty() && job.export_issuer().is_none() { return Ok(None); }
         // Do not take over unrelated existing narrow qualified routes.
         // The old ranked route still owns wide imports; new unary
         // qualification needs an explicitly enrolled pure owner proof.
@@ -329,14 +360,15 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         }
         let verdict = self.qualified.verdicts.get_mut(&target).ok_or(ProjectCheck::Unsupported)?;
         if std::mem::replace(&mut verdict.scheduled, true) { return Err(ProjectCheck::Unsupported); }
+        let active = verdict.active;
         if let Some(mut failure) = verdict.failure.take() {
             if verdict.evidence != Evidence::Refuted { return Err(ProjectCheck::Unsupported); }
             failure.directive_position = effects.records.len();
-            self.failure = Some(failure);
+            self.publish_failure(failure);
         } else if verdict.evidence == Evidence::Refuted {
             return Err(ProjectCheck::Unsupported);
         }
-        Ok(Some(verdict.active))
+        Ok(Some(active))
     }
 }
 
@@ -383,7 +415,7 @@ mod tests {
             }
         %%end"#;
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            let run = |main: &str, lhs: &str, rhs: &str, scope| {
+            let run = |main: &str, lhs: &str, rhs: &str, leaf_text: &str, scope| {
                 let parse = |source: &SourceIdentity, text: &str| {
                     crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1
                 };
@@ -397,7 +429,7 @@ mod tests {
                         (parse(&hub, merge), vec![edge("first", &left), edge("second", &right)]),
                         (parse(&left, lhs), vec![edge("bottom", &leaf)]),
                         (parse(&right, rhs), vec![edge("bottom", &leaf)]),
-                        (parse(&leaf, rank), Vec::new()),
+                        (parse(&leaf, leaf_text), Vec::new()),
                     ],
                     // Consumer roots deliberately precede suppliers, while
                     // sibling diagnostic order is opposite to use order.
@@ -406,25 +438,54 @@ mod tests {
                 )
             };
             let scope = ScalarCheckerScope::CurrentPackage;
-            let receipt = run(main, relay, relay, scope).unwrap();
+            let receipt = run(main, relay, relay, rank, scope).unwrap();
             assert!(receipt.active && receipt.directives.is_empty() && receipt.symbolic_diagnostic.is_none());
             let contrary = main.replace("observed == 7", "observed == 8");
-            let failure = run(&contrary, relay, relay, scope).unwrap();
+            let failure = run(&contrary, relay, relay, rank, scope).unwrap();
             assert_eq!(failure.directives.len(), 1);
             assert_eq!(failure.directives[0].code(), &BigInt::from(64));
             let seven = BigInt::from(7);
             assert!(failure.directives[0].witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
             assert!(failure.symbolic_diagnostic.is_none());
             let refuted = relay.replace("ensures (out == 7)", "ensures (out == 8)");
-            let failure = run(&contrary, &refuted, &refuted, scope).unwrap();
+            let failure = run(&contrary, &refuted, &refuted, rank, scope).unwrap();
             assert!(failure.directives.is_empty());
             assert_eq!(failure.symbolic_diagnostic.unwrap().proof.source, right);
             assert_eq!(failure.additional_symbolic_diagnostics.len(), 1);
             assert_eq!(failure.additional_symbolic_diagnostics[0].proof.source, left);
             let uncovered = relay.replace("input <= 7", "input <= 6");
-            assert!(matches!(run(main, relay, &uncovered, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
-            let idle = run(&contrary, &refuted, &refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(matches!(run(main, relay, &uncovered, rank, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let idle = run(&contrary, &refuted, &refuted, rank, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!idle.active && idle.directives.is_empty() && idle.symbolic_diagnostic.is_none());
+
+            let closed = r#"%%start
+                u8(u8) fixed = fn(input) { if (input <= 7) { 7 } else { 9 } };
+                proof bounded for fixed(input) -> (out) where (input <= 7) ensures (out == 7) {}
+            %%end"#;
+            let forwards = relay.replace("descend(input, 2, input, 4)", "fixed(input)");
+            let ordinary = run(main, &forwards, &forwards, closed, scope).unwrap();
+            assert!(ordinary.active && ordinary.directives.is_empty() && ordinary.symbolic_diagnostic.is_none());
+            let failure = run(&contrary, &forwards, &forwards, closed, scope).unwrap();
+            assert_eq!(failure.directives.len(), 1);
+            assert_eq!(failure.directives[0].code(), &BigInt::from(64));
+            assert!(failure.directives[0].witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+            assert!(failure.symbolic_diagnostic.is_none());
+            let false_forward = forwards.replace("ensures (out == 7)", "ensures (out == 8)");
+            let siblings = run(&contrary, &false_forward, &false_forward, closed, scope).unwrap();
+            assert!(siblings.directives.is_empty());
+            assert_eq!(siblings.symbolic_diagnostic.unwrap().proof.source, right);
+            assert_eq!(siblings.additional_symbolic_diagnostics.len(), 1);
+            assert_eq!(siblings.additional_symbolic_diagnostics[0].proof.source, left);
+            let false_leaf = closed.replace("ensures (out == 7)", "ensures (out == 8)");
+            let failed = run(&contrary, &forwards, &forwards, &false_leaf, scope).unwrap();
+            assert!(failed.directives.is_empty() && failed.additional_symbolic_diagnostics.is_empty());
+            let leaf_failure = failed.symbolic_diagnostic.unwrap();
+            assert_eq!(leaf_failure.proof.source, leaf);
+            assert_eq!(leaf_failure.returned, seven);
+            let narrowed_leaf = closed.replace("where (input <= 7)", "where (input <= 6)");
+            assert!(matches!(run(main, &forwards, &forwards, &narrowed_leaf, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let dormant = run(&contrary, &forwards, &forwards, &false_leaf, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant.active && dormant.directives.is_empty() && dormant.symbolic_diagnostic.is_none());
         }
     }
 

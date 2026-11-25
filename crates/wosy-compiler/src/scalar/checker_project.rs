@@ -6218,7 +6218,21 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         group.is_some_and(|group| group.result_pair)
     }
 
+    fn complete(&self) -> Result<(), ProjectCheck> {
+        self.qualified.complete()
+    }
+
     fn try_collect(
+        &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        self.try_collect_in_catalog(target, calls, function, source, effects, runtime, &mut HashMap::new())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl SelectedSymbolicProof<'_, '_> {
+    fn try_collect_legacy(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
         runtime: SymbolicProofRuntime<'_>,
@@ -7218,6 +7232,7 @@ struct MainFlowProofTarget<'a> {
     cases: MainFlowProofCases<'a>,
     issuer: Option<SymbolicSummaryIssuer<'a>>,
     qualified_issuer: Option<SymbolicSummaryIssuer<'a>>,
+    qualified_closed_leaf: bool,
     seen: bool,
     required_nested: usize,
     observed_nested: HashSet<wosy_syntax::SourceSpan>,
@@ -7278,7 +7293,7 @@ impl<'a> MainFlowProofTarget<'a> {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
         Self { citation_output_type, exact_citations: None, has_case_citations, case_citations: None,
-            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, issuer: None, qualified_issuer: None, seen: false,
+            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, issuer: None, qualified_issuer: None, qualified_closed_leaf: false, seen: false,
             required_nested: 0, observed_nested: HashSet::new() }
     }
 
@@ -7315,6 +7330,7 @@ struct MainFlowProofObserver<'a> {
     character_initializers: bool,
     nested_scalar_routes: HashSet<PreparedCallable>,
     named_exact_work: usize,
+    qualified_catalog: bool,
     active: bool,
     incomplete: bool,
     diagnostics: Vec<MainFlowProofDiagnostic>,
@@ -7326,7 +7342,7 @@ impl<'a> MainFlowProofObserver<'a> {
         Self {
             character_initializers: first.0.literal_leaf == Some(ProofLiteralType::Character),
             first: (target, MainFlowProofTarget::new(first)), other: HashMap::new(),
-            pure_affine_target: None, nested_scalar_routes: HashSet::new(), named_exact_work: 0,
+            pure_affine_target: None, nested_scalar_routes: HashSet::new(), named_exact_work: 0, qualified_catalog: false,
             active: false, incomplete: false, diagnostics: Vec::new(),
         }
     }
@@ -7397,6 +7413,27 @@ impl<'a> MainFlowProofObserver<'a> {
                 entry.insert(MainFlowProofTarget { issuer, ..MainFlowProofTarget::new(proof) });
             }
         }
+    }
+
+    fn enroll_qualified(
+        &mut self, scope: ScalarCheckerScope, root: &SourceIdentity, startup_count: usize, plan: &PlannedModuleProof<'a>,
+    ) -> Result<(), ProjectCheck> {
+        if scope != ScalarCheckerScope::CurrentPackage { return Ok(()); }
+        self.qualified_catalog = true;
+        if plan.target.0 >= startup_count || plan.proof_source != &plan.typed.target.source
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        {
+            return Ok(());
+        }
+        let group = if self.first.0 == plan.target { &mut self.first.1 }
+            else { self.other.get_mut(&plan.target).ok_or(ProjectCheck::MissingRoot)? };
+        // Candidate evidence is never installed in legacy local issuer
+        // state; an earlier proof for this callable does not grant authority.
+        group.qualified_issuer = Some(SymbolicSummaryIssuer {
+            canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body: plan.typed.body,
+        });
+        group.qualified_closed_leaf = plan.proof_source != root;
+        Ok(())
     }
 
     fn finish_plans(&mut self, prepared: &PreparedCheckerProject, scope: ScalarCheckerScope) -> Result<(), ProjectCheck> {
@@ -8334,17 +8371,7 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
             }
             (active, rank.failure.take(), Vec::new())
         } else if let Some(bare) = &mut self.bare {
-            let active = if let Some(active) = bare.try_collect_qualified_provider(
-                target, calls, source, effects, runtime, &mut self.ranked,
-            )? {
-                Some(active)
-            } else if let Some(active) = bare.try_collect_qualified_requirement(
-                target, calls, source, effects, runtime, &mut self.ranked,
-            )? {
-                Some(active)
-            } else {
-                bare.try_collect(target, calls, function, source, effects, runtime)?
-            };
+            let active = bare.try_collect_in_catalog(target, calls, function, source, effects, runtime, &mut self.ranked)?;
             (active, bare.failure.take(), std::mem::take(&mut bare.additional_failures))
         } else {
             return self.ranked_only_equalities.consume(target, calls, source, effects);
@@ -8421,19 +8448,9 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
         } else {
             observed = Some(MainFlowProofObserver::from_first_plan(scope, &prepared.source, plan)?);
         }
-        if LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage
-            && plan.target.0 < startup_count && plan.proof_source == &plan.typed.target.source
-            && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
-        {
-            let observer = observed.as_mut().ok_or(ProjectCheck::MissingRoot)?;
-            let group = if observer.first.0 == plan.target { &mut observer.first.1 }
-                else { observer.other.get_mut(&plan.target).ok_or(ProjectCheck::MissingRoot)? };
-            // Candidate authority is kept separate from legacy local issuers.
-            // Job discovery rejects sibling proofs; the qualified edge and
-            // full caller check must succeed before any summary is published.
-            group.qualified_issuer = Some(SymbolicSummaryIssuer {
-                canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body: plan.typed.body,
-            });
+        if LOCAL_CATALOGS {
+            observed.as_mut().ok_or(ProjectCheck::MissingRoot)?
+                .enroll_qualified(scope, &prepared.source, startup_count, plan)?;
         }
     }
     if scope == ScalarCheckerScope::CurrentPackage {
@@ -8653,8 +8670,10 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     let mut observer = MainFlowProofObserver::from_prepared_plan(
         scope, &prepared.source, &first_plan, prepare_ordered_public_observation(&first_plan, citations.as_ref())?,
     );
+    if LOCAL_CATALOGS { observer.enroll_qualified(scope, &prepared.source, startup_count, &first_plan)?; }
     for plan in &plans {
         observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref())?);
+        if LOCAL_CATALOGS { observer.enroll_qualified(scope, &prepared.source, startup_count, plan)?; }
     }
     observer.finish_plans(&prepared.prepared, scope)?;
     catalog_composition::run(
