@@ -132,6 +132,10 @@ enum LocalRuntimeExtent<'ctx> {
         length: inkwell::values::IntValue<'ctx>,
         signed: Option<memory::SignedRuntimeAddressDomain>,
     },
+    PortableConstruction {
+        length: inkwell::values::IntValue<'ctx>,
+        domain: memory::PortableRuntimeAddressDomain,
+    },
     OrdinaryDescriptor {
         length: inkwell::values::IntValue<'ctx>,
         signed: Option<memory::SignedRuntimeAddressDomain>,
@@ -238,6 +242,7 @@ struct EmitState<'ctx, 'module> {
     // only the backing (or paired replacement slot) still installed.
     local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>, bool)>,
     indexed_runtime_allocations: BTreeSet<(u32, u32)>,
+    portable_runtime_allocations: BTreeSet<(u32, u32)>,
     runtime_borrow_index: RuntimeBorrowIndex<'ctx>,
     observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
 
@@ -277,15 +282,32 @@ enum CheckedAssignmentOwner {
     Borrowed,
 }
 
+fn portable_lexical_runtime_body(
+    target: ScalarTargetLayout,
+    release: bool,
+    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
+) -> bool {
+    // Don't inspect the signature or classify an unrelated scalar Wasm body.
+    target == ScalarTargetLayout::WASM32 && release && !reference_cfg.allocations.is_empty()
+        && function.generic_parameters.is_empty()
+        && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
+            if parameters.iter().all(memory::ordinary_scalar_storage)
+                && outputs.outputs.iter().all(|output| output.ty == ScalarType::Unit
+                    || memory::ordinary_scalar_storage(&output.ty)))
+}
+
 fn runtime_allocation_access<'ctx>(
     reference_cfg: &ScalarReferenceCfg,
     body_nodes: Option<&CallableBodyCallNodes<'_>>,
     plan: Option<&crate::scalar::ClosedBody>,
     checked_access: bool,
-) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>) {
+    mut portable_body: bool,
+) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>, BTreeSet<(u32, u32)>) {
     let mut mutable = BTreeSet::new();
     let mut indexed = BTreeSet::new();
     let mut unproved_writes = BTreeSet::new();
+    let mut not_portable = std::collections::HashSet::new();
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
     let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
         .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
@@ -328,6 +350,53 @@ fn runtime_allocation_access<'ctx>(
         }
     };
     for point in &reference_cfg.points {
+        // No portable authority is inherited by a formal, carried through a
+        // whole-value use, or lent to independently lowered address syntax.
+        // Refuse unmodelled effects within this same ordinary census.
+        if portable_body {
+            let mut exclude = |binding: &crate::scalar::ReferenceBindingId| {
+                if reference_cfg.allocations.contains(binding) {
+                    not_portable.insert(key(binding.declaration_span));
+                }
+            };
+            let direct_index = |place: &crate::scalar::ReferencePlaceId| {
+                matches!((&place.place, place.projections.as_slice()),
+                    (crate::ScalarPlace::Index { base, .. }, [crate::scalar::ReferencePlaceProjection::Index(_)])
+                        if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
+            };
+            match &point.kind {
+                CfgPointKind::Read { binding } => exclude(binding),
+                CfgPointKind::Assign { target, .. } => {
+                    if !direct_index(target) { exclude(&target.binding); }
+                }
+                CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
+                    for place in candidates {
+                        if !direct_index(place) { exclude(&place.binding); }
+                    }
+                }
+                CfgPointKind::Borrow { place, loan } => {
+                    let exact_length = loan.mode == crate::scalar::ScalarReferenceMutability::Shared
+                        && loan.parent.is_none() && place.projections.is_empty()
+                        && matches!(place.place, crate::ScalarPlace::Name { .. })
+                        && matches!(point.successors.as_slice(), [call] if matches!(
+                            reference_cfg.points.get(call.0).map(|next| &next.kind),
+                            Some(CfgPointKind::Call {
+                                output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
+                                argument_points, ..
+                            }) if argument_points.as_slice() == [point.id]));
+                    if !exact_length { exclude(&place.binding); }
+                }
+                CfgPointKind::Call { target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), .. }
+                | CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+                | CfgPointKind::Bind { .. } | CfgPointKind::Branch { .. } | CfgPointKind::Join
+                | CfgPointKind::ReturnOutput { .. } | CfgPointKind::Return
+                | CfgPointKind::ConditionalOutput { .. }
+                | CfgPointKind::CaptureAssignmentPrevious { .. } => {}
+                CfgPointKind::Evaluate(expression)
+                    if !matches!(expression, ScalarExpression::RawAddress { .. }) => {}
+                _ => portable_body = false,
+            }
+        }
         match &point.kind {
             CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
                 if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id))
@@ -381,7 +450,10 @@ fn runtime_allocation_access<'ctx>(
             borrowed.owners.entry(declaration).or_insert(None);
         }
     }
-    (mutable, indexed, borrowed)
+    let portable = if portable_body {
+        indexed.iter().copied().filter(|key| !mutable.contains(key) && !not_portable.contains(key)).collect()
+    } else { BTreeSet::new() };
+    (mutable, indexed, borrowed, portable)
 }
 
 fn resolved_invalidations(
@@ -2179,8 +2251,16 @@ fn store_runtime_allocation<'ctx, 'module>(
         Some((_, _, Some(unwind))) => Some(unwind),
         Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
     };
+    let portable = (prepared && checked_extent && !widened && !mutable && relay_unwind.is_none()
+        && !state.runtime_borrow_index.owners.contains_key(&receiver.name_span)
+        && state.portable_runtime_allocations.contains(&declaration)
+        && state.aggregate.as_ref().is_none_or(|aggregate| {
+            let plan = aggregate.plan();
+            !plan.fallible_allocation_leaf && !plan.guarded_array_descriptor_leaf
+                && plan.literal_array.is_none()
+        })).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
     let allocation = ownership::emit_runtime_array_allocation_with_absence(
-        context, state, element, length, checked_extent, relay_unwind,
+        context, state, element, length, checked_extent && portable.is_none(), relay_unwind,
     )?;
     let slot = allocation.backing;
     if let Some((target, producer_element)) = state.aggregate.as_ref()
@@ -2197,8 +2277,13 @@ fn store_runtime_allocation<'ctx, 'module>(
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
     if !mutable {
         if tracked_extent {
-            let extent = if widened { LocalRuntimeExtent::WidenedLiteral { length, signed: None } }
-                else { LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed } };
+            let extent = if let Some(domain) = portable {
+                LocalRuntimeExtent::PortableConstruction { length: allocation.length, domain }
+            } else if widened {
+                LocalRuntimeExtent::WidenedLiteral { length, signed: None }
+            } else {
+                LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed }
+            };
             state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
             if let Some(backing) = state.runtime_borrow_index.owners.get_mut(&receiver.name_span) {
                 if widened || !checked_extent || backing.replace(slot).is_some() {
@@ -2680,8 +2765,9 @@ fn emit_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
-    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index) =
-        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access);
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
+        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access,
+            portable_lexical_runtime_body(target_layout, require_release_checked_access, function, reference_cfg));
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access,
@@ -2728,6 +2814,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        portable_runtime_allocations,
         runtime_borrow_index,
         observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
@@ -2930,6 +3017,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        portable_runtime_allocations: BTreeSet::new(),
         runtime_borrow_index: RuntimeBorrowIndex::default(),
         observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
@@ -3046,8 +3134,9 @@ fn emit_project_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
-    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index) =
-        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, project_names.require_release_checked_access);
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
+        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, project_names.require_release_checked_access,
+            portable_lexical_runtime_body(target_layout, project_names.require_release_checked_access, function, reference_cfg));
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access: project_names.require_release_checked_access,
@@ -3094,6 +3183,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        portable_runtime_allocations,
         runtime_borrow_index,
         observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
@@ -3321,6 +3411,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        portable_runtime_allocations: BTreeSet::new(),
         runtime_borrow_index: RuntimeBorrowIndex::default(),
         observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),

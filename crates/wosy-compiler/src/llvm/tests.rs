@@ -16264,18 +16264,18 @@ if (observed_and(0) != 99 || observed_and(0) != 7 || observed_and(1) != 99
 }
 
 #[test]
-fn checked_runtime_construction_shares_signed_address_domain_with_local_indexing() {
+fn checked_runtime_construction_shares_target_address_domain_with_local_indexing() {
     let text = "%%start
 u16(u64,u64) observed = fn(length, index) {
     u16[length] values;
     values[index] = 37;
-    values[index]
+    if (core.array_len(&values) == length) { values[index] } else { 0 }
 };
 if (observed(3, 1) != 37) { core.system_panic(); };
 %%end";
     for (layout, cap) in [
         (ScalarTargetLayout::NATIVE64, (i64::MAX as u64) / 2),
-        (ScalarTargetLayout::WASM32, (i32::MAX as u64) / 2),
+        (ScalarTargetLayout::WASM32, u64::MAX / 2),
     ] {
         let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
         let parsed = parse_source(source.clone(), text.into(), &[]);
@@ -16300,7 +16300,17 @@ if (observed(3, 1) != 37) { core.system_panic(); };
         for line in body.lines().filter(|line| line.contains(&format!("call void @{helper}("))) {
             assert!(line.ends_with(&format!(", i64 {length})")), "{body}");
         }
-        assert_eq!(body.matches("getelementptr inbounds i16").count(), 2, "{body}");
+        if layout == ScalarTargetLayout::WASM32 {
+            assert!(!body.contains("getelementptr inbounds i16"), "{body}");
+            for after in body.split(&format!("call void @{helper}(")).skip(1) {
+                let narrow = after.find("trunc i64").unwrap();
+                let address = after.find("getelementptr i16").unwrap();
+                assert!(narrow < address, "{body}");
+            }
+            assert_eq!(body.matches("getelementptr i16").count(), 2, "{body}");
+        } else {
+            assert_eq!(body.matches("getelementptr inbounds i16").count(), 2, "{body}");
+        }
         assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
         if let Some(out) = std::env::var_os("WOSY_SIGNED_RUNTIME_ADDRESS_DOMAIN_IR_DIR") {
             let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };

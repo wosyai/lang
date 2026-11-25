@@ -461,10 +461,9 @@ pub(super) fn place_pointer<'ctx, 'module>(
             {
                 return Err("runtime array indexing requires its authenticated backing extent".into());
             }
-            let checked_lexical_descriptor = runtime_extent.is_some()
-                && state.local_runtime_extents.get(&base_pointer)
-                    .is_some_and(|(_, extent, _)| matches!(extent,
-                        LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral { .. }));
+            let local_extent = runtime_extent.and_then(|_| state.local_runtime_extents.get(&base_pointer));
+            let checked_lexical_descriptor = local_extent.is_some_and(|(_, extent, _)| matches!(extent,
+                LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral { .. }));
             let runtime_offset = matches!(base_type, ScalarType::RuntimeArray { .. }).then(||
                 state.aggregate.as_ref().and_then(|aggregate| aggregate.plan().replacement_index_observation.as_ref())
             ).flatten();
@@ -500,9 +499,10 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 crate::scalar::ReturnedArrayAddress::Signed(maximum) => Some(maximum),
                 crate::scalar::ReturnedArrayAddress::PortableDefault => None,
             });
+            let portable_local = matches!(local_extent, Some((_, LocalRuntimeExtent::PortableConstruction { .. }, true)));
             let portable_wasm_offset = state.target_layout == ScalarTargetLayout::WASM32
-                && runtime_offset.is_some_and(|receipt|
-                    receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault);
+                && (portable_local || runtime_offset.is_some_and(|receipt|
+                    receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault));
             let index = emit_place_index(context, state, index, project)?;
             if signed_selector_maximum.zip(index.get_zero_extended_constant())
                 .is_some_and(|(maximum, index)| index > maximum)
@@ -640,6 +640,23 @@ fn signed_array_max_bytes(pointer_bytes: u64) -> Option<u64> {
 
 // Only these fieldless types have one canonical layout per exact kind,
 // independent of recursive aggregate layout or a declaration's identity.
+pub(super) fn ordinary_scalar_storage(ty: &ScalarType) -> bool {
+    signed_runtime_scalar_element(ty).is_some()
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PortableRuntimeAddressDomain(std::mem::Discriminant<ScalarType>);
+
+impl PortableRuntimeAddressDomain {
+    pub(super) fn for_construction(target: ScalarTargetLayout, element: &ScalarType) -> Option<Self> {
+        (target == ScalarTargetLayout::WASM32).then_some(signed_runtime_scalar_element(element)?).map(Self)
+    }
+
+    fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
+        target == ScalarTargetLayout::WASM32 && Some(self.0) == signed_runtime_scalar_element(element)
+    }
+}
+
 fn signed_runtime_scalar_element(ty: &ScalarType) -> Option<std::mem::Discriminant<ScalarType>> {
     matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16
         | ScalarType::I32 | ScalarType::I64 | ScalarType::I128 | ScalarType::U8
@@ -719,6 +736,14 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
                 if !signed.matches_consumer(state.target_layout, element) {
                     return Err("indexed runtime construction changed its signed address domain".into());
                 }
+            }
+            Ok(Some(*length))
+        }
+        LocalRuntimeExtent::PortableConstruction { length, domain }
+            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+        {
+            if !domain.matches_consumer(state.target_layout, element) {
+                return Err("portable runtime extent changed its exact scalar storage".into());
             }
             Ok(Some(*length))
         }
