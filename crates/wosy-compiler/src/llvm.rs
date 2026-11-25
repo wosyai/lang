@@ -590,7 +590,20 @@ fn emit_prepared_runtime_enum<'ctx>(
     let plan = build.bind_runtime_enum_match(module, item, function)?;
     let emitted = *functions.get(name).ok_or("missing runtime enum match function")?;
     builder.position_at_end(context.append_basic_block(emitted, "entry"));
-    runtime_enum_match::emit(context, builder, emitted, source, function, plan, target)
+    let values = runtime_enum_match::emit_values(context, builder, emitted, source, function, plan, target)?;
+    if let [value] = values.as_slice() {
+        builder.build_return(Some(value)).map_err(memory::builder_error)?;
+    } else {
+        let ScalarType::Callable { outputs, .. } = &function.signature else {
+            return Err("missing prepared runtime enum callable outputs".into());
+        };
+        let values = values.into_iter().map(EmitValue::Basic).collect();
+        let EmitValue::Aggregate { value, .. } = memory::build_aggregate_at(context, builder, target, outputs, values)? else {
+            return Err("missing prepared runtime enum multi-output return".into());
+        };
+        builder.build_return(Some(&value)).map_err(memory::builder_error)?;
+    }
+    Ok(())
 }
 
 fn emit_single_module_llvm<'a>(

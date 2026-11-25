@@ -602,6 +602,9 @@ fn prepared_runtime_enum_match_returns_authentic_positional_output_sequences() {
             let ir = emit(&analyzed).unwrap();
             assert!(ir.contains("switch i32") && ir.contains("insertvalue { i8, i16 }") && ir.contains("ret { i8, i16 }"));
             assert!(ir.contains("extractvalue { i8, i16 }"));
+            assert!(ir.contains("enum.match.continue:"));
+            assert!(ir.contains("phi i8") && ir.contains("phi i16"));
+            assert_eq!(ir.matches("ret { i8, i16 }").count(), 1);
         }
     }
     for (invalid, reason) in [

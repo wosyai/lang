@@ -1,13 +1,14 @@
 use inkwell::values::BasicValue;
-use super::{expression::emit_integer_binary, memory::{build_aggregate_at, builder_error, integer_constant, integer_type}, *};
+use super::{expression::emit_integer_binary, memory::{builder_error, integer_constant, integer_type}, *};
 use crate::scalar::runtime_enum_match::{ArmResult, IntegerExpression, IntegerKind, Operand, Plan, Predicate, TypedSelector};
 use crate::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout};
 use wosy_syntax::ByteSpan;
 
-pub(super) fn emit<'ctx>(
+/// Emit one exhaustive value region and leave the builder at its continuation.
+pub(super) fn emit_values<'ctx>(
     context: &'ctx Context, builder: &Builder<'ctx>, function: FunctionValue<'ctx>,
     source: &ScalarModule, callable: &ScalarFunction, plan: &Plan, target: ScalarTargetLayout,
-) -> Result<(), String> {
+) -> Result<Vec<BasicValueEnum<'ctx>>, String> {
     if !plan.authenticates(&source.source, callable) || source.target_layout != target {
         return Err("invalid prepared runtime enum match owner".to_owned());
     }
@@ -43,6 +44,11 @@ pub(super) fn emit<'ctx>(
     builder.build_switch(tag, invalid, &cases).map_err(builder_error)?;
     builder.position_at_end(invalid);
     builder.build_unreachable().map_err(builder_error)?;
+    let continuation = context.append_basic_block(function, "enum.match.continue");
+    builder.position_at_end(continuation);
+    let results = plan.outputs.iter().map(|ty| {
+        builder.build_phi(integer_type(context, ty)?, "enum.match.result").map_err(builder_error)
+    }).collect::<Result<Vec<_>, _>>()?;
     for (arm, (_, block)) in plan.arms.iter().zip(cases) {
         builder.position_at_end(block);
         let variant = layout.variants.get(arm.tag as usize).filter(|variant| variant.tag == arm.tag)
@@ -68,20 +74,14 @@ pub(super) fn emit<'ctx>(
                 }
             }
         }).collect::<Result<Vec<_>, String>>()?;
-        if let [value] = values.as_slice() {
-            builder.build_return(Some(value)).map_err(builder_error)?;
-        } else {
-            let ScalarType::Callable { outputs, .. } = &callable.signature else {
-                return Err("missing prepared runtime enum callable outputs".into());
-            };
-            let values = values.into_iter().map(|value| EmitValue::Basic(value.into())).collect();
-            let EmitValue::Aggregate { value, .. } = build_aggregate_at(context, builder, target, outputs, values)? else {
-                return Err("missing prepared runtime enum multi-output return".into());
-            };
-            builder.build_return(Some(&value)).map_err(builder_error)?;
+        let from = builder.get_insert_block().ok_or("missing runtime enum arm result block")?;
+        builder.build_unconditional_branch(continuation).map_err(builder_error)?;
+        for (joined, value) in results.iter().zip(&values) {
+            joined.add_incoming(&[(value, from)]);
         }
     }
-    Ok(())
+    builder.position_at_end(continuation);
+    Ok(results.into_iter().map(|result| result.as_basic_value()).collect())
 }
 
 fn literal<'ctx>(context: &'ctx Context, ty: &ScalarType, value: &num_bigint::BigInt)
