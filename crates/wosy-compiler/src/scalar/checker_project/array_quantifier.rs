@@ -284,29 +284,7 @@ fn dependent_witness_image<'a>(
     argument: &ScalarExpression, universal: &str, domain: &'a IntegerSet, target: &IntegerSet,
     work: &mut usize,
 ) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
-    let universal_name = |expression: &ScalarExpression|
-        matches!(expression, ScalarExpression::Name { name, .. } if name == universal);
-    let (image, shift) = if universal_name(argument) {
-        (Cow::Borrowed(domain), None)
-    } else {
-        let ScalarExpression::Binary { operator, left, right, .. } = argument else { return Err(ProjectCheck::Unsupported); };
-        if !universal_name(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
-        if !integer_literal_fits_type(&literal, &ScalarType::U64) { return Err(ProjectCheck::Unsupported); }
-        let shift = if *operator == BinaryOperator::Subtract { -literal } else { literal };
-        // Translation is monotone. Checking both endpoints establishes
-        // exact checked u64 arithmetic throughout the quantified domain.
-        if domain.extremes().is_some_and(|(min, max)|
-            !integer_literal_fits_type(&(min + &shift), &ScalarType::U64)
-                || !integer_literal_fits_type(&(max + &shift), &ScalarType::U64))
-        {
-            return Err(ProjectCheck::Unsupported);
-        }
-        charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
-        (Cow::Owned(domain.affine_unit(false, &shift, false)), Some(shift))
-    };
+    let (image, shift) = checked_quantified_witness_translation(argument, universal, domain, &ScalarType::U64, work)?;
     let cost = image.interval_count().checked_add(target.interval_count()).ok_or(ProjectCheck::Unsupported)?;
     charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
     if !image.is_subset_of(target) { return Err(ProjectCheck::Unsupported); }

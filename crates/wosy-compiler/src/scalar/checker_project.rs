@@ -11711,6 +11711,33 @@ fn dependent_witness_conjunction(
 }
 
 #[cfg(feature = "internal-checker")]
+fn checked_quantified_witness_translation<'a>(
+    argument: &ScalarExpression, universal: &str, domain: &'a IntegerSet, ty: &ScalarType, work: &mut usize,
+) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
+    let universal_name = |expression: &ScalarExpression|
+        matches!(expression, ScalarExpression::Name { name, .. } if name == universal);
+    if universal_name(argument) {
+        return Ok((Cow::Borrowed(domain), None));
+    }
+    let ScalarExpression::Binary { operator, left, right, .. } = argument else { return Err(ProjectCheck::Unsupported); };
+    if !universal_name(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
+    if !integer_literal_fits_type(&literal, ty) { return Err(ProjectCheck::Unsupported); }
+    let shift = if *operator == BinaryOperator::Subtract { -literal } else { literal };
+    // Monotonicity and both typed endpoints prove no overflow for every
+    // admitted original value, without enumerating even a full-width set.
+    if domain.extremes().is_some_and(|(min, max)|
+        !integer_literal_fits_type(&(min + &shift), ty) || !integer_literal_fits_type(&(max + &shift), ty))
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    super::checker_flow::charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+    Ok((Cow::Owned(domain.affine_unit(false, &shift, false)), Some(shift)))
+}
+
+#[cfg(feature = "internal-checker")]
 fn typed_named_dependent_witness(
     forall: &CstNode, exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<TypedProofGoal, ProjectCheck> {
@@ -11720,18 +11747,24 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::InvalidProof);
     }
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
-    if matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
-        let (relation, output_bounds) = typed_existential_conjuncts(&predicate, &existential, output, inputs, ty)?;
-        if !matches!(authored_witness_argument(steps)?, ScalarExpression::Name { name, .. } if name == &universal) {
-            return Err(ProjectCheck::Unsupported);
-        }
+    let witness_domains = || -> Result<(IntegerSet, IntegerSet), ProjectCheck> {
+        let argument = authored_witness_argument(steps)?;
         let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
         let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
-        if universal_domain.is_empty() {
-            return Err(ProjectCheck::Unsupported);
+        if universal_domain.is_empty() { return Err(ProjectCheck::Unsupported); }
+        let mut work = 0;
+        let (image, shift) = checked_quantified_witness_translation(argument, &universal, &universal_domain, ty, &mut work)?;
+        if shift.is_some() {
+            let cost = image.interval_count().checked_add(existential_domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
         }
+        Ok((match image { Cow::Borrowed(_) => universal_domain, Cow::Owned(image) => image }, existential_domain))
+    };
+    if matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+        let (relation, output_bounds) = typed_existential_conjuncts(&predicate, &existential, output, inputs, ty)?;
+        let (image, existential_domain) = witness_domains()?;
         return Ok(TypedProofGoal::DependentWitness(dependent_witness_conjunction(
-            relation, output_bounds, universal_domain, &existential_domain,
+            relation, output_bounds, image, &existential_domain,
         )?));
     }
     let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
@@ -11739,28 +11772,23 @@ fn typed_named_dependent_witness(
     };
     if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
         || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &existential)
-        || !matches!(authored_witness_argument(steps)?, ScalarExpression::Name { name, .. } if name == &universal)
     {
         return Err(ProjectCheck::Unsupported);
     }
     let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
-    let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
-    let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
-    if universal_domain.is_empty() {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let witness = if !universal_domain.is_subset_of(&existential_domain) {
+    let (image, existential_domain) = witness_domains()?;
+    let witness = if !image.is_subset_of(&existential_domain) {
         DependentWitness::OutsideDomain
-    } else if operator == BinaryOperator::Equal && universal_domain.singleton_value().is_none() {
+    } else if operator == BinaryOperator::Equal && image.singleton_value().is_none() {
         DependentWitness::Unavailable
     } else {
         match operator {
-            BinaryOperator::Equal => universal_domain.into_singleton()
+            BinaryOperator::Equal => image.into_singleton()
                 .map_or(DependentWitness::Unavailable, |bound| DependentWitness::Comparison(relation, bound)),
-            BinaryOperator::NotEqual => DependentWitness::Avoiding(universal_domain),
+            BinaryOperator::NotEqual => DependentWitness::Avoiding(image),
             BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual => {
                 let lower = matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual);
-                let bound = universal_domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
+                let bound = image.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
                 DependentWitness::Comparison(relation, bound)
             }
             _ => return Err(ProjectCheck::Unsupported),
@@ -21377,6 +21405,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_scalar_dependent_witness_translates_checked_typed_domains() {
+        let source = r#"%%start
+            u8(u8) positive = fn(value) { value };
+            i8(i8) negative = fn(value) { value };
+            proof plus for positive(entry) -> (out) where (entry == 5)
+                forall (u8 seed where seed == 1 || seed == 3)
+                ensures (exists (u8 candidate where candidate == 2 || candidate == 4) { out > candidate && out <= 5 })
+                { core.witness(seed + 1); }
+            proof minus for negative(entry) -> (out) where (entry == -1)
+                forall (i8 seed where seed == 0)
+                ensures (exists (i8 candidate where candidate == -1) { out == candidate })
+                { core.witness(seed - 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 check_plus = positive(5); i8 check_minus = negative(-1); %%end");
+        let pass = check_array_proof_cohort(source, package).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none() && pass.additional_symbolic_diagnostics.is_empty());
+        let pass = check_array_proof_cohort(&actual(source), main).unwrap();
+        assert!(pass.active && pass.diagnostics.is_empty());
+        let domain = source.replace("candidate == 2 || candidate == 4", "candidate == 2");
+        let predicate = source.replace("out > candidate", "out < candidate");
+        for (text, step) in [(&domain, true), (&predicate, false)] {
+            let dormant = check_array_proof_cohort(text, main).unwrap();
+            assert!(!dormant.active && dormant.diagnostics.is_empty());
+            let symbolic = check_array_proof_cohort(text, package).unwrap().symbolic_diagnostic.unwrap();
+            assert_eq!(symbolic.returned, BigInt::from(5));
+            let reached = actual(text);
+            let active = check_array_proof_cohort(&reached, main).unwrap();
+            let [failure] = active.diagnostics.as_slice() else { panic!("one actual translated witness obligation"); };
+            assert_eq!(failure.invocation.returned, BigInt::from(5));
+            for (span, text) in [(symbolic.failed_step.as_ref(), text.as_str()), (failure.failed_step.as_ref(), reached.as_str())] {
+                assert_eq!(span.is_some(), step);
+                if let Some(span) = span {
+                    assert_eq!(&text[span.range.start as usize..span.range.end as usize], "core.witness(seed + 1)");
+                }
+            }
+        }
+        for excluded in [
+            source.replace("seed == 1 || seed == 3", "seed == 255"),
+            source.replace("seed == 0", "seed == -128"),
+            source.replace("seed + 1", "seed * 1"),
+        ] {
+            assert!(matches!(check_array_proof_cohort(&excluded, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
