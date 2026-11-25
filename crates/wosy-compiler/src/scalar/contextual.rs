@@ -367,9 +367,18 @@ pub(super) fn prepare_contextual_transport_graph(
 
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn prepare_contextual_transport_graph_with_proof_root(
-    mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
     checker_directives: bool, allow_empty_startup: bool,
+) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
+    prepare_contextual_transport_graph_with_targets(sources, initialization_order, inputs, checker_directives, allow_empty_startup, &[])
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_contextual_transport_graph_with_targets(
+    mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
+    checker_directives: bool, allow_empty_startup: bool, queries: &[super::reference::CheckerTargetQuery<'_>],
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -381,7 +390,7 @@ pub(super) fn prepare_contextual_transport_graph_with_proof_root(
     };
     let root = initialization_order.first().ok_or(Unsupported)?;
     if sources.len() != initialization_order.len() { return Err(Unsupported); }
-    charge(sources.len())?;
+    charge(sources.len().checked_add(queries.len()).ok_or(Unsupported)?)?;
     let allowed: HashSet<_> = initialization_order.iter().collect();
     if allowed.len() != sources.len() { return Err(Unsupported); }
     let root_module = sources.iter().position(|(source, _)| source.source() == root).ok_or(Unsupported)?;
@@ -423,7 +432,7 @@ pub(super) fn prepare_contextual_transport_graph_with_proof_root(
             source.contextual_places.inherited.clear();
         }
     }
-    let (project, mut calls) = prepare_project_contextual_types(sources, initialization_order, inputs, checker_directives)
+    let (project, mut calls) = prepare_project_contextual_types_with_targets(sources, initialization_order, inputs, checker_directives, queries)
         .map_err(|_| Unsupported)?;
     let mut by_target = HashMap::new();
     let mut callables = Vec::new();
@@ -595,9 +604,18 @@ pub(super) fn prepare_project_contextual_types(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, checker_directives: bool,
 ) -> Result<(ScalarProject, super::reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    prepare_project_contextual_types_with_targets(declarations, initialization_order, inputs, checker_directives, &[])
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+fn prepare_project_contextual_types_with_targets(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, checker_directives: bool,
+    queries: &[super::reference::CheckerTargetQuery<'_>],
+) -> Result<(ScalarProject, super::reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
     let (project, types) = project_from_declarations_with_context_types(declarations, initialization_order, inputs, true)?;
     super::static_calls::prepare_project_occurrences(
-        typecheck_scalar_project_with_formals(project, types, checker_directives), &[],
+        typecheck_scalar_project_with_formals(project, types, checker_directives), queries,
     )
 }
 

@@ -511,6 +511,14 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
 #[cfg(feature = "internal-checker")]
 fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+    policy: OrderedReachPolicy, evidence: E, effects: OrderedFailures,
+) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
+    run_prepared_ordered_check_profiles::<E, false>(prepared, scope, startup_count, policy, evidence, effects)
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const DEFER_NAMED_TO_SYMBOLIC: bool>(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
     policy: OrderedReachPolicy, evidence: E, mut effects: OrderedFailures,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
     let (project, _) = prepared.parts();
@@ -525,16 +533,25 @@ fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
         }
         authored_roots
     };
-    let (initialization, evidence) = match policy {
+    let (initialization, evidence) = if DEFER_NAMED_TO_SYMBOLIC {
+        if !matches!(policy, OrderedReachPolicy::Closed) { return Err(ProjectCheck::Unsupported); }
+        // Keep the actual contextual cursor profile intact. The named
+        // observer may consume only genuinely dormant symbolic roots.
+        let (initialization, _) = check_package_initialization_observing_with_policy::<_, true, true>(
+            prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+        )?;
+        (initialization, evidence)
+    } else { match policy {
         OrderedReachPolicy::Legacy => check_package_initialization_observing_with_policy::<_, true, false>(
             prepared, root, ordinals, evidence, Some(&mut effects),
         ),
         OrderedReachPolicy::Closed => check_package_initialization_observing_with_policy::<_, true, true>(
             prepared, root, ordinals, evidence, Some(&mut effects),
         ),
-    }?;
+    }? };
     for contextual in effects.contextual_proofs.entries.values_mut() {
         contextual.reached_at_startup = initialization.reached.contains(&contextual.target);
+        if DEFER_NAMED_TO_SYMBOLIC && !contextual.reached_at_startup { return Err(ProjectCheck::Unsupported); }
     }
     let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations;
     let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
@@ -809,6 +826,18 @@ fn check_prepared_contextual_proofs(
     )
         .map_err(|_| ProjectCheck::Unsupported)?;
     let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
+    let effects = prepare_contextual_effects(&prepared, &context, headers, startup_count, retain_observations)?;
+    let mut report = run_prepared_ordered_check_with_effects(&prepared, scope, startup_count,
+        OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, effects)?;
+    complete_contextual_effects(&mut report, scope, retain_observations)?;
+    Ok(report)
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_contextual_effects(
+    prepared: &PreparedCheckerProject, context: &super::contextual::DormantContextReceipt,
+    headers: Vec<(SourceIdentity, ContextualProofHeader)>, startup_count: usize, retain_observations: bool,
+) -> Result<OrderedFailures, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let mut contextual_proofs = ContextualProofCohort::default();
     for (proof_source, header) in headers {
@@ -842,8 +871,13 @@ fn check_prepared_contextual_proofs(
             return Err(ProjectCheck::AmbiguousRoot);
         }
     }
-    let mut report = run_prepared_ordered_check_with_effects(&prepared, scope, startup_count,
-        OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, OrderedFailures { contextual_proofs, ..OrderedFailures::default() })?;
+    Ok(OrderedFailures { contextual_proofs, ..OrderedFailures::default() })
+}
+
+#[cfg(feature = "internal-checker")]
+fn complete_contextual_effects<E: OrderedRunEvidence>(
+    report: &mut PreparedOrderedRun<E>, scope: ScalarCheckerScope, retain_observations: bool,
+) -> Result<(), ProjectCheck> {
     for proof in report.contextual_proofs.entries.values() {
         if proof.refutation.is_none()
             && (((proof.reached_at_startup || retain_observations) && !proof.saw_proved_occurrence)
@@ -853,7 +887,7 @@ fn check_prepared_contextual_proofs(
         }
         report.active |= proof.saw_proved_occurrence || proof.refutation.is_some();
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -4612,6 +4646,8 @@ struct PreparedProofModule {
     prepared: PreparedCheckerProject,
     #[cfg(feature = "internal-checker")]
     ordered_steps: Vec<Option<PreparedOrderedProofSteps>>,
+    #[cfg(feature = "internal-checker")]
+    context: Option<super::contextual::DormantContextReceipt>,
 }
 
 struct SelectedModuleProof<'a> {
@@ -4673,6 +4709,18 @@ impl PreparedProofModule {
     }
 
     fn prepare_declarations(
+        source: SourceIdentity,
+        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        catalogs: Vec<ModuleProofCatalog>,
+        initialization_order: Vec<SourceIdentity>,
+        inputs: ScalarPreparationInputs,
+        dormant: Vec<ScalarProofDeclarations>,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] ordered: OrderedProofPreparation,
+    ) -> Result<Self, ProjectCheck> {
+        Self::prepare_declarations_in::<false>(source, declarations, catalogs, initialization_order, inputs, dormant, ordered)
+    }
+
+    fn prepare_declarations_in<const CONTEXTUAL: bool>(
         source: SourceIdentity,
         mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
         catalogs: Vec<ModuleProofCatalog>,
@@ -4752,10 +4800,22 @@ impl PreparedProofModule {
             watch_case_nesting: ordered_steps.get(_ordinal).and_then(Option::as_ref)
                 .is_some_and(|proof| matches!(proof.shape, Some(AuthoredShape::Cases))),
         }).collect::<Vec<_>>();
+        #[cfg(feature = "internal-checker")]
+        let (prepared, context) = if CONTEXTUAL {
+            let (project, context) = super::contextual::prepare_contextual_transport_graph_with_targets(
+                declarations, initialization_order, inputs, true, false, &queries,
+            ).map_err(|_| ProjectCheck::Unsupported)?;
+            (PreparedCheckerProject::from_contextual_transport(project), Some(context))
+        } else {
+            (prepared::prepare_checker_project_with_queries(declarations, initialization_order, inputs, &queries)?, None)
+        };
+        #[cfg(not(feature = "internal-checker"))]
         let prepared = prepared::prepare_checker_project_with_queries(declarations, initialization_order, inputs, &queries)?;
         Ok(Self { source, proofs, prepared,
             #[cfg(feature = "internal-checker")]
             ordered_steps,
+            #[cfg(feature = "internal-checker")]
+            context,
         })
     }
 
@@ -4970,6 +5030,9 @@ fn prepare_loaded_proof_project(
 #[doc(hidden)]
 pub struct MainFlowProofReceipt {
     pub active: bool,
+    // In mixed mode all contextual theorem failures are real startup
+    // events, while the enrolled scalar theorem failures are dormant.
+    pub contextual_before_symbolic: bool,
     pub directives: Vec<ScalarOrderedCheckerFailure>,
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
@@ -8687,6 +8750,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
+        contextual_before_symbolic: false,
         active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
@@ -8744,6 +8808,92 @@ fn prepare_ordered_public_observation<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
+fn ordered_contextual_diagnostics(mut contextual: ContextualProofCohort) -> Result<Vec<ContextualProofDiagnostic>, ProjectCheck> {
+    let mut ordered = Vec::with_capacity(contextual.refutations.len());
+    for target in contextual.refutations {
+        let proof = contextual.entries.remove(&target).ok_or(ProjectCheck::Unsupported)?;
+        let occurrence = proof.refutation.ok_or(ProjectCheck::Unsupported)?;
+        let at = |range| wosy_syntax::SourceSpan::new(proof.source.clone(), range);
+        ordered.push(ContextualProofDiagnostic {
+            symbolic: occurrence.symbolic, proof: at(proof.proof), goal: at(proof.goal),
+            supplying_call: wosy_syntax::SourceSpan::new(occurrence.binding.source.clone(), occurrence.supplying_call),
+            call: wosy_syntax::SourceSpan::new(occurrence.call_source, occurrence.call),
+            binding: wosy_syntax::SourceSpan::new(occurrence.binding.source, occurrence.binding.declaration_span),
+            entry: occurrence.entry, exit: occurrence.exit,
+        });
+    }
+    Ok(ordered)
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_mixed_dormant_symbolic_contextual(
+    sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>, ordinary: Vec<ModuleProofCatalog>,
+    initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
+    inputs: ScalarPreparationInputs, scope: ScalarCheckerScope,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    let [catalog] = ordinary.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let [root, ..] = initialization_order.as_slice() else { return Err(ProjectCheck::MissingRoot); };
+    let [(context_owner, _), ..] = headers.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if initialization_order.len() != 3 || catalog.definitions.len() > MAX_CONTEXTUAL_PROOFS
+        || &catalog.source == root || context_owner == root || context_owner == &catalog.source
+        || headers.iter().any(|(owner, _)| owner != context_owner)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let ordinary_source = catalog.source.clone();
+    let prepared = PreparedProofModule::prepare_declarations_in::<true>(
+        root.clone(), sources, ordinary, initialization_order, inputs, Vec::new(), OrderedProofPreparation::All,
+    )?;
+    let catalog = prepared.proofs.get(&ordinary_source).ok_or(ProjectCheck::MissingRoot)?;
+    let mut selections = Vec::with_capacity(catalog.definitions.len());
+    let mut names = HashSet::new();
+    for (index, definition) in catalog.definitions.iter().enumerate() {
+        let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
+        if !names.insert(name.text().to_owned()) { return Err(ProjectCheck::AmbiguousRoot); }
+        let selected = prepared.resolve_selected_proof(definition, catalog.first_query + index)?;
+        if selected.owner.source != ordinary_source { return Err(ProjectCheck::Unsupported); }
+        selections.push((name, Some(selected)));
+    }
+    let mut plans = Vec::with_capacity(selections.len());
+    for (name, selected) in &mut selections {
+        let plan = prepared.plan_resolved_module_proof::<false, false, false>(
+            &ordinary_source, name.text(), selected.take().ok_or(ProjectCheck::Unsupported)?,
+        )?;
+        let body = plan.typed.body;
+        if !plan.has_no_authored_steps() || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
+            || !body.checker_pure_calling_frame() || body.contextual_formal().is_some()
+            || !body.callable_escapes.is_empty() || !body.structure.module_storage_uses.is_empty()
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        plans.push(plan);
+    }
+    let [first, rest @ ..] = plans.as_slice() else { return Err(ProjectCheck::MissingRoot); };
+    let mut observed = MainFlowProofObserver::from_first_plan(scope, &prepared.source, first)?;
+    for plan in rest {
+        observed.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
+    }
+    observed.finish_plans(&prepared.prepared, scope)?;
+    let context = prepared.context.as_ref().ok_or(ProjectCheck::Unsupported)?;
+    let effects = prepare_contextual_effects(&prepared.prepared, context, headers, 3, false)?;
+    let mut report = run_prepared_ordered_check_profiles::<_, true>(
+        &prepared.prepared, scope, 3, OrderedReachPolicy::Closed, NamedOrderedEvidence { observed }, effects,
+    )?;
+    complete_contextual_effects(&mut report, scope, false)?;
+    let mut contextual = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
+    let (symbolic_diagnostic, additional_symbolic_diagnostics) = report.symbolic;
+    // No actual scalar witness is consumed by this profile; a reached
+    // named scalar target is rejected by complete_startup instead.
+    Ok(MainFlowProofReceipt {
+        contextual_before_symbolic: true, active: report.active, directives: report.directives,
+        diagnostics: report.actual.observed.diagnostics, contextual_diagnostic: contextual.next(),
+        additional_contextual_diagnostics: contextual.collect(), pointer_effect_diagnostic: None,
+        aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: report.entry_evidence,
+    })
+}
+
+#[cfg(feature = "internal-checker")]
 fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
@@ -8763,14 +8913,15 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     if LOCAL_CATALOGS && proofs.iter().any(|(proof, _)| !proof.contextual_proofs.is_empty()) {
         // All contextual theorems share one typed transport and one ordered
         // execution. Unrelated and dormant proof modes are not omitted.
-        if !(1..=2).contains(&startup_count) || !dormant.is_empty() {
+        if !(1..=3).contains(&startup_count) || !dormant.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
         let mut sources = declarations;
         let mut headers = Vec::new();
+        let mut ordinary = Vec::new();
         for (proof, namespaces) in proofs {
             if proof.contextual_proofs.is_empty() && !proof.definitions.is_empty() {
-                return Err(ProjectCheck::Unsupported);
+                ordinary.push(ModuleProofCatalog { source: proof.declarations.source().clone(), definitions: proof.definitions });
             }
             if headers.len().checked_add(proof.contextual_proofs.len()).ok_or(ProjectCheck::Unsupported)? > MAX_CONTEXTUAL_PROOFS {
                 return Err(ProjectCheck::Unsupported);
@@ -8778,27 +8929,19 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             headers.extend(proof.contextual_proofs.into_iter().map(|header| (proof.declarations.source().clone(), header)));
             sources.push((proof.declarations, namespaces));
         }
-        let mut report = check_prepared_contextual_proofs(sources, initialization_order, headers, inputs, scope, false)?;
-        let mut ordered = Vec::with_capacity(report.contextual_proofs.refutations.len());
-        for target in report.contextual_proofs.refutations {
-            let proof = report.contextual_proofs.entries.remove(&target).ok_or(ProjectCheck::Unsupported)?;
-            let occurrence = proof.refutation.ok_or(ProjectCheck::Unsupported)?;
-            let at = |range| wosy_syntax::SourceSpan::new(proof.source.clone(), range);
-            ordered.push(ContextualProofDiagnostic {
-                symbolic: occurrence.symbolic, proof: at(proof.proof), goal: at(proof.goal),
-                supplying_call: wosy_syntax::SourceSpan::new(occurrence.binding.source.clone(), occurrence.supplying_call),
-                call: wosy_syntax::SourceSpan::new(occurrence.call_source, occurrence.call),
-                binding: wosy_syntax::SourceSpan::new(occurrence.binding.source, occurrence.binding.declaration_span),
-                entry: occurrence.entry, exit: occurrence.exit,
-            });
+        if !ordinary.is_empty() {
+            return check_mixed_dormant_symbolic_contextual(sources, ordinary, initialization_order, headers, inputs, scope);
         }
-        let mut rest = ordered.into_iter();
+        if startup_count > 2 { return Err(ProjectCheck::Unsupported); }
+        let mut report = check_prepared_contextual_proofs(sources, initialization_order, headers, inputs, scope, false)?;
+        let mut rest = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
         let contextual_diagnostic = rest.next();
         if contextual_diagnostic.is_some() {
             // Preserve the existing contextual diagnostic priority over buffered ordinary directives.
             report.directives.clear();
         }
         return Ok(MainFlowProofReceipt {
+            contextual_before_symbolic: false,
             active: report.active, directives: report.directives, diagnostics: Vec::new(), contextual_diagnostic,
             additional_contextual_diagnostics: rest.collect(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
@@ -23387,6 +23530,75 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(at(root, diagnostic.binding.range).trim_end(), "core.context.credit");
             let nonempty_initializer = child.replace("%%end", "relay(); %%end");
             assert!(matches!(run(root, &nonempty_initializer, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_contextual_startup_and_dormant_scalar_share_one_check() {
+        let app = source("src/main.w", "configured-mixed-root");
+        let library = source("src/credit.w", "configured-mixed-context");
+        let scalar = source("src/facts.w", "configured-mixed-symbolic");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            facts = namespace app "src/facts.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend();
+                core.require(core.context.credit == 2,
+                    { .stdout = ""; .stderr = "wrong credit"; .code = 78; .files = []; });
+            };
+            entry();
+        %%end"#;
+        let context = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() spend = fn { consume(); };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        let theorem = r#"%%start
+            u8(u8) score = fn(value) { value };
+            proof scalar_value for score(entry) -> (out) where (entry == 4) ensures (out == 4) {}
+        %%end"#;
+        let false_context = context.replace("core.old(core.context.credit) - 1", "core.old(core.context.credit) - 0");
+        let false_scalar = theorem.replace("out == 4", "out == 3");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, context: &str, theorem: &str, scope| {
+                let parse = |source: &SourceIdentity, text: &str| crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1;
+                let edge = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                    binding: binding.into(), target: target.clone(), span: ByteSpan::new(0, 0),
+                };
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), [(parse(&library, context), Vec::new()), (parse(&scalar, theorem), Vec::new()),
+                        (parse(&app, root), vec![edge("accounting", &library), edge("facts", &scalar)])],
+                    vec![app.clone(), library.clone(), scalar.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let pass = run(root, context, theorem, scope).unwrap();
+                assert!(pass.active && pass.directives.is_empty() && pass.diagnostics.is_empty()
+                    && pass.contextual_diagnostic.is_none() && pass.symbolic_diagnostic.is_none());
+                let fail = run(root, &false_context, &false_scalar, scope).unwrap();
+                assert!(fail.contextual_before_symbolic && fail.diagnostics.is_empty() && fail.directives.is_empty());
+                let contextual = fail.contextual_diagnostic.unwrap();
+                assert!(!contextual.symbolic && contextual.call.source == library && contextual.supplying_call.source == app);
+                let call = contextual.call.range;
+                assert_eq!(&context[call.start as usize..call.end as usize], "consume()");
+                assert_eq!((contextual.entry, contextual.exit), (BigInt::from(3), BigInt::from(2)));
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let symbolic = fail.symbolic_diagnostic.unwrap();
+                    assert_eq!(symbolic.callable.source, scalar);
+                    assert_eq!(symbolic.returned, BigInt::from(4));
+                } else {
+                    assert!(fail.symbolic_diagnostic.is_none());
+                }
+                let stale = root.replace("credit == 2", "credit == 3");
+                let report = run(&stale, context, &false_scalar, scope).unwrap();
+                assert_eq!(report.directives[0].code(), &BigInt::from(78));
+                let reached = root.replace("accounting.spend();",
+                    r#"accounting.spend(); u8 score = facts.score(4); core.require(score == 4, { .stdout = ""; .stderr = ""; .code = 78; .files = []; });"#);
+                assert!(matches!(run(&reached, context, theorem, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 

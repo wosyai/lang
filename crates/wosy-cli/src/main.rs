@@ -1318,7 +1318,16 @@ fn check_command(
             failure.entry, failure.observed, failure.expected))
             .chain(failure.guard.map(|value| format!("Boolean guard input at entry: {value}"))).collect(),
     });
-    let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).chain(pointer_effect).collect::<Vec<_>>();
+    let mut diagnostics = actual.collect::<Vec<_>>();
+    if report.contextual_before_symbolic {
+        diagnostics.extend(contextual);
+        diagnostics.extend(symbolic);
+    } else {
+        diagnostics.extend(symbolic);
+        diagnostics.extend(contextual);
+    }
+    diagnostics.extend(aggregate);
+    diagnostics.extend(pointer_effect);
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);
