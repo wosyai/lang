@@ -11479,28 +11479,6 @@ enum RankedBaseRejection {
 }
 
 #[cfg(feature = "internal-checker")]
-fn prepare_ranked_base_show<'a>(
-    steps: &'a ScalarBlock, typed: &TypedProofPostcondition<'a>,
-) -> Result<(Cow<'a, BigInt>, ByteSpan), ProjectCheck> {
-    let ([show_item @ ScalarBlockItem::Expression(show)], [terminated]) =
-        (steps.items.as_slice(), steps.terminated_items.as_slice())
-    else {
-        return Err(ProjectCheck::Unsupported);
-    };
-    let claim = IntegerComparison::from_expression(proof_show_expression(show_item, *terminated)?)
-        .ok_or(ProjectCheck::Unsupported)?;
-    if claim.operator != &BinaryOperator::Equal || claim.name != typed.output {
-        return Err(ProjectCheck::Unsupported);
-    }
-    if !integer_literal_fits_type(claim.bound.as_ref(), typed.result_type) {
-        return Err(ProjectCheck::InvalidProof);
-    }
-    let base_claim = claim.bound;
-    let base_show = super::typecheck::expression_span(show);
-    Ok((base_claim, base_show))
-}
-
-#[cfg(feature = "internal-checker")]
 fn ranked_output_at(
     body: &FunctionCallSites, block: super::reference::BlockOrdinal, ty: &ScalarType,
 ) -> Option<OccurrenceOrdinal> {
@@ -17977,6 +17955,73 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(witness.witness.intervals_at(0, 1).unwrap().eq([(&value, &value)]));
         let excluded = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!excluded.active && excluded.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_ranked_leaves_check_each_authored_step_without_assuming_the_result() {
+        let app = source("src/main.w", "ordered-ranked-leaf-steps");
+        let program = r#"%%start
+            u8(i16, u8) descend = fn(tag, value) { if (value < 3) { 4 } else { descend(tag, value - 3) } };
+            proof rank for descend(tag, entry) -> (out)
+                where (tag >= 11 && entry <= 8) ensures (out == 4) decreases (entry) {
+                if (entry < 3) {
+                    core.show(out >= 4);
+                    core.show(out == 4);
+                    core.show(out < 5);
+                } else {
+                    core.show(entry >= 3);
+                    core.show(tag >= 11);
+                    core.use(rank(tag, entry - 3));
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let checked = run(program, package).unwrap();
+        assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+        let bad_base = program.replace("out == 4);", "out == 5);").replace("out < 5);", "out < 4);");
+        let failure = run(&bad_base, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(4));
+        let first = failure.failed_step.unwrap();
+        assert_eq!(first.source, app);
+        assert_eq!(&bad_base[first.range.start as usize..first.range.end as usize], "core.show(out == 5)");
+        let idle = run(&bad_base, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.symbolic_diagnostic.is_none());
+        for invalid in [
+            program.replace("core.show(entry >= 3);", "core.show(entry >= 4);"),
+            program.replace("core.show(entry >= 3);", "core.show(out == 4);"),
+            program.replace("core.use(rank(tag, entry - 3));", "core.use(rank(tag, entry - 2));"),
+            program.replace("core.use(rank(tag, entry - 3));", "core.use(rank(tag, entry - 3)); core.show(entry >= 3);"),
+        ] {
+            assert!(run(&invalid, package).is_err());
+        }
+
+        for width in ["f32", "f64"] {
+            let float = r#"%%start
+                u8(FLOAT) descend = fn(value) { if (value <= 1.0) { 4 } else { descend(value - 1.0) } };
+                proof rank for descend(entry) -> (out)
+                    where (entry >= 0.0 && entry <= 1024.0) ensures (out == 4) decreases (entry) {
+                    if (entry <= 1.0) {
+                        core.show(out >= 4);
+                        core.show(out == 4);
+                    } else {
+                        core.show(entry > 1.0);
+                        core.show(entry <= 1024.0);
+                        core.use(rank(entry - 1.0));
+                    }
+                }
+            %%end"#.replace("FLOAT", width);
+            let checked = run(&float, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+            let invalid = float.replace("core.show(entry > 1.0);", "core.show(entry > 2.0);");
+            assert!(run(&invalid, package).is_err());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

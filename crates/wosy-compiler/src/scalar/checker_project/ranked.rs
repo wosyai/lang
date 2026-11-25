@@ -133,14 +133,15 @@ impl<'a> Coordinate<'a> {
 }
 
 fn self_use<'a>(
-    name: &str, steps: &'a ScalarBlock, typed: &TypedProofPostcondition<'_>, rank: TypedInductionRank<'_>,
+    name: &str, item: &'a ScalarBlockItem, terminated: bool,
+    typed: &TypedProofPostcondition<'_>, rank: TypedInductionRank<'_>,
 ) -> Result<Vec<Coordinate<'a>>, ProjectCheck> {
-    let [ScalarBlockItem::Expression(ScalarExpression::Call {
+    let ScalarBlockItem::Expression(ScalarExpression::Call {
         receiver: Some(core), name: instruction, type_arguments: outer_types, arguments: outer, ..
-    })] = steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    }) = item else { return Err(ProjectCheck::Unsupported); };
     let [ScalarExpression::Call { receiver: None, name: cited, arguments, type_arguments, .. }] = outer.as_slice()
         else { return Err(ProjectCheck::Unsupported); };
-    if steps.terminated_items.as_slice() != [true] || core != "core" || instruction != "use"
+    if !terminated || core != "core" || instruction != "use"
         || cited != name || !type_arguments.is_empty() || !outer_types.is_empty()
         || arguments.len() != typed.input_names.len() || arguments.len() != rank.entries().count()
     {
@@ -268,6 +269,40 @@ impl RankLane {
         }
     }
 
+    // An authored show is an obligation, never a filter. Check that its
+    // complement has no active entry without changing the incoming lane.
+    fn proves_entry_show(
+        &self, claim: &ScalarExpression, typed: &TypedProofPostcondition<'_>,
+        rank: TypedInductionRank<'_>, work: &mut usize,
+    ) -> Result<bool, ProjectCheck> {
+        match self {
+            Self::Integers(path) => {
+                let predicate = proof_input_condition::<true>(claim, &typed.input_names, typed.body, false)?;
+                charge(work, path.0.len())?;
+                match predicate {
+                    CheckerPredicate::Boolean(value) => Ok(value || !path.reachable()),
+                    CheckerPredicate::Integer(p) => {
+                        let axis = rank.entries().position(|(slot, key)| slot.ty == p.ty && *key == p.binding)
+                            .and_then(|slot| path.0.get(slot)).ok_or(ProjectCheck::Unsupported)?;
+                        let opposite = IntegerRelation::from_operator(&p.operator)
+                            .ok_or(ProjectCheck::Unsupported)?.complement();
+                        charge(work, axis.interval_count())?;
+                        Ok(!path.reachable() || axis.keep_relation(opposite, &p.bound).is_empty())
+                    }
+                    _ => Err(ProjectCheck::Unsupported),
+                }
+            }
+            Self::Float(path) => {
+                let (axis, _) = rank.float_entry().ok_or(ProjectCheck::Unsupported)?;
+                let entry_name = typed.input_names.get(axis.ordinal).ok_or(ProjectCheck::Unsupported)?;
+                let guard = ranked_float::Guard::from_expression(claim, &axis.ty, |expr|
+                    matches!(expr, ScalarExpression::Name { name, .. } if name == entry_name))
+                    .ok_or(ProjectCheck::Unsupported)?;
+                Ok(!path.keep(&guard, false, work)?.reachable())
+            }
+        }
+    }
+
     fn transition(
         &self, entry: &Self, rank: TypedInductionRank<'_>, arguments: &[Coordinate<'_>], work: &mut usize,
     ) -> Result<InductionPremise, ProjectCheck> {
@@ -318,15 +353,16 @@ pub(super) fn verify<'a>(
     while let Some((proof, runtime, block, path)) = pending.pop() {
         charge(&mut work, 1)?;
         let output = ranked_output_at(body, block, typed.result_type).ok_or(ProjectCheck::Unsupported)?;
-        let [item] = proof.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if proof.items.len() != proof.terminated_items.len() { return Err(ProjectCheck::Unsupported); }
+        let item = proof.items.first().ok_or(ProjectCheck::Unsupported)?;
         if let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) = body.conditionals.get(&output) {
             let branches = runtime.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
             if body.occurrences.get(output.0).map(|node| node.span) != Some(branches.span) {
                 return Err(ProjectCheck::Unsupported);
             }
             let (yes_proof, no_proof, proof_condition) = match item {
-                ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. }) =>
-                    (then_branch, else_branch, Some(condition.as_ref())),
+                ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })
+                    if proof.items.len() == 1 => (then_branch, else_branch, Some(condition.as_ref())),
                 // An unbranched show is an obligation on every actual returning leaf.
                 ScalarBlockItem::Expression(ScalarExpression::Call { receiver: Some(core), name, .. })
                     if core == "core" && name == "show" => (proof, proof, None),
@@ -362,14 +398,25 @@ pub(super) fn verify<'a>(
             pending.push((yes_proof, branches.then_branch, *then_block, yes));
         } else if let Some(value) = structure.checker_integer_literals.get(&output) {
             has_base = true;
-            let (claim, show_span) = prepare_ranked_base_show(proof, typed)?;
-            if failure.is_none() && path.reachable() && (claim.as_ref() != value || !relation.accepts(value.cmp(bound))) {
-                let rejected = if claim.as_ref() != value {
-                    RankedBaseRejection::AuthoredShow(show_span)
-                } else {
+            charge(&mut work, proof.items.len())?;
+            let mut rejected = None;
+            for (item, &terminated) in proof.items.iter().zip(&proof.terminated_items) {
+                let claim = IntegerComparison::from_expression(proof_show_expression(item, terminated)?)
+                    .ok_or(ProjectCheck::Unsupported)?;
+                let (_, relation, bound) = checked_literal_output_goal_borrowed(
+                    claim, &typed.output, &typed.input_names, typed.result_type,
+                )?;
+                if rejected.is_none() && !relation.accepts(value.cmp(&bound)) {
+                    let ScalarBlockItem::Expression(show) = item else { return Err(ProjectCheck::Unsupported); };
+                    rejected = Some(RankedBaseRejection::AuthoredShow(expression_span(show)));
+                }
+            }
+            if failure.is_none() && path.reachable() {
+                if rejected.is_none() && !relation.accepts(value.cmp(bound)) {
                     let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-                    RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
-                };
+                    rejected = Some(RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal)));
+                }
+                let Some(rejected) = rejected else { continue; };
                 let entry = match path {
                     RankLane::Integers(path) => {
                         charge(&mut work, path.0.len())?;
@@ -387,7 +434,17 @@ pub(super) fn verify<'a>(
                 });
             }
         } else {
-            let args = self_use(plan.name, proof, typed, rank)?;
+            charge(&mut work, proof.items.len())?;
+            let (last, before) = proof.items.split_last().ok_or(ProjectCheck::Unsupported)?;
+            let (&terminated, earlier) = proof.terminated_items.split_last().ok_or(ProjectCheck::Unsupported)?;
+            for (show, &terminated) in before.iter().zip(earlier) {
+                let claim = proof_show_expression(show, terminated)?;
+                if !path.proves_entry_show(claim, typed, rank, &mut work)? {
+                    // No actual returned value is known at this recursive leaf.
+                    return Err(ProjectCheck::Unsupported);
+                }
+            }
+            let args = self_use(plan.name, last, terminated, typed, rank)?;
             check_tail(plan, rank, output, runtime, &args)?;
             matched_calls += 1;
             match path.transition(&entry, rank, &args, &mut work)? {
@@ -415,6 +472,8 @@ pub(super) fn audit_premise(
     let entry = Rectangle::entry(rank, plan.filter.as_deref().unwrap_or_default(), &mut work)?;
     let guard = proof_input_condition::<true>(condition, &plan.typed.input_names, plan.typed.body, false)?;
     let (_, recursive) = entry.clone().split(rank, &guard, &mut work)?;
-    let args = self_use(plan.name, else_branch, &plan.typed, rank)?;
+    let ([item], [terminated]) = (else_branch.items.as_slice(), else_branch.terminated_items.as_slice())
+        else { return Err(ProjectCheck::Unsupported); };
+    let args = self_use(plan.name, item, *terminated, &plan.typed, rank)?;
     transition(rank, &entry, &recursive, &args, &mut work)
 }
