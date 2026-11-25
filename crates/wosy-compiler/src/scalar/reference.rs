@@ -6817,7 +6817,52 @@ pub(super) struct FixedIndexReadShape<'a> {
     pub(super) extent: usize,
 }
 
+/// Shape only: the checked-reference type does not establish non-null,
+/// liveness, a safe checked-helper match, or permission to omit any guard.
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub(super) struct SharedCheckedReadShape<'a> {
+    pub(super) read: OccurrenceOrdinal,
+    pub(super) place: OccurrenceOrdinal,
+    pub(super) pointer: OccurrenceOrdinal,
+    pub(super) binding: &'a ReferenceBindingId,
+    pub(super) result: &'a ScalarType,
+}
+
 impl FunctionCallSites {
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)] // No proof or backend consumer yet.
+    pub(super) fn shared_checked_read_shape(&self, read: OccurrenceOrdinal) -> Option<SharedCheckedReadShape<'_>> {
+        let edges = &self.structure.edges;
+        let checked = &self.structure.checked_types;
+        let OccurrenceNode::Place(place) = *edges.get(&(
+            OccurrenceParent::Expression(read), OccurrenceEdge::ExpressionPlace,
+        ))? else { return None; };
+        let OccurrenceNode::Expression(pointer) = *edges.get(&(
+            OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer,
+        ))? else { return None; };
+        let ScalarType::CheckedReference { mutability: super::ScalarReferenceMutability::Shared, inner }
+            = checked.expressions.get(&pointer)? else { return None; };
+        let result = checked.expressions.get(&read)?;
+        // Address expressions have the same place edge but a pointer
+        // result, while this corridor is an exact scalar value read.
+        if !is_integer_type(result) || inner.as_ref() != result || checked.places.get(&place) != Some(result) {
+            return None;
+        }
+        let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
+        let PlainNameIdentity::Lexical(binding) = names.get(&pointer)? else { return None; };
+        // A direct declared parameter cannot be substituted with a lexical
+        // name initialized by a call, alias or computed pointer expression.
+        let [formal] = self.boundary.parameters.as_slice() else { return None; };
+        let root = self.structure.blocks.get(self.structure.root.0)?;
+        if binding.kind != ReferenceBindingKind::Declared || binding.declaration_span != formal.span
+            || binding.block_span != root.span || checked.expressions.get(&pointer) != Some(&formal.ty)
+        {
+            return None;
+        }
+        Some(SharedCheckedReadShape { read, place, pointer, binding, result })
+    }
+
     /// Project only existing prepared identities. No checker-only rows, AST
     /// rewalk, control-flow fact, or runtime helper lowering is implied.
     #[cfg(feature = "internal-checker")]

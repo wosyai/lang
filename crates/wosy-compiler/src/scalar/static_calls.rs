@@ -263,6 +263,15 @@ impl PreparedScalarProject {
         self.calls.function_body(module, item, None)?.fixed_index_read_shape(read)
     }
 
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn shared_checked_read_shapes(
+        &self, module: usize, item: usize,
+    ) -> Option<Vec<reference::SharedCheckedReadShape<'_>>> {
+        let calls = self.calls.function_body(module, item, None)?;
+        Some((0..calls.occurrences.len()).filter_map(|read|
+            calls.shared_checked_read_shape(reference::OccurrenceOrdinal(read))).collect())
+    }
+
     pub fn project(&self) -> &ScalarProject {
         &self.project
     }

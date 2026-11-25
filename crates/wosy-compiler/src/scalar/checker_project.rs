@@ -15767,6 +15767,56 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn shared_checked_read_preflight_keeps_only_typed_lexical_dereferences() {
+        let src = source("src/main.w", "shared-checked-read-preflight");
+        let text = r#"%%start
+            u8(*u8) read = fn(pointer) { *pointer };
+            u8(*!u8) mutable = fn(pointer) { *pointer };
+            *?u8(*u8) address = fn(pointer) { unsafe { &?*pointer } };
+            u8(*u8) alias_read = fn(pointer) { *u8 alias = pointer; *alias };
+        %%end"#;
+        let parsed = crate::parse_source(src.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let scalar = parsed.result.canonical_cst();
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let checker = prepare_checker_project(
+                vec![(crate::derive_scalar_check_declarations_from_cst(scalar), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap();
+            let build = crate::prepare_scalar_project(
+                vec![(crate::derive_scalar_build_declarations_from_cst(scalar), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap();
+            for (item, expected) in [1, 0, 0, 0].into_iter().enumerate() {
+                let body = checker.parts().1.function_body(0, item, None).unwrap();
+                let shapes = (0..body.occurrences.len()).filter_map(|read|
+                    body.shared_checked_read_shape(OccurrenceOrdinal(read))).collect::<Vec<_>>();
+                let ordinary = build.shared_checked_read_shapes(0, item).unwrap();
+                assert_eq!(shapes.len(), expected);
+                assert_eq!(ordinary, shapes);
+                if let ([left], [right]) = (ordinary.as_slice(), shapes.as_slice()) {
+                    assert!(!std::ptr::eq(left.binding, right.binding));
+                    assert_eq!(left.result, &ScalarType::U8);
+                }
+            }
+            let raw = crate::parse_source(src.clone(),
+                "%%start u8(*?u8) raw = fn(pointer) { unsafe { *pointer } }; %%end".to_owned(), &[]);
+            let rejected = prepare_checker_project(
+                vec![(crate::derive_scalar_check_declarations_from_cst(raw.result.canonical_cst()), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout },
+            );
+            assert!(matches!(rejected, Err(ProjectCheck::Invalid(diagnostics))
+                if diagnostics.iter().any(|d| d.message == "checked dereference requires a checked reference")));
+            let validated = crate::analyze_scalar_build(&build);
+            assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+            let ir = crate::emit_scalar_build_single_module_llvm(&validated).unwrap().to_text();
+            let read = ir.split_once("define i8 @read(").unwrap().1.split_once("\n}").unwrap().0;
+            assert!(read.contains("deref_is_null"), "{read}");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn runtime_fixed_index_evidence_requires_the_ordinary_guard_and_exact_preparation() {
         use super::super::reference::{CheckerOrdinaryScalarLocalKind, CheckerSnapshotReadIndex, CheckerSnapshotArrayOffset};
         let src = source("src/main.w", "runtime-fixed-index-evidence");
