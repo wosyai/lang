@@ -14984,6 +14984,102 @@ if (guarded(2) != 99 || guarded(2) != 2 || ordinary(3, 2) != 3
 }
 
 #[test]
+fn ordinary_and_guarded_fallible_receivers_join_runtime_array_arms() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64[](u64) _make = fn(count) { u64[count] fresh; fresh };
+u64[](u64) _other = fn(count) { u64[count] fresh; fresh };
+u64(u64) guarded = fn(count) {
+    u64[] held =? _make(count);
+    if (&held == null) { 99 } else { held[1] = 7; core.array_len(&held) }
+};
+u64(bool, u64, u64) ordinary = fn(first, count, index) {
+    u64[] item = if (first) { _make(count) } else { _other(4) };
+    item[index] = 8;
+    core.array_len(&item)
+};
+if (guarded(2) != 99 || guarded(2) != 2 || ordinary(true, 3, 2) != 3
+    || ordinary(false, 4, 3) != 4) { core.system_panic(); };
+ordinary(false, 2, 2);
+%%end";
+    let rebound = text.replace("    core.array_len(&item)", "    u64[count] replacement;\n    item = replacement;\n    item[index] = 9;\n    count");
+    let whole_use = text.replace("    core.array_len(&item)", "    item;\n    count");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for test in [&rebound, &whole_use] {
+            let candidate = prepare_initializer_test(test, layout);
+            let checked = analyze_scalar_build(&candidate);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            assert!(matches!(emit_scalar_build_project_llvm(&checked), Err(error)
+                if error.contains("guarded owned array cohort has a non-guarded use")));
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", true, emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let bytes = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed guarded ordinary runtime array");
+            let module = context.create_module_from_ir(bytes).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
+            let make = authored("_make");
+            assert_eq!(make.get_linkage(), inkwell::module::Linkage::Internal);
+            let other = authored("_other");
+            assert_eq!(other.get_linkage(), inkwell::module::Linkage::Internal);
+            let ordinary = authored("ordinary");
+            let guarded = authored("guarded");
+            let called = |function: inkwell::values::FunctionValue<'_>, callee| function.get_basic_blocks()
+                .into_iter().flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                    |instruction| instruction.get_next_instruction())).filter(|&instruction|
+                    CallSiteValue::try_from(instruction).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .count();
+            assert_eq!(called(ordinary, make), 1);
+            assert_eq!(called(guarded, make), 1);
+            assert_eq!(called(ordinary, other), 1);
+            assert_eq!(called(guarded, other), 0);
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            assert_eq!(called(make, alloc), 1);
+            assert_eq!(called(other, alloc), 1);
+            for receiver in [ordinary, guarded] {
+                assert_eq!(called(receiver, alloc), 0);
+                assert_eq!(called(receiver, free), 1);
+            }
+            let joins = ordinary.get_basic_blocks().into_iter()
+                .flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                    |instruction| instruction.get_next_instruction()))
+                .filter(|&instruction| instruction.get_opcode() == InstructionOpcode::Phi
+                    && instruction.get_type().is_struct_type()).count();
+            assert_eq!(joins, 1);
+            let failure = ordinary.get_basic_blocks().into_iter()
+                .find(|block| block.get_name().to_bytes() == b"ordinary.array_absent").unwrap();
+            let panic = CallSiteValue::try_from(failure.get_first_instruction().unwrap()).unwrap();
+            assert_eq!(panic.get_called_fn_value(), module.get_function("__wosy_core_system_panic"));
+            assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+            if let Some(out) = std::env::var_os("WOSY_JOINED_RUNTIME_ARRAY_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn guarded_fallible_runtime_array_explicit_release_consumes_one_present_owner() {
     let text = "%%start
 u64[](u64) _make = fn(count) { u64[count] fresh; fresh };

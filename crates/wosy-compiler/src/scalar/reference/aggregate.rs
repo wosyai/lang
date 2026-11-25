@@ -1293,6 +1293,8 @@ impl GuardedNumericExpression {
     }
 }
 
+pub(super) type OrdinaryArrayReceiver = (OccurrenceOrdinal, ByteSpan, Vec<(CfgPointId, OccurrenceOrdinal)>);
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     selected_mixed: Option<LocalReceiptChoice>,
@@ -1334,7 +1336,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
     pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
-    pub(super) ordinary_array_receivers: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) ordinary_array_receivers: Vec<OrdinaryArrayReceiver>,
     pub(super) ordinary_array_extent_demands: HashSet<OccurrenceOrdinal>,
     pub(super) ordinary_array_incompatible_uses: HashSet<OccurrenceOrdinal>,
     pub(super) guarded_array_choices: BTreeSet<usize>,
@@ -6702,13 +6704,13 @@ fn closed_aggregates<'a>(
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
             if is_monomorphic && arm.is_none() {
-                for &(point, call, receiver) in &facts.ordinary_array_receivers {
-                    let demanded = facts.ordinary_array_extent_demands.contains(&call);
-                    if facts.ordinary_array_incompatible_uses.contains(&call) {
+                for (call, receiver, paths) in &facts.ordinary_array_receivers {
+                    let demanded = facts.ordinary_array_extent_demands.contains(call);
+                    if facts.ordinary_array_incompatible_uses.contains(call) {
                         if demanded { return Err("ordinary returned array extent requires one non-escaping lexical backing".into()); }
                         continue;
                     }
-                    ordinary_array_requests.push((key, cfg, point, call, receiver, demanded));
+                    ordinary_array_requests.push((key, cfg, *call, *receiver, paths.as_slice(), demanded));
                 }
                 ordinary_fallible_candidates.extend(facts.ordinary_fallible_call_candidates.iter()
                     .map(|ordinal| (key, ordinal.0)));
@@ -7309,20 +7311,30 @@ fn closed_aggregates<'a>(
     let mut waiting = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
     let mut unresolved = BTreeMap::<BodyKey, usize>::new();
     let mut ready = Vec::new();
-    let mut ordinary_array_sites = BTreeMap::new();
-    for (caller, cfg, point, call, receiver, demanded) in ordinary_array_requests {
-        let Some(target) = target_body(&declarations, cfg, point) else {
-            if demanded { return Err(invalid()); }
-            continue;
-        };
-        ordinary_array_sites.insert((caller, call.0), (target, receiver));
-        if demanded {
-            guarded_array_requests.push((caller, cfg, point, call));
-        }
-    }
+    let mut groups = Vec::new();
+    let mut groups_by_target = BTreeMap::<BodyKey, Vec<usize>>::new();
     let mut pending = guarded_array_requests.into_iter().map(|(caller, cfg, point, occurrence)|
         Ok((target_body(&declarations, cfg, point).ok_or_else(invalid)?, (caller, occurrence.0), None)))
         .collect::<Result<Vec<_>, String>>()?;
+    let mut ordinary_array_receivers = BTreeMap::new();
+    for (caller, cfg, root, receiver, paths, demanded) in ordinary_array_requests {
+        let Some(arms) = paths.iter().map(|&(point, call)|
+            Some((target_body(&declarations, cfg, point)?, (caller, call.0))))
+            .collect::<Option<Vec<_>>>() else {
+            if demanded { return Err(invalid()); }
+            continue;
+        };
+        if demanded {
+            ordinary_array_receivers.insert((caller, root.0), receiver);
+            pending.extend(arms.into_iter().map(|(target, site)| (target, site, None)));
+        } else {
+            let group = groups.len();
+            for &(target, _) in &arms {
+                groups_by_target.entry(target).or_default().push(group);
+            }
+            groups.push(Some(((caller, root.0), receiver, arms)));
+        }
+    }
     // First collect each reachable shape once, recording all exact incoming
     // call occurrences including shared suffixes and duplicate targets.
     while let Some((target, incoming, expected)) = pending.pop() {
@@ -7333,6 +7345,15 @@ fn closed_aggregates<'a>(
         }
         let (route, dependencies, ty) = guarded_array_cohort(target).ok_or_else(invalid)?;
         if expected.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
+        // Once any arm selects the private descriptor ABI, the receiver is an
+        // atomic cohort: enroll every mutually exclusive arm before the use
+        // census. Each group and each target edge is visited at most once.
+        for group in groups_by_target.remove(&target).into_iter().flatten() {
+            if let Some((site, receiver, arms)) = groups[group].take() {
+                ordinary_array_receivers.insert(site, receiver);
+                pending.extend(arms.into_iter().map(|(target, site)| (target, site, None)));
+            }
+        }
         ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
         guarded_array_cohorts.insert(target, (route, ty, BTreeSet::from([incoming])));
         if dependencies.is_empty() {
@@ -7360,20 +7381,13 @@ fn closed_aggregates<'a>(
     }
     if !unresolved.is_empty() { return Err(invalid()); }
     ordinary.census(reservations, &module_at, &declarations);
-    let mut ordinary_array_receivers = BTreeMap::new();
-    for (target, (_, _, sites)) in &mut guarded_array_cohorts {
+    for (target, (_, _, sites)) in &guarded_array_cohorts {
         let observed = ordinary.transport_uses.get(target).and_then(Option::as_ref)
             .ok_or("guarded owned array cohort has an unknown use")?
             .iter().copied().collect::<BTreeSet<_>>();
         if !sites.is_subset(&observed) { return Err(invalid()); }
-        for &site in &observed {
-            if let Some(&(actual, receiver)) = ordinary_array_sites.get(&site).filter(|(actual, _)| actual == target) {
-                debug_assert_eq!(actual, *target);
-                ordinary_array_receivers.insert(site, receiver);
-                sites.insert(site);
-            } else if !sites.contains(&site) {
-                return Err("guarded owned array cohort has a non-guarded use".into());
-            }
+        if !observed.is_subset(sites) {
+            return Err("guarded owned array cohort has a non-guarded use".into());
         }
     }
     let mut ordinary_fallible_calls = BTreeSet::new();

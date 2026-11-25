@@ -5344,7 +5344,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let runtime_returned = binding.fallible_assignment.is_some()
                         && matches!(receiver.ty, ScalarType::RuntimeArray { .. })
                         && super::typecheck::guarded_runtime_rhs(primary);
-                    let walk_fallible_expression = !runtime_returned
+                    let ordinary_runtime_receive = !block.unsafe_context && self.generic_parameters.is_empty()
+                        && !binding.is_allocation && binding.fallible_assignment.is_none()
+                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+                        && matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+                        && super::typecheck::guarded_runtime_rhs(primary);
+                    let walk_fallible_expression = !runtime_returned && !ordinary_runtime_receive
                         && (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
@@ -5375,7 +5381,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         )?
                     } else if ordinary_aggregate {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryScalarAggregateInitializer)?
-                    } else if walk_fallible_expression || runtime_returned {
+                    } else if walk_fallible_expression || runtime_returned || ordinary_runtime_receive {
                         let previous = self.capture_call_points;
                         self.capture_call_points = true;
                         let result = self.expression(primary, scope, primary_ordinal);
@@ -5515,19 +5521,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
                         aggregate::same_runtime_array_type(&site.ty, &receiver.ty).then(|| source.clone())
                     })();
-                    let ordinary_array_receive = call_producer.filter(|&point|
-                        !block.unsafe_context && self.generic_parameters.is_empty()
-                            && !binding.is_allocation && binding.fallible_assignment.is_none()
-                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                            && matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
-                            && super::typecheck::guarded_runtime_rhs(primary)
-                            && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
-                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
-                                signature.parameters.as_slice() == [ScalarType::U64]
-                                    && matches!(signature.outputs.outputs.as_slice(), [output]
-                                        if aggregate::same_runtime_array_type(&output.ty, &receiver.ty)))
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
-                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
+                    let ordinary_array_receive = ordinary_runtime_receive
+                        .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty))
+                        .flatten();
                     let widened_move = outputs.secondary.is_empty()
                         && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
                     self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
@@ -5539,9 +5535,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         kind: ReferenceBindingKind::Declared,
                     };
                     self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
-                    if let Some(point) = ordinary_array_receive {
+                    if let Some(paths) = ordinary_array_receive {
                         self.proof_points.ordinary_array_receivers.insert(id.clone(), primary_ordinal);
-                        self.aggregate_result.ordinary_array_receivers.push((point, primary_ordinal, receiver.span));
+                        self.aggregate_result.ordinary_array_receivers.push((primary_ordinal, receiver.span, paths));
                     }
                     if let Some(source) = guarded_move {
                         declares_guarded_owner = true;
