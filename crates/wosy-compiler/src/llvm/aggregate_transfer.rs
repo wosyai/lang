@@ -499,6 +499,18 @@ pub(super) fn install_ordinary_array_descriptor<'ctx>(
         || binding.fallible_assignment.is_some() || binding.is_allocation
     { return Err("ordinary array receiver changed its prepared assignment boundary".into()); }
     let (backing, extent) = unpack_widened_owning_descriptor(context, state, value)?;
+    require_ordinary_array_backing(context, state, backing)?;
+    install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.local_runtime_extents.insert(backing, (span, LocalRuntimeExtent::OrdinaryDescriptor(extent), true));
+    Ok(true)
+}
+
+pub(super) fn require_ordinary_array_backing<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    backing: PointerValue<'ctx>,
+) -> Result<(), String> {
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing ordinary array receiver block")?;
     let present = context.append_basic_block(function, "ordinary.array_present");
@@ -508,10 +520,7 @@ pub(super) fn install_ordinary_array_descriptor<'ctx>(
     state.builder.position_at_end(absent);
     super::expression::emit_terminal_system_panic(context, state)?;
     state.builder.position_at_end(present);
-    install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
-    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.local_runtime_extents.insert(backing, (span, LocalRuntimeExtent::OrdinaryDescriptor(extent), true));
-    Ok(true)
+    Ok(())
 }
 
 pub(super) fn install_widened_owning_receiver<'ctx>(

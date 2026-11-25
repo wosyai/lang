@@ -2003,7 +2003,7 @@ fn store_widened_join<'ctx>(
     if !plan.widened_join_receivers.contains(&(receiver.name_span.start, receiver.name_span.end)) {
         return Ok(false);
     }
-    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, value)?;
+    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, false, value)?;
     Ok(true)
 }
 
@@ -2012,6 +2012,7 @@ fn install_widened_join<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     (name, declaration, ty): (&str, wosy_syntax::ByteSpan, &ScalarType),
     replace: bool,
+    nullable: bool,
     value: &EmitValue<'ctx>,
 ) -> Result<(), String> {
     let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
@@ -2024,6 +2025,9 @@ fn install_widened_join<'ctx>(
         .map_err(builder_error)?.into_pointer_value();
     let count = state.builder.build_extract_value(*pair, 1, "widened_join_extent")
         .map_err(builder_error)?.into_int_value();
+    if nullable {
+        aggregate_transfer::require_ordinary_array_backing(context, state, backing)?;
+    }
     if replace {
         let (previous, _) = state.storage.get(name).cloned().ok_or("missing widened join predecessor")?;
         if state.runtime_array_owners.get(name) != Some(&true)
@@ -4402,12 +4406,16 @@ fn emit_widened_join_replace<'ctx>(
 ) -> Result<bool, String> {
     let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
         .filter(|plan| !plan.widened_join_replacements.is_empty()) else { return Ok(false) };
-    let ([target], [rhs @ ScalarExpression::If { .. }]) =
+    let ([target], [rhs]) =
         (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
     let nodes = state.body_call_nodes.ok_or("missing prepared widened join replacement")?;
-    let Some((expected, _, owner)) = nodes.place_ordinal(&target.place)
-        .and_then(|ordinal| plan.widened_join_replacements.get(&ordinal)).copied()
+    let Some(destination) = nodes.place_ordinal(&target.place) else { return Ok(false) };
+    let Some((expected, _, owner)) = plan.widened_join_replacements.get(&destination).copied()
     else { return Ok(false) };
+    let nullable = plan.ordinary_array_descriptor_replacements.contains(&destination);
+    if !nullable && !matches!(rhs, ScalarExpression::If { .. }) {
+        return Err("widened replacement changed the prepared conditional".into());
+    }
     let crate::ScalarPlace::Name { name, .. } = &target.place
     else { return Err("widened join replacement requires a lexical owner".into()); };
     if nodes.expression_ordinal(rhs) != Some(expected)
@@ -4418,7 +4426,7 @@ fn emit_widened_join_replace<'ctx>(
         Some(project) => emit_project_typed_expression(context, state, rhs, &ty, project.module, project.modules)?,
         None => emit_typed_expression(context, state, rhs, &ty)?,
     };
-    install_widened_join(context, state, (name, owner, &ty), true, &pair)?;
+    install_widened_join(context, state, (name, owner, &ty), true, nullable, &pair)?;
     Ok(true)
 }
 

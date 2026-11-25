@@ -1293,7 +1293,15 @@ impl GuardedNumericExpression {
     }
 }
 
-pub(super) type OrdinaryArrayReceiver = (OccurrenceOrdinal, ByteSpan, Vec<(CfgPointId, OccurrenceOrdinal)>);
+#[derive(Clone, Copy, Debug)]
+pub(super) enum OrdinaryArrayDestination {
+    Declaration(ByteSpan),
+    Replace { destination: OccurrenceOrdinal, install: CfgPointId, declaration: ByteSpan },
+}
+
+pub(super) type OrdinaryArrayReceiver = (
+    OccurrenceOrdinal, OrdinaryArrayDestination, Vec<(CfgPointId, OccurrenceOrdinal)>,
+);
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
@@ -3082,6 +3090,7 @@ pub(crate) struct ClosedBody {
     pub(crate) replacement_index_observation: Option<usize>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     pub(crate) ordinary_array_descriptor_receivers: BTreeMap<usize, ByteSpan>,
+    pub(crate) ordinary_array_descriptor_replacements: BTreeSet<usize>,
     // Each exit's owning formals, in ascending declared slot order.
     pub(crate) input_releases: BTreeMap<CfgPointId, Vec<usize>>,
     pub(crate) input_release_guard: Option<usize>,
@@ -6705,7 +6714,8 @@ fn closed_aggregates<'a>(
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
             if is_monomorphic && arm.is_none() {
                 for (call, receiver, paths) in &facts.ordinary_array_receivers {
-                    let demanded = facts.ordinary_array_extent_demands.contains(call);
+                    let demanded = matches!(receiver, OrdinaryArrayDestination::Replace { .. })
+                        || facts.ordinary_array_extent_demands.contains(call);
                     if facts.ordinary_array_incompatible_uses.contains(call) {
                         if demanded { return Err("ordinary returned array extent requires one non-escaping lexical backing".into()); }
                         continue;
@@ -7808,8 +7818,17 @@ fn closed_aggregates<'a>(
                 result.bodies.entry(body).or_default().array_descriptor_calls.insert(call);
             }
         }
-        for (&(key, call), &receiver) in &ordinary_array_receivers {
-            result.bodies.entry(key).or_default().ordinary_array_descriptor_receivers.insert(call, receiver);
+        for (&(key, root), &receiver) in &ordinary_array_receivers {
+            let plan = result.bodies.entry(key).or_default();
+            match receiver {
+                OrdinaryArrayDestination::Declaration(receiver) => {
+                    plan.ordinary_array_descriptor_receivers.insert(root, receiver);
+                }
+                OrdinaryArrayDestination::Replace { destination, install, declaration } => {
+                    plan.widened_join_replacements.insert(destination.0, (root, install, declaration));
+                    plan.ordinary_array_descriptor_replacements.insert(destination.0);
+                }
+            }
         }
         for (&key, &choices) in &guarded_array_choices {
             result.bodies.entry(key).or_default().guarded_array_descriptor_choices.extend(choices);

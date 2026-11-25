@@ -15157,3 +15157,70 @@ if (observed(true, 2) != 99 || observed(true, 2) != 2
         }
     }
 }
+
+#[test]
+fn ordinary_fallible_runtime_array_replacement_retires_only_after_selected_success() {
+    let text = "%%start
+u8[](u64) _left = fn(count) { u8[count] fresh; fresh };
+u8[](u64) _right = fn(count) { u8[count] fresh; fresh };
+u64(bool, u64) replace = fn(first, count) {
+    u8[] target = [11, 13];
+    u64 previous = core.array_len(&target);
+    target = if (first) { _left(count) } else { _right(4) };
+    previous * 10 + core.array_len(&target)
+};
+if (replace(true, 3) != 23 || replace(false, 3) != 24) { core.system_panic(); };
+replace(true, 5);
+%%end";
+    let live = text.replace("    target = if", "    *u8 loan = &target[0];\n    target = if")
+        .replace("    previous * 10", "    *loan;\n    previous * 10");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let negative = prepare_initializer_test(&live, layout);
+        let rejected = analyze_scalar_build(&negative);
+        assert!(rejected.diagnostics().iter().any(|diagnostic|
+            diagnostic.labels.iter().any(|label| label.span.range.start == live.find("&target[0]").unwrap() as u32)),
+            "{:?}", rejected.diagnostics());
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+            ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible runtime owner replacement");
+            let module = context.create_module_from_ir(bytes).unwrap();
+            module.verify().unwrap();
+            let function = module.get_function(&self_tail_test_symbol(&source, project, "replace")).unwrap();
+            let blocks = function.get_basic_blocks();
+            let calls = |callee| blocks.iter().flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                |instruction| instruction.get_next_instruction())).filter(|&instruction|
+                CallSiteValue::try_from(instruction).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .collect::<Vec<_>>();
+            let free = calls(module.get_function("__wosy_core_free").unwrap());
+            assert_eq!(free.len(), 2);
+            let present = blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.array_present").unwrap();
+            let absent = blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.array_absent").unwrap();
+            assert_eq!(free[0].get_parent(), Some(*present));
+            assert_eq!(absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+            if let Some(out) = std::env::var_os("WOSY_RUNTIME_DESCRIPTOR_REPLACE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

@@ -5537,7 +5537,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
                     if let Some(paths) = ordinary_array_receive {
                         self.proof_points.ordinary_array_receivers.insert(id.clone(), primary_ordinal);
-                        self.aggregate_result.ordinary_array_receivers.push((primary_ordinal, receiver.span, paths));
+                        self.aggregate_result.ordinary_array_receivers.push((
+                            primary_ordinal, aggregate::OrdinaryArrayDestination::Declaration(receiver.span), paths,
+                        ));
                     }
                     if let Some(source) = guarded_move {
                         declares_guarded_owner = true;
@@ -6048,6 +6050,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some((_, _, _, arms)) = widened_join_replace {
                         self.aggregate_result.widened_join_arms.extend(arms);
                     }
+                    let descriptor_replace = (|| {
+                        if block.unsafe_context || !self.generic_parameters.is_empty()
+                            || group.projected_outputs().len() != 0 { return None; }
+                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+                        else { return None; };
+                        if !matches!(target.place, ScalarPlace::Name { .. })
+                            || !super::typecheck::guarded_runtime_rhs(value) { return None; }
+                        let rhs = group.rhs_evaluations().next()?.expression;
+                        let destination = group.destinations().next()?.destination;
+                        let DirectDestinationIdentity::Existing(owner) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        if owner.block_span != block.span
+                            || !self.widened_arrays.as_ref()?.contains(owner)
+                        { return None; }
+                        let ty = self.binding_types.get(owner)?;
+                        matches!(ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+                            .then(|| (destination, rhs, owner.declaration_span, ty.clone()))
+                    })();
+                    let mut descriptor_paths = None;
                     let ordinary_aggregate_replacement = (|| {
                         if block.unsafe_context || !self.generic_parameters.is_empty()
                             || group.projected_outputs().len() != 0
@@ -6104,10 +6125,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             _ => ExpressionReadMode::Ordinary,
                         };
                         let capture = self.capture_call_points;
-                        self.capture_call_points |= ordinary_payload.is_some();
+                        let descriptor_type = descriptor_replace.as_ref().filter(|(_, rhs, _, _)| *rhs == evaluation.expression)
+                            .map(|(_, _, _, ty)| ty);
+                        self.capture_call_points |= ordinary_payload.is_some() || descriptor_type.is_some();
                         let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode);
                         self.capture_call_points = capture;
                         let result = result?;
+                        if let Some(ty) = descriptor_type {
+                            descriptor_paths = self.guarded_runtime_call_paths(value, evaluation.expression, ty);
+                        }
                         if let Some(ty) = ordinary_payload {
                             if let Some(proof) = self.guarded_numeric_expression(value, evaluation.expression, ty) {
                                 scalar_rhs.as_mut().expect("eligible ordinary RHS group").push(proof);
@@ -6276,8 +6302,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 *destination == slot.destination && *target == id.declaration_span);
                             let widened_join_replace = widened_join_replace.filter(|(destination, _, target, _)|
                                 *destination == slot.destination && *target == id.declaration_span && capture.is_none());
+                            let descriptor_replace = descriptor_replace.as_ref()
+                                .filter(|(destination, _, target, _)| *destination == slot.destination
+                                    && *target == id.declaration_span && capture.is_none())
+                                .zip(descriptor_paths.take());
                             if widened_rebind.is_none() && widened_roundtrip.is_none() && widened_owning_replace.is_none()
-                                && widened_join_replace.is_none()
+                                && widened_join_replace.is_none() && descriptor_replace.is_none()
                                 && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
                                 && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
                             {
@@ -6315,6 +6345,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             if let Some((destination, rhs, target, _)) = widened_join_replace {
                                 self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
                                 self.aggregate_result.widened_join_replacements.insert(destination.0, (rhs.0, emitted.install, target));
+                            }
+                            if let Some(((destination, rhs, declaration, _), paths)) = descriptor_replace {
+                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                                self.aggregate_result.ordinary_array_receivers.push((*rhs,
+                                    aggregate::OrdinaryArrayDestination::Replace {
+                                        destination: *destination, install: emitted.install, declaration: *declaration,
+                                    }, paths));
                             }
                             self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
                                 && assignment.targets.len() == 1 && assignment.values.len() == 1);
