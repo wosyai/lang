@@ -3960,6 +3960,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         exact_type: Option<&ScalarType>, guarded: bool,
         ordinary: &mut Option<Vec<aggregate::GuardedNumericExpression>>,
     ) -> Result<(), ReferenceAnalysisError> {
+        if guarded && matches!((exact_type, value),
+            (Some(ScalarType::Struct(_)), ScalarExpression::StructLiteral { .. })
+            | (Some(ScalarType::Array { .. }), ScalarExpression::ArrayLiteral { .. }))
+        {
+            return self.guarded_inline_member(value, scope, ordinal);
+        }
         let candidate = (guarded || ordinary.is_some())
             && (matches!(value, ScalarExpression::Call { .. }) || self.call_sites.candidate_fallible_composite(value, ordinal));
         let before = self.cursor;
@@ -3997,6 +4003,48 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }))
         {
             *ordinary = None;
+        }
+        Ok(())
+    }
+
+    fn guarded_inline_member(
+        &mut self, value: &ScalarExpression, scope: ReferenceScopeId, ordinal: OccurrenceOrdinal,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let sites = self.call_sites;
+        let types = &sites.structure.checked_types;
+        let mut pending = vec![(value, ordinal)];
+        let mut no_ordinary = None;
+        while let Some((value, ordinal)) = pending.pop() {
+            let reject = || self.missing_context(expression_span(value),
+                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer);
+            let ty = types.expressions.get(&ordinal).ok_or_else(reject)?;
+            let parent = OccurrenceParent::Expression(ordinal);
+            match (ty, value) {
+                (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
+                    if sites.structure.copy_struct_literals.contains(&ordinal) =>
+                {
+                    for (position, field) in fields.iter().enumerate().rev() {
+                        let child = self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
+                        if !sites.structure.literal_fields.get(&child).is_some_and(|field| &field.structure == id) {
+                            return Err(reject());
+                        }
+                        pending.push((&field.value, child));
+                    }
+                }
+                (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+                    if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
+                        && *length != 0 && *length == elements.len() as u64 =>
+                {
+                    for (position, value) in elements.iter().enumerate().rev() {
+                        let child = self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
+                        if types.expressions.get(&child) != Some(element.as_ref()) { return Err(reject()); }
+                        pending.push((value, child));
+                    }
+                }
+                _ if aggregate::ordinary_value(ty) =>
+                    self.scalar_aggregate_member(value, scope, ordinal, Some(ty), true, &mut no_ordinary)?,
+                _ => return Err(reject()),
+            }
         }
         Ok(())
     }
@@ -13068,6 +13116,7 @@ pub(super) struct OccurrenceStructure {
     callful_total_unary: HashSet<OccurrenceOrdinal>,
     pub(super) callful_arguments: HashSet<OccurrenceOrdinal>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    copy_struct_literals: HashSet<OccurrenceOrdinal>,
     pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -13091,6 +13140,7 @@ impl OccurrenceStructure {
             callful_total_unary: HashSet::new(),
             callful_arguments: HashSet::new(),
             literal_fields: HashMap::new(),
+            copy_struct_literals: HashSet::new(),
             value_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -14517,6 +14567,9 @@ impl StructuralWalker<'_, '_> {
                 }
             }
             ScalarExpression::StructLiteral { fields, .. } => {
+                if self.occurrence_typing.take_copy_struct_literal(expression) {
+                    self.structure.copy_struct_literals.insert(ordinal);
+                }
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal = self.expression_at(
                         &field.value,

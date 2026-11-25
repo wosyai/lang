@@ -4750,6 +4750,9 @@ fn check_expression_type_in_module_expected(
             ));
             return ScalarType::Error;
         };
+        if structure.copy_policy == CopyPolicy::Copy {
+            inference.record_copy_struct_literal(expression);
+        }
         let mut seen = BTreeSet::new();
         let mut initialized = BTreeSet::new();
         for field in fields {
@@ -6715,6 +6718,53 @@ pub(super) fn guarded_runtime_rhs(expression: &ScalarExpression) -> bool {
     true
 }
 
+fn guarded_inline_struct_literal(
+    id: &ScalarStructId,
+    fields: &[ScalarStructLiteralField],
+    structs: &[ScalarStruct],
+    scope: &BTreeMap<String, ScalarType>,
+) -> bool {
+    let mut pending = vec![(id, fields, false)];
+    while let Some((id, fields, nested)) = pending.pop() {
+        let Some(structure) = structs.get(id.index).filter(|structure| &structure.id == id) else { return false; };
+        if fields.is_empty() || structure.fields.is_empty()
+            || (nested && structure.copy_policy != CopyPolicy::Copy)
+        { return false; }
+        let member_types = structure.fields.iter().map(|field| (field.name.as_str(), &field.ty))
+            .collect::<BTreeMap<_, _>>();
+        for field in fields {
+            let Some(ty) = member_types.get(field.name.as_str()).copied() else { return false; };
+            match (ty, &field.value) {
+                (ScalarType::Struct(inner), ScalarExpression::StructLiteral { fields, .. }) =>
+                    pending.push((inner, fields, true)),
+                (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+                    if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
+                        && *length != 0 && *length == elements.len() as u64 =>
+                {
+                    if !elements.iter().all(|value| guarded_inline_leaf(element, value, scope)) { return false; }
+                }
+                (_, value) if guarded_inline_leaf(ty, value, scope) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+fn guarded_inline_leaf(ty: &ScalarType, value: &ScalarExpression, scope: &BTreeMap<String, ScalarType>) -> bool {
+    if !is_guarded_struct_field_type(ty) { return false; }
+    match value {
+        ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } |
+        ScalarExpression::Char { .. } | ScalarExpression::Float { .. } => true,
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+            matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+        ScalarExpression::Name { name, .. } => scope.get(name) == Some(ty),
+        expression => matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
+            && (matches!(expression, ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty())
+                || guarded_numeric_rhs(ty, expression)),
+    }
+}
+
 fn pending_fallible_operator(
     binding: &ScalarBinding,
     structs: &[ScalarStruct],
@@ -6744,6 +6794,9 @@ fn pending_fallible_operator(
                 && *length != 0 && *length == elements.len() as u64
                 && elements.iter().all(|value| array_element(element, value)) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
+            if super::has_inline_aggregate_field(fields) {
+                return (!guarded_inline_struct_literal(id, fields, structs, scope)).then_some(operator);
+            }
             let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return Some(operator); };
             if fields.is_empty() || structure.fields.is_empty()
                 || !structure.fields.iter().all(|field| is_guarded_struct_field_type(&field.ty))

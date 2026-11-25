@@ -1410,6 +1410,11 @@ pub struct ScalarStructLiteralField {
     pub span: ByteSpan,
 }
 
+pub(crate) fn has_inline_aggregate_field(fields: &[ScalarStructLiteralField]) -> bool {
+    fields.iter().any(|field| matches!(&field.value,
+        ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarTypeArgument {
     pub ty: ScalarType,

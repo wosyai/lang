@@ -1095,6 +1095,69 @@ pub(super) fn write_fixed_array_literal<'ctx>(
     Ok(())
 }
 
+pub(super) struct GuardedInlineWrite<'ctx, 'module> {
+    offset: u64,
+    name: &'module str,
+    ty: &'module ScalarType,
+    value: GuardedInlineLeaf<'ctx>,
+}
+
+enum GuardedInlineLeaf<'ctx> {
+    Scalar(EmitValue<'ctx>),
+    FixedArray(Vec<EmitValue<'ctx>>),
+}
+
+pub(super) fn stage_guarded_inline<'ctx, 'module: 'literal, 'literal>(
+    state: &mut EmitState<'ctx, 'module>,
+    ty: &'literal ScalarType, expression: &'literal ScalarExpression,
+    emit_leaf: &mut impl FnMut(&mut EmitState<'ctx, 'module>, &ScalarExpression, &ScalarType) -> Result<EmitValue<'ctx>, String>,
+) -> Result<Vec<GuardedInlineWrite<'ctx, 'literal>>, String> {
+    let nodes = state.body_call_nodes.ok_or("guarded inline literal lacks prepared fields")?;
+    let mut pending = vec![(0u64, "", ty, expression)];
+    let mut staged = Vec::new();
+    while let Some((offset, name, ty, expression)) = pending.pop() {
+        let value = match (ty, expression) {
+            (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
+                for field in fields.iter().rev() {
+                    let member = nodes.literal_field(&field.value)
+                        .filter(|member| &member.structure == id).ok_or("guarded inline literal lost exact field")?;
+                    let delta = state.layouts.field(member).and_then(|layout| layout.offset)
+                        .ok_or("guarded inline literal lost field layout")?;
+                    let offset = offset.checked_add(delta).ok_or("invalid guarded inline field offset")?;
+                    let ty = nodes.checked_expression_type(&field.value).ok_or("missing guarded inline member type")?;
+                    pending.push((offset, field.name.as_str(), ty, &field.value));
+                }
+                continue;
+            }
+            (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+                if *length == elements.len() as u64 && matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32) =>
+                GuardedInlineLeaf::FixedArray(elements.iter().map(|value| emit_leaf(state, value, element))
+                    .collect::<Result<Vec<_>, _>>()?),
+            (ScalarType::Struct(_) | ScalarType::Array { .. }, _) =>
+                return Err("invalid guarded inline layout".into()),
+            _ => GuardedInlineLeaf::Scalar(emit_leaf(state, expression, ty)?),
+        };
+        staged.push(GuardedInlineWrite { offset, name, ty, value });
+    }
+    Ok(staged)
+}
+
+pub(super) fn write_guarded_inline<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    writes: Vec<GuardedInlineWrite<'ctx, '_>>, backing: PointerValue<'ctx>,
+) -> Result<(), String> {
+    for GuardedInlineWrite { offset, name, ty, value } in writes {
+        let destination = if offset == 0 && name.is_empty() { backing }
+            else { byte_layout_field_pointer(context, state, backing, offset, name)? };
+        match value {
+            GuardedInlineLeaf::Scalar(value) => store_value(context, state, destination, ty, value)?,
+            GuardedInlineLeaf::FixedArray(values) => write_fixed_array_literal(context, state, ty, values, destination)?,
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn emit_typed_expression<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,

@@ -15758,3 +15758,57 @@ if (guarded(true, 11, 9) != 99 || guarded(true, 7, 13) != 99
         }
     }
 }
+
+#[test]
+fn guarded_fallible_inline_aggregate_stages_copy_leaves_before_root_backing() {
+    let text = "%%start
+struct copy Payload { u8 mark; u64 first; u64 second; }
+struct Box { Payload inside; u64[2] samples; u64 tail; }
+u64(u64) _head = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _inner = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _sample = fn(count) { u32[count] scratch; core.array_len(&scratch) };
+u64(u64) observed = fn(count) {
+    Box result =? { .tail = _head(count); .inside = { .second = _inner(count); .first = 2; .mark = 3; };
+        .samples = [_sample(count), 5]; };
+    if (&result == null) { 99 } else {
+        result.inside.first ^ result.inside.second ^ result.samples[0] ^ result.samples[1] ^ result.tail
+    }
+};
+if (observed(1) != 99 || observed(2) != 99 || observed(3) != 99
+    || observed(0) != 7 || observed(4) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded inline Copy aggregate");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let observed = module.get_function(&self_tail_test_symbol(source, project, "observed")).unwrap();
+            let blocks = observed.get_basic_blocks();
+            let calls = |callee| blocks.iter().flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                |i| i.get_next_instruction())).filter(|&i|
+                CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .collect::<Vec<_>>();
+            assert_eq!(calls(module.get_function("__wosy_core_alloc").unwrap()).len(), 1);
+            assert_eq!(calls(module.get_function("__wosy_core_free").unwrap()).len(), 1);
+            let initialize = blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.initialize").unwrap();
+            assert_eq!(std::iter::successors(initialize.get_first_instruction(), |i| i.get_next_instruction())
+                .filter(|i| i.get_opcode() == InstructionOpcode::Store).count(), 6);
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_INLINE_TREE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

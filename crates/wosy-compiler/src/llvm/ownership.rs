@@ -1344,9 +1344,10 @@ fn transfer_guarded_runtime_owner<'ctx>(
     Ok(())
 }
 
-enum GuardedAggregateInitializer<'ctx, 'module> {
+enum GuardedAggregateInitializer<'ctx, 'module, 'literal> {
     Struct(memory::PreparedStructLiteral<'ctx, 'module>),
     Array(Vec<EmitValue<'ctx>>),
+    Inline(Vec<memory::GuardedInlineWrite<'ctx, 'literal>>),
 }
 
 pub(super) fn bind_guarded_scalar<'ctx>(
@@ -1431,8 +1432,18 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         }
     };
     let aggregate = match (materialized_ty, &binding.value, value) {
-        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
-            Some(GuardedAggregateInitializer::Struct(memory::prepare_struct_literal_with(state, id, fields, emit_member)?)),
+        (ScalarType::Struct(id), expression @ ScalarExpression::StructLiteral { fields, .. }, None) => {
+            if crate::scalar::has_inline_aggregate_field(fields)
+            {
+                Some(GuardedAggregateInitializer::Inline(
+                    memory::stage_guarded_inline(state, materialized_ty, expression, &mut emit_member)?,
+                ))
+            } else {
+                Some(GuardedAggregateInitializer::Struct(
+                    memory::prepare_struct_literal_with(state, id, fields, emit_member)?,
+                ))
+            }
+        }
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. }, None)
             if *length == elements.len() as u64 && matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32) =>
             Some(GuardedAggregateInitializer::Array(elements.iter().map(|value|
@@ -1472,8 +1483,12 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state.builder.position_at_end(initialized);
     if let Some(values) = aggregate {
         match values {
-            GuardedAggregateInitializer::Struct(values) => memory::write_struct_literal(context, state, values, backing)?,
-            GuardedAggregateInitializer::Array(values) => memory::write_fixed_array_literal(context, state, materialized_ty, values, backing)?,
+            GuardedAggregateInitializer::Struct(values) =>
+                memory::write_struct_literal(context, state, values, backing)?,
+            GuardedAggregateInitializer::Array(values) =>
+                memory::write_fixed_array_literal(context, state, materialized_ty, values, backing)?,
+            GuardedAggregateInitializer::Inline(values) =>
+                memory::write_guarded_inline(context, state, values, backing)?,
         }
     } else {
         let value = if let Some(rhs) = rhs {
