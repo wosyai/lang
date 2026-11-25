@@ -3076,6 +3076,7 @@ pub(crate) struct ClosedBody {
     pub(crate) signed_array_descriptor_calls: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) signed_array_descriptor_choices: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) signed_ordinary_array_descriptor_receivers: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
+    pub(crate) signed_ordinary_array_descriptor_replacements: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -7986,6 +7987,9 @@ fn closed_aggregates<'a>(
                 OrdinaryArrayDestination::Replace { destination, install, declaration } => {
                     plan.widened_join_replacements.insert(destination.0, (root, install, declaration));
                     plan.ordinary_array_descriptor_replacements.insert(destination.0);
+                    if let Some(domain) = plan.joined_signed_array_domain(paths) {
+                        plan.signed_ordinary_array_descriptor_replacements.insert(destination.0, domain);
+                    }
                 }
             }
         }

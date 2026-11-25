@@ -15222,6 +15222,27 @@ terminal(true, 5);
             let release_checked = analyze_scalar_build(&release);
             assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
             assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+            let module = &prepared.project().modules[0];
+            let mut reservations = crate::scalar::AggregateReservations {
+                modules: vec![0], target_layout: Some(layout), ..Default::default()
+            };
+            reservations.bodies.extend(module.items.iter().enumerate().filter_map(|(item, declaration)|
+                matches!(declaration, ScalarItem::Function(_)).then_some(((0, item, None), true))));
+            let plans = checked.aggregate(&reservations).unwrap();
+            for name in ["replace", "terminal"] {
+                let index = module.items.iter().position(|item|
+                    matches!(item, ScalarItem::Function(f) if f.name == name)).unwrap();
+                let plan = plans.body(0, index, None).unwrap();
+                let mut replacements = plan.signed_ordinary_array_descriptor_replacements.iter();
+                let (destination, receipt) = replacements.next().unwrap();
+                assert!(replacements.next().is_none());
+                assert_eq!(receipt, &(layout, ScalarType::U8));
+                assert!(plan.ordinary_array_descriptor_replacements.contains(destination));
+                let (root, _, _) = plan.widened_join_replacements[destination];
+                assert!(!plan.signed_array_descriptor_calls.contains_key(&root));
+                assert_eq!(plan.signed_array_descriptor_calls.len(), 2);
+                assert!(plan.signed_array_descriptor_calls.values().all(|arm| arm == receipt));
+            }
             for (route, project, output) in [
                 ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
                 ("project", true, emit_scalar_build_project_llvm(&checked)),

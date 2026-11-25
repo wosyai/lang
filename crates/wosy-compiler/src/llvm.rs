@@ -136,7 +136,10 @@ enum LocalRuntimeExtent<'ctx> {
         length: inkwell::values::IntValue<'ctx>,
         signed: Option<memory::SignedRuntimeAddressDomain>,
     },
-    WidenedLiteral(inkwell::values::IntValue<'ctx>),
+    WidenedLiteral {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
     OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),
 }
@@ -2009,7 +2012,7 @@ fn store_widened_join<'ctx>(
     if !plan.widened_join_receivers.contains(&(receiver.name_span.start, receiver.name_span.end)) {
         return Ok(false);
     }
-    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, false, value)?;
+    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, (false, None), value)?;
     Ok(true)
 }
 
@@ -2018,7 +2021,7 @@ fn install_widened_join<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     (name, declaration, ty): (&str, wosy_syntax::ByteSpan, &ScalarType),
     replace: bool,
-    nullable: bool,
+    (nullable, signed): (bool, Option<memory::SignedRuntimeAddressDomain>),
     value: &EmitValue<'ctx>,
 ) -> Result<(), String> {
     let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
@@ -2039,7 +2042,7 @@ fn install_widened_join<'ctx>(
         if state.runtime_array_owners.get(name) != Some(&true)
             || state.runtime_array_allocations.get(name) != Some(&true)
             || !matches!(state.local_runtime_extents.get(&previous),
-                Some((owner, LocalRuntimeExtent::WidenedLiteral(_), true)) if *owner == declaration)
+                Some((owner, LocalRuntimeExtent::WidenedLiteral { .. }, true)) if *owner == declaration)
         { return Err("widened join predecessor lost its exact owner".into()); }
         ownership::consume_runtime_array_release(context, state,
             ownership::RuntimeArrayRelease { pointer: previous.into(), live: None })?;
@@ -2047,7 +2050,7 @@ fn install_widened_join<'ctx>(
     }
     install_runtime_array_binding_owner(state, name, true, true, None);
     state.storage.insert(name.to_owned(), (backing, ty.clone()));
-    state.local_runtime_extents.insert(backing, (declaration, LocalRuntimeExtent::WidenedLiteral(count), true));
+    state.local_runtime_extents.insert(backing, (declaration, LocalRuntimeExtent::WidenedLiteral { length: count, signed }, true));
     Ok(())
 }
 
@@ -2066,7 +2069,7 @@ fn pack_widened_join_arm<'ctx>(
     let EmitValue::Basic(BasicValueEnum::PointerValue(backing)) = value else {
         return Err("missing widened join arm backing".into());
     };
-    let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(count), true)) = state.local_runtime_extents.get(backing)
+    let Some(&(owner, LocalRuntimeExtent::WidenedLiteral { length: count, .. }, true)) = state.local_runtime_extents.get(backing)
     else { return Err("missing widened join arm extent".into()) };
     if owner != *declaration || nodes.lexical_expression_declaration(expression) != Some(owner)
         || state.runtime_array_owners.get(name) != Some(&true)
@@ -2091,7 +2094,7 @@ fn store_widened_move<'ctx>(
     let ScalarExpression::Name { name: source, .. } = &binding.value else { return Ok(false) };
     let Some((backing, _)) = state.storage.get(source) else { return Ok(false) };
     let backing = *backing;
-    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral(_), checked)) =
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral { .. }, checked)) =
         state.local_runtime_extents.get(&backing)
     else { return Ok(false) };
     let [receiver] = binding.receivers.as_slice() else {
@@ -2171,7 +2174,7 @@ fn store_runtime_allocation<'ctx, 'module>(
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
     if !mutable {
         if tracked_extent {
-            let extent = if widened { LocalRuntimeExtent::WidenedLiteral(length) }
+            let extent = if widened { LocalRuntimeExtent::WidenedLiteral { length, signed: None } }
                 else { LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed } };
             state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
         }
@@ -4448,11 +4451,13 @@ fn emit_widened_join_replace<'ctx>(
         || nodes.lexical_existing_destination_span(&target.place) != Some(owner)
     { return Err("widened join replacement changed its prepared operands".into()); }
     let (_, ty) = state.storage.get(name).cloned().ok_or("missing widened join target declaration")?;
+    let signed = memory::SignedRuntimeAddressDomain::for_closed_receiver(state.target_layout, &ty,
+        plan.signed_ordinary_array_descriptor_replacements.get(&destination))?;
     let pair = match project {
         Some(project) => emit_project_typed_expression(context, state, rhs, &ty, project.module, project.modules)?,
         None => emit_typed_expression(context, state, rhs, &ty)?,
     };
-    install_widened_join(context, state, (name, owner, &ty), true, nullable, &pair)?;
+    install_widened_join(context, state, (name, owner, &ty), true, (nullable, signed), &pair)?;
     Ok(true)
 }
 
@@ -4506,12 +4511,12 @@ fn emit_widened_rebind<'ctx>(
     }
     let (backing, ty) = state.storage.get(source).cloned().ok_or("missing widened rebind source")?;
     let (previous, target_ty) = state.storage.get(target).cloned().ok_or("missing widened rebind destination")?;
-    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral(_), checked)) =
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral { .. }, checked)) =
         state.local_runtime_extents.get(&backing)
     else { return Err("missing exact widened rebind extent".into()) };
     if declaration != proof.source || backing == previous
         || !state.local_runtime_extents.get(&previous).is_some_and(|(declaration, extent, _)|
-            *declaration == proof.target && matches!(extent, LocalRuntimeExtent::WidenedLiteral(_)))
+            *declaration == proof.target && matches!(extent, LocalRuntimeExtent::WidenedLiteral { .. }))
         || [source, target].into_iter().any(|name| state.runtime_array_allocations.get(name) != Some(&true)
             || state.runtime_array_owners.get(name) != Some(&true))
     {

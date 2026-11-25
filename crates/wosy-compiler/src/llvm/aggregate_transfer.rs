@@ -451,7 +451,7 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
         } else if fresh.is_some() || plan.widened_owning_roundtrip
             .is_some_and(|(call, _, owner)| call == ordinal && owner == declaration)
         {
-            let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(length), true)) = state.local_runtime_extents.get(base)
+            let Some(&(owner, LocalRuntimeExtent::WidenedLiteral { length, .. }, true)) = state.local_runtime_extents.get(base)
             else { return Err("widened roundtrip argument has no current extent".into()); };
             if owner != declaration || state.storage.get(name).is_none_or(|(backing, _)| backing != base)
                 || state.runtime_array_owners.get(name) != Some(&true)
@@ -548,7 +548,7 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
         let (base, count) = unpack_widened_owning_descriptor(context, state, value)?;
         install_runtime_array_binding_owner(state, &receiver_slot.name, true, true, None);
         state.storage.insert(receiver_slot.name.clone(), (base, receiver_slot.ty.clone()));
-        state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
+        state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral { length: count, signed: None }, true));
     } else {
         install_widened_owning_local(context, state, (name, source), (&receiver_slot.name, receiver, &receiver_slot.ty),
             false, value)?;
@@ -572,7 +572,7 @@ pub(super) fn install_widened_owning_local<'ctx>(
     }
     let (previous, _) = state.storage.get(source_name).ok_or("missing original widened array backing")?;
     if !matches!(state.local_runtime_extents.get(previous),
-        Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == source)
+        Some((declaration, LocalRuntimeExtent::WidenedLiteral { .. }, true)) if *declaration == source)
     { return Err("widened owning receiver lost its active source extent".into()); }
     let previous = *previous;
     let (base, count) = unpack_widened_owning_descriptor(context, state, value)?;
@@ -581,7 +581,7 @@ pub(super) fn install_widened_owning_local<'ctx>(
         if *target == previous || state.runtime_array_owners.get(target_name) != Some(&true)
             || state.runtime_array_allocations.get(target_name) != Some(&true)
             || !matches!(state.local_runtime_extents.get(target),
-                Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == receiver)
+                Some((declaration, LocalRuntimeExtent::WidenedLiteral { .. }, true)) if *declaration == receiver)
         { return Err("widened owning install lost its distinct active target".into()); }
         let target = *target;
         ownership::consume_runtime_array_release(context, state,
@@ -591,7 +591,7 @@ pub(super) fn install_widened_owning_local<'ctx>(
     install_runtime_array_binding_owner(state, target_name, true, true, Some(source_name));
     state.storage.insert(target_name.to_owned(), (base, target_ty.clone()));
     state.local_runtime_extents.remove(&previous);
-    state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
+    state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral { length: count, signed: None }, true));
     Ok(())
 }
 
@@ -1135,12 +1135,12 @@ pub(super) fn install_literal_array_replacement<'ctx>(
         if let Some((_, _, owner)) = aggregate.plan.widened_owning_roundtrip.filter(|(ordinal, _, _)| *ordinal == call) {
             let (previous, ty) = state.storage.get(name).cloned().ok_or("missing widened roundtrip backing")?;
             if !matches!(state.local_runtime_extents.get(&previous),
-                Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == owner)
+                Some((declaration, LocalRuntimeExtent::WidenedLiteral { .. }, true)) if *declaration == owner)
             { return Err("widened roundtrip installation changed its owner".into()); }
             let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
             let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
             state.local_runtime_extents.remove(&previous);
-            state.local_runtime_extents.insert(base, (owner, LocalRuntimeExtent::WidenedLiteral(count), true));
+            state.local_runtime_extents.insert(base, (owner, LocalRuntimeExtent::WidenedLiteral { length: count, signed: None }, true));
             state.storage.insert(name.to_owned(), (base, ty));
             return Ok(());
         }

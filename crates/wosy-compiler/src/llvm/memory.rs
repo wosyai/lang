@@ -423,7 +423,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let checked_lexical_descriptor = runtime_extent.is_some()
                 && state.local_runtime_extents.get(&base_pointer)
                     .is_some_and(|(_, extent, _)| matches!(extent,
-                        LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral(_)));
+                        LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral { .. }));
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = guarded_extent {
@@ -632,6 +632,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
             Ok(Some(*length))
         }
         LocalRuntimeExtent::OrdinaryDescriptor { length, signed }
+        | LocalRuntimeExtent::WidenedLiteral { length, signed }
             if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
         {
             if for_index && signed.is_some_and(|domain| !domain.matches_consumer(state.target_layout, element)) {
@@ -639,9 +640,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
             }
             Ok(Some(*length))
         }
-        LocalRuntimeExtent::WidenedLiteral(length)
-            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
-                Ok(Some(*length)),
+
         LocalRuntimeExtent::OwningFormal(length)
             if !for_index && *storage == address && state.runtime_array_allocations.get(name) == Some(&false) =>
                 Ok(Some(*length)),
