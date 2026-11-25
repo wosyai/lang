@@ -13,3 +13,6 @@ text-size = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[dependencies.blake3]
+workspace = true

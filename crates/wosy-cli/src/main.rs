@@ -5,10 +5,10 @@ use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 #[cfg(test)]
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::process::ExitCode;
@@ -21,11 +21,9 @@ use wosy_compiler::{
     LlvmPartition, ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
-    artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
-    publish_artifact, ArtifactIdentity, ContentRevision, NamespaceEdgeInput, NamespacePackages,
-    PackageRelativePath, ProjectConfiguration, ProjectContext,
-    SourceIdentity as ProjectSourceIdentity, SourceNodeInput, SourceObservation,
-    SourceSpan as ProjectSourceSpan,
+    artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,
+    ArtifactIdentity, ContentRevision, PackageRelativePath, ProjectConfiguration, ProjectContext,
+    SourceIdentity as ProjectSourceIdentity, SourceObservation,
 };
 #[cfg(test)]
 use wosy_compiler::parse_source;
@@ -455,132 +453,38 @@ fn compile_project(
     target_layout: ScalarTargetLayout,
     root_exports: Option<&BTreeMap<String, String>>,
 ) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
-    let root_path = PackageRelativePath::new(project.source_root.clone())?;
-    let root_project = root.to_string_lossy().into_owned();
-    let packages = NamespacePackages {
-        root_name: &project.package,
-        root_source: configuration.module_source_root.as_ref(),
-        dependencies: &configuration.resolved_packages,
-    };
-    let mut discovered = HashMap::from([(
-        project.package.as_str(),
-        HashSet::from([root_path.clone()]),
-    )]);
-    let mut pending = VecDeque::from([(project.package.as_str(), root_path, None::<fs::File>)]);
-    let mut root_node = None;
-    let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
-
-    while let Some((package, path, checked_git_source)) = pending.pop_front() {
-        let (package_root, project_identity) = if package == project.package {
-            (root, root_project.clone())
-        } else {
-            let resolved = configuration
-                .resolved_packages
-                .get(package)
-                .ok_or_else(|| format!("dependency package {package} is missing"))?;
-            (
-                resolved.project_root.as_path(),
-                resolved.identity.project.clone(),
-            )
-        };
-        let source_path = package_root.join(path.as_path());
-        let read_error = |error| format!("failed to read {}: {error}", source_path.display());
-        let text = if let Some(mut file) = checked_git_source {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(read_error)?;
-            text
-        } else {
-            fs::read_to_string(&source_path).map_err(read_error)?
-        };
-        let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
-        let source = SourceIdentity::new(
-            project_identity,
-            package.to_owned(),
-            path.as_path().to_string_lossy().replace('\\', "/"),
-            revision.clone(),
-        );
-        let (fresh, diagnostics) =
-            parse_source_with_snapshot(source, text, &project.comment_categories);
-        let result = fresh.result();
-        let source = &result.source;
-        render_diagnostics(&result.text, &diagnostics, source);
-        if !diagnostics.is_empty() {
-            return Err("build rejected by syntax diagnostics".to_owned());
-        }
-        persist_cst(root, &source.revision, &fresh.snapshot_json_serializable())?;
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.extractions += 1);
-        let declarations = derive_scalar_declarations_from_cst(result.canonical_cst());
-        let mut namespace_edges = Vec::new();
-        for namespace in declarations.namespaces() {
-            let module_path = serde_json::from_str::<String>(&namespace.path)
-                .map_err(|error| format!("invalid namespace path: {error}"))?;
-            let module_path = PackageRelativePath::new(module_path.into())?;
-            let module = packages
-                .resolve(&namespace.package, &module_path)
-                .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
-            let target_package = module.package;
-            let already_discovered = discovered
-                .get(target_package)
-                .is_some_and(|paths| paths.contains(module.path.as_ref()));
-            if !already_discovered {
-                let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
-                    checkout.source(module.path.as_path())?.map(Some)
-                } else {
-                    let target_root = module
-                        .dependency
-                        .map_or(root, |resolved| resolved.project_root.as_path());
-                    target_root.join(module.path.as_path()).is_file().then_some(None)
-                };
-                if let Some(checked_git_source) = available {
-                    let target_path = module.path.into_owned();
-                    discovered
-                        .entry(target_package)
-                        .or_default()
-                        .insert(target_path.clone());
-                    pending.push_back((target_package, target_path, checked_git_source));
-                }
+    let graph = wosy_cli::project_sources::load(
+        root,
+        project,
+        configuration,
+        true,
+        |source, revision, text| {
+            let identity = compiler_source_identity(source, revision);
+            let (fresh, diagnostics) =
+                parse_source_with_snapshot(identity, text, &project.comment_categories);
+            let result = fresh.result();
+            render_diagnostics(&result.text, &diagnostics, &result.source);
+            if !diagnostics.is_empty() {
+                return Err("build rejected by syntax diagnostics".to_owned());
             }
-            namespace_edges.push(NamespaceEdgeInput {
-                origin: namespace.package.clone(),
-                path: module_path,
-                binding: namespace.binding.clone(),
-                span: ProjectSourceSpan {
-                    source: ProjectSourceIdentity::new(
-                        source.project.clone(),
-                        source.package.clone(),
-                        path.clone(),
-                    ),
-                    range: wosy_project::ByteSpan::new(namespace.span.start, namespace.span.end),
-                },
-            });
+            persist_cst(root, &result.source.revision, &fresh.snapshot_json_serializable())?;
+            #[cfg(test)]
+            routing_observations::record(|counts| counts.extractions += 1);
+            let declarations = derive_scalar_declarations_from_cst(result.canonical_cst());
+            let imports = wosy_cli::project_sources::imports(&declarations)?;
+            declarations_by_path.insert((source.package.clone(), source.path.clone()), declarations);
+            texts.insert(source.clone(), fresh.into_result().text);
+            Ok(imports)
+        },
+    )
+    .map_err(|error| match error {
+        wosy_cli::project_sources::Error::Observe(error) => error,
+        wosy_cli::project_sources::Error::Graph(error) => {
+            render_graph_diagnostics(&error, &texts);
+            format_graph_error(error)
         }
-        let graph_source = ProjectSourceIdentity::new(
-            source.project.clone(),
-            source.package.clone(),
-            path.clone(),
-        );
-        let node = SourceNodeInput {
-            source: graph_source.clone(),
-            content_revision: ContentRevision(revision),
-            namespace_edges,
-        };
-        if root_node.is_none() {
-            root_node = Some(node);
-        } else {
-            nodes.push(node);
-        }
-        declarations_by_path.insert((package, path), declarations);
-        texts.insert(graph_source, fresh.into_result().text);
-    }
-    drop((discovered, pending));
-
-    let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(&packages, root_node, nodes).map_err(|error| {
-        render_graph_diagnostics(&error, &texts);
-        format_graph_error(error)
     })?;
     let source_identities: Vec<_> = graph
         .nodes
@@ -592,7 +496,7 @@ fn compile_project(
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
         let declarations = declarations_by_path
-            .remove(&(node.source.package.as_str(), node.source.path.clone()))
+            .remove(&(node.source.package.clone(), node.source.path.clone()))
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",

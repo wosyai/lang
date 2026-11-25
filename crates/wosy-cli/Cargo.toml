@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rowan.workspace = true
+wosy-protocol = { path = "../wosy-protocol" }
 blake3.workspace = true
 clap.workspace = true
 codespan-reporting.workspace = true
@@ -19,4 +21,6 @@ name = "wosy"
 path = "src/main.rs"
 
 [dev-dependencies]
+wosy-daemon = { path = "../wosy-daemon" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 toml_edit.workspace = true

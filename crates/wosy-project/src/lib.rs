@@ -274,15 +274,22 @@ impl<'a> NamespacePackages<'a> {
             let (name, resolved) = self.dependencies.get_key_value(origin)?;
             (name.as_str(), Some(resolved), Some(&resolved.identity.path))
         };
-        let path = match source_root.map(PackageRelativePath::as_path) {
-            Some(root) => Cow::Owned(PackageRelativePath::new(root.join(path.as_path())).ok()?),
-            _ => Cow::Borrowed(path),
-        };
+        let path = namespace_module_path(source_root, path).ok()?;
         Some(NamespaceModule {
             package,
             dependency,
             path,
         })
+    }
+}
+
+pub fn namespace_module_path<'a>(
+    root: Option<&PackageRelativePath>,
+    path: &'a PackageRelativePath,
+) -> Result<Cow<'a, PackageRelativePath>, String> {
+    match root {
+        Some(root) => PackageRelativePath::new(root.as_path().join(path.as_path())).map(Cow::Owned),
+        None => Ok(Cow::Borrowed(path)),
     }
 }
 

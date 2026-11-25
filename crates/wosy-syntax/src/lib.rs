@@ -104,7 +104,17 @@ impl Language for WosyLanguage {
     type Kind = SyntaxKind;
 
     fn kind_from_raw(raw: rowan::SyntaxKind) -> SyntaxKind {
-        match raw.0 {
+        SyntaxKind::try_from_raw(raw.0).unwrap_or_else(|| panic!("invalid syntax kind: {}", raw.0))
+    }
+
+    fn kind_to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
+        rowan::SyntaxKind(kind as u16)
+    }
+}
+
+impl SyntaxKind {
+    pub fn try_from_raw(raw: u16) -> Option<Self> {
+        Some(match raw {
             0 => SyntaxKind::Root,
             1 => SyntaxKind::Error,
             2 => SyntaxKind::Whitespace,
@@ -189,12 +199,8 @@ impl Language for WosyLanguage {
             82 => SyntaxKind::DirectFieldChainTail,
             83 => SyntaxKind::ValueField,
             84 => SyntaxKind::InvalidTemporaryPlace,
-            _ => panic!("invalid syntax kind: {}", raw.0),
-        }
-    }
-
-    fn kind_to_raw(kind: SyntaxKind) -> rowan::SyntaxKind {
-        rowan::SyntaxKind(kind as u16)
+            _ => return None,
+        })
     }
 }
 
@@ -823,37 +829,59 @@ fn collect_comments(
     comments: &mut Vec<TypedComment>,
 ) {
     if pair.as_rule() == Rule::comment {
-        let span = pair.as_span();
-        let mut children = pair.into_inner();
-        let category_pair = children
-            .find(|child| matches!(child.as_rule(), Rule::typed_comment | Rule::untyped_comment))
-            .expect("comment category pair");
-        let typed = category_pair.as_rule() == Rule::typed_comment;
-        let mut fields = category_pair.into_inner();
-        let category = fields.next().expect("comment category");
-        let payload = fields.next();
-        let category_text = category.as_str();
-        let raw_payload = payload.map_or_else(String::new, |pair| pair.as_str().to_owned());
-        let valid = typed
-            && !category_text.is_empty()
-            && configured.iter().any(|item| item == category_text);
-        if !valid {
+        let comment = comment_from_pair(pair, 0, configured);
+        if !comment.valid {
             errors.push(SyntaxError {
-                span: ByteSpan::new(span.start() as u32, span.end() as u32),
+                span: comment.span,
                 message: "invalid or unconfigured typed comment".to_owned(),
             });
         }
-        comments.push(TypedComment {
-            span: ByteSpan::new(span.start() as u32, span.end() as u32),
-            category: category_text.to_owned(),
-            raw_payload,
-            valid,
-        });
+        comments.push(comment);
         return;
     }
     for child in pair.into_inner() {
         collect_comments(child, configured, errors, comments);
     }
+}
+
+fn comment_from_pair(pair: Pair<'_, Rule>, offset: u32, configured: &[String]) -> TypedComment {
+    let span = pair.as_span();
+    let mut children = pair.into_inner();
+    let category_pair = children
+        .find(|child| matches!(child.as_rule(), Rule::typed_comment | Rule::untyped_comment))
+        .expect("comment category pair");
+    let typed = category_pair.as_rule() == Rule::typed_comment;
+    let mut fields = category_pair.into_inner();
+    let category = fields.next().expect("comment category");
+    let payload = fields.next();
+    let category_text = category.as_str();
+    TypedComment {
+        span: ByteSpan::new(offset + span.start() as u32, offset + span.end() as u32),
+        category: category_text.to_owned(),
+        raw_payload: payload.map_or_else(String::new, |pair| pair.as_str().to_owned()),
+        valid: typed
+            && !category_text.is_empty()
+            && configured.iter().any(|item| item == category_text),
+    }
+}
+
+/// Decode one already-classified CST comment token with the scanner's own
+/// grammar and field projection, at the file-relative range supplied by Rowan.
+pub fn typed_comment_from_token(
+    text: &str,
+    offset: u32,
+    configured: &[String],
+) -> Option<TypedComment> {
+    let scan = WosyParser::parse(Rule::comment_scan, text).ok()?.next()?;
+    let pair = scan.into_inner().find(|part| part.as_rule() == Rule::comment)?;
+    let span = pair.as_span();
+    let end = span.end();
+    if span.start() != 0 || end != text.len() {
+        return None;
+    }
+    offset.checked_add(u32::try_from(end).ok()?)?;
+    let comment = comment_from_pair(pair, offset, configured);
+    comment.valid.then_some(comment)
 }
 
 fn kind(rule: Rule) -> SyntaxKind {
@@ -2824,4 +2852,11 @@ mod tests {
         assert_eq!(literals[0].1, ByteSpan::new(16, 28));
         assert_eq!(literals[1].1, ByteSpan::new(38, 42));
     }
+}
+
+/// Version of the Rowan base CST encoder/validator; bump on incompatible
+/// scanner or tree-construction changes (grammar bytes are always included).
+pub fn base_cst_schema() -> &'static [u8; 32] {
+    static ID: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    ID.get_or_init(|| blake3::derive_key("wosy base CST grammar, scanner, and Rowan encoding v3", include_bytes!("grammar.pest")))
 }
