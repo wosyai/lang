@@ -90,6 +90,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) checked_named_scalar_stores: Vec<super::CfgPointId>,
     pub(super) private_runtime_formal_stores: HashMap<super::CfgPointId, OccurrenceOrdinal>,
     pub(super) private_runtime_formal_copy_stores: HashMap<super::CfgPointId, (OccurrenceOrdinal, ScalarStructFieldId)>,
+    pub(super) private_runtime_formal_copy_borrows: Vec<PrivateCopyFieldBorrow>,
     pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
     pub(super) joined_reborrow_descendants: Vec<super::CfgPointId>,
     pub(super) joined_shared_aliases: Vec<(super::CfgPointId, super::CfgPointId)>,
@@ -711,6 +712,17 @@ pub(super) enum BlockItemKind {
     Evaluation { expression: OccurrenceOrdinal },
     FinalOutput(FinalOutputSlot),
     Assignment { group: BlockPosition },
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PrivateCopyFieldBorrow {
+    pub(super) issuance: super::CfgPointId,
+    pub(super) parent_read: super::CfgPointId,
+    pub(super) parent: super::ReferenceOriginId,
+    pub(super) child: super::ReferenceOriginId,
+    pub(super) leaf: OccurrenceOrdinal,
+    pub(super) prefix: OccurrenceOrdinal,
+    pub(super) field: ScalarStructFieldId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

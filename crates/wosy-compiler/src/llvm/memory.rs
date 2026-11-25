@@ -391,11 +391,13 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 return Err("LLVM indexed place requires an array".to_owned());
             }
             let formal_receipt = state.aggregate.as_ref().filter(|aggregate|
-                !aggregate.plan().private_runtime_reads.is_empty() || !aggregate.plan().private_runtime_writes.is_empty())
+                !aggregate.plan().private_runtime_reads.is_empty() || !aggregate.plan().private_runtime_writes.is_empty()
+                    || !aggregate.plan().private_runtime_copy_borrows.is_empty())
                 .and_then(|aggregate| {
                     let nodes = state.body_call_nodes?;
                     let ordinal = nodes.place_ordinal(place)?;
-                    (aggregate.plan().private_runtime_reads.contains(&ordinal) || aggregate.plan().private_runtime_writes.contains(&ordinal))
+                    (aggregate.plan().private_runtime_reads.contains(&ordinal) || aggregate.plan().private_runtime_writes.contains(&ordinal)
+                        || aggregate.plan().private_runtime_copy_borrows.values().next().is_some_and(|(prefix, _)| *prefix == ordinal))
                         .then_some((aggregate, nodes))
                 });
             let portable_formal = formal_receipt.is_some_and(|(aggregate, _)|
@@ -409,7 +411,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 { return Err("private runtime index changed its prepared formal".into()); }
                 if let ScalarType::Struct(id) = element.as_ref() {
                     if portable_formal || (aggregate.plan().private_runtime_copy_fields.is_empty()
-                        && aggregate.plan().private_runtime_copy_writes.is_empty()) {
+                        && aggregate.plan().private_runtime_copy_writes.is_empty()
+                        && aggregate.plan().private_runtime_copy_borrows.is_empty()) {
                         return Err("private runtime Copy index lacks its signed field plan".into());
                     }
                     private_runtime_copy_row(state, id)?;
@@ -645,7 +648,8 @@ fn require_runtime_field_extent(
         let receipt = |rows: &std::collections::HashMap<_, _>| rows.get(&leaf)
             .is_some_and(|(actual_prefix, actual_field)| *actual_prefix == prefix && actual_field == field);
         let exact = (plan.private_runtime_reads.contains(&prefix) && receipt(&plan.private_runtime_copy_fields))
-            || (plan.private_runtime_writes.contains(&prefix) && receipt(&plan.private_runtime_copy_writes));
+            || (plan.private_runtime_writes.contains(&prefix) && receipt(&plan.private_runtime_copy_writes))
+            || receipt(&plan.private_runtime_copy_borrows);
         if !exact || &field.structure != id || nodes.checked_expression_type(index) != Some(&ScalarType::U64)
             || !matches!(nodes.checked_place_type(base), Some(ScalarType::Struct(actual)) if actual == id)
         { return Err("runtime Copy field changed its private formal projection".into()); }

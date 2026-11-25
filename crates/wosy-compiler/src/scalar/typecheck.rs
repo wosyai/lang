@@ -5519,6 +5519,41 @@ fn checked_address_type_in_module(
             return ScalarType::Error;
         }
     }
+    // This nominates a checked field place for typing only. The solved private
+    // runtime cohort still has to authenticate the actual formal, child loan,
+    // lexical uses and original backing/extent before lowering.
+    if mutability == ScalarReferenceMutability::Shared {
+        if let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = place {
+            if let ScalarPlace::Index { base, index, .. } = base.as_ref() {
+                if let (ScalarPlace::Dereference { pointer, .. }, ScalarExpression::Name { name: selector, .. }) =
+                    (base.as_ref(), index.as_ref())
+                {
+                    if let ScalarExpression::Name { name: parent, .. } = pointer.as_ref() {
+                        if scope.get(selector) == Some(&ScalarType::U64)
+                            && matches!(scope.get(parent), Some(ScalarType::CheckedReference {
+                                mutability: ScalarReferenceMutability::Shared, inner,
+                            }) if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+                                if matches!(element.as_ref(), ScalarType::Struct(id) if id == &field.structure)))
+                        {
+                            let inner = check_place_type_in_module(
+                                place, scope, module, modules, diagnostics, overloads, inference,
+                                PlaceTypeMode::IndexedRead { unsafe_context: false },
+                            );
+                            if super::reference::aggregate::ordinary_value(&inner) {
+                                inference.record_place_type(place, &inner);
+                                return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+                            }
+                            if inner != ScalarType::Error {
+                                diagnostics.push(module_diagnostic(module, "B0003",
+                                    "checked runtime field borrow requires an ordinary Copy field", span));
+                            }
+                            return ScalarType::Error;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
             module,

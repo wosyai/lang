@@ -816,7 +816,8 @@ pub(super) fn definition_type<'ctx>(
         }
         if !(crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs)
             || (crate::scalar::private_runtime_copy_read_signature(parameters, &outputs.outputs)
-                && plan.is_some_and(|body| !body.private_runtime_copy_fields.is_empty() && body.private_runtime_writes.is_empty()
+                && plan.is_some_and(|body| (!body.private_runtime_copy_fields.is_empty()
+                    || body.private_runtime_copy_borrows.len() == 1) && body.private_runtime_writes.is_empty()
                     && body.private_runtime_read_forward.is_none() && !body.private_runtime_portable_formal)))
         { return Err("private runtime array accessor changed its prepared signature".into()); }
         return Ok(basic_type(context, &outputs.outputs[0].ty, layout)?

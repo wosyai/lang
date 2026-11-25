@@ -3501,6 +3501,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if parent_id.is_none() && self.exact_local_runtime_copy_row(place, place_ordinal, ordinal, *mutability) {
                         self.proof_points.runtime_field_borrows.insert(span, (borrow, id));
                     }
+                    if self.capture_private_runtime_reads && *mutability == ScalarReferenceMutability::Shared {
+                        if let Some((pointer, parent)) = named_parent_point.zip(parent_id).filter(|(_, parent)|
+                            matches!(self.cfg.facts.get(parent.0), Some(ReferenceOrigin::BorrowedFrom { parameter: 0, .. })))
+                        {
+                            if let Some((prefix, field)) = self.private_runtime_copy_borrow_prefix(
+                                proof_place.as_ref(), place_ordinal, ordinal, pointer,
+                            ) {
+                                self.proof_points.private_runtime_formal_copy_borrows.push(super::control::PrivateCopyFieldBorrow {
+                                    issuance: borrow, parent_read: pointer, parent, child: id,
+                                    leaf: place_ordinal, prefix, field,
+                                });
+                            }
+                        }
+                    }
                     if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
                         self.has_projected_child |= is_direct_checked_leaf(place);
                         self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
@@ -5164,6 +5178,43 @@ impl<'a> ReferenceFlowBuilder<'a> {
             occurrence: occurrence.0, pointer, handle: binding.declaration_span, origin,
             reached: false, refused: false, portable_install: None,
         })
+    }
+
+    fn private_runtime_copy_borrow_prefix(
+        &mut self, place: &ScalarPlace, leaf: OccurrenceOrdinal, expression: OccurrenceOrdinal,
+        parent_read: CfgPointId,
+    ) -> Option<(OccurrenceOrdinal, ScalarStructFieldId)> {
+        let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = place else { return None; };
+        let ScalarPlace::Index { base, index, .. } = base.as_ref() else { return None; };
+        let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) || !matches!(index.as_ref(), ScalarExpression::Name { .. }) {
+            return None;
+        }
+        let [formal, selector] = self.call_sites.boundary.parameters.as_slice() else { return None; };
+        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = &formal.ty else { return None; };
+        let ScalarType::RuntimeArray { element, .. } = inner.as_ref() else { return None; };
+        let ScalarType::Struct(id) = element.as_ref() else { return None; };
+        let prefix = self.place_ordinal(OccurrenceParent::Place(leaf), OccurrenceEdge::PlaceBase);
+        let root = self.place_ordinal(OccurrenceParent::Place(prefix), OccurrenceEdge::PlaceBase);
+        let selector_site = self.expression_ordinal(OccurrenceParent::Place(prefix), OccurrenceEdge::PlaceIndex);
+        let types = &self.call_sites.structure.checked_types;
+        let target = types.places.get(&leaf)?;
+        let CfgPointKind::Read { binding } = &self.cfg.points.get(parent_read.0)?.kind else { return None; };
+        if &field.structure != id || formal.span != binding.declaration_span || !aggregate::ordinary_value(target)
+            || types.places.get(&prefix) != Some(element.as_ref())
+            || types.expressions.get(&selector_site) != Some(&ScalarType::U64)
+            || !matches!(self.call_sites.prepared_plain_name(selector_site), Some(PlainNameIdentity::Lexical(actual))
+                if actual.declaration_span == selector.span)
+            || !matches!(self.call_sites.prepared_plain_name(self.expression_ordinal(
+                    OccurrenceParent::Place(root), OccurrenceEdge::DereferencePointer)),
+                Some(PlainNameIdentity::Lexical(actual)) if actual == binding)
+            || !matches!(types.expressions.get(&expression), Some(ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared, inner,
+            }) if inner.as_ref() == target)
+        { return None; }
+        (*self.copy_runtime_field_structs.get_or_insert_with(HashMap::new).entry(id.clone())
+            .or_insert_with(|| self.structs.iter().any(|item| item.id == *id && item.copy_policy == CopyPolicy::Copy)))
+            .then(|| (prefix, field.clone()))
     }
 
     fn private_runtime_formal_store(
@@ -17203,6 +17254,7 @@ fn derive_module_reference_cohort(
                     && aggregate::private_runtime_read_declaration(function)
                     && result.cfg.runtime_array_read_sites.keys().any(|&point| result.cfg.pending_runtime_array_formal(point).is_some()))
                 || !result.proof_points.private_runtime_formal_stores.is_empty()
+                || !result.proof_points.private_runtime_formal_copy_borrows.is_empty()
             ) {
                 pending_runtime_read(index);
             }
