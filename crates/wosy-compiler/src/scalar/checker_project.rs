@@ -3300,6 +3300,49 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn exact_contextual_debit_forwarder(
+        &self, owner: &ScalarModule, body: &FunctionCallSites, parameter: &ScalarType,
+        cohort: &ContextualProofCohort,
+    ) -> Option<()> {
+        use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+        let (formal, ty) = body.contextual_formal()?;
+        let [input] = body.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+        if !body.checker_returns_unit() || !body.assignments.is_empty() || !body.arms.is_empty()
+            || !body.structure.checker_directives.is_empty() || !body.callable_escapes.is_empty()
+        {
+            return None;
+        }
+        let [site] = body.call_occurrences.as_slice() else { return None; };
+        let [statement] = body.structure.blocks.get(body.structure.root.0)?.items.as_slice() else { return None; };
+        let BlockItemKind::Evaluation { expression: call } = statement.kind else { return None; };
+        if call != site.ordinal || body.contextual_argument(call) != Some((formal, ty)) { return None; }
+        let selected = body.resolved_call_site(call)?;
+        let ResolvedCallTarget::ModuleCallable {
+            source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        } = &selected.target else { return None; };
+        if source != &owner.source { return None; }
+        let (target, _, _, leaf) = self.validated_direct_body(&body.structure, call, source, *declaration_span).ok()?;
+        let proof = cohort.entries.get(&target)?;
+        if !matches!(proof.amount, super::contextual::ContextualProofAmount::EntryParameter(_))
+            || !matches!(body.checked_call_signatures.get(&call)?.parameters.as_slice(), [ty] if ty == parameter)
+            || leaf.contextual_formal() != Some((&proof.formal, &proof.ty))
+            || &proof.ty != ty || proof.explicit.is_none()
+            || !leaf.call_occurrences.is_empty() || !leaf.allocation_length_calls.is_empty()
+        {
+            return None;
+        }
+        let OccurrenceNode::Expression(argument) = body.structure.edges.get(&(
+            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
+        ))? else { return None; };
+        if !matches!(body.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(binding)) if binding == input)
+            || body.structure.checked_types.expressions.get(argument) != Some(parameter)
+        {
+            return None;
+        }
+        Some(())
+    }
+
     fn prepare_exact_child<const NAMED: bool>(
         &mut self, parent: &mut ExactCallActivation<'project>, effect: ExactCallEffect<'project>,
         collection: Option<OrderedCallCollection<'_, '_>>,
@@ -3345,11 +3388,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let unary_context = ACTUAL_STARTUP && !NAMED && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
             && matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
             && matches!(body.boundary.parameters.as_slice(), [slot] if slot.ordinal == 0 && Some(&slot.ty) == signature.parameters.first())
-            && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
+            && body.allocation_length_calls.is_empty()
             && collection.is_some_and(|ordered| {
                 let effects = ordered.failures.borrow();
-                effects.contextual_proofs.entries.get(&target).is_some_and(|proof|
-                    proof.explicit.is_some() && body.contextual_formal() == Some((&proof.formal, &proof.ty)))
+                let cohort = &effects.contextual_proofs;
+                if let Some(proof) = cohort.entries.get(&target) {
+                    body.call_occurrences.is_empty() && proof.explicit.is_some()
+                        && body.contextual_formal() == Some((&proof.formal, &proof.ty))
+                } else {
+                    self.exact_contextual_debit_forwarder(owner, body, &signature.parameters[0], cohort).is_some()
+                }
             });
         #[cfg(feature = "internal-checker")]
         let contextual_entry = match (caller.contextual_argument(call), body.contextual_formal()) {
@@ -24608,6 +24656,62 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert_eq!(&stale[after.start as usize..after.end as usize], "core.context.credit == 3");
                 let unmatched = provider.split_once("proof debit").unwrap().0.to_owned() + "%%end";
                 assert!(matches!(run(&root, &unmatched, scope), Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordinary_contextual_resource_forwarder_preserves_actual_cost_and_theorem_owner() {
+        let app = source("src/main.w", "forwarded-contextual-debit-root");
+        let lib = source("src/credit.w", "forwarded-contextual-debit-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend(2);
+                core.require(core.context.credit == 1, OUTPUT);
+                u8 cost = 1;
+                accounting.spend(cost);
+                core.require(core.context.credit == 0, OUTPUT);
+            };
+            entry();
+        %%end"#.replace("OUTPUT", OUTPUT);
+        let provider = r#"%%start
+            unit(u8) debit = fn(charged) {
+                core.narrow(core.context.credit >= charged, {
+                    .stdout = ""; .stderr = "insufficient credit"; .code = 68; .files = [];
+                });
+                core.context.credit = core.context.credit - charged;
+            };
+            unit(u8) spend = fn(bound) { debit(bound); };
+            proof debit_goal for debit(cost) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - cost) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, provider: &str, scope| {
+                let (_, root_proof) = crate::parse_configured_root_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+                let (_, lib_proof) = crate::parse_configured_proof_source(lib.clone(), provider.to_owned(), &[]).ok().unwrap();
+                let import = ScalarNamespaceBinding { binding: "accounting".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(lib_proof, Vec::new()), (root_proof, vec![import])],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let passed = run(&root, provider, scope).unwrap();
+                assert!(passed.active && passed.directives.is_empty() && passed.contextual_diagnostic.is_none());
+                let failed = run(&root.replace("spend(2)", "spend(4)"), provider, scope).unwrap();
+                assert!(failed.contextual_diagnostic.is_none());
+                let [guard] = failed.directives.as_slice() else { panic!("only original leaf guarded failure"); };
+                assert_eq!(guard.code(), &BigInt::from(68));
+                assert_eq!(guard.source, lib);
+                let wrong = provider.replace("credit - charged", "credit - 1");
+                let refuted = run(&root, &wrong, scope).unwrap().contextual_diagnostic.unwrap();
+                assert_eq!(refuted.explicit_entry, Some(("cost".into(), 2.into())));
+                assert_eq!((refuted.entry, refuted.exit), (3.into(), 2.into()));
+                assert_eq!((&refuted.call.source, &refuted.supplying_call.source), (&lib, &app));
+                assert_eq!(&wrong[refuted.call.range.start as usize..refuted.call.range.end as usize], "debit(bound)");
+                assert!(matches!(run(&root, &provider.replace("debit(bound);", "if (bound == 2) { debit(1); };"), scope),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
     }
