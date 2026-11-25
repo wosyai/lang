@@ -3333,6 +3333,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => unreachable!("expression item region"),
                     };
+                    #[cfg(feature = "internal-checker")]
+                    if matches!(kind, BlockItemKind::Evaluation { .. })
+                        && calls.structure.checker_directives.get(&ordinal).is_some_and(|marker|
+                            marker.operation == super::checker_directive::CheckerOperation::Require
+                                && matches!(marker.predicate, Some(super::checker_flow::CheckerPredicate::Integer(_)))
+                        )
+                    {
+                        // The canonical checker walker has deliberately not
+                        // created a runtime target/operand here. Preserve the
+                        // program point, not a reference event or policy action.
+                        self.point(CfgPointKind::CheckerRequire, expression_span(expression), scope, BTreeSet::new());
+                        continue;
+                    }
                     let value = self.expression_with_projected_origins(
                         expression,
                         scope,

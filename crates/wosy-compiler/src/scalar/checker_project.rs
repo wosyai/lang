@@ -2237,6 +2237,15 @@ trait ActualIntegerObserver {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
     #[cfg(feature = "internal-checker")]
+    const EXACT_POINTEE_UPDATE: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn exact_pointee_update(
+        &self, _: PreparedCallable, _: &FunctionCallSites, _: OccurrenceOrdinal,
+        _: &SourceIdentity, _: SymbolicProofRuntime<'_>,
+    ) -> Result<Option<pointer_proof::LocalTransition>, ProjectCheck> { Ok(None) }
+
+    #[cfg(feature = "internal-checker")]
     fn watches_fixed_array(&self, _: PreparedCallable) -> bool { false }
 
     #[cfg(feature = "internal-checker")]
@@ -2854,6 +2863,29 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             match progress {
                 ExactCallProgress::Pending(call) => {
                     #[cfg(feature = "internal-checker")]
+                    if ACTUAL_STARTUP && !NAMED && Observer::EXACT_POINTEE_UPDATE {
+                        if let (Some(ordered), ExactCallEffect::Unit(occurrence)) = (active_collection, call) {
+                            let site = body.resolved_call_site(occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
+                            if let ResolvedCallTarget::ModuleCallable {
+                                source: owner, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                            } = &site.target {
+                                let (target, _, _, _) =
+                                    self.validated_direct_body(&body.structure, occurrence, owner, *declaration_span)?;
+                                if let Some(update) = self.observer.exact_pointee_update(
+                                    target, body, occurrence, source,
+                                    SymbolicProofRuntime { project: self.project, calls: self.calls, visits: ordered.visits },
+                                )? {
+                                    frame.cursor.resume_exact_local_update(
+                                        &update.binding, &update.ty, update.entry, update.exit,
+                                    ).ok_or(ProjectCheck::Unsupported)?;
+                                    self.reached.insert(target);
+                                    self.had_obligations = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(feature = "internal-checker")]
                     let routed_unit = match call {
                         ExactCallEffect::Unit(occurrence) if ordinary_named && body.checker_returns_unit() => {
                             let &target = body.structure.checker_direct_targets.get(&occurrence)
@@ -2948,7 +2980,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 }
                             }
                         }
-                        parent.cursor.resume_contextual_unit(binding, ty, entry, exit)
+                        parent.cursor.resume_exact_local_update(binding, ty, entry, exit)
                             .ok_or(ProjectCheck::Unsupported)?;
                         continue;
                     }

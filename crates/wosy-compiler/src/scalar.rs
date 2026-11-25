@@ -625,6 +625,9 @@ pub enum CfgPointKind {
         then_point: CfgPointId,
         else_point: CfgPointId,
     },
+    /// An authenticated check-only statement, not a runtime call or load.
+    #[doc(hidden)]
+    CheckerRequire,
 }
 
 #[cfg_attr(not(test), derive(Clone))]

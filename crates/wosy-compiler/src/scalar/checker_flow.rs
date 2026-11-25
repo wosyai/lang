@@ -8454,7 +8454,7 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn resume_contextual_unit(
+    pub(super) fn resume_exact_local_update(
         &mut self, binding: &ReferenceBindingId, ty: &ScalarType, entry: BigInt, exit: BigInt,
     ) -> Option<()> {
         if self.contextual_singleton(binding, ty)? != &entry

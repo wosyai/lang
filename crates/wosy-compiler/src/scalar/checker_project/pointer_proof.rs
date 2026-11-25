@@ -1,5 +1,5 @@
-//! The closed authored Unit effect route. No summary or real-call import is
-//! issued: the exact selected symbolic root has one authenticated entry cell.
+//! The closed authored Unit effect route for one sealed entry cell. This
+//! installs no reusable summary; a reached call needs its own exact receipt.
 use super::*;
 use super::super::{ScalarPlace, ScalarReferenceMutability};
 use wosy_syntax::SourceSpan;
@@ -9,6 +9,15 @@ pub(super) struct Plan {
     proof: SourceSpan,
     goal: SourceSpan,
     amount: BigInt,
+    references: std::cell::OnceCell<super::super::reference::ProjectReferenceResults>,
+    applied: std::cell::Cell<bool>,
+}
+
+pub(super) struct LocalTransition {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) ty: ScalarType,
+    pub(super) entry: BigInt,
+    pub(super) exit: BigInt,
 }
 
 pub(super) fn is_unit_target(selected: &SelectedModuleProof<'_>) -> bool {
@@ -61,7 +70,32 @@ impl Plan {
         };
         if !integer_literal_fits_type(amount, inner) { return Err(ProjectCheck::InvalidProof); }
         let at = |node| SourceSpan::new(source.clone(), wosy_syntax::byte_span(node));
-        Ok(Self { target: (selected.function.0, selected.function.1), proof: at(declaration), goal: at(&goal), amount: amount.clone() })
+        Ok(Self { target: (selected.function.0, selected.function.1), proof: at(declaration), goal: at(&goal), amount: amount.clone(),
+            references: std::cell::OnceCell::new(), applied: std::cell::Cell::new(false) })
+    }
+
+    fn references(
+        &self, source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
+    ) -> Result<&super::super::reference::ProjectReferenceResults, ProjectCheck> {
+        if let Some(known) = self.references.get() { return Ok(known); }
+        let [module] = runtime.project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if &self.proof.source != source || module.items.len() > 32 || !module.structs.is_empty() || !module.enums.is_empty()
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        // Bound the one opt-in project reference pass before requesting it.
+        // There is no pass on a dormant proof or any other proof shape.
+        let mut remaining = 512usize;
+        for (item, declaration) in module.items.iter().enumerate() {
+            if matches!(declaration, ScalarItem::Function(_)) {
+                let sites = runtime.calls.function_body(self.target.0, item, None).ok_or(ProjectCheck::Unsupported)?;
+                if !sites.arms.is_empty() { return Err(ProjectCheck::Unsupported); }
+                remaining = remaining.checked_sub(sites.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
+            }
+        }
+        Ok(self.references.get_or_init(|| super::super::reference::analyze_project_references_with_call_points(
+            &runtime.project.modules, runtime.calls, true,
+        )))
     }
 
     pub(super) fn run(
@@ -79,7 +113,38 @@ impl Plan {
 
 impl ActualIntegerObserver for &Plan {
     const ENABLED: bool = false;
+    const EXACT_POINTEE_UPDATE: bool = true;
+    const ORDINARY_INTEGER_LOCALS: bool = true;
+
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+
+    fn exact_pointee_update(
+        &self, target: PreparedCallable, body: &FunctionCallSites, occurrence: OccurrenceOrdinal,
+        source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
+    ) -> Result<Option<LocalTransition>, ProjectCheck> {
+        if target != self.target { return Ok(None); }
+        if self.applied.get() || &self.proof.source != source
+            || !matches!(runtime.visits, Some([InitializationVisit::Started]))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let references = self.references(source, runtime)?;
+        let module = runtime.project.modules.get(target.0).ok_or(ProjectCheck::Unsupported)?;
+        let caller = module.items.iter().enumerate().find_map(|(item, decl)| {
+            matches!(decl, ScalarItem::Function(_)).then_some(())?;
+            std::ptr::eq(body, runtime.calls.function_body(target.0, item, None)?).then_some(item)
+        }).ok_or(ProjectCheck::Unsupported)?;
+        let receipt = references.pointer_caller_effect(
+            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &self.amount,
+        ).ok_or(ProjectCheck::Unsupported)?;
+        let call = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
+        if &receipt.call().source != source || receipt.call().range != call { return Err(ProjectCheck::Unsupported); }
+        self.applied.set(true);
+        Ok(Some(LocalTransition {
+            binding: receipt.place().binding.clone(), ty: receipt.width().clone(),
+            entry: receipt.entry().clone(), exit: receipt.exit().clone(),
+        }))
+    }
 }
 
 impl OrderedRunEvidence for &Plan {
@@ -88,10 +153,8 @@ impl OrderedRunEvidence for &Plan {
     const HAS_NAMED_ROOT: bool = true;
 
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
-        // A physically reached pointer call may not borrow a symbolic atom
-        // or this effect's receipt in place of its actual caller state.
-        if reached.contains(&self.target) { return Err(ProjectCheck::Unsupported); }
-        Ok(false)
+        if reached.contains(&self.target) != self.applied.get() { return Err(ProjectCheck::Unsupported); }
+        Ok(self.applied.get())
     }
     fn symbolic(&self) -> Root<'_> { Root { plan: self, diagnostic: None } }
     fn finish_symbolic<'run>(root: Root<'run>) -> Self::SymbolicReport where Self: 'run { root.diagnostic }
@@ -115,28 +178,12 @@ impl SymbolicRootProof for Root<'_> {
         source: &SourceIdentity, _: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         if target != self.plan.target { return Ok(None); }
-        let [module] = runtime.project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        if &self.plan.proof.source != source || runtime.visits != Some(&[InitializationVisit::Completed])
-            || module.items.len() > 32 || !module.structs.is_empty() || !module.enums.is_empty()
+        if runtime.visits != Some(&[InitializationVisit::Completed])
+            || !std::ptr::eq(body, runtime.calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?)
         {
             return Err(ProjectCheck::Unsupported);
         }
-        // Bound the one opt-in project reference pass before requesting it.
-        // There is no pass on a dormant proof or any other proof shape.
-        let mut remaining = 512usize;
-        for (item, declaration) in module.items.iter().enumerate() {
-            if matches!(declaration, ScalarItem::Function(_)) {
-                let sites = runtime.calls.function_body(target.0, item, None).ok_or(ProjectCheck::Unsupported)?;
-                if !sites.arms.is_empty() { return Err(ProjectCheck::Unsupported); }
-                remaining = remaining.checked_sub(sites.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
-            }
-        }
-        if !std::ptr::eq(body, runtime.calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?) {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let validated = super::super::reference::analyze_project_references_with_call_points(
-            &runtime.project.modules, runtime.calls, true,
-        );
+        let validated = self.plan.references(source, runtime)?;
         let update = validated.pointer_entry_wrapping_write(&runtime.project.modules, runtime.calls, target.0, target.1)
             .ok_or(ProjectCheck::Unsupported)?;
         if &update.formal().source != source || !integer_literal_fits_type(&self.plan.amount, update.width()) {
@@ -159,6 +206,51 @@ impl SymbolicRootProof for Root<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_actual_pointer_update_changes_only_the_borrowed_local_before_require() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r8".into());
+        let program = r#"%%start
+            unit(*!u32) increment = fn(p) { *p = *p +@ 1; };
+            proof increment_effect for increment(p) -> ()
+                ensures (*p == core.old(*p) +@ 1) {}
+            unit() start = fn {
+                u32 local = 4294967295;
+                increment(&!local);
+                core.require(local == 0, { .stdout = ""; .stderr = "wrong exit"; .code = 1; .files = []; });
+            };
+            start();
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, scope| {
+                let (_, proof) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), vec![(proof, Vec::new())],
+                    vec![source.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let approved = run(program, scope).unwrap();
+                assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+
+                let old = program.replace("core.require(local == 0", "core.require(local == 4294967295");
+                let witnessed = run(&old, scope).unwrap();
+                assert!(witnessed.pointer_effect_diagnostic.is_none());
+                let [failed] = witnessed.directives.as_slice() else { panic!("exact caller requirement"); };
+                assert_eq!(failed.source, source);
+                assert_eq!(&old[failed.condition.start as usize..failed.condition.end as usize], "local == 4294967295");
+                let zero = BigInt::from(0);
+                assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+
+                for unsupported in [
+                    program.replace("core.old(*p) +@ 1", "core.old(*p) +@ 2"),
+                    program.replace("increment(&!local);", "*!u32 alias = &!local; increment(alias);"),
+                    program.replace("increment(&!local);", "local = 2; increment(&!local);"),
+                    program.replace("            start();", "            start(); start();"),
+                ] {
+                    assert!(run(&unsupported, scope).is_err(), "{unsupported}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn authored_unit_pointer_old_observes_one_sealed_entry_epoch() {
@@ -200,7 +292,7 @@ mod tests {
                 program.replace("= *p +@", "= *p +"),
                 program.replace("*p = *p +@ 1;", "*p = *p +@ 1; *p = *p +@ 2;"),
                 program.replace("ensures", "where (true) ensures"),
-                program.replace("%%end", "unit() start = fn { u32 local = 15; increment(&!local); }; start(); %%end"),
+                program.replace("%%end", "unit() start = fn { u32 local = 15; local = 16; increment(&!local); }; start(); %%end"),
             ] {
                 assert!(run(&excluded, package).is_err(), "{excluded}");
             }
