@@ -8041,6 +8041,26 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(any(test, feature = "internal-checker"))]
         let initializer_literal_argument = matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
             && matches!(self.mode, WalkMode::ModuleInitialization { .. });
+        #[cfg(feature = "internal-checker")]
+        let wide_rank_initializer_argument = match (&self.mode, parent, edge) {
+            (WalkMode::ModuleInitialization { source, declarations },
+                OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot))
+                if slot >= 2 && slot < super::checker_project::MAX_RANKED_INTEGER_AXES =>
+            {
+                matches!(self.initialization_call_targets.get(&call),
+                    Some(ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration })
+                        if &declaration.source == *source
+                            && declarations.checker_proof_targets.contains(&(*source, declaration.range)))
+                    && self.checked_call_signatures.get(&call).is_some_and(|signature|
+                        (3..=super::checker_project::MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len())
+                            && slot < signature.parameters.len()
+                            && signature.parameters.iter().all(is_integer_type)
+                            && matches!(signature.outputs.outputs.as_slice(), [output] if is_integer_type(&output.ty)))
+            }
+            _ => false,
+        };
+        #[cfg(all(test, not(feature = "internal-checker")))]
+        let wide_rank_initializer_argument = false;
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
         #[cfg(feature = "internal-checker")]
@@ -8083,11 +8103,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            ) || initializer_literal_argument || checked_scalar_pair_argument
+            ) || initializer_literal_argument || wide_rank_initializer_argument || checked_scalar_pair_argument
                 || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
-            let value = if initializer_literal_argument || checked_scalar_pair_argument
+            let value = if initializer_literal_argument || wide_rank_initializer_argument || checked_scalar_pair_argument
                 || matches!(edge, OccurrenceEdge::FinalOutput { .. })
             {
                 super::checker_flow::concrete_integer_literal(expression).map(std::borrow::Cow::into_owned)

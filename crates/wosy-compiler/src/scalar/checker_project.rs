@@ -1517,7 +1517,16 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     || (COLLECT && matches!(ty, ScalarType::Bool | ScalarType::Char)
                         && matches!(expression, ScalarExpression::Call { .. })) =>
                 {
-                    let value = if let Some(value) = concrete_integer_literal(expression) {
+                    #[cfg(feature = "internal-checker")]
+                    let wide = if COLLECT && is_integer_type(ty) && receiver.contextual_storage.is_none()
+                        && matches!(expression, ScalarExpression::Call { .. }) {
+                        actual.wide_ranked_startup_initializer(topology, source, outputs.primary, ty, &storage)?
+                    } else { None };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let wide = None;
+                    let value = if let Some(value) = wide {
+                        Cow::Owned(value)
+                    } else if let Some(value) = concrete_integer_literal(expression) {
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
                         match run_scalar_initializer_call(
@@ -2278,6 +2287,11 @@ trait ActualIntegerObserver {
     ) -> Result<[BigInt; 2], ProjectCheck> { Err(ProjectCheck::Unsupported) }
 
     #[cfg(feature = "internal-checker")]
+    fn proved_wide_initializer_return(
+        &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &[&BigInt], _: &ScalarType,
+    ) -> Option<BigInt> { None }
+
+    #[cfg(feature = "internal-checker")]
     fn proved_recursive_return(
         &mut self, _target: (usize, usize), _arguments: &[&BigInt], _expected: &ScalarType,
     ) -> Option<BigInt> {
@@ -2644,6 +2658,46 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let &target = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
         self.validated_prepared_body(target, target_source, target_span)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn wide_ranked_startup_initializer(
+        &mut self, topology: &ModuleInitializationTopology, source: &SourceIdentity, call: OccurrenceOrdinal,
+        expected: &ScalarType, storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+    ) -> Result<Option<BigInt>, ProjectCheck> {
+        let Some(signature) = topology.checked_call_signatures.get(&call) else { return Ok(None); };
+        if !(3..=MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len()) { return Ok(None); }
+        let Some(ModuleInitializationCallTarget::Direct {
+            declaration, concrete: ConcreteCallSelection::Declaration,
+        }) = topology.call_targets.get(&call) else { return Err(ProjectCheck::Unsupported); };
+        if !ACTUAL_STARTUP || !Observer::ENABLED || &declaration.source != source
+            || !matches!(signature.outputs.outputs.as_slice(), [result] if &result.ty == expected)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let (target, _, _, body) = self.validated_direct_body(&topology.structure, call, source, declaration.range)?;
+        if self.active.contains(&target) || body.contextual_formal().is_some()
+            || body.boundary.parameters.len() != signature.parameters.len()
+            || !matches!(body.boundary.results.as_slice(), [result] if &result.ty == expected)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let mut arguments = Vec::with_capacity(signature.parameters.len());
+        for (i, (ty, slot)) in signature.parameters.iter().zip(&body.boundary.parameters).enumerate() {
+            let (checked_ty, value) = exact_typed_call_argument_at(&topology.structure, call, i, false,
+                |argument, ty| initialized_integer_argument(topology, storage, argument, ty))
+                .ok_or(ProjectCheck::Unsupported)?;
+            if slot.ordinal != i || ty != &slot.ty || ty != checked_ty || !integer_literal_fits_type(value, ty) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            arguments.push(value);
+        }
+        // The ordinary ordered proof token supplies this value. This does
+        // not execute the recursive body or widen the scalar evaluator.
+        let result = self.observer.proved_wide_initializer_return(target, body, &arguments, expected)
+            .ok_or(ProjectCheck::Unsupported)?;
+        self.reached.insert(target);
+        Ok(Some(result))
     }
 
     fn validated_prepared_body(
@@ -7479,6 +7533,7 @@ struct RankedOrderedEvidence<'a, 'proof> {
     plan: &'proof PlannedModuleProof<'a>,
     rank: TypedInductionRank<'a>,
     allow_reached: bool,
+    allow_wide_initializer: bool,
     allow_symbolic_summary: bool,
     reached_return: Option<Option<VerifiedInductionExactReturn<'proof>>>,
 }
@@ -7489,6 +7544,19 @@ impl ActualIntegerObserver for RankedOrderedEvidence<'_, '_> {
     const CONTEXTUAL: bool = true;
 
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+
+    fn proved_wide_initializer_return(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+    ) -> Option<BigInt> {
+        if !self.allow_wide_initializer || target != self.plan.target || !std::ptr::eq(body, self.plan.typed.body)
+            || !matches!(&self.plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        {
+            return None;
+        }
+        let (plan, rank) = (self.plan, self.rank);
+        self.reached_return.get_or_insert_with(|| VerifiedInductionExactReturn::verify_with_arity(
+            plan, rank, MAX_RANKED_INTEGER_AXES).1).as_mut()?.consume(target, arguments, expected)
+    }
 
     fn proved_recursive_return(
         &mut self, target: PreparedCallable, arguments: &[&BigInt], expected: &ScalarType,
@@ -7664,6 +7732,12 @@ impl ActualIntegerObserver for MixedOrderedEvidence<'_, '_> {
         }
     }
 
+    fn proved_wide_initializer_return(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+    ) -> Option<BigInt> {
+        self.ranked.get_mut(&target)?.proved_wide_initializer_return(target, body, arguments, expected)
+    }
+
     fn proved_recursive_return(
         &mut self, target: PreparedCallable, arguments: &[&BigInt], expected: &ScalarType,
     ) -> Option<BigInt> {
@@ -7773,6 +7847,7 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
         plan, rank,
         allow_reached: existing_transfer_arity
             && (plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count)),
+        allow_wide_initializer: !existing_transfer_arity && plan.proof_source == root_source,
         allow_symbolic_summary: existing_transfer_arity && plan.proof_source == root_source,
         reached_return: None,
     })
@@ -9999,9 +10074,16 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
 fn checked_scalar_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     body: &FunctionCallSites, filter: &'a [CheckerPredicate], named_mixed: bool, allow_nullary: bool,
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
+    checked_scalar_guard_slots_with_arity::<ALLOW_DOMAIN>(body, filter, named_mixed, allow_nullary, 2)
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_scalar_guard_slots_with_arity<'a, const ALLOW_DOMAIN: bool>(
+    body: &FunctionCallSites, filter: &'a [CheckerPredicate], named_mixed: bool, allow_nullary: bool, max_arity: usize,
+) -> Option<CheckedIntegerGuardSlots<'a>> {
     let parameters = body.boundary.parameters.as_slice();
     let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
-    if (!matches!(parameters.len(), 1 | 2) && !(allow_nullary && parameters.is_empty()))
+    if (!(1..=max_arity).contains(&parameters.len()) && !(allow_nullary && parameters.is_empty()))
         || parameters.len() != bindings.len()
         || (!named_mixed && !parameters.iter().all(|parameter| is_integer_type(&parameter.ty)))
     {
@@ -10192,6 +10274,12 @@ impl<'a> VerifiedInductionExactReturn<'a> {
     fn verify(plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>)
         -> (Result<ProjectCheck, ProjectCheck>, Option<Self>)
     {
+        Self::verify_with_arity(plan, rank, 2)
+    }
+
+    fn verify_with_arity(plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>, max_arity: usize)
+        -> (Result<ProjectCheck, ProjectCheck>, Option<Self>)
+    {
         let checked = plan.verify_unused_induction(rank);
         let token = (|| {
             if !matches!(checked, Ok(ProjectCheck::Proved)) {
@@ -10202,7 +10290,8 @@ impl<'a> VerifiedInductionExactReturn<'a> {
             };
             Some(Self {
                 target: plan.target, result_type: plan.typed.result_type, value: bound,
-                where_guard: checked_integer_guard_slots::<true>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?,
+                where_guard: checked_scalar_guard_slots_with_arity::<true>(
+                    plan.typed.body, plan.filter.as_deref().unwrap_or_default(), false, false, max_arity)?,
                 used: false,
             })
         })();
@@ -11020,7 +11109,7 @@ impl TypedProofPostcondition<'_> {
 
 type TypedEntryMeasure<'a> = (&'a super::reference::ParameterSlot, &'a ReferenceBindingId);
 
-const MAX_RANKED_INTEGER_AXES: usize = 4;
+pub(super) const MAX_RANKED_INTEGER_AXES: usize = 4;
 
 #[derive(Clone, Copy)]
 struct TypedInductionRank<'a> {
@@ -17185,7 +17274,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn ordered_induction_rank_checks_four_guarded_axes_without_transfer() {
+    fn ordered_induction_rank_checks_four_guarded_axes_and_direct_initializers() {
         let app = source("src/main.w", "ordered-four-axis-rank");
         let program = r#"%%start
             u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {
@@ -17230,9 +17319,21 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         ] {
             assert!(matches!(run(&text, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
-        let reached = program.replace("%%end", "u8 answer = descend(2, 3, 1, 4); answer; %%end");
+        let reached = program.replace("%%end", &format!(
+            "u8 last = 4; u8 first = descend(2, 3, 1, 4); u8 second = descend(0, 1, 3, last);              core.require(first == 7, {OUTPUT}); core.require(second == 7, {OUTPUT}); %%end"));
         for scope in [main, package] {
-            assert!(matches!(run(&reached, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let receipt = run(&reached, scope).unwrap();
+            assert!(receipt.active && receipt.directives.is_empty()
+                && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            for unsupported in [
+                reached.replace("descend(0, 1, 3, last)", "descend(0, 1, 3, 6)"),
+                reached.replace("descend(0, 1, 3, last)", "descend(0, 1, 3, last + 0)"),
+                reached.replace("out == 7) decreases", "out >= 7) decreases"),
+                reached.replace("decreases (page, slot, left)", "decreases (left, slot, page)"),
+                program.replace("%%end", "descend(2, 3, 1, 4); %%end"),
+            ] {
+                assert!(matches!(run(&unsupported, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
         let refuted = program.replace("out == 7) decreases", "out == 8) decreases");
         let receipt = run(&refuted, package).unwrap();
