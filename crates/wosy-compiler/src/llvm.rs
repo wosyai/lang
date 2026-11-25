@@ -389,6 +389,7 @@ fn emit_scalar_llvm_with_metadata(
         GenericInitializerInput::RawStandalone(&prepared),
         &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
+        None,
         metadata,
         &[],
     )
@@ -572,9 +573,24 @@ fn emit_scalar_build_single_module_with_metadata(
         GenericInitializerInput::PreparedRows(prepared),
         &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
+        Some(validation),
         metadata,
         exports,
     )
+}
+
+fn emit_prepared_runtime_enum<'ctx>(
+    context: &'ctx Context, builder: &Builder<'ctx>, functions: &BTreeMap<String, FunctionValue<'ctx>>,
+    name: &str, function: &ScalarFunction, build: Option<&ScalarBuildValidation<'_>>,
+    module: usize, item: usize, original_body_bound: bool, target: ScalarTargetLayout,
+) -> Result<(), String> {
+    let build = build.filter(|_| original_body_bound)
+        .ok_or("runtime enum match requires its original prepared Build body")?;
+    let source = build.prepared().project().modules.get(module).ok_or("missing runtime enum Build module")?;
+    let plan = build.bind_runtime_enum_match(module, item, function)?;
+    let emitted = *functions.get(name).ok_or("missing runtime enum match function")?;
+    builder.position_at_end(context.append_basic_block(emitted, "entry"));
+    runtime_enum_match::emit(context, builder, emitted, source, function, plan, target)
 }
 
 fn emit_single_module_llvm<'a>(
@@ -591,6 +607,7 @@ fn emit_single_module_llvm<'a>(
         Option<usize>,
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
+    project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
@@ -831,6 +848,11 @@ fn emit_single_module_llvm<'a>(
     };
     for (function, cfg, name, item, arm) in definitions {
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
+        if function.runtime_enum_match.is_some() {
+            emit_prepared_runtime_enum(&context, &builder, &functions, name, function, project_build,
+                0, item, arm.is_none() && nodes.is_some(), target_layout)?;
+            continue;
+        }
         emit_function(
             prepared_render,
             aggregates.body(0, item, arm),
@@ -1372,6 +1394,11 @@ fn emit_project_llvm<'a>(
             }
             _ => generic_input.bind_body(ordinal, item, arm, &function.body)?,
         };
+        if function.runtime_enum_match.is_some() {
+            emit_prepared_runtime_enum(&context, &builder, &functions, name, function, project_build,
+                ordinal, item, original && arm.is_none() && nodes.is_some(), target_layout)?;
+            continue;
+        }
         emit_project_function(
             prepared_render,
             aggregates.body(ordinal, item, arm),
@@ -1778,6 +1805,7 @@ fn definition_function_type<'ctx>(
 
 mod aggregate_transfer;
 mod memory;
+mod runtime_enum_match;
 use memory::{
     aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
     emit_array_literal, emit_place_value, emit_place_value_in_project, emit_struct_literal,

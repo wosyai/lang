@@ -758,6 +758,7 @@ fn emit_initializer_test_input(
             input,
             &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
+            None,
             super::PartitionMetadata::Full,
             &[],
         ),
@@ -1268,6 +1269,7 @@ i32 nested = unsafe { echo(33) };
                 input,
                 &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
+                None,
                 super::PartitionMetadata::Full,
                 &[],
             )

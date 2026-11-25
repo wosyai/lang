@@ -7659,6 +7659,9 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
         .filter_map(|item| match item {
             ScalarItem::Function(function) => {
                 let mut analyzer = StaticUseAnalyzer::new(function);
+                if let Some(plan) = &function.runtime_enum_match {
+                    plan.for_each_formal_read(|_, declaration| { analyzer.used_spans.insert(declaration); });
+                }
                 for item in &function.body.items {
                     analyzer.item(item, false);
                 }

@@ -442,6 +442,24 @@ impl<'a> ScalarBuildValidation<'a> {
             .bind_body_with_proof(module, item, None, &function.body, proof)
     }
 
+    pub(crate) fn bind_runtime_enum_match<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction,
+    ) -> Result<&'b runtime_enum_match::Plan, String> {
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum callable".to_owned());
+        };
+        let plan = original.runtime_enum_match.as_deref().ok_or("missing runtime enum source plan")?;
+        let cfg = self.reference_cfg(module, item, None).ok_or("missing canonical runtime enum reference check")?;
+        if !std::ptr::eq(original, function) || !plan.authenticates(&owner.source, function)
+            || !cfg.facts.is_empty() || !cfg.allocations.is_empty() || !cfg.specialized_policies.is_empty()
+            || !cfg.primary_call_points.is_empty()
+        {
+            return Err("runtime enum match is not the sealed primitive Build body".to_owned());
+        }
+        Ok(plan)
+    }
+
     pub(crate) fn reference_cfg(
         &self,
         module_ordinal: usize,

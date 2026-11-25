@@ -2165,6 +2165,8 @@ pub struct ScalarFunction {
     pub parameters: Vec<String>,
     pub parameter_spans: Vec<ByteSpan>,
     pub body: ScalarBlock,
+    #[serde(skip)]
+    pub(crate) runtime_enum_match: Option<Box<runtime_enum_match::Plan>>,
     pub span: ByteSpan,
     pub generic_parameters: Vec<ScalarGenericParameter>,
     pub overload_arms: Vec<ScalarFunction>,
@@ -2469,15 +2471,17 @@ fn derive_scalar_declarations(
         for node in pending_runtime_matches {
             match runtime_enum_match::prepare(&canonical.source, &enums, &node, &mut runtime_match_work) {
                 Ok(plan) => {
-                    diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span,
-                        "typed runtime enum match is not yet eligible for lowering"));
+                    if !retain_build_proofs {
+                        diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span,
+                            "typed runtime enum match is not yet eligible for this preparation route"));
+                    }
                     runtime_enum_matches.push(plan);
                 }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
     }
-    if guarded_runtime || invalid_projection || diagnostics.len() != proof_diagnostic_start {
+    if invalid_projection || diagnostics.len() != proof_diagnostic_start || (guarded_runtime && !diagnostics.is_empty()) {
         return ScalarSourceDeclarations {
             source: canonical.source.clone(),
             items,
@@ -2501,6 +2505,11 @@ fn derive_scalar_declarations(
             "contextual storage with named proofs is not supported by this checker boundary",
         ));
     }
+    let mut executable_matches = runtime_enum_matches.into_iter().map(|plan| (plan.owner.start, plan)).collect::<HashMap<_, _>>();
+    let mut function_from_source = |node: &CstNode, places: &contextual::ContextualPlaces| {
+        let plan = executable_matches.remove(&wosy_syntax::byte_span(node).start);
+        derive_function_with_runtime_match(node, places, plan)
+    };
     let derive_items = !contextual || diagnostics.is_empty();
     let mut generic_function = false;
     for node in source_root.children().filter(|_| derive_items) {
@@ -2518,7 +2527,7 @@ fn derive_scalar_declarations(
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, &contextual_places))),
             SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node, &contextual_places)))
+                items.push(ScalarItem::Function(function_from_source(&node, &contextual_places)))
             }
             SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node, &contextual_places))),
             SyntaxKind::GenericFunctionDecl => {
@@ -2542,7 +2551,7 @@ fn derive_scalar_declarations(
                             items.push(ScalarItem::Binding(derive_binding(&item, &contextual_places)))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item, &contextual_places)))
+                            items.push(ScalarItem::Function(function_from_source(&item, &contextual_places)))
                         }
                         SyntaxKind::OverloadDecl => {
                             items.push(ScalarItem::Function(derive_overload(&item, &contextual_places)))
@@ -2563,6 +2572,9 @@ fn derive_scalar_declarations(
             generic_function = false;
         }
     }
+    if let Some(plan) = executable_matches.into_values().next() {
+        diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span, "missing runtime match callable owner"));
+    }
     ScalarSourceDeclarations {
         source: canonical.source.clone(),
         items,
@@ -2571,7 +2583,7 @@ fn derive_scalar_declarations(
         diagnostics,
         contextual_places,
         build_proofs,
-        runtime_enum_matches,
+        runtime_enum_matches: Vec::new(),
     }
 }
 
@@ -2648,7 +2660,7 @@ mod contextual;
 mod declarations;
 mod proof_typing;
 mod proof_match;
-mod runtime_enum_match;
+pub(crate) mod runtime_enum_match;
 mod analysis_budget;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
@@ -3126,6 +3138,13 @@ fn typecheck_scalar_project_with_build_proofs(
                             &mut folded_names,
                             &mut diagnostics,
                         );
+                        if let Some(plan) = &function.runtime_enum_match {
+                            if !plan.authenticates(module.source, function) {
+                                diagnostics.push(module_diagnostic(module, "B0003",
+                                    "runtime match does not authenticate its typed callable", function.span));
+                            }
+                            continue;
+                        }
                         if outputs.outputs.len() > 1
                             && !function.body.final_output_values.is_empty()
                         {
@@ -3937,6 +3956,12 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
 }
 
 fn derive_function(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
+    derive_function_with_runtime_match(node, places, None)
+}
+
+fn derive_function_with_runtime_match(node: &CstNode, places: &contextual::ContextualPlaces,
+    runtime_enum_match: Option<runtime_enum_match::Plan>,
+) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
         children
@@ -3977,6 +4002,10 @@ fn derive_function(node: &CstNode, places: &contextual::ContextualPlaces) -> Sca
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
         .map(|node| derive_block_with_context(node, false, places))
+        .or_else(|| runtime_enum_match.as_ref().map(|plan| ScalarBlock {
+            span: plan.span, items: Vec::new(), terminated_items: Vec::new(), expressions: Vec::new(),
+            final_output_values: Vec::new(), unsafe_context: false,
+        }))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -3990,6 +4019,7 @@ fn derive_function(node: &CstNode, places: &contextual::ContextualPlaces) -> Sca
         parameters,
         parameter_spans,
         body,
+        runtime_enum_match: runtime_enum_match.map(Box::new),
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
@@ -4091,6 +4121,7 @@ fn derive_overload(node: &CstNode, places: &contextual::ContextualPlaces) -> Sca
                 parameter_spans,
                 body,
                 span: wosy_syntax::byte_span(&arm),
+                runtime_enum_match: None,
                 generic_parameters: children
                     .iter()
                     .find(|child| child.kind() == SyntaxKind::GenericDecl)
@@ -4123,6 +4154,7 @@ fn derive_overload(node: &CstNode, places: &contextual::ContextualPlaces) -> Sca
             unsafe_context: false,
         },
         span: wosy_syntax::byte_span(node),
+        runtime_enum_match: None,
         generic_parameters: Vec::new(),
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
