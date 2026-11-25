@@ -3730,7 +3730,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if matches!(inner.as_ref(), ScalarType::Struct(_) | ScalarType::Array { .. }));
         if !reads_checked_value
             && !reads_checked_aggregate
-            && matches!(root, ScalarPlace::Dereference { pointer, .. } if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+            && matches!(root, ScalarPlace::Dereference { pointer, .. } if
+                !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+                    && !(checked_pointee && matches!(pointer.as_ref(), ScalarExpression::CheckedAddress { .. })))
         {
             self.read_place_expressions(place, scope, source)?;
             self.point(
@@ -3855,15 +3857,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
         root: &ReferencePlaceRoot<'_>,
         pointer: &ScalarExpression,
     ) -> Result<Option<&'a ScalarType>, ReferenceAnalysisError> {
+        let ordinal = self.expression_ordinal(
+            OccurrenceParent::Place(root.ordinal),
+            OccurrenceEdge::DereferencePointer,
+        );
+        if let ScalarExpression::CheckedAddress { span, .. } = pointer {
+            return self.call_sites.structure.checked_types.expressions.get(&ordinal)
+                .filter(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+                .map(Some).ok_or_else(|| self.missing_context(*span,
+                    ReferenceAnalysisErrorReason::MissingCheckedExpressionResult { ordinal: ordinal.0 }));
+        }
         let ScalarExpression::Name { name, span } = pointer else {
             // Preserve the inherited non-name dereference gate (direct core.pointer_cast).
             self.raw_indexed_move_type(root.place)?;
             return Ok(None);
         };
-        let ordinal = self.expression_ordinal(
-            OccurrenceParent::Place(root.ordinal),
-            OccurrenceEdge::DereferencePointer,
-        );
         if !matches!(
             self.prepared_name_identity(ordinal, *span)?,
             Some(PlainNameIdentity::Lexical(_))

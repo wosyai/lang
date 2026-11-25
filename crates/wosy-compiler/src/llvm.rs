@@ -5025,6 +5025,14 @@ fn core_pointer_cast_dereference_type(
     }
 }
 
+fn immediate_checked_borrow_type<'module>(
+    state: &EmitState<'_, 'module>, pointer: &ScalarExpression,
+) -> Option<&'module ScalarType> {
+    if !matches!(pointer, ScalarExpression::CheckedAddress { .. }) { return None; }
+    state.body_call_nodes?.checked_expression_type(pointer)
+        .filter(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+}
+
 fn pointer_target_type<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
@@ -5042,6 +5050,10 @@ fn pointer_target_type<'ctx, 'module>(
                 }
                 _ => None,
             }),
+        ScalarExpression::CheckedAddress { .. } => match immediate_checked_borrow_type(state, expression)? {
+            ScalarType::CheckedReference { inner, .. } => Some(*inner.clone()),
+            _ => None,
+        },
         ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
         ScalarExpression::Call { .. } if state.has_prepared_calls() => {
             match state.prepared_call_output(expression).ok().flatten()? {
@@ -5118,6 +5130,7 @@ fn dereference_requires_null_guard<'ctx, 'module>(
             .map(|(_, ty)| ty)
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
             .is_some_and(|ty| matches!(ty, ScalarType::CheckedReference { .. })),
+        ScalarExpression::CheckedAddress { .. } => immediate_checked_borrow_type(state, expression).is_some(),
         ScalarExpression::Call { .. } if state.has_prepared_calls() => {
             matches!(
                 state.prepared_call_output(expression),

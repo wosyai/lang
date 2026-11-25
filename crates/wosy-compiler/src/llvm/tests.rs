@@ -16575,3 +16575,53 @@ absent_only(5);
         }
     }
 }
+
+#[test]
+fn immediate_checked_borrow_read_uses_release_stdlib_before_access() {
+    let text = "%%start
+u8(u8) scalar = fn(value) { *(&value) };
+u8(u64) indexed = fn(index) {
+    u8[3] cells = [7, 8, 9];
+    u8[3] snapshot = *(&cells);
+    snapshot[index]
+};
+if (scalar(42) != 42 || indexed(2) != 9) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&release);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helper_source = release.checked_access_source().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(helper_source, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(helper_source, "check_index_in_extent"));
+        for name in ["scalar", "indexed"] {
+            let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, name));
+            assert_eq!(body.matches(&non_null).count(), 1, "{body}");
+            let null_check = body.find(&non_null).unwrap();
+            let address = body.find("inttoptr").unwrap();
+            assert!(null_check < address, "{body}");
+            assert!(!body.contains("deref_is_null") && !body.contains("__wosy_core_system_panic"), "{body}");
+            if name == "indexed" {
+                assert_eq!(body.matches(&bounds).count(), 1, "{body}");
+                let extent = body.find(&bounds).unwrap();
+                let checked_address = body[extent..].find("getelementptr inbounds [3 x i8]").unwrap();
+                assert!(address < extent && checked_address != 0, "{body}");
+                assert!(body[extent..].lines().next().unwrap().ends_with(", i64 3)"), "{body}");
+            }
+        }
+        if let Some(out) = std::env::var_os("WOSY_IMMEDIATE_CHECKED_BORROW_RELEASE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
