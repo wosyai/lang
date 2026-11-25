@@ -5879,13 +5879,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let scalar_tail = self.capture_private_scalar_tail && !block.unsafe_context
                         && scope == ReferenceScopeId(0)
                         && matches!(calls.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
-                        && matches!(region.items.as_slice(), [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }]
+                        && region.items.len() % 2 == 1
+                        && matches!(region.items.last(), Some(BlockItem { kind: BlockItemKind::FinalOutput(row), .. })
                             if row.output == 0 && row.expression == ordinal)
                         && matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
                         && matches!(calls.boundary.root_outputs.as_slice(),
                             [output] if matches!(output.ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool));
                     let previous = self.capture_call_points;
                     self.capture_call_points |= guarded_owner_choice;
+                    if scalar_tail && region.items.len() > 1 {
+                        self.aggregate_result.owning_scalar_tail_entry = Some(CfgPointId(self.cfg.points.len()));
+                    }
                     let tail_active = self.private_scalar_tail_active;
                     self.private_scalar_tail_active |= scalar_tail;
                     let value = self.expression_with_read_mode(expression, scope, ordinal, mode);
@@ -17211,6 +17215,7 @@ impl FunctionReferenceResult {
             if self.aggregate.has_observations()
                 || !self.aggregate.ordinary_fallible_call_candidates.is_empty()
                 || !self.aggregate.ordinary_fallible_expressions.is_empty()
+                || self.aggregate.owning_scalar_tail_entry.is_some()
                 || self.aggregate.guarded_array_producer_choice.is_some()
                 || !self.aggregate.ordinary_array_receivers.is_empty()
             {

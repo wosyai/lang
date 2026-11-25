@@ -15513,3 +15513,85 @@ selected(true);
         }
     }
 }
+
+#[test]
+fn fallible_owned_scalar_tail_cleans_only_installed_prefix_on_every_outcome() {
+    let text = "%%start
+u64(u64) _left = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _compose = fn(count) {
+    u32[count] a_prefix;
+    core.array_len(&a_prefix);
+    u8[count] b_prefix;
+    core.array_len(&b_prefix);
+    _left(count) ^ _right(5)
+};
+u64(u64) observed = fn(count) {
+    u64 value =? _compose(count);
+    if (&value == null) { 99 } else { value }
+};
+if (observed(1) != 99 || observed(2) != 99 || observed(3) != 99
+    || observed(4) != 99 || observed(5) != 0) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "owning fallible scalar tail");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let composed = authored("_compose");
+            let blocks = composed.get_basic_blocks();
+            let calls = |callee| blocks.iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |i| i.get_next_instruction()))
+                .filter(|&i| CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .collect::<Vec<_>>();
+            assert_eq!(calls(authored("_left")).len(), 1);
+            assert_eq!(calls(authored("_right")).len(), 1);
+            let allocations = calls(module.get_function("__wosy_core_alloc").unwrap());
+            assert_eq!(allocations.len(), 2);
+            assert_eq!(calls(module.get_function("__wosy_core_free").unwrap()).len(), 3);
+            let panics = calls(module.get_function("__wosy_core_system_panic").unwrap());
+            assert_eq!(panics.len(), 1);
+            let branches_to = |branch: InstructionValue<'_>, block| branch.get_operands()
+                .filter_map(|operand| operand.and_then(|operand| operand.block())).any(|target| target == block);
+            for panic in panics {
+                let panic_block = panic.get_parent().unwrap();
+                assert_eq!(panic_block.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                let predecessors = blocks.iter().filter_map(|block| block.get_terminator())
+                    .filter(|&branch| branches_to(branch, panic_block)).collect::<Vec<_>>();
+                let [overflow] = predecessors.as_slice() else { panic!("{llvm}") };
+                let size = known_field_operand(*overflow, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(size.get_icmp_predicate(), Some(inkwell::IntPredicate::UGT));
+                let matching = allocations.iter().filter(|allocation|
+                    branches_to(*overflow, allocation.get_parent().unwrap())).collect::<Vec<_>>();
+                let [allocation] = matching.as_slice() else { panic!("{llvm}") };
+                let bytes = known_field_operand(**allocation, 0).unwrap();
+                let scaled = bytes.as_instruction_value().filter(|i| i.get_opcode() == InstructionOpcode::Mul)
+                    .unwrap_or_else(|| panic!("{llvm}"));
+                assert_eq!(known_field_operand(scaled, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(4));
+                assert_eq!(known_field_operand(size, 0), known_field_operand(scaled, 0));
+                assert_eq!(known_field_operand(size, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(u64::MAX / 4));
+                for allocation in &allocations {
+                    let egress = allocation.get_parent().unwrap().get_terminator().unwrap();
+                    assert!(!branches_to(egress, panic_block));
+                }
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_OWNING_TAIL_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

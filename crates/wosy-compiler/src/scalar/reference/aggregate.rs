@@ -1348,6 +1348,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
+    pub(super) owning_scalar_tail_entry: Option<CfgPointId>,
     pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) ordinary_array_receivers: Vec<OrdinaryArrayReceiver>,
     pub(super) ordinary_array_extent_demands: HashSet<OccurrenceOrdinal>,
@@ -7027,39 +7028,14 @@ fn closed_aggregates<'a>(
             }
             has_output.then_some(callees)
         };
-        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Vec<ByteSpan>, ScalarType)> {
-            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
-            let input = module_at(key.0)?;
-            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
-            if !crate::scalar::typecheck::is_module_private_name(&function.name)
-                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
-                || function.body.unsafe_context
-            { return None; }
-            let (last, prefix) = function.body.items.split_last()?;
-            if !matches!(last, ScalarBlockItem::Expression(ScalarExpression::Call { .. }))
-                || prefix.len() % 2 != 0
-            { return None; }
-            let sites = input.calls.function_body(key.1, None)?;
+        let relay_prefix = |source: &SourceIdentity, function: &ScalarFunction, sites: &FunctionCallSites,
+            cfg: &ScalarReferenceCfg, tail: CfgPointId| {
+            let (_, prefix) = function.body.items.split_last()?;
+            if prefix.len() % 2 != 0 { return None; }
+            let observers = sites.call_occurrences.get(..prefix.len() / 2)?;
             let [formal] = sites.boundary.parameters.as_slice() else { return None; };
             let root = sites.structure.blocks.get(sites.structure.root.0)?;
-            let mut outputs = root.final_outputs();
-            let output = outputs.next()?;
-            if output.output != 0 || outputs.next().is_some() { return None; }
-            let (occurrence, observers) = sites.call_occurrences.split_last()?;
-            if occurrence.ordinal != output.expression || observers.len() != prefix.len() / 2 {
-                return None;
-            }
-            let signature = sites.checked_call_signatures.get(&occurrence.ordinal)?;
-            let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
-            if formal.ty != ScalarType::U64
-                || !matches!(payload.ty, ScalarType::U64 | ScalarType::I32)
-                || signature.parameters.as_slice() != [ScalarType::U64]
-                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == payload.ty)
-                || !sites.declared_unsafe_calls.is_empty()
-            { return None; }
-            let (_, cfg) = result_at(key, function)?;
-            if !cfg.guarded_scalar_allocations().is_empty() { return None; }
-            let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
+            let formal = parameter_binding_identity(source, function.span, root.span, formal);
             if cfg.allocations.len() != observers.len() { return None; }
             let mut owner_by_span = cfg.allocations.iter().map(|owner| (owner.declaration_span, owner))
                 .collect::<HashMap<_, _>>();
@@ -7094,32 +7070,19 @@ fn closed_aggregates<'a>(
                 observed.iter().copied().eq(spans.iter().map(|span| (span.start, span.end))))
             { return None; }
             let points = &cfg.initial_points;
-            let point = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call {
-                target: ResolvedCallTarget::ModuleCallable { .. }, ..
-            }))?;
-            let CfgPointKind::Call { output: 0, target: target @ ResolvedCallTarget::ModuleCallable {
-                concrete: ConcreteCallSelection::Declaration, ..
-            }, argument_points, .. } = &point.kind else { return None; };
-            if target != &sites.sites.get(occurrence.site)?.target { return None; }
-            let ([read], [output]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
-            let read = points.get(read.0)?;
-            let output = points.get(output.0)?;
-            let mut predecessor = vec![None; points.len()];
-            for (index, candidate) in points.iter().enumerate() {
+            let mut predecessor = vec![None; tail.0.checked_add(1)?];
+            for (index, candidate) in points.get(..tail.0)?.iter().enumerate() {
                 if candidate.id.0 != index { return None; }
-                match candidate.successors.as_slice() {
-                    [] => {},
-                    [next] if next.0 > index => {
-                        if predecessor.get_mut(next.0)?.replace(candidate).is_some() { return None; }
-                    }
-                    _ => return None,
+                let [next] = candidate.successors.as_slice() else { return None; };
+                if next.0 <= index || predecessor.get_mut(next.0)?.replace(candidate).is_some() {
+                    return None;
                 }
             }
             let prior = |id: CfgPointId| predecessor.get(id.0).copied().flatten();
-            let mut permitted = vec![false; points.len()];
+            let mut permitted = vec![false; tail.0];
             // Every earlier observing loan is confined to its own adjacent call.
             // Each prefix segment must run on the same fallthrough path.
-            let mut next = read.id;
+            let mut next = tail;
             for (&owner, allocation) in owners.iter().zip(allocations).rev() {
                 let observed = prior(next).filter(|candidate| matches!(candidate.kind, CfgPointKind::Call {
                         target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), output: 0, ..
@@ -7136,7 +7099,7 @@ fn closed_aggregates<'a>(
                     matches!(&candidate.kind, CfgPointKind::Bind { binding } if binding == owner))?;
                 let zero = prior(bind.id).filter(|candidate|
                     matches!(&candidate.kind, CfgPointKind::Evaluate(value) if value == &allocation.value))?;
-                for id in [zero.id, bind.id, borrow.id, observed.id] { permitted[id.0] = true; }
+                for id in [zero.id, bind.id, borrow.id, observed.id] { *permitted.get_mut(id.0)? = true; }
                 next = zero.id;
                 // Some prepared routes record the allocation's exact length
                 // read as a separate point immediately before its placeholder.
@@ -7147,13 +7110,72 @@ fn closed_aggregates<'a>(
                     next = length.id;
                 }
             }
+            // No skipped effects before the computed expression. The
+            // earlier checked extent loans are scalar observations only.
+            if !points[..tail.0].iter().all(|candidate| match &candidate.kind {
+                CfgPointKind::Entry | CfgPointKind::ScopeEnter => true,
+                CfgPointKind::Bind { binding } if binding == &formal => true,
+                _ => permitted[candidate.id.0],
+            }) { return None; }
+            Some(spans)
+        };
+        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Vec<ByteSpan>, ScalarType)> {
+            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
+            if !crate::scalar::typecheck::is_module_private_name(&function.name)
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                || function.body.unsafe_context
+            { return None; }
+            let (last, prefix) = function.body.items.split_last()?;
+            if !matches!(last, ScalarBlockItem::Expression(ScalarExpression::Call { .. }))
+                || prefix.len() % 2 != 0
+            { return None; }
+            let sites = input.calls.function_body(key.1, None)?;
+            let [formal] = sites.boundary.parameters.as_slice() else { return None; };
+            let root = sites.structure.blocks.get(sites.structure.root.0)?;
+            let mut outputs = root.final_outputs();
+            let output = outputs.next()?;
+            if output.output != 0 || outputs.next().is_some() { return None; }
+            let (occurrence, observers) = sites.call_occurrences.split_last()?;
+            if occurrence.ordinal != output.expression || observers.len() != prefix.len() / 2 {
+                return None;
+            }
+            let signature = sites.checked_call_signatures.get(&occurrence.ordinal)?;
+            let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
+            if formal.ty != ScalarType::U64
+                || !matches!(payload.ty, ScalarType::U64 | ScalarType::I32)
+                || signature.parameters.as_slice() != [ScalarType::U64]
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == payload.ty)
+                || !sites.declared_unsafe_calls.is_empty()
+            { return None; }
+            let (_, cfg) = result_at(key, function)?;
+            if !cfg.guarded_scalar_allocations().is_empty() { return None; }
+            let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
+            let points = &cfg.initial_points;
+            let point = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call {
+                target: ResolvedCallTarget::ModuleCallable { .. }, ..
+            }))?;
+            let CfgPointKind::Call { output: 0, target: target @ ResolvedCallTarget::ModuleCallable {
+                concrete: ConcreteCallSelection::Declaration, ..
+            }, argument_points, .. } = &point.kind else { return None; };
+            if target != &sites.sites.get(occurrence.site)?.target { return None; }
+            let ([read], [output]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
+            let read = points.get(read.0)?;
+            let output = points.get(output.0)?;
+            let spans = relay_prefix(input.source, function, sites, cfg, read.id)?;
             if !matches!(&read.kind, CfgPointKind::Read { binding } if binding == &formal)
                 || read.successors.as_slice() != [point.id]
                 || !matches!(output.kind, CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. } if value_point == point.id)
-                || !points.iter().all(|candidate| match &candidate.kind {
-                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
-                    CfgPointKind::Bind { binding } if binding == &formal => true,
-                    _ => [read.id, point.id, output.id].contains(&candidate.id) || permitted[candidate.id.0],
+                || !points[read.id.0..].iter().enumerate().all(|(index, candidate)| {
+                    let index = read.id.0 + index;
+                    candidate.id.0 == index
+                        && points.get(index + 1).map_or(candidate.successors.is_empty(),
+                            |next| candidate.successors.as_slice() == [next.id])
+                        && match &candidate.kind {
+                            CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+                            _ => [read.id, point.id, output.id].contains(&candidate.id),
+                        }
                 })
             { return None; }
             Some((target_body(&declarations, cfg, point.id)?, occurrence.ordinal,
@@ -7168,25 +7190,35 @@ fn closed_aggregates<'a>(
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
             { return None; }
             let sites = input.calls.function_body(key.1, None)?;
-            let (_, cfg) = result_at(key, function)?;
+            let (facts, cfg) = result_at(key, function)?;
             let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
-            let [ScalarBlockItem::Expression(value @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))] =
-                function.body.items.as_slice() else { return None; };
+            let (ScalarBlockItem::Expression(value @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. })), prefix) =
+                function.body.items.split_last()? else { return None; };
+            if prefix.len() % 2 != 0 { return None; }
             let root = sites.structure.blocks.get(sites.structure.root.0)?;
-            let [BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] = root.items.as_slice() else { return None; };
+            let BlockItemKind::FinalOutput(output) = &root.items.last()?.kind else { return None; };
+            if root.items.len() != function.body.items.len() { return None; }
             if output.output != 0 || function.body.unsafe_context
-                || !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
+                || !cfg.guarded_scalar_allocations().is_empty()
                 || sites.call_occurrences.is_empty()
                 || !matches!(sites.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
             { return None; }
             let proof = ReferenceFlowBuilder::prove_guarded_numeric_expression(sites, cfg, value, output.expression, &payload.ty)?;
-            if proof.calls.len() != sites.call_occurrences.len() { return None; }
+            let observer_count = prefix.len() / 2;
+            if proof.calls.len().checked_add(observer_count)? != sites.call_occurrences.len() { return None; }
+            let spans = if prefix.is_empty() {
+                if !cfg.allocations.is_empty() { return None; }
+                Vec::new()
+            } else {
+                let tail = facts?.owning_scalar_tail_entry?;
+                relay_prefix(input.source, function, sites, cfg, tail)?
+            };
             let dependencies = proof.calls.iter().map(|&(point, ordinal)| {
                 let [output] = sites.checked_call_signatures.get(&ordinal)?.outputs.outputs.as_slice()
                     else { return None; };
                 Some((target_body(&declarations, cfg, point)?, ordinal, output.ty.clone()))
             }).collect::<Option<Vec<_>>>()?;
-            Some((proof, dependencies, payload.ty.clone()))
+            Some((proof, dependencies, payload.ty.clone(), spans))
         };
         let mut complete_suffixes = BTreeSet::new();
         let mut allocated_sites = BTreeSet::new();
@@ -7239,7 +7271,7 @@ fn closed_aggregates<'a>(
                     fallible_allocation_relays.insert(current);
                     fallible_prefixes.insert(current, allocation);
                 } else {
-                    let (proof, mut callees, actual) = scalar_tail(current).ok_or_else(unsupported)?;
+                    let (proof, mut callees, actual, spans) = scalar_tail(current).ok_or_else(unsupported)?;
                     check_payload(&actual)?;
                     callees.retain(|(target, _, _)| !allocation_free_integer_graph(*target, &mut memo, dependencies));
                     let sealed = callees.iter().map(|(_, ordinal, _)| *ordinal).collect::<HashSet<_>>();
@@ -7251,6 +7283,7 @@ fn closed_aggregates<'a>(
                     }
                     fallible_payloads.insert(current, actual);
                     fallible_allocation_relays.insert(current);
+                    if !spans.is_empty() { fallible_prefixes.insert(current, spans); }
                     fallible_choices.insert((current, proof.expression.0));
                     work.extend(callees.into_iter().rev().map(|(callee, ordinal, payload)|
                         Visit::Enter(callee, (current, ordinal.0), Some(payload))));
