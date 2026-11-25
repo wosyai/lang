@@ -90,6 +90,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::GeneratedArray { .. } => Err("unprepared generated fixed array".into()),
         ScalarExpression::AnonymousCallable { .. } => Err("unprepared inline callable".into()),
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
@@ -393,6 +394,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::GeneratedArray { .. } => Err("unprepared generated fixed array".into()),
         ScalarExpression::AnonymousCallable { .. } => Err("unprepared inline callable".into()),
         ScalarExpression::Member {
             receiver,

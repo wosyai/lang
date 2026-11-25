@@ -969,7 +969,7 @@ fn extend_return_bindings_from_expression(
     expression: &ScalarExpression,
 ) {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => {}
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::Block(block) => bindings.extend(return_bindings(block)),
         ScalarExpression::If {
             then_branch,
@@ -1010,7 +1010,7 @@ fn escaped_runtime_array_owners(
     visited: &mut BTreeSet<String>,
 ) -> BTreeSet<String> {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => BTreeSet::new(),
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => BTreeSet::new(),
         ScalarExpression::Name { name, .. } => {
             if !visited.insert(name.clone()) {
                 return BTreeSet::new();

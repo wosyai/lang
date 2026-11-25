@@ -442,7 +442,7 @@ fn record_expression_overload_selection(
     overloads: &BTreeMap<String, &ScalarOverloadHeader>,
 ) {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => {}
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::Call {
             receiver,
             name,

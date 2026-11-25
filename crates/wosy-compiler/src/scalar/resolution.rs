@@ -505,7 +505,7 @@ fn resolve_expression_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => {}
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_place(
@@ -1394,7 +1394,7 @@ fn resolve_expression_module_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => {}
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_module_place(

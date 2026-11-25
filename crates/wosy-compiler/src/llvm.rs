@@ -2927,6 +2927,9 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(binding.value, ScalarExpression::GeneratedArray { .. }) {
+        return memory::emit_generated_fixed_scalar_array(context, state, binding);
+    }
     if let Some(value) = local_callable::binding_value(context, state, binding, Some(ProjectCallScope { module, modules }))? {
         return Ok(value);
     }

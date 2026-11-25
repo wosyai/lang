@@ -1127,6 +1127,10 @@ impl<'a> Binder<'a, '_> {
         let parent = Parent::Expression(ordinal);
         match expression {
             ScalarExpression::AnonymousCallable { .. } => {}
+            ScalarExpression::GeneratedArray { factory, count, .. } => {
+                self.expression(parent, Edge::AggregateElement(0), factory)?;
+                self.expression(parent, Edge::AggregateElement(1), count)?;
+            }
             ScalarExpression::Call { arguments, .. } => {
                 (self.bind_call)(ordinal, expression)?;
                 for (index, argument) in arguments.iter().enumerate() {

@@ -1245,6 +1245,7 @@ enum ScalarExpressionIdentity {
     StructLiteral(Vec<(String, ScalarExpressionIdentity)>),
     ArrayLiteral(Vec<ScalarExpressionIdentity>),
     AnonymousCallable(ByteSpan),
+    GeneratedArray(Box<ScalarExpressionIdentity>, Box<ScalarExpressionIdentity>),
     Binary(
         BinaryOperator,
         Box<ScalarExpressionIdentity>,
@@ -1381,6 +1382,9 @@ fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpression
                 .collect(),
         ),
         ScalarExpression::AnonymousCallable { span, .. } => ScalarExpressionIdentity::AnonymousCallable(*span),
+        ScalarExpression::GeneratedArray { factory, count, .. } => ScalarExpressionIdentity::GeneratedArray(
+            Box::new(scalar_expression_identity(factory)), Box::new(scalar_expression_identity(count)),
+        ),
         ScalarExpression::ArrayLiteral { elements, .. } => ScalarExpressionIdentity::ArrayLiteral(
             elements.iter().map(scalar_expression_identity).collect(),
         ),
@@ -2140,6 +2144,11 @@ pub enum ScalarExpression {
     },
     ArrayLiteral {
         elements: Vec<ScalarExpression>,
+        span: ByteSpan,
+    },
+    GeneratedArray {
+        factory: Box<ScalarExpression>,
+        count: Box<ScalarExpression>,
         span: ByteSpan,
     },
     AnonymousCallable {
@@ -4735,6 +4744,15 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .expect("unsafe block"),
             true,
         )),
+        SyntaxKind::GeneratedArray => {
+            let children = direct_nodes(&actual);
+            let [factory, count] = children.as_slice() else { unreachable!("authored generated array operands"); };
+            ScalarExpression::GeneratedArray {
+                factory: Box::new(derive_expression(factory)),
+                count: Box::new(derive_expression(count)),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::CallableLiteral => {
             let mut parameters = Vec::new();
             if let Some(list) = actual.children().find(|node| node.kind() == SyntaxKind::Parameters) {
@@ -5305,7 +5323,7 @@ fn token_span(token: &CstToken) -> ByteSpan {
 
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
-        ScalarExpression::AnonymousCallable { span, .. } => *span,
+        ScalarExpression::AnonymousCallable { span, .. } | ScalarExpression::GeneratedArray { span, .. } => *span,
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::ValueField { span, .. }

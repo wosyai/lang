@@ -2692,6 +2692,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 );
                 Ok(ReferenceValue::Other)
             }
+            ScalarExpression::GeneratedArray { factory, count, .. } => {
+                self.expression_child(factory, scope, parent, OccurrenceEdge::AggregateElement(0))?;
+                self.expression_child(count, scope, parent, OccurrenceEdge::AggregateElement(1))?;
+                self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                Ok(ReferenceValue::Other)
+            }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 let track_raw = !self.aggregate_facts.raw_formals.is_empty() || !self.aggregate_facts.formals.is_empty();
                 let mut operands = Vec::new();
@@ -15387,6 +15393,10 @@ impl StructuralWalker<'_, '_> {
                         self.structure.literal_fields.insert(ordinal, id);
                     }
                 }
+            }
+            ScalarExpression::GeneratedArray { factory, count, .. } => {
+                self.expression(factory, names, types, parent, OccurrenceEdge::AggregateElement(0))?;
+                self.expression(count, names, types, parent, OccurrenceEdge::AggregateElement(1))?;
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 for (position, element) in elements.iter().enumerate() {

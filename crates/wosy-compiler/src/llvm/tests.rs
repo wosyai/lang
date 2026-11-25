@@ -18721,3 +18721,73 @@ if (observe(0) != 18 || observe(1) != 40 || mixed(0) != 7 || mixed(1) != 44) {
         }
     }
 }
+
+#[test]
+fn generated_fixed_scalar_array_invokes_factory_in_index_order() {
+    let text = "%%start
+u64(u64) by_index = fn(i) { i + 10 };
+u64(u64) observe = fn(index) {
+    u64[3] values = [by_index; 3];
+    values[index]
+};
+u64() empty_count = fn {
+    u64[0] empty = [by_index; 0];
+    core.array_len(&empty)
+};
+if (observe(0) != 10 || observe(1) != 11 || observe(2) != 12 || empty_count() != 0) {
+    core.system_panic();
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/generated-array.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = parse(text).unwrap_or_else(|e| panic!("{:?}", e.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let observe = self_tail_test_body(&ir, "i64", &project_function_name(&source, "observe"));
+        let empty = self_tail_test_body(&ir, "i64", &project_function_name(&source, "empty_count"));
+        let call = format!("call i64 @{}(", project_function_name(&source, "by_index"));
+        assert!(!empty.contains(&call) && !empty.contains("generated_array.body"), "{empty}");
+        let body = observe.split_once("\ngenerated_array.body:").unwrap().1
+            .split_once("\ngenerated_array.done:").unwrap().0;
+        let phi = body.lines().find_map(|line| line.trim().split_once(" = phi i64 ").map(|(phi, incoming)| {
+            assert!(incoming.starts_with("[ 0, %"), "{body}");
+            phi
+        })).unwrap();
+        let value = body.lines().find_map(|line| line.trim().split_once(&format!(" = {call}i64 {phi})"))
+            .map(|(value, _)| value)).unwrap();
+        assert_eq!(observe.matches(&call).count(), 1, "{observe}");
+        let generated_index = if target == ScalarTargetLayout::WASM32 {
+            let trunc = format!(" = trunc i64 {phi} to i32");
+            let result = body.lines().find_map(|line| line.trim().strip_suffix(&trunc)).unwrap();
+            format!("i32 {result}")
+        } else { format!("i64 {phi}") };
+        let address = body.lines().find_map(|line| {
+            let (address, gep) = line.trim().split_once(" = getelementptr inbounds [3 x i64], ptr ")?;
+            (gep.ends_with(&generated_index)).then_some(address)
+        }).unwrap();
+        assert!(body.contains(&format!("store i64 {value}, ptr {address},")), "{body}");
+        assert!(body.contains(&format!("add i64 {phi}, 1")) && body.contains("icmp ult i64"), "{body}");
+        let access = prepared.checked_access().unwrap();
+        assert_eq!(observe.matches(&format!("call void @{}(", project_function_name(&access.source, &access.in_extent))).count(), 1, "{observe}");
+        for refused in [text.replace("[by_index; 3]", "[by_index; 2]"), text.replace("[by_index; 3]", "[by_index; index]")] {
+            let diagnostics = parse(&refused).err().expect("not an exact fixed count").diagnostics.clone();
+            assert!(diagnostics.iter().any(|d| d.message.contains("exact fixed count")), "{diagnostics:?}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_DEV4_GENERATED_ARRAY_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-generated-array.ll")), controlled).unwrap();
+        }
+    }
+}

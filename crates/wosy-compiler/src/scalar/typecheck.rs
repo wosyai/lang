@@ -408,6 +408,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::AnonymousCallable { span, .. }
+        | ScalarExpression::GeneratedArray { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Unary { span, .. }
         | ScalarExpression::Call { span, .. }
@@ -1231,7 +1232,37 @@ pub(super) fn block_item_type_in_module(
             if !unsafe_context {
                 inference.nominate_inline_elements(binding);
             }
-            let actual = expression_type_in_module_expected(
+            let actual = if let ScalarExpression::GeneratedArray { factory, count, span } = &binding.value {
+                let supported = !unsafe_context && binding.receivers.len() == 1
+                    && binding.fallible_assignment.is_none() && matches!(factory.as_ref(), ScalarExpression::Name { .. });
+                let expected = match (&binding.declared_type, count.as_ref()) {
+                    (ScalarType::Array { element, length, .. }, ScalarExpression::Integer { value, .. })
+                        if supported && u64::try_from(value).ok() == Some(*length) => Some(element.as_ref()),
+                    _ => None,
+                };
+                let signature = expected.and_then(|element| {
+                    let signature = expression_type_in_module(
+                        factory, scope, visible_names, folded_names, module, modules, diagnostics,
+                        unsafe_context, overloads, inference,
+                    );
+                    match &signature {
+                        ScalarType::Callable { parameters, outputs }
+                            if parameters.as_slice() == [ScalarType::U64]
+                                && matches!(outputs.outputs.as_slice(), [ScalarOutput { ty, .. }] if ty == element)
+                                && super::anonymous_callable::closed_scalar_signature(&signature) => Some(signature),
+                        _ => None,
+                    }
+                });
+                if signature.is_none() {
+                    diagnostics.push(module_diagnostic(module, "B0003",
+                        "generated fixed array requires a closed matching scalar u64 factory and exact fixed count", *span));
+                    ScalarType::Error
+                } else {
+                    inference.record_expression_type(count, &ScalarType::U64, true);
+                    inference.record_expression_type(&binding.value, &binding.declared_type, true);
+                    binding.declared_type.clone()
+                }
+            } else { expression_type_in_module_expected(
                 &binding.value,
                 Some(widening.as_ref().unwrap_or(&binding.declared_type)),
                 scope,
@@ -1243,7 +1274,7 @@ pub(super) fn block_item_type_in_module(
                 unsafe_context,
                 overloads,
                 inference,
-            );
+            ) };
             validate_output_receivers_in_module(
                 &binding.value,
                 &binding.receivers,
@@ -3411,6 +3442,10 @@ fn check_expression_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::GeneratedArray { span, .. } => {
+            diagnostics.push(module_diagnostic(module, "B0003", "generated array requires an exact prepared fixed array owner", *span));
+            ScalarType::Error
+        }
         ScalarExpression::AnonymousCallable { span, .. } => {
             diagnostics.push(module_diagnostic(module, "B0003", "inline callable lacks its prepared fixed array owner", *span));
             ScalarType::Error
@@ -7157,7 +7192,7 @@ fn validate_unit_if_position(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match expression {
-        ScalarExpression::AnonymousCallable { .. } => {}
+        ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -7774,7 +7809,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
 
     fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
-            ScalarExpression::AnonymousCallable { .. } => {}
+            ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
             ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
@@ -8464,6 +8499,10 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::GeneratedArray { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0003", "generated array requires an exact prepared fixed array owner", *span));
+            ScalarType::Error
+        }
         ScalarExpression::AnonymousCallable { span, .. } => {
             diagnostics.push(diagnostic(program, "B0003", "inline callable lacks its prepared fixed array owner", *span));
             ScalarType::Error
