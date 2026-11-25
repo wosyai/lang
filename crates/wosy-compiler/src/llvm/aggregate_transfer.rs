@@ -488,21 +488,23 @@ pub(super) fn install_ordinary_array_descriptor<'ctx>(
     binding: &ScalarBinding,
     value: &EmitValue<'ctx>,
 ) -> Result<bool, String> {
-    let Some(receivers) = state.aggregate.as_ref().map(|aggregate| &aggregate.plan.ordinary_array_descriptor_receivers)
-        .filter(|receivers| !receivers.is_empty()) else { return Ok(false); };
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan)
+        .filter(|plan| !plan.ordinary_array_descriptor_receivers.is_empty()) else { return Ok(false); };
     let nodes = state.body_call_nodes.ok_or("missing ordinary returned array receipt")?;
-    let Some(&span) = nodes.expression_ordinal(&binding.value).and_then(|call| receivers.get(&call))
-        else { return Ok(false); };
+    let Some(root) = nodes.expression_ordinal(&binding.value) else { return Ok(false); };
+    let Some(&span) = plan.ordinary_array_descriptor_receivers.get(&root) else { return Ok(false); };
     let [receiver] = binding.receivers.as_slice() else { return Err("missing ordinary array receiver".into()); };
     if receiver.name_span != span || nodes.binding_position(binding).is_none()
         || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
         || binding.fallible_assignment.is_some() || binding.is_allocation
     { return Err("ordinary array receiver changed its prepared assignment boundary".into()); }
+    let signed = memory::SignedRuntimeAddressDomain::for_closed_receiver(state.target_layout, &receiver.ty,
+        plan.signed_ordinary_array_descriptor_receivers.get(&root))?;
     let (backing, extent) = unpack_widened_owning_descriptor(context, state, value)?;
     require_ordinary_array_backing(context, state, backing)?;
     install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.local_runtime_extents.insert(backing, (span, LocalRuntimeExtent::OrdinaryDescriptor(extent), true));
+    state.local_runtime_extents.insert(backing, (span, LocalRuntimeExtent::OrdinaryDescriptor { length: extent, signed }, true));
     Ok(true)
 }
 

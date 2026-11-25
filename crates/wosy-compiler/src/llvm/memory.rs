@@ -423,7 +423,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let checked_lexical_descriptor = runtime_extent.is_some()
                 && state.local_runtime_extents.get(&base_pointer)
                     .is_some_and(|(_, extent, _)| matches!(extent,
-                        LocalRuntimeExtent::OrdinaryDescriptor(_) | LocalRuntimeExtent::WidenedLiteral(_)));
+                        LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral(_)));
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = guarded_extent {
@@ -573,6 +573,19 @@ impl SignedRuntimeAddressDomain {
         (domain.scalar_element.is_some() && allocation_bytes <= domain.max_bytes).then_some(domain)
     }
 
+    pub(super) fn for_closed_receiver(
+        target: ScalarTargetLayout, receiver: &ScalarType, authority: Option<&(ScalarTargetLayout, ScalarType)>,
+    ) -> Result<Option<Self>, String> {
+        let Some((producer_layout, producer_element)) = authority else { return Ok(None); };
+        let ScalarType::RuntimeArray { element, .. } = receiver else {
+            return Err("signed private descriptor receiver is not a runtime array".into());
+        };
+        if *producer_layout != target || producer_element != element.as_ref() {
+            return Err("signed private descriptor differs from its source element or target".into());
+        }
+        Self::for_construction(*producer_layout, producer_element).map(Some)
+    }
+
     pub(super) fn max_bytes(self) -> u64 { self.max_bytes }
 
     pub(super) fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
@@ -618,7 +631,15 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
             }
             Ok(Some(*length))
         }
-        LocalRuntimeExtent::WidenedLiteral(length) | LocalRuntimeExtent::OrdinaryDescriptor(length)
+        LocalRuntimeExtent::OrdinaryDescriptor { length, signed }
+            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+        {
+            if for_index && signed.is_some_and(|domain| !domain.matches_consumer(state.target_layout, element)) {
+                return Err("ordinary runtime array descriptor changed its signed address domain".into());
+            }
+            Ok(Some(*length))
+        }
+        LocalRuntimeExtent::WidenedLiteral(length)
             if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
                 Ok(Some(*length)),
         LocalRuntimeExtent::OwningFormal(length)

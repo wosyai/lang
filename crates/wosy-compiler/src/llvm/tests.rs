@@ -16458,3 +16458,85 @@ if (observed(2, 1) != 99 || observed(2, 1) != 2 || observed(3, 2) != 3) { core.s
         }
     }
 }
+
+#[test]
+fn ordinary_private_descriptor_receiver_retains_exact_all_arm_signed_authority() {
+    let text = "%%start
+u64[](u64) _left = fn(count) { u64[count] fresh; fresh };
+u64[](u64) _right = fn(count) { u64[count] fresh; fresh };
+u64(u64) guarded = fn(count) {
+    u64[] held =? _left(count);
+    if (&held == null) { 99 } else { held[0] = 7; core.array_len(&held) }
+};
+u64(u64,u64) ordinary = fn(count,index) {
+    u64[] held = if (count == 2) { _left(count) } else { _right(count) };
+    held[index] = 7;
+    core.array_len(&held)
+};
+u64(u64,u64) direct = fn(count,index) {
+    u64[] held = _right(count);
+    held[index] = 7;
+    core.array_len(&held)
+};
+u64(u64) absent_only = fn(count) {
+    u64[] held = _right(count);
+    core.array_len(&held)
+};
+if (guarded(1) != 1 || ordinary(2, 1) != 2 || ordinary(3, 2) != 3 || direct(4, 3) != 4) {
+    core.system_panic();
+};
+absent_only(5);
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let module = &prepared.project().modules[0];
+        let mut reservations = crate::scalar::AggregateReservations {
+            modules: vec![0], target_layout: Some(layout), ..Default::default()
+        };
+        reservations.bodies.extend(module.items.iter().enumerate().filter_map(|(item, declaration)|
+            matches!(declaration, ScalarItem::Function(_)).then_some(((0, item, None), true))));
+        let plans = checked.aggregate(&reservations).unwrap();
+        for (name, arity) in [("ordinary", 2), ("direct", 1), ("absent_only", 1)] {
+            let index = module.items.iter().position(|item|
+                matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap();
+            let body = plans.body(0, index, None).unwrap();
+            let mut receivers = body.signed_ordinary_array_descriptor_receivers.iter();
+            let (root, receipt) = receivers.next().expect("one source-established ordinary receiver");
+            assert!(receivers.next().is_none());
+            assert_eq!(receipt, &(layout, ScalarType::U64));
+            assert!(body.ordinary_array_descriptor_receivers.contains_key(root));
+            assert_eq!(body.signed_array_descriptor_calls.contains_key(root), arity == 1);
+            assert_eq!(body.signed_array_descriptor_calls.len(), arity);
+            assert!(body.signed_array_descriptor_calls.values().all(|arm| arm == receipt));
+        }
+        let parsed = parse_source(module.source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![module.source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let release_checked = analyze_scalar_build(&release);
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, artifact) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+            ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = artifact.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "signed ordinary descriptor receiver");
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(&module.source, project, "absent_only"));
+            assert!(!body.contains("getelementptr"), "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_system_panic()").count(), 1, "{body}");
+            if let Some(out) = std::env::var_os("WOSY_SIGNED_ORDINARY_DESCRIPTOR_RECEIVER_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

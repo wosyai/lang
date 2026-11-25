@@ -132,7 +132,10 @@ enum LocalRuntimeExtent<'ctx> {
         length: inkwell::values::IntValue<'ctx>,
         signed: Option<memory::SignedRuntimeAddressDomain>,
     },
-    OrdinaryDescriptor(inkwell::values::IntValue<'ctx>),
+    OrdinaryDescriptor {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
     WidenedLiteral(inkwell::values::IntValue<'ctx>),
     OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),

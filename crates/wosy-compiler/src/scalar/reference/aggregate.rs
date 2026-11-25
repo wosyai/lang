@@ -3075,6 +3075,7 @@ pub(crate) struct ClosedBody {
     pub(crate) signed_array_descriptor_result: Option<(ScalarTargetLayout, ScalarType)>,
     pub(crate) signed_array_descriptor_calls: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) signed_array_descriptor_choices: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
+    pub(crate) signed_ordinary_array_descriptor_receivers: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -3104,6 +3105,14 @@ pub(crate) struct ClosedBody {
 }
 
 impl ClosedBody {
+    fn joined_signed_array_domain(
+        &self, paths: &[(CfgPointId, OccurrenceOrdinal)],
+    ) -> Option<(ScalarTargetLayout, ScalarType)> {
+        let mut receipts = paths.iter().map(|(_, call)| self.signed_array_descriptor_calls.get(&call.0));
+        let first = receipts.next()??;
+        receipts.all(|receipt| receipt == Some(first)).then(|| first.clone())
+    }
+
     pub(crate) fn multi_return_width(&self) -> usize {
         self.multi_forward.as_ref().map_or(self.multi_returns.len(), |(_, outputs)| outputs.len())
     }
@@ -7459,14 +7468,14 @@ fn closed_aggregates<'a>(
             continue;
         };
         if demanded {
-            ordinary_array_receivers.insert((caller, root.0), receiver);
+            ordinary_array_receivers.insert((caller, root.0), (receiver, paths));
             pending.extend(arms.into_iter().map(|(target, site)| (target, site, None)));
         } else {
             let group = groups.len();
             for &(target, _) in &arms {
                 groups_by_target.entry(target).or_default().push(group);
             }
-            groups.push(Some(((caller, root.0), receiver, arms)));
+            groups.push(Some(((caller, root.0), receiver, paths, arms)));
         }
     }
     // First collect each reachable shape once, recording all exact incoming
@@ -7483,8 +7492,8 @@ fn closed_aggregates<'a>(
         // atomic cohort: enroll every mutually exclusive arm before the use
         // census. Each group and each target edge is visited at most once.
         for group in groups_by_target.remove(&target).into_iter().flatten() {
-            if let Some((site, receiver, arms)) = groups[group].take() {
-                ordinary_array_receivers.insert(site, receiver);
+            if let Some((site, receiver, paths, arms)) = groups[group].take() {
+                ordinary_array_receivers.insert(site, (receiver, paths));
                 pending.extend(arms.into_iter().map(|(target, site)| (target, site, None)));
             }
         }
@@ -7965,11 +7974,14 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        for (&(key, root), &receiver) in &ordinary_array_receivers {
+        for (&(key, root), &(receiver, paths)) in &ordinary_array_receivers {
             let plan = result.bodies.entry(key).or_default();
             match receiver {
                 OrdinaryArrayDestination::Declaration(receiver) => {
                     plan.ordinary_array_descriptor_receivers.insert(root, receiver);
+                    if let Some(domain) = plan.joined_signed_array_domain(paths) {
+                        plan.signed_ordinary_array_descriptor_receivers.insert(root, domain);
+                    }
                 }
                 OrdinaryArrayDestination::Replace { destination, install, declaration } => {
                     plan.widened_join_replacements.insert(destination.0, (root, install, declaration));
@@ -7980,11 +7992,8 @@ fn closed_aggregates<'a>(
         for &(key, root, paths) in &guarded_array_choices {
             let plan = result.bodies.entry(key).or_default();
             plan.guarded_array_descriptor_choices.insert(root.0);
-            let mut receipts = paths.iter().map(|(_, call)| plan.signed_array_descriptor_calls.get(&call.0));
-            if let Some(Some(first)) = receipts.next() {
-                if receipts.all(|receipt| receipt == Some(first)) {
-                    plan.signed_array_descriptor_choices.insert(root.0, first.clone());
-                }
+            if let Some(domain) = plan.joined_signed_array_domain(paths) {
+                plan.signed_array_descriptor_choices.insert(root.0, domain);
             }
         }
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
