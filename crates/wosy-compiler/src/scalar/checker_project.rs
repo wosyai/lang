@@ -4961,7 +4961,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             let (guards, domain, meter_rectangle) = match &summary.guards {
                 VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
                 VerifiedSymbolicGuards::Partitioned { guards, .. } => (guards.as_slice(), None, true),
-                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, false),
+                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, guards.arity > 2),
             };
             use super::checker_flow::ImportedVerifiedReturn;
             let result = match &summary.result {
@@ -4971,6 +4971,13 @@ impl<'a> VerifiedSymbolicSummary<'a> {
                 VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
                 VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
             };
+            if let super::reference::CheckerIntegerCallArguments::Wide(_) = &origin.arguments {
+                if !matches!(&summary.guards, VerifiedSymbolicGuards::Ranked(guard) if guard.arity > 2)
+                    || !matches!(result, ImportedVerifiedReturn::Constant { .. })
+                {
+                    return Ok(None);
+                }
+            }
             let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
@@ -7679,7 +7686,8 @@ fn ranked_symbolic_equality<'proof>(
     let TypedProofGoal::Literal { operator: BinaryOperator::Equal, bound, .. } = &plan.typed.goal else {
         return None;
     };
-    let guards = checked_integer_guard_slots::<true>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?;
+    let guards = checked_scalar_guard_slots_with_arity::<true>(
+        plan.typed.body, plan.filter.as_deref().unwrap_or_default(), false, false, MAX_RANKED_INTEGER_AXES)?;
     if guards.always_rejects {
         return None;
     }
@@ -7848,7 +7856,7 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
         allow_reached: existing_transfer_arity
             && (plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count)),
         allow_wide_initializer: !existing_transfer_arity && plan.proof_source == root_source,
-        allow_symbolic_summary: existing_transfer_arity && plan.proof_source == root_source,
+        allow_symbolic_summary: plan.proof_source == root_source,
         reached_return: None,
     })
 }
@@ -18565,6 +18573,54 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(checked.symbolic_diagnostic.unwrap().returned, BigInt::from(4));
         let [later] = checked.additional_symbolic_diagnostics.as_slice() else { panic!("second failure"); };
         assert_eq!(later.returned, BigInt::from(7));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_wide_ranked_equality_refines_only_guarded_symbolic_locals() {
+        let app = source("src/main.w", "ordered-wide-symbolic-rank");
+        let text = format!(r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {{
+                if (left == 0) {{ 7 }} else {{ descend(page, slot, left - 1, quota) }}
+            }};
+            unit(u8) client = fn(input) {{
+                core.narrow(input <= 3, {OUTPUT});
+                u8 observed = descend(input, 2, input, 4);
+                core.require(observed == 7, {OUTPUT});
+                core.require(observed == 8, {OUTPUT});
+            }};
+            proof rank for descend(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && (quota == 4 || quota == 6))
+                ensures (out == 7) decreases (left) {{
+                if (left == 0) {{ core.show(out == 7); }}
+                else {{ core.use(rank(page, slot, left - 1, quota)); }}
+            }}
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let checked = run(&text, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        let [failure] = checked.directives.as_slice() else { panic!("only the false downstream requirement fails"); };
+        assert_eq!(&text[failure.condition.start as usize..failure.condition.end as usize], "observed == 8");
+        let seven = BigInt::from(7);
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        let main = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.directives.is_empty());
+        for rejected in [
+            text.replace("input <= 3", "input <= 4"),
+            text.replace("descend(input, 2, input, 4)", "descend(input, 2, input, 5)"),
+            text.replace("descend(input, 2, input, 4)", "descend(input, 2, input + 0, 4)"),
+            text.replace("ensures (out == 7)", "ensures (out >= 7)"),
+            text.replace("decreases (left)", "decreases (page)"),
+            text.replace("if (left == 0) { 7 }", &format!("core.require(false, {OUTPUT}); if (left == 0) {{ 7 }}")),
+            text.replace("%%end", "u8 reached = descend(0, 2, 3, 4); %%end"),
+        ] {
+            assert!(matches!(run(&rejected, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

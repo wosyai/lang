@@ -7246,9 +7246,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         return None;
                     };
                     use ImportedScalarArgument as Argument;
+                    #[cfg(feature = "internal-checker")]
+                    let mut arguments = [None; super::checker_project::MAX_RANKED_INTEGER_AXES];
+                    #[cfg(not(feature = "internal-checker"))]
                     let mut arguments = [None; 2];
                     for (slot, (ordinal, argument)) in origin.arguments.as_slice().iter().enumerate() {
-                        arguments[slot] = Some(match argument {
+                        *arguments.get_mut(slot)? = Some(match argument {
                             CheckerIntegerCallArgument::Literal(value) => Argument::Literal(value),
                             CheckerIntegerCallArgument::ContextualValue => return None,
                             #[cfg(feature = "internal-checker")]
@@ -7285,15 +7288,30 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle } => {
                             if meter_rectangle {
                                 let work = roots.ordinary_local_work.get_or_insert(0);
-                                charge_call_work(work, 1usize.checked_add(guards.len())?)?;
+                                let width = origin.arguments.as_slice().len();
+                                charge_call_work(work, 1usize.checked_add(guards.len())?
+                                    .checked_add(if width > 2 { width } else { 0 })?)?;
                                 for row in &path.0 {
                                     let mut cost = row.len().checked_add(1)?;
+                                    if width > 2 {
+                                        // The per-row accounting loop visits literal
+                                        // guards as well as guards on caller axes.
+                                        cost = cost.checked_add(guards.len())?;
+                                    }
                                     if matches!(result, ImportedVerifiedReturn::EntryAlias(_) | ImportedVerifiedReturn::EntryAffine { .. }) {
                                         cost = cost.checked_add(row.equal_axes().len().checked_mul(2)?)?.checked_add(2)?;
                                     }
                                     for guard in guards {
                                         if let Some(Argument::Axis(axis)) = arguments.get(guard.slot).copied().flatten() {
                                             cost = cost.checked_add(row.get(axis)?.interval_count())?;
+                                        }
+                                    }
+                                    if width > 2 {
+                                        if let Some((slot, domain)) = domain {
+                                            if let Some(Argument::Axis(axis)) = arguments.get(slot).copied().flatten() {
+                                                cost = cost.checked_add(row.get(axis)?.interval_count())?
+                                                    .checked_add(domain.interval_count())?;
+                                            }
                                         }
                                     }
                                     charge_call_work(work, cost)?;
@@ -7361,7 +7379,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     path = rows;
                                 }
                                 (ImportedVerifiedReturn::PairPartitions(pair), None) => {
-                                    let [Some(first), Some(second)] = arguments else { return None; };
+                                    let (Some(first), Some(second)) = (arguments[0], arguments[1]) else { return None; };
                                     let [(left, _), (right, _)] = origin.arguments.as_slice() else { return None; };
                                     let types = [structure.checked_types.expressions.get(left)?, structure.checked_types.expressions.get(right)?];
                                     path = transfer_imported_pair_returns(&path.0, [first, second], types, &receiver.ty, pair,
@@ -7385,6 +7403,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     continue;
                 }
                 if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
+                    if origin.arguments.as_slice().len() > 2 {
+                        // Wide canonical calls are only consumed as enrolled
+                        // ranked imports above, never by the generic evaluator.
+                        return None;
+                    }
                     let [receiver] = binding.receivers() else { return None; };
                     let contextual = matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]);
                     #[cfg(feature = "internal-checker")]

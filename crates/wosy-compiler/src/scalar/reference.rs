@@ -6205,6 +6205,8 @@ pub(super) enum CheckerIntegerCallArguments {
     Nullary,
     Single(CheckerIntegerArgumentSite),
     Pair(Box<[CheckerIntegerArgumentSite; 2]>),
+    #[cfg(feature = "internal-checker")]
+    Wide(Box<[CheckerIntegerArgumentSite]>),
 }
 
 #[cfg(any(test, feature = "internal-checker"))]
@@ -6215,6 +6217,8 @@ impl CheckerIntegerCallArguments {
             Self::Nullary => &[],
             Self::Single(site) => std::slice::from_ref(site),
             Self::Pair(sites) => sites.as_ref(),
+            #[cfg(feature = "internal-checker")]
+            Self::Wide(sites) => sites.as_ref(),
         }
     }
 }
@@ -9416,6 +9420,32 @@ impl StructuralWalker<'_, '_> {
             ([first, second], [first_ty, second_ty]) => Some(CheckerIntegerCallArguments::Pair(Box::new([
                 describe(0, first, first_ty)?, describe(1, second, second_ty)?,
             ]))),
+            #[cfg(feature = "internal-checker")]
+            (expressions, parameters) if expressions.len() == parameters.len()
+                && (3..=super::checker_project::MAX_RANKED_INTEGER_AXES).contains(&parameters.len())
+                && parameters.iter().all(is_integer_type) =>
+            {
+                let WalkMode::Callable(walk) = &self.mode else { return None; };
+                let source = walk.target_resolver.source;
+                let association = walk.call_occurrences.binary_search_by_key(&call.0, |site| site.ordinal.0).ok()?;
+                let site = walk.sites.get(walk.call_occurrences[association].site)?;
+                let ResolvedCallTarget::ModuleCallable { source: owner, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+                    &site.target else { return None; };
+                if owner != source || !self.structure.checker_direct_targets.contains_key(&call)
+                    || !walk.target_resolver.declarations.checker_proof_targets.contains(&(source, *declaration_span))
+                {
+                    return None;
+                }
+                let sites = expressions.iter().zip(parameters).enumerate().map(|(i, (argument, ty))| {
+                    let site = describe(i, argument, ty)?;
+                    match &site.1 {
+                        CheckerIntegerCallArgument::Literal(value) if super::typecheck::integer_literal_fits_type(value, ty) => Some(site),
+                        CheckerIntegerCallArgument::PlainName => Some(site),
+                        _ => None,
+                    }
+                }).collect::<Option<Box<[_]>>>()?;
+                Some(CheckerIntegerCallArguments::Wide(sites))
+            }
             _ => None,
         }
     }
