@@ -5091,7 +5091,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
         &self, target: PreparedCallable, calls: &FunctionCallSites, position: usize,
         origin: &CheckerIntegerCallOrigin, occurrence: &super::reference::CallOccurrence, scalar_return: bool, qualified_layout: Option<ScalarTargetLayout>,
     ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
-        if if qualified_layout.is_some() { !scalar_return || target.0 == self.target.0 }
+        if if qualified_layout.is_some() { target.0 == self.target.0 }
             else { target.0 != self.target.0 || target.1 <= self.target.1 }
         {
             return Ok(None);
@@ -5119,16 +5119,16 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
             VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
         };
-        if scalar_return || matches!(&origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
+        if scalar_return || qualified_layout.is_some() || matches!(&origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
             let eligible = matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
-                || (scalar_return && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
+                || ((scalar_return || qualified_layout.is_some()) && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
                     && origin.arguments.as_slice().len() == 1);
             if !eligible || !matches!(result, ImportedVerifiedReturn::Constant { .. })
             {
                 return Ok(None);
             }
         }
-        let full_ranked_meter = scalar_return
+        let full_ranked_meter = scalar_return || qualified_layout.is_some()
             || matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if guard.arity > 2);
         let values = ImportedIntegerValues::Shared {
             result, guards, domain, meter_rectangle: meter_rectangle || full_ranked_meter, full_ranked_meter,
@@ -8321,6 +8321,10 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
             (active, rank.failure.take(), Vec::new())
         } else if let Some(bare) = &mut self.bare {
             let active = if let Some(active) = bare.try_collect_qualified_provider(
+                target, calls, source, effects, runtime, &mut self.ranked,
+            )? {
+                Some(active)
+            } else if let Some(active) = bare.try_collect_qualified_requirement(
                 target, calls, source, effects, runtime, &mut self.ranked,
             )? {
                 Some(active)

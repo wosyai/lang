@@ -248,6 +248,57 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         Ok(())
     }
 
+    pub(super) fn try_collect_qualified_requirement(
+        &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity,
+        effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        let watched = self.watched;
+        if target == watched.first.0 || watched.other.contains_key(&target)
+            || !calls.checker_returns_unit() || !calls.checker_named_route_frame()
+            || !calls.callable_escapes.is_empty() || !calls.structure.module_storage_uses.is_empty()
+            || calls.contextual_formal().is_some()
+        {
+            return Ok(None);
+        }
+        let body = &calls.structure;
+        let Some(root) = body.blocks.get(body.root.0) else { return Ok(None); };
+        let [binding, evaluation] = root.items.as_slice() else { return Ok(None); };
+        let (BlockItemKind::Binding(region), BlockItemKind::Evaluation { expression }) = (&binding.kind, &evaluation.kind) else {
+            return Ok(None);
+        };
+        let [receiver] = region.receivers() else { return Ok(None); };
+        let Some(origin) = body.checker_integer_call_locals.get(&(body.root, binding.position)) else { return Ok(None); };
+        let Some(&callee) = body.checker_direct_targets.get(&origin.call) else { return Ok(None); };
+        let [occurrence] = calls.call_occurrences.as_slice() else { return Ok(None); };
+        let Some(directive) = body.checker_directives.get(expression) else { return Ok(None); };
+        let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return Ok(None); };
+        if callee.0 == target.0 || occurrence.ordinal != origin.call || body.checker_directives.len() != 1
+            || directive.operation != CheckerOperation::Require || predicate.binding != origin.binding
+            || !is_integer_type(&receiver.ty) || predicate.ty != receiver.ty || receiver.contextual_storage.is_some()
+            || Job::discover(watched, callee, runtime).and_then(|job| job.export_issuer()).is_none()
+        {
+            return Ok(None);
+        }
+        let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
+        if owner.source != *source { return Err(ProjectCheck::Unsupported); }
+        let edge = (callee, binding.position, origin, occurrence);
+        self.qualify_edge(owner, calls, edge, runtime, ranked)?;
+        self.ensure_qualified_provider(callee, target, runtime, ranked)?;
+        let Some(summary) = self.qualified.verified.lookup(callee) else {
+            // This exact requirement is gated by a refuted supplying proof.
+            // The actual owner's diagnostic retains its original root order.
+            self.qualified.refuter(callee)?;
+            return Ok(Some(false));
+        };
+        let import = summary.import_local(target, calls, binding.position, origin, occurrence, false, Some(owner.target_layout))?
+            .ok_or(ProjectCheck::Unsupported)?;
+        let active = super::super::checker_flow::collect_ordered_imported_root_locals(
+            calls, &mut [Some(import)], &mut |failure| effects.push_callable(calls, source, failure),
+        ).ok_or(ProjectCheck::Unsupported)?;
+        Ok(Some(active))
+    }
+
     pub(super) fn try_collect_qualified_provider(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity,
         effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
@@ -402,6 +453,27 @@ mod tests {
             assert!(matches!(run_chain(MAX_SYMBOLIC_SUMMARY_LINEAGE + 1), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let covered = run(main, relay, library, package).unwrap();
             assert!(covered.active && covered.directives.is_empty() && covered.symbolic_diagnostic.is_none());
+            // No theorem is authored for this Unit root. A real ordered
+            // requirement observes the exact result of its qualified call.
+            let add_ordinary = |expected, argument| main.replace("%%end", &format!(r#"
+                unit() ordinary = fn() {{
+                    u8 seen = bridge.relay({argument});
+                    core.require(seen == {expected}, {{ .stdout = ""; .stderr = "ordinary call result"; .code = 63; .files = []; }});
+                }};
+            %%end"#));
+            let yes = run(&add_ordinary(7, 2), relay, library, package).unwrap();
+            assert!(yes.active && yes.directives.is_empty() && yes.symbolic_diagnostic.is_none());
+            let no = run(&add_ordinary(8, 2), relay, library, package).unwrap();
+            assert_eq!(no.directives.len(), 1);
+            let requirement = &no.directives[0];
+            assert_eq!(requirement.code(), &BigInt::from(63));
+            let seven = BigInt::from(7);
+            assert!(requirement.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+            assert!(no.symbolic_diagnostic.is_none());
+            assert!(matches!(run(&add_ordinary(7, 4), relay, library, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let dormant = run(&add_ordinary(8, 2), relay, library, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant.active && dormant.directives.is_empty() && dormant.symbolic_diagnostic.is_none());
+
             let bad_clients = main.replace("ensures (out == 7)", "ensures (out == 8)");
             let refuted = run(&bad_clients, relay, library, package).unwrap();
             let failures = refuted.symbolic_diagnostic.iter().chain(&refuted.additional_symbolic_diagnostics);
@@ -412,6 +484,9 @@ mod tests {
             }).zip(["proof first_client", "proof later_client"]).all(|(actual, expected)| actual.starts_with(expected)));
             assert_eq!(refuted.additional_symbolic_diagnostics.len(), 1);
             let bad_relay = relay.replace("ensures (out == 7)", "ensures (out == 8)");
+            let blocked = run(&add_ordinary(8, 2), &bad_relay, library, package).unwrap();
+            assert!(blocked.directives.is_empty() && blocked.additional_symbolic_diagnostics.is_empty());
+            assert_eq!(blocked.symbolic_diagnostic.unwrap().proof.source, mid);
             let refuted = run(&bad_clients, &bad_relay, library, package).unwrap();
             assert!(refuted.active && refuted.additional_symbolic_diagnostics.is_empty() && refuted.directives.is_empty());
             let failure = refuted.symbolic_diagnostic.unwrap();
