@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 use wosy_compiler::{
-    derive_scalar_declarations_from_cst, parse_source_with_snapshot, prepare_scalar_project,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, parse_source_with_snapshot, prepare_scalar_project,
     PreparedScalarProject, ScalarNamespaceBinding, ScalarPreparationInputs,
     ScalarProjectPreparationRejection, ScalarSourceDeclarations, ScalarTargetLayout, ScalarType,
 };
-use wosy_daemon::{RootedPreparedProject, SourceStore};
+use wosy_daemon::{BuildAnalysisPhase, RootedPreparedProject, SourceStore};
 use wosy_project::{ProjectConfiguration, ProjectContext};
 use wosy_protocol::{FileEntry, FileKey, NodeId};
 use wosy_syntax::SourceIdentity;
@@ -118,12 +118,37 @@ fn report(view: &RootedPreparedProject<'_>, elapsed_ms: f64) -> Result<serde_jso
     let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
     Ok(serde_json::json!({
         "snapshot": view.declarations().snapshot.hex(), "project_ast": view.declarations().entry_projection.hex(),
-        "prepared_identity": view.identity.hex(), "ready": view.prepared().is_some(),
-        "layout": view.target_layout, "reused_live": out.reused_live_preparation,
+        "prepared_identity": view.identity().hex(), "ready": view.prepared().is_some(),
+        "layout": view.target_layout(), "reused_live": out.reused_live_preparation,
         "projected_ms": ms(out.projected_declarations), "materialized_ms": ms(out.materialized_bodies),
         "compiler_ms": ms(out.compiler_preparation), "query_ms": elapsed_ms,
         "bodies_derived": view.declarations().report.bodies_derived,
         "modules": modules, "diagnostics": view.authored_diagnostics()?,
+    }))
+}
+
+fn report_build(
+    view: &RootedPreparedProject<'_>, preparation_ms: f64, oracle: Option<(&Path, &str)>,
+) -> Result<serde_json::Value> {
+    let analysis = view.build_analysis()?;
+    if let Some((project, profile)) = oracle {
+        let (phase, diagnostics) = match fresh_preparation(project, profile, None)? {
+            Ok(prepared) => (
+                BuildAnalysisPhase::Analyzed, analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            ),
+            Err(rejected) => (
+                BuildAnalysisPhase::PreparationRejected, rejected.into_ordered_diagnostics(),
+            ),
+        };
+        assert_eq!((analysis.phase, &analysis.diagnostics), (phase, &diagnostics));
+    }
+    Ok(serde_json::json!({
+        "snapshot": analysis.source_root.hex(), "prepared_identity": analysis.preparation.hex(),
+        "target_layout": view.target_layout(), "phase": format!("{:?}", analysis.phase),
+        "diagnostics": analysis.diagnostics, "preparation_diagnostics": view.authored_diagnostics()?,
+        "preparation_ms": preparation_ms, "reused_live": view.report.reused_live_preparation,
+        "analysis_ms": analysis.analysis_elapsed.as_secs_f64() * 1000.0,
+        "authored_projection_ms": analysis.authored_projection_elapsed.as_secs_f64() * 1000.0,
     }))
 }
 
@@ -132,7 +157,7 @@ pub(super) async fn run(
     other_root: Option<NodeId>, other_profile: Option<&str>,
 ) -> Result<serde_json::Value> {
     let start = Instant::now();
-    if mode == Some("--held") {
+    if matches!(mode, Some("--held" | "--build-held")) {
         let (first, second) = tokio::join!(
             store.rooted_prepared_project(root, profile),
             store.rooted_prepared_project(other_root.unwrap_or(root), other_profile.unwrap_or(profile)),
@@ -140,13 +165,19 @@ pub(super) async fn run(
         let first = first?.ok_or("unknown first rooted preparation")?;
         let second = second?.ok_or("unknown second rooted preparation")?;
         if let (Some(one), Some(two)) = (first.prepared(), second.prepared()) {
-            assert_eq!(std::ptr::eq(one, two), first.identity == second.identity);
+            assert_eq!(std::ptr::eq(one, two), first.identity() == second.identity());
         }
         let elapsed = milliseconds(start);
+        if mode == Some("--build-held") {
+            return Ok(serde_json::json!([report_build(&first, elapsed, None)?, report_build(&second, elapsed, None)?]));
+        }
         return Ok(serde_json::json!([report(&first, elapsed)?, report(&second, elapsed)?]));
     }
     let first = store.rooted_prepared_project(root, profile).await?.ok_or("unknown rooted preparation")?;
     let elapsed = milliseconds(start);
+    if matches!(mode, Some("--build" | "--build-oracle")) {
+        return report_build(&first, elapsed, (mode == Some("--build-oracle")).then_some((project, profile)));
+    }
     if mode == Some("--oracle") { assert_ordinary(store, &first, project, profile)?; }
     let first_report = report(&first, elapsed)?;
     if mode != Some("--released") { return Ok(first_report); }

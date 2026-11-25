@@ -160,13 +160,18 @@ impl ScalarProjectPreparationRejection {
     pub fn into_ordered_diagnostics(self) -> Vec<Diagnostic> {
         match self.kind {
             ProjectPreparationRejectionKind::ExtractionOrTyping => self.inspection.diagnostics,
-            ProjectPreparationRejectionKind::StaticLookup(calls) => {
-                reference::analyze_project_references(&self.inspection.project.modules, &calls)
-                    .errors()
-                    .iter()
-                    .map(ReferenceAnalysisError::diagnostic)
-                    .collect()
-            }
+            ProjectPreparationRejectionKind::StaticLookup(calls) =>
+                static_lookup_build_diagnostics(&self.inspection.project, &calls),
+        }
+    }
+
+    /// The ordinary Build rejection for a caller that retains its prepared
+    /// input. Unlike inspecting diagnostics, this can run origin analysis.
+    pub fn ordered_build_diagnostics(&self) -> Vec<Diagnostic> {
+        match &self.kind {
+            ProjectPreparationRejectionKind::ExtractionOrTyping => self.inspection.diagnostics.clone(),
+            ProjectPreparationRejectionKind::StaticLookup(calls) =>
+                static_lookup_build_diagnostics(&self.inspection.project, calls),
         }
     }
 
@@ -178,6 +183,13 @@ impl ScalarProjectPreparationRejection {
             }
         }
     }
+}
+
+fn static_lookup_build_diagnostics(
+    project: &ScalarProject, calls: &reference::ProjectCallSiteResults,
+) -> Vec<Diagnostic> {
+    reference::analyze_project_references(&project.modules, calls)
+        .errors().iter().map(ReferenceAnalysisError::diagnostic).collect()
 }
 
 impl PreparedScalarProject {

@@ -50,7 +50,7 @@ pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
-pub use prepared_project::{ProjectPreparationReport, RootedPreparedProject};
+pub use prepared_project::{BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject};
 pub use retention_plan::SourceRetentionPlan;
 
 pub struct SourceStore {
