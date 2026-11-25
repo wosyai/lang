@@ -8101,6 +8101,57 @@ fn build_types_authored_match_arms_without_proving_or_lowering_them() {
 }
 
 #[test]
+fn prepared_enum_payload_layout_keeps_target_and_source_slot_order() {
+    let text = r#"%%start
+        enum Plain { a; }
+        enum Ground { empty; pair(u8, *?u8); bytes(u16[3]); }
+        enum Wide { aligned(u128); bigger(u8[21]); }
+        enum Pending { cyclic(Pending); }
+        enum TooLargeForWasi { overflow(u8[4294967296]); }
+        u8(u8) identity = fn(x) { x };
+        u8 example = identity(6);
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for (target_layout, pointer_offset, payload_size, total) in [
+        (ScalarTargetLayout::NATIVE64, 8, 16, 24),
+        (ScalarTargetLayout::WASM32, 4, 8, 12),
+    ] {
+        let canonical = parsed.result.canonical_cst();
+        let declarations = derive_scalar_build_declarations_from_cst(canonical);
+        let prepared = prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout }).unwrap();
+        let module = &prepared.project().modules[0];
+        let [plain, ground, wide, pending, large] = module.enums.as_slice() else { panic!("canonical declarations"); };
+        assert!(module.layouts.enum_payload(&plain.id).is_none());
+        assert!(module.layouts.enum_payload(&pending.id).is_none());
+        assert_eq!(module.layouts.enum_payload(&large.id).is_some(), target_layout == ScalarTargetLayout::NATIVE64);
+        let layout = module.layouts.enum_payload(&ground.id).unwrap();
+        assert_eq!(layout.target, target_layout);
+        assert_eq!(layout.payload_storage, ScalarLayout { size: payload_size, alignment: pointer_offset });
+        assert_eq!(layout.layout, ScalarLayout { size: total, alignment: pointer_offset });
+        assert_eq!(layout.payload_offset, pointer_offset);
+        let [empty, pair, bytes] = layout.variants.as_slice() else { panic!("canonical variant layout order"); };
+        assert_eq!((empty.tag, pair.tag, bytes.tag), (0, 1, 2));
+        assert_eq!(empty.layout, ScalarLayout { size: 0, alignment: 1 });
+        assert_eq!(pair.slots[1].offset_in_payload, pointer_offset);
+        assert_eq!(pair.slots[1].layout, ScalarLayout { size: pointer_offset, alignment: pointer_offset });
+        let origin = pair.slots[1].source_type.span;
+        assert_eq!(&text[origin.start as usize..origin.end as usize], "*?u8");
+        assert_eq!(bytes.layout, ScalarLayout { size: 6, alignment: 2 });
+        let wide = module.layouts.enum_payload(&wide.id).unwrap();
+        assert_eq!(wide.payload_offset, 16);
+        assert_eq!(wide.payload_storage, ScalarLayout { size: 32, alignment: 16 });
+        assert_eq!(wide.layout, ScalarLayout { size: 48, alignment: 16 });
+        let json = serde_json::to_value(&module.layouts).unwrap();
+        let roundtrip: ScalarTargetLayouts = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, module.layouts);
+        let legacy = derive_scalar_program_from_cst_with_layout(canonical, target_layout);
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+        assert_eq!(legacy.program.layouts, module.layouts);
+    }
+}
+
+#[test]
 fn enum_layout_gate_is_recomputed_from_serialized_variant_slots() {
     let parsed = parse_source(source(), "%%start enum TagOnly { active; } enum HasPayload { none; some(u8); } %%end".to_owned(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);

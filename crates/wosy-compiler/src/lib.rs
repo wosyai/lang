@@ -21,6 +21,7 @@ pub use scalar::{
     ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,
+    ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout, ScalarEnumVariantLayout,
     ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction, ScalarInitializationNode,
     ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
     ScalarOutputReceiver, ScalarOutputSequence, ScalarPlace, ScalarPreparationInputs,

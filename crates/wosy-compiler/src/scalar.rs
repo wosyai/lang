@@ -2637,7 +2637,7 @@ use overload::{
     ScalarOverloadHeader, ScalarTypingView,
 };
 pub(crate) mod layout;
-pub use layout::ScalarTargetLayouts;
+pub use layout::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout, ScalarEnumVariantLayout, ScalarTargetLayouts};
 use layout::{resolve_program_struct_layouts, resolve_project_struct_layouts};
 mod resolution;
 use resolution::{
