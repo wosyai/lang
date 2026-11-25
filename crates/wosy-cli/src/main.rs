@@ -459,7 +459,6 @@ fn compile_project(
         root,
         project,
         configuration,
-        true,
         |source, revision, text| {
             let identity = compiler_source_identity(source, revision);
             let (fresh, diagnostics) =

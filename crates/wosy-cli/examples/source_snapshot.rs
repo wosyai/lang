@@ -8,6 +8,7 @@ use wosy_daemon::{BaseDeclarationsView, ProjectDeclarationsView, QueryDispositio
 use wosy_syntax::{CanonicalCstRoot, CstNode, SyntaxKind};
 use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext, SourceNodeId};
 use wosy_protocol::{FileKey, NodeId};
+use std::collections::BTreeMap;
 
 #[path = "source_snapshot/typed_preparation.rs"]
 mod typed_preparation;
@@ -118,7 +119,7 @@ async fn materialize_project(
         let (cfg, manifest) = ProjectConfiguration::load_with_manifest(&project)?;
         let target = cfg.resolve_target(None)?;
         let ctx = ProjectContext::from_manifest(&project, &target, manifest.as_table())?;
-        let graph = wosy_cli::project_sources::load(&project, &ctx, &cfg, true, |source, rev, text| {
+        let graph = wosy_cli::project_sources::load(&project, &ctx, &cfg, |source, rev, text| {
             let identity = wosy_syntax::SourceIdentity::new(
                 source.project.clone(), source.package.clone(),
                 source.path.as_path().to_str().ok_or("expected UTF-8 fixture path")?.to_owned(),
@@ -190,6 +191,19 @@ async fn main() -> Result<()> {
         return retention::publish_and_pin(&store, &project, &name).await;
     }
     if let Some(package) = args.next() {
+        if package == "--installed-git" {
+            let root = prior.ok_or("Git selection query needs a root")?;
+            let view = store.snapshot(root)?.ok_or("unknown rooted Git selection")?;
+            let selected: BTreeMap<_, _> = view.installed_git_selections()?.into_iter().map(|(name, selection)| {
+                (name, serde_json::json!({
+                    "locked": NodeId(*selection.locked.as_bytes()).hex(),
+                    "patches": NodeId(*selection.patches.as_bytes()).hex(),
+                }))
+            }).collect();
+            println!("{}", serde_json::json!(selected));
+            drop(view);
+            return store.close().await;
+        }
         if matches!(package.as_str(), "--source-pin" | "--source-unpin" | "--source-pins"
             | "--source-plan" | "--source-plan-readers") {
             let scope = prior.ok_or("source pin operation needs a root")?;

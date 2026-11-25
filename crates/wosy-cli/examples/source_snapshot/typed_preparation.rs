@@ -24,7 +24,7 @@ fn fresh_preparation(
         pointer_size: target_layout.pointer_size, pointer_alignment: target_layout.pointer_alignment,
     };
     let mut declarations = BTreeMap::<_, ScalarSourceDeclarations>::new();
-    let graph = wosy_cli::project_sources::load(&project, &ctx, &cfg, true, |source, rev, text| {
+    let graph = wosy_cli::project_sources::load(&project, &ctx, &cfg, |source, rev, text| {
         let key = FileKey::from(source);
         let path = source.path.as_path().to_str().ok_or("expected UTF-8 fixture path")?;
         let authored = SourceIdentity::new(

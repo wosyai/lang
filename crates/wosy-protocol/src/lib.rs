@@ -1,6 +1,7 @@
 //! Content-addressed records for the base CST preparation protocol.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use wosy_project::packages::{LockedInputId, PatchStackId};
 use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -162,6 +163,14 @@ pub fn source_preparation_schema() -> &'static [u8; 32] {
         wosy_syntax::base_cst_schema(),
     ))
 }
+
+pub fn installed_git_source_schema() -> &'static [u8; 32] {
+    static ID: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    ID.get_or_init(|| blake3::derive_key(
+        "wosy source preparation with installed Git selection v1",
+        source_preparation_schema(),
+    ))
+}
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParserPolicy {
@@ -181,6 +190,17 @@ impl ParserPolicy {
 pub struct Namespace {
     pub project: String,
     pub source_root: Option<PackageRelativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<InstalledGitSelection>,
+}
+
+/// The resolved lock and installed patch stack. It does not attest that the
+/// current editable checkout's observed bytes equal either pristine or replayed bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledGitSelection {
+    pub locked: LockedInputId,
+    pub patches: PatchStackId,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -193,6 +213,16 @@ pub struct SourceConfig {
     pub parser: ParserPolicy,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ArtifactProfile>,
+}
+
+impl SourceConfig {
+    pub fn schema(&self) -> &'static [u8; 32] {
+        if self.namespaces.values().any(|ns| ns.git.is_some()) {
+            installed_git_source_schema()
+        } else {
+            source_preparation_schema()
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]

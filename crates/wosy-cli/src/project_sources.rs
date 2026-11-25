@@ -34,7 +34,6 @@ pub fn load(
     root: &Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
-    include_git: bool,
     mut observe: impl FnMut(&SourceIdentity, &ContentRevision, String) -> Result<Vec<Import>, String>,
 ) -> Result<SourceGraph, Error> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
@@ -83,9 +82,6 @@ pub fn load(
                 .get(target)
                 .is_some_and(|paths| paths.contains(module.path.as_ref()));
             if !already_discovered {
-                if !include_git && module.dependency.is_some_and(|p| p.git_pin_identity.is_some()) {
-                    return Err(Error::Observe("source preparation currently supports local dependencies only".to_owned()));
-                }
                 let available = if let Some((_, checkout)) = configuration.git_package(target)? {
                     checkout.source(module.path.as_path())?.map(Some)
                 } else {

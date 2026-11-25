@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use wosy_project::{ProjectConfiguration, ProjectContext, SourceGraph};
 use wosy_protocol::{
-    imports_from_cst, source_preparation_schema, Delta, FileEntry, FileKey, FileMetadata, Kind,
+    imports_from_cst, Delta, FileEntry, FileKey, FileMetadata, InstalledGitSelection, Kind,
     Namespace, NodeId, ParserPolicy, SourceConfig,
 };
 use wosy_syntax::{CstNode, SyntaxKind};
@@ -126,20 +126,29 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
         .map_err(|error| error.to_string())?;
     let inputs = NodeId(blake3::derive_key("wosy source configuration inputs v2", &input));
     let mut namespaces: BTreeMap<_, _> = cfg.resolved_packages.iter().map(|(name, p)| {
-        (name.clone(), Namespace {
+        let git = if let Some(locked) = &p.git_pin_identity {
+            let patches = p.patch_stack_id
+                .ok_or_else(|| format!("Git dependency {name} has no verified patch stack"))?;
+            Some(InstalledGitSelection { locked: locked.clone(), patches })
+        } else {
+            None
+        };
+        Ok((name.clone(), Namespace {
             project: p.identity.project.clone(),
             source_root: Some(p.identity.path.clone()),
-        })
-    }).collect();
+            git,
+        }))
+    }).collect::<Result<_, String>>()?;
     namespaces.insert(ctx.package.clone(), Namespace {
         project: project.to_str().ok_or("project path is not UTF-8")?.to_owned(),
         source_root: cfg.module_source_root.clone()
             .filter(|path| path.as_path() != Path::new(".")),
+        git: None,
     });
     let mut delta = Delta::default();
     let (mut parsed, mut reused) = (0, 0);
     let mut files = Files::new();
-    let graph = crate::project_sources::load(&project, &ctx, &cfg, false, |source, revision, text| {
+    let graph = crate::project_sources::load(&project, &ctx, &cfg, |source, revision, text| {
         let key = FileKey::from(source);
         let revision = NodeId::parse_hex(&revision.0).expect("source observation is a BLAKE3 hash");
         let file = if let Some(old) = base.and_then(|files| files.get(&key)).filter(|old| {
@@ -170,6 +179,7 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
     let config = SourceConfig {
         entry: FileKey::from(&graph.nodes[0].source), namespaces, target, inputs, parser, profiles,
     };
+    let schema = config.schema();
     let config = delta.add(Kind::Config, json(&config), vec![]);
     let mut by_location = BTreeMap::new();
     let mut leaves = Vec::new();
@@ -186,6 +196,6 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
     let annotation = delta.add(Kind::AnnotationTree, vec![], by_location.values().map(|v| v.2).collect());
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
-    let root = delta.add(Kind::SourcePreparation, source_preparation_schema().to_vec(), roots);
+    let root = delta.add(Kind::SourcePreparation, schema.to_vec(), roots);
     Ok(PreparedSources { root, delta, parsed, reused })
 }

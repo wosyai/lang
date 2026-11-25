@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
-    imports_from_cst, source_preparation_schema, Delta, FileEntry, FileKey, Import, Kind, Node,
-    NodeId, SourceConfig,
+    imports_from_cst, installed_git_source_schema, source_preparation_schema, Delta, FileEntry,
+    FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig,
 };
 use wosy_syntax::{
     typed_comment_from_token, AuthoredSpanMap, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind,
@@ -227,7 +227,7 @@ fn validate_shape(node: &Node) -> Result<()> {
 fn supported_top(node: &Node) -> bool {
     node.kind == Kind::SourcePreparation
         && node.children.len() >= 5
-        && node.data == source_preparation_schema()
+        && (node.data == source_preparation_schema() || node.data == installed_git_source_schema())
 }
 
 #[derive(Clone, Copy)]
@@ -366,9 +366,13 @@ fn check_path(path: &PackageRelativePath) -> Result<()> {
 
 fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishReport) -> Result<()> {
     // The newly interned root has already passed the schema boundary.
-    let index = read_index(tx, read_node(tx, root)?)?;
+    let top = read_node(tx, root)?;
+    let schema = top.data.as_slice().try_into().map(|array: &[u8; 32]| *array)?;
+    let index = read_index(tx, top)?;
     let config: SourceConfig = serde_json::from_slice(&read_node(tx, index.config)?.data)?;
-    if config.parser.schema.0 != *wosy_syntax::base_cst_schema()
+    if &schema != config.schema()
+        || config.namespaces.get(&config.entry.package).is_none_or(|ns| ns.git.is_some())
+        || config.parser.schema.0 != *wosy_syntax::base_cst_schema()
         || !index.files.contains_key(&config.entry)
         || index.files.len() != index.modules.len()
         || index.files.len() != index.executable_paths.len()
@@ -627,9 +631,21 @@ fn read_cst(tx: &Transaction, root: NodeId) -> Result<CstNode> {
 }
 
 impl SourceView {
+    fn source_config(&self) -> Result<SourceConfig> {
+        Ok(serde_json::from_slice(&read_node(&self.tx, self.config)?.data)?)
+    }
+
     fn configured(self) -> Result<ConfiguredSourceView> {
-        let config = serde_json::from_slice(&read_node(&self.tx, self.config)?.data)?;
+        let config = self.source_config()?;
         Ok(ConfiguredSourceView { source: self, config })
+    }
+
+    /// Describe the exact lock and patch selections of this rooted view,
+    /// independently from the current workspace and its editable file bytes.
+    pub fn installed_git_selections(&self) -> Result<BTreeMap<String, InstalledGitSelection>> {
+        Ok(self.source_config()?.namespaces.into_iter().filter_map(|(name, namespace)| {
+            namespace.git.map(|selection| (name, selection))
+        }).collect())
     }
 
     /// Reconstitute the real Rowan tree from the selected root without reparsing.
