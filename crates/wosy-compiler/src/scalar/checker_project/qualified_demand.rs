@@ -68,6 +68,56 @@ struct Job<'proof, 'run, 'case> {
     origins: Vec<RankedScalarOrigin<'run>>,
 }
 
+// Preflight only the bounded obligations and canonical Unit control regions
+// dominated by the imported prefix. The integer walker, not this shape check,
+// selects rows and visits actual reachable requirements in checker order.
+fn qualified_requirement_suffix(
+    calls: &FunctionCallSites, root_items: &[BlockItem],
+    origin_binding: impl Fn(&super::super::checker_flow::IntegerPredicate) -> bool,
+) -> Option<()> {
+    const MAX_REQUIREMENTS: usize = 4;
+    const MAX_CONDITIONALS: usize = 4;
+    let body = &calls.structure;
+    if !(1..=MAX_REQUIREMENTS).contains(&body.checker_directives.len()) {
+        return None;
+    }
+    let mut remaining = vec![root_items.iter()];
+    let mut blocks = HashSet::new();
+    let mut obligations = HashSet::new();
+    let mut branches = 0;
+    while let Some(items) = remaining.last_mut() {
+        let Some(item) = items.next() else { remaining.pop(); continue; };
+        let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
+        if let Some(directive) = body.checker_directives.get(&expression) {
+            let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return None; };
+            if directive.operation != CheckerOperation::Require || !origin_binding(predicate)
+                || !obligations.insert(expression)
+            {
+                return None;
+            }
+            continue;
+        }
+        branches += 1;
+        if branches > MAX_CONDITIONALS { return None; }
+        let (condition, then_block, else_block) = match calls.conditionals.get(&expression)? {
+            ConditionalRegion::Unit { condition, then_block, .. } => (*condition, *then_block, None),
+            ConditionalRegion::Value { condition, then_block, else_block, .. }
+                if body.checked_types.expressions.get(&expression) == Some(&ScalarType::Unit) =>
+                (*condition, *then_block, Some(*else_block)),
+            _ => return None,
+        };
+        let CheckerPredicate::Integer(predicate) = body.checker_branches.get(&condition)? else { return None; };
+        if !origin_binding(predicate) { return None; }
+        for arm in else_block.into_iter().chain([then_block]) {
+            if arm == body.root || !blocks.insert(arm) { return None; }
+            let block = body.blocks.get(arm.0)?;
+            if block.unsafe_context { return None; }
+            remaining.push(block.items.iter());
+        }
+    }
+    (obligations.len() == body.checker_directives.len()).then_some(())
+}
+
 impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
     fn discover(
         watched: &'case MainFlowProofObserver<'proof>, target: PreparedCallable,
@@ -371,11 +421,10 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         let body = &calls.structure;
         let Some(root) = body.blocks.get(body.root.0) else { return Ok(None); };
         let count = calls.call_occurrences.len();
-        if !(1..=4).contains(&count) || root.items.len() <= count || root.items.len() > count + 4 {
+        if !(1..=4).contains(&count) || root.unsafe_context || root.items.len() <= count {
             return Ok(None);
         }
         let (bindings, requirements) = root.items.split_at(count);
-        if body.checker_directives.len() != requirements.len() { return Ok(None); }
         let mut origins = Vec::with_capacity(count);
         let mut seen = HashSet::with_capacity(count);
         for binding in bindings {
@@ -392,15 +441,10 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             origins.push(((callee, binding.position, origin, occurrence), &receiver.ty));
         }
-        for requirement in requirements {
-            let BlockItemKind::Evaluation { expression } = &requirement.kind else { return Ok(None); };
-            let Some(directive) = body.checker_directives.get(expression) else { return Ok(None); };
-            let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return Ok(None); };
-            if directive.operation != CheckerOperation::Require
-                || !origins.iter().any(|((_, _, origin, _), ty)| predicate.binding == origin.binding && &predicate.ty == *ty)
-            {
-                return Ok(None);
-            }
+        if qualified_requirement_suffix(calls, requirements, |predicate| {
+            origins.iter().any(|((_, _, origin, _), ty)| predicate.binding == origin.binding && &predicate.ty == *ty)
+        }).is_none() {
+            return Ok(None);
         }
         let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
         if owner.source != *source { return Err(ProjectCheck::Unsupported); }
@@ -588,6 +632,33 @@ mod tests {
                 assert_eq!(failure.source, app);
                 assert_eq!(&bad_ordered[failure.condition.start as usize..failure.condition.end as usize], expected);
             }
+            let branched = r#"%%start
+                joined = namespace package "src/hub.w";
+                next = namespace package "src/right.w";
+                unit() check = fn() {
+                    u8 first_value = joined.compose(0);
+                    u8 second_value = next.shift(first_value);
+                    if (first_value == 2) {
+                        core.require(second_value == 3, { .stdout = ""; .stderr = "selected"; .code = 73; .files = []; });
+                    } else {
+                        core.require(second_value == 99, { .stdout = ""; .stderr = "other"; .code = 74; .files = []; });
+                    };
+                    core.require(first_value == 2, { .stdout = ""; .stderr = "joined"; .code = 75; .files = []; });
+                };
+            %%end"#;
+            let selected = run(branched, &mixed, increment, &wide, package).unwrap();
+            assert!(selected.active && selected.directives.is_empty());
+            let wrong_branch_and_join = branched.replace("if (first_value == 2)", "if (first_value == 1)")
+                .replace("core.require(first_value == 2", "core.require(first_value == 1");
+            let report = run(&wrong_branch_and_join, &mixed, increment, &wide, package).unwrap();
+            let [arm, join] = report.directives.as_slice() else { panic!("only selected arm then joined requirement"); };
+            for (failure, code, text) in [(arm, 74, "second_value == 99"), (join, 75, "first_value == 1")] {
+                assert_eq!(failure.code(), &BigInt::from(code));
+                assert_eq!(failure.source, app);
+                assert_eq!(&wrong_branch_and_join[failure.condition.start as usize..failure.condition.end as usize], text);
+            }
+            let dormant_branch = run(&wrong_branch_and_join, &mixed, increment, &wide, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant_branch.active && dormant_branch.directives.is_empty());
             let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");
             assert!(matches!(run(ordered, &mixed, increment, &guarded, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let provider_failure = wide.replace("core.old(input) + 1", "core.old(input) + 2");
