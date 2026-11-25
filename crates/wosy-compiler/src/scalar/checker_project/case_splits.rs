@@ -465,7 +465,8 @@ fn compile<'a>(
                 let peer = catalog.and_then(|catalog| catalog.resolve(plan.proof_source, name))
                     .ok_or(ProjectCheck::Unsupported)?;
                 let (relation, equality) = peer.peer_literal_goal().ok_or(ProjectCheck::Unsupported)?;
-                if !peer.has_no_authored_steps() || !plan.same_peer_target(peer)
+                charge_call_work(&mut work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
+                if !peer.has_closed_case_citation_steps(relation, equality) || !plan.same_peer_target(peer)
                     || Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal)
                 {
                     return Err(ProjectCheck::Unsupported);

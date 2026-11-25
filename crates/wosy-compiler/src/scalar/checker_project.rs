@@ -5683,8 +5683,8 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         }
         let mut verdicts = (0..cases.len()).map(|_| PeerVerdict { established: false, failure: None })
             .collect::<Vec<_>>();
-        for (index, (proof, authored)) in cases.iter().enumerate() {
-            if authored.is_some() || domains[index].is_empty() { continue; }
+        for (index, (proof, _)) in cases.iter().enumerate() {
+            if index == cohort.consumer || domains[index].is_empty() { continue; }
             let goal = PartitionedProofGoal::Literal(proof.relation()?, proof.bound.literal().ok_or(ProjectCheck::Unsupported)?);
             let checked = verify_partitioned_call_return(body, &returned, &domains[index], false, goal, Some(&mut work))
                 .ok_or(ProjectCheck::Unsupported)?;
@@ -5696,7 +5696,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         for (index, (proof, authored)) in cases.iter().enumerate() {
             if index != cohort.consumer {
                 if let Some(failure) = verdicts[index].failure.take() {
-                    self.record(proof, function, source, position, failure, None)?;
+                    self.record(proof, function, source, position, failure, cohort.peer_steps[index])?;
                 }
                 continue;
             }
@@ -7059,6 +7059,9 @@ impl<'a> SymbolicSummaryIssuer<'a> {
 struct CaseCitationCohort {
     consumer: usize,
     peers: HashMap<u32, usize>,
+    // Authored certificate and goal must be the same literal relation.
+    // A single verdict then verifies both and preserves the step span.
+    peer_steps: Vec<Option<ByteSpan>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7073,6 +7076,7 @@ impl CaseCitationCohort {
         super::checker_flow::charge_call_work(work, cases.len()).ok_or(ProjectCheck::Unsupported)?;
         let mut consumer = None;
         let mut peers = HashMap::new();
+        let mut peer_steps = vec![None; cases.len()];
         for (index, (proof, authored)) in cases.iter().enumerate() {
             match authored {
                 Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations() && consumer.is_none() => {
@@ -7081,10 +7085,17 @@ impl CaseCitationCohort {
                 None if proof.bound.literal().is_some() && !proof.qualified_leaf => {
                     if peers.insert(proof.proof.start, index).is_some() { return Err(ProjectCheck::Unsupported); }
                 }
+                Some(MainFlowAuthoredShows::Single(step))
+                    if !proof.qualified_leaf && proof.bound.literal() == Some(step.bound.as_ref())
+                        && proof.relation == Some(step.relation) =>
+                {
+                    if peers.insert(proof.proof.start, index).is_some() { return Err(ProjectCheck::Unsupported); }
+                    peer_steps[index] = Some(step.span);
+                }
                 _ => return Err(ProjectCheck::Unsupported),
             }
         }
-        Ok(Self { consumer: consumer.ok_or(ProjectCheck::Unsupported)?, peers })
+        Ok(Self { consumer: consumer.ok_or(ProjectCheck::Unsupported)?, peers, peer_steps })
     }
 
     fn at_invocation(
@@ -7634,9 +7645,19 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if !applies() {
                                 continue;
                             }
+                            if let Some((cohort, points)) = &case_points {
+                                if cohort.peer_steps[index] == Some(step.span) {
+                                    if points[index].established { continue; }
+                                    Some(step.span)
+                                } else {
+                                    self.incomplete = true;
+                                    return;
+                                }
+                            } else {
                             let Some(failed) = literal_proof_failure(value, relation, bound.as_ref(), Some(step))
                                 else { continue; };
                             failed
+                            }
                         }
                         Some(shows @ (MainFlowAuthoredShows::Multiple { .. } | MainFlowAuthoredShows::CallingSequence { .. })) => {
                             if !applies() {
@@ -10197,6 +10218,19 @@ impl PlannedModuleProof<'_> {
                 Err(ProjectCheck::Unsupported),
             RankedInductionOutcome::Refuted(_) => Ok(ProjectCheck::Refuted),
         }
+    }
+
+    fn has_closed_case_citation_steps(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
+        if self.has_no_authored_steps() { return true; }
+        if self.variant_match.is_some() { return false; }
+        let ([item], [terminated]) = (self.steps.items.as_slice(), self.steps.terminated_items.as_slice()) else {
+            return false;
+        };
+        let Some(comparison) = proof_show_expression(item, *terminated).ok().and_then(IntegerComparison::from_expression) else {
+            return false;
+        };
+        checked_literal_output_goal_borrowed(comparison, &self.typed.output, &self.typed.input_names, self.typed.result_type)
+            .is_ok_and(|(_, shown_relation, shown_bound)| shown_relation == relation && shown_bound.as_ref() == bound)
     }
 
     fn uses_direct_goal(&self) -> bool {
@@ -16766,6 +16800,61 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         %%end"#);
         let combined = run(&other_flat, package).unwrap();
         assert!(combined.active && combined.symbolic_diagnostic.is_none() && combined.directives.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_case_rewrite_consumes_independently_verified_authored_peer() {
+        let app = source("src/main.w", "ordered-authored-peer-rewrite");
+        let text = r#"%%start
+            u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+            proof clamped for clamp(x) -> (out) ensures (out <= 10) {
+                if (x > 10) {
+                    core.use(high(x));
+                    if (x == 11) { core.rewrite(out == 10, _ <= 10); }
+                    else { core.rewrite(10 == out, _ <= 10); }
+                } else { core.show(out == x); }
+            }
+            proof high for clamp(input) -> (value) where (input > 10) ensures (value == 10)
+            { core.show(value == 10); }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let reached = text.replace("%%end", "u8 first = clamp(11); u8 second = clamp(13); %%end");
+        for (program, scope) in [(text, ScalarCheckerScope::CurrentPackage), (reached.as_str(), ScalarCheckerScope::MainFlowOnly)] {
+            let passed = run(program, scope).unwrap();
+            assert!(passed.active && passed.diagnostics.is_empty() && passed.symbolic_diagnostic.is_none());
+            let failed = program.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }");
+            let report = run(&failed, scope).unwrap();
+            let at = |span: ByteSpan| &failed[span.start as usize..span.end as usize];
+            if scope == ScalarCheckerScope::CurrentPackage {
+                let diagnostic = report.symbolic_diagnostic.unwrap();
+                assert!(report.additional_symbolic_diagnostics.is_empty() && report.diagnostics.is_empty());
+                assert!(at(diagnostic.proof.range).starts_with("proof high"));
+                assert_eq!(at(diagnostic.failed_step.unwrap().range), "core.show(value == 10)");
+                assert_eq!(diagnostic.returned, BigInt::from(9));
+            } else {
+                assert!(report.symbolic_diagnostic.is_none());
+                assert_eq!(report.diagnostics.len(), 2);
+                for (diagnostic, call) in report.diagnostics.iter().zip(["clamp(11)", "clamp(13)"]) {
+                    assert!(at(diagnostic.proof.range).starts_with("proof high"));
+                    assert_eq!(at(diagnostic.failed_step.as_ref().unwrap().range), "core.show(value == 10)");
+                    assert_eq!(at(diagnostic.invocation.call.range), call);
+                }
+            }
+        }
+        for unsupported in [
+            text.replace("core.show(value == 10)", "core.show(value <= 10)"),
+            text.replace("core.show(value == 10);", "core.show(value == 10); core.show(value == 10);"),
+            text.replace("core.show(value == 10)", "core.use(high(input))"),
+            text.replace("input > 10", "input > 11"),
+        ] {
+            assert!(run(&unsupported, ScalarCheckerScope::CurrentPackage).is_err());
+        }
     }
 
     #[cfg(feature = "internal-checker")]
