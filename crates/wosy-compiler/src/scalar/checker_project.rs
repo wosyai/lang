@@ -7001,7 +7001,7 @@ impl<'a> MainFlowProofCase<'a> {
         use super::checker_flow::QuantifiedIntegerReturn as Quantified;
         let quantified = match &plan.typed.goal {
             TypedProofGoal::UniversalNotEqual(excluded) => Some((Quantified::Avoiding(None, excluded), None)),
-            TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal) => Some((match goal {
+            TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal, _) => Some((match goal {
                 UniversalConjunction::Vacuous => Quantified::Vacuous,
                 UniversalConjunction::Impossible => Quantified::Impossible,
                 UniversalConjunction::Output(bounds) => Quantified::Output(bounds),
@@ -7055,7 +7055,7 @@ impl<'a> MainFlowProofCase<'a> {
                 (if witness_outside { Quantified::Impossible } else { goal_claim }, goal, failed_step)
             } else {
                 if !plan.has_no_authored_steps() { return Err(ProjectCheck::Unsupported); }
-                let goal = if matches!(plan.typed.goal, TypedProofGoal::InferredExistential(_)) {
+                let goal = if matches!(plan.typed.goal, TypedProofGoal::InferredExistential(..)) {
                     child(&ensures, SyntaxKind::ProofExists)?
                 } else {
                     child(&ensures, SyntaxKind::Expression)?
@@ -7063,7 +7063,8 @@ impl<'a> MainFlowProofCase<'a> {
                 (goal_claim, goal, None)
             };
             let original_witness = match &plan.typed.goal {
-                TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(witness)) => Some(witness),
+                TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(witness))
+                | TypedProofGoal::InferredExistential(_, Some(witness)) => Some(witness),
                 _ => None,
             };
             return Ok((Self {
@@ -11074,7 +11075,7 @@ impl SelectedProofObserver<'_> {
                     },
                     TypedProofGoal::EntryWitness { .. } => None,
                     TypedProofGoal::UniversalNotEqual(domain) => Some(!domain.covers_closed(value, value)),
-                    TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal) => Some(match goal {
+                    TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal, _) => Some(match goal {
                         UniversalConjunction::Vacuous => true,
                         UniversalConjunction::Impossible => false,
                         UniversalConjunction::Output(output) => output.holds_value(value),
@@ -11334,7 +11335,7 @@ enum TypedProofGoal {
     #[cfg(feature = "internal-checker")]
     UniversalConjunction(UniversalConjunction),
     #[cfg(feature = "internal-checker")]
-    InferredExistential(UniversalConjunction),
+    InferredExistential(UniversalConjunction, Option<(String, BigInt)>),
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
     EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet, offset: Option<BigInt> },
@@ -11370,7 +11371,7 @@ impl TypedProofGoal {
                 DependentWitness::OutputAvoiding(bounds) =>
                     path.output_satisfies_constraints_avoiding(&bounds.0, &bounds.1)?.then_some(true),
             },
-            Self::UniversalConjunction(goal) | Self::InferredExistential(goal) => match goal {
+            Self::UniversalConjunction(goal) | Self::InferredExistential(goal, _) => match goal {
                 UniversalConjunction::Vacuous => Some(true),
                 UniversalConjunction::Impossible => Some(false),
                 UniversalConjunction::Output(output) => path.output_satisfies_constraints(output),
@@ -11595,7 +11596,9 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     }
     let admission = witness.map(|(exists, binder, chosen, translation)| {
         let original = &declarations.get(chosen).ok_or(ProjectCheck::Unsupported)?.1;
-        let relative = origin.is_some().then(|| (original.as_str(), quantified_offset_order(translation.as_ref())));
+        let relative = origin.is_some().then(|| QuantifiedDomainDependency::CheckedOffset {
+            source: original.as_str(), order: quantified_offset_order(translation.as_ref()),
+        });
         let domain = typed_quantifier_domain_with_relative(exists, &binder, inputs, ty, relative)?;
         Ok::<_, ProjectCheck>((chosen, domain, translation))
     }).transpose()?;
@@ -11755,9 +11758,23 @@ fn typed_quantifier_domain(
     typed_quantifier_domain_with_relative(quantifier, binder, inputs, ty, None)
 }
 
+#[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+enum QuantifiedDomainDependency<'a> {
+    CheckedOffset { source: &'a str, order: std::cmp::Ordering },
+    MonotoneProjection { source: &'a str, relation: &'a mut Option<IntegerRelation> },
+}
+
+impl QuantifiedDomainDependency<'_> {
+    fn name(&self) -> &str {
+        match self {
+            Self::CheckedOffset { source, .. } | Self::MonotoneProjection { source, .. } => source,
+        }
+    }
+}
+
 fn typed_quantifier_domain_with_relative(
     quantifier: &CstNode, binder: &str, inputs: &[String], ty: &ScalarType,
-    relative: Option<(&str, std::cmp::Ordering)>,
+    mut relative: Option<QuantifiedDomainDependency<'_>>,
 ) -> Result<IntegerSet, ProjectCheck> {
     use super::{checker_flow::charge_call_work, symbolic_integer::IntegerIntersection};
 
@@ -11781,38 +11798,48 @@ fn typed_quantifier_domain_with_relative(
     }
     let condition = derive_expression(&expression);
     enum Task<'a> {
-        Visit(&'a ScalarExpression, bool),
+        Visit(&'a ScalarExpression, bool, bool),
         Combine { union: bool },
     }
-    let mut tasks = vec![Task::Visit(&condition, false)];
+    let mut tasks = vec![Task::Visit(&condition, false, true)];
     let mut domains = Vec::<IntegerSet>::new();
     while let Some(task) = tasks.pop() {
         match task {
-            Task::Visit(ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. }, negated) =>
-                tasks.push(Task::Visit(operand, !negated)),
-            Task::Visit(ScalarExpression::Binary { operator, left, right, .. }, negated)
+            Task::Visit(ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. }, negated, conjunctive) =>
+                tasks.push(Task::Visit(operand, !negated, conjunctive)),
+            Task::Visit(ScalarExpression::Binary { operator, left, right, .. }, negated, conjunctive)
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
-                tasks.push(Task::Combine { union: (*operator == BinaryOperator::Or) != negated });
-                tasks.push(Task::Visit(right, negated));
-                tasks.push(Task::Visit(left, negated));
+                let union = (*operator == BinaryOperator::Or) != negated;
+                tasks.push(Task::Combine { union });
+                tasks.push(Task::Visit(right, negated, conjunctive && !union));
+                tasks.push(Task::Visit(left, negated, conjunctive && !union));
             }
-            Task::Visit(ScalarExpression::Boolean { value, .. }, negated) =>
+            Task::Visit(ScalarExpression::Boolean { value, .. }, negated, _) =>
                 domains.push(if *value != negated { universe.clone() } else { IntegerSet::default() }),
-            Task::Visit(expression, negated) => {
-                if let Some((original, order)) = relative {
+            Task::Visit(expression, negated, conjunctive) => {
+                if let Some(original) = relative.as_ref().map(QuantifiedDomainDependency::name) {
                     if let ScalarExpression::Binary { operator, left, right, .. } = expression {
                         if let (ScalarExpression::Name { name: first, .. }, ScalarExpression::Name { name: second, .. }) =
                             (left.as_ref(), right.as_ref())
                         {
-                            // Both names were bound by the typed quantifier
-                            // plan. For an exact checked candidate=x+shift
-                            // the comparison with x has one constant order.
-                            let order = if first == binder && second == original { order }
-                                else if first == original && second == binder { order.reverse() }
+                            // Both names belong to the immediately bound,
+                            // same-width integer coordinates of this plan.
+                            let flipped = if first == binder && second == original { false }
+                                else if first == original && second == binder { true }
                                 else { return Err(ProjectCheck::Unsupported); };
                             let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+                            let relation = if flipped { relation.reversed() } else { relation };
+                            let relation = if negated { relation.complement() } else { relation };
                             charge_call_work(&mut work, 1).ok_or(ProjectCheck::Unsupported)?;
-                            domains.push(if relation.accepts(order) != negated { universe.clone() } else { IntegerSet::default() });
+                            let active = match relative.as_mut().ok_or(ProjectCheck::Unsupported)? {
+                                QuantifiedDomainDependency::CheckedOffset { order, .. } => relation.accepts(*order),
+                                QuantifiedDomainDependency::MonotoneProjection { relation: observed, .. } => {
+                                    if !conjunctive { return Err(ProjectCheck::Unsupported); }
+                                    **observed = Some(observed.map_or(relation, |known| known.intersection(relation)));
+                                    true
+                                }
+                            };
+                            domains.push(if active { universe.clone() } else { IntegerSet::default() });
                             continue;
                         }
                     }
@@ -11898,10 +11925,17 @@ fn partition_existential_conjuncts(
 fn inferred_scalar_existential(
     exists: &CstNode, predicate: &ScalarExpression, binder: &str, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<TypedProofGoal, ProjectCheck> {
+    let (relation, bounds) = partition_existential_conjuncts(predicate, binder, output, inputs, ty)?;
+    let domain = typed_quantifier_domain(exists, binder, inputs, ty)?;
+    Ok(TypedProofGoal::InferredExistential(inferred_existential_output(domain, relation, bounds, ty)?, None))
+}
+
+#[cfg(feature = "internal-checker")]
+fn inferred_existential_output(
+    domain: IntegerSet, relation: Option<IntegerRelation>, mut bounds: IntegerShowConstraints<'static>, ty: &ScalarType,
+) -> Result<UniversalConjunction, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     use UniversalConjunction::{Impossible, Output as Bounds, OutputAvoiding};
-    let (relation, mut bounds) = partition_existential_conjuncts(predicate, binder, output, inputs, ty)?;
-    let domain = typed_quantifier_domain(exists, binder, inputs, ty)?;
     let condition = if domain.is_empty() {
         Impossible
     } else if let Some(relation) = relation {
@@ -11939,7 +11973,46 @@ fn inferred_scalar_existential(
         bounds.normalize();
         Bounds(Box::new(bounds))
     };
-    Ok(TypedProofGoal::InferredExistential(condition))
+    Ok(condition)
+}
+
+#[cfg(feature = "internal-checker")]
+fn inferred_monotone_dependent_existential(
+    forall: &CstNode, exists: &CstNode, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (_, source) = typed_quantifier_binder(forall, output, inputs, ty)?;
+    let (_, candidate) = typed_quantifier_binder(exists, output, inputs, ty)?;
+    if source == candidate { return Err(ProjectCheck::InvalidProof); }
+    let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
+    let (result_relation, bounds) = partition_existential_conjuncts(&predicate, &candidate, output, inputs, ty)?;
+    let universal = typed_quantifier_domain(forall, &source, inputs, ty)?;
+    let mut relative = None;
+    let mut domain = typed_quantifier_domain_with_relative(exists, &candidate, inputs, ty,
+        Some(QuantifiedDomainDependency::MonotoneProjection { source: &source, relation: &mut relative }))?;
+    let shape = relative.map(|relation| (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)));
+    if matches!(shape, Some((false, false, true) | (true, true, false))) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let Some((minimum, maximum)) = universal.extremes() else {
+        return Ok(TypedProofGoal::InferredExistential(UniversalConjunction::Vacuous, None));
+    };
+    let original_witness = match (relative, shape) {
+        (Some(_), Some((false, false, false))) => return Ok(TypedProofGoal::InferredExistential(
+            UniversalConjunction::Impossible, Some((source, minimum.clone())),
+        )),
+        (Some(relation), Some((allow_less, allow_greater, _))) if allow_less != allow_greater => {
+            // Monotone candidates at the hardest actual universal point
+            // are contained in every other admitted point's candidates.
+            let hardest = if allow_greater { maximum } else { minimum };
+            super::checker_flow::charge_call_work(&mut 0, domain.interval_count().checked_add(1)
+                .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+            domain = domain.keep_relation(relation, hardest);
+            Some((source, hardest.clone()))
+        }
+        _ => None,
+    };
+    Ok(TypedProofGoal::InferredExistential(inferred_existential_output(domain, result_relation, bounds, ty)?, original_witness))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12033,7 +12106,9 @@ fn typed_named_dependent_witness(
         let argument = authored_witness_argument(steps)?;
         let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
         let shift = checked_quantified_witness_offset(argument, &universal, ty)?;
-        let relative = configured_relative.then(|| (universal.as_str(), quantified_offset_order(shift.as_ref())));
+        let relative = configured_relative.then(|| QuantifiedDomainDependency::CheckedOffset {
+            source: universal.as_str(), order: quantified_offset_order(shift.as_ref()),
+        });
         let existential_domain = typed_quantifier_domain_with_relative(exists, &existential, inputs, ty, relative)?;
         let mut work = 0;
         let image = if let Some(offset) = &shift {
@@ -12931,6 +13006,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                         [forall, second].into_iter().chain(foralls), &predicate, output, &input_names, &result.ty,
                         Some((&exists, steps)), qualified_owner.map(|_| &mut exclusion_origins),
                     )?
+                } else if qualified_owner.is_some() && steps.items.is_empty() && steps.terminated_items.is_empty() {
+                    inferred_monotone_dependent_existential(&forall, &exists, output, &input_names, &result.ty)?
                 } else {
                     typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty,
                         qualified_owner.map(|_| &mut exclusion_origins))?
@@ -21756,6 +21833,61 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_inferred_monotone_existential_chooses_the_hardest_exact_axis() {
+        let source = r#"%%start
+            u8(u8) unsigned = fn(value) { value };
+            i8(i8) signed = fn(value) { value };
+            proof high for unsigned(entry) -> (out) where (entry == 4)
+                forall (u8 seed where seed == 1 || seed == 3)
+                ensures (exists (u8 chosen where (chosen == 2 || chosen == 4) && chosen > seed) { out == chosen }) {}
+            proof low for signed(entry) -> (out) where (entry == -3)
+                forall (i8 seed where seed == -2 || seed == 0)
+                ensures (exists (i8 chosen where (chosen == -3 || chosen == -1) && !(seed <= chosen)) { out == chosen }) {}
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", &format!(
+            "u8 a = unsigned({}); i8 b = signed({}); %%end",
+            if text.contains("entry == 2") { 2 } else { 4 },
+            if text.contains("entry == -1") { -1 } else { -3 },
+        ));
+        let passed = check_array_proof_cohort(source, package).unwrap();
+        assert!(passed.active && passed.symbolic_diagnostic.is_none());
+        let passed = check_array_proof_cohort(&actual(source), main).unwrap();
+        assert!(passed.active && passed.diagnostics.is_empty());
+        for (text, returned, hardest) in [
+            (source.replace("entry == 4", "entry == 2"), 2, 3),
+            (source.replace("entry == -3", "entry == -1"), -1, -2),
+            (source.replace("seed == 1 || seed == 3", "seed == 255"), 4, 255),
+        ] {
+            let dormant = check_array_proof_cohort(&text, main).unwrap();
+            assert!(!dormant.active && dormant.diagnostics.is_empty());
+            let failed = check_array_proof_cohort(&text, package).unwrap().symbolic_diagnostic.unwrap();
+            let evidence = Some(("seed".into(), BigInt::from(hardest)));
+            assert_eq!(failed.quantified_witness, evidence);
+            assert_eq!(failed.returned, BigInt::from(returned));
+            assert!(failed.failed_step.is_none());
+            let report = check_array_proof_cohort(&actual(&text), main).unwrap();
+            let [failed] = report.diagnostics.as_slice() else { panic!("one failing monotone existential"); };
+            assert_eq!(failed.quantified_witness, evidence);
+            assert_eq!(failed.invocation.returned, BigInt::from(returned));
+            assert!(failed.failed_step.is_none());
+        }
+        let empty = source.replace("seed == 1 || seed == 3", "seed == 1 && seed == 3")
+            .replace("chosen == 2 || chosen == 4", "chosen == 2 && chosen == 4");
+        let vacuous = check_array_proof_cohort(&empty, package).unwrap();
+        assert!(vacuous.active && vacuous.symbolic_diagnostic.is_none());
+        for unsupported in [
+            source.replace("chosen > seed", "chosen != seed"),
+            source.replace("chosen > seed", "chosen == seed"),
+            source.replace("&& chosen > seed", "|| chosen > seed"),
+        ] {
+            assert!(matches!(check_array_proof_cohort(&unsupported, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
