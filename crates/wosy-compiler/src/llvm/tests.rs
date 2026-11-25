@@ -18930,3 +18930,82 @@ if (ordered(2,0) != 20 || ordered(0,1) != 1 || constant(0) != 7 || constant(1) !
         }
     }
 }
+
+
+#[test]
+fn generated_runtime_callable_array_owns_exact_private_entries() {
+    let text = "%%start
+u64(u64) count_once = fn(value) { value };
+u64(u64,u64,u64) observe = fn(count,first,second) {
+    u64()[] operations = [fn(index) { fn() { index } }; count_once(count)];
+    u64() saved_first = operations[first];
+    u64() saved_second = operations[second];
+    saved_first() * 10 + saved_second()
+};
+u64(u64) empty = fn(count) {
+    u8()[] operations = [fn(_) { fn() { 7 } }; count];
+    core.array_len(&operations)
+};
+if (observe(3,2,1) != 21 || empty(0) != 0) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/runtime-callables.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = parse(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        assert_eq!(prepared.generated_callables().count(), 2);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        let choose = format!("call i64 @{}(", project_function_name(&source, "count_once"));
+        for (item, name, selected) in [(1, "observe", 2), (2, "empty", 0)] {
+            assert_eq!(checked.reference_cfg(0, item, None).unwrap().allocations.len(), 1);
+            let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, name));
+            let count = if selected > 0 {
+                assert_eq!(body.matches(&choose).count(), 1, "{body}");
+                body.lines().find_map(|line| line.trim().split_once(&format!(" = {choose}")).map(|(v, _)| v)).unwrap()
+            } else {
+                let slot = body.lines().find_map(|line| line.trim().strip_prefix("store i64 %count, ptr ")
+                    .and_then(|tail| tail.split_once(", align ")).map(|(slot, _)| slot)).unwrap();
+                let load = format!(" = load i64, ptr {slot}, align ");
+                let count = body.lines().find_map(|line| line.trim().split_once(&load).map(|(result, _)| result)).unwrap();
+                assert!(body.contains(&format!("ret i64 {count}")), "{body}");
+                count
+            };
+            let backing = body.lines().find_map(|line| line.trim().split_once(" = call ptr @__wosy_core_alloc(").map(|(v, _)| v)).unwrap();
+            let cap = if target == ScalarTargetLayout::WASM32 { i32::MAX as u64 / 16 } else { i64::MAX as u64 / 16 };
+            assert!(body.contains(&format!("icmp ugt i64 {count}, {cap}")), "{body}");
+            assert!(body.contains(&format!("mul nuw i64 {count}, 16")), "{body}");
+            assert!(body.contains(&format!("icmp eq ptr {backing}, null")), "{body}");
+            assert!(body.contains(&format!("icmp ne i64 {count}, 0")), "{body}");
+            assert!(body.contains("label %generated_array.body, label %generated_array.done"), "{body}");
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+            assert!(body.contains(&format!("call void @__wosy_core_free(ptr {backing})")), "{body}");
+            assert_eq!(body.matches("call { ptr, i64 } @__wosy_private_generated_").count(), 1, "{body}");
+            assert_eq!(body.matches(&bounds).count(), selected, "{body}");
+            for guard in body.lines().filter(|line| line.contains(&bounds)) {
+                assert!(guard.ends_with(&format!(", i64 {count})")), "{guard}");
+            }
+            assert_eq!(body.matches(&format!("getelementptr inbounds {{ ptr, i64 }}, ptr {backing},")).count(), selected + 1, "{body}");
+        }
+        let escape = text.replace("    saved_first() *", "    operations;\n    saved_first() *");
+        let errors = parse(&escape).err().expect("generic runtime private owner use is not legal").diagnostics.clone();
+        assert!(errors.iter().any(|error| error.message.contains("only direct checked selection")), "{errors:?}");
+        if let Some(out) = std::env::var_os("WOSY_DEV4_RUNTIME_CALLABLE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-generated-runtime-callable.ll")), controlled).unwrap();
+        }
+    }
+}

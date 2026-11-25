@@ -939,7 +939,7 @@ pub(super) fn fixed_array_storage_element_pointer<'ctx>(
     .map_err(builder_error)
 }
 
-fn array_address_index<'ctx>(
+pub(super) fn array_address_index<'ctx>(
     context: &'ctx Context, state: &EmitState<'ctx, '_>,
     index: inkwell::values::IntValue<'ctx>,
 ) -> Result<inkwell::values::IntValue<'ctx>, String> {
@@ -1006,7 +1006,7 @@ pub(super) fn check_fixed_index<'ctx>(
     check_array_extent(context, state, index, context.i64_type().const_int(length, false), legacy_guard_labels)
 }
 
-fn check_array_extent<'ctx>(
+pub(super) fn check_array_extent<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
     index: inkwell::values::IntValue<'ctx>, count: inkwell::values::IntValue<'ctx>,
     legacy_guard_labels: Option<(&str, &str, &str)>,

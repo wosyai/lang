@@ -12,9 +12,21 @@ pub(super) struct LocalCallableSlot<'ctx> {
 pub(super) struct LocalCallableArray<'ctx> {
     storage: PointerValue<'ctx>,
     generated: Option<bool>,
-    llvm_type: inkwell::types::ArrayType<'ctx>,
-    length: u64,
+    geometry: CallableArrayGeometry<'ctx>,
     element: ScalarType,
+}
+
+#[derive(Clone, Copy)]
+enum CallableArrayGeometry<'ctx> {
+    Fixed { ty: inkwell::types::ArrayType<'ctx>, length: u64 },
+    GeneratedRuntime(inkwell::values::IntValue<'ctx>),
+}
+
+pub(super) fn generated_entry_layout(target: ScalarTargetLayout) -> Result<(u64, u64), String> {
+    match target {
+        ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32 => Ok((16, 8)),
+        _ => Err("unsupported private generated callable entry geometry".into()),
+    }
 }
 
 pub(super) fn generated_entry_type(context: &Context) -> inkwell::types::StructType<'_> {
@@ -37,7 +49,7 @@ pub(super) fn emit_generated_factory<'ctx>(
     Ok(())
 }
 
-fn generated_factory<'a>(state: &'a EmitState<'_, '_>, binding: &ScalarBinding) -> Option<(&'a str, bool)> {
+pub(super) fn prepared_generated_factory<'a>(state: &'a EmitState<'_, '_>, binding: &ScalarBinding) -> Option<(&'a str, bool)> {
     let (name, captures) = state.initializer_symbols?.generated_array_factories.get(&std::ptr::from_ref(&binding.value))?;
     Some((name, *captures))
 }
@@ -74,7 +86,8 @@ fn array_binding<'a>(
         return Err("fixed callable array requires a prepared lexical scalar-only declaration".into());
     }
     // {ptr, i64} is naturally aligned to 8 and occupies 16 bytes on both supported targets.
-    let stride = if generated_factory(state, binding).is_some() { 16 } else { state.target_layout.pointer_size };
+    let stride = if prepared_generated_factory(state, binding).is_some() { generated_entry_layout(state.target_layout)?.0 }
+        else { state.target_layout.pointer_size };
     let bytes = length.checked_mul(stride).ok_or("fixed callable array size overflows")?;
     memory::check_fixed_address_domain(state.target_layout, bytes)?;
     Ok((receiver, element, u32::try_from(length).map_err(|_| "fixed callable array exceeds LLVM array count")?))
@@ -94,11 +107,12 @@ fn selected_array<'a, 'ctx>(
 pub(super) fn generated_fixed_extent(state: &EmitState<'_, '_>, place: &crate::ScalarPlace) -> Option<u64> {
     let array = selected_array(state, place)?;
     let nodes = state.body_call_nodes?;
+    let CallableArrayGeometry::Fixed { length, .. } = array.geometry else { return None; };
     if array.generated.is_none() || !matches!(place, crate::ScalarPlace::Name { .. })
         || !nodes.checked_place_type(place).and_then(array_element)
-            .is_some_and(|(element, length)| same_scalar_signature(element, &array.element) && length == array.length)
+            .is_some_and(|(element, actual)| same_scalar_signature(element, &array.element) && actual == length)
     { return None; }
-    Some(array.length)
+    Some(length)
 }
 
 fn selected_pointer<'ctx, 'module>(
@@ -112,16 +126,34 @@ fn selected_pointer<'ctx, 'module>(
     let selected = selected_array(state, place).ok_or("fixed callable element lacks its lexical array")?;
     if !matches!(base.as_ref(), crate::ScalarPlace::Name { .. })
         || nodes.place_ordinal(place).is_none()
-        || !nodes.checked_place_type(base).and_then(array_element)
-            .is_some_and(|(element, length)| same_scalar_signature(element, &selected.element) && length == selected.length)
         || !nodes.checked_place_type(place).is_some_and(|ty| same_scalar_signature(ty, &selected.element))
     {
-        return Err("fixed callable array changed its checked place or element".into());
+        return Err("callable array changed its checked place or element".into());
     }
-    let (storage, array, length) = (selected.storage, selected.llvm_type, selected.length);
-    let selected = memory::emit_place_index(context, state, index, project)?;
-    memory::check_fixed_index(context, state, selected, length, None)?;
-    memory::fixed_array_storage_element_pointer(context, state, array.into(), storage, selected)
+    let (storage, geometry) = (selected.storage, selected.geometry);
+    let base_ty = nodes.checked_place_type(base);
+    match geometry {
+        CallableArrayGeometry::Fixed { ty, length } => {
+            if !base_ty.and_then(array_element).is_some_and(|(element, actual)|
+                same_scalar_signature(element, &selected.element) && actual == length)
+            { return Err("fixed callable array changed its extent or element".into()); }
+            let selected = memory::emit_place_index(context, state, index, project)?;
+            memory::check_fixed_index(context, state, selected, length, None)?;
+            memory::fixed_array_storage_element_pointer(context, state, ty.into(), storage, selected)
+        }
+        CallableArrayGeometry::GeneratedRuntime(count) => {
+            if !matches!(base_ty, Some(ScalarType::RuntimeArray { element, .. })
+                if same_scalar_signature(element, &selected.element))
+            { return Err("generated runtime callable changed its extent authority".into()); }
+            let selected = memory::emit_place_index(context, state, index, project)?;
+            memory::check_array_extent(context, state, selected, count, None)?;
+            let selected = memory::array_address_index(context, state, selected)?;
+            // The exact constructor checked byte capacity and installed the
+            // entire private layout before registering this owner/backing.
+            unsafe { state.builder.build_in_bounds_gep(generated_entry_type(context), storage, &[selected], "generated_callable_selected") }
+                .map_err(builder_error)
+        }
+    }
 }
 
 fn scalar(ty: &ScalarType) -> bool {
@@ -199,13 +231,36 @@ fn target_pointer<'ctx>(
     Ok(definition.as_global_value().as_pointer_value())
 }
 
+pub(super) fn install_generated_runtime<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, receiver: &crate::scalar::ScalarOutputReceiver,
+    callee: FunctionValue<'ctx>, backing: PointerValue<'ctx>, count: inkwell::values::IntValue<'ctx>, captures: bool,
+) -> Result<(), String> {
+    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+        return Err("generated callable construction lost its runtime receiver".into());
+    };
+    let entry = generated_entry_type(context);
+    memory::emit_generated_elements(context, state, callee, count, |state, index, result| {
+        if result.get_type() != entry.into() { return Err("generated runtime factory changed entry type".into()); }
+        let index = memory::array_address_index(context, state, index)?;
+        let pointer = unsafe { state.builder.build_in_bounds_gep(entry, backing, &[index], "generated_callable_cell") }
+            .map_err(builder_error)?;
+        state.builder.build_store(pointer, result).map_err(builder_error)?;
+        Ok(())
+    })?;
+    if state.local_callable_arrays.insert(receiver.name_span, LocalCallableArray {
+        storage: backing, generated: Some(captures),
+        geometry: CallableArrayGeometry::GeneratedRuntime(count), element: element.as_ref().clone(),
+    }).is_some() { return Err("duplicate generated runtime callable declaration".into()); }
+    Ok(())
+}
+
 pub(super) fn binding_value<'ctx, 'module>(
     context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &ScalarBinding,
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
     if array_element(&binding.declared_type).is_some() {
         let (_, element, length) = array_binding(state, binding)?;
-        if let Some((name, _)) = generated_factory(state, binding) {
+        if let Some((name, _)) = prepared_generated_factory(state, binding) {
             let callee = *state.functions.get(name).ok_or("missing private generated factory")?;
             let entry = generated_entry_type(context);
             let array = entry.array_type(length);
@@ -272,7 +327,7 @@ pub(super) fn store_binding<'ctx>(
 ) -> Result<bool, String> {
     if array_element(&binding.declared_type).is_some() {
         let (receiver, element, length) = array_binding(state, binding)?;
-        let generated = generated_factory(state, binding).map(|(_, captures)| captures);
+        let generated = prepared_generated_factory(state, binding).map(|(_, captures)| captures);
         let (storage, llvm_type) = if generated.is_some() {
             let EmitValue::Basic(BasicValueEnum::PointerValue(storage)) = value else {
                 return Err("generated callable array lacks fully initialized storage".into());
@@ -289,7 +344,7 @@ pub(super) fn store_binding<'ctx>(
             (storage, ty)
         };
         if state.local_callable_arrays.insert(receiver.name_span, LocalCallableArray {
-            storage, generated, llvm_type, length: length.into(), element: element.clone(),
+            storage, generated, geometry: CallableArrayGeometry::Fixed { ty: llvm_type, length: length.into() }, element: element.clone(),
         }).is_some() { return Err("duplicate fixed callable array declaration".into()); }
         return Ok(true);
     }

@@ -1232,7 +1232,7 @@ pub(super) fn block_item_type_in_module(
             if !unsafe_context {
                 inference.nominate_inline_elements(binding);
             }
-            let actual = if let Some(candidate) = super::anonymous_callable::candidate_fixed_generated_callable(binding)
+            let actual = if let Some(candidate) = super::anonymous_callable::candidate_generated_callable(binding)
                 .filter(|_| !unsafe_context && inference.nominate_generated_callable())
             {
                 inference.record_expression_type(candidate.factory, &candidate.factory_signature(), true);

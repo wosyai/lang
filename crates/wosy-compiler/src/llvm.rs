@@ -2503,6 +2503,7 @@ enum RuntimeArrayConstructionKind {
     Ordinary,
     Widened,
     Generated,
+    GeneratedCallable,
 }
 
 fn store_runtime_allocation<'ctx, 'module>(
@@ -2516,7 +2517,8 @@ fn store_runtime_allocation<'ctx, 'module>(
     initialize: impl FnOnce(&mut EmitState<'ctx, 'module>, PointerValue<'ctx>) -> Result<(), String>,
 ) -> Result<(), String> {
     let widened = construction == RuntimeArrayConstructionKind::Widened;
-    let generated = construction == RuntimeArrayConstructionKind::Generated;
+    let private_callable = construction == RuntimeArrayConstructionKind::GeneratedCallable;
+    let generated = private_callable || construction == RuntimeArrayConstructionKind::Generated;
     let declaration = (receiver.name_span.start, receiver.name_span.end);
     let mutable = state.mutable_runtime_allocations.contains(&declaration);
     if widened && mutable {
@@ -2552,7 +2554,7 @@ fn store_runtime_allocation<'ctx, 'module>(
         && state.portable_runtime_allocations.contains(&declaration)
         && state.aggregate.as_ref().is_none_or(|aggregate| portable_runtime_plan_allows_plain_storage(aggregate.plan()))).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
     let allocation = ownership::emit_runtime_array_allocation_with_absence(
-        context, state, element, length, checked_extent && portable.is_none(), relay_unwind,
+        context, state, element, length, checked_extent && portable.is_none(), relay_unwind, private_callable,
     )?;
     let slot = allocation.backing;
     if let Some((target, producer_element)) = state.aggregate.as_ref()
@@ -2656,6 +2658,24 @@ fn store_generated_runtime_array<'ctx, 'module>(
     context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &crate::ScalarBinding,
     project: ProjectCallScope<'_>,
 ) -> Result<bool, String> {
+    if matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) {
+        if let Some((factory, captures)) = local_callable::prepared_generated_factory(state, binding) {
+            let [receiver] = binding.receivers.as_slice() else { return Err("generated callable requires one receiver".into()); };
+            let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+                return Err("generated runtime callable changed its prepared receiver".into());
+            };
+            let ScalarExpression::GeneratedArray { count, .. } = &binding.value else { unreachable!(); };
+            let callee = *state.functions.get(factory).ok_or("missing private runtime generated callable factory")?;
+            let length = take_basic(emit_project_typed_expression(
+                context, state, count, &ScalarType::U64, project.module, project.modules,
+            )?)?.into_int_value();
+            store_runtime_allocation(context, state, binding, receiver, element, length,
+                RuntimeArrayConstructionKind::GeneratedCallable, |state, backing| {
+                    local_callable::install_generated_runtime(context, state, receiver, callee, backing, length, captures)
+                })?;
+            return Ok(true);
+        }
+    }
     if !crate::scalar::generated_runtime_scalar_binding(binding) { return Ok(false); }
     let [receiver] = binding.receivers.as_slice() else { unreachable!(); };
     let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {

@@ -1682,7 +1682,7 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
 ) -> Result<PointerValue<'ctx>, String> {
-    emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, None)
+    emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, None, false)
         .map(|allocation| allocation.backing)
 }
 
@@ -1699,9 +1699,17 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
     relay_unwind: Option<inkwell::basic_block::BasicBlock<'ctx>>,
+    private_generated_callable: bool,
 ) -> Result<RuntimeArrayConstruction<'ctx>, String> {
     declare_core_runtime(context, state.module);
-    let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
+    let (element_size, alignment) = if private_generated_callable {
+        if !checked_extent || relay_unwind.is_some() || !matches!(element, ScalarType::Callable { .. }) {
+            return Err("generated callable allocation requires ordinary signed private entry geometry".into());
+        }
+        local_callable::generated_entry_layout(state.target_layout)?
+    } else {
+        allocation_layout(element, state.layouts, state.target_layout)?
+    };
     let function = state
         .builder
         .get_insert_block()

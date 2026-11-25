@@ -61,10 +61,10 @@ pub(super) fn candidate_fixed_elements(binding: &ScalarBinding) -> Option<&[Scal
     Some(elements)
 }
 
-/// Exact authored parent/child corridor for private fixed generation. A
+/// Exact authored parent/child corridor for private lexical generation. A
 /// regular named factory is a different case; this must be the actual complete
 /// initializer, with a single authored return of the nested callable.
-pub(super) struct FixedGeneratedCallable<'a> {
+pub(super) struct GeneratedCallableCandidate<'a> {
     pub(super) factory: &'a ScalarExpression,
     pub(super) count: &'a ScalarExpression,
     pub(super) child: &'a ScalarExpression,
@@ -72,7 +72,7 @@ pub(super) struct FixedGeneratedCallable<'a> {
     pub(super) invocation_index: Option<&'a (String, ByteSpan)>,
 }
 
-impl FixedGeneratedCallable<'_> {
+impl GeneratedCallableCandidate<'_> {
     pub(super) fn factory_signature(&self) -> ScalarType {
         let span = expression_span(self.child);
         ScalarType::Callable {
@@ -85,15 +85,18 @@ impl FixedGeneratedCallable<'_> {
     }
 }
 
-pub(super) fn candidate_fixed_generated_callable(binding: &ScalarBinding) -> Option<FixedGeneratedCallable<'_>> {
+pub(super) fn candidate_generated_callable(binding: &ScalarBinding) -> Option<GeneratedCallableCandidate<'_>> {
     if binding.receivers.len() != 1 || binding.fallible_assignment.is_some() || binding.is_allocation {
         return None;
     }
-    let ScalarType::Array { element, length, .. } = &binding.declared_type else { return None; };
-    if !closed_scalar_signature(element) { return None; }
     let ScalarExpression::GeneratedArray { factory, count, .. } = &binding.value else { return None; };
-    let ScalarExpression::Integer { value, .. } = count.as_ref() else { return None; };
-    if u64::try_from(value).ok() != Some(*length) { return None; }
+    let element = match (&binding.declared_type, count.as_ref()) {
+        (ScalarType::Array { element, length, .. }, ScalarExpression::Integer { value, .. })
+            if u64::try_from(value).ok() == Some(*length) => element,
+        (ScalarType::RuntimeArray { element, .. }, ScalarExpression::Name { .. } | ScalarExpression::Call { .. }) => element,
+        _ => return None,
+    };
+    if !closed_scalar_signature(element) { return None; }
     let ScalarExpression::AnonymousCallable { parameters, body, .. } = factory.as_ref() else { return None; };
     let [index] = parameters.as_slice() else { return None; };
     if body.unsafe_context || body.items.len() != 1 || body.final_output_values.len() != 1 {
@@ -109,7 +112,7 @@ pub(super) fn candidate_fixed_generated_callable(binding: &ScalarBinding) -> Opt
         // shadowing. An unneeded non-underscore formal is not in this family.
         return None;
     }
-    Some(FixedGeneratedCallable { factory, count, child, element, invocation_index })
+    Some(GeneratedCallableCandidate { factory, count, child, element, invocation_index })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -200,7 +203,7 @@ pub(crate) fn actual_generated_callable<'a>(
         else { return Err("generated owner changed its function".into()); };
     let Some(ScalarBlockItem::LocalBinding(binding)) = fun.body.items.get(owner.binding)
         else { return Err("generated callable lost its binding".into()); };
-    let candidate = candidate_fixed_generated_callable(binding)
+    let candidate = candidate_generated_callable(binding)
         .ok_or("generated callable changed its authored initializer")?;
     if nodes.binding_position(binding) != Some((owner.block, owner.binding))
         || nodes.expression_ordinal(candidate.factory) != Some(owner.ordinal) || owner.rank != 0
@@ -216,13 +219,23 @@ pub(super) fn collect_prepared_generated_callables(
         for (item, value) in actual.items.iter().enumerate() {
             let ScalarItem::Function(fun) = value else { continue; };
             if !fun.generic_parameters.is_empty() || !fun.overload_arms.is_empty() { continue; }
+            let runtime_owners: HashSet<_> = fun.body.items.iter().filter_map(|item| {
+                let ScalarBlockItem::LocalBinding(binding) = item else { return None; };
+                matches!(binding.declared_type, ScalarType::RuntimeArray { .. })
+                    .then(|| candidate_generated_callable(binding).map(|_| binding.name_span)).flatten()
+            }).collect();
             let mut nodes = None;
             for value in &fun.body.items {
                 let ScalarBlockItem::LocalBinding(binding) = value else { continue; };
-                let Some(candidate) = candidate_fixed_generated_callable(binding) else { continue; };
+                let Some(candidate) = candidate_generated_callable(binding) else { continue; };
                 if nodes.is_none() {
-                    nodes = Some(outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
-                        .map_err(|_| vec![arm_diagnostic(&actual.source, fun.span, "missing prepared generated callable owner")])?);
+                    let bound = outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
+                        .map_err(|_| vec![arm_diagnostic(&actual.source, fun.span, "missing prepared generated callable owner")])?;
+                    if !runtime_owners.is_empty() && !bound.generated_runtime_callable_uses_are_closed(&fun.body, &runtime_owners) {
+                        return Err(vec![arm_diagnostic(&actual.source, fun.span,
+                            "a generated runtime callable owner allows only direct checked selection or an immediate array_len observation")]);
+                    }
+                    nodes = Some(bound);
                 }
                 let nodes = nodes.as_ref().expect("bound generated callable owner");
                 let invalid = || vec![arm_diagnostic(&actual.source, binding.span, "missing exact generated callable binding or count")];

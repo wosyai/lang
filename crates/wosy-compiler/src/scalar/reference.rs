@@ -6126,7 +6126,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
                     }
-                    let runtime_generated = super::generated_runtime_scalar_binding(binding)
+                    let runtime_generated = (super::generated_runtime_scalar_binding(binding)
+                        || (matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+                            && super::anonymous_callable::candidate_generated_callable(binding).is_some()))
                         && calls.structure.checked_types.expressions.get(&primary_ordinal) == Some(&receiver.ty);
                     if binding.is_allocation || widened || runtime_generated {
                         self.cfg.allocations.insert(id.clone());

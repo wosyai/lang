@@ -718,6 +718,56 @@ impl<'a> CallableBodyCallNodes<'a> {
         }
     }
 
+    /// No generic ownership/ABI path may observe this private element layout.
+    /// Check the existing canonical lexical occurrence census once per affected
+    /// function, not once per owner. The only allowed root references are exact
+    /// ordinary lexical snapshot initializers and the intrinsic extent read.
+    pub(crate) fn generated_runtime_callable_uses_are_closed(
+        &self, body: &ScalarBlock, owners: &std::collections::HashSet<ByteSpan>,
+    ) -> bool {
+        let Some(calls) = self.proof_nodes.calls else { return false; };
+        let mut allowed = std::collections::HashSet::new();
+        for item in &body.items {
+            let expression = match item {
+                super::super::ScalarBlockItem::LocalBinding(binding) => {
+                    if matches!(binding.declared_type, ScalarType::Callable { .. })
+                        && !binding.is_allocation && binding.fallible_assignment.is_none()
+                        && binding.receivers.len() == 1
+                    {
+                        if let ScalarExpression::IndexedRead { place, .. } = &binding.value {
+                            if let ScalarPlace::Index { base, .. } = place {
+                                if matches!(base.as_ref(), ScalarPlace::Name { .. }) {
+                                    allowed.insert(std::ptr::from_ref(base.as_ref()));
+                                }
+                            }
+                        }
+                    }
+                    &binding.value
+                }
+                super::super::ScalarBlockItem::Expression(expression) => expression,
+                super::super::ScalarBlockItem::Assignment(_) => continue,
+            };
+            if self.targets.get(&std::ptr::from_ref(expression)).copied() == Some(&ResolvedCallTarget::Core(CoreOperationId::ArrayLen)) {
+                if let ScalarExpression::Call { arguments, .. } = expression {
+                    if let [ScalarExpression::CheckedAddress { place, mutability: crate::scalar::ScalarReferenceMutability::Shared, .. }] = arguments.as_slice() {
+                        if matches!(place, ScalarPlace::Name { .. }) {
+                            allowed.insert(std::ptr::from_ref(place));
+                        }
+                    }
+                }
+            }
+        }
+        !self.proof_nodes.expressions.values().any(|&ordinal|
+            matches!(calls.prepared_plain_name(ordinal), Some(super::super::reference::PlainNameIdentity::Lexical(binding))
+                if owners.contains(&binding.declaration_span)))
+            && self.named_place_roots.iter().all(|(place, root)| !matches!(root,
+                NamedPlaceRootIdentity::Lexical(binding) if owners.contains(&binding.declaration_span))
+                || allowed.contains(place))
+            && !self.proof_nodes.places.values().any(|&ordinal|
+                matches!(calls.prepared_direct_destination(ordinal), Some(DirectDestinationIdentity::Existing(binding))
+                    if owners.contains(&binding.declaration_span)))
+    }
+
     pub(crate) fn lexical_expression_declaration(&self, expression: &ScalarExpression) -> Option<ByteSpan> {
         let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
         match self.proof_nodes.calls?.prepared_plain_name(ordinal)? {
