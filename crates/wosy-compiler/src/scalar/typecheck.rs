@@ -1338,7 +1338,7 @@ fn assignment_type_in_module(
             )
         })
         .collect::<Vec<_>>();
-    validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
+    validate_assignment_target_distinctness_in_module(assignment, scope, module, diagnostics);
     let outputs = assignment
         .values
         .iter()
@@ -1511,29 +1511,12 @@ fn assignment_target_type_in_module(
 
 fn validate_assignment_target_distinctness_in_module(
     assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModuleTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    for (index, target) in assignment.targets.iter().enumerate() {
-        for previous in &assignment.targets[..index] {
-            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            } else if place_contains_dynamic_index(&target.place)
-                || place_contains_dynamic_index(&previous.place)
-            {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "assignment targets require a distinctness proof",
-                    target.target_span,
-                ));
-            }
-        }
+    for (span, message) in assignment_target_distinctness(assignment, scope) {
+        diagnostics.push(module_diagnostic(module, "B0002", message, span));
     }
 }
 
@@ -8114,7 +8097,7 @@ fn assignment_type(
             assignment_target_type(target, scope, program, diagnostics, overloads, inference)
         })
         .collect::<Vec<_>>();
-    validate_assignment_target_distinctness(assignment, program, diagnostics);
+    validate_assignment_target_distinctness(assignment, scope, program, diagnostics);
     let outputs = assignment
         .values
         .iter()
@@ -8252,30 +8235,62 @@ fn assignment_target_type(
 
 fn validate_assignment_target_distinctness(
     assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    for (index, target) in assignment.targets.iter().enumerate() {
-        for previous in &assignment.targets[..index] {
-            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            } else if place_contains_dynamic_index(&target.place)
-                || place_contains_dynamic_index(&previous.place)
-            {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "assignment targets require a distinctness proof",
-                    target.target_span,
-                ));
-            }
-        }
+    for (span, message) in assignment_target_distinctness(assignment, scope) {
+        diagnostics.push(diagnostic(program, "B0002", message, span));
     }
+}
+
+// Only inline value storage contributes an independent root here. This does
+// not infer anything from the spelling of a pointer, namespace or projection;
+// those continue to need separate prepared alias/relationship evidence.
+fn direct_inline_assignment_root<'a>(
+    target: &'a ScalarAssignmentTarget,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<&'a str> {
+    use super::reference::aggregate::ordinary_value;
+    match &target.place {
+        ScalarPlace::Name { name, .. } if scope.get(name).is_some_and(ordinary_value) => Some(name),
+        ScalarPlace::Index { base, .. } => {
+            let ScalarPlace::Name { name, .. } = base.as_ref() else { return None; };
+            matches!(scope.get(name), Some(ScalarType::Array { element, .. }) if ordinary_value(element))
+                .then_some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn assignment_target_distinctness<'a>(
+    assignment: &'a ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
+) -> impl Iterator<Item = (ByteSpan, &'static str)> + 'a {
+    let targets = if assignment.targets.len() > 1 { assignment.targets.as_slice() } else { &[] };
+    let facts = targets.iter().map(|target| (
+        scalar_place_identity(&target.place),
+        place_contains_dynamic_index(&target.place),
+        direct_inline_assignment_root(target, scope),
+    )).collect::<Vec<_>>();
+    facts.into_iter()
+        .scan(Vec::new(), move |previous, (identity, dynamic, root)| {
+            let span = targets[previous.len()].target_span;
+            let failures = previous.iter().filter_map(|(previous_identity, previous_dynamic, previous_root)| {
+                if &identity == previous_identity {
+                    Some((span, "duplicate assignment target"))
+                } else if (dynamic || *previous_dynamic)
+                    && !matches!((root, *previous_root), (Some(left), Some(right)) if left != right)
+                {
+                    Some((span, "assignment targets require a distinctness proof"))
+                } else {
+                    None
+                }
+            }).collect::<Vec<_>>();
+            previous.push((identity, dynamic, root));
+            Some(failures)
+        })
+        .flatten()
 }
 
 fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {

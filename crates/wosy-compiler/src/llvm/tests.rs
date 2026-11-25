@@ -15960,3 +15960,150 @@ if (scalar(true) != 99 || scalar(true) != 7 || scalar(false) != 7
         }
     }
 }
+
+#[test]
+fn ordinary_fallible_assignment_group_captures_disjoint_dynamic_destination_before_writes() {
+    let text = "%%start
+u64(u64) _first = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _next = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) _index = fn(index, marker) { u8[marker] trace; core.array_len(&trace) ^ marker ^ index };
+u64(u64) guarded = fn(count) {
+    u64 result =? _next(_first(count));
+    if (&result == null) { 99 } else { result }
+};
+u64(u64) grouped = fn(count) {
+    u64 index = 0;
+    u64[2] items = [100, 200];
+    index, items[_index(index, 5)] = _first(count) ^ 0, _next(count);
+    index ^ items[0] ^ items[1]
+};
+if (guarded(1) != 1 || grouped(2) != 200) { core.system_panic(); };
+grouped(7);
+%%end";
+    let overlap = text.replace("    index, items[_index(index, 5)]", "    items[0], items[_index(index, 5)]");
+    let duplicate = text.replace("    index, items[_index(index, 5)]", "    items[_index(index, 5)], items[_index(index, 5)]");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (candidate, message) in [
+            (&overlap, "assignment targets require a distinctness proof"),
+            (&duplicate, "duplicate assignment target"),
+        ] {
+            let parsed = parse_source(SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into()), candidate.clone(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let lowered = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(lowered.diagnostics.iter().any(|d| d.code == "B0002" && d.message == message),
+                "{:?}", lowered.diagnostics);
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, out) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = out.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "disjoint dynamic destinations");
+            let module = context.create_module_from_ir(bytes).unwrap();
+            module.verify().unwrap();
+            let authored = |name| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let grouped = authored("grouped");
+            let blocks = grouped.get_basic_blocks();
+            let instructions = blocks.iter().flat_map(|block| std::iter::successors(block.get_first_instruction(),
+                |instruction| instruction.get_next_instruction())).collect::<Vec<_>>();
+            let called = |name| {
+                let callee = authored(name);
+                let calls = instructions.iter().copied().filter(|&instruction|
+                    inkwell::values::CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let [call] = calls.as_slice() else { panic!("one {name} call: {llvm}") };
+                *call
+            };
+            let first = called("_first");
+            let second = called("_next");
+            let selector = called("_index");
+            let index_read = known_field_operand(selector, 0).unwrap().as_instruction_value().unwrap();
+            assert_eq!(index_read.get_opcode(), InstructionOpcode::Load, "{llvm}");
+            let index_slot = known_field_operand(index_read, 0).unwrap();
+
+            let is_selector_value = |mut value: BasicValueEnum<'_>| {
+                while let Some(instruction) = value.as_instruction_value() {
+                    if instruction == selector { return true; }
+                    if !matches!(instruction.get_opcode(), InstructionOpcode::Trunc | InstructionOpcode::ZExt) {
+                        break;
+                    }
+                    value = known_field_operand(instruction, 0).unwrap();
+                }
+                false
+            };
+            let mut index_write = None;
+            let mut indexed_write = None;
+            for &store in &instructions {
+                if store.get_opcode() != InstructionOpcode::Store { continue; }
+                let address = known_field_operand(store, 1).unwrap();
+                if address == index_slot {
+                    let initial = known_field_operand(store, 0).is_some_and(|value|
+                        value.is_int_value() && value.into_int_value().get_zero_extended_constant() == Some(0));
+                    if !initial { assert!(index_write.replace(store).is_none(), "{llvm}"); }
+                } else if address.as_instruction_value().is_some_and(|gep|
+                    gep.get_opcode() == InstructionOpcode::GetElementPtr
+                        && gep.get_operands().filter_map(|operand| operand?.value()).skip(1).any(is_selector_value))
+                {
+                    assert!(indexed_write.replace(store).is_none(), "{llvm}");
+                }
+            }
+            let writes = [index_write.expect("actual scalar destination store"),
+                indexed_write.expect("actual indexed destination store")];
+            fn successors<'ctx>(block: inkwell::basic_block::BasicBlock<'ctx>)
+                -> Vec<inkwell::basic_block::BasicBlock<'ctx>>
+            {
+                block.get_terminator().unwrap().get_operands()
+                    .filter_map(|operand| operand?.block()).collect()
+            }
+            let reachable = |start, target, excluded| {
+                let mut pending = vec![start];
+                let mut seen = Vec::new();
+                while let Some(block) = pending.pop() {
+                    if Some(block) == excluded || seen.contains(&block) { continue; }
+                    if block == target { return true; }
+                    seen.push(block);
+                    pending.extend(successors(block));
+                }
+                false
+            };
+            let entry = grouped.get_first_basic_block().unwrap();
+            let selector_block = selector.get_parent().unwrap();
+            for call in [first, second] {
+                let block = call.get_parent().unwrap();
+                let terminator = block.get_terminator().unwrap();
+                let condition = known_field_operand(terminator, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(condition.get_opcode(), InstructionOpcode::ExtractValue, "{llvm}");
+                assert_eq!(known_field_operand(condition, 0).unwrap().as_instruction_value(), Some(call), "{llvm}");
+                let branches = successors(block);
+                let absent = *branches.iter().find(|branch| branch.get_terminator().unwrap().get_opcode()
+                    == InstructionOpcode::Unreachable).unwrap();
+                assert!(absent.get_name().to_bytes().starts_with(b"ordinary.allocation_absent"), "{llvm}");
+                let present = *branches.iter().find(|&&branch| branch != absent).unwrap();
+                for target in [selector_block, writes[0].get_parent().unwrap(), writes[1].get_parent().unwrap()] {
+                    assert!(reachable(present, target, None), "{llvm}");
+                    assert!(!reachable(entry, target, Some(present)), "{llvm}");
+                }
+            }
+            for write in writes {
+                let block = write.get_parent().unwrap();
+                if block == selector_block {
+                    assert!(std::iter::successors(selector.get_next_instruction(), |i| i.get_next_instruction())
+                        .any(|i| i == write), "{llvm}");
+                } else {
+                    assert!(!reachable(entry, block, Some(selector_block)), "{llvm}");
+                }
+            }
+            if let Some(out) = std::env::var_os("WOSY_DISJOINT_DYNAMIC_ASSIGNMENT_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
