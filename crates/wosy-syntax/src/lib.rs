@@ -96,7 +96,6 @@ pub enum SyntaxKind {
     FallibleAssignmentOperator,
     ValueField,
     InvalidTemporaryPlace,
-    AllocatorQualifier,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -192,7 +191,6 @@ impl Language for WosyLanguage {
             83 => SyntaxKind::FallibleAssignmentOperator,
             84 => SyntaxKind::ValueField,
             85 => SyntaxKind::InvalidTemporaryPlace,
-            86 => SyntaxKind::AllocatorQualifier,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -878,8 +876,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::array_literal => SyntaxKind::ArrayLiteral,
         Rule::binding_decl => SyntaxKind::BindingDecl,
         Rule::local_binding => SyntaxKind::LocalBinding,
-        Rule::allocation_binding | Rule::qualified_allocation_binding => SyntaxKind::ReceiverList,
-        Rule::allocator_qualifier => SyntaxKind::AllocatorQualifier,
+        Rule::allocation_binding => SyntaxKind::ReceiverList,
         Rule::runtime_receiver => SyntaxKind::Receiver,
         Rule::namespace_decl => SyntaxKind::NamespaceDecl,
         Rule::item => SyntaxKind::Item,

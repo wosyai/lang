@@ -4898,14 +4898,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ScalarBlockItem::LocalBinding(binding),
                     BlockItemKind::Binding(binding_region),
                 ) => {
-                    if let Some(qualifier) = &binding.allocator_qualifier {
-                        let reason = if binding_region.allocator.is_some() {
-                            ReferenceAnalysisErrorReason::UnsupportedLexicalAllocatorDispatch
-                        } else {
-                            ReferenceAnalysisErrorReason::MissingLexicalAllocator
-                        };
-                        return Err(self.missing_context(qualifier.span, reason));
-                    }
                     let receiver = &binding_region.receivers()[0];
                     let outputs = match &binding_region.initialization {
                         BindingInitialization::Outputs(outputs) => outputs,
@@ -14048,45 +14040,6 @@ impl StructuralWalker<'_, '_> {
         Ok(BindingOutputs { primary, secondary })
     }
 
-    fn lexical_allocator(
-        &self, qualifier: &super::ScalarAllocatorQualifier, scope: &WalkScope,
-    ) -> Result<Option<super::control::LexicalAllocatorIdentity>, ReferenceAnalysisError> {
-        let resolver = match &self.mode {
-            WalkMode::Callable(callable) => callable.target_resolver,
-            WalkMode::ModuleInitialization { source, .. } => return Err(ReferenceAnalysisError::MissingContext {
-                source_span: SourceSpan::new((*source).clone(), qualifier.span),
-                reason: ReferenceAnalysisErrorReason::MissingLexicalAllocator,
-            }),
-            _ => return Ok(None),
-        };
-        let error = |reason| ReferenceAnalysisError::MissingContext {
-            source_span: SourceSpan::new(resolver.source.clone(), qualifier.span), reason,
-        };
-        let instance = scope.names.get(&qualifier.name).filter(|binding| !binding.introduced_by_assignment)
-            .ok_or_else(|| error(ReferenceAnalysisErrorReason::MissingLexicalAllocator))?;
-        let protocol_error = || error(ReferenceAnalysisErrorReason::UnsupportedLexicalAllocatorProtocol);
-        let Some(ScalarType::Struct(id)) = scope.types.get(&qualifier.name) else { return Err(protocol_error()); };
-        let structure = resolver.declarations.structs.get(id).ok_or_else(protocol_error)?;
-        let raw_byte_pointer = ScalarType::RawPointer(Box::new(ScalarType::U8));
-        let field = |name: &str, inputs: &[ScalarType], result: &ScalarType| {
-            let mut fields = structure.fields.iter().filter(|field| field.name == name);
-            let field = fields.next()?;
-            if fields.next().is_some() { return None; }
-            let ScalarType::Callable { parameters, outputs } = &field.ty else { return None; };
-            if parameters.as_slice() != inputs || !matches!(outputs.outputs.as_slice(),
-                [output] if &output.ty == result)
-            { return None; }
-            Some(field.id.clone())
-        };
-        let alloc = field("alloc", &[ScalarType::U64, ScalarType::U64], &raw_byte_pointer)
-            .ok_or_else(protocol_error)?;
-        let free = field("free", std::slice::from_ref(&raw_byte_pointer), &ScalarType::Unit)
-            .ok_or_else(protocol_error)?;
-        Ok(Some(super::control::LexicalAllocatorIdentity {
-            instance: instance.reference_id(resolver.source, resolver.function_span), alloc, free,
-        }))
-    }
-
     fn binding_region(
         &mut self,
         binding: &ScalarBinding,
@@ -14094,8 +14047,6 @@ impl StructuralWalker<'_, '_> {
         block_span: ByteSpan,
         scope: &mut WalkScope,
     ) -> Result<BindingRegion, ReferenceAnalysisError> {
-        let allocator = binding.allocator_qualifier.as_ref().map(|qualifier|
-            self.lexical_allocator(qualifier, scope)).transpose()?.flatten();
         let initialization = if binding.is_allocation {
             if matches!(&self.mode, WalkMode::Callable(_)) {
                 let outputs = self.binding_outputs(binding, position, scope)?;
@@ -14147,9 +14098,7 @@ impl StructuralWalker<'_, '_> {
                 );
             }
         }
-        let mut region = BindingRegion::new(initialization, binding);
-        region.allocator = allocator;
-        Ok(region)
+        Ok(BindingRegion::new(initialization, binding))
     }
 
     fn block_item(

@@ -2227,9 +2227,6 @@ fn store_widened_local_array<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<bool, String> {
-    if binding.allocator_qualifier.is_some() {
-        return Err("qualified allocator callback dispatch is not supported; no default allocator fallback".into());
-    }
     if let Some((source, count)) = state.aggregate.as_ref()
         .and_then(|aggregate| {
             let [receiver] = binding.receivers.as_slice() else { return None };
@@ -3293,9 +3290,6 @@ fn initialize_runtime_array_global<'ctx, 'module>(
         &ScalarExpression,
     ) -> Result<EmitValue<'ctx>, String>,
 ) -> Result<(), String> {
-    if binding.allocator_qualifier.is_some() {
-        return Err("qualified allocator callback dispatch is not supported; no default allocator fallback".into());
-    }
     let receiver = binding
         .receivers
         .first()

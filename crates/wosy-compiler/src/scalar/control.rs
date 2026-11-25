@@ -631,16 +631,8 @@ pub(super) enum BindingInitialization {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct LexicalAllocatorIdentity {
-    pub(super) instance: super::ReferenceBindingId,
-    pub(super) alloc: ScalarStructFieldId,
-    pub(super) free: ScalarStructFieldId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BindingRegion {
     pub(super) initialization: BindingInitialization,
-    pub(super) allocator: Option<LexicalAllocatorIdentity>,
     receivers: Vec<BindingReceiverSlot>,
 }
 
@@ -663,7 +655,6 @@ impl BindingRegion {
         ));
         Self {
             initialization,
-            allocator: None,
             receivers,
         }
     }
