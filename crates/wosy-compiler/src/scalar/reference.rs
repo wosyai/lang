@@ -2655,7 +2655,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.move_value(element, scope, ordinal)?;
                 }
                 if let Some(proofs) = ordinary.filter(|proofs| !proofs.is_empty()) {
-                    self.aggregate_result.ordinary_fallible_expressions.push(proofs);
+                    self.aggregate_result.ordinary_fallible_expressions.push((None, proofs));
                 }
                 let point = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -2694,6 +2694,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let guarded = matches!(read_mode, ExpressionReadMode::GuardedScalarAggregateInitializer);
                 let mut ordinary = matches!(read_mode, ExpressionReadMode::OrdinaryScalarAggregateInitializer)
                     .then(Vec::new);
+                if ordinary.is_some() && calls.structure.callful_struct_literals.contains(&ordinal)
+                    && super::has_inline_aggregate_field(fields)
+                {
+                    if let Some(leaves) = self.inline_aggregate_leaves(expression, ordinal, false) {
+                        for (value, ordinal, ty) in leaves {
+                            self.scalar_aggregate_member(value, scope, ordinal, Some(ty), false, &mut ordinary)?;
+                        }
+                        if let Some(proofs) = ordinary.filter(|proofs| !proofs.is_empty()) {
+                            self.aggregate_result.ordinary_fallible_expressions.push((Some(ordinal), proofs));
+                        }
+                        self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                        return Ok(ReferenceValue::Other);
+                    }
+                }
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
@@ -2762,7 +2776,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.move_value(&field.value, scope, ordinal)?;
                 }
                 if let Some(proofs) = ordinary.filter(|proofs| !proofs.is_empty()) {
-                    self.aggregate_result.ordinary_fallible_expressions.push(proofs);
+                    self.aggregate_result.ordinary_fallible_expressions.push((None, proofs));
                 }
                 let literal = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -4007,26 +4021,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(())
     }
 
-    fn guarded_inline_member(
-        &mut self, value: &ScalarExpression, scope: ReferenceScopeId, ordinal: OccurrenceOrdinal,
-    ) -> Result<(), ReferenceAnalysisError> {
+    fn inline_aggregate_leaves<'expr>(
+        &self, root: &'expr ScalarExpression, root_ordinal: OccurrenceOrdinal, root_must_copy: bool,
+    ) -> Option<Vec<(&'expr ScalarExpression, OccurrenceOrdinal, &'a ScalarType)>> {
         let sites = self.call_sites;
         let types = &sites.structure.checked_types;
-        let mut pending = vec![(value, ordinal)];
-        let mut no_ordinary = None;
+        let mut pending = vec![(root, root_ordinal)];
+        let mut leaves = Vec::new();
         while let Some((value, ordinal)) = pending.pop() {
-            let reject = || self.missing_context(expression_span(value),
-                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer);
-            let ty = types.expressions.get(&ordinal).ok_or_else(reject)?;
+            let ty = types.expressions.get(&ordinal)?;
             let parent = OccurrenceParent::Expression(ordinal);
             match (ty, value) {
                 (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
-                    if sites.structure.copy_struct_literals.contains(&ordinal) =>
+                    if (ordinal == root_ordinal && !root_must_copy)
+                        || sites.structure.copy_struct_literals.contains(&ordinal) =>
                 {
                     for (position, field) in fields.iter().enumerate().rev() {
                         let child = self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
                         if !sites.structure.literal_fields.get(&child).is_some_and(|field| &field.structure == id) {
-                            return Err(reject());
+                            return None;
                         }
                         pending.push((&field.value, child));
                     }
@@ -4037,14 +4050,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 {
                     for (position, value) in elements.iter().enumerate().rev() {
                         let child = self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
-                        if types.expressions.get(&child) != Some(element.as_ref()) { return Err(reject()); }
+                        if types.expressions.get(&child) != Some(element.as_ref()) { return None; }
                         pending.push((value, child));
                     }
                 }
-                _ if aggregate::ordinary_value(ty) =>
-                    self.scalar_aggregate_member(value, scope, ordinal, Some(ty), true, &mut no_ordinary)?,
-                _ => return Err(reject()),
+                _ if aggregate::ordinary_value(ty) => leaves.push((value, ordinal, ty)),
+                _ => return None,
             }
+        }
+        Some(leaves)
+    }
+
+    fn guarded_inline_member(
+        &mut self, value: &ScalarExpression, scope: ReferenceScopeId, ordinal: OccurrenceOrdinal,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let leaves = self.inline_aggregate_leaves(value, ordinal, true).ok_or_else(||
+            self.missing_context(expression_span(value), ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer))?;
+        let mut no_ordinary = None;
+        for (value, ordinal, ty) in leaves {
+            self.scalar_aggregate_member(value, scope, ordinal, Some(ty), true, &mut no_ordinary)?;
         }
         Ok(())
     }
@@ -5451,7 +5475,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.capture_call_points = previous;
                         evaluated?;
                         if let Some(proof) = self.guarded_numeric_expression(value, length, &ScalarType::U64) {
-                            self.aggregate_result.ordinary_fallible_expressions.push(vec![proof]);
+                            self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof]));
                         }
                     }
                     let before = self.cursor;
@@ -5539,7 +5563,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && outputs.secondary.is_empty());
                         match (binding.fallible_assignment, expression) {
                             (Some(_), Some(proof)) => self.aggregate_result.fallible_call_expressions.push(proof),
-                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push(vec![proof]),
+                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof])),
                             (Some(_), None) => return Err(self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
                             (None, None) => {}
@@ -6315,7 +6339,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         values.push((result, rhs_point));
                     }
                     if let Some(proofs) = scalar_rhs.filter(|proofs| !proofs.is_empty()) {
-                        self.aggregate_result.ordinary_fallible_expressions.push(proofs);
+                        self.aggregate_result.ordinary_fallible_expressions.push((None, proofs));
                     }
                     for projection in group.projected_outputs() {
                         let producer = values[projection.producer.position].1;
@@ -13114,6 +13138,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     proven_index_values: HashMap<OccurrenceOrdinal, u64>,
     callful_total_unary: HashSet<OccurrenceOrdinal>,
+    callful_struct_literals: HashSet<OccurrenceOrdinal>,
     pub(super) callful_arguments: HashSet<OccurrenceOrdinal>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     copy_struct_literals: HashSet<OccurrenceOrdinal>,
@@ -13138,6 +13163,7 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             proven_index_values: HashMap::new(),
             callful_total_unary: HashSet::new(),
+            callful_struct_literals: HashSet::new(),
             callful_arguments: HashSet::new(),
             literal_fields: HashMap::new(),
             copy_struct_literals: HashSet::new(),
@@ -14084,7 +14110,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 call_tally(self).map(|count| (count, true)),
             _ => None,
         };
+        let literal_before = match expression {
+            ScalarExpression::StructLiteral { .. } => call_tally(self),
+            _ => None,
+        };
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
+        if literal_before.is_some_and(|before| call_tally(self).is_some_and(|after| after > before)) {
+            self.structure.callful_struct_literals.insert(ordinal);
+        }
         if let Some((before, root_is_call)) = before {
             // The existing census is preorder; a Call contributes its own
             // one row before any of its argument descendants. Store only

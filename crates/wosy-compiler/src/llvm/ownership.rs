@@ -1432,11 +1432,11 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         }
     };
     let aggregate = match (materialized_ty, &binding.value, value) {
-        (ScalarType::Struct(id), expression @ ScalarExpression::StructLiteral { fields, .. }, None) => {
+        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) => {
             if crate::scalar::has_inline_aggregate_field(fields)
             {
                 Some(GuardedAggregateInitializer::Inline(
-                    memory::stage_guarded_inline(state, materialized_ty, expression, &mut emit_member)?,
+                    memory::stage_inline_fields(state, id, fields, &mut emit_member)?,
                 ))
             } else {
                 Some(GuardedAggregateInitializer::Struct(

@@ -15812,3 +15812,62 @@ if (observed(1) != 99 || observed(2) != 99 || observed(3) != 99
         }
     }
 }
+
+#[test]
+fn ordinary_and_guarded_fallible_inline_aggregate_share_workers_and_stage_leaves() {
+    let text = "%%start
+struct copy Payload { u8 mark; u64 first; u64 second; }
+struct Box { Payload inside; u64[2] samples; u64 tail; }
+u64(u64) _head = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _inner = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _sample = fn(count) { u32[count] scratch; core.array_len(&scratch) };
+u64(u64) guarded = fn(count) {
+    Box result =? { .tail = _head(count); .inside = { .second = _inner(count); .first = 2; .mark = 3; };
+        .samples = [_sample(count), 5]; };
+    if (&result == null) { 99 } else { result.inside.second ^ result.samples[0] ^ result.tail }
+};
+u64(u64) ordinary = fn(count) {
+    Box result = { .tail = _head(count); .inside = { .second = _inner(count); .first = 2; .mark = 3; };
+        .samples = [_sample(count), 5]; };
+    result.inside.second ^ result.samples[0] ^ result.tail
+};
+if (guarded(1) != 99 || guarded(0) != 0 || ordinary(4) != 4 || ordinary(0) != 0) {
+    core.system_panic();
+};
+ordinary(2);
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed inline aggregate");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let ordinary = module.get_function(&self_tail_test_symbol(source, project, "ordinary")).unwrap();
+            let blocks = ordinary.get_basic_blocks();
+            let panic = blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.struct_allocation_absent").unwrap();
+            let terminal = panic.get_terminator().unwrap();
+            assert_eq!(terminal.get_opcode(), InstructionOpcode::Unreachable);
+            assert_eq!(CallSiteValue::try_from(terminal.get_previous_instruction().unwrap()).unwrap()
+                .get_called_fn_value(), module.get_function("__wosy_core_system_panic"));
+            for name in ["_head", "_inner", "_sample"] {
+                let worker = module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                assert!(worker.get_type().get_return_type().unwrap().is_struct_type());
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_ORDINARY_INLINE_TREE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

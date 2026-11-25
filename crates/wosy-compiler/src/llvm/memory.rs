@@ -941,9 +941,12 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     expected: &crate::ScalarType,
-    fields: &[crate::ScalarStructLiteralField],
+    expression: &ScalarExpression,
     path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    let ScalarExpression::StructLiteral { fields, .. } = expression else {
+        return Err("expected struct literal".into());
+    };
     let crate::ScalarType::Struct(id) = expected else {
         return Err("struct literal requires a resolved struct type".to_owned());
     };
@@ -959,6 +962,21 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     align_storage_alloca(destination, Some(layout.alignment))?;
+    if state.aggregate.as_ref().is_some_and(|aggregate| {
+        let roots = &aggregate.plan().ordinary_fallible_inline_roots;
+        !roots.is_empty() && state.body_call_nodes
+            .and_then(|nodes| nodes.expression_ordinal(expression))
+            .is_some_and(|ordinal| roots.contains(&ordinal))
+    }) {
+        let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+            .ok_or("missing ordinary aggregate literal function")?;
+        let failure = context.append_basic_block(parent, "ordinary.struct_allocation_absent");
+        let values = stage_inline_fields(state, id, fields, &mut |state, member, ty|
+            emit_ordinary_aggregate_member(context, state, member, ty, path, failure))?;
+        finish_ordinary_aggregate_fields(context, state, failure)?;
+        write_guarded_inline(context, state, values, destination)?;
+        return Ok(EmitValue::Basic(destination.into()));
+    }
     let failure = ordinary_aggregate_failure(context, state, fields.iter().map(|field| &field.value),
         "ordinary.struct_allocation_absent")?;
     let values = if let Some(failure) = failure {
@@ -1107,26 +1125,33 @@ enum GuardedInlineLeaf<'ctx> {
     FixedArray(Vec<EmitValue<'ctx>>),
 }
 
-pub(super) fn stage_guarded_inline<'ctx, 'module: 'literal, 'literal>(
+pub(super) fn stage_inline_fields<'ctx, 'module: 'literal, 'literal>(
     state: &mut EmitState<'ctx, 'module>,
-    ty: &'literal ScalarType, expression: &'literal ScalarExpression,
+    root: &crate::ScalarStructId, fields: &'literal [crate::ScalarStructLiteralField],
     emit_leaf: &mut impl FnMut(&mut EmitState<'ctx, 'module>, &ScalarExpression, &ScalarType) -> Result<EmitValue<'ctx>, String>,
 ) -> Result<Vec<GuardedInlineWrite<'ctx, 'literal>>, String> {
     let nodes = state.body_call_nodes.ok_or("guarded inline literal lacks prepared fields")?;
-    let mut pending = vec![(0u64, "", ty, expression)];
+    let layouts = state.layouts;
+    let push_fields = |pending: &mut Vec<_>, id: &crate::ScalarStructId,
+        fields: &'literal [crate::ScalarStructLiteralField], base: u64| -> Result<(), String> {
+        for field in fields.iter().rev() {
+            let member = nodes.literal_field(&field.value)
+                .filter(|member| &member.structure == id).ok_or("inline literal lost exact field")?;
+            let delta = layouts.field(member).and_then(|layout| layout.offset)
+                .ok_or("inline literal lost field layout")?;
+            let offset = base.checked_add(delta).ok_or("invalid inline field offset")?;
+            let ty = nodes.checked_expression_type(&field.value).ok_or("missing inline member type")?;
+            pending.push((offset, field.name.as_str(), ty, &field.value));
+        }
+        Ok(())
+    };
+    let mut pending = Vec::new();
+    push_fields(&mut pending, root, fields, 0)?;
     let mut staged = Vec::new();
     while let Some((offset, name, ty, expression)) = pending.pop() {
         let value = match (ty, expression) {
             (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
-                for field in fields.iter().rev() {
-                    let member = nodes.literal_field(&field.value)
-                        .filter(|member| &member.structure == id).ok_or("guarded inline literal lost exact field")?;
-                    let delta = state.layouts.field(member).and_then(|layout| layout.offset)
-                        .ok_or("guarded inline literal lost field layout")?;
-                    let offset = offset.checked_add(delta).ok_or("invalid guarded inline field offset")?;
-                    let ty = nodes.checked_expression_type(&field.value).ok_or("missing guarded inline member type")?;
-                    pending.push((offset, field.name.as_str(), ty, &field.value));
-                }
+                push_fields(&mut pending, id, fields, offset)?;
                 continue;
             }
             (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
@@ -1173,8 +1198,8 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::Utf8 { value, .. }, ScalarType::Struct(_)) => {
             emit_utf8_literal(context, state, value, expected)
         }
-        (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
-            emit_struct_literal(context, state, expected, fields, ExpressionPath::Single)
+        (ScalarExpression::StructLiteral { .. }, ScalarType::Struct(_)) => {
+            emit_struct_literal(context, state, expected, expression, ExpressionPath::Single)
         }
         (ScalarExpression::ArrayLiteral { elements, .. }, ScalarType::Array { .. }) => {
             emit_array_literal(context, state, expected, elements, ExpressionPath::Single)

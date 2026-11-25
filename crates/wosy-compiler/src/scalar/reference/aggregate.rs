@@ -1351,7 +1351,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) ordinary_array_incompatible_uses: HashSet<OccurrenceOrdinal>,
     pub(super) guarded_array_choices: BTreeSet<usize>,
     pub(super) guarded_array_producer_choice: Option<(OccurrenceOrdinal, Vec<(CfgPointId, OccurrenceOrdinal)>)>,
-    pub(super) ordinary_fallible_expressions: Vec<Vec<GuardedNumericExpression>>,
+    pub(super) ordinary_fallible_expressions: Vec<(Option<OccurrenceOrdinal>, Vec<GuardedNumericExpression>)>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -3030,6 +3030,7 @@ pub(crate) struct ClosedBody {
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) fallible_allocating_expressions: BTreeSet<usize>,
     pub(crate) ordinary_fallible_allocating_expressions: BTreeSet<usize>,
+    pub(crate) ordinary_fallible_inline_roots: HashSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_wrapper: Option<usize>,
@@ -6831,6 +6832,7 @@ fn closed_aggregates<'a>(
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
     let mut ordinary_choices = BTreeSet::new();
+    let mut ordinary_inline_roots = BTreeSet::new();
     let mut fallible_choices = BTreeSet::<(BodyKey, usize)>::new();
     let mut fallible_payloads = BTreeMap::new();
     let mut fallible_allocation_relays = BTreeSet::new();
@@ -7310,7 +7312,7 @@ fn closed_aggregates<'a>(
         // selected by a guarded use, but must not turn an unrelated ordinary
         // callable into a checked ABI. Commit all the expression's sites or
         // none: an unsupported sibling never gets a partial checked rewrite.
-        for (caller, cfg, expressions) in ordinary_expressions {
+        for (caller, cfg, (inline_root, expressions)) in ordinary_expressions {
             let mut checked = BTreeMap::new();
             let mut marked = Vec::new();
             let complete = expressions.iter().all(|proof| {
@@ -7331,6 +7333,9 @@ fn closed_aggregates<'a>(
             });
             if complete && !checked.is_empty() {
                 ordinary_choices.extend(marked.into_iter().map(|ordinal| (caller, ordinal)));
+                if let Some(root) = inline_root {
+                    ordinary_inline_roots.insert((caller, root.0));
+                }
                 for (ordinal, target) in checked {
                     if module_at(caller.0).and_then(|input| input.calls.function_body(caller.1, caller.2))
                         .is_some_and(|sites| sites.allocation_length_call_targets.contains_key(&OccurrenceOrdinal(ordinal)))
@@ -7892,6 +7897,9 @@ fn closed_aggregates<'a>(
         }
         for &(body, ordinal) in &ordinary_choices {
             result.bodies.entry(body).or_default().ordinary_fallible_allocating_expressions.insert(ordinal);
+        }
+        for &(body, ordinal) in &ordinary_inline_roots {
+            result.bodies.entry(body).or_default().ordinary_fallible_inline_roots.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         for (&target, (route, _, callers)) in &guarded_array_cohorts {
