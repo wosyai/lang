@@ -6006,9 +6006,33 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty))
                             .then_some(evaluation.expression)
                     })();
+                    let scalar_rhs_eligible = !block.unsafe_context && self.generic_parameters.is_empty()
+                        && group.projected_outputs().len() == 0;
+                    let mut scalar_rhs = Some(Vec::new());
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
+                        let ordinary_payload = if scalar_rhs_eligible && scalar_rhs.is_some()
+                            && matches!(value, ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                        {
+                            group.destinations().as_slice().get(evaluation.position).and_then(|slot| {
+                                let AssignmentReplacement::Resolved(ty @ (ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)) = &slot.replacement
+                                else { return None; };
+                                let target = &assignment.targets[slot.position].place;
+                                let exact = match target {
+                                    ScalarPlace::Name { .. } => matches!(calls.prepared_direct_destination(slot.destination),
+                                        Some(DirectDestinationIdentity::Existing(_))),
+                                    ScalarPlace::Index { .. } => {
+                                        let root = self.place_root(target, slot.destination);
+                                        matches!(root.place, ScalarPlace::Name { span, .. }
+                                            if matches!(self.prepared_place_root(root.ordinal, *span),
+                                                Ok(Some(PreparedPlaceRoot::Lexical(_)))))
+                                    }
+                                    _ => false,
+                                };
+                                (exact && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty)).then_some(ty)
+                            })
+                        } else { None };
                         let exact_move = widened_roundtrip.map(|(call, _, owner)| (call, owner))
                             .or(widened_owning_replace.map(|(call, _, owner, _)| (call, owner)));
                         let mode = match exact_move {
@@ -6017,7 +6041,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ExpressionReadMode::OrdinaryScalarAggregateInitializer,
                             _ => ExpressionReadMode::Ordinary,
                         };
-                        let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode)?;
+                        let capture = self.capture_call_points;
+                        self.capture_call_points |= ordinary_payload.is_some();
+                        let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode);
+                        self.capture_call_points = capture;
+                        let result = result?;
+                        if let Some(ty) = ordinary_payload {
+                            if let Some(proof) = self.guarded_numeric_expression(value, evaluation.expression, ty) {
+                                scalar_rhs.as_mut().expect("eligible ordinary RHS group").push(proof);
+                            } else {
+                                // Do not partially enroll a group whose other
+                                // candidate requires an unsupported expression.
+                                scalar_rhs = None;
+                            }
+                        }
                         let rhs_point = self.cursor.expect("evaluated assignment output");
                         self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
                         if let Some((source, target, ty, rhs, destination)) = &guarded_replacement {
@@ -6030,6 +6067,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             });
                         }
                         values.push((result, rhs_point));
+                    }
+                    if let Some(proofs) = scalar_rhs.filter(|proofs| !proofs.is_empty()) {
+                        self.aggregate_result.ordinary_fallible_expressions.push(proofs);
                     }
                     for projection in group.projected_outputs() {
                         let producer = values[projection.producer.position].1;

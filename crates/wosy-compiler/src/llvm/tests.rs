@@ -14817,3 +14817,85 @@ if (observed(2, 3) != 2 || observed(2, 3) != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn ordinary_fallible_assignment_group_evaluates_rhs_before_places() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _first = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _next = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) _index = fn(index, marker) { u8[marker] trace; core.array_len(&trace) ^ marker ^ index };
+u64(u64) guarded = fn(count) {
+    u64 result =? _next(_first(count));
+    if (&result == null) { 99 } else { result }
+};
+u64(u64) grouped = fn(count) {
+    u64 left = 50;
+    u64[2] items = [100, 200];
+    left, items[0] = _first(count) ^ 0, _next(count);
+    left ^ items[0] ^ items[1]
+};
+u64(u64, u64) indexed = fn(count, index) {
+    u64[2] items = [100, 200];
+    items[_index(index, 5)] = _next(_first(count));
+    items[0] ^ items[1]
+};
+if (guarded(1) != 1 || grouped(2) != 200 || indexed(2, 0) != 202
+    || indexed(7, 0) != 0) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let memory = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "ordinary staged scalar assignment");
+            let module = context.create_module_from_ir(memory).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            fn called<'ctx>(ordinary: inkwell::values::FunctionValue<'ctx>, callee: inkwell::values::FunctionValue<'ctx>)
+                -> Vec<InstructionValue<'ctx>> {
+                ordinary.get_basic_blocks().into_iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect()
+            }
+            for name in ["grouped", "indexed"] {
+                let ordinary = authored(name);
+                let [first] = called(ordinary, authored("_first"))[..] else { panic!("{llvm}") };
+                let [next] = called(ordinary, authored("_next"))[..] else { panic!("{llvm}") };
+                let destination = if name == "indexed" {
+                    let [index] = called(ordinary, authored("_index"))[..] else { panic!("{llvm}") };
+                    Some(index.get_parent().unwrap())
+                } else { None };
+                for (step, continuation) in [(first, next.get_parent()), (next, destination)] {
+                    let exit = step.get_parent().unwrap().get_terminator().unwrap();
+                    let successors = exit.get_operands().filter_map(|operand| operand.and_then(|operand| operand.block()))
+                        .collect::<Vec<_>>();
+                    if let Some(continuation) = continuation { assert!(successors.contains(&continuation)); }
+                    let [absent] = successors.into_iter().filter(|block|
+                        block.get_name().to_bytes().starts_with(b"ordinary.allocation_absent")).collect::<Vec<_>>()[..]
+                        else { panic!("{llvm}") };
+                    assert_eq!(absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                    if name == "grouped" {
+                        let instructions = std::iter::successors(step.get_parent().unwrap().get_first_instruction(),
+                            |instruction| instruction.get_next_instruction());
+                        assert!(!instructions.skip_while(|instruction| *instruction != step)
+                            .any(|instruction| instruction.get_opcode() == InstructionOpcode::Store));
+                    }
+                }
+            }
+            if let Some(out) = std::env::var_os("WOSY_ORDINARY_ASSIGNMENT_RHS_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
