@@ -16,10 +16,18 @@ pub(crate) struct Plan {
     inputs: Vec<(ByteSpan, ScalarType)>,
     initializer: bool,
     input_names: Vec<String>,
+    pub(crate) prefix: Vec<PrefixInput>,
     pub(crate) outputs: Vec<ScalarType>,
     pub(crate) selector: TypedSelector,
     pub(crate) local: Option<LexicalEnumBinding>,
     pub(crate) arms: Vec<TypedArm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixInput {
+    pub(crate) name: String,
+    pub(crate) declaration: ByteSpan,
+    pub(crate) ty: ScalarType,
 }
 
 /// Opaque source-prepared value occurrence; raw/serialized IR has no constructor.
@@ -31,6 +39,8 @@ impl Occurrence {
         self.0.for_each_formal_read(|_, declaration| {
             if let Ok(index) = self.0.inputs.binary_search_by_key(&declaration.start, |(span, _)| span.start) {
                 visit(&self.0.input_names[index]);
+            } else if let Ok(index) = self.0.prefix.binary_search_by_key(&declaration.start, |input| input.declaration.start) {
+                visit(&self.0.prefix[index].name);
             }
         });
     }
@@ -97,7 +107,7 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     let span = wosy_syntax::byte_span(body);
     let error = |message| diagnostic(source, span, message);
     let initializer = body.kind() == SyntaxKind::RuntimeMatchExpr;
-    let (owner, initializer_type) = if initializer {
+    let (owner, initializer_type, prefix) = if initializer {
         let parent = |node: &CstNode, kind| node.parent().filter(|node| node.kind() == kind)
             .ok_or_else(|| error("runtime match expression requires one scalar local initializer"));
         let expression = parent(body, SyntaxKind::Expression)?;
@@ -106,8 +116,24 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
         let item = parent(&binding, SyntaxKind::BlockItem)?;
         let block = parent(&item, SyntaxKind::Block)?;
         let owner = parent(&block, SyntaxKind::FunctionDecl)?;
-        if outputs.children().count() != 1 || block.children().next().as_ref() != Some(&item) {
-            return Err(error("runtime match initializer requires the first ordinary function local and one output"));
+        if outputs.children().count() != 1 {
+            return Err(error("runtime match initializer requires one output"));
+        }
+        let mut prefix = Vec::new();
+        for previous in block.children().take_while(|node| node != &item) {
+            let fail = || diagnostic(source, wosy_syntax::byte_span(&previous),
+                "runtime match initializer requires a prefix of ordinary primitive locals");
+            analysis_budget::charge_call_work(work, 1).ok_or_else(|| error("runtime match prefix exceeds analysis limits"))?;
+            let previous = previous.children().find(|node| node.kind() == SyntaxKind::LocalBinding).ok_or_else(fail)?;
+            let receivers = previous.children().find(|node| node.kind() == SyntaxKind::ReceiverList).ok_or_else(fail)?;
+            let mut receivers = receivers.children();
+            let receiver = receivers.next().ok_or_else(fail)?;
+            if receivers.next().is_some() { return Err(fail()); }
+            let name = direct_token(&receiver, SyntaxKind::Identifier).ok_or_else(fail)?;
+            let ty = receiver.children().find(|node| node.kind() == SyntaxKind::TypeSpec).ok_or_else(fail)?;
+            let ty = derive_type(&ty);
+            if ty != ScalarType::Bool && !is_integer_type(&ty) { return Err(fail()); }
+            prefix.push(PrefixInput { name: name.text().to_owned(), declaration: token_span(&name), ty });
         }
         let receivers = binding.children().find(|node| node.kind() == SyntaxKind::ReceiverList)
             .ok_or_else(|| error("missing runtime match initializer receiver"))?;
@@ -118,11 +144,11 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
         }
         let ty = receiver.children().find(|node| node.kind() == SyntaxKind::TypeSpec)
             .ok_or_else(|| error("missing runtime match initializer receiver type"))?;
-        (owner, Some(derive_type(&ty)))
+        (owner, Some(derive_type(&ty)), prefix)
     } else {
         let owner = body.parent().filter(|owner| owner.kind() == SyntaxKind::FunctionDecl)
             .ok_or_else(|| error("runtime match must be the sole result of a named function"))?;
-        (owner, None)
+        (owner, None, Vec::new())
     };
     if owner.parent().is_some_and(|parent| parent.kind() == SyntaxKind::GenericFunctionDecl)
         || owner.children_with_tokens().any(|element| element.kind() == SyntaxKind::Unsafe)
@@ -159,6 +185,13 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     for (name, ty) in names.into_iter().zip(parameters) {
         if typecheck::is_null_literal_name(name.text()) || formals.insert(name.text().to_owned(), (token_span(&name), ty)).is_some() {
             return Err(diagnostic(source, token_span(&name), "duplicate or reserved runtime match parameter"));
+        }
+    }
+    for input in &prefix {
+        if typecheck::is_null_literal_name(&input.name)
+            || formals.insert(input.name.clone(), (input.declaration, input.ty.clone())).is_some()
+        {
+            return Err(diagnostic(source, input.declaration, "runtime match prefix requires fresh scalar locals"));
         }
     }
     let (matching, local) = if initializer {
@@ -280,7 +313,7 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     }).collect::<Result<_, _>>()?;
     let name_span = direct_token(&owner, SyntaxKind::Identifier).as_ref().map(token_span)
         .ok_or_else(|| error("missing runtime enum match callable name"))?;
-    Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows, initializer, input_names,
+    Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows, initializer, input_names, prefix,
         enumeration: resolved.enumeration.id.clone(), outputs: output_types, selector, local: local_binding, arms })
 }
 
@@ -320,6 +353,26 @@ impl Plan {
         self.inputs.iter().map(|(span, _)| *span)
     }
 
+    pub(super) fn authenticates_prefix(
+        &self, preceding: &[ScalarBlockItem], nodes: &super::control::CallableBodyCallNodes<'_>,
+        facts: &super::control::CallablePointFacts,
+    ) -> bool {
+        if preceding.len() != self.prefix.len() { return false; }
+        let mut work = 0;
+        self.prefix.iter().zip(preceding).all(|(input, item)| {
+            let ScalarBlockItem::LocalBinding(binding) = item else { return false; };
+            !binding.is_allocation && binding.contextual_storage().is_none()
+                && binding.receivers.len() == 1 && binding.output_values.len() == 1
+                && binding.name == input.name && binding.name_span == input.declaration
+                && binding.declared_type == input.ty
+                && nodes.canonical_expression_type(&binding.value) == Some(&input.ty)
+                && matches!(nodes.binding_definition(facts, binding, 0),
+                    Some(super::control::BindingDefinition::Initialized { value, .. })
+                        if nodes.evaluation_point(facts, &binding.value) == Some(value))
+                && pure_prefix_value(&binding.value, &mut work)
+        })
+    }
+
     pub(super) fn authenticates_initializer(&self, source: &SourceIdentity, function: &ScalarFunction,
         binding: &ScalarBinding,
     ) -> bool {
@@ -352,6 +405,27 @@ impl Plan {
                 .all(|((declared, ty), (actual, actual_ty))| declared == actual && ty == actual_ty)
             && outputs.outputs.iter().map(|output| &output.ty).eq(self.outputs.iter())
     }
+}
+
+// Prefix locals remain ordinary statements. This guard classifies their
+// source-derived typed expressions without interpreting or re-evaluating them.
+fn pure_prefix_value(value: &ScalarExpression, work: &mut usize) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        if analysis_budget::charge_call_work(work, 1).is_none() { return false; }
+        match value {
+            ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } => {}
+            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot, operand, .. } =>
+                pending.push(operand),
+            ScalarExpression::Binary { operator: BinaryOperator::WrappingAdd | BinaryOperator::BitOr
+                | BinaryOperator::BitXor | BinaryOperator::BitAnd, left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: RuntimeSelector<'_>,
@@ -755,7 +829,7 @@ fn prepared_runtime_enum_match_as_ordinary_lexical_initializer() {
     for (invalid, reason) in [
         (text.replace("u16 selected =", "u8 selected ="), "payload result type differs"),
         (text.replace("left(narrow, wide) { wide ^ 1 }", "right(narrow, wide) { wide ^ 1 }"), "duplicate or unknown"),
-        (text.replace("u16 selected =", "u8 previous = 1; u16 selected ="), "requires the first ordinary function local"),
+        (text.replace("u16 selected =", "input = 1; u16 selected ="), "requires a prefix of ordinary primitive locals"),
         (text.replace("wide ^ 1", "wide / 1"), "total integer operator"),
     ] {
         let parsed = parse(&invalid);
@@ -763,5 +837,47 @@ fn prepared_runtime_enum_match_as_ordinary_lexical_initializer() {
         let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
         assert!(declarations.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)),
             "{:?}", declarations.diagnostics);
+    }
+}
+
+#[test]
+fn prepared_runtime_enum_match_uses_ordered_lexical_prefix_values() {
+    let text = r#"%%start
+        enum copy Region { left(u8, u16); right(u16, u8); }
+        (u16)(bool, u16) choose = fn(flag, input) {
+            bool alternate = !flag;
+            u16 second = input +@ 256;
+            u16 selected = match (if (alternate) { Region.left(17, second) } else { Region.right(second | 1, 24) }) {
+                right(wide, narrow) { wide }
+                left(narrow, wide) { wide ^ 2 }
+            };
+            u16 transformed = selected +@ 2;
+            transformed
+        };
+        u16 a = choose(false, 256);
+        u16 b = choose(true, 256);
+        if (a != 516 || b != 515) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source.clone()],
+                ScalarPreparationInputs { target_layout })
+        };
+        let prepared = prepare(text).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("enum.match.lexical") && ir.contains("phi i16"));
+            assert!(ir.contains("load i16, ptr %second"));
+            assert!(ir.contains("load i1, ptr %alternate"));
+        }
+        let invalid = text.replace("input +@ 256", "(if (flag) { input } else { 1 })");
+        let prepared = prepare(&invalid).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(crate::emit_scalar_build_single_module_llvm_text(&analyzed).unwrap_err().contains("checked pure primitive locals"));
     }
 }

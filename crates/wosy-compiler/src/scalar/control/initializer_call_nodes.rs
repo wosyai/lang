@@ -197,6 +197,7 @@ pub(crate) struct CallableBodyCallNodes<'a> {
 struct CallableProofNodes<'a> {
     calls: Option<&'a FunctionCallSites>,
     initializer_bindings: bool,
+    runtime_match_binding: Option<usize>,
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
@@ -832,6 +833,10 @@ impl<'a> CallableBodyCallNodes<'a> {
 
     /// Look up the checked type of an exact expression in the bound body.
     /// Unlike the self-tail cache, this does not require a tail candidate.
+    pub(crate) fn runtime_match_binding(&self) -> Option<usize> {
+        self.proof_nodes.runtime_match_binding
+    }
+
     pub(crate) fn canonical_expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
         let ordinal = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
         self.proof_nodes.calls?.structure.checked_types.expressions.get(ordinal)
@@ -1197,6 +1202,12 @@ impl<'a> Binder<'a, '_> {
         binding: &'a ScalarBinding,
     ) -> Result<(), String> {
         if let (Some(nodes), Parent::Block(block)) = (&mut self.proof_nodes, parent) {
+            if nodes.calls.is_some() && block == self.structure.root
+                && matches!(&binding.value, ScalarExpression::RuntimeMatch(_))
+                && nodes.runtime_match_binding.replace(item).is_some()
+            {
+                return Err("multiple runtime match initializers in one source block are not supported".to_owned());
+            }
             if nodes.calls.is_some() || nodes.initializer_bindings {
                 nodes
                     .bindings

@@ -445,8 +445,16 @@ impl<'a> ScalarBuildValidation<'a> {
     pub(crate) fn bind_runtime_enum_initializer<'b>(&'b self, module: usize, item: usize,
         function: &'b ScalarFunction, nodes: &control::CallableBodyCallNodes<'_>,
     ) -> Result<Option<(&'b runtime_enum_match::Occurrence, &'b ScalarEnumPayloadLayout)>, String> {
-        let Some(ScalarBlockItem::LocalBinding(binding)) = function.body.items.first() else { return Ok(None); };
-        let ScalarExpression::RuntimeMatch(site) = &binding.value else { return Ok(None); };
+        let Some(position) = nodes.runtime_match_binding() else { return Ok(None); };
+        let Some((preceding, remainder)) = function.body.items.split_at_checked(position) else {
+            return Err("missing runtime enum initializer position".into());
+        };
+        let Some(ScalarBlockItem::LocalBinding(binding)) = remainder.first() else {
+            return Err("missing runtime enum initializer binding".into());
+        };
+        let ScalarExpression::RuntimeMatch(site) = &binding.value else {
+            return Err("missing runtime enum initializer occurrence".into());
+        };
         let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum initializer module")?;
         let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
             return Err("missing original runtime enum initializer callable".to_owned());
@@ -456,6 +464,11 @@ impl<'a> ScalarBuildValidation<'a> {
             || nodes.canonical_expression_type(&binding.value) != Some(site.ty())
         {
             return Err("runtime enum initializer requires its checked original lexical binding".to_owned());
+        }
+        if !preceding.is_empty() && !self.callable_point_facts(module, item, None)
+            .is_some_and(|facts| site.0.authenticates_prefix(preceding, nodes, facts))
+        {
+            return Err("runtime match prefix must contain checked pure primitive locals".into());
         }
         let layout = owner.layouts.enum_payload(&site.0.enumeration)
             .ok_or("missing freshly prepared runtime enum initializer layout")?;

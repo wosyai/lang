@@ -14,7 +14,7 @@ pub(super) fn emit_values<'ctx>(
     }
     let layout = source.layouts.enum_payload(&plan.enumeration)
         .filter(|layout| layout.target == target).ok_or("missing freshly prepared runtime enum layout")?;
-    emit_region(context, builder, function, layout, plan)
+    emit_region(context, builder, function, layout, plan, BTreeMap::new())
 }
 
 pub(super) fn emit_initializer<'ctx>(
@@ -27,7 +27,13 @@ pub(super) fn emit_initializer<'ctx>(
         .ok_or("runtime match is not the exact prepared scalar initializer")?;
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing ordinary runtime match function")?;
-    let outputs = emit_region(context, state.builder, function, layout, &authored.0)?;
+    let mut locals = BTreeMap::new();
+    for input in &authored.0.prefix {
+        let (slot, _) = state.storage.get(&input.name).filter(|(_, ty)| ty == &input.ty)
+            .ok_or("missing exact runtime enum lexical input storage")?;
+        locals.insert((input.declaration.start, input.declaration.end), InputValue::Lexical(*slot));
+    }
+    let outputs = emit_region(context, state.builder, function, layout, &authored.0, locals)?;
     let [value] = outputs.as_slice() else { return Err("runtime match initializer is not scalar".into()); };
     Ok(EmitValue::Basic(*value))
 }
@@ -35,6 +41,7 @@ pub(super) fn emit_initializer<'ctx>(
 fn emit_region<'ctx>(
     context: &'ctx Context, builder: &Builder<'ctx>, function: FunctionValue<'ctx>,
     layout: &ScalarEnumPayloadLayout, plan: &Plan,
+    mut arguments: BTreeMap<(u32, u32), InputValue<'ctx>>,
 ) -> Result<Vec<BasicValueEnum<'ctx>>, String> {
     let size = u32::try_from(layout.layout.size).map_err(|_| "runtime enum storage exceeds LLVM array limit")?;
     let alignment = u32::try_from(layout.layout.alignment).ok().filter(|value| value.is_power_of_two())
@@ -48,8 +55,8 @@ fn emit_region<'ctx>(
     let storage = builder.build_alloca(context.i8_type().array_type(size), storage_name).map_err(builder_error)?;
     storage.as_instruction_value().ok_or("missing runtime enum storage instruction")?
         .set_alignment(alignment).map_err(|error| format!("{error:?}"))?;
-    let arguments = plan.input_spans().map(|span| (span.start, span.end)).zip(function.get_param_iter())
-        .collect::<BTreeMap<_, _>>();
+    arguments.extend(plan.input_spans().map(|span| (span.start, span.end))
+        .zip(function.get_param_iter().map(InputValue::Formal)));
     let join = context.append_basic_block(function, "enum.match.dispatch");
     let lowering = Lowering { context, builder, function, storage, layout, arguments };
     lowering.selector(&plan.selector, join)?;
@@ -116,13 +123,18 @@ fn literal<'ctx>(context: &'ctx Context, ty: &ScalarType, value: &num_bigint::Bi
     }
 }
 
+enum InputValue<'ctx> {
+    Formal(BasicValueEnum<'ctx>),
+    Lexical(PointerValue<'ctx>),
+}
+
 struct Lowering<'owner, 'ctx> {
     context: &'ctx Context,
     builder: &'owner Builder<'ctx>,
     function: FunctionValue<'ctx>,
     storage: PointerValue<'ctx>,
     layout: &'owner ScalarEnumPayloadLayout,
-    arguments: BTreeMap<(u32, u32), BasicValueEnum<'ctx>>,
+    arguments: BTreeMap<(u32, u32), InputValue<'ctx>>,
 }
 
 impl<'ctx> Lowering<'_, 'ctx> {
@@ -130,7 +142,9 @@ impl<'ctx> Lowering<'_, 'ctx> {
         -> Result<inkwell::values::IntValue<'ctx>, String>
     {
         match self.arguments.get(&(span.start, span.end)) {
-            Some(BasicValueEnum::IntValue(value)) if value.get_type() == ty => Ok(*value),
+            Some(InputValue::Formal(BasicValueEnum::IntValue(value))) if value.get_type() == ty => Ok(*value),
+            Some(InputValue::Lexical(slot)) => self.builder.build_load(ty, *slot, "enum.match.lexical")
+                .map_err(builder_error).map(|value| value.into_int_value()),
             _ => Err("missing prepared runtime enum formal".into()),
         }
     }
