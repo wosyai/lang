@@ -19459,14 +19459,15 @@ if (observe(2,1) != 202) { core.system_panic(); };
 
 #[test]
 fn configured_checked_access_positive_selection_retains_authored_helpers() {
-    // The current private extent cohort is demonstrated on a separate closed
-    // owner/caller per child mode. These do not claim mixed calls on one owner.
-    let cases = [
-        ("selected_values.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/selected_values.w"), None),
-        ("shared_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/shared_field.w"), Some(("_read_field", 2))),
-        ("exclusive_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/exclusive_field.w"), Some(("_update_field", 3))),
+    let cases: [(&str, &str, &[(&str, usize)], bool); 4] = [
+        ("selected_values.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/selected_values.w"), &[], true),
+        ("shared_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/shared_field.w"), &[("_read_field", 2)], false),
+        ("exclusive_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/exclusive_field.w"), &[("_update_field", 3)], false),
+        ("combined_selection.w",
+            include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/combined_selection.w"),
+            &[("_read_field", 2), ("_update_field", 3)], true),
     ];
-    for (name, text, field) in cases {
+    for (name, text, fields, callers) in cases {
         for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
             let source = SourceIdentity::new("project".into(), "package".into(), format!("src/{name}"), "r1".into());
             let parsed = parse_source(source.clone(), text.to_owned(), &[]);
@@ -19499,7 +19500,7 @@ fn configured_checked_access_positive_selection_retains_authored_helpers() {
                 assert!(trap.contains("call void @__wosy_core_system_panic("), "{helper}");
                 assert!(success.contains("ret void") && !success.contains("system_panic"), "{helper}");
             }
-            if field.is_none() {
+            if callers {
                 for (name, expected, fixed) in [("fixed_selected", 1, true), ("generated_selected", 2, false)] {
                     let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, name));
                     let selectors: Vec<_> = body.lines().filter(|line| line.contains(&selector)).collect();
@@ -19521,7 +19522,8 @@ fn configured_checked_access_positive_selection_retains_authored_helpers() {
                         }
                     }
                 }
-            } else if let Some((name, nulls)) = field {
+            }
+            for &(name, nulls) in fields {
                 let body = self_tail_test_body(&ir, "internal i64", &project_function_name(&source, name));
                 let (guard, row) = (body.find(&bounds).unwrap(), body.find("getelementptr inbounds [16 x i8]").unwrap());
                 assert_eq!(body.matches(&non_null).count(), nulls, "{body}");
@@ -19530,6 +19532,36 @@ fn configured_checked_access_positive_selection_retains_authored_helpers() {
                 assert!(body[guard..].lines().next().unwrap().ends_with(", i64 %borrowed_array_extent)"), "{body}");
                 assert!(body[..guard].lines().any(|line| line.contains("%borrowed_array_extent = extractvalue")
                     && line.ends_with("%view, 1")), "{body}");
+            }
+            if name == "combined_selection.w" {
+                let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, "combined_field"));
+                let size = body.lines().find(|line| line.contains(" = mul nuw i64 ") && line.ends_with(", 16")).unwrap();
+                let (bytes, scale) = size.trim().split_once(" = mul nuw i64 ").unwrap();
+                let (count, _) = scale.split_once(", ").unwrap();
+                let allocation = format!(" = call ptr @__wosy_core_alloc(i64 {bytes}, i64 8)");
+                let backing = body.lines().find_map(|line| line.trim().strip_suffix(&allocation)).unwrap();
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 1, "{body}");
+                assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+                let mut before = body.find(&allocation).unwrap();
+                let width = target.pointer_size * 8;
+                let pair_ty = format!("{{ i{width}, i64 }}");
+                for (callee, _) in fields {
+                    let call = format!("call i64 @{}(", project_function_name(&source, callee));
+                    let location = body[before..].find(&call).unwrap() + before;
+                    let argument = body[location..].lines().next().unwrap();
+                    let pair = argument.strip_prefix(&call).unwrap().strip_prefix(&pair_ty).unwrap()
+                        .trim_start().split_once(", ").unwrap().0;
+                    let staged = &body[before..location];
+                    let extent = format!("{pair} = insertvalue {pair_ty} ");
+                    let address_pair = staged.lines().find_map(|line| line.trim().strip_prefix(&extent)
+                        .and_then(|line| line.strip_suffix(&format!(", i64 {count}, 1")))).unwrap();
+                    let seed = format!("{address_pair} = insertvalue {pair_ty} undef, i{width} ");
+                    let address = staged.lines().find_map(|line| line.trim().strip_prefix(&seed)
+                        .and_then(|line| line.strip_suffix(", 0"))).unwrap();
+                    assert!(staged.contains(&format!("{address} = ptrtoint ptr {backing} to i{width}")), "{body}");
+                    before = location + call.len();
+                }
+                assert!(body[before..].contains(&format!("call void @__wosy_core_free(ptr {backing})")), "{body}");
             }
         }
     }

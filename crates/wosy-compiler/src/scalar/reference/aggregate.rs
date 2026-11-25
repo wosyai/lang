@@ -5346,6 +5346,7 @@ struct OrdinaryCohorts {
     private: BTreeMap<BodyKey, (OrdinaryResultCandidate, bool)>,
     transport_uses: HashMap<BodyKey, Option<Vec<(BodyKey, usize)>>>,
     checked_length_uses: BTreeSet<(BodyKey, usize)>,
+    allow_disjoint_scalar_local_calls: bool,
     namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
     indexed: BTreeMap<BodyKey, ClosedIndexedSnapshot>,
     terminal_indexed: BTreeMap<BodyKey, [ClosedIndexedSnapshot; 2]>,
@@ -5515,6 +5516,17 @@ impl OrdinaryCohorts {
                             }
                         }
                     }
+                    // Private runtime-pair targets all require a checked
+                    // array actual. An independently resolved ordinary
+                    // scalar-only local call cannot name such a target;
+                    // direct calls and callable values still contribute to
+                    // the normal use/escape census independently.
+                    ResolvedCallTarget::LocalCallable(_)
+                        if self.allow_disjoint_scalar_local_calls
+                            && !sites.declared_unsafe_calls.contains(&occurrence.ordinal.0)
+                            && sites.checked_call_signatures.get(&occurrence.ordinal).is_some_and(|signature|
+                                signature.parameters.iter().all(ordinary_value)
+                                && matches!(signature.outputs.outputs.as_slice(), [output] if ordinary_value(&output.ty))) => {}
                     ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
                     _ => {}
                 }
@@ -9739,7 +9751,10 @@ impl ProjectReferenceResults {
             let sites = calls.modules.get(module)?.as_ref().ok()?;
             Some(ModuleInput { source: &row.source, items: &row.items, structs: &row.structs, calls: sites })
         };
-        let mut census = OrdinaryCohorts::default();
+        let mut census = OrdinaryCohorts {
+            allow_disjoint_scalar_local_calls: true,
+            ..OrdinaryCohorts::default()
+        };
         let mut reservations = AggregateReservations::default();
         let mut declarations = HashMap::new();
         let mut routes = BTreeMap::new();

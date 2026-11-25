@@ -115,3 +115,27 @@ exit = 0
 stdout = "expected/empty"
 stderr = "expected/empty"
 exact = true
+
+[[assert]]
+source = "project/src/combined_selection.w"
+command = ["wosy", "build", "host"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "host"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+source = "project/src/combined_selection.w"
+command = ["wosy", "build", "wasi"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "wasi"]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
