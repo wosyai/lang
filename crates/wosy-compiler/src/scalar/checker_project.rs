@@ -7001,7 +7001,7 @@ impl<'a> MainFlowProofCase<'a> {
         use super::checker_flow::QuantifiedIntegerReturn as Quantified;
         let quantified = match &plan.typed.goal {
             TypedProofGoal::UniversalNotEqual(excluded) => Some((Quantified::Avoiding(None, excluded), None)),
-            TypedProofGoal::UniversalConjunction(goal) => Some((match goal {
+            TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal) => Some((match goal {
                 UniversalConjunction::Vacuous => Quantified::Vacuous,
                 UniversalConjunction::Impossible => Quantified::Impossible,
                 UniversalConjunction::Output(bounds) => Quantified::Output(bounds),
@@ -7055,7 +7055,12 @@ impl<'a> MainFlowProofCase<'a> {
                 (if witness_outside { Quantified::Impossible } else { goal_claim }, goal, failed_step)
             } else {
                 if !plan.has_no_authored_steps() { return Err(ProjectCheck::Unsupported); }
-                (goal_claim, child(&ensures, SyntaxKind::Expression)?, None)
+                let goal = if matches!(plan.typed.goal, TypedProofGoal::InferredExistential(_)) {
+                    child(&ensures, SyntaxKind::ProofExists)?
+                } else {
+                    child(&ensures, SyntaxKind::Expression)?
+                };
+                (goal_claim, goal, None)
             };
             let original_witness = match &plan.typed.goal {
                 TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(witness)) => Some(witness),
@@ -11069,7 +11074,7 @@ impl SelectedProofObserver<'_> {
                     },
                     TypedProofGoal::EntryWitness { .. } => None,
                     TypedProofGoal::UniversalNotEqual(domain) => Some(!domain.covers_closed(value, value)),
-                    TypedProofGoal::UniversalConjunction(goal) => Some(match goal {
+                    TypedProofGoal::UniversalConjunction(goal) | TypedProofGoal::InferredExistential(goal) => Some(match goal {
                         UniversalConjunction::Vacuous => true,
                         UniversalConjunction::Impossible => false,
                         UniversalConjunction::Output(output) => output.holds_value(value),
@@ -11328,6 +11333,8 @@ enum TypedProofGoal {
     UniversalNotEqual(IntegerSet),
     #[cfg(feature = "internal-checker")]
     UniversalConjunction(UniversalConjunction),
+    #[cfg(feature = "internal-checker")]
+    InferredExistential(UniversalConjunction),
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
     EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet, offset: Option<BigInt> },
@@ -11363,7 +11370,7 @@ impl TypedProofGoal {
                 DependentWitness::OutputAvoiding(bounds) =>
                     path.output_satisfies_constraints_avoiding(&bounds.0, &bounds.1)?.then_some(true),
             },
-            Self::UniversalConjunction(goal) => match goal {
+            Self::UniversalConjunction(goal) | Self::InferredExistential(goal) => match goal {
                 UniversalConjunction::Vacuous => Some(true),
                 UniversalConjunction::Impossible => Some(false),
                 UniversalConjunction::Output(output) => path.output_satisfies_constraints(output),
@@ -11832,6 +11839,14 @@ fn authored_witness_argument(steps: &ScalarBlock) -> Result<&ScalarExpression, P
 fn typed_existential_conjuncts(
     predicate: &ScalarExpression, binder: &str, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<(IntegerRelation, IntegerShowConstraints<'static>), ProjectCheck> {
+    let (relation, bounds) = partition_existential_conjuncts(predicate, binder, output, inputs, ty)?;
+    Ok((relation.ok_or(ProjectCheck::Unsupported)?, bounds))
+}
+
+#[cfg(feature = "internal-checker")]
+fn partition_existential_conjuncts(
+    predicate: &ScalarExpression, binder: &str, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<(Option<IntegerRelation>, IntegerShowConstraints<'static>), ProjectCheck> {
     let mut relation: Option<IntegerRelation> = None;
     let mut output_bounds = IntegerShowConstraints::default();
     visit_output_conjuncts(predicate, |atom| {
@@ -11849,8 +11864,55 @@ fn typed_existential_conjuncts(
         output_bounds.add(atom, Cow::Owned(bound));
         Ok(())
     })?;
-    let relation = relation.ok_or(ProjectCheck::Unsupported)?;
     Ok((relation, output_bounds))
+}
+
+#[cfg(feature = "internal-checker")]
+fn inferred_scalar_existential(
+    exists: &CstNode, predicate: &ScalarExpression, binder: &str, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    use UniversalConjunction::{Impossible, Output as Bounds, OutputAvoiding};
+    let (relation, mut bounds) = partition_existential_conjuncts(predicate, binder, output, inputs, ty)?;
+    let domain = typed_quantifier_domain(exists, binder, inputs, ty)?;
+    let condition = if domain.is_empty() {
+        Impossible
+    } else if let Some(relation) = relation {
+        match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
+            (false, false, false) => Impossible,
+            (false, false, true) => {
+                // For equality the result itself is an exact witness iff
+                // admitted by the sparse domain. Reuse the ordered
+                // exclusion consumer via the exact bounded complement.
+                let cost = domain.interval_count().checked_mul(3).and_then(|n| n.checked_add(2))
+                    .ok_or(ProjectCheck::Unsupported)?;
+                super::checker_flow::charge_call_work(&mut 0, cost).ok_or(ProjectCheck::Unsupported)?;
+                let excluded = domain.complement_in_type(ty).ok_or(ProjectCheck::Unsupported)?;
+                bounds.normalize();
+                OutputAvoiding(Box::new((bounds, excluded)))
+            }
+            (less, greater, _) if less != greater => {
+                // Existential order chooses max for output < witness and
+                // min for output > witness (opposite the forall extrema).
+                let witness = domain.into_extremum(greater).ok_or(ProjectCheck::Unsupported)?;
+                bounds.add(relation, Cow::Owned(witness));
+                bounds.normalize();
+                Bounds(Box::new(bounds))
+            }
+            (true, true, false) => {
+                // Two distinct admitted values guarantee a witness unlike
+                // the output; a singleton can do so only when different.
+                if let Some(witness) = domain.into_singleton() { bounds.add(relation, Cow::Owned(witness)); }
+                bounds.normalize();
+                Bounds(Box::new(bounds))
+            }
+            _ => { bounds.normalize(); Bounds(Box::new(bounds)) }
+        }
+    } else {
+        bounds.normalize();
+        Bounds(Box::new(bounds))
+    };
+    Ok(TypedProofGoal::InferredExistential(condition))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12001,9 +12063,14 @@ fn typed_existential_output_goal(
     exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] body: &FunctionCallSites,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
+    #[cfg(feature = "internal-checker")] configured: bool,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(exists, output, inputs, ty)?;
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
+    #[cfg(feature = "internal-checker")]
+    if configured && steps.items.is_empty() && steps.terminated_items.is_empty() {
+        return inferred_scalar_existential(exists, &predicate, &binder, output, inputs, &ty);
+    }
     let simple_relation = || {
         let ScalarExpression::Binary { operator, left, right, .. } = &predicate else {
             return Err(ProjectCheck::Unsupported);
@@ -12832,7 +12899,9 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                 return Err(ProjectCheck::Unsupported);
             }
         } else {
-            typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty, body, allow_named_entry_facts)?
+            typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty, body, allow_named_entry_facts,
+                #[cfg(feature = "internal-checker")] qualified_owner.is_some(),
+            )?
         }
     } else {
         let ensures = derive_expression(&child(&ensures_node, SyntaxKind::Expression)?);
@@ -21644,6 +21713,64 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_inferred_scalar_existential_constructs_typed_witnesses() {
+        use super::super::checker_flow::take_array_return_observations;
+        let source = r#"%%start
+            u8(u8) sparse = fn(value) { value };
+            i8(i8) ordered = fn(value) { value };
+            u8(u8) different = fn(value) { value };
+            u8[1]() make = fn { [7] };
+            proof membership for sparse(entry) -> (out) where (entry == 4)
+                ensures (exists (u8 chosen where chosen == 4 || chosen == 6) { out == chosen && out <= 6 }) {}
+            proof order for ordered(entry) -> (out) where (entry == -2)
+                ensures (exists (i8 chosen where chosen == -4 || chosen == -1) { out < chosen }) {}
+            proof distinct for different(entry) -> (out) where (entry == 7)
+                ensures (exists (u8 chosen where chosen == 7 || chosen == 9) { out != chosen }) {}
+            proof cell for make() -> (out)
+                ensures (exists (u64 index where index == 0) { out[index] == 7 }) {}
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", &format!(
+            "u8 a = sparse({}); i8 b = ordered(-2); u8 c = different(7); u8[1] cells = make(); %%end",
+            if text.contains("entry == 5") { 5 } else { 4 },
+        ));
+        let _ = take_array_return_observations();
+        let pass = check_array_proof_cohort(source, package).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none() && pass.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (1, 0));
+        let pass = check_array_proof_cohort(&actual(source), main).unwrap();
+        assert!(pass.active && pass.diagnostics.is_empty() && pass.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (0, 1));
+
+        for (text, returned) in [
+            (source.replace("entry == 4", "entry == 5"), 5),
+            (source.replace("chosen == -1", "chosen == -2"), -2),
+            (source.replace("chosen == 7 || chosen == 9", "chosen == 7"), 7),
+            (source.replace("chosen == 7 || chosen == 9", "chosen == 7 && chosen == 9"), 7),
+        ] {
+            let dormant = check_array_proof_cohort(&text, main).unwrap();
+            assert!(!dormant.active && dormant.diagnostics.is_empty());
+            assert_eq!(take_array_return_observations(), (0, 0));
+            let symbolic = check_array_proof_cohort(&text, package).unwrap();
+            assert!(symbolic.aggregate_diagnostics.is_empty());
+            let failed = symbolic.symbolic_diagnostic.unwrap();
+            assert_eq!(failed.returned, BigInt::from(returned));
+            assert!(failed.failed_step.is_none() && failed.quantified_witness.is_none());
+            assert!(text[failed.goal.range.start as usize..failed.goal.range.end as usize].starts_with("exists"));
+            assert_eq!(take_array_return_observations(), (1, 0));
+            let observed = check_array_proof_cohort(&actual(&text), main).unwrap();
+            let [failure] = observed.diagnostics.as_slice() else { panic!("one failed actual choice"); };
+            assert_eq!(failure.invocation.returned, BigInt::from(returned));
+            assert!(failure.failed_step.is_none() && failure.quantified_witness.is_none() && observed.aggregate_diagnostics.is_empty());
+            assert_eq!(take_array_return_observations(), (0, 1));
+        }
+        let independent = source.replace("out != chosen", "out == 7");
+        assert!(check_array_proof_cohort(&independent, package).unwrap().symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

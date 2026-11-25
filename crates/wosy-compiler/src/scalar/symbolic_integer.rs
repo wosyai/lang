@@ -627,6 +627,24 @@ impl IntegerSet {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn complement_in_type(self, ty: &ScalarType) -> Option<Self> {
+        let (minimum, maximum) = integer_bounds(ty)?;
+        let mut next = minimum;
+        let mut missing = Vec::with_capacity(self.0.len().checked_add(1)?);
+        for interval in self.0 {
+            if interval.first < next || interval.last > maximum { return None; }
+            if next < interval.first {
+                missing.push(Interval { first: next, last: &interval.first - 1u8 });
+            }
+            next = interval.last + 1u8;
+        }
+        if next <= maximum {
+            missing.push(Interval { first: next, last: maximum });
+        }
+        Some(Self(missing))
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn first_uncovered_from(&self, allowed: &Self) -> Option<BigInt> {
         let mut enclosing = allowed.0.iter().peekable();
         for range in &self.0 {
