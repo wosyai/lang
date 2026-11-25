@@ -14195,11 +14195,18 @@ u64(u64) observed = fn(index) {
 };
 if (observed(1) != 99 || observed(1) != 46 || observed(4294967297) != 0) { core.system_panic(); };
 %%end";
-    let unavailable = text.replace("    if (&held == null)", "    held[index] = 7;\n    if (&held == null)");
-    let aliased = text.replace("        held[_index", "        *!u64 alias = &!held[0]; *alias;\n        held[_index");
-    let whole = text.replace("        held[_index(3, index)] = _value(5, 7);",
-        "        u64 selected = _index(3, index); held = [selected, _value(5, 7)];");
-    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+    for (runtime, layout) in [false, true].into_iter().flat_map(|runtime|
+        [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32].into_iter().map(move |layout| (runtime, layout)))
+    {
+        let runtime_text = runtime.then(|| text.replace("u64[2] held =?", "u64[] held =?"));
+        let text = runtime_text.as_deref().unwrap_or(text);
+        let unavailable = text.replace("    if (&held == null)", "    held[index] = 7;\n    if (&held == null)");
+        let aliased = text.replace("        held[_index", "        *!u64 alias = &!held[0]; *alias;\n        held[_index");
+        let whole = if runtime {
+            text.replace("        held[_index(3, index)] = _value(5, 7);",
+                "        u64 selected = _index(3, index); selected; _value(5, 7); held;")
+        } else { text.replace("        held[_index(3, index)] = _value(5, 7);",
+            "        u64 selected = _index(3, index); held = [selected, _value(5, 7)];") };
         for (source, reason) in [
             (unavailable.as_str(), "fallible allocation is not known to be available"),
             (aliased.as_str(), "fallible allocation access is not a supported"),
@@ -14275,7 +14282,7 @@ if (observed(1) != 99 || observed(1) != 46 || observed(4294967297) != 0) { core.
                 assert_eq!(known_field_operand(check, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
                 assert_eq!(install.get_parent().unwrap().get_name().to_bytes(), b"guarded_index_continue");
             }
-            if let Some(out) = std::env::var_os("WOSY_GUARDED_INDEXED_STORE_IR_DIR") {
+            if let Some(out) = std::env::var_os(if runtime { "WOSY_GUARDED_RUNTIME_STORE_IR_DIR" } else { "WOSY_GUARDED_INDEXED_STORE_IR_DIR" }) {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
@@ -14305,11 +14312,15 @@ u64(u64) observed = fn(index) {
 if (observed(1) != 99 || observed(0) != 7 || observed(1) != 4
     || observed(4294967297) != 0) { core.system_panic(); };
 %%end";
-    let missing_presence = text.replace("    if (&held == null)", "    *u64 early = &held[index];\n    *early;\n    if (&held == null)");
-    let active_loan = text.replace("        u64 before = *cell;\n        held[1] = 7;",
-        "        held[1] = 7;\n        u64 before = *cell;");
-    let alias_guard = text.replace("u64 before = *cell;", "u64 before = if (cell == null) { 0 } else { *cell };");
-    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+    for (runtime, layout) in [false, true].into_iter().flat_map(|runtime|
+        [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32].into_iter().map(move |layout| (runtime, layout)))
+    {
+        let runtime_text = runtime.then(|| text.replace("u64[2] held =?", "u64[] held =?"));
+        let text = runtime_text.as_deref().unwrap_or(text);
+        let missing_presence = text.replace("    if (&held == null)", "    *u64 early = &held[index];\n    *early;\n    if (&held == null)");
+        let active_loan = text.replace("        u64 before = *cell;\n        held[1] = 7;",
+            "        held[1] = 7;\n        u64 before = *cell;");
+        let alias_guard = text.replace("u64 before = *cell;", "u64 before = if (cell == null) { 0 } else { *cell };");
         for (case, reason) in [
             (missing_presence.as_str(), "fallible allocation is not known to be available"),
             (active_loan.as_str(), "read or move of unavailable place"),
@@ -14383,7 +14394,7 @@ if (observed(1) != 99 || observed(0) != 7 || observed(1) != 4
                 assert_eq!(known_field_operand(check, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
                 assert_eq!(gep.get_parent().unwrap().get_name().to_bytes(), b"guarded_index_continue");
             }
-            if let Some(out) = std::env::var_os("WOSY_GUARDED_INDEXED_BORROW_IR_DIR") {
+            if let Some(out) = std::env::var_os(if runtime { "WOSY_GUARDED_RUNTIME_BORROW_IR_DIR" } else { "WOSY_GUARDED_INDEXED_BORROW_IR_DIR" }) {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
@@ -14409,12 +14420,12 @@ if (observed(7, 9, 0) != 99 || observed(7, 9, 0) != 99 || observed(7, 9, 0) != 9
 %%end";
     let absent_read = text.replace("if (&held == null)", "held[index]; if (&held == null)");
     let absent_extent = text.replace("if (&held == null)", "core.array_len(&held); if (&held == null)");
-    let unsupported_store = text.replace("else { core.array_len", "else { held[index] = 5; core.array_len");
+    let unsupported_whole_read = text.replace("else { core.array_len", "else { held; core.array_len");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (negative, reason) in [
             (absent_read.as_str(), "fallible allocation is not known to be available"),
             (absent_extent.as_str(), "fallible allocation is not known to be available"),
-            (unsupported_store.as_str(), "fallible allocation access is not a supported"),
+            (unsupported_whole_read.as_str(), "fallible allocation access is not a supported"),
         ] {
             let prepared = prepare_initializer_test(negative, layout);
             let checked = analyze_scalar_build(&prepared);

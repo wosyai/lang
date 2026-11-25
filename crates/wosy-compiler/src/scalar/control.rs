@@ -44,6 +44,16 @@ pub(super) struct GuardedAllocationBinding {
     pub(super) runtime_literal_length: Option<u64>,
 }
 
+impl GuardedAllocationBinding {
+    pub(super) fn indexed_extent(&self) -> Option<u64> {
+        match &self.ty {
+            ScalarType::Array { length, .. } => Some(*length),
+            ScalarType::RuntimeArray { .. } => self.runtime_literal_length,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
     pub(super) local_borrow: Option<Box<super::reference::local_borrow::Sealed>>,
