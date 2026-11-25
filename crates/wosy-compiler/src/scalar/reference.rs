@@ -1141,18 +1141,28 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let ScalarExpression::CheckedAddress { mutability, place, .. } = expression else { return None };
         let ScalarType::CheckedReference { mutability: expected_mode, inner } = expected else { return None };
-        if mutability != expected_mode || !matches!(place, ScalarPlace::Name { .. })
+        if mutability != expected_mode
             || self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(expected)
         {
             return None;
         }
-        let place = self.place_ordinal(OccurrenceParent::Expression(ordinal), OccurrenceEdge::ExpressionPlace);
+        let occurrence = self.place_ordinal(OccurrenceParent::Expression(ordinal), OccurrenceEdge::ExpressionPlace);
+        let root = self.place_root(place, occurrence);
         let NamedPlaceRootFacts::Prepared(roots) = &self.call_sites.named_place_roots else { return None };
-        let NamedPlaceRootIdentity::Lexical(owner) = roots.get(&place)? else { return None };
+        let NamedPlaceRootIdentity::Lexical(owner) = roots.get(&root.ordinal)? else { return None };
         let site = sites.get(owner)?;
-        (site.scope == scope && site.ty == **inner && (is_integer_type(inner) || site.whole_copy)
-            && self.call_sites.structure.checked_types.places.get(&place) == Some(inner.as_ref()))
-            .then(|| owner.clone())
+        match place {
+            ScalarPlace::Name { .. } if site.scope == scope && site.ty == **inner
+                && (is_integer_type(inner) || site.whole_copy)
+                && self.call_sites.structure.checked_types.places.get(&occurrence) == Some(inner.as_ref()) =>
+                Some(owner.clone()),
+            // A projected alias never serves as a root presence test. The
+            // Borrow CFG point below must already see the same owner present.
+            ScalarPlace::Index { .. } if *mutability == ScalarReferenceMutability::Shared
+                && self.exact_guarded_index(place, occurrence, owner, &site.ty) == Some(inner.as_ref()) =>
+                Some(owner.clone()),
+            _ => None,
+        }
     }
 
     fn reject_fallible_address(
@@ -1219,7 +1229,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let alias = self.expression_ordinal(parent, address_edge);
                 if let Some(PlainNameIdentity::Lexical(alias)) = self.prepared_name_identity(alias, *span)? {
                     if let Some(owner) = self.proof_points.fallible_aliases.get(alias) {
-                        if fallible_bindings.contains_key(owner) {
+                        if fallible_bindings.get(owner).is_some_and(|site| !matches!(site.ty, ScalarType::Array { .. })) {
                             return Ok(Some((owner.clone(), present_on_then)));
                         }
                     }
@@ -10946,6 +10956,13 @@ fn transfer_reference_facts(
                     }
                 }
             }
+            if let CfgPointKind::Borrow { place, .. } = &point.kind {
+                if let Some(bindings) = cfg.fallible_allocation_bindings {
+                    if bindings.get(&place.binding).is_some_and(|site| matches!(site.ty, ScalarType::Array { .. })) {
+                        require_available_fallible_read(bindings, &state, &place.binding, point, false, &mut errors);
+                    }
+                }
+            }
             for place in read_places {
                 if let Some(bindings) = cfg.fallible_allocation_bindings {
                     if matches!(&point.kind, CfgPointKind::ReadPlace { pointer_point: None, .. })
@@ -17265,6 +17282,28 @@ fn build_function_reference_cfg(
                         | ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead, ..
                 }
             )).cloned());
+        }
+        if !builder.has_joined_root_reborrow && !provisional.is_empty() {
+            // Preserve ordinary loan-conflict provenance for guarded indexed
+            // borrows; an overlapping live loan is not a failed null guard.
+            let sites = builder.proof_points.fallible_allocation_bindings.as_ref();
+            let is_guarded_array = |owner| sites.and_then(|sites| sites.get(owner))
+                .is_some_and(|site| matches!(site.ty, ScalarType::Array { .. }));
+            if builder.proof_points.fallible_aliases.values().any(is_guarded_array) {
+                let borrows = builder.cfg.initial_points.iter().filter_map(|point|
+                    matches!(&point.kind, CfgPointKind::Borrow { place, .. } if is_guarded_array(&place.binding))
+                        .then_some(&point.source_span)).collect::<HashSet<_>>();
+                let mut diagnosed = errors.iter().filter_map(|error|
+                    matches!(error, ReferenceAnalysisError::ConflictingPlace { .. })
+                        .then_some(error.source_span().clone())).collect::<HashSet<_>>();
+                for error in &provisional {
+                    if let ReferenceAnalysisError::ConflictingPlace { source_span, origins } = error {
+                        if origins.iter().any(|origin| borrows.contains(origin)) && diagnosed.insert(source_span.clone()) {
+                            errors.push(error.clone());
+                        }
+                    }
+                }
+            }
         }
         if provisional.is_empty() {
             if errors.is_empty() {
