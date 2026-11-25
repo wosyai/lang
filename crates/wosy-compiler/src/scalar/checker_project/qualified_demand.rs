@@ -116,8 +116,7 @@ fn qualified_requirement_suffix(
         let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
         if let Some(directive) = body.checker_directives.get(&expression) {
             let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return None; };
-            if directive.operation != CheckerOperation::Require || !origin_binding(&predicate.binding, &predicate.ty)
-                || !obligations.insert(expression)
+            if !origin_binding(&predicate.binding, &predicate.ty) || !obligations.insert(expression)
             {
                 return None;
             }
@@ -803,6 +802,41 @@ mod tests {
             let dormant_affine = run(&wrong_affine_join, &reflected_wrapper, increment, &reflected_leaf,
                 ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_affine.active && dormant_affine.directives.is_empty());
+            let narrowed_caller = r#"%%start
+                joined = namespace package "src/hub.w";
+                next = namespace package "src/right.w";
+                unit(u8) check = fn(input) {
+                    u8 first_value = joined.compose(input);
+                    u8 second_value = next.shift(first_value);
+                    if (first_value <= 127) {
+                        core.narrow(second_value >= 64, { .stdout = ""; .stderr = "narrowed"; .code = 82; .files = []; });
+                        core.require(input >= 64, { .stdout = ""; .stderr = "correlation"; .code = 83; .files = []; });
+                    };
+                    core.require(first_value >= 64, { .stdout = ""; .stderr = "after"; .code = 84; .files = []; });
+                };
+            %%end"#;
+            let narrowed = run(narrowed_caller, pass_through, increment, exact_alias, package).unwrap();
+            assert!(narrowed.active && narrowed.directives.is_empty() && narrowed.symbolic_diagnostic.is_none());
+            let removed_constraint = narrowed_caller.replace("core.narrow(second_value >= 64", "core.narrow(second_value >= 63");
+            let report = run(&removed_constraint, pass_through, increment, exact_alias, package).unwrap();
+            let [first, second] = report.directives.as_slice() else { panic!("selected arm then joined obligation"); };
+            for (failure, code, condition) in [(first, 83, "input >= 64"), (second, 84, "first_value >= 64")] {
+                assert_eq!(failure.code(), &BigInt::from(code));
+                assert_eq!(failure.source, app);
+                assert_eq!(&removed_constraint[failure.condition.start as usize..failure.condition.end as usize], condition);
+                let edge = BigInt::from(63);
+                for axis in 0..3 {
+                    assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&edge, &edge)]));
+                }
+            }
+            let fatal_narrow = narrowed_caller.replace("core.narrow(second_value >= 64", "core.narrow(second_value >= 128");
+            let report = run(&fatal_narrow, pass_through, increment, exact_alias, package).unwrap();
+            let [failed] = report.directives.as_slice() else { panic!("only selected contradictory narrowing reports"); };
+            assert_eq!(failed.operation, ScalarCheckerOperation::Narrow);
+            assert_eq!(failed.code(), &BigInt::from(82));
+            assert_eq!(&fatal_narrow[failed.condition.start as usize..failed.condition.end as usize], "second_value >= 128");
+            let dormant = run(&fatal_narrow, pass_through, increment, exact_alias, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant.active && dormant.directives.is_empty());
             let branched_provider = pass_through.replace("second.shift(input); forwarded",
                 "second.shift(input); if (input <= 127) { forwarded } else { input }");
             let passed = run(symbolic, &branched_provider, increment, exact_alias, package).unwrap();
