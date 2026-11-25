@@ -12901,7 +12901,7 @@ u64(u64) observed = fn(count) {
 if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
 %%end";
     let mixed = text.replace("u64 result =?",
-        "u8[count] prior; core.array_len(&prior); u64 ordinary = _middle(count) + 1; ordinary; u64 result =?");
+        "u8[count] prior; core.array_len(&prior); _middle(count); u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (closed, text) in [(true, text), (false, mixed.as_str())] {
             let prepared = prepare_initializer_test(text, layout);
@@ -13104,10 +13104,9 @@ u64(u64) guarded = fn(count) {
 if (ordinary(7) != 7 || ordinary(0) != 0 || guarded(9) != 0 || guarded(0) != 1) { core.system_panic(); };
 ordinary(13);
 %%end";
-    let preceding_owner = text.replace("u64 result = _relay(count);",
-        "u8[count] prior; core.array_len(&prior); u64 result = _relay(count);");
+    let unsupported_use = text.replace("u64 result = _relay(count); result", "_relay(count)");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let refused = prepare_initializer_test(&preceding_owner, layout);
+        let refused = prepare_initializer_test(&unsupported_use, layout);
         let refused = analyze_scalar_build(&refused);
         assert!(refused.diagnostics().is_empty(), "{:?}", refused.diagnostics());
         for output in [emit_scalar_build_single_module_llvm(&refused), emit_scalar_build_project_llvm(&refused)] {
@@ -13619,7 +13618,7 @@ if (allocating(7) != 99 || allocating(7) != 99 || allocating(7) != 99 || allocat
 }
 
 #[test]
-fn ordinary_fallible_expression_has_one_cold_panic_and_plain_result() {
+fn ordinary_fallible_expression_keeps_live_owners_on_the_success_path() {
     use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
     let template = "%%start
 u64(u64) _inner = fn(count) { u16[count] scratch; core.array_len(&scratch) };
@@ -13629,8 +13628,9 @@ u64(u64) guarded = fn(count) {
     if (&result == null) { 99 } else { result }
 };
 u64(bool, u64) ordinary = fn(select, count) {
+    u8[count] prior;
     u64 result = if (select) { _outer(_inner(count)) ^ 0 } else { 0 };
-    result
+    core.array_len(&prior) ^ result ^ count
 };
 if (guarded(0) != 0 || ordinary(false, 7) != 0 || ordinary(true, 0) != 0
     || ordinary(true, 7) != 7 || ordinary(true, COUNT) != 0) { core.system_panic(); };
@@ -13658,12 +13658,18 @@ if (guarded(0) != 0 || ordinary(false, 7) != 0 || ordinary(true, 0) != 0
                     block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
                     .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
                         .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
-                let [panic] = calls_to(module.get_function("__wosy_core_system_panic").unwrap())[..] else { panic!("{llvm}") };
+                let panics = calls_to(module.get_function("__wosy_core_system_panic").unwrap());
+                assert_eq!(panics.len(), 2);
+                let [panic] = panics.into_iter().filter(|call|
+                    call.get_parent().unwrap().get_name().to_bytes() == b"ordinary.allocation_absent")
+                    .collect::<Vec<_>>()[..] else { panic!("{llvm}") };
                 let failure = panic.get_parent().unwrap();
                 assert_eq!(failure.get_first_instruction(), Some(panic));
                 assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
-                assert!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).is_empty());
-                assert!(calls_to(module.get_function("__wosy_core_free").unwrap()).is_empty());
+                let [prior] = calls_to(module.get_function("__wosy_core_alloc").unwrap())[..] else { panic!("{llvm}") };
+                let [release] = calls_to(module.get_function("__wosy_core_free").unwrap())[..] else { panic!("{llvm}") };
+                assert_eq!(known_field_operand(release, 0).unwrap().as_instruction_value(), Some(prior));
+                assert_ne!(release.get_parent(), Some(failure));
                 let [inner] = calls_to(authored("_inner"))[..] else { panic!("{llvm}") };
                 let [outer] = calls_to(authored("_outer"))[..] else { panic!("{llvm}") };
                 for instruction in [inner, outer] {
@@ -13672,7 +13678,7 @@ if (guarded(0) != 0 || ordinary(false, 7) != 0 || ordinary(true, 0) != 0
                 }
                 assert!(inner.get_parent().unwrap().get_terminator().unwrap().get_operands()
                     .any(|operand| operand.and_then(|operand| operand.block()) == outer.get_parent()));
-                if let Some(out) = std::env::var_os("WOSY_ORDINARY_FALLIBLE_EXPRESSION_IR_DIR") {
+                if let Some(out) = std::env::var_os("WOSY_ORDINARY_LIVE_OWNER_IR_DIR") {
                     let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                     let route = if project { "project" } else { "standalone" };
                     let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);

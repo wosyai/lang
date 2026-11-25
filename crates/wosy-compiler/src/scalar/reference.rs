@@ -4972,6 +4972,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             scope,
             BTreeSet::new(),
         );
+        let ordinary_root_eligible = scope == ReferenceScopeId(0) && ordinal == calls.structure.root
+            && !block.unsafe_context && self.generic_parameters.is_empty()
+            && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
+            && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
         let mut declares_fallible = false;
         let mut declared = Vec::new();
         let mut result = ReferenceBlockResult::default();
@@ -5059,19 +5063,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         Some((source.declaration_span, count))
                     })();
                     let before = self.cursor;
-                    let ordinary_prologue = scope == ReferenceScopeId(0) && position.block == calls.structure.root
-                        && position.item == 0
+                    // SystemPanic terminates execution, not the current
+                    // lexical scope via an unwind. Existing local owners
+                    // retain their normal lexical release on success.
+                    let ordinary_root_binding = ordinary_root_eligible
+                        && binding.fallible_assignment.is_none() && !binding.is_allocation
+                        && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
+                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+                        && matches!(primary, ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                         && calls.structure.edges.get(&(
                             OccurrenceParent::Block(calls.structure.root),
-                            OccurrenceEdge::BindingRoot { item: 0, output: 0 },
-                        )) == Some(&OccurrenceNode::Expression(primary_ordinal))
-                        && !block.unsafe_context && !binding.is_allocation
-                        && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
-                        && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
-                        && self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
-                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression;
-                    let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_prologue)
+                            OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
+                        )) == Some(&OccurrenceNode::Expression(primary_ordinal));
+                    let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
                                 if arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
@@ -5130,7 +5135,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let (None, ScalarExpression::Call { arguments, type_arguments, .. }, Some(point)) =
                         (binding.fallible_assignment, primary, call_producer)
                     {
-                        if ordinary_prologue
+                        if ordinary_root_binding
                             && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
                             && matches!(arguments.as_slice(), [argument]
                                 if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
