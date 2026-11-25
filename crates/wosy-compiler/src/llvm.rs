@@ -354,6 +354,23 @@ fn runtime_allocation_access(
             CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
                 for place in candidates { record_index(&mut indexed, place); }
             }
+            CfgPointKind::ReadPlace { place: crate::ScalarPlace::Index { base, .. },
+                pointer_point: Some(pointer), .. } if checked_access =>
+            {
+                if let Some((_, creation)) = crate::scalar::immediate_shared_array_place(base) {
+                    if let Some(CfgPointKind::Borrow { place, loan }) =
+                        reference_cfg.points.get(pointer.0).map(|point| &point.kind)
+                    {
+                        if loan.parent.is_none() && loan.creation_span == creation
+                            && loan.mode == crate::scalar::ScalarReferenceMutability::Shared
+                            && place.projections.is_empty()
+                            && reference_cfg.allocations.contains(&place.binding)
+                        {
+                            indexed.insert(key(place.declaration_span));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

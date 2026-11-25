@@ -3724,12 +3724,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } else {
             None
         };
-        if !matches!(place, ScalarPlace::Dereference { .. })
-            && matches!(pointer_type, Some(ScalarType::CheckedReference { inner, .. })
-                if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. }))
+        if let (ScalarPlace::Index { base, .. }, Some(ScalarType::CheckedReference { inner, .. })) =
+            (place, pointer_type)
         {
-            return Err(self.missing_context(span,
-                ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+            if let ScalarType::RuntimeArray { element, .. } = inner.as_ref() {
+                let local = if let (true, Some(root), Some((addressed, _))) =
+                    (prepared, canonical_root.as_ref(), super::immediate_shared_array_place(base))
+                {
+                    let pointer = self.expression_ordinal(OccurrenceParent::Place(root.ordinal),
+                        OccurrenceEdge::DereferencePointer);
+                    let addressed_place = self.place_ordinal(OccurrenceParent::Expression(pointer),
+                        OccurrenceEdge::ExpressionPlace);
+                    let ScalarPlace::Name { span, .. } = addressed else { unreachable!() };
+                    matches!(self.prepared_place_root(addressed_place, *span)?,
+                        Some(PreparedPlaceRoot::Lexical(owner)) if self.cfg.allocations.contains(owner)
+                            && self.binding_types.get(owner) == Some(inner.as_ref()))
+                } else { false };
+                if !local || !aggregate::ordinary_value(element) {
+                    return Err(self.missing_context(span,
+                        ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+                }
+            }
         }
         let checked_pointee = matches!(pointer_type, Some(ScalarType::CheckedReference { .. }));
         let reads_checked_aggregate = matches!(pointer_type,

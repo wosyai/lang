@@ -16695,3 +16695,62 @@ if (invoke(0) != 7 || invoke(2) != 9 || immediate(1) != 8 || invoke_field(2) != 
         }
     }
 }
+
+#[test]
+fn immediate_runtime_array_index_uses_original_checked_backing_and_count() {
+    let text = "%%start
+u64(u64) select = fn(index) { index };
+u16(u64,u64) observe = fn(length, index) {
+    u16[length] values;
+    (*(&values))[select(index)]
+};
+if (observe(3, 1) != 37) { core.system_panic(); };
+%%end";
+    for (layout, cap) in [
+        (ScalarTargetLayout::NATIVE64, (i64::MAX as u64) / 2),
+        (ScalarTargetLayout::WASM32, (i32::MAX as u64) / 2),
+    ] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, "observe"));
+        let length = length_loaded_for_runtime_array(body);
+        let helper_source = prepared.checked_access_source().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(helper_source, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(helper_source, "check_index_in_extent"));
+        let select = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let guard = format!("icmp ugt i64 {length}, {cap}");
+        let alloc = "call ptr @__wosy_core_alloc";
+        let free = "call void @__wosy_core_free";
+        let inputs = [
+            guard.as_str(), alloc, &non_null, "inttoptr", &select, &bounds,
+            "getelementptr inbounds i16", "load i16, ptr", free,
+        ];
+        let order = inputs.map(|needle| {
+            assert_eq!(body.matches(needle).count(), 1, "{needle}: {body}");
+            body.find(needle).unwrap()
+        });
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{body}");
+        assert!(body[order[5]..].lines().next().unwrap().ends_with(&format!(", i64 {length})")), "{body}");
+        let narrowing = body.find("trunc i64");
+        if layout == ScalarTargetLayout::WASM32 {
+            assert!(narrowing.is_some_and(|narrow| order[5] < narrow && narrow < order[6]), "{body}");
+        } else {
+            assert!(narrowing.is_none(), "{body}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_IMMEDIATE_RUNTIME_INDEX_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

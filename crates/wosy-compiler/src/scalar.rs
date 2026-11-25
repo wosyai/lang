@@ -985,6 +985,16 @@ pub enum ScalarPlace {
     },
 }
 
+// Shape only; callers must authenticate the prepared borrow and backing.
+pub(crate) fn immediate_shared_array_place(place: &ScalarPlace) -> Option<(&ScalarPlace, ByteSpan)> {
+    let ScalarPlace::Dereference { pointer, .. } = place else { return None; };
+    match pointer.as_ref() {
+        ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
+            place: source @ ScalarPlace::Name { .. }, span } => Some((source, *span)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarPlaceIdentity {
     Name(String),

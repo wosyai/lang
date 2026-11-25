@@ -389,12 +389,28 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            if matches!(base_type, ScalarType::RuntimeArray { .. })
-                && matches!(base.as_ref(), crate::ScalarPlace::Dereference { .. })
-                && !fixed_index_has_raw_root(state, base)
-            {
-                return Err("checked runtime array indexing lacks a paired referent extent".into());
-            }
+            let immediate_extent = match (&base_type, base.as_ref()) {
+                (ScalarType::RuntimeArray { element, .. }, crate::ScalarPlace::Dereference { .. })
+                    if !fixed_index_has_raw_root(state, base) =>
+                {
+                    let Some((source @ crate::ScalarPlace::Name { name, .. }, _)) =
+                        crate::scalar::immediate_shared_array_place(base)
+                    else { return Err("checked runtime array indexing lacks a paired referent extent".into()); };
+                    let (backing, owner_type) = state.storage.get(name)
+                        .ok_or("missing immediate checked runtime backing")?;
+                    if owner_type != &base_type
+                        || state.runtime_array_allocations.get(name) != Some(&true)
+                        || !matches!(state.local_runtime_extents.get(backing),
+                            Some((_, LocalRuntimeExtent::Construction { .. }, true)))
+                        || signed_runtime_scalar_element(element).is_none()
+                    {
+                        return Err("immediate runtime borrow lacks a direct checked construction".into());
+                    }
+                    Some(capture_local_runtime_extent(context, state, source, *backing, true)?
+                        .ok_or("immediate runtime borrow lacks its original extent")?)
+                }
+                _ => None,
+            };
             // A guarded lexical array stores its original backing directly,
             // not an ordinary runtime-array pointer slot. Authenticate and
             // retain that backing and extent before evaluating the selector.
@@ -416,7 +432,9 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let fallback = guarded_extent.map(|_| (
                 "guarded_index_out_of_bounds", "guarded_index_panic", "guarded_index_continue",
             ));
-            let runtime_extent = if guarded_extent.is_none()
+            let runtime_extent = if immediate_extent.is_some() {
+                immediate_extent
+            } else if guarded_extent.is_none()
                 && (state.require_release_checked_access || !state.local_runtime_extents.is_empty())
                 && matches!(&base_type, ScalarType::RuntimeArray { .. })
             {
@@ -488,7 +506,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     }
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
-                let index = if guarded_extent.is_some() || checked_lexical_descriptor {
+                let index = if guarded_extent.is_some() || checked_lexical_descriptor || immediate_extent.is_some() {
                     array_address_index(context, state, index)?
                 } else { index };
                 return unsafe {
