@@ -424,7 +424,43 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 && state.local_runtime_extents.get(&base_pointer)
                     .is_some_and(|(_, extent, _)| matches!(extent,
                         LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral { .. }));
+            let runtime_offset = matches!(base_type, ScalarType::RuntimeArray { .. }).then(||
+                state.aggregate.as_ref().and_then(|aggregate| aggregate.plan().replacement_index_observation.as_ref())
+            ).flatten();
+            if let Some(receipt) = runtime_offset {
+                let ScalarType::RuntimeArray { element, .. } = &base_type else { unreachable!("runtime offset type") };
+                let crate::ScalarPlace::Name { name, .. } = base.as_ref() else {
+                    return Err("signed element offset lacks its prepared owner".into());
+                };
+                let nodes = state.body_call_nodes.ok_or("signed element offset lacks prepared occurrences")?;
+                let (slot, _) = state.storage.get(name).ok_or("signed element offset lacks its backing slot")?;
+                let Some((owner, LocalRuntimeExtent::ManagedLengthSlot(length_slot), true)) =
+                    state.local_runtime_extents.get(slot) else {
+                    return Err("signed element offset lacks its paired extent slot".into());
+                };
+                let is_loaded_from = |value: BasicValueEnum<'ctx>, slot: PointerValue<'ctx>| {
+                    value.as_instruction_value().is_some_and(|instruction|
+                        instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
+                            && instruction.get_operand(0).and_then(|operand| operand.value()) == Some(slot.into()))
+                };
+                if nodes.place_ordinal(place) != Some(receipt.place)
+                    || nodes.expression_ordinal(index) != Some(receipt.selector)
+                    || nodes.lexical_place_declaration(base) != Some(receipt.owner)
+                    || *owner != receipt.owner || receipt.target != state.target_layout
+                    || &receipt.element != element.as_ref()
+                    || !is_loaded_from(base_pointer.into(), *slot)
+                    || !runtime_extent.is_some_and(|length| is_loaded_from(length.into(), *length_slot))
+                {
+                    return Err("signed element offset differs from its checked selector or current owner pair".into());
+                }
+            }
+            let signed_selector_maximum = runtime_offset.map(|receipt| receipt.upper_bound);
             let index = emit_place_index(context, state, index, project)?;
+            if signed_selector_maximum.zip(index.get_zero_extended_constant())
+                .is_some_and(|(maximum, index)| index > maximum)
+            {
+                return Err("constant index exceeds its signed element offset receipt".into());
+            }
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = guarded_extent {
                     check_array_extent(context, state, index, extent, fallback)?;
@@ -444,8 +480,6 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     } else {
                         check_release_index(state, index, extent)?;
                     }
-                } else if super::aggregate_transfer::requires_returned_array_index(state) {
-                    return Err("sealed returned array index lost its paired extent".into());
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 let index = if guarded_extent.is_some() || checked_lexical_descriptor {

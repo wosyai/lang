@@ -681,7 +681,20 @@ pub(super) struct ReturnedArrayIndex {
     pub(super) first: CfgPointId,
     pub(super) read: CfgPointId,
     pub(super) output: OccurrenceOrdinal,
+    pub(super) place: OccurrenceOrdinal,
+    pub(super) selector: OccurrenceOrdinal,
+    pub(super) owner: ByteSpan,
     pub(super) upper_bound: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignedElementOffset {
+    pub(crate) place: usize,
+    pub(crate) selector: usize,
+    pub(crate) owner: ByteSpan,
+    pub(crate) upper_bound: u64,
+    pub(crate) target: ScalarTargetLayout,
+    pub(crate) element: ScalarType,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -3094,7 +3107,7 @@ pub(crate) struct ClosedBody {
     pub(crate) widened_owning_receives: BTreeMap<usize, (ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(crate) widened_owning_roundtrip: Option<(usize, CfgPointId, ByteSpan)>,
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
-    pub(crate) replacement_index_observation: Option<usize>,
+    pub(crate) replacement_index_observation: Option<SignedElementOffset>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     pub(crate) ordinary_array_descriptor_receivers: BTreeMap<usize, ByteSpan>,
     pub(crate) ordinary_array_descriptor_replacements: BTreeSet<usize>,
@@ -8005,17 +8018,18 @@ fn closed_aggregates<'a>(
         }
         for &(key, body, index) in &returned_index_requirements {
             let source = body.source;
-            let representable_offset = (|| {
-                let ty = body.sites.structure.checked_types.expressions.get(&index.output)?;
-                Some(returned_array_index_fits_offset(index.upper_bound, ty, reservations.target_layout?))
-            })();
-            if representable_offset != Some(true) {
-                return Err(format!("returned array index byte offset is not representable in {source:?}"));
-            }
+            let receipt = (|| {
+                let element = body.sites.structure.checked_types.expressions.get(&index.output)?;
+                let target = reservations.target_layout?;
+                returned_array_index_fits_offset(index.upper_bound, element, target).then(|| SignedElementOffset {
+                    place: index.place.0, selector: index.selector.0, owner: index.owner,
+                    upper_bound: index.upper_bound, target, element: element.clone(),
+                })
+            })().ok_or_else(|| format!("returned array index byte offset is not representable in {source:?}"))?;
             let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
                 matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { unit: None, .. })))
             else { return Err(format!("returned array index requires an exact replacement in {source:?}")); };
-            plan.replacement_index_observation = Some(index.output.0);
+            plan.replacement_index_observation = Some(receipt);
         }
         ordinary.seal_array_descriptors(&mut result);
         for &(key, source, output) in &widened_return_requirements {

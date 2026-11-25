@@ -11371,6 +11371,20 @@ if (replace(7)");
                 continue;
             }
             let llvm = result.unwrap().to_text();
+            let mut reservations = crate::scalar::AggregateReservations {
+                checked_access: true, target_layout: Some(layout), ..Default::default()
+            };
+            for (module, declaration) in prepared.project().modules.iter().enumerate() {
+                reservations.modules.push(module);
+                reservations.bodies.extend(declaration.items.iter().enumerate().filter_map(|(item, declaration)|
+                    matches!(declaration, ScalarItem::Function(_)).then_some(((module, item, None), true))));
+            }
+            let plans = checked.aggregate(&reservations).unwrap();
+            let replace = prepared.project().modules[0].items.iter().position(|item|
+                matches!(item, ScalarItem::Function(function) if function.name == "replace")).unwrap();
+            let receipt = plans.body(0, replace, None).unwrap().replacement_index_observation.as_ref().unwrap();
+            assert_eq!((receipt.target, &receipt.element, receipt.upper_bound), (layout, &ScalarType::U8, 3));
+            assert_eq!(receipt.owner.start as usize, text.find("u8[2] bytes").unwrap() + "u8[2] ".len());
             let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, "replace"));
             let extent = body.find("%runtime_extent = load i64, ptr %bytes_length").expect("paired extent");
             let transported = body.find("store i64 %array_descriptor_extent, ptr %bytes_length").expect("transported extent");

@@ -4989,6 +4989,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if !matches!(base.as_ref(), ScalarPlace::Name { .. }) {
             return None;
         }
+        let place = self.place_ordinal(OccurrenceParent::Expression(output), OccurrenceEdge::ExpressionPlace);
+        let selector = self.expression_ordinal(OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex);
+        let CfgPointKind::ReadPlace { candidates, .. } = &self.cfg.points.get(read.0)?.kind else { return None; };
+        let [owner] = candidates.as_slice() else { return None; };
         let (first, upper_bound) = match index.as_ref() {
             ScalarExpression::Integer { value, .. } => {
                 let first = CfgPointId(read.0.checked_sub(1)?);
@@ -5001,8 +5005,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } => {
                 use OccurrenceEdge::*;
-                let place = self.place_ordinal(OccurrenceParent::Expression(output), ExpressionPlace);
-                let selector = self.expression_ordinal(OccurrenceParent::Place(place), PlaceIndex);
                 let mask = match (left.as_ref(), right.as_ref()) {
                     (ScalarExpression::Integer { value, .. }, _)
                     | (_, ScalarExpression::Integer { value, .. }) => u64::try_from(value.clone()).ok()?,
@@ -5053,7 +5055,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             _ => return None,
         };
-        Some(aggregate::ReturnedArrayIndex { first, read, output, upper_bound })
+        Some(aggregate::ReturnedArrayIndex { first, read, output, place, selector, owner: owner.declaration_span, upper_bound })
     }
 
     fn observe_literal_array_bind(
