@@ -1930,7 +1930,7 @@ fn emit_value_field<'ctx, 'module>(
         .ok_or_else(|| "missing checked value field identity".to_owned())?;
     let ty = nodes.checked_expression_type(expression)
         .ok_or_else(|| "missing checked value field type".to_owned())?;
-    let base = aggregate_transfer::emit_value_field_receiver(context, state, receiver, project)?;
+    let base = aggregate_transfer::emit_value_field_receiver(context, state, receiver, &field.structure, project)?;
     let pointer = resolved_field_pointer(context, state, base, field)?;
     load_place_value(context, state, pointer, ty)
 }
@@ -2232,7 +2232,23 @@ fn emit_call_values<'ctx, 'module>(
         Some(ScalarType::Callable { outputs, .. }) => outputs,
         _ => return Err(format!("unknown LLVM callable signature {name}")),
     };
-    ordinary_call_result(call.try_as_basic_value(), outputs)
+    let returned = call.try_as_basic_value();
+    if let Some(BasicTypeEnum::ArrayType(expected)) = function.get_type().get_return_type() {
+        let (ValueKind::Basic(BasicValueEnum::ArrayValue(bytes)), [output]) =
+            (returned, outputs.outputs.as_slice()) else {
+                return Err("fixed copy callable result has an invalid ABI".into());
+            };
+        let storage = storage_type(context, &output.ty, state.layouts, state.target_layout)?;
+        if !owner_outputs.is_empty() || !matches!(output.ty, ScalarType::Struct(_)) || bytes.get_type() != expected
+            || storage != BasicTypeEnum::ArrayType(expected)
+        {
+            return Err("inline callable result does not match its declared struct layout".into());
+        }
+        let slot = entry_storage_alloca(context, state, &output.ty, "inline_result_storage")?;
+        state.builder.build_store(slot, bytes).map_err(builder_error)?;
+        return Ok(EmitValue::Basic(slot.into()));
+    }
+    ordinary_call_result(returned, outputs)
 }
 
 pub(super) fn stage_checked_return_sidecars<'ctx>(
