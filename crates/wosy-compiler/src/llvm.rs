@@ -2304,7 +2304,7 @@ fn store_binding_outputs<'ctx, 'module>(
             None => take_basic(emit_typed_expression(context, state, length, &ScalarType::U64)?)?
                 .into_int_value(),
         };
-        return store_runtime_allocation(context, state, binding, receiver, element, length, false, |_, _| Ok(()));
+        return store_runtime_allocation(context, state, binding, receiver, element, length, RuntimeArrayConstructionKind::Ordinary, |_, _| Ok(()));
     }
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
@@ -2460,6 +2460,13 @@ fn store_widened_move<'ctx>(
     Ok(true)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RuntimeArrayConstructionKind {
+    Ordinary,
+    Widened,
+    Generated,
+}
+
 fn store_runtime_allocation<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2467,9 +2474,11 @@ fn store_runtime_allocation<'ctx, 'module>(
     receiver: &crate::ScalarOutputReceiver,
     element: &ScalarType,
     length: inkwell::values::IntValue<'ctx>,
-    widened: bool,
+    construction: RuntimeArrayConstructionKind,
     initialize: impl FnOnce(&mut EmitState<'ctx, 'module>, PointerValue<'ctx>) -> Result<(), String>,
 ) -> Result<(), String> {
+    let widened = construction == RuntimeArrayConstructionKind::Widened;
+    let generated = construction == RuntimeArrayConstructionKind::Generated;
     let declaration = (receiver.name_span.start, receiver.name_span.end);
     let mutable = state.mutable_runtime_allocations.contains(&declaration);
     if widened && mutable {
@@ -2477,7 +2486,11 @@ fn store_runtime_allocation<'ctx, 'module>(
     }
     let private_literal = aggregate_transfer::has_literal_array_plan(state);
     let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
-    let checked_extent = widened || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+    if generated && (!prepared || mutable || private_literal || state.aggregate.as_ref().is_some_and(|aggregate|
+        aggregate.plan().guarded_array_descriptor_leaf || aggregate.plan().fallible_allocation_leaf
+            || !aggregate.plan().fallible_relay_allocations.is_empty()))
+    { return Err("generated array requires its ordinary direct owning backing".into()); }
+    let checked_extent = widened || generated || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
         || (prepared && state.require_release_checked_access && state.indexed_runtime_allocations.contains(&declaration));
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
         .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
@@ -2497,7 +2510,7 @@ fn store_runtime_allocation<'ctx, 'module>(
         Some((_, _, Some(unwind))) => Some(unwind),
         Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
     };
-    let portable = (prepared && checked_extent && !widened && !mutable && relay_unwind.is_none()
+    let portable = (prepared && checked_extent && !widened && !generated && !mutable && relay_unwind.is_none()
         && state.portable_runtime_allocations.contains(&declaration)
         && state.aggregate.as_ref().is_none_or(|aggregate| portable_runtime_plan_allows_plain_storage(aggregate.plan()))).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
     let allocation = ownership::emit_runtime_array_allocation_with_absence(
@@ -2601,6 +2614,29 @@ fn store_runtime_allocation<'ctx, 'module>(
     Ok(())
 }
 
+fn store_generated_runtime_array<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &crate::ScalarBinding,
+    project: ProjectCallScope<'_>,
+) -> Result<bool, String> {
+    if !crate::scalar::generated_runtime_scalar_binding(binding) { return Ok(false); }
+    let [receiver] = binding.receivers.as_slice() else { unreachable!(); };
+    let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+        return Err("generated runtime array changed its prepared receiver".into());
+    };
+    let ScalarExpression::GeneratedArray { count, .. } = &binding.value else { unreachable!(); };
+    // Resolve the once-evaluated, noncapturing factory identity first. Then
+    // evaluate the ordinary count exactly once before allocating any backing.
+    let callee = memory::prepared_generated_scalar_factory(context, state, binding, element)?;
+    let length = take_basic(emit_project_typed_expression(
+        context, state, count, &ScalarType::U64, project.module, project.modules,
+    )?)?.into_int_value();
+    store_runtime_allocation(context, state, binding, receiver, element, length,
+        RuntimeArrayConstructionKind::Generated, |state, backing| {
+            memory::emit_generated_runtime_elements(context, state, callee, length, element, backing)
+        })?;
+    Ok(true)
+}
+
 fn store_widened_local_array<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2624,7 +2660,7 @@ fn store_widened_local_array<'ctx, 'module>(
             .ok_or("widened Copy backing must be fixed")?;
         if actual != count { return Err("fixed Copy widening changed its exact extent".into()); }
         let count = context.i64_type().const_int(count, false);
-        store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing|
+        store_runtime_allocation(context, state, binding, receiver, element, count, RuntimeArrayConstructionKind::Widened, |state, backing|
             memory::copy_fixed_aggregate(context, state, backing, source, &fixed_ty))?;
         return Ok(true);
     }
@@ -2644,7 +2680,7 @@ fn store_widened_local_array<'ctx, 'module>(
             Some(project) => ExpressionPath::Project { module: project.module, modules: project.modules },
             None => ExpressionPath::Single,
         })?;
-    store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing| {
+    store_runtime_allocation(context, state, binding, receiver, element, count, RuntimeArrayConstructionKind::Widened, |state, backing| {
         let item = storage_type(context, element, state.layouts, state.target_layout)?;
         for (position, expression) in values.iter().enumerate() {
             let value = if let Some(staged) = staged.as_mut() {
@@ -4109,7 +4145,8 @@ fn emit_project_block_at<'ctx, 'module>(
             }
             ScalarBlockItem::LocalBinding(binding) => {
                 if ownership::move_guarded_runtime_owner(context, state, binding)?
-                    || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                    || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))?
+                    || store_generated_runtime_array(context, state, binding, ProjectCallScope { module, modules })? {
                     continue;
                 }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
@@ -5932,7 +5969,8 @@ fn emit_project_block_item<'ctx, 'module>(
                 return Ok(EmitValue::Unit);
             }
             if ownership::move_guarded_runtime_owner(context, state, binding)?
-                || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))?
+                    || store_generated_runtime_array(context, state, binding, ProjectCallScope { module, modules })? {
                 return Ok(EmitValue::Unit);
             }
             if binding.is_allocation {

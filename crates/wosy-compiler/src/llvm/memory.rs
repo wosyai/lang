@@ -1337,19 +1337,17 @@ pub(super) fn write_struct_literal<'ctx, 'module>(
 }
 
 /// A closed scalar factory has no environment or checked-owner sidecar.
-pub(super) fn emit_generated_fixed_scalar_array<'ctx, 'module>(
-    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &crate::ScalarBinding,
-) -> Result<EmitValue<'ctx>, String> {
+pub(super) fn prepared_generated_scalar_factory<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>, binding: &crate::ScalarBinding,
+    element: &ScalarType,
+) -> Result<FunctionValue<'ctx>, String> {
     let ScalarExpression::GeneratedArray { factory, count, .. } = &binding.value
         else { return Err("missing generated array expression".into()); };
-    let ScalarType::Array { element, length, .. } = &binding.declared_type
-        else { return Err("generated array requires fixed storage".into()); };
     let nodes = state.body_call_nodes.ok_or("generated array requires a prepared lexical owner")?;
     if !state.prepared_render || nodes.binding_position(binding).is_none()
         || binding.receivers.len() != 1 || binding.fallible_assignment.is_some() || binding.is_allocation
         || nodes.checked_expression_type(&binding.value) != Some(&binding.declared_type)
         || nodes.checked_expression_type(count) != Some(&ScalarType::U64)
-        || !matches!(count.as_ref(), ScalarExpression::Integer { value, .. } if u64::try_from(value).ok() == Some(*length))
     {
         return Err("generated array changed its prepared owner or extent".into());
     }
@@ -1359,7 +1357,7 @@ pub(super) fn emit_generated_fixed_scalar_array<'ctx, 'module>(
     if nodes.checked_expression_type(factory) != Some(signature)
         || !matches!(signature, ScalarType::Callable { parameters, outputs }
             if parameters.as_slice() == [ScalarType::U64]
-                && matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty, .. }] if ty == element.as_ref()))
+                && matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty, .. }] if ty == element))
         || state.dynamic_owner_outputs.get(name).is_some_and(|outputs| !outputs.is_empty())
     {
         return Err("generated array factory changed its prepared scalar ABI".into());
@@ -1368,6 +1366,20 @@ pub(super) fn emit_generated_fixed_scalar_array<'ctx, 'module>(
     if callee.get_type() != function_type(context, signature, state.target_layout)? {
         return Err("generated array factory changed its LLVM ABI".into());
     }
+    Ok(callee)
+}
+
+pub(super) fn emit_generated_fixed_scalar_array<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &crate::ScalarBinding,
+) -> Result<EmitValue<'ctx>, String> {
+    let ScalarExpression::GeneratedArray { count, .. } = &binding.value
+        else { return Err("missing generated array expression".into()); };
+    let ScalarType::Array { element, length, .. } = &binding.declared_type
+        else { return Err("generated array requires fixed storage".into()); };
+    if !matches!(count.as_ref(), ScalarExpression::Integer { value, .. } if u64::try_from(value).ok() == Some(*length)) {
+        return Err("generated array changed its prepared fixed extent".into());
+    }
+    let callee = prepared_generated_scalar_factory(context, state, binding, element)?;
     let (bytes, _) = allocation_layout(&binding.declared_type, state.layouts, state.target_layout)?;
     check_fixed_address_domain(state.target_layout, bytes)?;
     let (storage, alignment) = storage_type_and_alignment(
@@ -1378,28 +1390,59 @@ pub(super) fn emit_generated_fixed_scalar_array<'ctx, 'module>(
     if *length == 0 {
         return Ok(EmitValue::Basic(destination.into()));
     }
+    let count = context.i64_type().const_int(*length, false);
+    emit_generated_scalar_elements(context, state, callee, count, element,
+        |state, index| fixed_array_storage_element_pointer(context, state, storage, destination, index))?;
+    Ok(EmitValue::Basic(destination.into()))
+}
+
+pub(super) fn emit_generated_scalar_elements<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, callee: FunctionValue<'ctx>,
+    count: inkwell::values::IntValue<'ctx>, element: &ScalarType,
+    mut element_slot: impl FnMut(&mut EmitState<'ctx, 'module>, inkwell::values::IntValue<'ctx>) -> Result<PointerValue<'ctx>, String>,
+) -> Result<(), String> {
     let entry = state.builder.get_insert_block().ok_or("missing generated array preheader")?;
     let parent = entry.get_parent().ok_or("missing generated array function")?;
     let body = context.append_basic_block(parent, "generated_array.body");
     let done = context.append_basic_block(parent, "generated_array.done");
-    state.builder.build_unconditional_branch(body).map_err(builder_error)?;
+    if count.get_zero_extended_constant().is_some_and(|count| count != 0) {
+        state.builder.build_unconditional_branch(body).map_err(builder_error)?;
+    } else {
+        let nonempty = state.builder.build_int_compare(IntPredicate::NE, count,
+            context.i64_type().const_zero(), "factory_nonempty").map_err(builder_error)?;
+        state.builder.build_conditional_branch(nonempty, body, done).map_err(builder_error)?;
+    }
     state.builder.position_at_end(body);
     let index = state.builder.build_phi(context.i64_type(), "factory_index").map_err(builder_error)?;
     index.add_incoming(&[(&context.i64_type().const_zero(), entry)]);
     let current = index.as_basic_value().into_int_value();
     let result = state.builder.build_call(callee, &[current.into()], "generated_value").map_err(builder_error)?
         .try_as_basic_value().basic().ok_or("generated scalar factory returned no value")?;
-    let slot = fixed_array_storage_element_pointer(context, state, storage, destination, current)?;
+    let slot = element_slot(state, current)?;
     store_value(context, state, slot, element, EmitValue::Basic(result))?;
     let next = state.builder.build_int_add(current, context.i64_type().const_int(1, false), "factory_next")
         .map_err(builder_error)?;
     let more = state.builder.build_int_compare(IntPredicate::ULT, next,
-        context.i64_type().const_int(*length, false), "factory_more").map_err(builder_error)?;
+        count, "factory_more").map_err(builder_error)?;
     let latch = state.builder.get_insert_block().ok_or("missing generated array latch")?;
     index.add_incoming(&[(&next, latch)]);
     state.builder.build_conditional_branch(more, body, done).map_err(builder_error)?;
     state.builder.position_at_end(done);
-    Ok(EmitValue::Basic(destination.into()))
+    Ok(())
+}
+
+pub(super) fn emit_generated_runtime_elements<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, callee: FunctionValue<'ctx>,
+    count: inkwell::values::IntValue<'ctx>, element: &ScalarType, backing: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let storage = storage_type(context, element, state.layouts, state.target_layout)?;
+    emit_generated_scalar_elements(context, state, callee, count, element, |state, index| {
+        // The ordinary signed allocator check used this same count before
+        // passing the original backing. Only the induction indexes it here.
+        let index = array_address_index(context, state, index)?;
+        unsafe { state.builder.build_in_bounds_gep(storage, backing, &[index], "generated_array_cell") }
+            .map_err(builder_error)
+    })
 }
 
 pub(super) fn emit_array_literal<'ctx, 'module>(

@@ -6126,7 +6126,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
                     }
-                    if binding.is_allocation || widened {
+                    let runtime_generated = super::generated_runtime_scalar_binding(binding)
+                        && calls.structure.checked_types.expressions.get(&primary_ordinal) == Some(&receiver.ty);
+                    if binding.is_allocation || widened || runtime_generated {
                         self.cfg.allocations.insert(id.clone());
                     }
                     let runtime_literal_length = super::guarded_runtime_literal(binding).and_then(|(_, values, _)| {
@@ -6235,7 +6237,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         { return None; }
                         Some((output.expression, Self::pure_widened_literal_count(binding)?, initializer?))
                     })();
-                    self.record_binding_definition(position, 0, binding.is_allocation || widened_factory.is_some(), initializer);
+                    self.record_binding_definition(position, 0,
+                        binding.is_allocation || widened_factory.is_some() || runtime_generated, initializer);
                     if let Some((output, count, placeholder)) = widened_factory {
                         let bind = self.cursor.expect("widened array definition");
                         self.aggregate_facts.literal_array_bind = Some(aggregate::LiteralArrayBind {

@@ -2365,6 +2365,14 @@ pub struct ScalarBinding {
     pub span: ByteSpan,
 }
 
+pub(crate) fn generated_runtime_scalar_binding(binding: &ScalarBinding) -> bool {
+    !binding.is_allocation && binding.fallible_assignment.is_none() && binding.receivers.len() == 1
+        && matches!(binding.declared_type, ScalarType::RuntimeArray { .. })
+        && matches!(&binding.value, ScalarExpression::GeneratedArray { factory, count, .. }
+            if matches!(factory.as_ref(), ScalarExpression::Name { .. })
+                && matches!(count.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Call { .. }))
+}
+
 pub(crate) enum ScalarBindingOutput<'a> {
     Evaluate(&'a ScalarExpression),
     ProjectPrimary { output: usize },

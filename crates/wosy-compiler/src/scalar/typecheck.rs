@@ -1238,6 +1238,8 @@ pub(super) fn block_item_type_in_module(
                 let expected = match (&binding.declared_type, count.as_ref()) {
                     (ScalarType::Array { element, length, .. }, ScalarExpression::Integer { value, .. })
                         if supported && u64::try_from(value).ok() == Some(*length) => Some(element.as_ref()),
+                    (ScalarType::RuntimeArray { element, .. }, _)
+                        if supported && super::generated_runtime_scalar_binding(binding) => Some(element.as_ref()),
                     _ => None,
                 };
                 let signature = expected.and_then(|element| {
@@ -1258,7 +1260,11 @@ pub(super) fn block_item_type_in_module(
                         "generated fixed array requires a closed matching scalar u64 factory and exact fixed count", *span));
                     ScalarType::Error
                 } else {
-                    inference.record_expression_type(count, &ScalarType::U64, true);
+                    let count_type = expression_type_in_module_expected(
+                        count, Some(&ScalarType::U64), scope, visible_names, folded_names, module, modules,
+                        diagnostics, unsafe_context, overloads, inference,
+                    );
+                    expect_module_type(module, &ScalarType::U64, &count_type, expression_span(count), diagnostics);
                     inference.record_expression_type(&binding.value, &binding.declared_type, true);
                     binding.declared_type.clone()
                 }
@@ -7809,7 +7815,11 @@ impl<'tree> StaticUseAnalyzer<'tree> {
 
     fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
-            ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
+            ScalarExpression::AnonymousCallable { .. } => {}
+            ScalarExpression::GeneratedArray { factory, count, .. } => {
+                self.expression(factory);
+                self.expression(count);
+            }
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
             ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
