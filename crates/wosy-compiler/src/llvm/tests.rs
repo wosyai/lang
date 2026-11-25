@@ -16226,3 +16226,51 @@ if (observed_and(0) != 99 || observed_and(0) != 7 || observed_and(1) != 99
         }
     }
 }
+
+#[test]
+fn checked_runtime_construction_shares_signed_address_domain_with_local_indexing() {
+    let text = "%%start
+u16(u64,u64) observed = fn(length, index) {
+    u16[length] values;
+    values[index] = 37;
+    values[index]
+};
+if (observed(3, 1) != 37) { core.system_panic(); };
+%%end";
+    for (layout, cap) in [
+        (ScalarTargetLayout::NATIVE64, (i64::MAX as u64) / 2),
+        (ScalarTargetLayout::WASM32, (i32::MAX as u64) / 2),
+    ] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, "observed"));
+        let length = length_loaded_for_runtime_array(body);
+        assert_eq!(body.matches("icmp ugt i64").count(), 1, "{body}");
+        assert!(body.contains(&format!("icmp ugt i64 {length}, {cap}")), "{body}");
+        let overflow = body.find("icmp ugt i64").unwrap();
+        let alloc = body.find("call ptr @__wosy_core_alloc").unwrap();
+        assert!(overflow < alloc, "{body}");
+        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+        assert_eq!(body.matches(&format!("call void @{helper}(i64 ")).count(), 2, "{body}");
+        for line in body.lines().filter(|line| line.contains(&format!("call void @{helper}("))) {
+            assert!(line.ends_with(&format!(", i64 {length})")), "{body}");
+        }
+        assert_eq!(body.matches("getelementptr inbounds i16").count(), 2, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        if let Some(out) = std::env::var_os("WOSY_SIGNED_RUNTIME_ADDRESS_DOMAIN_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

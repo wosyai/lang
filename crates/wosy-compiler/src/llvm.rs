@@ -128,7 +128,10 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
 
 #[derive(Clone, Copy)]
 enum LocalRuntimeExtent<'ctx> {
-    Construction(inkwell::values::IntValue<'ctx>),
+    Construction {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
     OrdinaryDescriptor(inkwell::values::IntValue<'ctx>),
     WidenedLiteral(inkwell::values::IntValue<'ctx>),
     OwningFormal(inkwell::values::IntValue<'ctx>),
@@ -2147,15 +2150,16 @@ fn store_runtime_allocation<'ctx, 'module>(
         Some((_, _, Some(unwind))) => Some(unwind),
         Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
     };
-    let slot = ownership::emit_runtime_array_allocation_with_absence(
+    let allocation = ownership::emit_runtime_array_allocation_with_absence(
         context, state, element, length, checked_extent, relay_unwind,
     )?;
+    let slot = allocation.backing;
     initialize(state, slot)?;
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
     if !mutable {
         if tracked_extent {
             let extent = if widened { LocalRuntimeExtent::WidenedLiteral(length) }
-                else { LocalRuntimeExtent::Construction(length) };
+                else { LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed } };
             state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
         }
         state

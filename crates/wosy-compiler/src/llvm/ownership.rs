@@ -1658,6 +1658,13 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
     checked_extent: bool,
 ) -> Result<PointerValue<'ctx>, String> {
     emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, None)
+        .map(|allocation| allocation.backing)
+}
+
+pub(super) struct RuntimeArrayConstruction<'ctx> {
+    pub(super) backing: PointerValue<'ctx>,
+    pub(super) length: inkwell::values::IntValue<'ctx>,
+    pub(super) signed: Option<super::memory::SignedRuntimeAddressDomain>,
 }
 
 pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
@@ -1667,7 +1674,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
     relay_unwind: Option<inkwell::basic_block::BasicBlock<'ctx>>,
-) -> Result<PointerValue<'ctx>, String> {
+) -> Result<RuntimeArrayConstruction<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
     let function = state
@@ -1682,15 +1689,10 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
     // rather than repeating a size/range check at each access.
-    let max_bytes = if checked_extent {
-        match state.target_layout.pointer_size {
-            4 => i32::MAX as u64,
-            8 => i64::MAX as u64,
-            _ => return Err("unsupported runtime-array pointer index width".to_owned()),
-        }
-    } else {
-        u64::MAX
-    };
+    let signed = checked_extent.then(|| super::memory::SignedRuntimeAddressDomain::for_construction(
+        state.target_layout, element,
+    )).transpose()?;
+    let max_bytes = signed.map_or(u64::MAX, |domain| domain.max_bytes());
     let limit = (element_size != 0).then(|| max_bytes / element_size).filter(|&limit|
         limit != u64::MAX && !length.get_zero_extended_constant().is_some_and(|constant| constant <= limit));
     let panic_block = ((!recover && relay_unwind.is_none()) || limit.is_some()).then(|| context.append_basic_block(function, "allocation_panic"));
@@ -1735,7 +1737,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
         state.builder.build_unreachable().map_err(builder_error)?;
     }
     state.builder.position_at_end(continue_block);
-    Ok(allocation)
+    Ok(RuntimeArrayConstruction { backing: allocation, length, signed })
 }
 
 fn relay_failure_block<'ctx>(

@@ -530,6 +530,49 @@ pub(super) fn emit_array_len<'ctx>(
     Ok(EmitValue::Basic(length.into()))
 }
 
+// Evidence produced only on a checked runtime construction's continuation.
+// Neither the region capacity nor a forwarded extent manufactures it.
+#[derive(Clone, Copy)]
+pub(super) struct SignedRuntimeAddressDomain {
+    pointer_bytes: u64,
+    max_bytes: u64,
+    scalar_element: Option<std::mem::Discriminant<ScalarType>>,
+}
+
+fn signed_array_max_bytes(pointer_bytes: u64) -> Option<u64> {
+    match pointer_bytes {
+        4 => Some(i32::MAX as u64),
+        8 => Some(i64::MAX as u64),
+        _ => None,
+    }
+}
+
+// Only these fieldless types have one canonical layout per exact kind,
+// independent of recursive aggregate layout or a declaration's identity.
+fn signed_runtime_scalar_element(ty: &ScalarType) -> Option<std::mem::Discriminant<ScalarType>> {
+    matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16
+        | ScalarType::I32 | ScalarType::I64 | ScalarType::I128 | ScalarType::U8
+        | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        | ScalarType::F32 | ScalarType::F64).then(|| std::mem::discriminant(ty))
+}
+
+impl SignedRuntimeAddressDomain {
+    pub(super) fn for_construction(target: ScalarTargetLayout, element: &ScalarType) -> Result<Self, String> {
+        let pointer_bytes = target.pointer_size;
+        let max_bytes = signed_array_max_bytes(pointer_bytes)
+            .ok_or("unsupported runtime-array pointer index width")?;
+        Ok(Self { pointer_bytes, max_bytes, scalar_element: signed_runtime_scalar_element(element) })
+    }
+
+    pub(super) fn max_bytes(self) -> u64 { self.max_bytes }
+
+    fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
+        // None on both ends leaves the established non-scalar constructor
+        // and index path unchanged; it grants no reusable layout identity.
+        self.pointer_bytes == target.pointer_size && self.scalar_element == signed_runtime_scalar_element(element)
+    }
+}
+
 pub(super) fn capture_local_runtime_extent<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
@@ -538,7 +581,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
     for_index: bool,
 ) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
     let crate::ScalarPlace::Name { name, .. } = base else { return Ok(None) };
-    let Some((storage, ty @ ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
+    let Some((storage, ty @ ScalarType::RuntimeArray { element, .. })) = state.storage.get(name) else {
         return Ok(None);
     };
     if let Some(extent) = ownership::guarded_array_extent(context, state, base, address, ty)? {
@@ -555,8 +598,19 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
         return Err("runtime-array index differs from its qualified local declaration".to_owned());
     }
     match extent {
-        LocalRuntimeExtent::Construction(length) | LocalRuntimeExtent::WidenedLiteral(length)
-        | LocalRuntimeExtent::OrdinaryDescriptor(length) if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+        LocalRuntimeExtent::Construction { length, signed }
+            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+        {
+            if for_index {
+                let signed = signed.ok_or("indexed runtime construction lacks its signed address domain")?;
+                if !signed.matches_consumer(state.target_layout, element) {
+                    return Err("indexed runtime construction changed its signed address domain".into());
+                }
+            }
+            Ok(Some(*length))
+        }
+        LocalRuntimeExtent::WidenedLiteral(length) | LocalRuntimeExtent::OrdinaryDescriptor(length)
+            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
                 Ok(Some(*length)),
         LocalRuntimeExtent::OwningFormal(length)
             if !for_index && *storage == address && state.runtime_array_allocations.get(name) == Some(&false) =>
@@ -629,11 +683,8 @@ fn fixed_array_element_pointer<'ctx>(
 ) -> Result<PointerValue<'ctx>, String> {
     if checked && state.require_release_checked_access {
         let (bytes, _) = allocation_layout(ty, state.layouts, state.target_layout)?;
-        let max_offset = match state.target_layout.pointer_size {
-            4 => i32::MAX as u64,
-            8 => i64::MAX as u64,
-            _ => return Err("unsupported fixed-array pointer index width".to_owned()),
-        };
+        let max_offset = signed_array_max_bytes(state.target_layout.pointer_size)
+            .ok_or("unsupported fixed-array pointer index width")?;
         if bytes > max_offset {
             return Err("fixed array exceeds the target's addressable index domain".to_owned());
         }
