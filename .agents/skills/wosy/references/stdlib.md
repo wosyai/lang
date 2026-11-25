@@ -8,6 +8,10 @@ std = namespace std "bootstrap.w";
 
 From `stdlib/`, `wosy build` then `wosy run` runs the WASI smoke target and prints `Wosy standard library`.
 
+## Checked access
+
+On supported checked dereferences and array reads, writes, and borrows, the [standard-library checks](../../../../stdlib/src/checked_access.w) detect null references and compare the full `u64` index with the array's actual construction extent before address calculation or narrowing. A failed check calls `core.system_panic()` and terminates execution. The helpers and the way the compiler carries the extent are implementation details; use ordinary checked access syntax.
+
 ## Text
 
 ```wosy
