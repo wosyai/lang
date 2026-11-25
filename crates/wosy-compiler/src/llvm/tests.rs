@@ -16625,3 +16625,73 @@ if (scalar(42) != 42 || indexed(2) != 9) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn direct_checked_array_dereference_uses_stdlib_before_indexed_load() {
+    let text = "%%start
+struct Packet { u8 kind; u8[3] bytes; }
+u64(u64) select = fn(index) { index };
+u8(*(u8[3]), u64) indexed = fn(view, index) { (*view)[select(index)] };
+u8(*Packet, u64) field = fn(view, index) { (*view).bytes[select(index)] };
+u8(u64) immediate = fn(index) {
+    u8[3] cells = [7, 8, 9];
+    (*(&cells))[select(index)]
+};
+u8(u64) invoke = fn(index) {
+    u8[3] cells = [7, 8, 9];
+    indexed(&cells, index)
+};
+u8(u64) invoke_field = fn(index) {
+    Packet packet = { .kind = 4; .bytes = [5, 6, 7]; };
+    field(&packet, index) + packet.kind
+};
+if (invoke(0) != 7 || invoke(2) != 9 || immediate(1) != 8 || invoke_field(2) != 11) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&release);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helper_source = release.checked_access_source().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(helper_source, "check_non_null_address"));
+        let select = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let bounds = format!("call void @{}(", project_function_name(helper_source, "check_index_in_extent"));
+        for name in ["indexed", "immediate", "field"] {
+            let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, name));
+            for needle in [&non_null, &select, &bounds] {
+                assert_eq!(body.matches(needle).count(), 1, "{body}");
+            }
+            let (non_null, select, bounds) = (body.find(&non_null).unwrap(), body.find(&select).unwrap(), body.find(&bounds).unwrap());
+            let base = body.find("inttoptr").unwrap();
+            let cell = body[bounds..].lines()
+                .find(|line| line.contains(" = getelementptr inbounds [3 x i8]"))
+                .unwrap();
+            let address = cell.trim().split_once(" = ").unwrap().0;
+            let load = format!("load i8, ptr {address},");
+            assert_eq!(body.matches(&load).count(), 1, "{body}");
+            let cell = body.find(cell).unwrap();
+            let value = body.find(&load).unwrap();
+            if name == "field" {
+                let field = body.find("getelementptr inbounds i8, ptr").unwrap();
+                assert!(base < field && field < select, "{body}");
+            }
+            assert!(non_null < base && base < select && select < bounds && bounds < cell && cell < value, "{body}");
+            assert!(body[bounds..].lines().next().unwrap().ends_with(", i64 3)"), "{body}");
+            assert!(!body.contains("load [3 x i8]"), "{body}");
+            assert!(!body.contains("deref_is_null") && !body.contains("__wosy_core_system_panic"), "{body}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_DIRECT_CHECKED_INDEX_RELEASE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

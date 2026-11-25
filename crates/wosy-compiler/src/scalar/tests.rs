@@ -1138,17 +1138,39 @@ fn copyable_checked_dereference_remains_a_read_in_both_validators() {
 }
 
 #[test]
-fn indexed_dereference_of_fixed_array_is_rejected_by_current_grammar() {
-    let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { *!(Payload[2]) writer = &!values; (*writer)[index] };\n%%end";
+fn indexed_dereference_of_fixed_array_is_a_canonical_read_place() {
+    let text = "%%start\nu8(*(u8[3]), u64) read = fn(view, index) { (*view)[index] };\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "S0001"),
-        "{:?}",
-        parsed.diagnostics
-    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let validated = derive_scalar_program(&parsed.result);
+    assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+    let program = validated.program;
+    let function = program.items.iter().find_map(|item| match item {
+        ScalarItem::Function(function) => Some(function),
+        _ => None,
+    }).unwrap();
+    let expression = function.body.expressions.last().unwrap();
+    assert!(matches!(expression, ScalarExpression::IndexedRead {
+        place: ScalarPlace::Index { base, index, .. }, ..
+    } if matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+        if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. } if name == "view"))
+        && matches!(index.as_ref(), ScalarExpression::Name { name, .. } if name == "index")));
+    assert!(function.reference_cfg.points.iter().any(|point| matches!(&point.kind,
+        CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, .. }, pointer_point: Some(_), .. }
+            if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))));
+    let temporary = text.replace("(*view)[index]", "(view)[index]");
+    let parsed = parse_source(source(), temporary, &[]);
+    assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic.code == "S0001"), "{:?}", parsed.diagnostics);
+    let runtime = derive_scalar_program(&parse_source(source(), text.replace("u8[3]", "u8[]"), &[]).result);
+    assert!(runtime.diagnostics.iter().any(|diagnostic|
+        diagnostic.message.contains("extent of the dereferenced backing")), "{:?}", runtime.diagnostics);
+    let raw = parse_source(source(),
+        "%%start\nstruct Packet { u8[3] bytes; }\nu8(*?Packet, u64) read = fn(view, index) { (*view).bytes[index] };\n%%end".to_owned(), &[]);
+    assert!(raw.diagnostics.is_empty(), "{:?}", raw.diagnostics);
+    let raw = derive_scalar_program(&raw.result);
+    assert!(raw.diagnostics.iter().any(|diagnostic|
+        diagnostic.code == "B0012" && diagnostic.message == "raw dereference requires an unsafe block"),
+        "{:?}", raw.diagnostics);
 }
 
 #[test]

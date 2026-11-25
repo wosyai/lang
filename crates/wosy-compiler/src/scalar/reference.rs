@@ -3724,6 +3724,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } else {
             None
         };
+        if !matches!(place, ScalarPlace::Dereference { .. })
+            && matches!(pointer_type, Some(ScalarType::CheckedReference { inner, .. })
+                if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. }))
+        {
+            return Err(self.missing_context(span,
+                ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+        }
         let checked_pointee = matches!(pointer_type, Some(ScalarType::CheckedReference { .. }));
         let reads_checked_aggregate = matches!(pointer_type,
             Some(ScalarType::CheckedReference { inner, .. })

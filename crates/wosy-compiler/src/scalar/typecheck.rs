@@ -3456,7 +3456,7 @@ fn check_expression_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
-                true,
+                PlaceTypeMode::RawAddress,
             );
             inference.record_place_type(place, &ty);
             ScalarType::RawPointer(Box::new(ty))
@@ -3487,15 +3487,14 @@ fn check_expression_type_in_module(
             overloads,
             inference,
         ),
-        ScalarExpression::IndexedRead { place, .. } => place_type_in_module(
-            place,
-            scope,
-            module,
-            modules,
-            diagnostics,
-            overloads,
-            inference,
-        ),
+        ScalarExpression::IndexedRead { place, .. } => {
+            let ty = check_place_type_in_module(
+                place, scope, module, modules, diagnostics, overloads, inference,
+                PlaceTypeMode::IndexedRead { unsafe_context },
+            );
+            inference.record_place_type(place, &ty);
+            ty
+        },
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(module_diagnostic(
@@ -5658,7 +5657,7 @@ fn writable_path_type(
             diagnostics,
             overloads,
             inference,
-            false,
+            PlaceTypeMode::Ordinary,
         ),
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
@@ -5775,7 +5774,7 @@ fn writable_path_type_in_module(
             diagnostics,
             overloads,
             inference,
-            false,
+            PlaceTypeMode::Ordinary,
         ),
         ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
             pointer,
@@ -5904,6 +5903,30 @@ fn writable_path_type_in_module(
     ty
 }
 
+#[derive(Clone, Copy)]
+enum PlaceTypeMode {
+    Ordinary,
+    RawAddress,
+    IndexedRead { unsafe_context: bool },
+}
+
+impl PlaceTypeMode {
+    fn projected(self) -> Self {
+        // RawAddress historically authorizes only the outer dereference.
+        match self {
+            Self::RawAddress => Self::Ordinary,
+            _ => self,
+        }
+    }
+
+    fn unsafe_pointer_expression(self) -> bool {
+        match self {
+            Self::IndexedRead { unsafe_context } => unsafe_context,
+            _ => true,
+        }
+    }
+}
+
 pub(super) fn place_type(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
@@ -5919,7 +5942,7 @@ pub(super) fn place_type(
         diagnostics,
         overloads,
         inference,
-        false,
+        PlaceTypeMode::Ordinary,
     );
     inference.record_place_type(place, &ty);
     ty
@@ -5932,7 +5955,7 @@ fn check_place_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
-    raw_address: bool,
+    mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5942,7 +5965,10 @@ fn check_place_type(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type(base, scope, program, diagnostics, overloads, inference);
+            let base_type = check_place_type(
+                base, scope, program, diagnostics, overloads, inference, mode.projected(),
+            );
+            inference.record_place_type(base, &base_type);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -5980,12 +6006,16 @@ fn check_place_type(
             &BTreeMap::new(),
             program,
             diagnostics,
-            true,
+            mode.unsafe_pointer_expression(),
             overloads,
             inference,
         ) {
+            ScalarType::RawPointer(_) if matches!(mode, PlaceTypeMode::IndexedRead { unsafe_context: false }) => {
+                diagnostics.push(diagnostic(program, "B0012", "raw dereference requires an unsafe block", *span));
+                ScalarType::Error
+            }
             ScalarType::RawPointer(inner) => *inner,
-            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
+            ScalarType::CheckedReference { inner, .. } if !matches!(mode, PlaceTypeMode::Ordinary) => *inner,
             _ => {
                 diagnostics.push(diagnostic(
                     program,
@@ -6002,7 +6032,10 @@ fn check_place_type(
             span,
             index_span,
         } => {
-            let base_type = place_type(base, scope, program, diagnostics, overloads, inference);
+            let base_type = check_place_type(
+                base, scope, program, diagnostics, overloads, inference, mode.projected(),
+            );
+            inference.record_place_type(base, &base_type);
             let index_type = expression_type_expected(
                 index,
                 &ScalarType::U64,
@@ -6058,7 +6091,7 @@ pub(super) fn place_type_in_module(
         diagnostics,
         overloads,
         inference,
-        false,
+        PlaceTypeMode::Ordinary,
     );
     inference.record_place_type(place, &ty);
     ty
@@ -6072,7 +6105,7 @@ fn check_place_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
-    raw_address: bool,
+    mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -6087,12 +6120,16 @@ fn check_place_type_in_module(
             module,
             modules,
             diagnostics,
-            true,
+            mode.unsafe_pointer_expression(),
             overloads,
             inference,
         ) {
+            ScalarType::RawPointer(_) if matches!(mode, PlaceTypeMode::IndexedRead { unsafe_context: false }) => {
+                diagnostics.push(module_diagnostic(module, "B0012", "raw dereference requires an unsafe block", *span));
+                ScalarType::Error
+            }
             ScalarType::RawPointer(inner) => *inner,
-            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
+            ScalarType::CheckedReference { inner, .. } if !matches!(mode, PlaceTypeMode::Ordinary) => *inner,
             _ => {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -6106,7 +6143,7 @@ fn check_place_type_in_module(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type_in_module(
+            let base_type = check_place_type_in_module(
                 base,
                 scope,
                 module,
@@ -6114,7 +6151,9 @@ fn check_place_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
+                mode.projected(),
             );
+            inference.record_place_type(base, &base_type);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -6183,7 +6222,7 @@ fn check_place_type_in_module(
             span,
             index_span,
         } => {
-            let base_type = place_type_in_module(
+            let base_type = check_place_type_in_module(
                 base,
                 scope,
                 module,
@@ -6191,7 +6230,9 @@ fn check_place_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
+                mode.projected(),
             );
+            inference.record_place_type(base, &base_type);
             let index_type = expression_type_in_module_expected(
                 index,
                 Some(&ScalarType::U64),
@@ -8381,7 +8422,7 @@ fn check_expression_type(
                 diagnostics,
                 overloads,
                 inference,
-                true,
+                PlaceTypeMode::RawAddress,
             );
             inference.record_place_type(place, &ty);
             ScalarType::RawPointer(Box::new(ty))
@@ -8411,7 +8452,12 @@ fn check_expression_type(
             inference,
         ),
         ScalarExpression::IndexedRead { place, .. } => {
-            place_type(place, scope, program, diagnostics, overloads, inference)
+            let ty = check_place_type(
+                place, scope, program, diagnostics, overloads, inference,
+                PlaceTypeMode::IndexedRead { unsafe_context },
+            );
+            inference.record_place_type(place, &ty);
+            ty
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {

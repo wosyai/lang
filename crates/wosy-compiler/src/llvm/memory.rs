@@ -389,6 +389,12 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
+            if matches!(base_type, ScalarType::RuntimeArray { .. })
+                && matches!(base.as_ref(), crate::ScalarPlace::Dereference { .. })
+                && !fixed_index_has_raw_root(state, base)
+            {
+                return Err("checked runtime array indexing lacks a paired referent extent".into());
+            }
             // A guarded lexical array stores its original backing directly,
             // not an ordinary runtime-array pointer slot. Authenticate and
             // retain that backing and extent before evaluating the selector.

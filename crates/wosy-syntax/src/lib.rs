@@ -684,7 +684,28 @@ fn build_parenthesized_primary(
         return;
     };
     let mut suffix = suffix.into_inner();
-    let field = suffix.next().expect("parenthesized field suffix");
+    let first = suffix.next().expect("parenthesized primary suffix");
+    if first.as_rule() == Rule::parenthesized_index_suffix {
+        if !is_dereference_primary(head.clone()) {
+            let range = ByteSpan::new(head.as_span().start() as u32, first.as_span().end() as u32);
+            builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::InvalidTemporaryPlace));
+            add_gap(builder, &text[range.start as usize..range.end as usize], range.start as usize, comments);
+            builder.finish_node();
+            errors.push(SyntaxError {
+                span: range,
+                message: "a parenthesized index requires a dereferenced place".to_owned(),
+            });
+            return;
+        }
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::IndexedPlace));
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::ParenthesizedDereferencePlace));
+        build_pair(builder, head, text, comments, errors);
+        builder.finish_node();
+        build_pair(builder, first, text, comments, errors);
+        builder.finish_node();
+        return;
+    }
+    let field = first;
     let indices = suffix.next();
     if !is_dereference_primary(head.clone()) {
         build_value_field(builder, head, field, indices, text, comments, errors);

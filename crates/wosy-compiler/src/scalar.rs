@@ -731,6 +731,7 @@ pub enum ReferenceAnalysisErrorReason {
     UnprovedReturnedArraySelector,
     MissingRequiredDereferenceOrigin,
     UnprovedCheckedArrayIndex,
+    MissingDereferencedArrayExtent,
     MoveFromArrayElement,
     MovedPlace,
 }
@@ -756,6 +757,7 @@ impl ReferenceAnalysisErrorReason {
             Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
+            Self::MissingDereferencedArrayExtent => "checked runtime array indexing requires the extent of the dereferenced backing",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
             Self::MovedPlace => "read or move of unavailable place",
         }
@@ -4746,8 +4748,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
 fn derive_place(node: &CstNode) -> ScalarPlace {
     match node.kind() {
         SyntaxKind::ParenthesizedDereferencePlace => derive_place(
-            &direct_nodes(node)
-                .into_iter()
+            &node.descendants()
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("parenthesized dereference place"),
         ),
