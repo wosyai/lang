@@ -2265,13 +2265,22 @@ fn store_widened_local_array<'ctx, 'module>(
     };
     let [receiver] = binding.receivers.as_slice() else { return Err("invalid widened array receiver".into()) };
     let count = context.i64_type().const_int(values.len() as u64, false);
+    let mut staged = memory::stage_ordinary_array_elements(context, state, values, element,
+        match project {
+            Some(project) => ExpressionPath::Project { module: project.module, modules: project.modules },
+            None => ExpressionPath::Single,
+        })?;
     store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing| {
         let item = storage_type(context, element, state.layouts, state.target_layout)?;
         for (position, expression) in values.iter().enumerate() {
-            let value = match project {
-                Some(project) => emit_project_typed_expression(context, state, expression, element,
-                    project.module, project.modules)?,
-                None => emit_typed_expression(context, state, expression, element)?,
+            let value = if let Some(staged) = staged.as_mut() {
+                staged.next().expect("one staged value per widened array element")
+            } else {
+                match project {
+                    Some(project) => emit_project_typed_expression(context, state, expression, element,
+                        project.module, project.modules)?,
+                    None => emit_typed_expression(context, state, expression, element)?,
+                }
             };
             // This index comes from the exact same literal count supplied to
             // the successful allocation, not from an authored index.

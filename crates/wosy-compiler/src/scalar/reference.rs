@@ -5366,9 +5366,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && binding.fallible_assignment.is_none() && !binding.is_allocation
                         && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
                         && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && matches!((&receiver.ty, primary),
+                        && (matches!((&receiver.ty, primary),
                             (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. })
                             | (ScalarType::Array { .. }, ScalarExpression::ArrayLiteral { .. }))
+                            || super::widened_local_literal(binding).is_some_and(|(_, _, _)|
+                                calls.structure.checked_types.expressions.get(&primary_ordinal)
+                                    .and_then(|actual| super::fixed_copy_to_runtime(&receiver.ty, actual)).is_some()))
                         && calls.structure.edges.get(&(
                             OccurrenceParent::Block(ordinal),
                             OccurrenceEdge::BindingRoot { item: position.item, output: 0 },

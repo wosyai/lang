@@ -885,6 +885,9 @@ fn ordinary_aggregate_failure<'ctx, 'a>(
     members: impl Iterator<Item = &'a ScalarExpression>,
     label: &str,
 ) -> Result<Option<inkwell::basic_block::BasicBlock<'ctx>>, String> {
+    if !state.aggregate.as_ref().is_some_and(|aggregate|
+        !aggregate.plan().ordinary_fallible_allocating_expressions.is_empty())
+    { return Ok(None); }
     let mut members = members;
     if !members.any(|member|
         super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, member))
@@ -920,6 +923,18 @@ fn finish_ordinary_aggregate_fields<'ctx>(
     super::expression::emit_terminal_system_panic(context, state)?;
     state.builder.position_at_end(success);
     Ok(())
+}
+
+pub(super) fn stage_ordinary_array_elements<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>,
+    elements: &[ScalarExpression], element: &ScalarType, path: ExpressionPath<'_>,
+) -> Result<Option<std::vec::IntoIter<EmitValue<'ctx>>>, String> {
+    let failure = ordinary_aggregate_failure(context, state, elements.iter(), "ordinary.array_allocation_absent")?;
+    let Some(failure) = failure else { return Ok(None) };
+    let values = elements.iter().map(|value| emit_ordinary_aggregate_member(context, state, value, element, path, failure))
+        .collect::<Result<Vec<_>, _>>()?;
+    finish_ordinary_aggregate_fields(context, state, failure)?;
+    Ok(Some(values.into_iter()))
 }
 
 pub(super) fn emit_struct_literal<'ctx, 'module>(
@@ -1037,17 +1052,7 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
         storage_type_and_alignment(context, expected, state.layouts, state.target_layout)?;
     let destination = entry_alloca(state, storage, "array_literal")?;
     align_storage_alloca(destination, alignment)?;
-    let failure = ordinary_aggregate_failure(context, state, elements.iter(), "ordinary.array_allocation_absent")?;
-    let staged = if let Some(failure) = failure {
-        let values = elements.iter().map(|element_value|
-            emit_ordinary_aggregate_member(context, state, element_value, element, path, failure))
-            .collect::<Result<Vec<_>, _>>()?;
-        finish_ordinary_aggregate_fields(context, state, failure)?;
-        Some(values.into_iter())
-    } else {
-        None
-    };
-    let mut staged = staged;
+    let mut staged = stage_ordinary_array_elements(context, state, elements, element, path)?;
     for (index, expression) in elements.iter().enumerate() {
         let pointer = literal_array_element_pointer(context, state, storage, destination, index)?;
         let value = match staged.as_mut() {

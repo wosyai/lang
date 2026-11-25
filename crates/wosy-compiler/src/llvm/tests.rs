@@ -15278,3 +15278,82 @@ terminal(true, 5);
         }
     }
 }
+
+#[test]
+fn ordinary_and_guarded_fallible_widened_arrays_stage_members_before_backing() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let template = "%%start
+u64(u64) _left = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _last = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) ordinary = fn(first, second) {
+    u64[] result = [_left(first), _right(second) ^ 0, _last(5)];
+    core.array_len(&result) ^ result[0] ^ result[1] ^ result[2]
+};
+u64(u64, u64) guarded = fn(first, second) {
+    u64[] result =? [_left(first), _right(second) ^ 0, _last(5)];
+    if (&result == null) { 99 } else { core.array_len(&result) ^ result[0] ^ result[1] ^ result[2] }
+};
+if (guarded(11, 9) != 99 || guarded(13, 13) != 99 || guarded(7, 9) != 8
+    || ordinary(0, 9) != 15) { core.system_panic(); };
+ordinary(FIRST, SECOND);
+%%end";
+    for (scenario, first, second) in [("first", "17", "9"), ("middle", "19", "19")] {
+        let text = template.replace("FIRST", first).replace("SECOND", second);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let source = &prepared.project().modules[0].source;
+            let parsed = parse_source(source.clone(), text.clone(), &[]);
+            let release = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            let release_checked = analyze_scalar_build(&release);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+            for (route, project, output) in [
+                ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+                ("project", true, emit_scalar_build_project_llvm(&checked)),
+                ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+            ] {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible widened array staging");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                let ordinary = authored("ordinary");
+                let blocks = ordinary.get_basic_blocks();
+                let calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |i| i.get_next_instruction()))
+                    .filter(|&i| CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                    .collect::<Vec<_>>();
+                let [left] = calls(authored("_left"))[..] else { panic!("{llvm}") };
+                let [right] = calls(authored("_right"))[..] else { panic!("{llvm}") };
+                let [last] = calls(authored("_last"))[..] else { panic!("{llvm}") };
+                let [destination] = calls(module.get_function("__wosy_core_alloc").unwrap())[..] else { panic!("{llvm}") };
+                let failure = *blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.array_allocation_absent").unwrap();
+                fn edges<'ctx>(instruction: InstructionValue<'ctx>) -> Vec<inkwell::basic_block::BasicBlock<'ctx>> {
+                    instruction.get_operands().filter_map(|operand| operand.and_then(|operand| operand.block())).collect()
+                }
+                let left_edges = edges(left.get_parent().unwrap().get_terminator().unwrap());
+                let right_edges = edges(right.get_parent().unwrap().get_terminator().unwrap());
+                let last_edges = edges(last.get_parent().unwrap().get_terminator().unwrap());
+                assert!(left_edges.contains(&failure) && left_edges.contains(&right.get_parent().unwrap()));
+                assert!(right_edges.contains(&failure) && right_edges.contains(&last.get_parent().unwrap()));
+                assert!(last_edges.contains(&failure) && last_edges.contains(&destination.get_parent().unwrap()));
+                assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                assert_eq!(CallSiteValue::try_from(failure.get_first_instruction().unwrap()).unwrap().get_called_fn_value(),
+                    module.get_function("__wosy_core_system_panic"));
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_WIDENED_ELEMENTS_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(scenario).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}
