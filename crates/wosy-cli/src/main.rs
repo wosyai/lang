@@ -1319,21 +1319,20 @@ fn check_command(
             .chain(failure.guard.map(|value| format!("Boolean guard input at entry: {value}"))).collect(),
     });
     let mut diagnostics = Vec::new();
-    if let Some(positions) = &report.mixed_context_after_actual {
-        let mut actual = actual;
+    if let Some(positions) = &report.mixed_context_after_scalar {
+        let mut scalar = actual.chain(symbolic);
         let mut contextual = contextual;
         let mut emitted = 0;
         for &position in positions {
             if position < emitted { return Err("check: invalid mixed proof diagnostic order".to_owned()); }
             while emitted < position {
-                diagnostics.push(actual.next().ok_or_else(|| "check: incomplete mixed proof diagnostic order".to_owned())?);
+                diagnostics.push(scalar.next().ok_or_else(|| "check: incomplete mixed proof diagnostic order".to_owned())?);
                 emitted += 1;
             }
             diagnostics.push(contextual.next().ok_or_else(|| "check: missing mixed contextual diagnostic".to_owned())?);
         }
         if contextual.next().is_some() { return Err("check: incomplete mixed contextual diagnostic order".to_owned()); }
-        diagnostics.extend(actual);
-        diagnostics.extend(symbolic);
+        diagnostics.extend(scalar);
     } else {
         diagnostics.extend(actual);
         diagnostics.extend(symbolic);
