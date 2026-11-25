@@ -256,6 +256,13 @@ impl PreparedScalarProject {
         (self.project, self.calls)
     }
 
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn fixed_index_read_shape(
+        &self, module: usize, item: usize, read: reference::OccurrenceOrdinal,
+    ) -> Option<reference::FixedIndexReadShape<'_>> {
+        self.calls.function_body(module, item, None)?.fixed_index_read_shape(read)
+    }
+
     pub fn project(&self) -> &ScalarProject {
         &self.project
     }

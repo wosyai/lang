@@ -3502,6 +3502,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 #[derive(Clone, Copy)]
 struct RuntimeFixedIndexObserver<'a, 'proof> {
     conditions: OrderedRootConditions<'a, true, true>,
+    calls: &'a FunctionCallSites,
     discovered: &'proof std::cell::RefCell<HashMap<OccurrenceOrdinal, (&'a super::reference::CheckerOrdinaryScalarLocal, usize)>>,
 }
 
@@ -3533,6 +3534,16 @@ impl<'a> ScopedAuthoredReturn<'a> for RuntimeFixedIndexObserver<'a, '_> {
     fn observe_runtime_fixed_index(
         self, origin: &'a super::reference::CheckerOrdinaryScalarLocal, extent: usize,
     ) -> Option<()> {
+        let shape = self.calls.fixed_index_read_shape(origin.source)?;
+        let super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead {
+            index: super::reference::CheckerSnapshotReadIndex::ArrayPath(steps), ..
+        } = &origin.kind else { return None; };
+        if !matches!(steps.as_ref(), [step]
+            if step.length == extent && shape.extent == extent
+                && matches!(step.offset, super::reference::CheckerSnapshotArrayOffset::Lexical(index) if index == shape.index))
+        {
+            return None;
+        }
         if let Some((previous, length)) = self.discovered.borrow_mut().insert(origin.source, (origin, extent)) {
             if !std::ptr::eq(previous, origin) || length != extent { return None; }
         }
@@ -3574,7 +3585,7 @@ pub(super) fn observe_runtime_fixed_indices<'a>(
         return None;
     }
     let discovered = std::cell::RefCell::new(HashMap::new());
-    let observer = RuntimeFixedIndexObserver { conditions: OrderedRootConditions(body, true), discovered: &discovered };
+    let observer = RuntimeFixedIndexObserver { conditions: OrderedRootConditions(body, true), calls, discovered: &discovered };
     // Unrestricted typed arguments, no proof entry filter, no imported
     // summaries, erased requirements, captured state or effects.
     let mut failed = false;

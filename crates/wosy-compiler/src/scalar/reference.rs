@@ -6803,7 +6803,48 @@ struct ContextualCallPlace {
     ty: ScalarType,
 }
 
+/// Structural access candidate, not evidence that any check can be omitted.
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub(super) struct FixedIndexReadShape<'a> {
+    pub(super) read: OccurrenceOrdinal,
+    pub(super) place: OccurrenceOrdinal,
+    pub(super) base: OccurrenceOrdinal,
+    pub(super) index: OccurrenceOrdinal,
+    pub(super) base_binding: &'a ReferenceBindingId,
+    pub(super) index_binding: &'a ReferenceBindingId,
+    pub(super) result: &'a ScalarType,
+    pub(super) extent: usize,
+}
+
 impl FunctionCallSites {
+    /// Project only existing prepared identities. No checker-only rows, AST
+    /// rewalk, control-flow fact, or runtime helper lowering is implied.
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn fixed_index_read_shape(&self, read: OccurrenceOrdinal) -> Option<FixedIndexReadShape<'_>> {
+        let edges = &self.structure.edges;
+        let checked = &self.structure.checked_types;
+        let OccurrenceNode::Place(place) = *edges.get(&(
+            OccurrenceParent::Expression(read), OccurrenceEdge::ExpressionPlace,
+        ))? else { return None; };
+        let OccurrenceNode::Place(base) = *edges.get(&(
+            OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
+        ))? else { return None; };
+        let OccurrenceNode::Expression(index) = *edges.get(&(
+            OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex,
+        ))? else { return None; };
+        let ScalarType::Array { element, length: length @ 1..=64, .. } = checked.places.get(&base)? else { return None; };
+        let result = checked.expressions.get(&read)?;
+        if result != element.as_ref() || checked.expressions.get(&index) != Some(&ScalarType::U64) {
+            return None;
+        }
+        let NamedPlaceRootFacts::Prepared(roots) = &self.named_place_roots else { return None; };
+        let NamedPlaceRootIdentity::Lexical(base_binding) = roots.get(&base)? else { return None; };
+        let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
+        let PlainNameIdentity::Lexical(index_binding) = names.get(&index)? else { return None; };
+        Some(FixedIndexReadShape { read, place, base, index, base_binding, index_binding, result, extent: *length as usize })
+    }
+
     #[cfg(feature = "internal-checker")]
     fn checker_closed_calling_frame(&self) -> bool {
         self.checker_closed_frame_allowing_snapshots() && self.structure.checker_selected_snapshots.is_empty()

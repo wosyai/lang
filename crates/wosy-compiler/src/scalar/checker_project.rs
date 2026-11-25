@@ -15805,6 +15805,20 @@ mod tests {
             let result = prepared.observe_runtime_fixed_indices(0, 0).unwrap();
             let calls = prepared.parts().1.function_body(0, 0, None).unwrap();
             let dynamic = access(calls, true);
+            let shape = calls.fixed_index_read_shape(dynamic.source).unwrap();
+            assert_eq!(shape.extent, 2);
+            assert_eq!(shape.result, &ScalarType::I8);
+            assert!(calls.fixed_index_read_shape(access(calls, false).source).is_none());
+            // Ordinary Build preparation can describe the same operation
+            // without importing checker evidence or claiming authority.
+            let parsed = crate::parse_source(src.clone(), text.to_owned(), &[]);
+            let build = crate::prepare_scalar_project(
+                vec![(crate::derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout: target },
+            ).unwrap();
+            let build_shape = build.fixed_index_read_shape(0, 0, dynamic.source).unwrap();
+            assert_eq!(build_shape, shape);
+            assert!(!std::ptr::eq(build_shape.base_binding, shape.base_binding));
             assert!(result.authorizes(calls, dynamic, 2));
             assert!(!result.authorizes(calls, dynamic, 3));
             let similar = prepare(text, target);
