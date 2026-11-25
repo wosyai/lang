@@ -24397,6 +24397,54 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_ordinary_enum_match_calculates_selected_wrapping_payload() {
+        let text = format!(r#"%%start
+            enum copy Region {{ left(u8); right(u8); }}
+            unit(u8) inspect = fn(input) {{
+                u8 actual = match (if (input >= 254) {{ Region.left(input) }} else {{ Region.right(17) }}) {{
+                    right(payload) {{ payload }}
+                    left(payload) {{ payload +@ 1 }}
+                }};
+                core.require(input != 254 || actual == 255, {OUTPUT});
+                core.require(input != 255 || actual == 0, {OUTPUT});
+                core.require(input >= 254 || actual == 17, {OUTPUT});
+            }};
+        %%end"#);
+        let app = source("src/main.w", "symbolic-runtime-enum-selected-wrap");
+        let run = |text: &str, scope| {
+            let parsed = parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations, Vec::new())], Vec::new(), vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let constructor = text.replace("Region.left(input)", "Region.left(1 +@ input)")
+            .replace("left(payload) { payload +@ 1 }", "left(payload) { payload }");
+        for text in [&text, &constructor] {
+            let checked = run(text, ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(checked.active && checked.directives.is_empty());
+            let actual = text.replace("%%end", "inspect(254); inspect(255); %%end");
+            let checked = run(&actual, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(checked.active && checked.directives.is_empty());
+            let refuted = text.replace("actual == 0", "actual == 1");
+            let failed = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+            let [only] = failed.directives.as_slice() else { panic!("only the maximal wrapping input refutes"); };
+            assert_eq!(&refuted[only.condition.start as usize..only.condition.end as usize], "input != 255 || actual == 1");
+            let maximum = BigInt::from(u8::MAX);
+            let zero = BigInt::from(0);
+            assert_eq!(only.witness.row_count(), 1);
+            assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&maximum, &maximum)]));
+            assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&zero, &zero)]));
+        }
+        let broad = text.replace("if (input >= 254)", "if (input >= 0)");
+        assert!(matches!(run(&broad, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let double = text.replace("Region.left(input)", "Region.left(input +@ 1)");
+        assert!(matches!(run(&double, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+    }
+
     fn source(path: &str, revision: &str) -> SourceIdentity {
         SourceIdentity::new("local".into(), "demo".into(), path.into(), revision.into())
     }

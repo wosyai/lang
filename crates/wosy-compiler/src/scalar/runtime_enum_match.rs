@@ -51,6 +51,27 @@ pub(super) enum MatchCondition<T> {
 pub(super) enum MatchValue<T> {
     Literal(BigInt),
     Copy(T),
+    WrappingAdd { source: MatchAddend<T>, offset: BigInt },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchAddend<T> {
+    Literal(BigInt),
+    Copy(T),
+}
+
+#[cfg(feature = "internal-checker")]
+fn wrapping_literal_operand(expression: &IntegerExpression) -> Option<(&IntegerKind, &BigInt)> {
+    let IntegerKind::Binary { operator: BinaryOperator::WrappingAdd, operands } = &expression.kind else { return None; };
+    let [left, right] = operands.as_ref();
+    if left.ty != expression.ty || right.ty != expression.ty { return None; }
+    match (&left.kind, &right.kind) {
+        (value @ (IntegerKind::Formal(_) | IntegerKind::Payload(_)), IntegerKind::Literal(offset))
+        | (IntegerKind::Literal(offset), value @ (IntegerKind::Formal(_) | IntegerKind::Payload(_))) =>
+            Some((value, offset)),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -59,6 +80,13 @@ impl MatchTransfer<ByteSpan> {
         let value = |value: &MatchValue<ByteSpan>| Some(match value {
             MatchValue::Literal(value) => MatchValue::Literal(value.clone()),
             MatchValue::Copy(span) => MatchValue::Copy(resolve(*span, result)?),
+            MatchValue::WrappingAdd { source, offset } => MatchValue::WrappingAdd {
+                source: match source {
+                    MatchAddend::Literal(value) => MatchAddend::Literal(value.clone()),
+                    MatchAddend::Copy(span) => MatchAddend::Copy(resolve(*span, result)?),
+                },
+                offset: offset.clone(),
+            },
         });
         Some(match self {
             Self::Value(output) => MatchTransfer::Value(value(output)?),
@@ -401,23 +429,52 @@ impl Plan {
         // This is projection of already-typed leaves, not evaluation. Check
         // never silently omits effects or unsupported computations in a case.
         analysis_budget::charge_call_work(work, self.arms.len().checked_add(1)?)?;
-        if self.arms.iter().any(|arm| !matches!(&arm.results[..], [ArmResult::Literal { .. } | ArmResult::Payload { .. }])) {
-            return None;
+        for arm in &self.arms {
+            match arm.results.as_slice() {
+                [ArmResult::Literal { .. } | ArmResult::Payload { .. }] => {}
+                [ArmResult::Expression(expression)] if expression.ty == self.outputs[0]
+                    && matches!(wrapping_literal_operand(expression), Some((IntegerKind::Payload(_), _))) => {}
+                _ => return None,
+            }
         }
         let value = |selector: &TypedSelector, work: &mut usize| {
             let TypedSelector::Constructor { tag, payload, .. } = selector else { return None; };
-            analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?)?;
-            if payload.iter().any(|(_, operand)| matches!(operand, Operand::Expression(_))) { return None; }
+            analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?.checked_add(1)?)?;
             let [result] = self.arms.iter().find(|arm| arm.tag == *tag)?.results.as_slice() else { return None; };
-            match result {
-                ArmResult::Literal { value, .. } => Some(MatchValue::Literal(value.clone())),
-                ArmResult::Payload { slot, .. } => Some(match &payload.get(*slot)?.1 {
-                    Operand::Literal(value) => MatchValue::Literal(value.clone()),
-                    Operand::Formal(span) => MatchValue::Copy(*span),
-                    Operand::Expression(_) => return None,
-                }),
-                ArmResult::Expression(_) => None,
+            let (slot, wrapping_offset) = match result {
+                ArmResult::Literal { value, .. } => {
+                    if payload.iter().any(|(_, operand)| matches!(operand, Operand::Expression(_))) { return None; }
+                    return Some(MatchValue::Literal(value.clone()));
+                }
+                ArmResult::Payload { slot, .. } => (*slot, None),
+                ArmResult::Expression(expression) => {
+                    let (IntegerKind::Payload(slot), offset) = wrapping_literal_operand(expression)? else { return None; };
+                    (*slot, Some(offset))
+                }
+            };
+            if payload.iter().enumerate().any(|(index, (_, operand))|
+                matches!(operand, Operand::Expression(_)) && (index != slot || wrapping_offset.is_some()))
+            {
+                return None;
             }
+            let operand = &payload.get(slot)?.1;
+            if let Some(offset) = wrapping_offset {
+                let source = match operand {
+                    Operand::Literal(value) => MatchAddend::Literal(value.clone()),
+                    Operand::Formal(span) => MatchAddend::Copy(*span),
+                    Operand::Expression(_) => return None,
+                };
+                return Some(MatchValue::WrappingAdd { source, offset: offset.clone() });
+            }
+            Some(match operand {
+                Operand::Literal(value) => MatchValue::Literal(value.clone()),
+                Operand::Formal(span) => MatchValue::Copy(*span),
+                Operand::Expression(expression) if expression.ty == self.outputs[0] => {
+                    let (IntegerKind::Formal(span), offset) = wrapping_literal_operand(expression)? else { return None; };
+                    MatchValue::WrappingAdd { source: MatchAddend::Copy(*span), offset: offset.clone() }
+                }
+                Operand::Expression(_) => return None,
+            })
         };
         self.check_transfer = Some(match &self.selector {
             TypedSelector::Constructor { .. } => MatchTransfer::Value(value(&self.selector, work)?),

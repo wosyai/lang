@@ -9261,7 +9261,7 @@ fn bind_enum_match_value(
     roots: &mut IntegerRoots<'_>, path: IntegerInputs,
     transfer: &super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, ty: &ScalarType,
 ) -> Option<IntegerInputs> {
-    use super::runtime_enum_match::{MatchCondition, MatchTransfer, MatchValue};
+    use super::runtime_enum_match::{MatchAddend, MatchCondition, MatchTransfer, MatchValue};
     if !is_integer_type(ty) { return None; }
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len().checked_add(1)?)?;
     if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
@@ -9275,6 +9275,25 @@ fn bind_enum_match_value(
                 let (axis, source_ty) = roots.lookup(binding)?;
                 if source_ty != ty { return None; }
                 lane.append_ordinary_copy(axis, roots)?;
+            }
+            MatchValue::WrappingAdd { source, offset } => {
+                let operation = AuthoredIntegerOperation::WrappingAdd;
+                let right = (Some(offset), None);
+                let left = match source {
+                    MatchAddend::Literal(value) => (Some(value), None),
+                    MatchAddend::Copy(binding) => {
+                        let (axis, source_ty) = roots.lookup(binding)?;
+                        if source_ty != ty { return None; }
+                        charge_call_work(roots.ordinary_local_work.get_or_insert(0), lane.0.len())?;
+                        if lane.0.iter().any(|row| row.get(axis).is_none_or(|domain| domain.singleton_value().is_none())) {
+                            return lane.finite_ordinary_calculation(operation, (None, Some(axis)), right, ty,
+                                FiniteIntegerInstall::Append, roots.ordinary_local_work.get_or_insert(0));
+                        }
+                        (None, Some(axis))
+                    }
+                };
+                lane.append_ordinary_calculation(operation, left, right, ty,
+                    &mut roots.ordinary_local_work, &mut roots.affine_work)?;
             }
         }
         Some(lane)
