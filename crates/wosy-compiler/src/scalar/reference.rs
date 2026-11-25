@@ -344,6 +344,7 @@ pub(crate) struct GuardedRuntimeMove {
     pub(crate) target: ReferenceBindingId,
     pub(crate) target_ty: ScalarType,
     pub(crate) rhs: usize,
+    pub(crate) replacement: Option<usize>,
     moved: CfgPointId,
     scope: ReferenceScopeId,
 }
@@ -5486,7 +5487,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.cfg.allocations.insert(id.clone());
                         self.proof_points.guarded_runtime_receivers.insert(id.clone());
                         self.proof_points.guarded_runtime_moves.insert(read, GuardedRuntimeMove {
-                            source, target: id.clone(), target_ty: receiver.ty.clone(), rhs: primary_ordinal.0, moved, scope,
+                            source, target: id.clone(), target_ty: receiver.ty.clone(), rhs: primary_ordinal.0, replacement: None, moved, scope,
                         });
                     }
                     if let Some(owner) = alias_owner {
@@ -5894,6 +5895,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let calls = self.call_sites;
                     let group = &calls.assignments[&(key.block, key.item)];
                     let output_types = self.assignment_output_types(group)?;
+                    let guarded_replacement = (|| {
+                        if block.unsafe_context || !self.generic_parameters.is_empty() { return None; }
+                        let ([target], [ScalarExpression::Name { span, .. }]) =
+                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let rhs = group.rhs_evaluations().next()?.expression;
+                        let destination = group.destinations().next()?.destination;
+                        let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(rhs, *span).ok().flatten()?
+                        else { return None; };
+                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        let source_site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
+                        let ty = self.binding_types.get(target)?;
+                        (target.block_span == block.span
+                            && self.proof_points.guarded_runtime_receivers.contains(target)
+                            && aggregate::same_runtime_array_type(&source_site.ty, ty))
+                            .then(|| (source.clone(), target.clone(), ty.clone(), rhs, destination))
+                    })();
                     let widened_rebind = (|| {
                         let owners = self.widened_arrays.as_ref()?;
                         if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty() { return None; }
@@ -6001,6 +6020,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
                         self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
+                        if let Some((source, target, ty, rhs, destination)) = &guarded_replacement {
+                            let moved = self.cursor.filter(|point| *point != rhs_point)
+                                .ok_or_else(|| self.missing_context(expression_span(value),
+                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                            self.proof_points.guarded_runtime_moves.insert(rhs_point, GuardedRuntimeMove {
+                                source: source.clone(), target: target.clone(), target_ty: ty.clone(), rhs: rhs.0,
+                                replacement: Some(destination.0), moved, scope,
+                            });
+                        }
                         values.push((result, rhs_point));
                     }
                     for projection in group.projected_outputs() {
@@ -6153,12 +6181,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             {
                                 return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
                             }
-                            if self.proof_points.guarded_runtime_receivers.contains(&id)
+                            let guarded_install = guarded_replacement.as_ref()
+                                .is_some_and(|(_, owner, _, _, destination)| owner == &id && *destination == slot.destination && capture.is_none());
+                            if !guarded_install && self.proof_points.guarded_runtime_receivers.contains(&id)
                                 && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
                             {
                                 return Err(self.missing_origin(*span, id, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
                             }
                             let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
+                            if guarded_install {
+                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                            }
                             if let Some((destination, source, target)) = widened_rebind {
                                 self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
                                 self.aggregate_result.widened_rebinds.insert(destination.0,
@@ -17006,7 +17039,12 @@ fn seal_guarded_scalar_allocations(
             || !matches!(&moved.kind, CfgPointKind::Move { place, owner, ty }
                 if owner == &receipt.source && place.binding == receipt.source && place.projections.is_empty()
                     && aggregate::same_runtime_array_type(ty, &receipt.target_ty))
-            || !matches!(&installed.kind, CfgPointKind::Bind { binding } if binding == &receipt.target)
+            || !match (&installed.kind, receipt.replacement) {
+                (CfgPointKind::Bind { binding }, None) => binding == &receipt.target,
+                (CfgPointKind::Assign { target, rhs_point, .. }, Some(_)) =>
+                    target.binding == receipt.target && target.projections.is_empty() && rhs_point == read,
+                _ => false,
+            }
             || !points.scope_exit_bindings.as_ref()?.get(&exit)?.contains(&receipt.target)
         { return None; }
         moves_by_owner.entry(&receipt.source).or_default().push(receipt.clone());

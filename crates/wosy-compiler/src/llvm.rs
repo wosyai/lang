@@ -4502,6 +4502,9 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
+    if ownership::replace_guarded_runtime_owner(context, state, assignment)? {
+        return Ok(EmitValue::Unit);
+    }
     if emit_widened_join_replace(context, state, assignment, None)?
         || emit_widened_owning_replace(context, state, assignment, None)?
         || emit_widened_rebind(context, state, assignment, None)? {
@@ -4602,6 +4605,9 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if ownership::replace_guarded_runtime_owner(context, state, assignment)? {
+        return Ok(EmitValue::Unit);
+    }
     if emit_widened_join_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
         || emit_widened_owning_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
         || emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {

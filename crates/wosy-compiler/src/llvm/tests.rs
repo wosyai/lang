@@ -14755,3 +14755,65 @@ if (observed(true, 3, 1) != 99 || observed(true, 3, 2) != 3 || observed(false, 2
         }
     }
 }
+
+#[test]
+fn guarded_fallible_runtime_owner_replaces_existing_lexical_destination() {
+    let text = "%%start
+u64[](u64) _make = fn(count) { u64[count] fresh; fresh };
+u64(u64, u64) observed = fn(old_count, new_count) {
+    u64[] prior =? _make(old_count);
+    if (&prior == null) { 90 } else {
+        u64[] donor =? _make(new_count);
+        if (&donor == null) {
+            prior[0] = 11;
+            core.array_len(&prior)
+        } else {
+            u64[] dest = prior;
+            dest[0] = 12;
+            dest = donor;
+            dest[2] = 7;
+            core.array_len(&dest)
+        }
+    }
+};
+if (observed(2, 3) != 2 || observed(2, 3) != 3) { core.system_panic(); };
+%%end";
+    let live_loan = text.replace("            dest = donor;", "            *u64 edge = &donor[0];\n            dest = donor;\n            *edge;");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let borrowed = prepare_initializer_test(&live_loan, layout);
+        let borrowed = analyze_scalar_build(&borrowed);
+        assert!(borrowed.diagnostics().iter().any(|diagnostic|
+            diagnostic.message.contains("read or move of unavailable place")
+                && diagnostic.labels.iter().any(|label| label.kind == crate::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == live_loan.find("&donor[0]").unwrap() as u32)),
+            "{:?}", borrowed.diagnostics());
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, output) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded lexical replacement");
+            context.create_module_from_ir(bytes).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_RUNTIME_ARRAY_REPLACE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
