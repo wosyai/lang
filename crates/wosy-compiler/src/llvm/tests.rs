@@ -19083,3 +19083,77 @@ if (fixed(0,3) != 14 || fixed(1,3) != 24 || captured(2) != 2 || generated(3,2,1)
         }
     }
 }
+
+#[test]
+fn checked_root_runtime_arrays_publish_original_count_to_private_accessors() {
+    let text = "%%start
+u64(u64) count = fn(n) { n };
+u8(u64) _read_first = fn(i) { _first[i] };
+unit(u64,u8) _write_first = fn(i,v) { _first[i] = v; };
+u8(u64) _read_second = fn(i) { _second[i] };
+unit(u64,u8) _write_second = fn(i,v) { _second[i] = v; };
+u8[count(3)] _first;
+u8[count(5)] _second;
+_write_first(2,17);
+_write_second(4,23);
+if (_read_first(2) != 17 || _read_second(4) != 23) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/root-runtime-extent.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics))
+        };
+        let prepared = parse(text);
+        assert_eq!(prepared.root_array_uses().owners.len(), 2);
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&validated).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        let entry = self_tail_test_body(&ir, "i32", "main");
+        let choose = format!("call i64 @{}(", project_function_name(&source, "count"));
+        assert_eq!(entry.matches(&choose).count(), 2, "{entry}");
+        assert_eq!(entry.matches("call ptr @__wosy_core_alloc(").count(), 2, "{entry}");
+        assert_eq!(entry.matches("call void @__wosy_core_free(").count(), 2, "{entry}");
+        for (owner, names) in [("_first", ["_read_first", "_write_first"]), ("_second", ["_read_second", "_write_second"])] {
+            let declaration = prepared.root_array_uses().owners.iter().find_map(|(span, name)| (name == owner).then_some(span)).unwrap();
+            let count_global = format!("@__wosy_private_runtime_extent_{}", declaration.start);
+            assert!(ir.contains(&format!("{count_global} = internal global i64 0")), "{ir}");
+            let backing_name = project_global_name(&source, owner);
+            let count_store = entry.lines().find_map(|line| line.trim().strip_prefix("store i64 ")
+                .and_then(|line| line.split_once(&format!(", ptr {count_global}"))).map(|(value, _)| value)).unwrap();
+            let pointer_store = entry.lines().find_map(|line| line.trim().strip_prefix("store ptr ")
+                .and_then(|line| line.split_once(&format!(", ptr @{backing_name}"))).map(|(value, _)| value)).unwrap();
+            assert!(entry.contains(&format!("{pointer_store} = call ptr @__wosy_core_alloc(i64 {count_store}, i64 1)")), "{entry}");
+            assert!(entry.contains(&format!("icmp eq ptr {pointer_store}, null")), "{entry}");
+            for (rank, name) in names.into_iter().enumerate() {
+                let symbol = project_function_name(&source, name);
+                let output = if rank == 0 { "i8" } else { "void" };
+                assert!(ir.contains(&format!("define private {output} @{symbol}(")), "{ir}");
+                let body = self_tail_test_body(&ir, &format!("private {output}"), &symbol);
+                let (backing_line, _) = body.lines().find_map(|line| line.trim().split_once(&format!(" = load ptr, ptr @{backing_name}"))).unwrap();
+                let (count, _) = body.lines().find_map(|line| line.trim().split_once(&format!(" = load i64, ptr {count_global}"))).unwrap();
+                assert_eq!(body.matches(&bounds).count(), 1, "{body}");
+                let guard = body.lines().find(|line| line.contains(&bounds)).unwrap();
+                assert!(guard.ends_with(&format!(", i64 {count})")), "{body}");
+                let gep = format!("getelementptr inbounds i8, ptr {backing_line},");
+                assert!(body.find(&bounds).unwrap() < body.find(&gep).unwrap(), "{body}");
+            }
+        }
+        let early = text.replace("u8[count(3)] _first;", "_write_first(2,17);
+u8[count(3)] _first;");
+        assert_eq!(parse(&early).root_array_uses().owners.len(), 1);
+        if let Some(out) = std::env::var_os("WOSY_DEV4_ROOT_RUNTIME_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-root-runtime-extent.ll")), controlled).unwrap();
+        }
+    }
+}

@@ -112,10 +112,17 @@ struct CheckedAccessSymbols {
     in_extent: String,
 }
 
+struct RootRuntimeArrayStorage<'ctx> {
+    backing: GlobalValue<'ctx>,
+    count: GlobalValue<'ctx>,
+}
+
 struct ProjectNames<'ctx, 'module> {
     scopes: Vec<ModuleNames<'ctx, 'module>>,
     positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
     checked_access: Option<CheckedAccessSymbols>,
+    root_array_storage: HashMap<wosy_syntax::SourceSpan, RootRuntimeArrayStorage<'ctx>>,
+    root_array_accessors: HashMap<String, (wosy_syntax::SourceSpan, wosy_syntax::ByteSpan)>,
     private_runtime_portable_symbols: std::collections::HashSet<String>,
 
     require_release_checked_access: bool,
@@ -1347,6 +1354,10 @@ fn emit_project_llvm<'a>(
     let mut externs = Vec::new();
     let mut call_targets = BTreeMap::new();
     let mut initializer_symbols = InitializerSymbols::default();
+    let root_array_uses = project_build.map(|build| build.prepared().root_array_uses());
+    let root_source = project.initialization_order.first();
+    let mut root_array_storage = HashMap::new();
+    let mut root_array_accessors = HashMap::new();
     enum Declaration<'a> {
         Ordinary(usize),
         Extern(LlvmExternIdentity, String, &'a ScalarType),
@@ -1373,10 +1384,30 @@ fn emit_project_llvm<'a>(
                     global.set_linkage(Linkage::Internal);
                     global.set_initializer(&llvm_ty.const_zero());
                     globals.insert(name, (global, ty.clone()));
+                    if root_source == Some(&source_module.source)
+                        && root_array_uses.is_some_and(|uses| uses.owners.contains_key(&binding.name_span))
+                    {
+                        let qualified = wosy_syntax::SourceSpan::new(source_module.source.clone(), binding.name_span);
+                        let name = format!("__wosy_private_runtime_extent_{}", binding.name_span.start);
+                        let count = module.add_global(context.i64_type(), None, &name);
+                        count.set_initializer(&context.i64_type().const_zero());
+                        count.set_linkage(Linkage::Internal);
+                        root_array_storage.insert(qualified.clone(), RootRuntimeArrayStorage {
+                            backing: global, count,
+                        });
+                    }
                 }
             }
             if let ScalarItem::Function(function) = item {
                 let name = project_function_name(&source_module.source, &function.name);
+                if root_source == Some(&source_module.source) {
+                    if let Some(&(owner, site)) = root_array_uses.and_then(|uses| uses.accessor_sites.get(&function.name_span)) {
+                        if exports.iter().any(|export| export.symbol == name) {
+                            return Err("root-owned runtime array accessors cannot be exported".into());
+                        }
+                        root_array_accessors.insert(name.clone(), (wosy_syntax::SourceSpan::new(source_module.source.clone(), owner), site));
+                    }
+                }
                 initializer_symbols.function(&source_module.source, function, name.clone());
                 if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
                     continue;
@@ -1538,7 +1569,8 @@ fn emit_project_llvm<'a>(
                 let value = module.add_function(
                     &name,
                     aggregate_transfer::definition_type(&context, function, cfg, target_layout, &inline_results, &layouts, plan)?,
-                    aggregate_transfer::linkage(plan),
+                    if root_array_accessors.contains_key(name) { Some(Linkage::Private) }
+                    else { aggregate_transfer::linkage(plan) },
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
                     if let Some(argument) = value.get_nth_param(index as u32) {
@@ -1744,6 +1776,8 @@ fn emit_project_llvm<'a>(
         positions: module_positions,
         require_release_checked_access: generic_input.requires_release_checked_access(),
         private_runtime_portable_symbols,
+        root_array_storage,
+        root_array_accessors,
         checked_access: project_build.and_then(|build| build.prepared().checked_access()).map(|access| {
             CheckedAccessSymbols {
                 non_null: project_function_name(&access.source, &access.non_null),
@@ -3384,7 +3418,7 @@ fn emit_main<'ctx, 'module>(
                     continue;
                 }
                 if binding.is_allocation {
-                    initialize_runtime_array_global(context, &mut state, binding, |state, length| {
+                    initialize_runtime_array_global(context, &mut state, binding, None, |state, length| {
                         emit_typed_expression(context, state, length, &ScalarType::U64)
                     })?;
                     continue;
@@ -3801,6 +3835,7 @@ fn initialize_runtime_array_global<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
+    source: Option<&wosy_syntax::SourceIdentity>,
     emit_length: impl FnOnce(
         &mut EmitState<'ctx, 'module>,
         &ScalarExpression,
@@ -3818,12 +3853,21 @@ fn initialize_runtime_array_global<'ctx, 'module>(
         .as_ref()
         .ok_or_else(|| "runtime allocation has no length".to_owned())?;
     let length = take_basic(emit_length(state, length)?)?.into_int_value();
-    let pointer = emit_runtime_array_allocation(context, state, element, length)?;
-    let (global, _) = state
-        .globals
-        .get(&receiver.name)
+    let (global, _) = state.globals.get(&receiver.name)
         .ok_or_else(|| format!("unknown LLVM global {}", receiver.name))?;
+    let paired = source.and_then(|source| state.project_names?.root_array_storage.get(
+        &wosy_syntax::SourceSpan::new(source.clone(), receiver.name_span)))
+        .filter(|owner| owner.backing == *global);
+    let count = paired.map(|owner| owner.count);
+    let pointer = if count.is_some() {
+        ownership::emit_runtime_array_allocation_with_domain(context, state, element, length, true)?
+    } else {
+        emit_runtime_array_allocation(context, state, element, length)?
+    };
     let storage = global.as_pointer_value();
+    if let Some(count) = count {
+        state.builder.build_store(count.as_pointer_value(), length).map_err(builder_error)?;
+    }
     state.builder.build_store(storage, pointer).map_err(builder_error)?;
     state.storage.insert(receiver.name.clone(), (storage, receiver.ty.clone()));
     state.runtime_array_owners.insert(receiver.name.clone(), true);
@@ -3902,7 +3946,7 @@ fn initialize_project_module<'ctx, 'module>(
                     continue;
                 }
                 if binding.is_allocation {
-                    initialize_runtime_array_global(context, state, binding, |state, length| {
+                    initialize_runtime_array_global(context, state, binding, Some(&module.source), |state, length| {
                         emit_project_typed_expression(
                             context, state, length, &ScalarType::U64, module, modules,
                         )

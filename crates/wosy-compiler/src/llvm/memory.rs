@@ -472,8 +472,13 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let fallback = guarded_extent.map(|_| (
                 "guarded_index_out_of_bounds", "guarded_index_panic", "guarded_index_continue",
             ));
+            let root_extent = if matches!(&base_type, ScalarType::RuntimeArray { .. }) {
+                capture_root_module_runtime_extent(context, state, base, base_pointer)?
+            } else { None };
             let runtime_extent = if borrowed_extent.is_some() {
                 borrowed_extent
+            } else if root_extent.is_some() {
+                root_extent
             } else if guarded_extent.is_none()
                 && (state.require_release_checked_access || !state.local_runtime_extents.is_empty())
                 && matches!(&base_type, ScalarType::RuntimeArray { .. })
@@ -564,7 +569,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 let index = if guarded_extent.is_some() || checked_lexical_descriptor
-                    || borrowed_extent.is_some() || portable_wasm_offset
+                    || borrowed_extent.is_some() || root_extent.is_some() || portable_wasm_offset
                 {
                     array_address_index(context, state, index)?
                 } else { index };
@@ -593,6 +598,28 @@ pub(super) fn place_pointer<'ctx, 'module>(
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
     }
+}
+
+fn capture_root_module_runtime_extent<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    base: &crate::ScalarPlace, backing: PointerValue<'ctx>,
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
+    let Some(names) = state.project_names.filter(|names| !names.root_array_accessors.is_empty()) else { return Ok(None); };
+    let Some(function) = state.builder.get_insert_block().and_then(|block| block.get_parent()) else { return Ok(None); };
+    let Ok(symbol) = function.get_name().to_str() else { return Ok(None); };
+    let Some((owner, site)) = names.root_array_accessors.get(symbol) else { return Ok(None); };
+    let crate::ScalarPlace::Name { name, span } = base else { return Err("root-owned runtime index lost its exact place".into()); };
+    let nodes = state.body_call_nodes.ok_or("root-owned runtime index lacks prepared occurrences")?;
+    let paired = names.root_array_storage.get(owner).ok_or("root-owned runtime index lacks signed allocation storage")?;
+    let loaded_from = backing.as_instruction_value().is_some_and(|instruction|
+        instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
+            && instruction.get_operand(0).and_then(|operand| operand.value()) == Some(paired.backing.as_pointer_value().into()));
+    if !state.require_release_checked_access || *span != *site || !loaded_from
+        || nodes.module_place_declaration(base) != Some(owner)
+        || !state.globals.get(name).is_some_and(|(global, _)| *global == paired.backing)
+    { return Err("root-owned runtime index changed its checked owner or backing".into()); }
+    state.builder.build_load(context.i64_type(), paired.count.as_pointer_value(), "root_runtime_extent")
+        .map(|count| Some(count.into_int_value())).map_err(builder_error)
 }
 
 fn require_runtime_field_extent(

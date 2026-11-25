@@ -248,6 +248,7 @@ pub(crate) enum BindingDefinition {
 pub(crate) struct ModuleInitializationRegion {
     pub(crate) source: SourceIdentity,
     pub(crate) steps: Vec<ModuleInitializationStep>,
+    pub(super) has_private_runtime_owner_candidate: bool,
     pub(super) detail: ModuleInitializationDetail,
 }
 
@@ -504,6 +505,7 @@ pub(crate) fn module_initialization_region(
             .entry(binding.binding.as_str())
             .or_insert(&binding.target);
     }
+    let mut has_private_runtime_owner_candidate = false;
     let steps = items
         .iter()
         .enumerate()
@@ -519,7 +521,10 @@ pub(crate) fn module_initialization_region(
                         },
                     }
                 }
-                ScalarItem::Binding(_) => ModuleInitializationStepKind::BindingInitialization,
+                ScalarItem::Binding(binding) => {
+                    has_private_runtime_owner_candidate |= binding.is_allocation && binding.name.starts_with('_');
+                    ModuleInitializationStepKind::BindingInitialization
+                },
                 ScalarItem::Executable(_) => ModuleInitializationStepKind::ExecutableItem,
                 ScalarItem::Function(_) | ScalarItem::Extern(_) => return None,
             };
@@ -529,6 +534,7 @@ pub(crate) fn module_initialization_region(
     ModuleInitializationRegion {
         source: source.clone(),
         steps,
+        has_private_runtime_owner_candidate,
         detail: ModuleInitializationDetail::DispatchOnly,
     }
 }

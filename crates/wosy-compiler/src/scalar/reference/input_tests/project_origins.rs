@@ -494,6 +494,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),
+                has_private_runtime_owner_candidate: false,
                 detail: ModuleInitializationDetail::Occurrences(Box::new(
                     ModuleInitializationTopology {
                         structure: OccurrenceStructure::new(ByteSpan::new(0, 0)),

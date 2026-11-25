@@ -14277,6 +14277,193 @@ impl ProjectCallSiteResults {
     }
 }
 
+// A release-only module allocation can transport its real extent only when
+// every reader/writer is private, direct, and called inside the root lifetime.
+#[derive(Default)]
+pub(crate) struct ClosedRootArrayUses {
+    pub(crate) owners: HashMap<ByteSpan, String>,
+    pub(crate) accessor_sites: HashMap<ByteSpan, (ByteSpan, ByteSpan)>,
+}
+
+pub(super) fn close_root_array_uses(
+    prepared: &super::PreparedScalarProject, calls: &ProjectCallSiteResults,
+) -> ClosedRootArrayUses {
+    let project = prepared.project();
+    let Some(helper) = prepared.checked_access_source() else { return ClosedRootArrayUses::default(); };
+    let Some(source) = project.initialization_order.first() else { return ClosedRootArrayUses::default(); };
+    if source == helper || project.modules.len() != 2 { return ClosedRootArrayUses::default(); }
+    let Some((module, root)) = project.modules.iter().enumerate().find(|(_, module)| &module.source == source)
+        else { return ClosedRootArrayUses::default(); };
+    let Some(region) = calls.initialization_region(module) else { return ClosedRootArrayUses::default(); };
+    if !region.has_private_runtime_owner_candidate { return ClosedRootArrayUses::default(); }
+    let mut candidates = HashMap::new();
+    for item in &root.items {
+        match item {
+            ScalarItem::Namespace(_) | ScalarItem::Extern(_) => return ClosedRootArrayUses::default(),
+            ScalarItem::Binding(binding) if binding.is_allocation && binding.name.starts_with('_') => {
+                let [receiver] = binding.receivers.as_slice() else { continue; };
+                let ScalarType::RuntimeArray { element, .. } = &receiver.ty else { continue; };
+                if receiver.allocation_length.is_some() && aggregate::ordinary_value(element) {
+                    candidates.insert(receiver.name_span, (receiver.name.clone(), element.as_ref()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if candidates.is_empty() { return ClosedRootArrayUses::default(); }
+    let ModuleInitializationDetail::Occurrences(initializer) = &region.detail else { return ClosedRootArrayUses::default(); };
+    let mut initialization_steps = Vec::new();
+    let mut allocation_steps = HashMap::new();
+    for (position, step) in region.steps.iter().enumerate() {
+        let span = match (&step.kind, root.items.get(step.item)) {
+            (ModuleInitializationStepKind::BindingInitialization, Some(ScalarItem::Binding(binding))) => {
+                if candidates.contains_key(&binding.name_span) {
+                    allocation_steps.insert(binding.name_span, position);
+                }
+                binding.span
+            }
+            (ModuleInitializationStepKind::ExecutableItem, Some(ScalarItem::Executable(item))) => match item {
+                ScalarBlockItem::LocalBinding(binding) => binding.span,
+                ScalarBlockItem::Assignment(assignment) => assignment.span,
+                ScalarBlockItem::Expression(expression) => expression_span(expression),
+            },
+            _ => return ClosedRootArrayUses::default(),
+        };
+        if initialization_steps.last().is_some_and(|previous: &ByteSpan| previous.end > span.start) {
+            return ClosedRootArrayUses::default();
+        }
+        initialization_steps.push(span);
+    }
+    let mut invalid = HashSet::new();
+    let mut accessors = HashMap::new();
+    let poison_init = |seen: InitializationStorage, invalid: &mut HashSet<ByteSpan>| {
+        if let InitializationStorage::Module(span) = seen {
+            if candidates.contains_key(&span) { invalid.insert(span); }
+        }
+    };
+    for name in initializer.identities.names.values() {
+        if let InitializationName::Storage(storage) = *name { poison_init(storage, &mut invalid); }
+    }
+    for &storage in initializer.identities.roots.values() { poison_init(storage, &mut invalid); }
+    for destination in initializer.identities.destinations.values() {
+        match *destination {
+            InitializationDestination::Existing(storage) => poison_init(storage, &mut invalid),
+            InitializationDestination::IntroduceModule(span) => poison_init(InitializationStorage::Module(span), &mut invalid),
+            InitializationDestination::Introduce(_) => {}
+        }
+    }
+    let owner = |identity: &SourceSpan| (&identity.source == source && candidates.contains_key(&identity.range)).then_some(identity.range);
+    let mut outside_calls = HashSet::new();
+    for (item, function) in root.items.iter().enumerate().filter_map(|(item, value)| match value {
+        ScalarItem::Function(function) => Some((item, function)), _ => None,
+    }) {
+        let Some(body) = calls.function_body(module, item, None) else { return ClosedRootArrayUses::default(); };
+        let mut bodies = vec![body];
+        while let Some(sites) = bodies.pop() {
+            bodies.extend(&sites.arms);
+            outside_calls.extend(sites.callable_escapes.iter().filter(|decl| &decl.source == source).map(|decl| decl.range));
+            for site in &sites.sites {
+                if let ResolvedCallTarget::ModuleCallable { source: caller, declaration_span, .. } = &site.target {
+                    if caller == source { outside_calls.insert(*declaration_span); }
+                }
+            }
+            if let PlainNameFacts::Prepared(rows) = &sites.plain_names {
+                for plain in rows.values() {
+                    if let PlainNameIdentity::ModuleValue(identity) = plain {
+                        if let Some(owner) = owner(identity) { invalid.insert(owner); }
+                    }
+                }
+            }
+            if let DirectDestinationFacts::Prepared(rows) = &sites.direct_destinations {
+                for destination in rows.values() {
+                    if let DirectDestinationIdentity::Module(identity) = destination {
+                        if let Some(owner) = owner(identity) { invalid.insert(owner); }
+                    }
+                }
+            }
+            let NamedPlaceRootFacts::Prepared(roots) = &sites.named_place_roots else { return ClosedRootArrayUses::default(); };
+            let mut uses = roots.iter().filter_map(|(&point, identity)| match identity {
+                NamedPlaceRootIdentity::ModuleValue(identity) => Some((point, owner(identity)?)),
+                _ => None,
+            });
+            let Some((point, allocation)) = uses.next() else { continue; };
+            let (_, element) = candidates[&allocation];
+            let eligible = std::ptr::eq(sites, body)
+                && function.name.starts_with('_') && function.overload_arms.is_empty()
+                && function.generic_parameters.is_empty() && !function.body.unsafe_context
+                && uses.next().is_none()
+                && root_array_accessor(prepared, module, item, function, point, allocation, element);
+            if !eligible {
+                invalid.insert(allocation);
+                invalid.extend(roots.values().filter_map(|identity| match identity {
+                    NamedPlaceRootIdentity::ModuleValue(identity) => owner(identity), _ => None,
+                }));
+            } else {
+                accessors.insert(function.name_span, (allocation, sites.occurrences[point.0].span));
+            }
+        }
+    }
+    outside_calls.extend(initializer.callable_escapes.iter().filter(|decl| &decl.source == source).map(|decl| decl.range));
+    let mut reached = HashSet::new();
+    for (&point, target) in &initializer.call_targets {
+        let (identity, ordinary) = match target {
+            ModuleInitializationCallTarget::Direct { declaration, concrete } =>
+                (declaration, *concrete == ConcreteCallSelection::Declaration),
+            ModuleInitializationCallTarget::Generic { declaration, .. } => (declaration, false),
+            _ => continue,
+        };
+        if &identity.source != source { continue; }
+        let Some(&(allocation, _)) = accessors.get(&identity.range) else { continue; };
+        let span = initializer.occurrences[point.0].span;
+        let position = initialization_steps.partition_point(|step| step.end <= span.start);
+        let dominated = allocation_steps.get(&allocation).is_some_and(|&install| install < position)
+            && initialization_steps.get(position).is_some_and(|step| step.start <= span.start && span.end <= step.end);
+        if !ordinary || !dominated {
+            invalid.insert(allocation);
+        } else {
+            reached.insert(identity.range);
+        }
+    }
+    for (function, &(allocation, _)) in &accessors {
+        if outside_calls.contains(function) || !reached.contains(function) { invalid.insert(allocation); }
+    }
+    accessors.retain(|_, (allocation, _)| !invalid.contains(allocation));
+    let owners = accessors.values().map(|(allocation, _)| (*allocation, candidates[allocation].0.clone())).collect();
+    ClosedRootArrayUses { owners, accessor_sites: accessors }
+}
+
+fn root_array_accessor(
+    prepared: &super::PreparedScalarProject, module: usize, item: usize, function: &ScalarFunction,
+    root_ordinal: OccurrenceOrdinal, allocation: ByteSpan, element: &ScalarType,
+) -> bool {
+    let Some(node) = function.body.items.first() else { return false; };
+    if function.body.items.len() != 1 { return false; }
+    let ScalarType::Callable { parameters, outputs } = &function.signature else { return false; };
+    let (place, assigned) = match node {
+        ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })
+            if function.body.final_output_values.len() == 1 && parameters.as_slice() == [ScalarType::U64]
+                && matches!(outputs.outputs.as_slice(), [output] if &output.ty == element) => (place, None),
+        ScalarBlockItem::Assignment(assignment) if function.body.final_output_values.is_empty()
+            && matches!(parameters.as_slice(), [ScalarType::U64, value] if value == element)
+            && matches!(outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) => {
+            let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice()) else { return false; };
+            (&target.place, Some(value))
+        }
+        _ => return false,
+    };
+    let ScalarPlace::Index { base, index, .. } = place else { return false; };
+    let Ok(nodes) = prepared.bind_callable_body_call_nodes(module, item, None, &function.body) else { return false; };
+    matches!(base.as_ref(), ScalarPlace::Name { .. })
+        && nodes.place_ordinal(base) == Some(root_ordinal.0)
+        && matches!(nodes.named_place_root(base), Some(NamedPlaceRootIdentity::ModuleValue(owner))
+            if owner.range == allocation)
+        && nodes.checked_place_type(place) == Some(element)
+        && nodes.checked_expression_type(index) == Some(&ScalarType::U64)
+        && nodes.lexical_expression_declaration(index) == function.parameter_spans.first().copied()
+        && assigned.is_none_or(|value| nodes.checked_expression_type(value) == Some(element)
+            && nodes.lexical_expression_declaration(value) == function.parameter_spans.get(1).copied())
+}
+
 #[cfg(test)]
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
     resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly, None)

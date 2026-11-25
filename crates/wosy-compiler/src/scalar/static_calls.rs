@@ -114,6 +114,7 @@ pub struct PreparedScalarProject {
     checked_access: Option<CheckedAccessDeclarations>,
 
     require_release_checked_access: bool,
+    root_array_uses: reference::ClosedRootArrayUses,
     generated_callables: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedGeneratedCallable>,
     inline_arms: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedAnonymousCallable>,
 }
@@ -332,7 +333,7 @@ impl PreparedScalarProject {
                 kind: ProjectPreparationRejectionKind::StaticLookup(calls),
             });
         }
-        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new() };
+        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new(), root_array_uses: Default::default() };
         if inline_count != 0 {
             if isolated_anonymous_arm.is_some() {
                 return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
@@ -372,7 +373,12 @@ impl PreparedScalarProject {
                 }
             };
         }
+        prepared.root_array_uses = reference::close_root_array_uses(&prepared, &prepared.calls);
         Ok(prepared)
+    }
+
+    pub(crate) fn root_array_uses(&self) -> &reference::ClosedRootArrayUses {
+        &self.root_array_uses
     }
 
     pub(crate) fn generated_callables(&self) -> impl Iterator<Item = (

@@ -704,6 +704,11 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.callable_array_statements.contains(&std::ptr::from_ref(statement))
     }
 
+    pub(crate) fn module_place_declaration(&self, place: &ScalarPlace) -> Option<&'a SourceSpan> {
+        let NamedPlaceRootIdentity::ModuleValue(declaration) = self.named_place_root(place)? else { return None; };
+        Some(declaration)
+    }
+
     pub(crate) fn lexical_existing_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
         match self.direct_destination(place)? {
             DirectDestinationIdentity::Existing(binding) => Some(binding.declaration_span),
