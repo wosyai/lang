@@ -3720,6 +3720,62 @@ fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
     }
 }
 
+#[test]
+fn ordinary_build_read_projection_is_exact_owner_and_artifact_neutral() {
+    let text = r#"%%start
+        u8(u64) read_index = fn(index) {
+            u8[2] data = [1, 2];
+            data[index]
+        };
+        u8(*u8) read_pointer = fn(pointer) { *pointer };
+    %%end"#;
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, target);
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        let before = emit_scalar_build_single_module_llvm(&validated).unwrap().to_text();
+        let [ScalarItem::Function(array), ScalarItem::Function(shared)] = prepared.project().modules[0].items.as_slice()
+            else { panic!("ordinary prepared callable pair"); };
+        let indexed = prepared.bind_callable_body_call_nodes(0, 0, None, &array.body).unwrap();
+        let dereference = prepared.bind_callable_body_call_nodes(0, 1, None, &shared.body).unwrap();
+        let [ScalarBlockItem::LocalBinding(data), ScalarBlockItem::Expression(read)] = array.body.items.as_slice()
+            else { panic!("fixed-array value read"); };
+        let [ScalarBlockItem::Expression(pointer)] = shared.body.items.as_slice()
+            else { panic!("direct checked-reference value read"); };
+        let crate::ScalarExpression::IndexedRead { place, .. } = read else { panic!("indexed read AST"); };
+        let crate::ScalarPlace::Index { base, index, .. } = place else { panic!("indexed place AST"); };
+        let shape = indexed.fixed_index_read(read).unwrap();
+        assert_eq!(shape.extent, 2);
+        assert_eq!(shape.result, &ScalarType::U8);
+        assert_eq!(shape.base_binding.declaration_span, data.name_span);
+        assert_eq!(shape.index_binding.declaration_span, array.parameter_spans[0]);
+        assert!(indexed.expression_ordinal(read).is_some() && indexed.expression_ordinal(index).is_some());
+        assert_ne!(indexed.place_ordinal(place), indexed.place_ordinal(base));
+        assert_ne!(shape.read, shape.index);
+        assert_ne!(shape.place, shape.base);
+        let shape = dereference.shared_checked_read(pointer).unwrap();
+        assert_eq!(shape.binding.declaration_span, shared.parameter_spans[0]);
+        assert_eq!(shape.result, &ScalarType::U8);
+        assert!(indexed.fixed_index_read(&read.clone()).is_none());
+        assert!(dereference.shared_checked_read(&pointer.clone()).is_none());
+        assert!(indexed.shared_checked_read(pointer).is_none());
+        assert!(dereference.fixed_index_read(read).is_none());
+        let distinct = prepare_initializer_test(text, target);
+        let ScalarItem::Function(copy_array) = &distinct.project().modules[0].items[0] else { unreachable!(); };
+        let ScalarBlockItem::Expression(copy_read) = &copy_array.body.items[1] else { unreachable!(); };
+        assert!(indexed.fixed_index_read(copy_read).is_none());
+        let rebound = prepared.bind_callable_body_call_nodes(0, 0, None, &copy_array.body).unwrap();
+        assert!(rebound.expression_ordinal(copy_read).is_some());
+        assert!(rebound.fixed_index_read(copy_read).is_none());
+        let cloned = shared.body.clone();
+        let ScalarBlockItem::Expression(cloned_read) = &cloned.items[0] else { unreachable!(); };
+        let rebound = prepared.bind_callable_body_call_nodes(0, 1, None, &cloned).unwrap();
+        assert!(rebound.expression_ordinal(cloned_read).is_some());
+        assert!(rebound.shared_checked_read(cloned_read).is_none());
+        assert_eq!(emit_scalar_build_single_module_llvm(&validated).unwrap().to_text(), before);
+    }
+}
+
 fn length_loaded_for_runtime_array(llvm: &str) -> &str {
     let slot = llvm
         .lines()

@@ -6812,34 +6812,31 @@ struct ContextualCallPlace {
 }
 
 /// Structural access candidate, not evidence that any check can be omitted.
-#[cfg(feature = "internal-checker")]
 #[derive(Debug, PartialEq)]
-pub(super) struct FixedIndexReadShape<'a> {
-    pub(super) read: OccurrenceOrdinal,
-    pub(super) place: OccurrenceOrdinal,
-    pub(super) base: OccurrenceOrdinal,
-    pub(super) index: OccurrenceOrdinal,
-    pub(super) base_binding: &'a ReferenceBindingId,
-    pub(super) index_binding: &'a ReferenceBindingId,
-    pub(super) result: &'a ScalarType,
-    pub(super) extent: usize,
+pub(crate) struct FixedIndexReadShape<'a> {
+    pub(crate) read: OccurrenceOrdinal,
+    pub(crate) place: OccurrenceOrdinal,
+    pub(crate) base: OccurrenceOrdinal,
+    pub(crate) index: OccurrenceOrdinal,
+    pub(crate) base_binding: &'a ReferenceBindingId,
+    pub(crate) index_binding: &'a ReferenceBindingId,
+    pub(crate) result: &'a ScalarType,
+    pub(crate) extent: usize,
 }
 
 /// Shape only: the checked-reference type does not establish non-null,
 /// liveness, a safe checked-helper match, or permission to omit any guard.
-#[cfg(feature = "internal-checker")]
 #[derive(Debug, PartialEq)]
-pub(super) struct SharedCheckedReadShape<'a> {
-    pub(super) read: OccurrenceOrdinal,
-    pub(super) place: OccurrenceOrdinal,
-    pub(super) pointer: OccurrenceOrdinal,
-    pub(super) binding: &'a ReferenceBindingId,
-    pub(super) result: &'a ScalarType,
+pub(crate) struct SharedCheckedReadShape<'a> {
+    pub(crate) read: OccurrenceOrdinal,
+    pub(crate) place: OccurrenceOrdinal,
+    pub(crate) pointer: OccurrenceOrdinal,
+    pub(crate) binding: &'a ReferenceBindingId,
+    pub(crate) result: &'a ScalarType,
 }
 
 impl FunctionCallSites {
-    #[cfg(feature = "internal-checker")]
-    #[allow(dead_code)] // No proof or backend consumer yet.
+    #[allow(dead_code)] // Structural handoff only; no guard control.
     pub(super) fn shared_checked_read_shape(&self, read: OccurrenceOrdinal) -> Option<SharedCheckedReadShape<'_>> {
         let edges = &self.structure.edges;
         let checked = &self.structure.checked_types;
@@ -6873,7 +6870,6 @@ impl FunctionCallSites {
 
     /// Project only existing prepared identities. No checker-only rows, AST
     /// rewalk, control-flow fact, or runtime helper lowering is implied.
-    #[cfg(feature = "internal-checker")]
     pub(super) fn fixed_index_read_shape(&self, read: OccurrenceOrdinal) -> Option<FixedIndexReadShape<'_>> {
         let edges = &self.structure.edges;
         let checked = &self.structure.checked_types;

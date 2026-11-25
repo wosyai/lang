@@ -182,6 +182,7 @@ use crate::scalar::reference::self_tail::checked::CheckedForwardingProof;
 use crate::scalar::{CfgPointId, ScalarReferenceCfg};
 
 pub(crate) struct CallableBodyCallNodes<'a> {
+    original_read_body: Option<super::super::static_calls::OriginalReadBody<'a>>,
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
     self_tail_candidates: HashMap<*const ScalarExpression, &'a ScalarExpression>,
@@ -687,6 +688,36 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.calls?.contextual_argument(ordinal)
     }
 
+    pub(in crate::scalar) fn seal_original_read_body(
+        &mut self, body: &ScalarBlock, seal: super::super::static_calls::OriginalReadBody<'a>,
+    ) {
+        if seal.matches(body) { self.original_read_body = Some(seal); }
+    }
+
+    /// Structural identity of this original ordinary scalar read. This
+    /// does not certify a bound, resolve a helper, or authorize emission.
+    #[allow(dead_code)] // Retained-helper integration is a separate phase.
+    pub(crate) fn fixed_index_read(
+        &self, expression: &ScalarExpression,
+    ) -> Option<super::super::reference::FixedIndexReadShape<'a>> {
+        self.original_read_body.as_ref()?;
+        if !matches!(expression, ScalarExpression::IndexedRead { .. }) { return None; }
+        let read = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.fixed_index_read_shape(read)
+    }
+
+    /// Same structural query as Check uses, but borrowed from this one
+    /// existing typed body. No non-null or ownership result is implied.
+    #[allow(dead_code)]
+    pub(crate) fn shared_checked_read(
+        &self, expression: &ScalarExpression,
+    ) -> Option<super::super::reference::SharedCheckedReadShape<'a>> {
+        self.original_read_body.as_ref()?;
+        if !matches!(expression, ScalarExpression::Dereference { .. }) { return None; }
+        let read = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.shared_checked_read_shape(read)
+    }
+
     pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
         self.proof_nodes
             .expressions
@@ -723,6 +754,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             )
             .collect();
         let mut nodes = Self {
+            original_read_body: None,
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
             self_tail_candidates: HashMap::with_capacity(calls.self_tail_candidates.len()),

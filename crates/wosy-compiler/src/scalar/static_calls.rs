@@ -192,6 +192,15 @@ impl PreparedReadOccurrence<'_> {
     }
 }
 
+/// Sealed by the preparation owner, never inferred from a shape match.
+pub(in crate::scalar) struct OriginalReadBody<'a>(&'a ScalarBlock);
+
+impl OriginalReadBody<'_> {
+    pub(in crate::scalar) fn matches(&self, body: &ScalarBlock) -> bool {
+        std::ptr::eq(self.0, body)
+    }
+}
+
 pub struct PreparedScalarProject {
     project: ScalarProject,
     calls: reference::ProjectCallSiteResults,
@@ -416,7 +425,15 @@ impl PreparedScalarProject {
                     module.source,
                 )
             })?;
-        control::CallableBodyCallNodes::bind(&module.source, body, calls, checked_proof)
+        let mut bound = control::CallableBodyCallNodes::bind(&module.source, body, calls, checked_proof)?;
+        if let (None, Some(ScalarItem::Function(function))) = (arm_index, module.items.get(item_ordinal)) {
+            if function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                && std::ptr::eq(&function.body, body)
+            {
+                bound.seal_original_read_body(body, OriginalReadBody(&function.body));
+            }
+        }
+        Ok(bound)
     }
 
     #[cfg(test)]
