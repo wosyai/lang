@@ -4117,12 +4117,12 @@ fn check_closed_project_callable(
     }
 }
 
-use prepared::PreparedCheckerProject;
+pub(super) use prepared::PreparedCheckerProject;
 
 mod prepared {
     use super::*;
 
-    pub(super) struct PreparedCheckerProject {
+    pub(in crate::scalar) struct PreparedCheckerProject {
         project: ScalarProject,
         calls: ProjectCallSiteResults,
     }
@@ -4134,8 +4134,13 @@ mod prepared {
             Self { project, calls }
         }
 
-        pub(super) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
+        pub(in crate::scalar) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
             (&self.project, &self.calls)
+        }
+
+        #[cfg(feature = "internal-checker")]
+        pub(super) fn occurrence_snapshot(&self) -> super::super::static_calls::PreparedOccurrenceSnapshot<'_> {
+            super::super::static_calls::PreparedOccurrenceSnapshot::from_checker(self)
         }
 
         #[cfg(feature = "internal-checker")]
@@ -4143,9 +4148,7 @@ mod prepared {
         pub(super) fn observe_runtime_fixed_indices(
             &self, module: usize, item: usize,
         ) -> Option<super::super::checker_flow::RuntimeFixedIndexEvidence<'_>> {
-            let ScalarItem::Function(function) = self.project.modules.get(module)?.items.get(item)? else { return None; };
-            if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
-            let calls = self.calls.function_body(module, item, None)?;
+            let (function, calls) = self.occurrence_snapshot().monomorphic_body(module, item)?;
             super::super::checker_flow::observe_runtime_fixed_indices(calls, &function.body)
         }
     }
@@ -15768,9 +15771,11 @@ mod tests {
     #[cfg(feature = "internal-checker")]
     #[test]
     fn shared_checked_read_preflight_keeps_only_typed_lexical_dereferences() {
+        use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
         let src = source("src/main.w", "shared-checked-read-preflight");
         let text = r#"%%start
             u8(*u8) read = fn(pointer) { *pointer };
+            u8(*u8) second_read = fn(pointer) { *pointer };
             u8(*!u8) mutable = fn(pointer) { *pointer };
             *?u8(*u8) address = fn(pointer) { unsafe { &?*pointer } };
             u8(*u8) alias_read = fn(pointer) { *u8 alias = pointer; *alias };
@@ -15787,17 +15792,33 @@ mod tests {
                 vec![(crate::derive_scalar_build_declarations_from_cst(scalar), Vec::new())],
                 vec![src.clone()], ScalarPreparationInputs { target_layout },
             ).unwrap();
-            for (item, expected) in [1, 0, 0, 0].into_iter().enumerate() {
+            for (item, expected) in [1, 1, 0, 0, 0].into_iter().enumerate() {
                 let body = checker.parts().1.function_body(0, item, None).unwrap();
-                let shapes = (0..body.occurrences.len()).filter_map(|read|
-                    body.shared_checked_read_shape(OccurrenceOrdinal(read))).collect::<Vec<_>>();
-                let ordinary = build.shared_checked_read_shapes(0, item).unwrap();
-                assert_eq!(shapes.len(), expected);
-                assert_eq!(ordinary, shapes);
-                if let ([left], [right]) = (ordinary.as_slice(), shapes.as_slice()) {
-                    assert!(!std::ptr::eq(left.binding, right.binding));
-                    assert_eq!(left.result, &ScalarType::U8);
-                }
+                let checker_view = checker.occurrence_snapshot();
+                let build_view = build.occurrence_snapshot();
+                let kind = PreparedReadKind::SharedCheckedReference;
+                let shapes = (0..body.occurrences.len()).filter_map(|read| {
+                    let read = OccurrenceOrdinal(read);
+                    let checker_packet = checker_view.read(0, item, read, kind);
+                    let build_packet = build_view.read(0, item, read, kind);
+                    assert_eq!(checker_packet.is_some(), build_packet.is_some());
+                    let checked = checker_packet?;
+                    let ordinary = build_packet.unwrap();
+                    assert!(checked.matches(checker_view, 0, item, read, kind));
+                    assert_eq!(checked.target_layout(), target_layout);
+                    let other_item = 1 - item;
+                    let peer = checker_view.read(0, other_item, read, kind).expect("same ordinal in another actual read");
+                    assert!(peer.matches(checker_view, 0, other_item, read, kind));
+                    assert!(!checked.matches(checker_view, 0, other_item, read, kind));
+                    assert!(!checked.matches(build_view, 0, item, read, kind));
+                    assert!(!ordinary.matches(checker_view, 0, item, read, kind));
+                    assert!(!checked.matches(checker_view, 0, item, read, PreparedReadKind::FixedIndex));
+                    assert_eq!(checked.shape(), ordinary.shape());
+                    let PreparedReadShape::SharedCheckedReference(shape) = checked.shape() else { unreachable!() };
+                    assert_eq!(shape.result, &ScalarType::U8);
+                    Some(())
+                }).count();
+                assert_eq!(shapes, expected);
             }
             let raw = crate::parse_source(src.clone(),
                 "%%start u8(*?u8) raw = fn(pointer) { unsafe { *pointer } }; %%end".to_owned(), &[]);
@@ -15818,6 +15839,7 @@ mod tests {
     #[cfg(feature = "internal-checker")]
     #[test]
     fn runtime_fixed_index_evidence_requires_the_ordinary_guard_and_exact_preparation() {
+        use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
         use super::super::reference::{CheckerOrdinaryScalarLocalKind, CheckerSnapshotReadIndex, CheckerSnapshotArrayOffset};
         let src = source("src/main.w", "runtime-fixed-index-evidence");
         let text = r#"%%start
@@ -15866,15 +15888,24 @@ mod tests {
                 vec![(crate::derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
                 vec![src.clone()], ScalarPreparationInputs { target_layout: target },
             ).unwrap();
-            let build_shape = build.fixed_index_read_shape(0, 0, dynamic.source).unwrap();
-            assert_eq!(build_shape, shape);
+            let kind = PreparedReadKind::FixedIndex;
+            let checker_view = prepared.occurrence_snapshot();
+            let build_view = build.occurrence_snapshot();
+            let checker_packet = checker_view.read(0, 0, dynamic.source, kind).unwrap();
+            let build_packet = build_view.read(0, 0, dynamic.source, kind).unwrap();
+            assert_eq!(build_packet.shape(), checker_packet.shape());
+            let PreparedReadShape::FixedIndex(build_shape) = build_packet.shape() else { unreachable!() };
             assert!(!std::ptr::eq(build_shape.base_binding, shape.base_binding));
+            assert!(checker_packet.matches(checker_view, 0, 0, dynamic.source, kind));
+            assert!(!checker_packet.matches(build_view, 0, 0, dynamic.source, kind));
+            assert!(!checker_packet.matches(checker_view, 0, 0, access(calls, false).source, kind));
             assert!(result.authorizes(calls, dynamic, 2));
             assert!(!result.authorizes(calls, dynamic, 3));
             let similar = prepare(text, target);
             let similar_calls = similar.parts().1.function_body(0, 0, None).unwrap();
             assert!(!result.authorizes(similar_calls, access(similar_calls, true), 2));
             let other_target = prepare(text, if target == native { wasi } else { native });
+            assert!(!checker_packet.matches(other_target.occurrence_snapshot(), 0, 0, dynamic.source, kind));
             assert!(!result.authorizes(other_target.parts().1.function_body(0, 0, None).unwrap(), dynamic, 2));
             assert!(!result.authorizes(calls, access(calls, false), 2));
             let dead = text.replace("index < 2", "false");

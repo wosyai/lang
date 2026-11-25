@@ -111,6 +111,87 @@ impl PreparedProgram {
     }
 }
 
+/// Read-only borrowed view of one immutable prepared project and its
+/// canonical occurrences, not a checker result or Build authorization.
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+pub(super) struct PreparedOccurrenceSnapshot<'a> {
+    project: &'a ScalarProject,
+    calls: &'a reference::ProjectCallSiteResults,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // No proof or emission consumer.
+pub(super) enum PreparedReadKind { FixedIndex, SharedCheckedReference }
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub(super) enum PreparedReadShape<'a> {
+    FixedIndex(reference::FixedIndexReadShape<'a>),
+    SharedCheckedReference(reference::SharedCheckedReadShape<'a>),
+}
+
+/// No serialization, proof verdict or authority to match backend helpers.
+#[cfg(feature = "internal-checker")]
+pub(super) struct PreparedReadOccurrence<'a> {
+    snapshot: PreparedOccurrenceSnapshot<'a>,
+    body: &'a reference::FunctionCallSites,
+    module: usize,
+    item: usize,
+    read: reference::OccurrenceOrdinal,
+    kind: PreparedReadKind,
+    shape: PreparedReadShape<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PreparedOccurrenceSnapshot<'a> {
+    pub(super) fn from_checker(prepared: &'a super::checker_project::PreparedCheckerProject) -> Self {
+        let (project, calls) = prepared.parts();
+        Self { project, calls }
+    }
+
+    pub(super) fn monomorphic_body(self, module: usize, item: usize)
+        -> Option<(&'a ScalarFunction, &'a reference::FunctionCallSites)>
+    {
+        let ScalarItem::Function(function) = self.project.modules.get(module)?.items.get(item)? else { return None; };
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
+        Some((function, self.calls.function_body(module, item, None)?))
+    }
+
+    #[allow(dead_code)] // No proof or emission consumer.
+    pub(super) fn read(
+        self, module: usize, item: usize, read: reference::OccurrenceOrdinal, kind: PreparedReadKind,
+    ) -> Option<PreparedReadOccurrence<'a>> {
+        let (_, body) = self.monomorphic_body(module, item)?;
+        let shape = match kind {
+            PreparedReadKind::FixedIndex => PreparedReadShape::FixedIndex(body.fixed_index_read_shape(read)?),
+            PreparedReadKind::SharedCheckedReference => PreparedReadShape::SharedCheckedReference(body.shared_checked_read_shape(read)?),
+        };
+        Some(PreparedReadOccurrence { snapshot: self, body, module, item, read, kind, shape })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)] // No proof or emission consumer.
+impl PreparedReadOccurrence<'_> {
+    pub(super) fn shape(&self) -> &PreparedReadShape<'_> { &self.shape }
+
+    pub(super) fn target_layout(&self) -> ScalarTargetLayout {
+        self.snapshot.project.modules[self.module].target_layout
+    }
+
+    pub(super) fn matches(
+        &self, snapshot: PreparedOccurrenceSnapshot<'_>, module: usize, item: usize,
+        read: reference::OccurrenceOrdinal, kind: PreparedReadKind,
+    ) -> bool {
+        std::ptr::eq(self.snapshot.project, snapshot.project)
+            && std::ptr::eq(self.snapshot.calls, snapshot.calls)
+            && (self.module, self.item, self.read, self.kind) == (module, item, read, kind)
+            && snapshot.monomorphic_body(module, item).is_some_and(|(_, body)| std::ptr::eq(self.body, body))
+    }
+}
+
 pub struct PreparedScalarProject {
     project: ScalarProject,
     calls: reference::ProjectCallSiteResults,
@@ -257,19 +338,8 @@ impl PreparedScalarProject {
     }
 
     #[cfg(all(test, feature = "internal-checker"))]
-    pub(super) fn fixed_index_read_shape(
-        &self, module: usize, item: usize, read: reference::OccurrenceOrdinal,
-    ) -> Option<reference::FixedIndexReadShape<'_>> {
-        self.calls.function_body(module, item, None)?.fixed_index_read_shape(read)
-    }
-
-    #[cfg(all(test, feature = "internal-checker"))]
-    pub(super) fn shared_checked_read_shapes(
-        &self, module: usize, item: usize,
-    ) -> Option<Vec<reference::SharedCheckedReadShape<'_>>> {
-        let calls = self.calls.function_body(module, item, None)?;
-        Some((0..calls.occurrences.len()).filter_map(|read|
-            calls.shared_checked_read_shape(reference::OccurrenceOrdinal(read))).collect())
+    pub(super) fn occurrence_snapshot(&self) -> PreparedOccurrenceSnapshot<'_> {
+        PreparedOccurrenceSnapshot { project: &self.project, calls: &self.calls }
     }
 
     pub fn project(&self) -> &ScalarProject {
