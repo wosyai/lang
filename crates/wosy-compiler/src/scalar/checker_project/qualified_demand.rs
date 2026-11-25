@@ -756,6 +756,36 @@ mod tests {
             }
             let without_symbolic_root = run(&false_entry, pass_through, increment, exact_alias, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!without_symbolic_root.active && without_symbolic_root.directives.is_empty());
+            // Both reflected calls are checked across the full u8 domain.
+            // The first summary has slope -1; composing a second reflection
+            // must restore the exact entry axis, not just the same range.
+            let affine = symbolic.replace("first_value == input && second_value <= 127",
+                "first_value >= input && second_value == input");
+            let reflected_wrapper = pass_through.replace("out == core.old(input)", "out == 255 - core.old(input)");
+            let reflected_leaf = exact_alias.replace("fn(input) { input }", "fn(input) { u8 reflected = 255 - input; reflected }")
+                .replace("out == core.old(input)", "out == 255 - core.old(input)");
+            let checked = run(&affine, &reflected_wrapper, increment, &reflected_leaf, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+            let wrong_affine_join = affine.replace("core.require(input >= 128", "core.require(input >= 129");
+            let outcome = run(&wrong_affine_join, &reflected_wrapper, increment, &reflected_leaf, package).unwrap();
+            let [failure] = outcome.directives.as_slice() else { panic!("one applicable affine lane refutes the authored check"); };
+            assert_eq!(failure.code(), &BigInt::from(78));
+            assert_eq!(failure.source, app);
+            assert_eq!(&wrong_affine_join[failure.condition.start as usize..failure.condition.end as usize], "input >= 129");
+            for (axis, bound) in [128, 127, 128].into_iter().enumerate() {
+                let exact = BigInt::from(bound);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&exact, &exact)]));
+            }
+            let refuted_affine_leaf = reflected_leaf.replace("out == 255 - core.old(input)", "out == core.old(input)");
+            let withheld = run(&affine, &reflected_wrapper, increment, &refuted_affine_leaf, package).unwrap();
+            assert!(withheld.directives.is_empty());
+            assert_eq!(withheld.symbolic_diagnostic.unwrap().proof.source, right);
+            let wrong_coverage = reflected_leaf.replace("ensures", "where (input <= 254) ensures");
+            assert!(matches!(run(&affine, &reflected_wrapper, increment, &wrong_coverage, package),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let dormant_affine = run(&wrong_affine_join, &reflected_wrapper, increment, &reflected_leaf,
+                ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant_affine.active && dormant_affine.directives.is_empty());
             let dormant_branch = run(&wrong_branch_and_join, &mixed, increment, &wide, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_branch.active && dormant_branch.directives.is_empty());
             let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");
