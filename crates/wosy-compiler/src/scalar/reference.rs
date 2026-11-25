@@ -3823,6 +3823,40 @@ impl<'a> ReferenceFlowBuilder<'a> {
     }
 
     // Each complete edge transfers a freshly created arm-local owner.
+    fn guarded_call_choice(
+        &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal,
+    ) -> Option<[(CfgPointId, OccurrenceOrdinal); 2]> {
+        let ScalarExpression::If { then_branch, else_branch, .. } = value else { return None; };
+        let sites = self.call_sites;
+        let ConditionalRegion::Value { condition, then_block, else_block, .. } = sites.conditionals.get(&ordinal)?
+            else { return None; };
+        if sites.structure.checked_types.expressions.get(condition) != Some(&ScalarType::Bool)
+            || !matches!(sites.prepared_plain_name(*condition), Some(PlainNameIdentity::Lexical(_)))
+        { return None; }
+        let arm = |branch: &ScalarBlock, region: BlockOrdinal| {
+            let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, type_arguments, .. })] =
+                branch.items.as_slice() else { return None; };
+            if branch.unsafe_context || !type_arguments.is_empty()
+                || !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
+                    || aggregate::pure_widened_element(argument))
+            { return None; }
+            let [BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
+                sites.structure.blocks.get(region.0)?.items.as_slice() else { return None; };
+            let call = output.expression;
+            let signature = sites.checked_call_signatures.get(&call)?;
+            let point = *self.cfg.primary_call_points.get(&call)?;
+            if output.output != 0 || sites.declared_unsafe_calls.contains(&call.0)
+                || !signature.parameters.iter().all(aggregate::ordinary_value)
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
+            { return None; }
+            Some((point, call))
+        };
+        let arms = [arm(then_branch, *then_block)?, arm(else_branch, *else_block)?];
+        (arms[0] != arms[1] && arms[0].0 != arms[1].0 && arms[0].1 != arms[1].1).then_some(arms)
+    }
+
     fn widened_join_inputs(
         &self,
         value: &ScalarExpression,
@@ -4955,9 +4989,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             primary_ordinal,
                             ExpressionReadMode::GuardedStructInitializer,
                         )?
+                    } else if binding.fallible_assignment.is_some() && matches!(primary, ScalarExpression::If { .. }) {
+                        let previous = self.capture_call_points;
+                        self.capture_call_points = true;
+                        let result = self.expression(primary, scope, primary_ordinal);
+                        self.capture_call_points = previous;
+                        result?
                     } else {
                         self.expression(primary, scope, primary_ordinal)?
                     };
+                    if binding.fallible_assignment.is_some() && matches!(primary, ScalarExpression::If { .. }) {
+                        let Some(arms) = self.guarded_call_choice(primary, primary_ordinal).filter(|_|
+                            self.generic_parameters.is_empty() && receiver.ty == ScalarType::U64
+                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
+                        else {
+                            return Err(self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+                        };
+                        self.aggregate_result.fallible_call_choices.push((primary_ordinal, arms));
+                    }
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression
                         && matches!(primary, ScalarExpression::Call { .. })

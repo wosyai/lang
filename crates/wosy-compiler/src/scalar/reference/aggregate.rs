@@ -1273,6 +1273,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_formal_extent_required: bool,
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) fallible_call_choices: Vec<(OccurrenceOrdinal, [(CfgPointId, OccurrenceOrdinal); 2])>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -1509,7 +1510,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.fallible_call_initializers.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.fallible_call_initializers.is_empty() || !self.fallible_call_choices.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2947,6 +2948,7 @@ pub(crate) struct ClosedBody {
     pub(crate) fallible_allocation_relay: bool,
     pub(crate) fallible_relay_allocations: Vec<ByteSpan>,
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
+    pub(crate) fallible_allocating_choices: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_wrapper: Option<usize>,
@@ -6610,7 +6612,11 @@ fn closed_aggregates<'a>(
         declarations.insert((input.source, function.name_span), (module, item));
         if let Some(facts) = facts {
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
-                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal)));
+                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
+            for &(choice, arms) in &facts.fallible_call_choices {
+                fallible_call_requests.extend(arms.into_iter()
+                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice))));
+            }
         }
         if is_monomorphic && arm.is_none() && facts.is_some_and(|facts|
             matches!(facts.proved_literal_array_route(), Some(LiteralArrayRoute::FreshLeaf { .. })))
@@ -6701,6 +6707,7 @@ fn closed_aggregates<'a>(
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
+    let mut fallible_choices = BTreeMap::<(BodyKey, usize), usize>::new();
     let mut fallible_allocation_relays = BTreeMap::new();
     let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
@@ -6932,10 +6939,13 @@ fn closed_aggregates<'a>(
         };
         let mut memo = HashMap::new();
         let mut complete_suffixes = BTreeSet::new();
-        for (caller, source, cfg, call, ordinal) in fallible_call_requests {
+        for (caller, source, cfg, call, ordinal, choice) in fallible_call_requests {
             let target = target_body(&declarations, cfg, call)
                 .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
             if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
+            if let Some(choice) = choice {
+                *fallible_choices.entry((caller, choice.0)).or_default() += 1;
+            }
             let mut visited = BTreeSet::new();
             let mut current = target;
             let mut incoming = (caller, ordinal.0);
@@ -6965,6 +6975,9 @@ fn closed_aggregates<'a>(
             // The all-use check below still applies globally to every node.
             complete_suffixes.extend(visited);
         }
+    }
+    if fallible_choices.values().any(|&arms| arms != 2) {
+        return Err("fallible conditional requires the same sealed outcome in both arms".into());
     }
     ordinary.census(reservations, &module_at, &declarations);
     for (target, calls) in &fallible_allocating_targets {
@@ -7342,6 +7355,9 @@ fn closed_aggregates<'a>(
             for &(caller, ordinal) in sites {
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
             }
+        }
+        for &(body, ordinal) in fallible_choices.keys() {
+            result.bodies.entry(body).or_default().fallible_allocating_choices.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         if !returned_index_requirements.is_empty() && !reservations.checked_access {

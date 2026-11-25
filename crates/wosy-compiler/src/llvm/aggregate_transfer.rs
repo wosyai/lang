@@ -576,6 +576,14 @@ pub(super) fn fallible_allocation_call_at(state: &EmitState<'_, '_>, expression:
     })
 }
 
+pub(super) fn fallible_allocation_choice_at(state: &EmitState<'_, '_>, expression: &ScalarExpression) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate| {
+        let choices = &aggregate.plan().fallible_allocating_choices;
+        !choices.is_empty() && state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
+            .is_some_and(|ordinal| choices.contains(&ordinal))
+    })
+}
+
 pub(super) fn fallible_allocation_result_type(context: &Context) -> inkwell::types::StructType<'_> {
     context.struct_type(&[context.bool_type().into(), context.i64_type().into()], false)
 }

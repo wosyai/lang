@@ -6658,6 +6658,13 @@ fn pending_fallible_operator(
             if is_integer_type(ty) => None,
         (ty, ScalarExpression::Call { type_arguments, .. })
             if is_integer_type(ty) && type_arguments.is_empty() => None,
+        (ScalarType::U64, ScalarExpression::If { condition, then_branch, else_branch, .. })
+            if matches!(condition.as_ref(), ScalarExpression::Name { name, .. }
+                if scope.get(name) == Some(&ScalarType::Bool))
+                && [then_branch, else_branch].into_iter().all(|branch|
+                    !branch.unsafe_context && matches!(branch.items.as_slice(),
+                        [ScalarBlockItem::Expression(ScalarExpression::Call { type_arguments, .. })]
+                            if type_arguments.is_empty())) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
                 && fields.iter().all(|field| match &field.value {

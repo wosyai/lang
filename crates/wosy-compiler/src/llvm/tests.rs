@@ -13015,3 +13015,72 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0
         }
     }
 }
+
+#[test]
+fn guarded_fallible_conditional_call_selects_one_sealed_arm() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _left = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(bool, u64) observed = fn(left, count) {
+    u64 result =? if (left) { _left(count) } else { _right(count) };
+    if (&result == null) { 0 } else { result + 1 }
+};
+if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
+    || observed(false, 9) != 10 || observed(true, 0) != 1) { core.system_panic(); };
+%%end";
+    let mixed = text.replace("u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };",
+        "u64(u64) _right = fn(count) { count };");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (sealed, text) in [(true, text), (false, mixed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                if !sealed {
+                    assert!(matches!(output, Err(error) if error.contains("requires the same sealed outcome in both arms")));
+                    continue;
+                }
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "sealed conditional initializer");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let caller = module.get_function(&self_tail_test_symbol(source, project, "observed")).unwrap();
+                let blocks = caller.get_basic_blocks();
+                let leaf = |name| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                let left = leaf("_left");
+                let right = leaf("_right");
+                let alloc = module.get_function("__wosy_core_alloc").unwrap();
+                let named_calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                for (leaf, arm) in [(left, b"if.then".as_slice()), (right, b"if.else".as_slice())] {
+                    assert_eq!(leaf.get_linkage(), inkwell::module::Linkage::Internal);
+                    let [call] = named_calls(leaf)[..] else { panic!("{llvm}") };
+                    assert_eq!(call.get_parent().unwrap().get_name().to_bytes(), arm);
+                }
+                let [destination] = named_calls(alloc)[..] else { panic!("{llvm}") };
+                assert_eq!(destination.get_parent().unwrap().get_name().to_bytes(), b"fallible.destination");
+                let merge = blocks.iter().find(|block| block.get_name().to_bytes() == b"if.merge").unwrap();
+                let phi = merge.get_first_instruction().unwrap();
+                assert_eq!(phi.get_opcode(), InstructionOpcode::Phi);
+                let present = phi.get_next_instruction().unwrap();
+                assert_eq!(present.get_opcode(), InstructionOpcode::ExtractValue);
+                assert_eq!(present.get_indices(), vec![0]);
+                assert_eq!(known_field_operand(present, 0).unwrap().as_instruction_value(), Some(phi));
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_CONDITIONAL_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

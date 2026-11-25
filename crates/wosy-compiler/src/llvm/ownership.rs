@@ -1223,7 +1223,9 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     {
         return Err("invalid guarded scalar allocation binding".into());
     }
-    let rhs = if super::aggregate_transfer::fallible_allocation_call_at(state, &binding.value) {
+    let rhs = if super::aggregate_transfer::fallible_allocation_call_at(state, &binding.value)
+        || super::aggregate_transfer::fallible_allocation_choice_at(state, &binding.value)
+    {
         let Some(BasicValueEnum::StructValue(pair)) = value else {
             return Err("missing sealed fallible RHS result".into());
         };
