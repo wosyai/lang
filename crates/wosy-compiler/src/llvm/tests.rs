@@ -19456,3 +19456,81 @@ if (observe(2,1) != 202) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn configured_checked_access_positive_selection_retains_authored_helpers() {
+    // The current private extent cohort is demonstrated on a separate closed
+    // owner/caller per child mode. These do not claim mixed calls on one owner.
+    let cases = [
+        ("selected_values.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/selected_values.w"), None),
+        ("shared_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/shared_field.w"), Some(("_read_field", 2))),
+        ("exclusive_field.w", include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/exclusive_field.w"), Some(("_update_field", 3))),
+    ];
+    for (name, text, field) in cases {
+        for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("project".into(), "package".into(), format!("src/{name}"), "r1".into());
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let access = prepared.checked_access().unwrap();
+            let null_symbol = project_function_name(&access.source, &access.non_null);
+            let bounds_symbol = project_function_name(&access.source, &access.in_extent);
+            let non_null = format!("call void @{null_symbol}(");
+            let bounds = format!("call void @{bounds_symbol}(");
+            let selector = format!("call i64 @{}(", project_function_name(&source, "checked_selector"));
+            let bounds_body = self_tail_test_body(&ir, "void", &bounds_symbol);
+            let null_body = self_tail_test_body(&ir, "void", &null_symbol);
+            assert!(bounds_body.contains("icmp uge i64") && bounds_body.contains("br i1"), "{bounds_body}");
+            assert!(null_body.contains("icmp eq") && null_body.contains("br i1"), "{null_body}");
+            for helper in [bounds_body, null_body] {
+                let condition = helper.lines().find(|line| line.contains(" = icmp ")).unwrap()
+                    .trim().split_once(" = ").unwrap().0;
+                let branch = format!("br i1 {condition}, label %if.then, label %if.merge");
+                assert!(helper.contains(&branch), "{helper}");
+                let (_, then_body) = helper.split_once("\nif.then:").unwrap();
+                let (trap, success) = then_body.split_once("\nif.merge:").unwrap();
+                assert!(trap.contains("call void @__wosy_core_system_panic("), "{helper}");
+                assert!(success.contains("ret void") && !success.contains("system_panic"), "{helper}");
+            }
+            if field.is_none() {
+                for (name, expected, fixed) in [("fixed_selected", 1, true), ("generated_selected", 2, false)] {
+                    let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, name));
+                    let selectors: Vec<_> = body.lines().filter(|line| line.contains(&selector)).collect();
+                    let checks: Vec<_> = body.lines().filter(|line| line.contains(&bounds)).collect();
+                    assert_eq!(selectors.len(), expected, "{body}");
+                    assert_eq!(checks.len(), expected, "{body}");
+                    let mut extent = None;
+                    for (selected, check) in selectors.into_iter().zip(checks) {
+                        let (index, _) = selected.trim().split_once(" = ").unwrap();
+                        let (actual, count) = check.split_once(&bounds).unwrap().1.split_once(", ").unwrap();
+                        assert_eq!(actual, format!("i64 {index}"), "{body}");
+                        let count = count.strip_suffix(')').unwrap();
+                        if fixed { assert_eq!(count, "i64 2", "{body}"); }
+                        else {
+                            let count_ssa = count.strip_prefix("i64 %").unwrap();
+                            assert!(body.lines().any(|line| line.contains("icmp ult i64")
+                                && line.ends_with(&format!(", %{count_ssa}"))), "{body}");
+                            assert_eq!(*extent.get_or_insert(count), count, "{body}");
+                        }
+                    }
+                }
+            } else if let Some((name, nulls)) = field {
+                let body = self_tail_test_body(&ir, "internal i64", &project_function_name(&source, name));
+                let (guard, row) = (body.find(&bounds).unwrap(), body.find("getelementptr inbounds [16 x i8]").unwrap());
+                assert_eq!(body.matches(&non_null).count(), nulls, "{body}");
+                assert_eq!(body.matches(&bounds).count(), 1, "{body}");
+                assert!(body.find(&non_null).unwrap() < guard && guard < row, "{body}");
+                assert!(body[guard..].lines().next().unwrap().ends_with(", i64 %borrowed_array_extent)"), "{body}");
+                assert!(body[..guard].lines().any(|line| line.contains("%borrowed_array_extent = extractvalue")
+                    && line.ends_with("%view, 1")), "{body}");
+            }
+        }
+    }
+}
