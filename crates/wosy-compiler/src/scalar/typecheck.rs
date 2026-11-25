@@ -5736,6 +5736,11 @@ fn writable_path_type(
                 diagnostics,
             );
             match base_type {
+                ScalarType::RuntimeArray { .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. }) => {
+                    diagnostics.push(diagnostic(program, "B0003",
+                        "checked runtime array write requires the extent of the dereferenced backing", *span));
+                    ScalarType::Error
+                }
                 ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
                     *element
                 }
@@ -5883,6 +5888,11 @@ fn writable_path_type_in_module(
                 diagnostics,
             );
             match base_type {
+                ScalarType::RuntimeArray { .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. }) => {
+                    diagnostics.push(module_diagnostic(module, "B0003",
+                        "checked runtime array write requires the extent of the dereferenced backing", *span));
+                    ScalarType::Error
+                }
                 ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
                     *element
                 }

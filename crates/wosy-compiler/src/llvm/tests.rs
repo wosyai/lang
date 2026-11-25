@@ -16905,3 +16905,90 @@ if (nullable(3, 1, true) != 37 || common(4, 0, true) != 2 || common(4, 3, false)
         }
     }
 }
+
+#[test]
+fn checked_fixed_array_assignment_retains_one_destination_after_rhs() {
+    let text = "%%start
+u8(u8) rhs = fn(value) { value };
+u64(u64) select = fn(index) { index };
+u8(*!(u8[3]), u64, u8) update = fn(writer, index, value) {
+    (*writer)[select(index)] = rhs(value);
+    (*writer)[index]
+};
+u8(u64,u8) observe = fn(index, value) {
+    u8[3] cells = [7, 8, 9];
+    u8 written = update(&!cells, index, value);
+    written + cells[1]
+};
+if (observe(1, 42) != 84) { core.system_panic(); };
+%%end";
+    let shared = text.replace("*!(u8[3])", "*(u8[3])").replace("&!cells", "&cells");
+    let runtime = text.replace("*!(u8[3])", "*!(u8[])");
+    let conflict = text.replace("    u8 written = update", "    *u8 live = &cells[1];\n    u8 written = update")
+        .replace("    written + cells[1]", "    written + *live");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let names = prepared.checked_access_source().unwrap();
+        let null = format!("call void @{}(", project_function_name(names, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(names, "check_index_in_extent"));
+        let rhs = format!("call i8 @{}(", project_function_name(&source, "rhs"));
+        let selector = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, "update"));
+        for (needle, count) in [(&rhs, 1), (&selector, 1), (&null, 2), (&bounds, 2)] {
+            assert_eq!(body.matches(needle).count(), count, "{body}");
+        }
+        let rhs_line = body.lines().find(|line| line.contains(&rhs)).unwrap();
+        let value = rhs_line.trim().split_once(" = ").unwrap().0;
+        let capture_prefix = format!("store i8 {value}, ptr ");
+        let capture = body.lines().find(|line| line.trim_start().starts_with(&capture_prefix)).unwrap();
+        let slot = capture.trim_start().strip_prefix(&capture_prefix).unwrap().split(',').next().unwrap();
+        let load_value = format!("load i8, ptr {slot},");
+        let reload = body.lines().find(|line| line.contains(&load_value)).unwrap();
+        let saved = reload.trim().split_once(" = ").unwrap().0;
+        let cell = body.lines().find(|line| line.contains(" = getelementptr inbounds [3 x i8]")).unwrap();
+        let address = cell.trim().split_once(" = ").unwrap().0;
+        let write = format!("store i8 {saved}, ptr {address},");
+        assert_eq!(body.matches(&write).count(), 1, "{body}");
+        let order = [&rhs[..], capture, reload, &null, "inttoptr", &selector, &bounds, cell, &write];
+        assert!(order.windows(2).all(|pair| body.find(pair[0]).unwrap() < body.find(pair[1]).unwrap()), "{body}");
+        let extent = body[body.find(&bounds).unwrap()..].lines().next().unwrap();
+        assert!(extent.ends_with(", i64 3)"), "{body}");
+        if layout == ScalarTargetLayout::WASM32 {
+            let narrowed = body.find("trunc i64").unwrap();
+            assert!(body.find(&bounds).unwrap() < narrowed && narrowed < body.find(cell).unwrap(), "{body}");
+        }
+        assert!(body[body.find(&write).unwrap()..].contains("load i8, ptr"), "{body}");
+        if let Some(out) = std::env::var_os("WOSY_CHECKED_FIXED_ARRAY_WRITE_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+        for (source, expected) in [
+            (&shared, "assignment dereference requires a mutable checked reference"),
+            (&runtime, "checked runtime array write requires the extent of the dereferenced backing"),
+            (&conflict, "read or move of unavailable place"),
+        ] {
+            let diagnostics = match prepare(source) {
+                Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+                Err(error) => error.diagnostics.clone(),
+            };
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.message == expected &&
+                (source != &conflict || diagnostic.labels.iter().any(|label|
+                    label.message == "origin of conflicting place or loan"))), "{diagnostics:?}");
+        }
+    }
+}
