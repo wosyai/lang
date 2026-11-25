@@ -162,7 +162,14 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
         crate::project_sources::Error::Observe(error) => error,
         crate::project_sources::Error::Graph(error) => format!("{error:?}"),
     })?;
-    let config = SourceConfig { entry: FileKey::from(&graph.nodes[0].source), namespaces, target, inputs, parser };
+    let profiles = cfg.targets[&target].profiles.keys().filter_map(|profile| {
+        cfg.artifact_profile(&target, profile).ok().map(|(_, _, artifact, _)| {
+            (profile.clone(), artifact.clone())
+        })
+    }).collect();
+    let config = SourceConfig {
+        entry: FileKey::from(&graph.nodes[0].source), namespaces, target, inputs, parser, profiles,
+    };
     let config = delta.add(Kind::Config, json(&config), vec![]);
     let mut by_location = BTreeMap::new();
     let mut leaves = Vec::new();

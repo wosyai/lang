@@ -42,16 +42,19 @@ type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
 mod project_declarations;
+mod prepared_project;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
+pub use prepared_project::{ProjectPreparationReport, RootedPreparedProject};
 
 pub struct SourceStore {
     tree: Tree,
     blobs: PathBuf,
     base_flights: base_declarations::Flights,
     project_commit: tokio::sync::Mutex<()>,
+    prepared_projects: prepared_project::PreparationCache,
 }
 
 #[derive(Default)]
@@ -72,6 +75,7 @@ impl SourceStore {
         Ok(Self {
             tree, blobs: dir.join("cas"), base_flights: Default::default(),
             project_commit: Default::default(),
+            prepared_projects: Default::default(),
         })
     }
 
@@ -111,6 +115,7 @@ impl SourceStore {
         let index = read_index(&tx, top)?;
         Ok(Some(SourceView {
             tx,
+            root,
             executable: index.executable,
             annotation: index.annotation,
             config: index.config,
@@ -554,12 +559,18 @@ fn validate_file(
 
 pub struct SourceView {
     tx: Transaction,
+    root: NodeId,
     pub executable: NodeId,
     pub annotation: NodeId,
     config: NodeId,
     pub modules: BTreeMap<FileKey, NodeId>,
     module_edges: BTreeMap<FileKey, Vec<NodeId>>,
     pub files: BTreeMap<FileKey, FileEntry>,
+}
+
+struct ConfiguredSourceView {
+    source: SourceView,
+    config: SourceConfig,
 }
 
 pub struct AuthoredFile {
@@ -599,6 +610,11 @@ fn read_cst(tx: &Transaction, root: NodeId) -> Result<CstNode> {
 }
 
 impl SourceView {
+    fn configured(self) -> Result<ConfiguredSourceView> {
+        let config = serde_json::from_slice(&read_node(&self.tx, self.config)?.data)?;
+        Ok(ConfiguredSourceView { source: self, config })
+    }
+
     /// Reconstitute the real Rowan tree from the selected root without reparsing.
     pub fn authored(&self, key: &FileKey) -> Result<AuthoredFile> {
         let file = self.files.get(key).ok_or("file outside selected source root")?;

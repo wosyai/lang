@@ -1,13 +1,13 @@
 //! Ordered base declarations over the admitted executable import graph.
 use super::{
     child_edge, file_source, key, read_node, write_edge, write_node, BaseDeclarationsView,
-    QueryDisposition, Result, SourceStore, SourceView, INTERN,
+    ConfiguredSourceView, QueryDisposition, Result, SourceStore, SourceView, INTERN,
 };
 use std::collections::HashMap;
 use surrealkv::{Durability, Mode, Transaction};
 use wosy_compiler::BASE_DECLARATION_ABI;
 use wosy_project::SourceNodeId;
-use wosy_protocol::{FileEntry, FileKey, Import, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{FileEntry, FileKey, Import, Kind, Node, NodeId};
 use wosy_syntax::SourceIdentity;
 
 const MODULE_DECLARATION_QUERIES: u8 = 14;
@@ -39,7 +39,7 @@ pub struct ProjectDeclarationModule {
     pub projection: NodeId,
     pub body: NodeId,
     pub imports: Vec<ProjectDeclarationImport>,
-    file: FileEntry,
+    pub(super) file: FileEntry,
 }
 
 /// Modules are in the ordinary compiler's first-discovery initialization
@@ -81,9 +81,8 @@ struct RootedOrder {
 }
 
 impl RootedOrder {
-    fn from_snapshot(view: SourceView) -> Result<Self> {
-        let config: SourceConfig = serde_json::from_slice(&read_node(&view.tx, view.config)?.data)?;
-        let entry = view.modules[&config.entry];
+    fn from_snapshot(view: SourceView, entry: &FileKey) -> Self {
+        let entry = view.modules[entry];
         let SourceView { modules, mut files, mut module_edges, .. } = view;
         let mut locations: HashMap<_, _> = modules.into_iter().map(|(key, id)| (id, key)).collect();
         let mut order = Vec::with_capacity(files.len());
@@ -113,7 +112,7 @@ impl RootedOrder {
         let modules = order.into_iter().map(|(id, key, file, imports)| ModuleInput {
             id, key, file, imports: imports.into_iter().map(|id| visited[&id]).collect(),
         }).collect();
-        Ok(Self { modules, postorder })
+        Self { modules, postorder }
     }
 }
 
@@ -143,7 +142,14 @@ fn read_projection(tx: &Transaction, module: &ModuleInput) -> Result<Option<Proj
 impl SourceStore {
     pub async fn project_declarations(&self, root: NodeId) -> Result<Option<ProjectDeclarationsView<'_>>> {
         let Some(view) = self.snapshot(root)? else { return Ok(None); };
-        let RootedOrder { modules, postorder } = RootedOrder::from_snapshot(view)?;
+        self.project_declarations_for_snapshot(view.configured()?).await.map(Some)
+    }
+
+    pub(super) async fn project_declarations_for_snapshot(
+        &self, snapshot: ConfiguredSourceView,
+    ) -> Result<ProjectDeclarationsView<'_>> {
+        let root = snapshot.source.root;
+        let RootedOrder { modules, postorder } = RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
         let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
         let cached: Vec<_> = modules.iter().map(|module| read_projection(&read, module))
             .collect::<Result<_>>()?;
@@ -179,7 +185,7 @@ impl SourceStore {
                 body: projection.body, imports, file: module.file,
             })
         }).collect::<Result<_>>()?;
-        Ok(Some(ProjectDeclarationsView { store: self, snapshot: root, entry_projection, report, modules }))
+        Ok(ProjectDeclarationsView { store: self, snapshot: root, entry_projection, report, modules })
     }
 
     async fn publish_projections(

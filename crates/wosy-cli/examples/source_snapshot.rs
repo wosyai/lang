@@ -9,6 +9,9 @@ use wosy_syntax::{CanonicalCstRoot, CstNode, SyntaxKind};
 use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext, SourceNodeId};
 use wosy_protocol::{FileKey, NodeId};
 
+#[path = "source_snapshot/typed_preparation.rs"]
+mod typed_preparation;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn milliseconds(since: Instant) -> f64 {
@@ -52,10 +55,19 @@ fn verify_declarations(project: &Path, key: &FileKey, view: &BaseDeclarationsVie
         assert_eq!(view.authored_span(executable.path_span), authored.path_span);
     }
 
-    // Independent test oracle: use the ordinary fresh parser's typed Rowan
-    // events, not the store's decoder or cached declaration output.
+    let executable = without_typed_comments(fresh.result().canonical_cst(), rooted.source().clone());
+    let oracle = wosy_compiler::derive_scalar_declarations_from_cst(&executable);
+    assert_eq!(serde_json::to_vec(rooted)?, serde_json::to_vec(&oracle)?);
+    Ok(())
+}
+
+// Independent oracle: use the fresh parser's typed Rowan events, not the
+// store's decoder or its detached declaration owner attachment.
+fn without_typed_comments(
+    authored: &CanonicalCstRoot, owner: wosy_syntax::SourceIdentity,
+) -> CanonicalCstRoot {
     let mut green = GreenNodeBuilder::new();
-    for event in fresh.result().canonical_cst().root.preorder_with_tokens() {
+    for event in authored.root.preorder_with_tokens() {
         match event {
             WalkEvent::Enter(NodeOrToken::Node(node)) => {
                 green.start_node(rowan::SyntaxKind(node.kind() as u16));
@@ -67,10 +79,7 @@ fn verify_declarations(project: &Path, key: &FileKey, view: &BaseDeclarationsVie
             _ => {}
         }
     }
-    let executable = CanonicalCstRoot::new(rooted.source().clone(), CstNode::new_root(green.finish()));
-    let oracle = wosy_compiler::derive_scalar_declarations_from_cst(&executable);
-    assert_eq!(serde_json::to_vec(rooted)?, serde_json::to_vec(&oracle)?);
-    Ok(())
+    CanonicalCstRoot::new(owner, CstNode::new_root(green.finish()))
 }
 
 async fn report_project(
@@ -171,6 +180,18 @@ async fn main() -> Result<()> {
     let store = SourceStore::open(&dir, 8 << 20)?;
     let open_ms = milliseconds(start);
     if let Some(package) = args.next() {
+        if package == "--typed-project" {
+            let root = prior.ok_or("typed project query needs a root")?;
+            let profile = args.next().ok_or("typed project query needs a profile")?;
+            let mode = args.next();
+            let other = args.next().map(|text| NodeId::parse_hex(&text)).transpose()?;
+            let other_profile = args.next();
+            let result = typed_preparation::run(
+                &store, &project, root, &profile, mode.as_deref(), other, other_profile.as_deref(),
+            ).await?;
+            println!("{result}");
+            return store.close().await;
+        }
         if package == "--project-declarations" {
             let root = prior.ok_or("project query needs a root")?;
             let mode = args.next();

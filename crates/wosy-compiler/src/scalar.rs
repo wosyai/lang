@@ -2282,6 +2282,27 @@ pub struct ScalarSourceDeclarations {
 }
 
 impl ScalarSourceDeclarations {
+    /// Attach detached base declarations to the executable module that owns
+    /// them, before contextual resolution. Their byte coordinates stay canonical.
+    pub fn with_executable_owner(mut self, owner: SourceIdentity) -> Self {
+        for structure in &mut self.structs {
+            structure.id.source = owner.clone();
+            for field in &mut structure.fields {
+                field.id.structure.source = owner.clone();
+            }
+        }
+        for enumeration in &mut self.enums {
+            enumeration.id.source = owner.clone();
+        }
+        for diagnostic in &mut self.diagnostics {
+            for label in &mut diagnostic.labels {
+                label.span.source = owner.clone();
+            }
+        }
+        self.source = owner;
+        self
+    }
+
     pub fn source(&self) -> &SourceIdentity {
         &self.source
     }

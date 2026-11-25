@@ -2,6 +2,7 @@
 use super::{file_source, key, read_comments, read_cst, read_node, write_edge, write_node, Edge, Result, SourceStore, INTERN};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::hash::Hash;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,11 +22,16 @@ const BLOB: u8 = 1;
 
 type QueryKey = [u8; 33];
 
-#[derive(Default)]
-pub(super) struct Flights(Mutex<HashMap<QueryKey, Weak<AsyncMutex<()>>>>);
+pub(super) struct Flights<K = QueryKey>(Mutex<HashMap<K, Weak<AsyncMutex<()>>>>);
 
-impl Flights {
-    fn acquire(&self, key: QueryKey) -> Arc<AsyncMutex<()>> {
+impl<K> Default for Flights<K> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+impl<K: Eq + Hash> Flights<K> {
+    pub(super) fn acquire(&self, key: K) -> Arc<AsyncMutex<()>> {
         let mut flights = self.0.lock().expect("declaration query registry");
         if let Some(gate) = flights.get(&key).and_then(Weak::upgrade) {
             return gate;
@@ -114,23 +120,36 @@ impl SourceStore {
         let source = file_source(file)?;
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
         let spans = AuthoredSpanMap::from_comments(&read_comments(&tx, file.annotation)?);
-        let cached = if let Some(id) = projected {
-            self.read_base_declarations(&tx, id, executable)?.map(|declarations| BaseOutput {
-                id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
-            })
-        } else { None };
         drop(tx);
-        let output = if let Some(output) = cached { output } else {
-            let output = self.query_base(executable, true).await?;
-            if projected.is_some_and(|id| id != output.id) {
-                return Err("recomputed declarations differ from the rooted projection".into());
-            }
-            output
+        let output = match projected {
+            Some(id) => self.projected_base(executable, id).await?,
+            None => self.query_base(executable, true).await?,
         };
         Ok(BaseDeclarationsView {
             id: output.id, executable, module, source, disposition: output.disposition,
             declarations: output.declarations.expect("requested declaration payload"), spans,
         })
+    }
+
+    pub(super) async fn projected_body(
+        &self, executable: NodeId, id: NodeId,
+    ) -> Result<ScalarSourceDeclarations> {
+        Ok(self.projected_base(executable, id).await?.declarations.expect("requested declaration payload"))
+    }
+
+    async fn projected_base(&self, executable: NodeId, id: NodeId) -> Result<BaseOutput> {
+        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+        if let Some(declarations) = self.read_base_declarations(&tx, id, executable)? {
+            return Ok(BaseOutput {
+                id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
+            });
+        }
+        drop(tx);
+        let output = self.query_base(executable, true).await?;
+        if output.id != id {
+            return Err("recomputed declarations differ from the rooted projection".into());
+        }
+        Ok(output)
     }
 
     /// Composing a graph needs IDs, not decoded ASTs from already derived files.

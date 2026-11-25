@@ -247,4 +247,6 @@ with tempfile.TemporaryDirectory() as work:
         assert migrated["executable"] == legacy["executable"]
         assert (migrated["parsed"], migrated["reused"]) == (files_total, 0)
         assert migrated["namespace_derived"] == files_total
-        assert migrated["written"] == files_total + 1  # one new rooted authority schema and its namespace facts
+        # Namespace facts, one rooted authority schema, and the config with
+        # captured ordinary artifact profiles.
+        assert migrated["written"] == files_total + 2

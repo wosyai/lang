@@ -1,7 +1,7 @@
 //! Content-addressed records for the base CST preparation protocol.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use wosy_project::{ByteSpan, PackageRelativePath, SourceIdentity};
+use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NodeId(pub [u8; 32]);
@@ -187,6 +187,8 @@ pub struct SourceConfig {
     pub target: String,
     pub inputs: NodeId,
     pub parser: ParserPolicy,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ArtifactProfile>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
