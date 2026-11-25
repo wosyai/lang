@@ -4045,6 +4045,57 @@ impl<'a> ReferenceFlowBuilder<'a> {
         (!proof.calls.is_empty()).then_some(proof)
     }
 
+    fn guarded_runtime_call_paths(
+        &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, ty: &ScalarType,
+    ) -> Option<Vec<(CfgPointId, OccurrenceOrdinal)>> {
+        let sites = self.call_sites;
+        let mut proven = Vec::new();
+        let mut nodes = vec![(value, ordinal)];
+        while let Some((value, occurrence)) = nodes.pop() {
+            if !sites.structure.checked_types.expressions.get(&occurrence)
+                .is_some_and(|actual| aggregate::same_runtime_array_type(actual, ty))
+            { return None; }
+            match value {
+                ScalarExpression::Call { .. } => {
+                    let point = *self.cfg.primary_call_points.get(&occurrence)?;
+                    let signature = sites.checked_call_signatures.get(&occurrence)?;
+                    if sites.declared_unsafe_calls.contains(&occurrence.0)
+                        || signature.parameters.as_slice() != [ScalarType::U64]
+                        || !matches!(signature.outputs.outputs.as_slice(), [output]
+                            if aggregate::same_runtime_array_type(&output.ty, ty))
+                        || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call {
+                            output: 0, target: ResolvedCallTarget::ModuleCallable {
+                                concrete: ConcreteCallSelection::Declaration, ..
+                            }, argument_points, ..
+                        } if argument_points.len() == 1)
+                    { return None; }
+                    proven.push((point, occurrence));
+                }
+                ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                    let ConditionalRegion::Value { condition: predicate, then_block, else_block, .. } =
+                        sites.conditionals.get(&occurrence)? else { return None; };
+                    if sites.structure.checked_types.expressions.get(predicate) != Some(&ScalarType::Bool)
+                        || !match condition.as_ref() {
+                            ScalarExpression::Boolean { .. } => true,
+                            ScalarExpression::Name { .. } => matches!(sites.prepared_plain_name(*predicate),
+                                Some(PlainNameIdentity::Lexical(_))),
+                            _ => false,
+                        }
+                    { return None; }
+                    for (branch, block) in [(else_branch, else_block), (then_branch, then_block)] {
+                        let [ScalarBlockItem::Expression(value)] = branch.items.as_slice() else { return None; };
+                        let [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }] =
+                            sites.structure.blocks.get(block.0)?.items.as_slice() else { return None; };
+                        if branch.unsafe_context || row.output != 0 { return None; }
+                        nodes.push((value, row.expression));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        (!proven.is_empty()).then_some(proven)
+    }
+
     fn widened_join_inputs(
         &self,
         value: &ScalarExpression,
@@ -5209,7 +5260,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             OccurrenceParent::Block(ordinal),
                             OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
                         )) == Some(&OccurrenceNode::Expression(primary_ordinal));
-                    let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_root_binding)
+                    let runtime_returned = binding.fallible_assignment.is_some()
+                        && matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+                        && super::typecheck::guarded_runtime_rhs(primary);
+                    let walk_fallible_expression = !runtime_returned
+                        && (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
                                 if receiver.ty == ScalarType::Bool || arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
@@ -5239,7 +5294,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         )?
                     } else if ordinary_aggregate {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryScalarAggregateInitializer)?
-                    } else if walk_fallible_expression {
+                    } else if walk_fallible_expression || runtime_returned {
                         let previous = self.capture_call_points;
                         self.capture_call_points = true;
                         let result = self.expression(primary, scope, primary_ordinal);
@@ -5284,22 +5339,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             self.aggregate_result.ordinary_fallible_call_candidates.push(primary_ordinal);
                         }
                     }
-                    let runtime_returned = binding.fallible_assignment.is_some()
-                        && matches!(receiver.ty, ScalarType::RuntimeArray { .. })
-                        && matches!(primary, ScalarExpression::Call { .. });
                     if runtime_returned {
-                        let point = call_producer.filter(|point| self.generic_parameters.is_empty()
-                            && !block.unsafe_context && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                            && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
-                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
-                                signature.parameters.as_slice() == [ScalarType::U64]
-                                    && matches!(signature.outputs.outputs.as_slice(), [output]
-                                        if aggregate::same_runtime_array_type(&output.ty, &receiver.ty)))
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
-                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
-                        let Some(point) = point else { return Err(self.missing_context(expression_span(primary),
-                            ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)); };
-                        self.aggregate_result.guarded_array_returns.push((point, primary_ordinal));
+                        let paths = (!block.unsafe_context && self.generic_parameters.is_empty()
+                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
+                            .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty)).flatten()
+                            .ok_or_else(|| self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer))?;
+                        if matches!(primary, ScalarExpression::If { .. }) {
+                            self.aggregate_result.guarded_array_choices.insert(primary_ordinal.0);
+                        }
+                        self.aggregate_result.guarded_array_returns.extend(paths);
                     }
                     if let (Some(_), ScalarExpression::Call { arguments, .. }, false) =
                         (binding.fallible_assignment, primary, walk_fallible_expression || runtime_returned)

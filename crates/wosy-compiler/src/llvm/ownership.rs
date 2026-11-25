@@ -1239,7 +1239,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         if result.get_type() != super::aggregate_transfer::array_descriptor_type(context)
             || !state.aggregate.as_ref().is_some_and(|aggregate| state.body_call_nodes
                 .and_then(|nodes| nodes.expression_ordinal(&binding.value))
-                .is_some_and(|ordinal| aggregate.plan().array_descriptor_calls.contains(&ordinal)))
+                .is_some_and(|ordinal| aggregate.plan().array_descriptor_calls.contains(&ordinal)
+                    || aggregate.plan().guarded_array_descriptor_choices.contains(&ordinal)))
         { return Err("invalid guarded owned array descriptor".into()); }
         let backing = state.builder.build_extract_value(result, 0, "guarded_array_backing")
             .map_err(builder_error)?.into_pointer_value();

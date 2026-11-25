@@ -6680,6 +6680,28 @@ fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     calls
 }
 
+pub(super) fn guarded_runtime_rhs(expression: &ScalarExpression) -> bool {
+    let mut nodes = vec![expression];
+    while let Some(node) = nodes.pop() {
+        match node {
+            ScalarExpression::Call { arguments, type_arguments, .. }
+                if type_arguments.is_empty()
+                    && matches!(arguments.as_slice(), [ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }]) => {},
+            ScalarExpression::If { condition, then_branch, else_branch, .. }
+                if matches!(condition.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. }) =>
+            {
+                for arm in [else_branch, then_branch] {
+                    let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };
+                    if arm.unsafe_context { return false; }
+                    nodes.push(value);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn pending_fallible_operator(
     binding: &ScalarBinding,
     structs: &[ScalarStruct],
@@ -6703,9 +6725,8 @@ fn pending_fallible_operator(
             if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
         (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
             if guarded_numeric_rhs(ty, expression) => None,
-        (ScalarType::RuntimeArray { element, .. }, ScalarExpression::Call { arguments, type_arguments, .. })
-            if super::reference::aggregate::ordinary_value(element) && type_arguments.is_empty()
-                && matches!(arguments.as_slice(), [ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }]) => None,
+        (ScalarType::RuntimeArray { element, .. }, expression)
+            if super::reference::aggregate::ordinary_value(element) && guarded_runtime_rhs(expression) => None,
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
             if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
                 && *length != 0 && *length == elements.len() as u64

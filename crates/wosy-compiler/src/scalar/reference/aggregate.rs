@@ -1334,6 +1334,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
     pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) guarded_array_choices: BTreeSet<usize>,
     pub(super) ordinary_fallible_expressions: Vec<Vec<GuardedNumericExpression>>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
@@ -3053,6 +3054,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_return: bool,
     pub(crate) guarded_array_descriptor_leaf: bool,
     pub(crate) guarded_array_descriptor_forward: Option<usize>,
+    pub(crate) guarded_array_descriptor_choices: BTreeSet<usize>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -6665,6 +6667,7 @@ fn closed_aggregates<'a>(
     let mut borrowed_extent_observers = BTreeMap::new();
     let mut fallible_call_requests = Vec::new();
     let mut guarded_array_requests = Vec::new();
+    let mut guarded_array_choices = BTreeMap::new();
     let mut fallible_expressions = Vec::new();
     let mut ordinary_expressions = Vec::new();
     let mut ordinary_fallible_candidates = BTreeSet::new();
@@ -6686,6 +6689,9 @@ fn closed_aggregates<'a>(
             }
             guarded_array_requests.extend(facts.guarded_array_returns.iter()
                 .map(|&(point, ordinal)| (key, cfg, point, ordinal)));
+            if !facts.guarded_array_choices.is_empty() {
+                guarded_array_choices.insert(key, &facts.guarded_array_choices);
+            }
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
             if is_monomorphic && arm.is_none() {
@@ -7728,6 +7734,9 @@ fn closed_aggregates<'a>(
             for &(body, call) in callers {
                 result.bodies.entry(body).or_default().array_descriptor_calls.insert(call);
             }
+        }
+        for (&key, &choices) in &guarded_array_choices {
+            result.bodies.entry(key).or_default().guarded_array_descriptor_choices.extend(choices);
         }
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
             return Err("returned array index requires the authenticated checked-access helper".into());
