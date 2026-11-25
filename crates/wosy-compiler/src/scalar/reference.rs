@@ -3530,29 +3530,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
             return Ok(ReferenceValue::Other);
         }
         if let Some(binding) = root_binding {
-            if let Some(owner) = self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding)) {
-                if let ScalarType::Array { element, length, .. } = &owner.ty {
-                    let exact = (|| {
-                        let CheckedReadSource::Place(ordinal) = source else { return None; };
-                        let ScalarPlace::Index { base, index, .. } = place else { return None; };
-                        if !matches!(base.as_ref(), ScalarPlace::Name { .. }) { return None; }
-                        let parent = OccurrenceParent::Place(ordinal);
-                        let base = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
-                        let selector = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
-                        let types = &self.call_sites.structure.checked_types;
-                        (types.places.get(&base) == Some(&owner.ty)
-                            && types.places.get(&ordinal) == Some(element.as_ref())
-                            && types.expressions.get(&selector) == Some(&ScalarType::U64)
-                            && match index.as_ref() {
-                                ScalarExpression::Integer { value, .. } =>
-                                    u64::try_from(value.clone()).ok().is_some_and(|index| index < *length),
-                                _ => true,
-                            }).then_some(())
-                    })().is_some();
-                    if !exact {
-                        return Err(self.missing_origin(span, binding.clone(),
-                            ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
-                    }
+            let guarded_array = self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding))
+                .filter(|owner| matches!(owner.ty, ScalarType::Array { .. }));
+            if let Some(owner) = guarded_array {
+                let exact = match source {
+                    CheckedReadSource::Place(ordinal) => self.exact_guarded_index(place, ordinal, binding, &owner.ty).is_some(),
+                    _ => false,
+                };
+                if !exact {
+                    return Err(self.missing_origin(span, binding.clone(),
+                        ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
                 }
             }
         }
@@ -4930,6 +4917,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn exact_guarded_index<'b>(
+        &self, place: &ScalarPlace, ordinal: OccurrenceOrdinal, owner: &ReferenceBindingId, ty: &'b ScalarType,
+    ) -> Option<&'b ScalarType> {
+        let ScalarType::Array { element, length, .. } = ty else { return None; };
+        let ScalarPlace::Index { base, index, .. } = place else { return None; };
+        let ScalarPlace::Name { span, .. } = base.as_ref() else { return None; };
+        let parent = OccurrenceParent::Place(ordinal);
+        let base = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
+        let selector = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
+        let types = &self.call_sites.structure.checked_types;
+        (matches!(self.prepared_place_root(base, *span), Ok(Some(PreparedPlaceRoot::Lexical(binding))) if binding == owner)
+            && types.places.get(&base) == Some(ty)
+            && types.places.get(&ordinal) == Some(element.as_ref())
+            && types.expressions.get(&selector) == Some(&ScalarType::U64)
+            && match index.as_ref() {
+                ScalarExpression::Integer { value, .. } =>
+                    u64::try_from(value.clone()).ok().is_some_and(|index| index < *length),
+                _ => true,
+            }).then_some(element.as_ref())
+    }
+
     fn exact_indexed_store_type(
         &self, place: &ScalarPlace, destination: OccurrenceOrdinal, parent_type: &ScalarType, value_type: &ScalarType,
     ) -> bool {
@@ -6092,6 +6100,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ty == &output_types[position])
                         {
                             if let CfgPointKind::Assign { target, rhs_point: actual, .. } = &self.cfg.points[install.0].kind {
+                                if *actual == rhs_point
+                                    && self.proof_points.fallible_allocation_bindings.as_ref()
+                                        .and_then(|sites| sites.get(&target.binding))
+                                        .and_then(|owner| self.exact_guarded_index(
+                                            &assignment.targets[position].place, slot.destination, &target.binding, &owner.ty))
+                                        == Some(&output_types[position])
+                                {
+                                    self.proof_points.guarded_indexed_stores.insert(install);
+                                }
                                 if let (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
                                     [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =
                                     (&target.place, target.projections.as_slice())
@@ -8451,6 +8468,7 @@ struct ReferenceTransferCfg<'a> {
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
+    guarded_indexed_stores: Option<&'a HashSet<CfgPointId>>,
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -8489,6 +8507,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
             guarded_allocation_edges: proof.map(|proof| &proof.guarded_allocation_edges),
+            guarded_indexed_stores: proof.map(|proof| &proof.guarded_indexed_stores),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -11291,11 +11310,19 @@ fn transfer_reference_facts(
                 CfgPointKind::Assign { target, .. }
                     if let Some(site) = cfg.fallible_allocation_bindings.and_then(|bindings| bindings.get(&target.binding)) =>
                 {
-                    if let Some(reason) = guarded_allocation_overwrite_error(
-                        site.whole_copy,
-                        target.projections.is_empty() && matches!(target.place, ScalarPlace::Name { .. }),
-                        state.uninitialized.contains(&target.binding),
-                    ) {
+                    let unavailable = state.uninitialized.contains(&target.binding);
+                    let checked_indexed_store = matches!(site.ty, ScalarType::Array { .. })
+                        && cfg.guarded_indexed_stores.is_some_and(|stores| stores.contains(&id));
+                    let error = if checked_indexed_store {
+                        unavailable.then_some(ReferenceAnalysisErrorReason::UnavailableFallibleAllocation)
+                    } else {
+                        guarded_allocation_overwrite_error(
+                            site.whole_copy,
+                            target.projections.is_empty() && matches!(target.place, ScalarPlace::Name { .. }),
+                            unavailable,
+                        )
+                    };
+                    if let Some(reason) = error {
                         errors.push(ReferenceAnalysisError::MissingOrigin {
                             source_span: point.source_span.clone(),
                             binding_id: target.binding.clone(),
@@ -16435,6 +16462,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
                     guarded_allocation_edges: Some(&template_result.proof_points.guarded_allocation_edges),
+                    guarded_indexed_stores: Some(&template_result.proof_points.guarded_indexed_stores),
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
