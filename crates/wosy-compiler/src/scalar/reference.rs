@@ -3960,8 +3960,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         exact_type: Option<&ScalarType>, guarded: bool,
         ordinary: &mut Option<Vec<aggregate::GuardedNumericExpression>>,
     ) -> Result<(), ReferenceAnalysisError> {
-        let candidate = (guarded || ordinary.is_some()) && matches!(value,
-            ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. });
+        let candidate = (guarded || ordinary.is_some())
+            && (matches!(value, ScalarExpression::Call { .. }) || self.call_sites.candidate_fallible_composite(value, ordinal));
         let before = self.cursor;
         let previous = self.capture_call_points;
         self.capture_call_points |= candidate;
@@ -4072,6 +4072,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || aggregate::pure_widened_element(argument))
                         { return None; }
                         proof.operations.push(Node::Call(occurrence, 0));
+                    }
+                }
+                ScalarExpression::Unary { operator, operand, .. } => {
+                    let bound = super::fallible_total_unary_bound(payload, operator)?;
+                    if children_proved {
+                        proof.operations.push(Node::TotalUnary(bound));
+                    } else {
+                        let OccurrenceNode::Expression(child) = sites.structure.edges
+                            .get(&(OccurrenceParent::Expression(occurrence), OccurrenceEdge::UnaryOperand))? else { return None; };
+                        stack.push((value, occurrence, payload, true));
+                        stack.push((operand, *child, payload, false));
                     }
                 }
                 ScalarExpression::Binary { operator, left, right, .. } => {
@@ -5373,8 +5384,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         { return None; }
                         let BindingInitialization::Allocation { lengths } = &binding_region.initialization else { return None; };
                         let [length] = lengths.as_slice() else { return None; };
-                        let value @ (ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =
-                            binding.receivers[0].allocation_length.as_ref()? else { return None; };
+                        let value = binding.receivers[0].allocation_length.as_ref()?;
+                        if !matches!(value, ScalarExpression::Call { .. })
+                            && !calls.candidate_fallible_composite(value, length.expression)
+                        { return None; }
                         let exact_call = !matches!(value, ScalarExpression::Call { .. }) || matches!(
                             calls.allocation_length_call_targets.get(&length.expression),
                             Some(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }));
@@ -5398,10 +5411,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     // retain their normal lexical release on success.
                     let ordinary_root_binding = ordinary_root_eligible
                         && binding.fallible_assignment.is_none() && !binding.is_allocation
-                        && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
+                        && (matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
+                            || (receiver.ty == ScalarType::Bool && matches!(primary, ScalarExpression::Unary {
+                                operator: UnaryOperator::LogicalNot, .. })))
                         && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
                         && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && matches!(primary, ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                        && (matches!(primary, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(primary, primary_ordinal))
                         && calls.structure.edges.get(&(
                             OccurrenceParent::Block(calls.structure.root),
                             OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
@@ -5431,7 +5446,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && super::typecheck::guarded_runtime_rhs(primary);
                     let walk_fallible_expression = !runtime_returned && !ordinary_runtime_receive
                         && (binding.fallible_assignment.is_some() || ordinary_root_binding)
-                        && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                        && (calls.candidate_fallible_composite(primary, primary_ordinal)
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
                                 if receiver.ty == ScalarType::Bool || arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
                     let value = if let Some((owner, count)) = fixed_copy_receiver {
@@ -5882,7 +5897,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && region.items.len() % 2 == 1
                         && matches!(region.items.last(), Some(BlockItem { kind: BlockItemKind::FinalOutput(row), .. })
                             if row.output == 0 && row.expression == ordinal)
-                        && matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
+                        && calls.candidate_fallible_composite(expression, ordinal)
                         && matches!(calls.boundary.root_outputs.as_slice(),
                             [output] if matches!(output.ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool));
                     let previous = self.capture_call_points;
@@ -6190,7 +6205,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
                         let ordinary_payload = if scalar_rhs_eligible && scalar_rhs.is_some()
-                            && matches!(value, ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                            && (matches!(value, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(value, evaluation.expression))
                         {
                             group.destinations().as_slice().get(evaluation.position).and_then(|slot| {
                                 let AssignmentReplacement::Resolved(ty @ (ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)) = &slot.replacement
@@ -13049,6 +13064,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     proven_index_values: HashMap<OccurrenceOrdinal, u64>,
+    callful_total_unary: HashSet<OccurrenceOrdinal>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
@@ -13070,6 +13086,7 @@ impl OccurrenceStructure {
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
             proven_index_values: HashMap::new(),
+            callful_total_unary: HashSet::new(),
             literal_fields: HashMap::new(),
             value_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
@@ -13226,6 +13243,14 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
+    fn candidate_fallible_composite(&self, expression: &ScalarExpression, ordinal: OccurrenceOrdinal) -> bool {
+        if matches!(expression, ScalarExpression::Unary { .. }) {
+            self.structure.callful_total_unary.contains(&ordinal)
+        } else {
+            super::fallible_composite_expression(expression)
+        }
+    }
+
     fn attach_imported_reference_effects(
         &mut self, caller: &SourceIdentity,
         readers: &HashMap<&SourceIdentity, HashMap<ByteSpan, SharedScalarReadEffect>>,
@@ -13991,7 +14016,24 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     .insert(ordinal, identity);
             }
         }
+        let call_tally = |walker: &Self| match &walker.mode {
+            WalkMode::Callable(callable) if callable.prepared => Some(callable.call_occurrences.len()),
+            WalkMode::CallableAllocationLength(_) => Some(walker.structural_calls.len()),
+            _ => None,
+        };
+        let before = if let ScalarExpression::Unary { operator, .. } = expression {
+            self.structure.checked_types.expressions.get(&ordinal)
+                .filter(|ty| super::fallible_total_unary_bound(ty, operator).is_some())
+                .and_then(|_| call_tally(self))
+        } else { None };
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
+        if let Some(before) = before {
+            // Typed ordinary unary nodes with no prepared call in their own
+            // subtree never request the separate scalar proof traversal.
+            if call_tally(self).is_some_and(|after| after > before) {
+                self.structure.callful_total_unary.insert(ordinal);
+            }
+        }
         Ok(ordinal)
     }
 }

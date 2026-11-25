@@ -6648,7 +6648,7 @@ fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
 
 fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     if !matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
-        || !matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
+        || !super::fallible_composite_expression(expression)
     { return false; }
     let mut stack = vec![(expression, ty)];
     let mut calls = false;
@@ -6658,6 +6658,8 @@ fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
             ScalarExpression::Integer { .. } if *ty != ScalarType::Bool => {}
             ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {}
             ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty() => calls = true,
+            ScalarExpression::Unary { operator, operand, .. }
+                if super::fallible_total_unary_bound(ty, operator).is_some() => stack.push((operand, ty)),
             ScalarExpression::Binary { operator, left, right, .. }
                 if (*ty == ScalarType::Bool && matches!(operator, BinaryOperator::And | BinaryOperator::Or))
                     || (*ty != ScalarType::Bool && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor))
@@ -6734,8 +6736,7 @@ fn pending_fallible_operator(
             if is_integer_type(ty) => None,
         (ty, ScalarExpression::Call { type_arguments, .. })
             if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
-        (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
-            if guarded_numeric_rhs(ty, expression) => None,
+        (ty, expression) if guarded_numeric_rhs(ty, expression) => None,
         (ScalarType::RuntimeArray { element, .. }, expression)
             if super::reference::aggregate::ordinary_value(element) && guarded_runtime_rhs(expression) => None,
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
@@ -6758,7 +6759,7 @@ fn pending_fallible_operator(
                     matches!(operand.as_ref(), ScalarExpression::Float { .. }),
                 ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_guarded_struct_field_type),
                 expression => member_types.get(field.name.as_str()).is_some_and(|ty|
-                    matches!(ty, ScalarType::U64 | ScalarType::I32)
+                    matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
                     && (matches!(expression, ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty())
                         || guarded_numeric_rhs(ty, expression))),
             }) { None } else { Some(operator) }

@@ -2572,6 +2572,7 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
     enum Step<'ctx, 'ast> {
         Emit(&'ast ScalarExpression, &'ast ScalarType),
         Binary(&'ast BinaryOperator, &'ast ScalarType),
+        Unary(&'ast crate::scalar::UnaryOperator),
         Call(&'ast ScalarExpression, usize),
         BeginShort { rhs: &'ast ScalarExpression, is_and: bool },
         EndShort { skipped: BasicBlock<'ctx>, join: BasicBlock<'ctx>, is_and: bool },
@@ -2606,6 +2607,11 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
                 let right = values.pop().ok_or("missing fallible binary right operand")?;
                 let left = values.pop().ok_or("missing fallible binary left operand")?;
                 values.push(emit_binary_values(state, operator, left, right, *ty == ScalarType::U64)?);
+                continue;
+            }
+            Step::Unary(operator) => {
+                let value = take_basic(values.pop().ok_or("missing fallible unary operand")?)?;
+                values.push(emit_unary_value(state, operator, value)?);
                 continue;
             }
             Step::Call(call, arity) => {
@@ -2691,6 +2697,12 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
             }
         };
         match node {
+            ScalarExpression::Unary { operator, operand, .. }
+                if crate::scalar::fallible_total_unary_bound(ty, operator).is_some() =>
+            {
+                stack.push(Step::Unary(operator));
+                stack.push(Step::Emit(operand, ty));
+            }
             ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
                 stack.push(Step::BeginShort { rhs: right, is_and: *operator == BinaryOperator::And });
                 stack.push(Step::Emit(left, &ScalarType::Bool));

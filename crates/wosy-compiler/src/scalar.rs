@@ -3847,6 +3847,20 @@ pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,
     ScalarProjectPreparationRejection,
 };
+pub(crate) fn fallible_total_unary_bound(ty: &ScalarType, op: &UnaryOperator) -> Option<u64> {
+    match (ty, op) {
+        (ScalarType::Bool, UnaryOperator::LogicalNot) => Some(1),
+        (ScalarType::I32, UnaryOperator::BitwiseNot) => Some(u64::from(u32::MAX)),
+        (ScalarType::U64, UnaryOperator::BitwiseNot) => Some(u64::MAX),
+        _ => None,
+    }
+}
+
+pub(crate) fn fallible_composite_expression(expression: &ScalarExpression) -> bool {
+    matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. }
+        | ScalarExpression::Unary { operator: UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot, .. })
+}
+
 pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarType, &[ScalarExpression], ByteSpan)> {
     let ScalarType::RuntimeArray { element, .. } = &binding.declared_type else { return None };
     let ScalarExpression::ArrayLiteral { elements, span } = &binding.value else { return None };

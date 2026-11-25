@@ -15645,3 +15645,54 @@ if (guarded(2) != 99 || guarded(0) != 4294967297
         }
     }
 }
+
+#[test]
+fn fallible_unary_composition_applies_only_after_present_operands() {
+    let text = "%%start
+u64(u64) _extent = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _invert = fn(count) { ~_extent(count) };
+bool(u64) _empty = fn(count) { u8[count] scratch; core.array_len(&scratch) == 0 };
+u64(u64) numeric = fn(count) {
+    u64 value =? ~_invert(count);
+    if (&value == null) { 99 } else { value }
+};
+u64(u64, u64) logical = fn(first, second) {
+    bool value =? !_empty(first) && _empty(second);
+    if (&value == null) { 99 } else { if (value) { 1 } else { 0 } }
+};
+bool(u64) regular = fn(count) {
+    bool plain = !false;
+    bool value = !_empty(count);
+    plain && value
+};
+if (numeric(11) != 99 || numeric(0) != 0 || numeric(7) != 7
+    || logical(0, 9) != 0 || logical(7, 0) != 1 || logical(11, 9) != 99
+    || logical(7, 13) != 99 || regular(0)) { core.system_panic(); };
+%%end";
+    let overflow = text.replace("{ ~_extent(count) }", "{ ~_extent(count) + 1 }");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let negative = prepare_initializer_test(&overflow, layout);
+        let rejected = analyze_scalar_build(&negative);
+        assert!(rejected.diagnostics().is_empty(), "{:?}", rejected.diagnostics());
+        assert!(matches!(emit_scalar_build_project_llvm(&rejected), Err(error)
+            if error.contains("fallible scalar tail has no proved in-range result")));
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, output) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&checked)),
+            ("project", emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "present-only unary");
+            context.create_module_from_ir(bytes).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_UNARY_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

@@ -1423,7 +1423,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         } else {
             match (path, member) {
                 (ExpressionPath::Project { module, modules },
-                    ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =>
+                    ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }
+                | ScalarExpression::Unary { .. }) =>
                     super::expression::emit_project_typed_expression(context, state, member, ty, module, modules),
                 _ => memory::emit_typed_expression(context, state, member, ty),
             }

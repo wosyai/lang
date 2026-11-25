@@ -1245,6 +1245,7 @@ pub(super) struct GuardedNumericExpression {
 #[derive(Debug)]
 pub(super) enum GuardedNumericNode {
     Atom(u64),
+    TotalUnary(u64),
     Call(OccurrenceOrdinal, usize),
     Add,
     And,
@@ -1259,6 +1260,7 @@ impl GuardedNumericExpression {
         for node in &self.operations {
             let bound = match *node {
                 GuardedNumericNode::Atom(bound) => bound,
+                GuardedNumericNode::TotalUnary(bound) => { bounds.pop()?; bound },
                 GuardedNumericNode::Call(site, staged_arguments) => {
                     let Some(keep) = bounds.len().checked_sub(staged_arguments) else { return None; };
                     bounds.truncate(keep);
@@ -7186,9 +7188,8 @@ fn closed_aggregates<'a>(
             let sites = input.calls.function_body(key.1, None)?;
             let (facts, cfg) = result_at(key, function)?;
             let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
-            let (ScalarBlockItem::Expression(value @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. })), prefix) =
-                function.body.items.split_last()? else { return None; };
-            if prefix.len() % 2 != 0 { return None; }
+            let (ScalarBlockItem::Expression(value), prefix) = function.body.items.split_last()? else { return None; };
+            if prefix.len() % 2 != 0 || !crate::scalar::fallible_composite_expression(value) { return None; }
             let root = sites.structure.blocks.get(sites.structure.root.0)?;
             let BlockItemKind::FinalOutput(output) = &root.items.last()?.kind else { return None; };
             if root.items.len() != function.body.items.len() { return None; }
