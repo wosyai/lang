@@ -229,6 +229,13 @@ pub fn check_scalar_package_ordered_with_dormant_sources(
 ) -> ScalarOrderedCheckerOutcome {
     let result = prepare_checked_package_scope(declarations, initialization_order, dormant, inputs, scope)
         .and_then(|(prepared, startup_count)| collect_ordered_checker_records(&prepared, scope, startup_count));
+    terminal_ordered_outcome(result)
+}
+
+#[cfg(feature = "internal-checker")]
+fn terminal_ordered_outcome(
+    result: Result<(bool, Vec<ScalarOrderedCheckerFailure>), ProjectCheck>,
+) -> ScalarOrderedCheckerOutcome {
     match result {
         Ok((active, failures)) if failures.is_empty() => {
             if active { ScalarOrderedCheckerOutcome::Passed } else { ScalarOrderedCheckerOutcome::NoChecks }
@@ -495,6 +502,7 @@ impl OrderedRunEvidence for ProofFreeOrderedEvidence {
 
 #[cfg(feature = "internal-checker")]
 struct PreparedOrderedRun<E: OrderedRunEvidence> {
+    finished_all_initialization: bool,
     active: bool,
     directives: Vec<ScalarOrderedCheckerFailure>,
     actual: E,
@@ -517,11 +525,11 @@ fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
     policy: OrderedReachPolicy, evidence: E, effects: OrderedFailures,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
-    run_prepared_ordered_check_profiles::<E, false>(prepared, scope, startup_count, policy, evidence, effects)
+    run_prepared_ordered_check_profiles::<E, false, false>(prepared, scope, startup_count, policy, evidence, effects)
 }
 
 #[cfg(feature = "internal-checker")]
-fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXED_STARTUP: bool>(
+fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXED_STARTUP: bool, const FIXED_INDEX_OBSERVATION: bool>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
     policy: OrderedReachPolicy, evidence: E, mut effects: OrderedFailures,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
@@ -532,7 +540,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
     } else {
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
         if !potential_obligations && !E::CONTEXTUAL && !E::HAS_NAMED_ROOT && effects.contextual_proofs.entries.is_empty() {
-            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None,
+            return Ok(PreparedOrderedRun { finished_all_initialization: false, active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None,
                 contextual_proofs: effects.contextual_proofs, mixed_context_after_scalar: None });
         }
         authored_roots
@@ -553,6 +561,8 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
             prepared, root, ordinals, evidence, Some(&mut effects),
         ),
     }? };
+    let finished_all_initialization = FIXED_INDEX_OBSERVATION
+        && initialization.visits.iter().all(|visit| *visit == InitializationVisit::Completed);
     for contextual in effects.contextual_proofs.entries.values_mut() {
         contextual.reached_at_startup = initialization.reached.contains(&contextual.target);
     }
@@ -590,7 +600,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
         }
     }
     Ok(PreparedOrderedRun {
-        active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
+        finished_all_initialization, active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
         contextual_proofs: effects.contextual_proofs,
         mixed_context_after_scalar: effects.mixed_proof_order.map(|order| order.context_after_scalar),
     })
@@ -4151,6 +4161,62 @@ mod prepared {
             let (function, calls) = self.occurrence_snapshot().monomorphic_body(module, item)?;
             super::super::checker_flow::observe_runtime_fixed_indices(calls, &function.body)
         }
+    }
+
+    // Opt-in checker-only result for the ordinary whole-package route. The
+    // cover stays private until this same preparation's terminal verdict.
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)] // No production caller or Build helper validator yet.
+    pub(super) struct CompletedFixedIndexCheck<'a> {
+        read: super::super::static_calls::PreparedReadOccurrence<'a>,
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)]
+    impl CompletedFixedIndexCheck<'_> {
+        pub(super) fn describes(
+            &self, prepared: &PreparedCheckerProject, module: usize, item: usize,
+            read: super::super::reference::OccurrenceOrdinal, extent: usize,
+        ) -> bool {
+            use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
+            self.read.matches(prepared.occurrence_snapshot(), module, item, read, PreparedReadKind::FixedIndex)
+                && matches!(self.read.shape(), PreparedReadShape::FixedIndex(shape) if shape.extent == extent)
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)]
+    pub(super) fn check_ordinary_package_with_fixed_index_observation(
+        prepared: &PreparedCheckerProject, module: usize, item: usize,
+        occurrence: super::super::reference::OccurrenceOrdinal,
+    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'_>>) {
+        use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
+        // This entry point checks every prepared module as an ordinary
+        // package; it cannot take a caller-supplied scope, startup count,
+        // verdict, or an independently prepared read.
+        let snapshot = prepared.occurrence_snapshot();
+        let same_package = prepared.project.initialization_order.first()
+            .zip(prepared.project.modules.get(module))
+            .is_some_and(|(root, candidate)| root.project == candidate.source.project
+                && root.package == candidate.source.package);
+        let staged = same_package.then(|| snapshot.read(module, item, occurrence, PreparedReadKind::FixedIndex))
+            .flatten().filter(|read| {
+                let PreparedReadShape::FixedIndex(shape) = read.shape() else { return false };
+                prepared.observe_runtime_fixed_indices(module, item)
+                    .is_some_and(|evidence| evidence.covers_read(occurrence, shape.extent))
+            });
+        let run = run_prepared_ordered_check_profiles::<_, false, true>(
+            prepared, ScalarCheckerScope::CurrentPackage, prepared.project.modules.len(),
+            OrderedReachPolicy::Legacy, (), OrderedFailures::default(),
+        );
+        let finished = run.as_ref().is_ok_and(|run| run.finished_all_initialization);
+        let outcome = terminal_ordered_outcome(run.map(|run| (run.active, run.directives)));
+        let completed = if finished && matches!(outcome, ScalarOrderedCheckerOutcome::Passed) {
+            staged.map(|read| CompletedFixedIndexCheck { read })
+        } else {
+            None
+        };
+        (outcome, completed)
     }
 
     pub(super) fn prepare_checker_project(
@@ -9102,7 +9168,7 @@ fn check_mixed_scalar_contextual(
         captured: plans.iter().map(|plan| (plan.target, 0)).collect(),
         events: Vec::new(), work: 0,
     });
-    let mut report = run_prepared_ordered_check_profiles::<_, true>(
+    let mut report = run_prepared_ordered_check_profiles::<_, true, false>(
         &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, NamedOrderedEvidence { observed }, effects,
     )?;
     complete_contextual_effects(&mut report, scope, false)?;
@@ -15918,6 +15984,75 @@ mod tests {
             let nested_unsafe = text.replace("if (index < 2) {", "unsafe { if (index < 2) {")
                 .replace("if (second == 3) {};", "if (second == 3) {}; };");
             assert!(prepare(&nested_unsafe, target).observe_runtime_fixed_indices(0, 0).is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn fixed_index_observation_is_published_only_by_completed_explicit_check() {
+        use super::super::static_calls::PreparedReadKind;
+        let src = source("src/main.w", "terminal-fixed-index");
+        let text = r#"%%start
+            unit(u64) inspect = fn(index) {
+                i8[2] payload = [3, 9];
+                if (index < 2) {
+                    i8 checked = payload[index];
+                    if (checked == 3) {};
+                };
+            };
+            unit(u8) verify = fn(value) {
+                core.narrow(value > 0, OUTPUT);
+                core.require(value >= 1, OUTPUT);
+            };
+            verify(1);
+        %%end"#.replace("OUTPUT", OUTPUT);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare_with_init = |input: &str, order| {
+                prepare_checker_project(vec![(declarations(&src, input), Vec::new())], order,
+                    ScalarPreparationInputs { target_layout })
+            };
+            let prepare = |input: &str| prepare_with_init(input, vec![src.clone()]).unwrap();
+            let project = prepare(&text);
+            let find = |prepared: &PreparedCheckerProject| {
+                let (_, body) = prepared.occurrence_snapshot().monomorphic_body(0, 0).unwrap();
+                body.structure.checker_ordinary_scalar_locals.values().find_map(|local|
+                    body.fixed_index_read_shape(local.source).map(|_| local.source)).unwrap()
+            };
+            let read = find(&project);
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&project, 0, 0, read);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed), "{outcome:?}");
+            let proof = proof.unwrap();
+            assert!(proof.describes(&project, 0, 0, read, 2));
+            assert!(!proof.describes(&project, 0, 0, read, 3));
+            let other = prepare(&text);
+            assert!(!proof.describes(&other, 0, 0, find(&other), 2));
+            assert!(project.occurrence_snapshot().read(0, 1, read, PreparedReadKind::FixedIndex).is_none());
+            let (outcome, unmatched) = prepared::check_ordinary_package_with_fixed_index_observation(&project, 0, 1, read);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed) && unmatched.is_none());
+
+            let refuted = prepare(&text.replace("value >= 1", "value > 1"));
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&refuted, 0, 0, find(&refuted));
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Failed(failures) if !failures.is_empty()));
+            assert!(proof.is_none());
+            let skipped = prepare(&format!("{}%%end", text.split_once("unit(u8) verify").unwrap().0));
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&skipped, 0, 0, find(&skipped));
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::NoChecks), "{outcome:?}");
+            assert!(proof.is_none());
+            let partial = prepare(&text.replace("verify(1);", &format!("verify(1); core.narrow(false, {OUTPUT});")));
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&partial, 0, 0, find(&partial));
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Failed(_) | ScalarOrderedCheckerOutcome::Unsupported));
+            assert!(proof.is_none());
+            match prepare_with_init(&text, Vec::new()) {
+                Ok(invalid_order) => {
+                    let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&invalid_order, 0, 0, find(&invalid_order));
+                    assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Unsupported));
+                    assert!(proof.is_none());
+                }
+                Err(ProjectCheck::Invalid(_)) => (),
+                Err(_) => panic!("unexpected initialization error"),
+            }
+            assert!(matches!(prepare_with_init(&text.replace("i8 checked", "bool checked"), vec![src.clone()]),
+                Err(ProjectCheck::Invalid(_))));
         }
     }
 

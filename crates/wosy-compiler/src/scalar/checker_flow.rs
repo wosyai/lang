@@ -3565,6 +3565,10 @@ pub(super) struct RuntimeFixedIndexEvidence<'a> {
 #[cfg(feature = "internal-checker")]
 #[allow(dead_code)]
 impl RuntimeFixedIndexEvidence<'_> {
+    pub(super) fn covers_read(&self, read: OccurrenceOrdinal, extent: usize) -> bool {
+        self.accesses.get(&read).is_some_and(|&(_, length)| length == extent)
+    }
+
     pub(super) fn authorizes(
         &self, calls: &FunctionCallSites, access: &super::reference::CheckerOrdinaryScalarLocal, extent: usize,
     ) -> bool {
