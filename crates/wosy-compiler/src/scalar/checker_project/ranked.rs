@@ -1,5 +1,5 @@
-//! Check integer self-use at each leaf of the prepared return tree. The path is
-//! a rectangle because every enrolled guard restricts exactly one entry slot.
+//! Check typed self-use at each leaf of the prepared return tree. Integer
+//! paths are rectangles; a bounded float rank has one exact IEEE lane.
 //! No recursive call is executed here and no conclusion is installed by this pass.
 use super::*;
 use super::super::{
@@ -95,6 +95,8 @@ enum Coordinate<'a> {
     Entry,
     Offset { add: bool, magnitude: &'a BigInt },
     Literal(Cow<'a, BigInt>),
+    FloatLiteral(ranked_float::Atom),
+    FloatOffset { add: bool, magnitude: ranked_float::Atom },
 }
 
 impl<'a> Coordinate<'a> {
@@ -103,6 +105,16 @@ impl<'a> Coordinate<'a> {
     fn read(
         expr: &'a ScalarExpression, ty: &ScalarType, is_entry: impl Fn(&ScalarExpression) -> bool,
     ) -> Result<Self, ProjectCheck> {
+        if matches!(ty, ScalarType::F32 | ScalarType::F64) {
+            if is_entry(expr) { return Ok(Self::Entry); }
+            if let Some(literal) = ranked_float::Atom::literal(expr, ty) { return Ok(Self::FloatLiteral(literal)); }
+            let ScalarExpression::Binary { operator, left, right, .. } = expr else { return Err(ProjectCheck::Unsupported); };
+            if is_entry(left) && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+                let magnitude = ranked_float::Atom::literal(right, ty).ok_or(ProjectCheck::Unsupported)?;
+                return Ok(Self::FloatOffset { add: *operator == BinaryOperator::Add, magnitude });
+            }
+            return Err(ProjectCheck::Unsupported);
+        }
         if let Some(literal) = concrete_integer_literal(expr) {
             if integer_literal_fits_type(&literal, ty) { return Ok(Self::Literal(literal)); }
         } else if is_entry(expr) {
@@ -221,6 +233,7 @@ fn transition(
                 }
                 moved(low).cmp(low)
             }
+            Coordinate::FloatLiteral(_) | Coordinate::FloatOffset { .. } => return Err(ProjectCheck::Unsupported),
         };
     }
     if let Some(max_delta) = sum_delta {
@@ -241,6 +254,50 @@ fn transition(
     Ok(InductionPremise::NotStrict)
 }
 
+#[derive(Clone)]
+enum RankLane {
+    Integers(Rectangle),
+    Float(Vec<ranked_float::Atom>),
+}
+
+impl RankLane {
+    fn reachable(&self) -> bool {
+        match self {
+            Self::Integers(rectangle) => rectangle.reachable(),
+            Self::Float(points) => !points.is_empty(),
+        }
+    }
+
+    fn transition(
+        &self, entry: &Self, rank: TypedInductionRank<'_>, arguments: &[Coordinate<'_>], work: &mut usize,
+    ) -> Result<InductionPremise, ProjectCheck> {
+        match (self, entry) {
+            (Self::Integers(path), Self::Integers(entry)) => transition(rank, entry, path, arguments, work),
+            (Self::Float(path), Self::Float(entry)) => {
+                if path.is_empty() { return Ok(InductionPremise::Unreachable); }
+                let [argument] = arguments else { return Err(ProjectCheck::Unsupported); };
+                let probes = (usize::BITS - entry.len().leading_zeros()) as usize;
+                charge(work, path.len().checked_mul(probes + 3).ok_or(ProjectCheck::Unsupported)?)?;
+                for &point in path {
+                    let successor = match argument {
+                        Coordinate::Entry => point,
+                        Coordinate::FloatLiteral(value) => *value,
+                        Coordinate::FloatOffset { add, magnitude } => {
+                            let Some(value) = point.offset(*magnitude, *add) else { return Ok(InductionPremise::NotStrict); };
+                            value
+                        }
+                        _ => return Err(ProjectCheck::Unsupported),
+                    };
+                    if !successor.strictly_less(point) { return Ok(InductionPremise::NotStrict); }
+                    if !ranked_float::contains(entry, successor) { return Ok(InductionPremise::CalleeWhereUnproved); }
+                }
+                Ok(InductionPremise::Established)
+            }
+            _ => Err(ProjectCheck::Unsupported),
+        }
+    }
+}
+
 pub(super) fn verify<'a>(
     plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>,
 ) -> Result<RankedInductionOutcome<'a>, ProjectCheck> {
@@ -259,8 +316,15 @@ pub(super) fn verify<'a>(
         _ => return Err(ProjectCheck::Unsupported),
     };
     let mut work = 0;
-    let entry = Rectangle::entry(rank, plan.filter.as_deref().unwrap_or_default(), &mut work)?;
-    for axis in &entry.0 { charge(&mut work, axis.interval_count())?; }
+    let entry = if let Some((slot, _)) = rank.float_entry() {
+        let points = ranked_float::guarded_entry(plan, &slot.ty, &mut work)?;
+        charge(&mut work, points.len())?;
+        RankLane::Float(points)
+    } else {
+        let entry = Rectangle::entry(rank, plan.filter.as_deref().unwrap_or_default(), &mut work)?;
+        for axis in &entry.0 { charge(&mut work, axis.interval_count())?; }
+        RankLane::Integers(entry)
+    };
     let mut pending = vec![(plan.steps.as_ref(), &plan.function.body, structure.root, entry.clone())];
     let mut matched_calls = 0;
     let mut has_base = false;
@@ -271,23 +335,44 @@ pub(super) fn verify<'a>(
         let output = ranked_output_at(body, block, typed.result_type).ok_or(ProjectCheck::Unsupported)?;
         let [item] = proof.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
         if let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) = body.conditionals.get(&output) {
-            let guard = structure.checker_branches.get(condition).ok_or(ProjectCheck::Unsupported)?;
             let branches = runtime.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
             if body.occurrences.get(output.0).map(|node| node.span) != Some(branches.span) {
                 return Err(ProjectCheck::Unsupported);
             }
-            let (yes_proof, no_proof) = match item {
-                ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. }) => {
-                    let asserted = proof_input_condition::<true>(condition, &typed.input_names, body, false)?;
-                    if &asserted != guard { return Err(ProjectCheck::Unsupported); }
-                    (then_branch, else_branch)
-                }
+            let (yes_proof, no_proof, proof_condition) = match item {
+                ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. }) =>
+                    (then_branch, else_branch, Some(condition.as_ref())),
                 // An unbranched show is an obligation on every actual returning leaf.
                 ScalarBlockItem::Expression(ScalarExpression::Call { receiver: Some(core), name, .. })
-                    if core == "core" && name == "show" => (proof, proof),
+                    if core == "core" && name == "show" => (proof, proof, None),
                 _ => return Err(ProjectCheck::Unsupported),
             };
-            let (yes, no) = path.split(rank, guard, &mut work)?;
+            let (yes, no) = match path {
+                RankLane::Integers(path) => {
+                    let guard = structure.checker_branches.get(condition).ok_or(ProjectCheck::Unsupported)?;
+                    if let Some(proof_condition) = proof_condition {
+                        if &proof_input_condition::<true>(proof_condition, &typed.input_names, body, false)? != guard {
+                            return Err(ProjectCheck::Unsupported);
+                        }
+                    }
+                    let (yes, no) = path.split(rank, guard, &mut work)?;
+                    (RankLane::Integers(yes), RankLane::Integers(no))
+                }
+                RankLane::Float(points) => {
+                    let (axis, binding) = rank.float_entry().ok_or(ProjectCheck::Unsupported)?;
+                    let guard = ranked_float::Guard::checked_runtime(body, *condition, branches.condition, &axis.ty, binding)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    if let Some(proof_condition) = proof_condition {
+                        let authored = ranked_float::Guard::from_expression(proof_condition, &axis.ty, |expr|
+                            matches!(expr, ScalarExpression::Name { name, .. } if name == &typed.input_names[axis.ordinal]))
+                            .ok_or(ProjectCheck::Unsupported)?;
+                        if authored != guard { return Err(ProjectCheck::Unsupported); }
+                    }
+                    charge(&mut work, points.len().checked_mul(2).ok_or(ProjectCheck::Unsupported)?)?;
+                    let (yes, no) = points.into_iter().partition(|&point| guard.accepts(point));
+                    (RankLane::Float(yes), RankLane::Float(no))
+                }
+            };
             pending.push((no_proof, branches.else_branch, *else_block, no));
             pending.push((yes_proof, branches.then_branch, *then_block, yes));
         } else if let Some(value) = structure.checker_integer_literals.get(&output) {
@@ -300,6 +385,9 @@ pub(super) fn verify<'a>(
                     let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
                     RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
                 };
+                // The current report can render only an integer entry
+                // witness. A false float base never becomes a certificate.
+                let RankLane::Integers(path) = path else { return Err(ProjectCheck::Unsupported); };
                 charge(&mut work, path.0.len())?;
                 let coordinates = path.0.iter().map(|axis| axis.extremes()
                     .map(|(first, _)| first.clone()).ok_or(ProjectCheck::Unsupported))
@@ -314,7 +402,7 @@ pub(super) fn verify<'a>(
             let args = self_use(plan.name, proof, typed, rank)?;
             check_tail(plan, rank, output, runtime, &args)?;
             matched_calls += 1;
-            match transition(rank, &entry, &path, &args, &mut work)? {
+            match path.transition(&entry, rank, &args, &mut work)? {
                 InductionPremise::Unreachable => {}
                 next if matches!(premise, InductionPremise::Unreachable | InductionPremise::Established) => premise = next,
                 _ => {}

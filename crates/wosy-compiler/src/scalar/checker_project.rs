@@ -13,6 +13,8 @@ mod catalog_composition;
 #[cfg(feature = "internal-checker")]
 mod ranked;
 #[cfg(feature = "internal-checker")]
+mod ranked_float;
+#[cfg(feature = "internal-checker")]
 mod rewrite;
 
 use super::{
@@ -8031,16 +8033,17 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
     if plan.proof_source != &plan.typed.target.source {
         return Err(ProjectCheck::Unsupported);
     }
+    let integer_rank = rank.float_entry().is_none();
     let existing_transfer_arity = rank.entries().count() <= 2;
     Ok(RankedOrderedEvidence {
         plan, rank,
-        allow_reached: existing_transfer_arity
+        allow_reached: integer_rank && existing_transfer_arity
             && (plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count)),
-        allow_wide_initializer: !existing_transfer_arity && plan.proof_source == root_source,
-        allow_qualified_wide_initializer: !existing_transfer_arity && LOCAL_CATALOGS && plan.target.0 < startup_count
+        allow_wide_initializer: integer_rank && !existing_transfer_arity && plan.proof_source == root_source,
+        allow_qualified_wide_initializer: integer_rank && !existing_transfer_arity && LOCAL_CATALOGS && plan.target.0 < startup_count
             && plan.proof_source != root_source && plan.proof_source.project == root_source.project
             && plan.proof_source.package == root_source.package,
-        allow_symbolic_summary: plan.proof_source == root_source,
+        allow_symbolic_summary: integer_rank && plan.proof_source == root_source,
         reached_return: None,
     })
 }
@@ -9323,11 +9326,17 @@ impl PreparedProofModule {
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let filter = prepare_proof_entry_filter_in_scope(
+        let filter = if typed.measure.and_then(TypedInductionRank::float_entry).is_some() {
+            // The ranked verifier checks the typed, finite float guard. It
+            // must not be represented as an integer-path precondition.
+            None
+        } else {
+            prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             matches!(typed.result_type, ScalarType::Bool | ScalarType::Char) || typed.is_result_pair()
                 || typed.measure.is_some() || (ALLOW_DOMAIN && steps.items.is_empty()),
-        )?;
+            )?
+        };
         Ok(PlannedModuleProof {
             proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
             function, name: proof_name, typed, steps, ordered_shape, filter,
@@ -10474,7 +10483,7 @@ impl<'a> VerifiedInductionExactReturn<'a> {
     {
         let checked = plan.verify_unused_induction(rank);
         let token = (|| {
-            if !matches!(checked, Ok(ProjectCheck::Proved)) {
+            if rank.float_entry().is_some() || !matches!(checked, Ok(ProjectCheck::Proved)) {
                 return None;
             }
             let TypedProofGoal::Literal { operator: BinaryOperator::Equal, bound, .. } = &plan.typed.goal else {
@@ -11315,6 +11324,11 @@ impl<'a> TypedInductionRank<'a> {
         self.parameters.into_iter().flatten()
     }
 
+    fn float_entry(self) -> Option<TypedEntryMeasure<'a>> {
+        let first = self.parameters[0]?;
+        matches!(first.0.ty, ScalarType::F32 | ScalarType::F64).then_some(first)
+    }
+
     fn axes(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
         self.components.into_iter().flatten()
     }
@@ -11346,12 +11360,8 @@ fn typed_proof_decreases<'a>(
         };
         let slot = input_names.iter().position(|input| input == name).ok_or(ProjectCheck::InvalidProof)?;
         let selected = entry(slot)?;
-        if !is_integer_type(&selected.0.ty) {
-            return Err(if matches!(selected.0.ty, ScalarType::F32 | ScalarType::F64) {
-                ProjectCheck::Unsupported
-            } else {
-                ProjectCheck::InvalidProof
-            });
+        if !is_integer_type(&selected.0.ty) && !matches!(selected.0.ty, ScalarType::F32 | ScalarType::F64) {
+            return Err(ProjectCheck::InvalidProof);
         }
         Ok(selected)
     };
@@ -11360,7 +11370,7 @@ fn typed_proof_decreases<'a>(
     let sum = if let ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. } = &first_expression {
         if expressions.peek().is_some() || input_names.len() != 2 { return Err(ProjectCheck::Unsupported); }
         let (left, right) = (scalar(left)?, scalar(right)?);
-        if left.0.ty != right.0.ty || left.0.ordinal == right.0.ordinal {
+        if !is_integer_type(&left.0.ty) || left.0.ty != right.0.ty || left.0.ordinal == right.0.ordinal {
             return Err(ProjectCheck::Unsupported);
         }
         components[0] = Some(left);
@@ -11384,7 +11394,11 @@ fn typed_proof_decreases<'a>(
     let mut parameters = [None; MAX_RANKED_INTEGER_AXES];
     for (i, slot) in parameters.iter_mut().take(input_names.len()).enumerate() {
         let parameter = entry(i)?;
-        if !is_integer_type(&parameter.0.ty) { return Err(ProjectCheck::Unsupported); }
+        if !is_integer_type(&parameter.0.ty)
+            && !(input_names.len() == 1 && matches!(parameter.0.ty, ScalarType::F32 | ScalarType::F64))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
         *slot = Some(parameter);
     }
     let rank = TypedInductionRank { parameters, components, sum };
@@ -17462,6 +17476,54 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             "where ((entry == -120 || entry == -110) && entry == -115)");
         let checked = run(&dead, ScalarCheckerScope::CurrentPackage).unwrap();
         assert!(!checked.active && checked.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_induction_checks_bounded_ieee_rank_in_its_declared_width() {
+        let app = source("src/main.w", "ordered-float-rank");
+        let program = r#"%%start
+            u8(f32) descend = fn(value) {
+                if (value <= 1.0) { 7 } else { descend(value - 0.00000011920928955078125) }
+            };
+            proof rank for descend(entry) -> (out)
+                where (entry >= 1.0 && entry <= 1.0000002384185791015625)
+                ensures (out == 7) decreases (entry) {
+                if (entry <= 1.0) { core.show(out == 7); }
+                else { core.use(rank(entry - 0.00000011920928955078125)); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let double = program.replace("f32", "f64")
+            .replace("1.0000002384185791015625", "1.0000000000000004440892098500626")
+            .replace("0.00000011920928955078125", "0.0000000000000002220446049250313");
+        for text in [program, &double] {
+            let checked = run(text, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+            let idle = run(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!idle.active && idle.symbolic_diagnostic.is_none());
+        }
+        let expected_guard = "entry >= 1.0 && entry <= 1.0000002384185791015625";
+        let empty = program.replace(expected_guard, "entry >= 2.0 && entry <= 1.0");
+        assert!(!run(&empty, package).unwrap().active);
+        for text in [
+            program.replace("0.00000011920928955078125", "0.0000000001"),
+            double.replace("0.0000000000000002220446049250313", "0.00000000000000000001"),
+            program.replace(expected_guard, "entry >= 1.0"),
+            program.replace(expected_guard, "entry >= 0.0 && entry <= 3.0"),
+            program.replace("0.00000011920928955078125", "1.0"),
+            program.replace("rank(entry - 0.00000011920928955078125)", "rank(entry)"),
+            program.replace("out == 7) decreases", "out == 8) decreases"),
+            program.replace("%%end", r#"u8 reached = descend(1.0); core.require(reached == 7, { .stdout = ""; .stderr = ""; .code = 1; .files = []; }); %%end"#),
+        ] {
+            assert!(matches!(run(&text, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
