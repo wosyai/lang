@@ -2539,6 +2539,40 @@ fn checked_float_type<'a>(
         })
 }
 
+fn emit_fallible_binary<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    operator: &BinaryOperator, left: &ScalarExpression, right: &ScalarExpression,
+    payload: &ScalarType, path: ExpressionPath<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    if !aggregate_transfer::fallible_allocation_call_at(state, left) {
+        return Err("missing sealed fallible left operand".into());
+    }
+    let BasicValueEnum::StructValue(result) = take_basic(path.emit(context, state, left)?)? else {
+        return Err("missing sealed fallible left result".into());
+    };
+    let pair = aggregate_transfer::fallible_allocation_result_type(context, payload)?;
+    if result.get_type() != pair { return Err("invalid sealed fallible binary payload".into()); }
+    let test = state.builder.get_insert_block().ok_or("missing fallible binary test block")?;
+    let function = test.get_parent().ok_or("missing fallible binary function")?;
+    let present = context.append_basic_block(function, "fallible.binary_present");
+    let merge = context.append_basic_block(function, "fallible.binary_merge");
+    let succeeded = state.builder.build_extract_value(result, 0, "fallible.left_succeeded")
+        .map_err(builder_error)?.into_int_value();
+    state.builder.build_conditional_branch(succeeded, present, merge).map_err(builder_error)?;
+    state.builder.position_at_end(present);
+    let left = state.builder.build_extract_value(result, 1, "fallible.left_payload").map_err(builder_error)?;
+    let right = emit_contextual_numeric(context, state, right, payload, path)?;
+    let value = take_basic(emit_binary_values(state, operator, EmitValue::Basic(left), right,
+        *payload == ScalarType::U64)?)?;
+    let computed = aggregate_transfer::present_fallible_allocation_result(context, state, value, payload)?;
+    let computed_end = state.builder.get_insert_block().ok_or("missing fallible binary present block")?;
+    state.builder.build_unconditional_branch(merge).map_err(builder_error)?;
+    state.builder.position_at_end(merge);
+    let phi = state.builder.build_phi(pair, "fallible.binary_result").map_err(builder_error)?;
+    phi.add_incoming(&[(&result, test), (&computed, computed_end)]);
+    Ok(EmitValue::Basic(phi.as_basic_value()))
+}
+
 pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2568,6 +2602,9 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
                 || integer && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr
                     | BinaryOperator::BitXor | BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight) =>
         {
+            if aggregate_transfer::fallible_allocation_expression_at(state, expression) {
+                return emit_fallible_binary(context, state, operator, left, right, expected, path);
+            }
             let left = emit_contextual_numeric(context, state, left, expected, path)?;
             let right = emit_contextual_numeric(context, state, right, expected, path)?;
             let unsigned = matches!(expected, ScalarType::U8 | ScalarType::U16 | ScalarType::U32
@@ -2575,7 +2612,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
             emit_binary_values(state, operator, left, right, unsigned)
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
-            let choice = aggregate_transfer::fallible_allocation_choice_at(state, expression);
+            let choice = aggregate_transfer::fallible_allocation_expression_at(state, expression);
             if choice && !matches!(expected, ScalarType::U64 | ScalarType::I32) {
                 return Err("invalid sealed fallible conditional payload type".into());
             }

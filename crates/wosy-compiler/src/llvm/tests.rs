@@ -13315,3 +13315,77 @@ if (observed(7) != -99 || observed(7) != -99 || observed(7) != -99 || observed(7
         }
     }
 }
+
+#[test]
+fn guarded_fallible_typed_binary_propagates_before_later_work() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _wide = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+i32(u64) _signed = fn(count) { u16[count] scratch; 7 - core.int_trunc<i32>(core.array_len(&scratch)) };
+u64(u64) plus = fn(count) {
+    u64 result =? _wide(count) + 2;
+    if (&result == null) { 0 } else { result }
+};
+i32(u64, i32) masked = fn(count, mask) {
+    i32 result =? _signed(count) ^ mask;
+    if (&result == null) { -99 } else { result }
+};
+if (plus(7) != 0 || plus(7) != 9 || plus(0) != 0
+    || masked(9, 0) != -2 || masked(7, 0) != 0 || masked(7, 0) != -99) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "sealed typed binary initializer");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let function = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let allocate = module.get_function("__wosy_core_alloc").unwrap();
+            for (caller, leaf, op, integer) in [
+                ("plus", "_wide", InstructionOpcode::Add, context.i64_type()),
+                ("masked", "_signed", InstructionOpcode::Xor, context.i32_type()),
+            ] {
+                let (caller, leaf) = (function(caller), function(leaf));
+                assert_eq!(caller.get_type().get_return_type(), Some(integer.into()));
+                let pair = context.struct_type(&[context.bool_type().into(), integer.into()], false);
+                assert_eq!(leaf.get_type().get_return_type(), Some(pair.into()));
+                let blocks = caller.get_basic_blocks();
+                let calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let [left] = calls(leaf)[..] else { panic!("{llvm}") };
+                let left_status = left.get_next_instruction().unwrap();
+                let dispatch = left_status.get_next_instruction().unwrap();
+                assert_eq!(left_status.get_indices(), vec![0]);
+                assert_eq!(known_field_operand(dispatch, 0).unwrap().as_instruction_value(), Some(left_status));
+                let present = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.binary_present").unwrap();
+                let merge = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.binary_merge").unwrap();
+                for destination in [present, merge] {
+                    assert!(dispatch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(destination)));
+                }
+                assert!(std::iter::successors(present.get_first_instruction(), |instruction| instruction.get_next_instruction())
+                    .any(|instruction| instruction.get_opcode() == op));
+                let [destination] = calls(allocate)[..] else { panic!("{llvm}") };
+                assert_eq!(destination.get_parent().unwrap().get_name().to_bytes(), b"fallible.destination");
+                let first = merge.get_first_instruction().unwrap();
+                assert_eq!(first.get_opcode(), InstructionOpcode::Phi);
+                assert_eq!(first.get_type().into_struct_type(), pair);
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_TYPED_BINARY_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

@@ -1274,6 +1274,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) fallible_call_operations: Vec<(OccurrenceOrdinal, (CfgPointId, OccurrenceOrdinal, bool))>,
     pub(super) fallible_call_choices: Vec<(OccurrenceOrdinal, [(CfgPointId, OccurrenceOrdinal); 2])>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
@@ -1511,7 +1512,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.fallible_call_initializers.is_empty() || !self.fallible_call_choices.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.fallible_call_initializers.is_empty() || !self.fallible_call_operations.is_empty() || !self.fallible_call_choices.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2951,7 +2952,7 @@ pub(crate) struct ClosedBody {
     pub(crate) fallible_relay_allocations: Vec<ByteSpan>,
     pub(crate) ordinary_fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
-    pub(crate) fallible_allocating_choices: BTreeSet<usize>,
+    pub(crate) fallible_allocating_expressions: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_wrapper: Option<usize>,
@@ -6616,15 +6617,19 @@ fn closed_aggregates<'a>(
         declarations.insert((input.source, function.name_span), (module, item));
         if let Some(facts) = facts {
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
-                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
+                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None, false)));
             if is_monomorphic && arm.is_none() {
                 ordinary_fallible_candidates.extend(facts.ordinary_fallible_call_candidates.iter()
                     .map(|ordinal| (key, ordinal.0)));
             }
             for &(choice, arms) in &facts.fallible_call_choices {
                 fallible_call_requests.extend(arms.into_iter()
-                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice))));
+                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice), false)));
             }
+            for &(operation, (call, ordinal, requires_extent)) in &facts.fallible_call_operations {
+                fallible_call_requests.push((key, input.source, cfg, call, ordinal, Some(operation), requires_extent));
+            }
+
         }
         if is_monomorphic && arm.is_none() && facts.is_some_and(|facts|
             matches!(facts.proved_literal_array_route(), Some(LiteralArrayRoute::FreshLeaf { .. })))
@@ -6763,7 +6768,7 @@ fn closed_aggregates<'a>(
                 if !allocation.is_allocation || allocation.fallible_assignment.is_some()
                     || !matches!(allocation.value, ScalarExpression::Integer { ref value, span }
                         if *value == 0.into() && span == allocation.span)
-                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if ordinary_value(element))
                 { return None; }
                 owners.push(by_span.remove(&receiver.name_span)?);
                 let BlockItemKind::Binding(region) = &root.items.get(index * 2)?.kind else { return None; };
@@ -6931,7 +6936,7 @@ fn closed_aggregates<'a>(
                 if !allocation.is_allocation || allocation.fallible_assignment.is_some()
                     || !matches!(&allocation.value, ScalarExpression::Integer { value, span }
                         if *value == 0.into() && *span == allocation.span)
-                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if ordinary_value(element))
                     || !matches!(&root.items.get(index * 2 + 1)?.kind, BlockItemKind::Evaluation { expression }
                         if *expression == observer.ordinal)
                     || sites.sites.get(observer.site)?.target != ResolvedCallTarget::Core(CoreOperationId::ArrayLen)
@@ -7020,10 +7025,15 @@ fn closed_aggregates<'a>(
         };
         let mut memo = HashMap::new();
         let mut complete_suffixes = BTreeSet::new();
-        for (caller, source, cfg, call, ordinal, choice) in fallible_call_requests {
+        for (caller, source, cfg, call, ordinal, choice, requires_extent) in fallible_call_requests {
             let target = target_body(&declarations, cfg, call)
                 .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
-            if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
+            if allocation_free_integer_graph(target, &mut memo, dependencies) {
+                if requires_extent {
+                    return Err("checked fallible addition requires a proven materialized extent".into());
+                }
+                continue;
+            }
             if let Some(choice) = choice {
                 fallible_choices.insert((caller, choice.0));
             }
@@ -7037,6 +7047,9 @@ fn closed_aggregates<'a>(
                 // Reusing a proven suffix still records its new incoming use.
                 // Every downstream edge has already been recorded once.
                 let check_payload = |actual: &ScalarType| {
+                    if requires_extent && *actual != ScalarType::U64 {
+                        return Err("checked fallible addition requires an unsigned materialized extent".to_owned());
+                    }
                     if payload.as_ref().is_some_and(|expected| expected != actual) {
                         Err("sealed fallible allocation relay changes the result payload type".to_owned())
                     } else { Ok(()) }
@@ -7459,7 +7472,7 @@ fn closed_aggregates<'a>(
             result.bodies.entry(body).or_default().ordinary_fallible_allocating_calls.insert(ordinal);
         }
         for &(body, ordinal) in &fallible_choices {
-            result.bodies.entry(body).or_default().fallible_allocating_choices.insert(ordinal);
+            result.bodies.entry(body).or_default().fallible_allocating_expressions.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
