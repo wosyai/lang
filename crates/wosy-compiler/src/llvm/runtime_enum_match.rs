@@ -1,5 +1,5 @@
 use inkwell::values::BasicValue;
-use super::{expression::emit_integer_binary, memory::{builder_error, integer_constant, integer_type}, *};
+use super::{expression::emit_integer_binary, memory::{build_aggregate_at, builder_error, integer_constant, integer_type}, *};
 use crate::scalar::runtime_enum_match::{ArmResult, IntegerExpression, IntegerKind, Operand, Plan, Predicate, TypedSelector};
 use crate::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout};
 use wosy_syntax::ByteSpan;
@@ -52,18 +52,34 @@ pub(super) fn emit<'ctx>(
         {
             return Err("prepared runtime enum arm slot mismatch".into());
         }
-        let result = match &arm.result {
-            ArmResult::Literal { value, .. } => literal(context, &plan.output, value)?,
-            ArmResult::Expression(expression) if expression.ty == plan.output => lowering.integer(expression, Some(&variant.slots))?,
-            ArmResult::Expression(_) => return Err("invalid prepared runtime arm result type".into()),
-            ArmResult::Payload { slot, .. } => {
-                let selected = variant.slots.get(*slot).filter(|slot| slot.source_type.ty == plan.output)
-                    .ok_or("missing prepared runtime enum projection")?;
-                builder.build_load(integer_type(context, &plan.output)?, lowering.address(selected)?, "enum.match.payload")
-                    .map_err(builder_error)?.into_int_value()
+        if arm.results.len() != plan.outputs.len() {
+            return Err("prepared runtime enum output arity mismatch".into());
+        }
+        let values = arm.results.iter().zip(&plan.outputs).map(|(result, ty)| {
+            match result {
+                ArmResult::Literal { value, .. } => literal(context, ty, value),
+                ArmResult::Expression(expression) if &expression.ty == ty => lowering.integer(expression, Some(&variant.slots)),
+                ArmResult::Expression(_) => Err("invalid prepared runtime arm result type".into()),
+                ArmResult::Payload { slot, .. } => {
+                    let selected = variant.slots.get(*slot).filter(|slot| &slot.source_type.ty == ty)
+                        .ok_or("missing prepared runtime enum projection")?;
+                    builder.build_load(integer_type(context, ty)?, lowering.address(selected)?, "enum.match.payload")
+                        .map_err(builder_error).map(|value| value.into_int_value())
+                }
             }
-        };
-        builder.build_return(Some(&result)).map_err(builder_error)?;
+        }).collect::<Result<Vec<_>, String>>()?;
+        if let [value] = values.as_slice() {
+            builder.build_return(Some(value)).map_err(builder_error)?;
+        } else {
+            let ScalarType::Callable { outputs, .. } = &callable.signature else {
+                return Err("missing prepared runtime enum callable outputs".into());
+            };
+            let values = values.into_iter().map(|value| EmitValue::Basic(value.into())).collect();
+            let EmitValue::Aggregate { value, .. } = build_aggregate_at(context, builder, target, outputs, values)? else {
+                return Err("missing prepared runtime enum multi-output return".into());
+            };
+            builder.build_return(Some(&value)).map_err(builder_error)?;
+        }
     }
     Ok(())
 }

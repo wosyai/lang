@@ -14,7 +14,7 @@ pub(crate) struct Plan {
     pub(crate) enumeration: ScalarEnumId,
     name_span: ByteSpan,
     inputs: Vec<(ByteSpan, ScalarType)>,
-    pub(crate) output: ScalarType,
+    pub(crate) outputs: Vec<ScalarType>,
     pub(crate) selector: TypedSelector,
     pub(crate) local: Option<LexicalEnumBinding>,
     pub(crate) arms: Vec<TypedArm>,
@@ -49,7 +49,7 @@ pub(crate) struct TypedArm {
     pub(crate) tag: u32,
     pub(crate) scope: ByteSpan,
     pub(crate) bindings: Vec<CaseBinding>,
-    pub(crate) result: ArmResult,
+    pub(crate) results: Vec<ArmResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,10 +89,13 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     let ScalarType::Callable { outputs, parameters } = derive_type(&signature) else {
         return Err(error("invalid runtime enum match signature"));
     };
-    let [result] = outputs.outputs.as_slice() else { return Err(error("runtime enum match requires one integer result")); };
-    if !is_integer_type(&result.ty) || !parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool) {
+    if outputs.outputs.is_empty() || !outputs.outputs.iter().all(|output| is_integer_type(&output.ty))
+        || !parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool)
+    {
         return Err(error("runtime enum match requires scalar integer results and primitive formals"));
     }
+    analysis_budget::charge_call_work(work, outputs.outputs.len()).ok_or_else(||
+        error("runtime enum output sequence exceeds analysis limits"))?;
     let names = owner.children().find(|node| node.kind() == SyntaxKind::Parameters).into_iter()
         .flat_map(|parameters| parameters.children_with_tokens()).filter_map(|element| element.into_token())
         .filter(|token| token.kind() == SyntaxKind::Identifier).collect::<Vec<_>>();
@@ -176,12 +179,18 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     let arms = resolved.arms.into_iter().map(|arm| {
         let scope = arm.body.span;
         let arm_error = |message| diagnostic(source, scope, message);
-        let [returned] = arm.body.final_output_values.as_slice() else {
-            return Err(arm_error("runtime enum arm requires one scalar result"));
-        };
-        if arm.body.items.len() != 1 || arm.body.terminated_items.as_slice() != [false] {
-            return Err(arm_error("runtime enum arm must directly return its payload or an integer literal"));
+        let returned = &arm.body.final_output_values;
+        if returned.len() != outputs.outputs.len() {
+            return Err(arm_error("runtime enum arms must match the function output arity"));
         }
+        if arm.body.items.len() != returned.len()
+            || arm.body.terminated_items.len() != returned.len()
+            || arm.body.terminated_items.iter().any(|terminated| *terminated)
+        {
+            return Err(arm_error("runtime enum arms must return a direct primitive output sequence"));
+        }
+        analysis_budget::charge_call_work(work, returned.len()).ok_or_else(||
+            arm_error("runtime enum output sequence exceeds analysis limits"))?;
         let bindings = arm.binders.iter().zip(arm.binder_spans).enumerate().map(|(slot, ((name, ty), declaration))| {
             if formals.contains_key(*name) || typecheck::is_null_literal_name(name)
                 || local.as_ref().is_some_and(|(binding, ..)| binding.text() == *name) {
@@ -189,31 +198,33 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
             }
             Ok(CaseBinding { slot, declaration, ty: (*ty).clone() })
         }).collect::<Result<Vec<_>, _>>()?;
-        let result = if let ScalarExpression::Name { name, span } = &returned.value {
-            let Some(slot) = arm.binders.iter().position(|(binder, _)| *binder == name) else {
-                return Err(diagnostic(source, *span, "runtime enum arm result must name its own payload binder"));
-            };
-            if bindings[slot].ty != result.ty {
-                return Err(diagnostic(source, *span, "runtime enum payload result type differs from the function output"));
+        let slots = arm.binders.iter().enumerate().map(|(slot, (name, _))| (*name, slot))
+            .collect::<HashMap<_, _>>();
+        let names = |name: &str| slots.get(name).map(|&slot| (bindings[slot].ty.clone(), IntegerKind::Payload(slot)));
+        let results = returned.iter().zip(&outputs.outputs).map(|(returned, result)| {
+            if let ScalarExpression::Name { name, span } = &returned.value {
+                let Some(&slot) = slots.get(name.as_str()) else {
+                    return Err(diagnostic(source, *span, "runtime enum arm result must name its own payload binder"));
+                };
+                if bindings[slot].ty != result.ty {
+                    return Err(diagnostic(source, *span, "runtime enum payload result type differs from the function output"));
+                }
+                Ok(ArmResult::Payload { slot, use_span: *span })
+            } else if let Some(literal) = concrete_integer_literal(&returned.value) {
+                if !integer_literal_fits_type(&literal, &result.ty) {
+                    return Err(diagnostic(source, returned.span, "runtime enum arm literal does not fit the function output"));
+                }
+                Ok(ArmResult::Literal { value: literal.into_owned(), span: returned.span })
+            } else {
+                Ok(ArmResult::Expression(primitive::compile(source, &returned.value, &result.ty, &names, work, 0)?))
             }
-            ArmResult::Payload { slot, use_span: *span }
-        } else if let Some(literal) = concrete_integer_literal(&returned.value) {
-            if !integer_literal_fits_type(&literal, &result.ty) {
-                return Err(diagnostic(source, returned.span, "runtime enum arm literal does not fit the function output"));
-            }
-            ArmResult::Literal { value: literal.into_owned(), span: returned.span }
-        } else {
-            let slots = arm.binders.iter().enumerate().map(|(slot, (name, _))| (*name, slot))
-                .collect::<HashMap<_, _>>();
-            let names = |name: &str| slots.get(name).map(|&slot| (bindings[slot].ty.clone(), IntegerKind::Payload(slot)));
-            ArmResult::Expression(primitive::compile(source, &returned.value, &result.ty, &names, work, 0)?)
-        };
-        Ok(TypedArm { tag: arm.tag, scope, bindings, result })
+        }).collect::<Result<_, _>>()?;
+        Ok(TypedArm { tag: arm.tag, scope, bindings, results })
     }).collect::<Result<_, _>>()?;
     let name_span = direct_token(&owner, SyntaxKind::Identifier).as_ref().map(token_span)
         .ok_or_else(|| error("missing runtime enum match callable name"))?;
     Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows,
-        enumeration: resolved.enumeration.id.clone(), output: result.ty.clone(), selector, local: local_binding, arms })
+        enumeration: resolved.enumeration.id.clone(), outputs: outputs.outputs.into_iter().map(|output| output.ty).collect(), selector, local: local_binding, arms })
 }
 
 impl Plan {
@@ -259,7 +270,7 @@ impl Plan {
             && self.inputs.len() == parameters.len()
             && self.inputs.iter().zip(function.parameter_spans.iter().zip(parameters))
                 .all(|((declared, ty), (actual, actual_ty))| declared == actual && ty == actual_ty)
-            && matches!(outputs.outputs.as_slice(), [output] if output.ty == self.output)
+            && outputs.outputs.iter().map(|output| &output.ty).eq(self.outputs.iter())
     }
 }
 
@@ -332,7 +343,7 @@ mod tests {
         let [plan] = declarations.runtime_enum_matches.as_slice() else { panic!("{:?}", declarations.diagnostics); };
         assert_eq!(plan.enumeration.source, source);
         assert_eq!(plan.enumeration.index, 0);
-        assert_eq!(plan.output, ScalarType::U8);
+        assert_eq!(plan.outputs, [ScalarType::U8]);
         let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
         let TypedSelector::If { predicate: Predicate::Formal { use_span, declaration }, yes, no } = &plan.selector
             else { panic!("resolved runtime condition"); };
@@ -351,7 +362,7 @@ mod tests {
         assert_eq!(right.bindings[0].slot, 0);
         assert_eq!(right.bindings[1].ty, ScalarType::U16);
         assert_eq!(snippet(right.bindings[1].declaration), "other");
-        assert!(matches!(right.result, ArmResult::Payload { slot: 0, .. }));
+        assert!(matches!(right.results.as_slice(), [ArmResult::Payload { slot: 0, .. }]));
         assert!(declarations.diagnostics.iter().any(|diagnostic| diagnostic.message == "typed runtime enum match is not yet eligible for this preparation route"));
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
             assert!(prepare_scalar_project(vec![(parse(text), Vec::new())], vec![source.clone()],
@@ -553,5 +564,54 @@ fn prepared_runtime_enum_typed_primitive_regions_share_ordinary_integer_lowering
     ] {
         let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime primitive expression");
         assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{:?}", rejected.diagnostics);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_match_returns_authentic_positional_output_sequences() {
+    let text = r#"%%start
+        enum copy Region { left(u8, u16); right(u16, u8); }
+        (u8, u16)(bool, u8) choose = fn(flag, input) {
+            Region selected = if (flag) { Region.left(input, 256) } else { Region.right(513, input | 2) };
+            match (selected) {
+                right(wide, narrow) { narrow ^ 1, wide }
+                left(narrow, wide) { narrow, wide }
+            }
+        };
+        u8 a, u16 b = choose(true, 17);
+        u8 c, u16 d = choose(false, 24);
+        if (a != 17 || b != 256 || c != 27 || d != 513) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target).unwrap();
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[0] else { panic!("function owner"); };
+        let plan = function.runtime_enum_match.as_deref().unwrap();
+        assert_eq!(plan.outputs, [ScalarType::U8, ScalarType::U16]);
+        assert!(matches!(plan.arms[0].results.as_slice(), [ArmResult::Expression(_), ArmResult::Payload { slot: 0, .. }]));
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("switch i32") && ir.contains("insertvalue { i8, i16 }") && ir.contains("ret { i8, i16 }"));
+            assert!(ir.contains("extractvalue { i8, i16 }"));
+        }
+    }
+    for (invalid, reason) in [
+        (text.replace("{ narrow, wide }", "{ narrow }"), "output arity"),
+        (text.replace("{ narrow, wide }", "{ wide, narrow }"), "differs from the function output"),
+        (text.replace("{ narrow, wide }", "{ narrow, wide, 1 }"), "output arity"),
+        (text.replace("(u8, u16)(bool", "(u8, *u16)(bool"), "scalar integer results"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime enum output sequence");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
     }
 }

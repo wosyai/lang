@@ -917,7 +917,17 @@ pub(super) fn build_aggregate<'ctx, 'module>(
     outputs: &crate::ScalarOutputSequence,
     values: Vec<EmitValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let ty = aggregate_type(context, outputs, state.target_layout)?;
+    build_aggregate_at(context, state.builder, state.target_layout, outputs, values)
+}
+
+pub(super) fn build_aggregate_at<'ctx>(
+    context: &'ctx Context,
+    builder: &inkwell::builder::Builder<'ctx>,
+    target: ScalarTargetLayout,
+    outputs: &crate::ScalarOutputSequence,
+    values: Vec<EmitValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let ty = aggregate_type(context, outputs, target)?;
     let mut aggregate = ty.const_zero();
     for (index, (output, value)) in outputs.outputs.iter().zip(values).enumerate() {
         let value = if output.ty == ScalarType::Unit {
@@ -925,8 +935,7 @@ pub(super) fn build_aggregate<'ctx, 'module>(
         } else {
             take_basic(value)?
         };
-        aggregate = state
-            .builder
+        aggregate = builder
             .build_insert_value(aggregate, value, index as u32, "output")
             .map_err(builder_error)?
             .into_struct_value();
