@@ -30,14 +30,103 @@ pub(super) fn checked_effects<'a>(
     source: &SourceIdentity, function: &ScalarFunction, body: &'a FunctionCallSites,
     cfg: &'a ScalarReferenceCfg, facts: &'a CallablePointFacts,
 ) -> Option<Vec<EntryPointeeWrite<'a>>> {
+    if !body.conditionals.is_empty() || body.structure.blocks.len() != 1 { return None; }
+    let items = &body.structure.blocks.get(body.structure.root.0)?.items;
+    if items.len() != body.assignments.len() || cfg.points.len() > 64 { return None; }
+    let path = cfg.points.iter().map(|point| point.id).collect::<Vec<_>>();
+    checked_path(source, function, body, cfg, facts, items, &path, None)
+}
+
+/// Exact prepared single Boolean conditional. Lane zero is false, lane one
+/// true; both original CFG paths are validated, not just the claimed lane.
+#[cfg(feature = "internal-checker")]
+pub(super) fn checked_bool_effects<'a>(
+    source: &SourceIdentity, function: &ScalarFunction, body: &'a FunctionCallSites,
+    cfg: &'a ScalarReferenceCfg, facts: &'a CallablePointFacts,
+) -> Option<[EntryPointeeWrite<'a>; 2]> {
+    let structure = &body.structure;
+    let [pointer, control] = body.boundary.parameters.as_slice() else { return None; };
+    if !matches!(&pointer.ty, ScalarType::CheckedReference { .. }) || control.ty != ScalarType::Bool
+        || cfg.points.len() > 64 || body.conditionals.len() != 1 || structure.blocks.len() != 3
+        || body.short_circuits.len() != 0
+    {
+        return None;
+    }
+    let [item] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
+    let ConditionalRegion::Value { condition, then_block, else_block, .. } = *body.conditionals.get(&expression)?
+        else { return None; };
+    let binding = facts.formals.get(&1)?;
+    if control.ordinal != 1 || &binding.source != source || binding.function_span != function.span
+        || structure.checked_types.expressions.get(&condition) != Some(&ScalarType::Bool)
+        || !matches!(body.prepared_plain_name(condition), Some(PlainNameIdentity::Lexical(seen)) if seen == binding)
+    {
+        return None;
+    }
+    let condition_point = cfg.points.get(facts.evaluations.get(&condition)?.0)?;
+    let [branch_id] = condition_point.successors.as_slice() else { return None; };
+    let branch = cfg.points.get(branch_id.0)?;
+    let CfgPointKind::Branch { condition: test @ ScalarExpression::Name { .. } } = &branch.kind else { return None; };
+    if !matches!(&condition_point.kind, CfgPointKind::Read { binding: read } if read == binding)
+        && !matches!(&condition_point.kind, CfgPointKind::Evaluate(expression) if expression == test)
+    {
+        return None;
+    }
+    // ReferenceFlowBuilder links then first and else second. Enforce that
+    // correspondence independently by binding each arm's assignment RHS
+    // occurrence to the points reached through its actual successor.
+    let [when_true, when_false] = branch.successors.as_slice() else { return None; };
+    if when_true == when_false { return None; }
+    let follow = |branch_target| {
+        let mut path = Vec::new();
+        let mut current = CfgPointId(0);
+        loop {
+            if path.len() >= cfg.points.len() { return None; }
+            path.push(current);
+            let point = cfg.points.get(current.0)?;
+            if point.id != current { return None; }
+            current = if current == *branch_id { branch_target }
+                else { match point.successors.as_slice() {
+                    [] => break,
+                    [next] => *next,
+                    _ => return None,
+                }};
+        }
+        Some(path)
+    };
+    let false_path = follow(*when_false)?;
+    let true_path = follow(*when_true)?;
+    let mut joins = cfg.points.iter().filter(|point| matches!(point.kind, CfgPointKind::Join));
+    let join_id = joins.next()?.id;
+    if joins.next().is_some() { return None; }
+    if !false_path.contains(&join_id) || !true_path.contains(&join_id)
+        || (0..cfg.points.len()).any(|index| !false_path.contains(&CfgPointId(index)) && !true_path.contains(&CfgPointId(index)))
+    {
+        return None;
+    }
+    let extras = (condition_point.id, *branch_id, join_id);
+    let arm = |block: BlockOrdinal, path: &[CfgPointId]| {
+        let items = &structure.blocks.get(block.0)?.items;
+        checked_path(source, function, body, cfg, facts, items, path, Some(extras))?.pop()
+    };
+    let false_items = &structure.blocks.get(else_block.0)?.items;
+    let true_items = &structure.blocks.get(then_block.0)?.items;
+    if false_items.len().checked_add(true_items.len())? != body.assignments.len() { return None; }
+    Some([arm(else_block, &false_path)?, arm(then_block, &true_path)?])
+}
+
+fn checked_path<'a>(
+    source: &SourceIdentity, function: &ScalarFunction, body: &'a FunctionCallSites,
+    cfg: &'a ScalarReferenceCfg, facts: &'a CallablePointFacts,
+    items: &[BlockItem], path: &[CfgPointId], guard: Option<(CfgPointId, CfgPointId, CfgPointId)>,
+) -> Option<Vec<EntryPointeeWrite<'a>>> {
     // Only successive straight-line integer load/modify/stores on exact formal loans are admitted.
     // Cap before inspecting the path; there is no new reference analysis.
     if cfg.points.len() > 64 || !cfg.allocations.is_empty()
         || function.body.unsafe_context || !function.generic_parameters.is_empty()
         || !body.arms.is_empty() || !body.call_occurrences.is_empty()
         || !body.callable_escapes.is_empty() || !body.allocation_length_calls.is_empty()
-        || !body.conditionals.is_empty() || !body.short_circuits.is_empty()
-        || !(1..=8).contains(&body.assignments.len()) || body.structure.blocks.len() != 1
+        || !body.short_circuits.is_empty() || !(1..=8).contains(&body.assignments.len())
         || !body.structure.module_storage_uses.is_empty()
         || !matches!(body.boundary.results.as_slice(), [DeclaredResultSlot { ordinal: 0, ty: ScalarType::Unit, .. }])
         || !body.boundary.root_outputs.is_empty()
@@ -58,13 +147,14 @@ pub(super) fn checked_effects<'a>(
         last_write: Option<SourceSpan>,
     }
     let parameters = &body.boundary.parameters;
-    if !(1..=2).contains(&parameters.len()) || facts.formals.len() != parameters.len()
-        || cfg.facts.len() != parameters.len()
+    let loan_count = parameters.len().checked_sub(usize::from(guard.is_some()))?;
+    if !(1..=2).contains(&loan_count) || facts.formals.len() != parameters.len()
+        || cfg.facts.len() != loan_count
     {
         return None;
     }
     let mut formals: Vec<Formal<'_>> = Vec::with_capacity(parameters.len());
-    for (index, slot) in parameters.iter().enumerate() {
+    for (index, slot) in parameters.iter().take(loan_count).enumerate() {
         let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &slot.ty
             else { return None; };
         let formal = facts.formals.get(&index)?;
@@ -91,9 +181,8 @@ pub(super) fn checked_effects<'a>(
             binding_point: None, first_reader: None, first_read: None, last_write: None });
     }
     let structure = &body.structure;
-    let items = &structure.blocks.get(structure.root.0)?.items;
-    if items.len() != body.assignments.len() { return None; }
-    let writes = cfg.points.iter().filter(|point| matches!(point.kind, CfgPointKind::AssignThrough { .. }))
+    let writes = path.iter().map(|id| cfg.points.get(id.0)).collect::<Option<Vec<_>>>()?
+        .into_iter().filter(|point| matches!(point.kind, CfgPointKind::AssignThrough { .. }))
         .collect::<Vec<_>>();
     if writes.len() != items.len() { return None; }
     let has_only_origin = |point: &ReferenceFlowPoint, origin| {
@@ -194,7 +283,7 @@ pub(super) fn checked_effects<'a>(
             }
         }
         for point in [*reader, *writer, read.id, literal.id, rhs.id, write.id] {
-            if std::mem::replace(claimed.get_mut(point.0)?, true) { return None; }
+            if !path.contains(&point) || std::mem::replace(claimed.get_mut(point.0)?, true) { return None; }
         }
         effect.offset = super::super::typecheck::wrapping_integer_sum(&effect.offset, offset, &effect.bounds.0, &effect.bounds.1)?;
         effect.first_reader.get_or_insert(reader.0.min(writer.0));
@@ -204,13 +293,19 @@ pub(super) fn checked_effects<'a>(
     }
     let mut next_write = 0;
     let mut captured = false;
-    for (ordinal, point) in cfg.points.iter().enumerate() {
-        let next = cfg.points.get(ordinal + 1).map(|point| point.id);
-        if point.id.0 != ordinal || &point.source_span.source != source
-            || point.successors.iter().copied().ne(next)
-        {
-            return None;
+    for (index, id) in path.iter().copied().enumerate() {
+        let point = cfg.points.get(id.0)?;
+        let ordinal = id.0;
+        let next = path.get(index + 1).copied();
+        if point.id != id || &point.source_span.source != source { return None; }
+        if guard.is_some_and(|(_, branch, _)| id == branch) {
+            if !matches!(point.kind, CfgPointKind::Branch { .. }) || !next.is_some_and(|next| point.successors.contains(&next)) {
+                return None;
+            }
+            continue;
         }
+        if point.successors.iter().copied().ne(next) { return None; }
+        if guard.is_some_and(|(condition, _, join)| id == condition || id == join) { continue; }
         if claimed[ordinal] {
             if matches!(point.kind, CfgPointKind::AssignThrough { .. }) {
                 next_write += 1;
@@ -234,7 +329,7 @@ pub(super) fn checked_effects<'a>(
             _ => return None,
         }
     }
-    if !matches!(cfg.points.last()?, ReferenceFlowPoint { kind: CfgPointKind::ScopeExit, scope: ReferenceScopeId(0), .. }) {
+    if !matches!(cfg.points.get(path.last()?.0)?, ReferenceFlowPoint { kind: CfgPointKind::ScopeExit, scope: ReferenceScopeId(0), .. }) {
         return None;
     }
     formals.into_iter().map(|effect| {

@@ -1308,8 +1308,9 @@ fn check_command(
             DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.write.clone(),
                 message: "write determining the exit pointee".to_owned() },
         ],
-        notes: vec![format!("pointee at entry: {}; at exit: {}; goal requires: {}",
-            failure.entry, failure.observed, failure.expected)],
+        notes: std::iter::once(format!("pointee at entry: {}; at exit: {}; goal requires: {}",
+            failure.entry, failure.observed, failure.expected))
+            .chain(failure.guard.map(|value| format!("Boolean guard input at entry: {value}"))).collect(),
     });
     let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).chain(pointer_effect).collect::<Vec<_>>();
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())

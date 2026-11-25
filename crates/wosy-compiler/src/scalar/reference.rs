@@ -10796,6 +10796,19 @@ impl ProjectReferenceResults {
         pointer_entry::checked_effects(&source.source, function, body, &result.cfg, &result.proof_points)
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn pointer_entry_bool_effects<'a>(
+        &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
+        module: usize, item: usize,
+    ) -> Option<[pointer_entry::EntryPointeeWrite<'a>; 2]> {
+        if !self.errors.is_empty() { return None; }
+        let source = modules.get(module)?;
+        let ScalarItem::Function(function) = source.items.get(item)? else { return None; };
+        let body = calls.function_body(module, item, None)?;
+        let result = self.function_result(module, item, None)?;
+        pointer_entry::checked_bool_effects(&source.source, function, body, &result.cfg, &result.proof_points)
+    }
+
     #[cfg(any(test, feature = "internal-checker"))]
     #[allow(dead_code)]
     pub(super) fn pointer_caller_effect<'a>(

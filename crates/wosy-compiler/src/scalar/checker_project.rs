@@ -4939,6 +4939,7 @@ pub struct PointerEffectProofDiagnostic {
     pub entry: BigInt,
     pub expected: BigInt,
     pub observed: BigInt,
+    pub guard: Option<bool>,
 }
 
 #[cfg(feature = "internal-checker")]

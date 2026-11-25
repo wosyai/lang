@@ -9,6 +9,7 @@ pub(super) struct Plan {
     target: PreparedCallable,
     proof: SourceSpan,
     claims: Vec<PointeeClaim>,
+    guard: Option<bool>,
     references: std::cell::OnceCell<super::super::reference::ProjectReferenceResults>,
     applied: std::cell::Cell<Option<(usize, usize)>>,
 }
@@ -32,7 +33,7 @@ impl Plan {
         if source != &selected.owner.source || proof_target_tokens(declaration)?.0.is_some()
             || declaration.descendants().take(limit + 1).count() > limit
             || declaration.children().any(|node| matches!(node.kind(),
-                SyntaxKind::ProofWhere | SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
+                SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -49,6 +50,23 @@ impl Plan {
         if names.len() != parameters.len() || (names.len() == 2 && names[0] == names[1]) {
             return Err(ProjectCheck::InvalidProof);
         }
+        let guarded_signature = matches!(parameters.as_slice(), [_, control] if control.ty == ScalarType::Bool);
+        let guard = match (declaration.children().find(|node| node.kind() == SyntaxKind::ProofWhere), guarded_signature) {
+            (Some(clause), true) => {
+                let expression = derive_expression(&child(&clause, SyntaxKind::Expression)?);
+                let (expression, positive) = match &expression {
+                    ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } =>
+                        (operand.as_ref(), false),
+                    _ => (&expression, true),
+                };
+                if !matches!(expression, ScalarExpression::Name { name, .. } if name == &names[1]) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                Some(positive)
+            }
+            (None, false) => None,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
         let point = |expression: &ScalarExpression| {
             let ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. } = expression
                 else { return None; };
@@ -57,7 +75,7 @@ impl Plan {
         };
         let goal = child(&child(declaration, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
         let prepared = derive_expression(&goal);
-        let goals = match (&prepared, parameters.len()) {
+        let goals = match (&prepared, parameters.len() - usize::from(guard.is_some())) {
             (_, 1) => vec![&prepared],
             (ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. }, 2) =>
                 vec![left.as_ref(), right.as_ref()],
@@ -73,7 +91,7 @@ impl Plan {
                 else { return Err(ProjectCheck::Unsupported); };
             let [snapshot] = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
             let slot = point(left).ok_or(ProjectCheck::Unsupported)?;
-            if point(snapshot) != Some(slot) || core != "core" || name != "old" || !type_arguments.is_empty()
+            if (guard.is_some() && slot != 0) || point(snapshot) != Some(slot) || core != "core" || name != "old" || !type_arguments.is_empty()
                 || claims.iter().any(|claim: &PointeeClaim| claim.slot == slot)
             {
                 return Err(ProjectCheck::Unsupported);
@@ -85,12 +103,12 @@ impl Plan {
                 return Err(ProjectCheck::Unsupported);
             };
             if !integer_literal_fits_type(amount, inner) { return Err(ProjectCheck::InvalidProof); }
-            let range = if parameters.len() == 1 { wosy_syntax::byte_span(&goal) }
+            let range = if parameters.len() == 1 || guard.is_some() { wosy_syntax::byte_span(&goal) }
                 else { super::super::typecheck::expression_span(term) };
             claims.push(PointeeClaim { slot, goal: SourceSpan::new(source.clone(), range), amount: amount.clone() });
         }
         Ok(Self { target: (selected.function.0, selected.function.1),
-            proof: SourceSpan::new(source.clone(), wosy_syntax::byte_span(declaration)), claims,
+            proof: SourceSpan::new(source.clone(), wosy_syntax::byte_span(declaration)), claims, guard,
             references: std::cell::OnceCell::new(), applied: std::cell::Cell::new(None) })
     }
 
@@ -143,6 +161,7 @@ impl ActualIntegerObserver for &Plan {
         source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<Vec<LocalTransition>>, ProjectCheck> {
         if target != self.target { return Ok(None); }
+        if self.guard.is_some() { return Err(ProjectCheck::Unsupported); }
         if &self.proof.source != source
             || !matches!(runtime.visits, Some([InitializationVisit::Started]))
         {
@@ -219,8 +238,21 @@ impl SymbolicRootProof for Root<'_> {
             return Err(ProjectCheck::Unsupported);
         }
         let validated = self.plan.references(source, runtime)?;
-        let updates = validated.pointer_entry_wrapping_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
-            .ok_or(ProjectCheck::Unsupported)?;
+        let updates = if let Some(guard) = self.plan.guard {
+            // Same typed Bool domain and relation partition as the ordinary
+            // checker. Both authenticated arms exist before this restriction.
+            let updates = validated.pointer_entry_bool_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
+                .ok_or(ProjectCheck::Unsupported)?;
+            let relation = IntegerRelation::from_operator(if guard { &BinaryOperator::Equal } else { &BinaryOperator::NotEqual })
+                .ok_or(ProjectCheck::Unsupported)?;
+            let admitted = IntegerSet::ordinary_bool_domain().keep_relation(relation, &BigInt::from(1u8));
+            let lane = admitted.singleton_value().and_then(super::super::checker_flow::bool_result_lane)
+                .ok_or(ProjectCheck::Unsupported)?;
+            vec![updates.into_iter().nth(lane).ok_or(ProjectCheck::Unsupported)?]
+        } else {
+            validated.pointer_entry_wrapping_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
+                .ok_or(ProjectCheck::Unsupported)?
+        };
         if updates.len() != self.plan.claims.len() { return Err(ProjectCheck::Unsupported); }
         for claim in &self.plan.claims {
             let update = updates.get(claim.slot).ok_or(ProjectCheck::Unsupported)?;
@@ -234,6 +266,7 @@ impl SymbolicRootProof for Root<'_> {
                     proof: self.plan.proof.clone(), goal: claim.goal.clone(),
                     read: update.read().clone(), write: update.write().clone(),
                     entry: BigInt::from(0), expected: claim.amount.clone(), observed: update.offset().clone(),
+                    guard: self.plan.guard,
                 });
                 break;
             }
@@ -348,6 +381,53 @@ mod tests {
                 ] {
                     assert!(run(&unsupported, scope).is_err(), "{unsupported}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn authored_unit_pointer_old_follows_the_original_typed_boolean_path() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "guarded-pointer".into());
+        let program = r#"%%start
+            unit(*!u8, bool) update = fn(cell, selected) {
+                if (selected) { *cell = *cell +@ 1; *cell = *cell +@ 2; }
+                else { *cell = *cell +@ 5; };
+            };
+            proof epoch for update(p, gate) -> () where (gate)
+                ensures (*p == core.old(*p) +@ 3) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |code: &str, scope| {
+                let (_, catalog) = crate::parse_proof_source(source.clone(), code.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(catalog, Vec::new())],
+                    vec![source.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let opposite = program.replace("where (gate)", "where (!gate)").replace("+@ 3) {}", "+@ 5) {}");
+            for (program, lane, actual, wrong) in [(program, true, 3, 5), (opposite.as_str(), false, 5, 3)] {
+                let good = run(program, package).unwrap();
+                assert!(good.active && good.pointer_effect_diagnostic.is_none());
+                let refuted = program.replace(&format!("+@ {actual}) {{}}"), &format!("+@ {wrong}) {{}}"));
+                let failure = run(&refuted, package).unwrap().pointer_effect_diagnostic.unwrap();
+                assert_eq!(failure.guard, Some(lane));
+                assert_eq!(failure.entry, BigInt::from(0));
+                assert_eq!(failure.observed, BigInt::from(actual));
+                assert_eq!(failure.expected, BigInt::from(wrong));
+                let at = |span: &SourceSpan| &refuted[span.range.start as usize..span.range.end as usize];
+                assert_eq!(at(&failure.read), "*cell");
+                assert_eq!(at(&failure.write), "*cell");
+                let last = if lane { "*cell = *cell +@ 2" } else { "*cell = *cell +@ 5" };
+                assert_eq!(failure.write.range.start as usize, refuted.find(last).unwrap());
+                let dormant = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+                assert!(!dormant.active && dormant.pointer_effect_diagnostic.is_none());
+            }
+            for refused in [
+                program.replace("where (gate)", "where (true)"),
+                program.replace("if (selected)", "if (!selected)"),
+                program.replace("*cell = *cell +@ 5", "*cell = *cell + 5"),
+                program.replace("%%end", "unit() start = fn { u8 a = 0; update(&!a, true); }; start(); %%end"),
+            ] {
+                assert!(run(&refused, package).is_err(), "{refused}");
             }
         }
     }
