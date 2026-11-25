@@ -5647,7 +5647,15 @@ impl<'a> VerifiedSymbolicSummary<'a> {
         &self, target: PreparedCallable, calls: &FunctionCallSites, position: usize,
         origin: &CheckerIntegerCallOrigin, occurrence: &super::reference::CallOccurrence, scalar_return: bool, qualified_layout: Option<ScalarTargetLayout>,
     ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
-        if if qualified_layout.is_some() { target.0 == self.target.0 }
+        self.import_ordered(target, calls, position, origin, occurrence, scalar_return, qualified_layout, false)
+    }
+
+    fn import_ordered(
+        &self, target: PreparedCallable, calls: &FunctionCallSites, position: usize,
+        origin: &CheckerIntegerCallOrigin, occurrence: &super::reference::CallOccurrence, scalar_return: bool,
+        qualified_layout: Option<ScalarTargetLayout>, enrolled_local: bool,
+    ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
+        if if qualified_layout.is_some() && !enrolled_local { target.0 == self.target.0 }
             else { target.0 != self.target.0 || target.1 <= self.target.1 }
         {
             return Ok(None);
@@ -5861,6 +5869,11 @@ impl<'a> SymbolicSummaryIndex<'a> {
             .or_else(|| self.other.get(&target))
     }
 
+    fn lookup_unique(&self, target: PreparedCallable) -> Option<&VerifiedSymbolicSummary<'a>> {
+        (self.generation.get(&target) == Some(&1)).then_some(())?;
+        self.lookup(target)
+    }
+
     fn insert_derived(&mut self, summary: VerifiedSymbolicSummary<'a>, provider: PreparedCallable) -> Option<()> {
         self.insert_linked(summary, provider, false)
     }
@@ -5873,12 +5886,19 @@ impl<'a> SymbolicSummaryIndex<'a> {
         &mut self, summary: VerifiedSymbolicSummary<'a>,
         providers: impl IntoIterator<Item = PreparedCallable>, qualified: bool,
     ) -> Option<()> {
+        self.insert_ordered_dependency_links(summary, providers.into_iter().map(|provider| (provider, qualified)))
+    }
+
+    fn insert_ordered_dependency_links(
+        &mut self, summary: VerifiedSymbolicSummary<'a>,
+        providers: impl IntoIterator<Item = (PreparedCallable, bool)>,
+    ) -> Option<()> {
         let target = summary.target;
         if self.generation.contains_key(&target) { return None; }
         let mut lineage = Vec::new();
-        for provider in providers {
+        for (provider, qualified) in providers {
             let ordered = if qualified { target.0 != provider.0 } else { target.0 == provider.0 && provider.1 < target.1 };
-            if !ordered || self.generation.get(&provider) != Some(&1) || self.lookup(provider).is_none() {
+            if !ordered || self.lookup_unique(provider).is_none() {
                 return None;
             }
             let ancestors = self.derived.get(&provider).map(Vec::as_slice).unwrap_or_default();
@@ -13739,7 +13759,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                             // and check this goal on the exact imported row.
                             matches!(body.boundary.parameters.as_slice(), [input] if input.ty == result.ty)
                                 && ranked_scalar_return_origins(body).is_some_and(|origins|
-                                    origins.iter().all(|(target, _, _, _)| target.0 != owner))
+                                    origins.iter().any(|(target, _, _, _)| target.0 != owner))
                         })))
             {
                 checked_affine_old_output(&ensures, output, &input_names, body, &result.ty)

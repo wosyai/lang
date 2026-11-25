@@ -94,7 +94,8 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
         } else {
             ranked_scalar_return_origins(body)?
         };
-        if origins.iter().any(|(callee, _, _, _)| callee.0 == target.0)
+        if (!origins.is_empty() && !origins.iter().any(|(callee, _, _, _)| callee.0 != target.0))
+            || origins.iter().any(|(callee, _, _, _)| callee.0 == target.0 && callee.1 >= target.1)
             || (first.bound.literal().is_none() && !(
                 matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
                 && first.relation == IntegerRelation::from_operator(&BinaryOperator::Equal)
@@ -145,15 +146,21 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
 }
 
 fn checked_edge(
-    caller: &ScalarModule, body: &FunctionCallSites, (target, _, origin, occurrence): RankedScalarOrigin<'_>,
+    caller_target: PreparedCallable, caller: &ScalarModule, body: &FunctionCallSites,
+    (target, _, origin, occurrence): RankedScalarOrigin<'_>,
     canonical: &ResolvedCallTarget, provider_body: &FunctionCallSites, runtime: SymbolicProofRuntime<'_>,
 ) -> Result<(), ProjectCheck> {
     let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
     let signature = body.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let [output] = provider_body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let site = body.sites.get(occurrence.site).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    if &caller.source == &owner.source
-        || !completed_namespace_owner(&caller.source, &owner.source, target.0, runtime.visits)
+    let owner_order = if caller_target.0 == target.0 {
+        caller.source == owner.source && target.1 < caller_target.1
+            && runtime.visits.and_then(|visits| visits.get(target.0)) == Some(&InitializationVisit::Completed)
+    } else {
+        completed_namespace_owner(&caller.source, &owner.source, target.0, runtime.visits)
+    };
+    if !owner_order
         || !std::ptr::eq(runtime.calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?, provider_body)
         || output.ordinal != 0
         || !production_bound_reuse::matching_call(
@@ -168,10 +175,21 @@ fn checked_edge(
 
 impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
     fn qualify_edge(
-        &self, caller: &ScalarModule, body: &FunctionCallSites, origin: RankedScalarOrigin<'_>,
+        &self, caller_target: PreparedCallable, caller: &ScalarModule, body: &FunctionCallSites, origin: RankedScalarOrigin<'_>,
         runtime: SymbolicProofRuntime<'_>, ranked: &HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
     ) -> Result<(), ProjectCheck> {
         let (target, _, argument, _) = origin;
+        if target.0 == caller_target.0 {
+            // A local dependency here is specifically an earlier, separately
+            // enrolled closed unary issuer. It is not an arbitrary local
+            // theorem or a source-order grant of authority.
+            let provider = Job::discover(self.watched, target, runtime).ok_or(ProjectCheck::Unsupported)?;
+            if argument.arguments.as_slice().len() != 1 || !provider.origins.is_empty() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let issuer = provider.export_issuer().ok_or(ProjectCheck::Unsupported)?;
+            return checked_edge(caller_target, caller, body, origin, issuer.canonical_target, issuer.body, runtime);
+        }
         if let Some(provider) = ranked.get(&target) {
             let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
             if !provider.allow_qualified_demand || provider.plan.proof_source != &owner.source
@@ -179,15 +197,15 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             {
                 return Err(ProjectCheck::Unsupported);
             }
-            return checked_edge(caller, body, origin, provider.plan.canonical_target, provider.plan.typed.body, runtime);
+            return checked_edge(caller_target, caller, body, origin, provider.plan.canonical_target, provider.plan.typed.body, runtime);
         }
         if argument.arguments.as_slice().len() != 1 { return Err(ProjectCheck::Unsupported); }
-        if let Some(summary) = self.qualified.verified.lookup(target) {
-            return checked_edge(caller, body, origin, summary.canonical_target, summary.body, runtime);
+        if let Some(summary) = self.qualified.verified.lookup_unique(target) {
+            return checked_edge(caller_target, caller, body, origin, summary.canonical_target, summary.body, runtime);
         }
         let provider = Job::discover(self.watched, target, runtime).ok_or(ProjectCheck::Unsupported)?;
         let issuer = provider.export_issuer().ok_or(ProjectCheck::Unsupported)?;
-        checked_edge(caller, body, origin, issuer.canonical_target, issuer.body, runtime)
+        checked_edge(caller_target, caller, body, origin, issuer.canonical_target, issuer.body, runtime)
     }
 
     fn ensure_qualified_provider(
@@ -203,7 +221,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
                 if current == requesting || stack.iter().any(|(job, _)| job.target == current) {
                     return Err(ProjectCheck::Unsupported);
                 }
-                if self.qualified.verified.lookup(current).is_none() && !self.qualified.verdicts.contains_key(&current) {
+                if self.qualified.verified.lookup_unique(current).is_none() && !self.qualified.verdicts.contains_key(&current) {
                     if let Some(provider) = ranked.get_mut(&current) {
                         let source = &runtime.project.modules.get(current.0).ok_or(ProjectCheck::MissingRoot)?.source;
                         provider.verify_qualified_demand()?;
@@ -219,7 +237,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             let Some((job, index)) = stack.last_mut() else { break; };
             if let Some(&edge) = job.origins.get(*index) {
-                self.qualify_edge(job.owner, job.body, edge, runtime, ranked)?;
+                self.qualify_edge(job.target, job.owner, job.body, edge, runtime, ranked)?;
                 *index += 1;
                 next = Some(edge.0);
             } else {
@@ -227,7 +245,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
                 self.verify_qualified_job(job, runtime)?;
             }
         }
-        if self.qualified.verified.lookup(first).is_none() {
+        if self.qualified.verified.lookup_unique(first).is_none() {
             self.qualified.refuter(first)?;
         }
         Ok(())
@@ -257,10 +275,11 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             let mut imports = Vec::with_capacity(job.origins.len());
             for &(callee, position, origin, occurrence) in &job.origins {
-                let Some(summary) = index.lookup(callee) else {
+                let Some(summary) = index.lookup_unique(callee) else {
                     return Ok(Evaluation::Blocked(self.qualified.refuter(callee)?));
                 };
-                let import = summary.import_local(job.target, job.body, position, origin, occurrence, true, Some(job.owner.target_layout))?
+                let import = summary.import_ordered(job.target, job.body, position, origin, occurrence, true,
+                    Some(job.owner.target_layout), callee.0 == job.target.0)?
                     .ok_or(ProjectCheck::Unsupported)?;
                 imports.push(Some(import));
             }
@@ -307,7 +326,8 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
                         self.qualified.verified.insert(summary);
                         true
                     } else {
-                        self.qualified.verified.insert_dependency_links(summary, job.origins.iter().map(|provider| provider.0), true).is_some()
+                        self.qualified.verified.insert_ordered_dependency_links(summary,
+                            job.origins.iter().map(|&(provider, ..)| (provider, provider.0 != job.target.0))).is_some()
                     }
                 });
                 (active, if certified { Evidence::Certified } else { Evidence::Unavailable })
@@ -370,9 +390,9 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
         if owner.source != *source { return Err(ProjectCheck::Unsupported); }
         let edge = (callee, binding.position, origin, occurrence);
-        self.qualify_edge(owner, calls, edge, runtime, ranked)?;
+        self.qualify_edge(target, owner, calls, edge, runtime, ranked)?;
         self.ensure_qualified_provider(callee, target, runtime, ranked)?;
-        let Some(summary) = self.qualified.verified.lookup(callee) else {
+        let Some(summary) = self.qualified.verified.lookup_unique(callee) else {
             // This exact requirement is gated by a refuted supplying proof.
             // The actual owner's diagnostic retains its original root order.
             self.qualified.refuter(callee)?;
@@ -406,7 +426,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         }
         if !self.qualified.verdicts.contains_key(&target) {
             for &origin in &job.origins {
-                self.qualify_edge(job.owner, job.body, origin, runtime, ranked)?;
+                self.qualify_edge(job.target, job.owner, job.body, origin, runtime, ranked)?;
                 self.ensure_qualified_provider(origin.0, target, runtime, ranked)?;
             }
             self.verify_qualified_job(job, runtime)?;
@@ -471,13 +491,17 @@ mod tests {
                 let edge = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
                     binding: binding.to_owned(), target: target.clone(), span: ByteSpan::new(0, 0),
                 };
+                let mut wrapper_edges = vec![edge("second", &right)];
+                let mut order = vec![app.clone(), hub.clone(), right.clone()];
+                let mut catalogs = vec![(parse(&app, main), vec![edge("joined", &hub)]), (parse(&right, rhs), Vec::new())];
+                if wrapper.contains("first = namespace") {
+                    wrapper_edges.insert(0, edge("first", &left));
+                    order.push(left.clone());
+                    catalogs.push((parse(&left, lhs), Vec::new()));
+                }
+                catalogs.insert(1, (parse(&hub, wrapper), wrapper_edges));
                 check_loaded_scalar_ordered_local_proof_contexts(
-                    Vec::new(),
-                    [(parse(&app, main), vec![edge("joined", &hub)]),
-                    (parse(&hub, wrapper), vec![edge("first", &left), edge("second", &right)]),
-                    (parse(&left, lhs), Vec::new()), (parse(&right, rhs), Vec::new())],
-                    vec![app.clone(), hub.clone(), right.clone(), left.clone()],
-                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    Vec::new(), catalogs, order, ScalarPreparationInputs { target_layout }, scope, Vec::new(),
                 )
             };
             let package = ScalarCheckerScope::CurrentPackage;
@@ -511,6 +535,27 @@ mod tests {
             assert_eq!(directive.code(), &BigInt::from(68));
             assert!(directive.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
             assert!(failure.symbolic_diagnostic.is_none());
+            let local = r#"
+                u8(u8) nearby = fn(input) { u8 next = input + 1; next };
+                proof near_goal for nearby(input) -> (out) where (input <= 7)
+                    ensures (out == core.old(input) + 1) {}
+            "#;
+            let mixed = wrapper.replace("first = namespace package \"src/left.w\";", local)
+                .replace("first.shift(input)", "nearby(input)");
+            let mixed_pass = run(main, &mixed, increment, &wide, package).unwrap();
+            assert!(mixed_pass.active && mixed_pass.directives.is_empty() && mixed_pass.symbolic_diagnostic.is_none());
+            let mixed_failure = run(&bad, &mixed, increment, &wide, package).unwrap();
+            let [failure] = mixed_failure.directives.as_slice() else { panic!("mixed original requirement"); };
+            assert_eq!(failure.code(), &BigInt::from(68));
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
+            let wrong_local = mixed.replace("core.old(input) + 1", "core.old(input) + 3");
+            let failed = run(main, &wrong_local, increment, &wide, package).unwrap();
+            let exact = failed.symbolic_diagnostic.unwrap();
+            assert_eq!(exact.proof.source, hub);
+            assert!(wrong_local[exact.proof.range.start as usize..exact.proof.range.end as usize].contains("proof near_goal"));
+            assert!(failed.additional_symbolic_diagnostics.is_empty() && failed.directives.is_empty());
+            let narrow_local = mixed.replace("nearby(input) -> (out) where (input <= 7)", "nearby(input) -> (out) where (input <= 6)");
+            assert!(matches!(run(main, &narrow_local, increment, &wide, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let dormant = run(&not_identity, &wrong, increment, decrement, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant.active && dormant.directives.is_empty() && dormant.symbolic_diagnostic.is_none());
         }
@@ -702,27 +747,28 @@ mod tests {
             SourceIdentity::new("project".into(), "package".into(), format!("src/{name}.w"), name.into())
         });
         let declarations = identities.iter().map(|source| {
-            let parsed = crate::parse_source(source.clone(), "%%start u8() fixed = fn { 7 }; %%end".to_owned(), &[]);
+            let parsed = crate::parse_source(source.clone(), "%%start u8() fixed = fn { 7 }; u8() merged = fn { 7 }; %%end".to_owned(), &[]);
             (crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())
         }).collect::<Vec<_>>();
         let layout = ScalarTargetLayout::NATIVE64;
         let prepared = prepare_checker_project(declarations, identities.to_vec(), ScalarPreparationInputs { target_layout: layout }).unwrap();
         let (project, calls) = prepared.parts();
-        let keys = project.modules.iter().map(|module| {
-            let ScalarItem::Function(function) = &module.items[0] else { panic!("prepared fixed callable"); };
+        let keys = project.modules.iter().map(|module| [0, 1].map(|item| {
+            let ScalarItem::Function(function) = &module.items[item] else { panic!("prepared fixed callable"); };
             ResolvedCallTarget::ModuleCallable {
                 source: module.source.clone(), declaration_span: function.name_span,
                 concrete: ConcreteCallSelection::Declaration,
             }
-        }).collect::<Vec<_>>();
+        })).collect::<Vec<_>>();
         let value = BigInt::from(7);
-        let make = |module| VerifiedSymbolicSummary {
-            target: (module, 0), canonical_target: &keys[module], layout,
-            body: calls.function_body(module, 0, None).unwrap(),
+        let make_at = |module: usize, item: usize| VerifiedSymbolicSummary {
+            target: (module, item), canonical_target: &keys[module][item], layout,
+            body: calls.function_body(module, item, None).unwrap(),
             result: VerifiedSymbolicResult::Constant { bound: &value, shared: std::cell::OnceCell::new() },
             guards: if module == 0 || module == 3 { VerifiedSymbolicGuards::Bare(None) }
                 else { VerifiedSymbolicGuards::Derived(Vec::new()) },
         };
+        let make = |module| make_at(module, 0);
         let mut index = SymbolicSummaryIndex::default();
         index.insert(make(0));
         index.insert(make(3));
@@ -738,6 +784,17 @@ mod tests {
         assert!(index.lookup((2, 0)).is_none());
         assert!(index.lookup((3, 0)).is_some());
         assert!(index.insert_linked(make(1), (0, 0), true).is_none());
+        let mut mixed = SymbolicSummaryIndex::default();
+        mixed.insert(make(0));
+        mixed.insert(make(4));
+        mixed.insert_ordered_dependency_links(make_at(4, 1), [((4, 0), false), ((0, 0), true)]).unwrap();
+        mixed.insert_linked(make(5), (4, 1), true).unwrap();
+        assert!(mixed.lookup_unique((5, 0)).is_some());
+        mixed.insert(make(4));
+        assert!(mixed.lookup_unique((4, 0)).is_none());
+        assert!(mixed.lookup_unique((4, 1)).is_none() && mixed.lookup_unique((5, 0)).is_none());
+        assert!(mixed.lookup_unique((0, 0)).is_some());
+
     }
 
     #[test]
