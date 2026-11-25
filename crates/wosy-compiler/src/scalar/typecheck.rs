@@ -5522,7 +5522,7 @@ fn checked_address_type_in_module(
     // This nominates a checked field place for typing only. The solved private
     // runtime cohort still has to authenticate the actual formal, child loan,
     // lexical uses and original backing/extent before lowering.
-    if mutability == ScalarReferenceMutability::Shared {
+    {
         if let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = place {
             if let ScalarPlace::Index { base, index, .. } = base.as_ref() {
                 if let (ScalarPlace::Dereference { pointer, .. }, ScalarExpression::Name { name: selector, .. }) =
@@ -5531,8 +5531,8 @@ fn checked_address_type_in_module(
                     if let ScalarExpression::Name { name: parent, .. } = pointer.as_ref() {
                         if scope.get(selector) == Some(&ScalarType::U64)
                             && matches!(scope.get(parent), Some(ScalarType::CheckedReference {
-                                mutability: ScalarReferenceMutability::Shared, inner,
-                            }) if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+                                mutability: parent_mode, inner,
+                            }) if *parent_mode == mutability && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
                                 if matches!(element.as_ref(), ScalarType::Struct(id) if id == &field.structure)))
                         {
                             let inner = check_place_type_in_module(

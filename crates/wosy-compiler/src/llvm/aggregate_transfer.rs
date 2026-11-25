@@ -409,8 +409,13 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     };
     let mutable = *mutability == crate::scalar::ScalarReferenceMutability::Mutable;
     let function_type = function.get_type();
+    let child_store = mutable && crate::scalar::private_runtime_copy_child_store_signature(parameters, &outputs.outputs);
     let exact_abi =
-        if mutable && (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
+        if child_store {
+            function_type.get_param_types().as_slice()
+                == [descriptor.into(), context.i64_type().into(), basic_type(context, &parameters[2], state.target_layout)?.into()]
+                && function_type.get_return_type() == Some(basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
+        } else if mutable && (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
             || crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs)) {
             function_type.get_param_types().as_slice()
                 == [descriptor.into(), context.i64_type().into(), basic_type(context, &parameters[2], state.target_layout)?.into()]
@@ -430,9 +435,9 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         let EmitValue::Basic(value) = value else { return Err("private runtime array accessor lacks a scalar argument".into()); };
         args.push(value.into());
     }
-    let value = state.builder.build_call(function, &args, if mutable { "" } else { "private_runtime_read" })
+    let value = state.builder.build_call(function, &args, if mutable && !child_store { "" } else { "private_runtime_read" })
         .map_err(builder_error)?;
-    if mutable {
+    if mutable && !child_store {
         Ok(Some(EmitValue::Unit))
     } else {
         let value = value.try_as_basic_value().basic().ok_or("private runtime reader returned no scalar")?;
@@ -805,6 +810,16 @@ pub(super) fn definition_type<'ctx>(
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("private runtime array reader is not callable".into());
         };
+        if crate::scalar::private_runtime_copy_child_store_signature(parameters, &outputs.outputs)
+            && plan.is_some_and(|body| body.private_runtime_copy_child_store && body.private_runtime_copy_borrows.len() == 1
+                && body.private_runtime_writes.is_empty() && body.private_runtime_reads.is_empty()
+                && body.private_runtime_read_forward.is_none() && !body.private_runtime_portable_formal)
+        {
+            return Ok(basic_type(context, &outputs.outputs[0].ty, layout)?.fn_type(&[
+                borrowed_extent_type(context, layout).into(), context.i64_type().into(),
+                basic_type(context, &parameters[2], layout)?.into(),
+            ], false));
+        }
         let copy_write = crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs);
         if (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs) || copy_write)
             && plan.is_some_and(|body| (!copy_write || (!body.private_runtime_copy_writes.is_empty() && !body.private_runtime_portable_formal))

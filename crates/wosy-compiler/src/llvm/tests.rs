@@ -19382,3 +19382,77 @@ if (observe(2,1) != 202) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn private_exclusive_runtime_copy_field_child_keeps_formation_store_and_read_checks() {
+    let text = "%%start
+struct copy Cell { u8 tag; u64 value; }
+u64(*!(Cell[]),u64,u64) _update = fn(view,index,value) {
+    *!u64 child = &!(*view)[index].value;
+    *child = value;
+    *child
+};
+u64(u64,u64) observe = fn(count,index) {
+    Cell[count] rows;
+    rows[index].tag = 7;
+    _update(&!rows,index,202)
+};
+if (observe(2,1) != 202) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/private-copy-field-child-store.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&validated).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(&access.source, &access.non_null));
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        let name = project_function_name(&source, "_update");
+        let reader = self_tail_test_body(&ir, "internal i64", &name);
+        let nulls: Vec<_> = reader.match_indices(&non_null).map(|(offset, _)| offset).collect();
+        assert_eq!(nulls.len(), 3, "{reader}");
+        assert_eq!(reader.matches(&bounds).count(), 1, "{reader}");
+        let check = reader.find(&bounds).unwrap();
+        let row = reader.find("getelementptr inbounds [16 x i8]").unwrap();
+        let field = reader.find("getelementptr inbounds i8").unwrap();
+        let saved = reader[field..].find("ptrtoint").unwrap() + field;
+        assert!(nulls[0] < check && check < row && row < field && field < saved && saved < nulls[1], "{reader}");
+        assert!(reader[check..].lines().next().unwrap().contains("i64 %borrowed_array_extent"), "{reader}");
+        if target == ScalarTargetLayout::WASM32 {
+            let narrow = reader.find("trunc i64").unwrap();
+            assert!(check < narrow && narrow < row, "{reader}");
+        }
+        let field_line = reader.lines().find(|line| line.contains("getelementptr inbounds i8")).unwrap();
+        assert!(field_line.ends_with(", i8 8"), "{reader}");
+        let store = reader[nulls[1]..nulls[2]].lines().find(|line| line.contains("store i64")).unwrap();
+        assert!(store.contains(", ptr %"), "{reader}");
+        let child_load = reader[nulls[2]..].lines().find(|line| line.contains("load i64")).unwrap();
+        let (loaded, _) = child_load.trim().split_once(" = ").unwrap();
+        assert!(reader[nulls[2]..].contains(&format!("ret i64 {loaded}")), "{reader}");
+        let caller = self_tail_test_body(&ir, "i64", &project_function_name(&source, "observe"));
+        assert_eq!(caller.matches("call ptr @__wosy_core_alloc(").count(), 1, "{caller}");
+        assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
+        let public = text.replace("_update", "update");
+        let refused = match prepare(&public) {
+            Ok(prepared) => !analyze_scalar_build(&prepared).diagnostics().is_empty(),
+            Err(_) => true,
+        };
+        assert!(refused);
+        if let Some(out) = std::env::var_os("WOSY_DEV4_PRIVATE_COPY_FIELD_CHILD_STORE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-private-copy-field-child-store.ll")), controlled).unwrap();
+        }
+    }
+}

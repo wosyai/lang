@@ -3117,6 +3117,7 @@ pub(crate) struct ClosedBody {
     pub(crate) private_runtime_reads: HashSet<usize>,
     pub(crate) private_runtime_copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     pub(crate) private_runtime_copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
+    pub(crate) private_runtime_copy_child_store: bool,
     pub(crate) private_runtime_copy_borrows: HashMap<usize, (usize, ScalarStructFieldId)>,
     pub(crate) private_runtime_writes: HashSet<usize>,
     pub(crate) private_runtime_access_calls: HashMap<usize, PrivateRuntimePairCall>,
@@ -9360,6 +9361,7 @@ struct PrivateRuntimeReadPlan {
     accesses: HashSet<usize>,
     copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
+    copy_child_store: bool,
     copy_borrows: HashMap<usize, (usize, ScalarStructFieldId)>,
     writes: HashSet<usize>,
     calls: HashMap<usize, PrivateRuntimePairCall>,
@@ -9422,6 +9424,7 @@ impl ClosedAggregates {
             body.private_runtime_reads.clone_from(&plan.accesses);
             body.private_runtime_copy_fields.clone_from(&plan.copy_fields);
             body.private_runtime_copy_writes.clone_from(&plan.copy_writes);
+            body.private_runtime_copy_child_store = plan.copy_child_store;
             body.private_runtime_copy_borrows.clone_from(&plan.copy_borrows);
             body.private_runtime_writes.clone_from(&plan.writes);
             body.private_runtime_access_calls.clone_from(&plan.calls);
@@ -9465,6 +9468,14 @@ pub(crate) fn private_runtime_copy_write_signature(parameters: &[ScalarType], ou
     }, ScalarType::U64, value] if ordinary_value(value) && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
         if matches!(element.as_ref(), ScalarType::Struct(_))))
         && (outputs.is_empty() || matches!(outputs, [output] if output.ty == ScalarType::Unit))
+}
+
+pub(crate) fn private_runtime_copy_child_store_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
+    matches!(parameters, [ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Mutable, inner,
+    }, ScalarType::U64, value] if ordinary_value(value) && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+        if matches!(element.as_ref(), ScalarType::Struct(_))))
+        && matches!((parameters.get(2), outputs), (Some(value), [out]) if &out.ty == value)
 }
 
 fn exclusive_runtime_store_origin(
@@ -9522,21 +9533,31 @@ pub(super) fn private_runtime_read_declaration(function: &ScalarFunction) -> boo
 enum PrivateRuntimeAccessRoute {
     Read(ByteSpan),
     Borrow(ByteSpan),
+    ChildStore(ByteSpan),
     Write(ByteSpan),
     Forward { formal: ByteSpan, call: OccurrenceOrdinal, target: Option<BodyKey> },
 }
 
 fn closed_private_copy_field_borrow(
     function: &ScalarFunction, result: &FunctionReferenceResult, site: &super::super::control::PrivateCopyFieldBorrow,
+    child_store: bool,
 ) -> Option<ByteSpan> {
-    let [ScalarBlockItem::LocalBinding(holder), ScalarBlockItem::Expression(ScalarExpression::Dereference {
-        place: ScalarPlace::Dereference { pointer, .. }, ..
-    })] = function.body.items.as_slice() else { return None; };
-    let [formal, selector] = function.parameter_spans.as_slice() else { return None; };
+    let (holder, write, tail, formal, selector, mode) = match (
+        child_store, function.body.items.as_slice(), function.parameter_spans.as_slice(),
+    ) {
+        (false, [ScalarBlockItem::LocalBinding(holder), ScalarBlockItem::Expression(tail)], [formal, selector]) =>
+            (holder, None, tail, formal, selector, ScalarReferenceMutability::Shared),
+        (true, [ScalarBlockItem::LocalBinding(holder), ScalarBlockItem::Assignment(write),
+            ScalarBlockItem::Expression(tail)], [formal, selector, value]) =>
+            (holder, Some((write, value)), tail, formal, selector, ScalarReferenceMutability::Mutable),
+        _ => return None,
+    };
+    let ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. } = tail
+        else { return None; };
     let [receiver] = holder.receivers.as_slice() else { return None; };
     if holder.fallible_assignment.is_some() || holder.is_allocation
         || function.body.final_output_values.len() != 1
-        || !matches!(&holder.value, ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, .. })
+        || !matches!(&holder.value, ScalarExpression::CheckedAddress { mutability, .. } if *mutability == mode)
         || !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
     { return None; }
     let cfg = &result.cfg;
@@ -9551,8 +9572,43 @@ fn closed_private_copy_field_borrow(
     let [bind] = issuance.successors.as_slice() else { return None; };
     let bind = points.get(bind.0)?;
     let CfgPointKind::Bind { binding: installed } = &bind.kind else { return None; };
-    let [read] = bind.successors.as_slice() else { return None; };
-    let read = points.get(read.0)?;
+    let [first_use] = bind.successors.as_slice() else { return None; };
+    let singleton = |point: &ReferenceFlowPoint, origin| point.possible_origins.as_ref()
+        .is_some_and(|origins| origins.len() == 1 && origins.contains(&origin));
+    let read = if let Some((assignment, value)) = write {
+        let [target] = assignment.targets.as_slice() else { return None; };
+        let [rhs_expression @ ScalarExpression::Name { .. }] = assignment.values.as_slice() else { return None; };
+        let ScalarPlace::Dereference { pointer: assigned, .. } = &target.place else { return None; };
+        if !matches!(assigned.as_ref(), ScalarExpression::Name { .. }) || assignment.receiver.is_some()
+            || assignment.receiver_span.is_some() || target.receiver.is_some() || target.receiver_span.is_some()
+        { return None; }
+        let rhs = points.get(first_use.0)?;
+        let CfgPointKind::Read { binding: rhs_binding } = &rhs.kind else { return None; };
+        let [write_read] = rhs.successors.as_slice() else { return None; };
+        let pointer_read = points.get(write_read.0)?;
+        let [install] = pointer_read.successors.as_slice() else { return None; };
+        let install = points.get(install.0)?;
+        let CfgPointKind::AssignThrough {
+            place: destination, pointer_point, rhs_point, candidates, previous_origins, previous_loans,
+        } = &install.kind else { return None; };
+        let [candidate] = candidates.as_slice() else { return None; };
+        if rhs_binding.declaration_span != *value || rhs.source_span.range != expression_span(rhs_expression)
+            || !matches!(&pointer_read.kind, CfgPointKind::Read { binding } if binding == installed)
+            || pointer_read.source_span.range != expression_span(assigned)
+            || !singleton(pointer_read, site.child)
+            || destination != &target.place || candidate.place.place != *destination
+            || *pointer_point != pointer_read.id || *rhs_point != rhs.id || candidate.origin != site.child
+            || &candidate.loan != loan || candidate.place.binding != place.binding
+            // AssignThrough resolves the child to its issued projection.
+            // ReadPlace below independently retains the dereference suffix.
+            || candidate.place.projections != place.projections
+            || !previous_origins.is_empty() || !previous_loans.is_empty()
+        { return None; }
+        let [next] = install.successors.as_slice() else { return None; };
+        points.get(next.0)?
+    } else {
+        points.get(first_use.0)?
+    };
     let CfgPointKind::Read { binding: read_binding } = &read.kind else { return None; };
     let [load] = read.successors.as_slice() else { return None; };
     let load = points.get(load.0)?;
@@ -9567,8 +9623,6 @@ fn closed_private_copy_field_borrow(
         ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projected_field))] = place.projections.as_slice() else { return None; };
     let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(authored_field), .. } = &place.place else { return None; };
     let ScalarPlace::Index { index, .. } = base.as_ref() else { return None; };
-    let singleton = |point: &ReferenceFlowPoint, origin| point.possible_origins.as_ref()
-        .is_some_and(|origins| origins.len() == 1 && origins.contains(&origin));
     let [(expected_bind, expected_issuance)] = result.proof_points.checked_binding_initializers.as_slice() else { return None; };
     let [return_value] = load.successors.as_slice() else { return None; };
     (parent_binding.declaration_span == *formal && selector_binding.declaration_span == *selector
@@ -9579,8 +9633,8 @@ fn closed_private_copy_field_borrow(
         && *indirect == read.id && points.get(return_value.0).is_some_and(|output|
             matches!(output.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } if value_point == load.id))
         && formal_loan.origin_place.binding == *parent_binding && formal_loan.parent.is_none()
-        && formal_loan.mode == ScalarReferenceMutability::Shared && formal_loan.origin_place.projections.is_empty()
-        && loan == child && child.origin_place == *place && child.mode == ScalarReferenceMutability::Shared
+        && formal_loan.mode == mode && formal_loan.origin_place.projections.is_empty()
+        && loan == child && child.origin_place == *place && child.mode == mode
         && child.parent.as_deref() == Some(formal_loan) && projected_parent.as_ref() == formal_loan
         && place.binding == *parent_binding && projected_field == &site.field && authored_field == &site.field
         && projected_index == index.as_ref() && loaded.binding == *parent_binding
@@ -9748,12 +9802,16 @@ impl ProjectReferenceResults {
                 let Some(function) = function(module, item) else { continue; };
                 let ScalarType::Callable { parameters, outputs } = &function.signature else { continue; };
                 let [site] = borrows.as_slice() else { continue; };
-                if !normal(function) || !private_runtime_read_declaration(function)
-                    || !private_runtime_copy_read_signature(parameters, &outputs.outputs)
+                let child_store = private_runtime_copy_child_store_signature(parameters, &outputs.outputs);
+                if !normal(function) || function.body.unsafe_context
+                    || !crate::scalar::typecheck::is_module_private_name(&function.name)
+                    || !(child_store || (private_runtime_read_declaration(function)
+                        && private_runtime_copy_read_signature(parameters, &outputs.outputs)))
                     || routes.contains_key(&key) || !result.proof_points.raw_address_exposures.is_empty()
                 { continue; }
-                let Some(formal) = closed_private_copy_field_borrow(function, result, site) else { continue; };
-                routes.insert(key, PrivateRuntimeAccessRoute::Borrow(formal));
+                let Some(formal) = closed_private_copy_field_borrow(function, result, site, child_store) else { continue; };
+                routes.insert(key, if child_store { PrivateRuntimeAccessRoute::ChildStore(formal) }
+                    else { PrivateRuntimeAccessRoute::Borrow(formal) });
                 census.transport_uses.insert(key, Some(Vec::new()));
             }
             for (&key @ (module, item, arm), stores) in &pending_writes {
@@ -9833,15 +9891,19 @@ impl ProjectReferenceResults {
                 let sites = input.calls.function_body(caller.1, caller.2)?;
                 let ordinal = OccurrenceOrdinal(occurrence);
                 let signature = sites.checked_call_signatures.get(&ordinal)?;
-                let mutable = matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
+                let child_store = matches!(routes[&target], PrivateRuntimeAccessRoute::ChildStore(_));
+                let mutable = child_store || matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
                 let copy_fields = private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)
-                    || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs);
+                    || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs)
+                    || child_store;
                 // The callee's exact field receipt already authenticated Copy.
                 // The declaration, actual and formal must share the same
                 // authored module and exact type identity below.
                 if copy_fields && caller.0 != target.0 { return None; }
                 let mode = if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared };
-                let exact_signature = if mutable {
+                let exact_signature = if child_store {
+                    private_runtime_copy_child_store_signature(&signature.parameters, &signature.outputs.outputs)
+                } else if mutable {
                     private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs)
                         || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs)
                 } else {
@@ -9946,7 +10008,8 @@ impl ProjectReferenceResults {
             }
         }
         let sealed = closed_descriptor_routes(&census, &routes, |_| true, |_, route| match *route {
-            PrivateRuntimeAccessRoute::Read(_) | PrivateRuntimeAccessRoute::Write(_) | PrivateRuntimeAccessRoute::Borrow(_) => None,
+            PrivateRuntimeAccessRoute::Read(_) | PrivateRuntimeAccessRoute::Write(_) | PrivateRuntimeAccessRoute::Borrow(_)
+                | PrivateRuntimeAccessRoute::ChildStore(_) => None,
             PrivateRuntimeAccessRoute::Forward { call, target, .. } => Some((call, target)),
         }, |caller, call| local_sites.get(&(caller, call)).map(|site| site.target));
         for target in sealed {
@@ -9962,8 +10025,9 @@ impl ProjectReferenceResults {
                         }
                     }
                 }
-                PrivateRuntimeAccessRoute::Borrow(formal) => {
+                PrivateRuntimeAccessRoute::Borrow(formal) | PrivateRuntimeAccessRoute::ChildStore(formal) => {
                     plan.formal = Some(formal);
+                    plan.copy_child_store = matches!(routes[&target], PrivateRuntimeAccessRoute::ChildStore(_));
                     let site = &pending_borrows[&target].1[0];
                     plan.copy_borrows.insert(site.leaf.0, (site.prefix.0, site.field.clone()));
                 }
