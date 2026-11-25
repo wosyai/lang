@@ -36,7 +36,14 @@ pub(crate) struct PrefixInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MatchTransfer<T> {
     Value(MatchValue<T>),
-    Select { condition: T, yes: MatchValue<T>, no: MatchValue<T> },
+    Select { condition: MatchCondition<T>, yes: MatchValue<T>, no: MatchValue<T> },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchCondition<T> {
+    Boolean(T),
+    Integer { binding: T, ty: ScalarType, relation: super::symbolic_integer::IntegerRelation, bound: BigInt },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -48,15 +55,21 @@ pub(super) enum MatchValue<T> {
 
 #[cfg(feature = "internal-checker")]
 impl MatchTransfer<ByteSpan> {
-    pub(super) fn bind<T>(&self, resolve: impl Fn(ByteSpan, bool) -> Option<T>) -> Option<MatchTransfer<T>> {
+    pub(super) fn bind<T>(&self, result: &ScalarType, resolve: impl Fn(ByteSpan, &ScalarType) -> Option<T>) -> Option<MatchTransfer<T>> {
         let value = |value: &MatchValue<ByteSpan>| Some(match value {
             MatchValue::Literal(value) => MatchValue::Literal(value.clone()),
-            MatchValue::Copy(span) => MatchValue::Copy(resolve(*span, false)?),
+            MatchValue::Copy(span) => MatchValue::Copy(resolve(*span, result)?),
         });
         Some(match self {
             Self::Value(output) => MatchTransfer::Value(value(output)?),
             Self::Select { condition, yes, no } => MatchTransfer::Select {
-                condition: resolve(*condition, true)?, yes: value(yes)?, no: value(no)?,
+                condition: match condition {
+                    MatchCondition::Boolean(binding) => MatchCondition::Boolean(resolve(*binding, &ScalarType::Bool)?),
+                    MatchCondition::Integer { binding, ty, relation, bound } => MatchCondition::Integer {
+                        binding: resolve(*binding, ty)?, ty: ty.clone(), relation: *relation, bound: bound.clone(),
+                    },
+                },
+                yes: value(yes)?, no: value(no)?,
             },
         })
     }
@@ -413,8 +426,27 @@ impl Plan {
                 let no = value(no, work)?;
                 match predicate {
                     Predicate::Constant(flag) => MatchTransfer::Value(if *flag { yes } else { no }),
-                    Predicate::Formal { declaration, .. } => MatchTransfer::Select { condition: *declaration, yes, no },
-                    Predicate::Compare { .. } => return None,
+                    Predicate::Formal { declaration, .. } => MatchTransfer::Select {
+                        condition: MatchCondition::Boolean(*declaration), yes, no,
+                    },
+                    Predicate::Compare { operator, operands } => {
+                        let mut relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+                        let [left, right] = operands.as_ref();
+                        if left.ty != right.ty || !is_integer_type(&left.ty) { return None; }
+                        let (binding, bound) = match (&left.kind, &right.kind) {
+                            (IntegerKind::Formal(binding), IntegerKind::Literal(bound)) => (*binding, bound),
+                            (IntegerKind::Literal(bound), IntegerKind::Formal(binding)) => {
+                                relation = relation.reversed();
+                                (*binding, bound)
+                            }
+                            _ => return None,
+                        };
+                        analysis_budget::charge_call_work(work, 2)?;
+                        MatchTransfer::Select {
+                            condition: MatchCondition::Integer { binding, ty: left.ty.clone(), relation, bound: bound.clone() },
+                            yes, no,
+                        }
+                    }
                 }
             }
         });

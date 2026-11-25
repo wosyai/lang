@@ -24350,6 +24350,53 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(only.witness.intervals_at(0, 2).unwrap().eq([(&selected, &selected)]));
     }
 
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_ordinary_enum_match_uses_typed_integer_selector_order() {
+        let text = format!(r#"%%start
+            enum copy Region {{ left(u8, u16); right(u16, u8); }}
+            unit(i8, u16) inspect = fn(input, entry) {{
+                u16 actual = match (if (input < 0) {{ Region.left(3, entry) }} else {{ Region.right(513, 7) }}) {{
+                    right(wide, narrow) {{ wide }}
+                    left(narrow, wide) {{ wide }}
+                }};
+                core.require(input >= 0 || actual == entry, {OUTPUT});
+                core.require(input < 0 || actual == 513, {OUTPUT});
+            }};
+        %%end"#);
+        let app = source("src/main.w", "symbolic-runtime-enum-match-order");
+        let run = |text: &str| {
+            let parsed = parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations, Vec::new())], Vec::new(), vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        for text in [&text, &text.replace("if (input < 0)", "if (0 > input)")] {
+            let passed = run(text).unwrap();
+            assert!(passed.active && passed.directives.is_empty());
+            let refuted = text.replace("actual == 513", "actual == 512");
+            let failed = run(&refuted).unwrap();
+            let [only] = failed.directives.as_slice() else { panic!("only the nonnegative path fails"); };
+            assert_eq!(&refuted[only.condition.start as usize..only.condition.end as usize], "input < 0 || actual == 512");
+            let zero = BigInt::from(0);
+            let max = BigInt::from(i8::MAX);
+            let payload_max = BigInt::from(u16::MAX);
+            let result = BigInt::from(513);
+            assert_eq!(only.witness.row_count(), 1);
+            assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&zero, &max)]));
+            assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&zero, &payload_max)]));
+            assert!(only.witness.intervals_at(0, 2).unwrap().eq([(&result, &result)]));
+        }
+        for unsupported in [text.replace("if (input < 0)", "if ((input ^ 1) < 0)"),
+            text.replace("if (input < 0)", "if (input < 128)")]
+        {
+            assert!(matches!(run(&unsupported), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+        }
+    }
+
     fn source(path: &str, revision: &str) -> SourceIdentity {
         SourceIdentity::new("local".into(), "demo".into(), path.into(), revision.into())
     }

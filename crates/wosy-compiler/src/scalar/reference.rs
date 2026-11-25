@@ -9585,9 +9585,8 @@ impl StructuralWalker<'_, '_> {
                             || position.block != self.structure.root || position.item != 0
                             || site.ty() != &receiver.ty
                         { return None; }
-                        let transfer = plan.check_transfer.as_ref()?.bind(|span, boolean| {
+                        let transfer = plan.check_transfer.as_ref()?.bind(&receiver.ty, |span, ty| {
                             let (name, declared) = plan.checked_input(span)?;
-                            let ty = if boolean { &ScalarType::Bool } else { &receiver.ty };
                             if declared != ty || scope.types.get(name)? != ty { return None; }
                             let PlainNameIdentity::Lexical(identity) = resolver.plain_name(name, &scope.names)? else { return None; };
                             (identity.declaration_span == span).then_some(identity)

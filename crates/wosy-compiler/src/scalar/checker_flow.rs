@@ -9261,7 +9261,7 @@ fn bind_enum_match_value(
     roots: &mut IntegerRoots<'_>, path: IntegerInputs,
     transfer: &super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, ty: &ScalarType,
 ) -> Option<IntegerInputs> {
-    use super::runtime_enum_match::{MatchTransfer, MatchValue};
+    use super::runtime_enum_match::{MatchCondition, MatchTransfer, MatchValue};
     if !is_integer_type(ty) { return None; }
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len().checked_add(1)?)?;
     if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
@@ -9282,12 +9282,19 @@ fn bind_enum_match_value(
     match transfer {
         MatchTransfer::Value(value) => install(roots, path, value),
         MatchTransfer::Select { condition, yes, no } => {
-            let (axis, condition_ty) = roots.lookup(condition)?;
-            if condition_ty != &ScalarType::Bool { return None; }
-            // The ordinary Bool domain is exactly {0,1}. Keep the
-            // selector coordinate and its equalities on every cut row.
+            // Keep the selector coordinate and its equalities on every cut row.
+            let one = BigInt::from(1);
+            let (binding, ty, relation, bound) = match condition {
+                MatchCondition::Boolean(binding) => (binding, &ScalarType::Bool,
+                    IntegerRelation::from_operator(&BinaryOperator::Equal)?, &one),
+                MatchCondition::Integer { binding, ty, relation, bound } if is_integer_type(ty) =>
+                    (binding, ty, *relation, bound),
+                MatchCondition::Integer { .. } => return None,
+            };
+            let (axis, checked_ty) = roots.lookup(binding)?;
+            if checked_ty != ty { return None; }
             let [no_path, yes_path] = path.ordinary_atom(
-                OrdinaryIntegerAtom::Literal(axis, IntegerRelation::from_operator(&BinaryOperator::Equal)?, &BigInt::from(1)),
+                OrdinaryIntegerAtom::Literal(axis, relation, bound),
                 [true, true], roots.ordinary_local_work.get_or_insert(0),
             )?;
             let mut joined = install(roots, yes_path, yes)?;
