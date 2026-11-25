@@ -370,38 +370,61 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         }
         let body = &calls.structure;
         let Some(root) = body.blocks.get(body.root.0) else { return Ok(None); };
-        let [binding, evaluation] = root.items.as_slice() else { return Ok(None); };
-        let (BlockItemKind::Binding(region), BlockItemKind::Evaluation { expression }) = (&binding.kind, &evaluation.kind) else {
+        let count = calls.call_occurrences.len();
+        if !(1..=4).contains(&count) || root.items.len() <= count || root.items.len() > count + 4 {
             return Ok(None);
-        };
-        let [receiver] = region.receivers() else { return Ok(None); };
-        let Some(origin) = body.checker_integer_call_locals.get(&(body.root, binding.position)) else { return Ok(None); };
-        let Some(&callee) = body.checker_direct_targets.get(&origin.call) else { return Ok(None); };
-        let [occurrence] = calls.call_occurrences.as_slice() else { return Ok(None); };
-        let Some(directive) = body.checker_directives.get(expression) else { return Ok(None); };
-        let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return Ok(None); };
-        if callee.0 == target.0 || occurrence.ordinal != origin.call || body.checker_directives.len() != 1
-            || directive.operation != CheckerOperation::Require || predicate.binding != origin.binding
-            || !is_integer_type(&receiver.ty) || predicate.ty != receiver.ty || receiver.contextual_storage.is_some()
-            || Job::discover(watched, callee, runtime).and_then(|job| job.export_issuer()).is_none()
-        {
-            return Ok(None);
+        }
+        let (bindings, requirements) = root.items.split_at(count);
+        if body.checker_directives.len() != requirements.len() { return Ok(None); }
+        let mut origins = Vec::with_capacity(count);
+        let mut seen = HashSet::with_capacity(count);
+        for binding in bindings {
+            let BlockItemKind::Binding(region) = &binding.kind else { return Ok(None); };
+            let [receiver] = region.receivers() else { return Ok(None); };
+            let Some(origin) = body.checker_integer_call_locals.get(&(body.root, binding.position)) else { return Ok(None); };
+            let Some(&callee) = body.checker_direct_targets.get(&origin.call) else { return Ok(None); };
+            let Some(occurrence) = calls.call_occurrences.iter().find(|item| item.ordinal == origin.call) else { return Ok(None); };
+            if callee.0 == target.0 || !seen.insert(origin.call)
+                || !is_integer_type(&receiver.ty) || receiver.contextual_storage.is_some()
+                || Job::discover(watched, callee, runtime).and_then(|job| job.export_issuer()).is_none()
+            {
+                return Ok(None);
+            }
+            origins.push(((callee, binding.position, origin, occurrence), &receiver.ty));
+        }
+        for requirement in requirements {
+            let BlockItemKind::Evaluation { expression } = &requirement.kind else { return Ok(None); };
+            let Some(directive) = body.checker_directives.get(expression) else { return Ok(None); };
+            let Some(CheckerPredicate::Integer(predicate)) = &directive.predicate else { return Ok(None); };
+            if directive.operation != CheckerOperation::Require
+                || !origins.iter().any(|((_, _, origin, _), ty)| predicate.binding == origin.binding && &predicate.ty == *ty)
+            {
+                return Ok(None);
+            }
         }
         let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
         if owner.source != *source { return Err(ProjectCheck::Unsupported); }
-        let edge = (callee, binding.position, origin, occurrence);
-        self.qualify_edge(target, owner, calls, edge, runtime, ranked)?;
-        self.ensure_qualified_provider(callee, target, runtime, ranked)?;
-        let Some(summary) = self.qualified.verified.lookup_unique(callee) else {
-            // This exact requirement is gated by a refuted supplying proof.
-            // The actual owner's diagnostic retains its original root order.
-            self.qualified.refuter(callee)?;
-            return Ok(Some(false));
-        };
-        let import = summary.import_local(target, calls, binding.position, origin, occurrence, false, Some(owner.target_layout))?
-            .ok_or(ProjectCheck::Unsupported)?;
+        // Inspect each demand's verdict before touching a later edge.
+        // A retained authored refutation owns the diagnostic; it is not
+        // equivalent to an unavailable or stale provider generation.
+        for &(edge, _) in &origins {
+            self.qualify_edge(target, owner, calls, edge, runtime, ranked)?;
+            self.ensure_qualified_provider(edge.0, target, runtime, ranked)?;
+            if self.qualified.verified.lookup_unique(edge.0).is_none() {
+                self.qualified.refuter(edge.0)?;
+                return Ok(Some(false));
+            }
+        }
+        let mut imports = Vec::with_capacity(count);
+        for &((callee, position, origin, occurrence), _) in &origins {
+            // A subsequent demand may have changed an ancestor generation.
+            let summary = self.qualified.verified.lookup_unique(callee).ok_or(ProjectCheck::Unsupported)?;
+            let import = summary.import_local(target, calls, position, origin, occurrence, false, Some(owner.target_layout))?
+                .ok_or(ProjectCheck::Unsupported)?;
+            imports.push(Some(import));
+        }
         let active = super::super::checker_flow::collect_ordered_imported_root_locals(
-            calls, &mut [Some(import)], &mut |failure| effects.push_callable(calls, source, failure),
+            calls, &mut imports, &mut |failure| effects.push_callable(calls, source, failure),
         ).ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }
@@ -493,7 +516,9 @@ mod tests {
                 };
                 let mut wrapper_edges = vec![edge("second", &right)];
                 let mut order = vec![app.clone(), hub.clone(), right.clone()];
-                let mut catalogs = vec![(parse(&app, main), vec![edge("joined", &hub)]), (parse(&right, rhs), Vec::new())];
+                let mut app_edges = vec![edge("joined", &hub)];
+                if main.contains("next = namespace") { app_edges.push(edge("next", &right)); }
+                let mut catalogs = vec![(parse(&app, main), app_edges), (parse(&right, rhs), Vec::new())];
                 if wrapper.contains("first = namespace") {
                     wrapper_edges.insert(0, edge("first", &left));
                     order.push(left.clone());
@@ -542,6 +567,51 @@ mod tests {
             "#;
             let mixed = wrapper.replace("first = namespace package \"src/left.w\";", local)
                 .replace("first.shift(input)", "nearby(input)");
+            let ordered = r#"%%start
+                joined = namespace package "src/hub.w";
+                next = namespace package "src/right.w";
+                unit() check = fn() {
+                    u8 first_value = joined.compose(0);
+                    u8 second_value = next.shift(first_value);
+                    core.require(first_value == 2, { .stdout = ""; .stderr = "first"; .code = 71; .files = []; });
+                    core.require(second_value == 3, { .stdout = ""; .stderr = "second"; .code = 72; .files = []; });
+                };
+            %%end"#;
+            let ordered_pass = run(ordered, &mixed, increment, &wide, package).unwrap();
+            assert!(ordered_pass.active && ordered_pass.directives.is_empty());
+            let bad_ordered = ordered.replace("first_value == 2", "first_value == 1")
+                .replace("second_value == 3", "second_value == 2");
+            let ordered_report = run(&bad_ordered, &mixed, increment, &wide, package).unwrap();
+            let [first, second] = ordered_report.directives.as_slice() else { panic!("both real ordered requirements"); };
+            assert_eq!((first.code(), second.code()), (&71.into(), &72.into()));
+            for (failure, expected) in [(first, "first_value == 1"), (second, "second_value == 2")] {
+                assert_eq!(failure.source, app);
+                assert_eq!(&bad_ordered[failure.condition.start as usize..failure.condition.end as usize], expected);
+            }
+            let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");
+            assert!(matches!(run(ordered, &mixed, increment, &guarded, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let provider_failure = wide.replace("core.old(input) + 1", "core.old(input) + 2");
+            let provider_report = run(ordered, &mixed, increment, &provider_failure, package).unwrap();
+            assert!(provider_report.directives.is_empty());
+            assert_eq!(provider_report.symbolic_diagnostic.unwrap().proof.source, right);
+            // This later provider has a real typed theorem but no applicable
+            // entry and therefore no current summary. Demand must not let
+            // that absence mask the earlier provider's owned diagnostic.
+            let later_unavailable = wide.replace("%%end", r#"
+                u8(u8) unavailable = fn(input) { u8 next = input + 1; next };
+                proof unavailable_goal for unavailable(input) -> (out)
+                    where (input >= 5 && input <= 4) ensures (out == core.old(input) + 1) {}
+            %%end"#);
+            let with_unavailable = ordered.replace("next.shift(first_value)", "next.unavailable(first_value)");
+            assert!(matches!(run(&with_unavailable, &mixed, increment, &later_unavailable, package),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let early_refuted = mixed.replace("core.old(input) + 2", "core.old(input) + 3");
+            let prioritized = run(&with_unavailable, &early_refuted, increment, &later_unavailable, package).unwrap();
+            assert!(prioritized.directives.is_empty() && prioritized.additional_symbolic_diagnostics.is_empty());
+            let diagnosis = prioritized.symbolic_diagnostic.unwrap();
+            assert_eq!(diagnosis.proof.source, hub);
+            assert!(early_refuted[diagnosis.proof.range.start as usize..diagnosis.proof.range.end as usize]
+                .contains("proof composition"));
             let mixed_pass = run(main, &mixed, increment, &wide, package).unwrap();
             assert!(mixed_pass.active && mixed_pass.directives.is_empty() && mixed_pass.symbolic_diagnostic.is_none());
             let mixed_failure = run(&bad, &mixed, increment, &wide, package).unwrap();
