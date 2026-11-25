@@ -10779,12 +10779,21 @@ impl ProjectReferenceResults {
         &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
         module: usize, item: usize,
     ) -> Option<pointer_entry::EntryPointeeWrite<'a>> {
+        if calls.function_body(module, item, None)?.boundary.parameters.len() != 1 { return None; }
+        self.pointer_entry_wrapping_effects(modules, calls, module, item)?.pop()
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn pointer_entry_wrapping_effects<'a>(
+        &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
+        module: usize, item: usize,
+    ) -> Option<Vec<pointer_entry::EntryPointeeWrite<'a>>> {
         if !self.errors.is_empty() { return None; }
         let source = modules.get(module)?;
         let ScalarItem::Function(function) = source.items.get(item)? else { return None; };
         let body = calls.function_body(module, item, None)?;
         let result = self.function_result(module, item, None)?;
-        pointer_entry::checked(&source.source, function, body, &result.cfg, &result.proof_points)
+        pointer_entry::checked_effects(&source.source, function, body, &result.cfg, &result.proof_points)
     }
 
     #[cfg(any(test, feature = "internal-checker"))]

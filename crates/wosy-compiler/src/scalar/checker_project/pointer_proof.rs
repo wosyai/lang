@@ -1,5 +1,6 @@
-//! The closed authored Unit effect route for one sealed entry cell. This
-//! installs no reusable summary; a reached call needs its own exact receipt.
+//! The closed authored Unit effect route for sealed entry cells. A reached
+//! single-formal call still needs its own exact receipt; no multi-formal
+//! effect is exported to a caller.
 use super::*;
 use super::super::{ScalarPlace, ScalarReferenceMutability};
 use wosy_syntax::SourceSpan;
@@ -7,10 +8,15 @@ use wosy_syntax::SourceSpan;
 pub(super) struct Plan {
     target: PreparedCallable,
     proof: SourceSpan,
-    goal: SourceSpan,
-    amount: BigInt,
+    claims: Vec<PointeeClaim>,
     references: std::cell::OnceCell<super::super::reference::ProjectReferenceResults>,
     applied: std::cell::Cell<Option<(usize, usize)>>,
+}
+
+struct PointeeClaim {
+    slot: usize,
+    goal: SourceSpan,
+    amount: BigInt,
 }
 
 pub(super) struct LocalTransition {
@@ -28,8 +34,10 @@ pub(super) fn is_unit_target(selected: &SelectedModuleProof<'_>) -> bool {
 impl Plan {
     pub(super) fn prepare(source: &SourceIdentity, selected: SelectedModuleProof<'_>) -> Result<Self, ProjectCheck> {
         let declaration = selected.node;
+        let parameters = &selected.body.boundary.parameters;
+        let limit = match parameters.len() { 1 => 48, 2 => 96, _ => return Err(ProjectCheck::Unsupported) };
         if source != &selected.owner.source || proof_target_tokens(declaration)?.0.is_some()
-            || declaration.descendants().take(49).count() > 48
+            || declaration.descendants().take(limit + 1).count() > limit
             || declaration.children().any(|node| matches!(node.kind(),
                 SyntaxKind::ProofWhere | SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
         {
@@ -39,38 +47,57 @@ impl Plan {
         if !shape.items.is_empty() || shape.unsafe_context || !shape.final_output_values.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
-        let [parameter] = selected.body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &parameter.ty
-            else { return Err(ProjectCheck::Unsupported); };
-        if parameter.ordinal != 0 || !is_integer_type(inner) || !selected.body.boundary.root_outputs.is_empty()
+        if !selected.body.boundary.root_outputs.is_empty()
             || !proof_input_names(&child(declaration, SyntaxKind::ProofOutputs)?)?.is_empty()
         {
             return Err(ProjectCheck::Unsupported);
         }
         let names = proof_input_names(&child(declaration, SyntaxKind::ProofTarget)?)?;
-        let [formal] = names.as_slice() else { return Err(ProjectCheck::InvalidProof); };
+        if names.len() != parameters.len() || (names.len() == 2 && names[0] == names[1]) {
+            return Err(ProjectCheck::InvalidProof);
+        }
         let point = |expression: &ScalarExpression| {
-            matches!(expression, ScalarExpression::Dereference {
-                place: ScalarPlace::Dereference { pointer, .. }, ..
-            } if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. } if name.as_str() == formal.as_str()))
+            let ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. } = expression
+                else { return None; };
+            let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None; };
+            names.iter().position(|formal| name == formal)
         };
         let goal = child(&child(declaration, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-        let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } =
-            derive_expression(&goal) else { return Err(ProjectCheck::Unsupported); };
-        let ScalarExpression::Binary { operator: BinaryOperator::WrappingAdd, left: old, right: amount, .. } = right.as_ref()
-            else { return Err(ProjectCheck::Unsupported); };
-        let ScalarExpression::Call { receiver: Some(core), name, arguments, type_arguments, .. } = old.as_ref()
-            else { return Err(ProjectCheck::Unsupported); };
-        let [snapshot] = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        if !point(&left) || !point(snapshot) || core != "core" || name != "old" || !type_arguments.is_empty() {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let ScalarExpression::Integer { value: amount, .. } = amount.as_ref() else {
-            return Err(ProjectCheck::Unsupported);
+        let prepared = derive_expression(&goal);
+        let goals = match (&prepared, parameters.len()) {
+            (_, 1) => vec![&prepared],
+            (ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. }, 2) =>
+                vec![left.as_ref(), right.as_ref()],
+            _ => return Err(ProjectCheck::Unsupported),
         };
-        if !integer_literal_fits_type(amount, inner) { return Err(ProjectCheck::InvalidProof); }
-        let at = |node| SourceSpan::new(source.clone(), wosy_syntax::byte_span(node));
-        Ok(Self { target: (selected.function.0, selected.function.1), proof: at(declaration), goal: at(&goal), amount: amount.clone(),
+        let mut claims = Vec::with_capacity(goals.len());
+        for term in goals {
+            let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = term
+                else { return Err(ProjectCheck::Unsupported); };
+            let ScalarExpression::Binary { operator: BinaryOperator::WrappingAdd, left: old, right: amount, .. } = right.as_ref()
+                else { return Err(ProjectCheck::Unsupported); };
+            let ScalarExpression::Call { receiver: Some(core), name, arguments, type_arguments, .. } = old.as_ref()
+                else { return Err(ProjectCheck::Unsupported); };
+            let [snapshot] = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            let slot = point(left).ok_or(ProjectCheck::Unsupported)?;
+            if point(snapshot) != Some(slot) || core != "core" || name != "old" || !type_arguments.is_empty()
+                || claims.iter().any(|claim: &PointeeClaim| claim.slot == slot)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &parameters[slot].ty
+                else { return Err(ProjectCheck::Unsupported); };
+            if parameters[slot].ordinal != slot || !is_integer_type(inner) { return Err(ProjectCheck::Unsupported); }
+            let ScalarExpression::Integer { value: amount, .. } = amount.as_ref() else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            if !integer_literal_fits_type(amount, inner) { return Err(ProjectCheck::InvalidProof); }
+            let range = if parameters.len() == 1 { wosy_syntax::byte_span(&goal) }
+                else { super::super::typecheck::expression_span(term) };
+            claims.push(PointeeClaim { slot, goal: SourceSpan::new(source.clone(), range), amount: amount.clone() });
+        }
+        Ok(Self { target: (selected.function.0, selected.function.1),
+            proof: SourceSpan::new(source.clone(), wosy_syntax::byte_span(declaration)), claims,
             references: std::cell::OnceCell::new(), applied: std::cell::Cell::new(None) })
     }
 
@@ -123,6 +150,7 @@ impl ActualIntegerObserver for &Plan {
         source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<LocalTransition>, ProjectCheck> {
         if target != self.target { return Ok(None); }
+        let [claim] = self.claims.as_slice() else { return Err(ProjectCheck::Unsupported); };
         if &self.proof.source != source
             || !matches!(runtime.visits, Some([InitializationVisit::Started]))
         {
@@ -135,7 +163,7 @@ impl ActualIntegerObserver for &Plan {
             std::ptr::eq(body, runtime.calls.function_body(target.0, item, None)?).then_some(item)
         }).ok_or(ProjectCheck::Unsupported)?;
         let receipt = references.pointer_caller_effect(
-            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &self.amount, Some(occurrence),
+            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &claim.amount, Some(occurrence),
         ).ok_or(ProjectCheck::Unsupported)?;
         let call = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
         if &receipt.call().source != source || receipt.call().range != call { return Err(ProjectCheck::Unsupported); }
@@ -193,20 +221,24 @@ impl SymbolicRootProof for Root<'_> {
             return Err(ProjectCheck::Unsupported);
         }
         let validated = self.plan.references(source, runtime)?;
-        let update = validated.pointer_entry_wrapping_write(&runtime.project.modules, runtime.calls, target.0, target.1)
+        let updates = validated.pointer_entry_wrapping_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
             .ok_or(ProjectCheck::Unsupported)?;
-        if &update.formal().source != source || !integer_literal_fits_type(&self.plan.amount, update.width()) {
-            return Err(ProjectCheck::InvalidProof);
-        }
-        if update.offset() != &self.plan.amount {
-            // Both constants fit the same integer width. At the admitted
-            // entry value 0 each post-value is exactly its offset, making the
-            // disagreement an actual counterexample to the symbolic goal.
-            self.diagnostic = Some(PointerEffectProofDiagnostic {
-                proof: self.plan.proof.clone(), goal: self.plan.goal.clone(),
-                read: update.read().clone(), write: update.write().clone(),
-                entry: BigInt::from(0), expected: self.plan.amount.clone(), observed: update.offset().clone(),
-            });
+        if updates.len() != self.plan.claims.len() { return Err(ProjectCheck::Unsupported); }
+        for claim in &self.plan.claims {
+            let update = updates.get(claim.slot).ok_or(ProjectCheck::Unsupported)?;
+            if &update.formal().source != source || !integer_literal_fits_type(&claim.amount, update.width()) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            if update.offset() != &claim.amount {
+                // The per-place offset gives a genuine counterexample at
+                // entry zero for that place; report the first authored claim.
+                self.diagnostic = Some(PointerEffectProofDiagnostic {
+                    proof: self.plan.proof.clone(), goal: claim.goal.clone(),
+                    read: update.read().clone(), write: update.write().clone(),
+                    entry: BigInt::from(0), expected: claim.amount.clone(), observed: update.offset().clone(),
+                });
+                break;
+            }
         }
         Ok(Some(true))
     }
@@ -318,6 +350,53 @@ mod tests {
                 ] {
                     assert!(run(&unsupported, scope).is_err(), "{unsupported}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn authored_unit_pointer_old_seals_distinct_formal_epochs() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "dual-formal".into());
+        let program = r#"%%start
+            unit(*!u8, *!u32) adjust = fn(p, q) {
+                *p = *p +@ 255;
+                *q = *q +@ 2;
+                *p = *p +@ 2;
+            };
+            proof snapshots for adjust(first, second) -> ()
+                ensures ((*second == core.old(*second) +@ 2) && (*first == core.old(*first) +@ 1)) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, scope| {
+                let (_, proof) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), vec![(proof, Vec::new())],
+                    vec![source.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let pass = run(program, package).unwrap();
+            assert!(pass.active && pass.directives.is_empty() && pass.pointer_effect_diagnostic.is_none());
+            for (previous, wrong, read) in [
+                ("core.old(*second) +@ 2", "core.old(*second) +@ 4", "*q"),
+                ("core.old(*first) +@ 1", "core.old(*first) +@ 3", "*p"),
+            ] {
+                let failed = program.replace(previous, wrong);
+                let receipt = run(&failed, package).unwrap().pointer_effect_diagnostic.unwrap();
+                let snippet = |span: &SourceSpan| &failed[span.range.start as usize..span.range.end as usize];
+                assert!(snippet(&receipt.goal).ends_with(wrong));
+                assert_eq!(snippet(&receipt.read), read);
+                assert_eq!(snippet(&receipt.write), read);
+                assert_eq!(receipt.entry, BigInt::from(0));
+                let dormant = run(&failed, ScalarCheckerScope::MainFlowOnly).unwrap();
+                assert!(!dormant.active && dormant.pointer_effect_diagnostic.is_none());
+            }
+            for unsupported in [
+                program.replace("*first == core.old(*first)", "*first == core.old(*second)"),
+                program.replace("*first == core.old(*first) +@ 1", "*second == core.old(*second) +@ 2"),
+                program.replace("*!u32", "*!u8").replace("*p = *p +@ 2", "*p = *q +@ 2"),
+                program.replace("*q = *q +@ 2;", ""),
+                program.replace("%%end", "unit() start = fn { u8 a = 12; u32 b = 42; adjust(&!a, &!b); }; start(); %%end"),
+            ] {
+                assert!(run(&unsupported, package).is_err(), "{unsupported}");
             }
         }
     }

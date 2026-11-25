@@ -26,13 +26,13 @@ impl<'a> EntryPointeeWrite<'a> {
     pub(crate) fn offset(&self) -> &BigInt { &self.offset }
 }
 
-pub(super) fn checked<'a>(
+pub(super) fn checked_effects<'a>(
     source: &SourceIdentity, function: &ScalarFunction, body: &'a FunctionCallSites,
     cfg: &'a ScalarReferenceCfg, facts: &'a CallablePointFacts,
-) -> Option<EntryPointeeWrite<'a>> {
-    // Only successive straight-line integer load/modify/stores on one loan are admitted.
+) -> Option<Vec<EntryPointeeWrite<'a>>> {
+    // Only successive straight-line integer load/modify/stores on exact formal loans are admitted.
     // Cap before inspecting the path; there is no new reference analysis.
-    if cfg.points.len() > 64 || cfg.facts.len() != 1 || !cfg.allocations.is_empty()
+    if cfg.points.len() > 64 || !cfg.allocations.is_empty()
         || function.body.unsafe_context || !function.generic_parameters.is_empty()
         || !body.arms.is_empty() || !body.call_occurrences.is_empty()
         || !body.callable_escapes.is_empty() || !body.allocation_length_calls.is_empty()
@@ -44,18 +44,51 @@ pub(super) fn checked<'a>(
     {
         return None;
     }
-    let [slot] = body.boundary.parameters.as_slice() else { return None; };
-    let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &slot.ty
-        else { return None; };
-    if slot.ordinal != 0 || !is_integer_type(inner) || facts.formals.len() != 1 { return None; }
-    let formal = facts.formals.get(&0)?;
-    if &formal.source != source || formal.function_span != function.span { return None; }
-    let [ReferenceOrigin::BorrowedFrom { parameter: 0, loan }] = cfg.facts.as_slice() else { return None; };
-    if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
-        || !loan.origin_place.projections.is_empty() || &loan.origin_place.binding != formal
-        || &loan.origin_place.source != source || loan.creation_span != slot.span
+    struct Formal<'a> {
+        binding: &'a ReferenceBindingId,
+        loan: &'a ReferenceLoanId,
+        origin: ReferenceOriginId,
+        slot_type: &'a ScalarType,
+        width: &'a ScalarType,
+        bounds: (BigInt, BigInt),
+        offset: BigInt,
+        binding_point: Option<usize>,
+        first_reader: Option<usize>,
+        first_read: Option<&'a SourceSpan>,
+        last_write: Option<SourceSpan>,
+    }
+    let parameters = &body.boundary.parameters;
+    if !(1..=2).contains(&parameters.len()) || facts.formals.len() != parameters.len()
+        || cfg.facts.len() != parameters.len()
     {
         return None;
+    }
+    let mut formals: Vec<Formal<'_>> = Vec::with_capacity(parameters.len());
+    for (index, slot) in parameters.iter().enumerate() {
+        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &slot.ty
+            else { return None; };
+        let formal = facts.formals.get(&index)?;
+        if slot.ordinal != index || !is_integer_type(inner) || &formal.source != source
+            || formal.function_span != function.span
+            || formals.iter().any(|prior| prior.binding == formal)
+        {
+            return None;
+        }
+        let (origin, loan) = cfg.facts.iter().enumerate().find_map(|(origin, fact)| match fact {
+            ReferenceOrigin::BorrowedFrom { parameter, loan } if *parameter == index =>
+                Some((ReferenceOriginId(origin), loan)),
+            _ => None,
+        })?;
+        if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
+            || !loan.origin_place.projections.is_empty() || &loan.origin_place.binding != formal
+            || &loan.origin_place.source != source || loan.creation_span != slot.span
+            || formals.iter().any(|prior| prior.origin == origin || prior.loan == loan)
+        {
+            return None;
+        }
+        formals.push(Formal { binding: formal, loan, origin, slot_type: &slot.ty, width: inner,
+            bounds: super::super::typecheck::integer_bounds(inner)?, offset: BigInt::from(0),
+            binding_point: None, first_reader: None, first_read: None, last_write: None });
     }
     let structure = &body.structure;
     let items = &structure.blocks.get(structure.root.0)?.items;
@@ -63,17 +96,11 @@ pub(super) fn checked<'a>(
     let writes = cfg.points.iter().filter(|point| matches!(point.kind, CfgPointKind::AssignThrough { .. }))
         .collect::<Vec<_>>();
     if writes.len() != items.len() { return None; }
-    let origin = ReferenceOriginId(0);
-    let has_only_origin = |point: &ReferenceFlowPoint| {
+    let has_only_origin = |point: &ReferenceFlowPoint, origin| {
         point.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1 && origins.contains(&origin))
     };
-    let bounds = super::super::typecheck::integer_bounds(inner)?;
-    let mut offset_sum = BigInt::from(0);
     let mut claimed = vec![false; cfg.points.len()];
     let mut previous_write = 0;
-    let mut first_reader = None;
-    let mut first_read = None;
-    let mut last_write = None;
 
     // Zip genuine source assignments and ordered converged write points.
     // Write i consumes the current value after write i−1, not a second
@@ -83,12 +110,6 @@ pub(super) fn checked<'a>(
         let assignment = body.assignments.get(&(group.block, group.item))?;
         let [rhs] = assignment.rhs_evaluations().as_slice() else { return None; };
         let [destination] = assignment.destinations().as_slice() else { return None; };
-        if rhs.position != 0 || destination.position != 0
-            || structure.checked_types.places.get(&destination.destination)? != inner.as_ref()
-            || structure.checked_types.expressions.get(&rhs.expression)? != inner.as_ref()
-        {
-            return None;
-        }
         let expression = |parent, edge| match structure.edges.get(&(parent, edge))? {
             OccurrenceNode::Expression(ordinal) => Some(*ordinal),
             _ => None,
@@ -96,19 +117,24 @@ pub(super) fn checked<'a>(
         let parent = OccurrenceParent::Expression(rhs.expression);
         let read_ordinal = expression(parent, OccurrenceEdge::BinaryLeft)?;
         let offset_ordinal = expression(parent, OccurrenceEdge::BinaryRight)?;
-        if structure.checked_types.expressions.get(&read_ordinal)? != inner.as_ref()
-            || structure.checked_types.expressions.get(&offset_ordinal)? != inner.as_ref()
-        {
-            return None;
-        }
         let OccurrenceNode::Place(read_place) = structure.edges.get(&(
             OccurrenceParent::Expression(read_ordinal), OccurrenceEdge::ExpressionPlace,
         ))? else { return None; };
         let pointer_for = |place| expression(OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer);
         let read_pointer = pointer_for(*read_place)?;
         let write_pointer = pointer_for(destination.destination)?;
+        let PlainNameIdentity::Lexical(binding) = body.prepared_plain_name(write_pointer)? else { return None; };
+        let effect = formals.iter_mut().find(|effect| effect.binding == binding)?;
+        let (formal, loan, origin, width) = (effect.binding, effect.loan, effect.origin, effect.width);
+        if rhs.position != 0 || destination.position != 0
+            || structure.checked_types.places.get(&destination.destination)? != width
+            || [rhs.expression, read_ordinal, offset_ordinal].into_iter()
+                .any(|operand| structure.checked_types.expressions.get(&operand) != Some(width))
+        {
+            return None;
+        }
         for pointer in [read_pointer, write_pointer] {
-            if structure.checked_types.expressions.get(&pointer)? != &slot.ty
+            if structure.checked_types.expressions.get(&pointer)? != effect.slot_type
                 || body.prepared_plain_name(pointer) != Some(&PlainNameIdentity::Lexical(formal.clone()))
             {
                 return None;
@@ -124,7 +150,7 @@ pub(super) fn checked<'a>(
             else { return None; };
         let ScalarExpression::Integer { value: offset, .. } = right.as_ref() else { return None; };
         if !matches!(&literal.kind, CfgPointKind::Evaluate(expression) if expression == right.as_ref())
-            || !super::super::typecheck::integer_literal_fits_type(offset, inner)
+            || !super::super::typecheck::integer_literal_fits_type(offset, width)
         {
             return None;
         }
@@ -135,7 +161,7 @@ pub(super) fn checked<'a>(
         let [read_target] = candidates.as_slice() else { return None; };
         // ReadPlace carries the explicit dereference projection; AssignThrough
         // carries its base place plus the dereferenced loan separately.
-        if &read_target.binding != formal || &read_target.source != source || !has_only_origin(read)
+        if &read_target.binding != formal || &read_target.source != source || !has_only_origin(read, origin)
             || !matches!(read_target.projections.as_slice(),
                 [ReferencePlaceProjection::Dereference(parent)] if parent.as_ref() == loan)
         {
@@ -162,7 +188,7 @@ pub(super) fn checked<'a>(
         for point in [reader, writer] {
             let point = cfg.points.get(point.0)?;
             if !matches!(&point.kind, CfgPointKind::Read { binding } if binding == formal)
-                || !has_only_origin(point)
+                || !has_only_origin(point, origin)
             {
                 return None;
             }
@@ -170,13 +196,12 @@ pub(super) fn checked<'a>(
         for point in [*reader, *writer, read.id, literal.id, rhs.id, write.id] {
             if std::mem::replace(claimed.get_mut(point.0)?, true) { return None; }
         }
-        offset_sum = super::super::typecheck::wrapping_integer_sum(&offset_sum, offset, &bounds.0, &bounds.1)?;
-        first_reader.get_or_insert(reader.0.min(writer.0));
-        first_read.get_or_insert(&read.source_span);
-        last_write = Some(SourceSpan::new(write.source_span.source.clone(), *write_place));
+        effect.offset = super::super::typecheck::wrapping_integer_sum(&effect.offset, offset, &effect.bounds.0, &effect.bounds.1)?;
+        effect.first_reader.get_or_insert(reader.0.min(writer.0));
+        effect.first_read.get_or_insert(&read.source_span);
+        effect.last_write = Some(SourceSpan::new(write.source_span.source.clone(), *write_place));
         previous_write = write.id.0;
     }
-    let mut bind = None;
     let mut next_write = 0;
     let mut captured = false;
     for (ordinal, point) in cfg.points.iter().enumerate() {
@@ -196,8 +221,11 @@ pub(super) fn checked<'a>(
         match &point.kind {
             CfgPointKind::Entry if ordinal == 0 => {}
             CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit => {}
-            CfgPointKind::Bind { binding } if binding == formal && has_only_origin(point) && bind.is_none() => {
-                bind = Some(ordinal);
+            CfgPointKind::Bind { binding } => {
+                let effect = formals.iter_mut().find(|effect| effect.binding == binding)?;
+                if !has_only_origin(point, effect.origin) || effect.binding_point.replace(ordinal).is_some() {
+                    return None;
+                }
             }
             CfgPointKind::CaptureAssignmentPrevious { writes: recorded } if !captured => {
                 if recorded.as_slice() != [writes.get(next_write)?.id] { return None; }
@@ -206,13 +234,14 @@ pub(super) fn checked<'a>(
             _ => return None,
         }
     }
-    if !matches!(cfg.points.last()?, ReferenceFlowPoint { kind: CfgPointKind::ScopeExit, scope: ReferenceScopeId(0), .. })
-        || bind? >= first_reader?
-    {
+    if !matches!(cfg.points.last()?, ReferenceFlowPoint { kind: CfgPointKind::ScopeExit, scope: ReferenceScopeId(0), .. }) {
         return None;
     }
-    Some(EntryPointeeWrite { formal, loan, width: inner, entry: CfgPointId(0),
-        read: first_read?, write: last_write?, offset: offset_sum })
+    formals.into_iter().map(|effect| {
+        if effect.binding_point? >= effect.first_reader? { return None; }
+        Some(EntryPointeeWrite { formal: effect.binding, loan: effect.loan, width: effect.width, entry: CfgPointId(0),
+            read: effect.first_read?, write: effect.last_write?, offset: effect.offset })
+    }).collect()
 }
 
 #[cfg(test)]
