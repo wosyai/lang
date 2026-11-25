@@ -6273,7 +6273,7 @@ impl SelectedSymbolicProof<'_, '_> {
         }
         if group.quantified_return {
             let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
-            let MainFlowProofBound::Quantified(goal) = first.bound else { return Err(ProjectCheck::Unsupported); };
+            let MainFlowProofBound::Quantified { claim: goal, failed_step } = first.bound else { return Err(ProjectCheck::Unsupported); };
             if !rest.is_empty() || first.proof_source != source || first.owner != source {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -6282,7 +6282,7 @@ impl SelectedSymbolicProof<'_, '_> {
             ).ok_or(ProjectCheck::Unsupported)?;
             if active || !directives.is_empty() { return Err(ProjectCheck::Unsupported); }
             if let Some(failure) = rejected {
-                self.record(first, function, source, effects.records.len(), failure, None)?;
+                self.record(first, function, source, effects.records.len(), failure, failed_step)?;
             }
             return Ok(Some(returned));
         }
@@ -6728,7 +6728,7 @@ impl ShowEqualityIndex {
 
 #[cfg(feature = "internal-checker")]
 enum MainFlowProofBound<'a> {
-    Quantified(super::checker_flow::QuantifiedIntegerReturn<'a>),
+    Quantified { claim: super::checker_flow::QuantifiedIntegerReturn<'a>, failed_step: Option<ByteSpan> },
     ResultPair(&'a super::checker_flow::ResultPairProof),
     Literal(&'a BigInt),
     Entry(usize),
@@ -6740,7 +6740,7 @@ impl<'a> MainFlowProofBound<'a> {
     fn literal(&self) -> Option<&'a BigInt> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::Quantified(_) | Self::ResultPair(_) | Self::Entry(_) | Self::EntryAffine { .. } => None,
+            Self::Quantified { .. } | Self::ResultPair(_) | Self::Entry(_) | Self::EntryAffine { .. } => None,
         }
     }
 
@@ -6761,7 +6761,7 @@ impl<'a> MainFlowProofBound<'a> {
                 let value = transform.apply_point(entry);
                 integer_literal_fits_type(&value, parameter).then_some(Cow::Owned(value))
             }
-            Self::Quantified(_) | Self::ResultPair(_) | Self::EntryAffine { .. } => None,
+            Self::Quantified { .. } | Self::ResultPair(_) | Self::EntryAffine { .. } => None,
         }
     }
 }
@@ -6925,18 +6925,32 @@ impl<'a> MainFlowProofCase<'a> {
         }
         use super::checker_flow::QuantifiedIntegerReturn as Quantified;
         let quantified = match &plan.typed.goal {
-            TypedProofGoal::UniversalNotEqual(excluded) => Some(Quantified::Avoiding(None, excluded)),
-            TypedProofGoal::UniversalConjunction(goal) => Some(match goal {
+            TypedProofGoal::UniversalNotEqual(excluded) => Some((Quantified::Avoiding(None, excluded), None)),
+            TypedProofGoal::UniversalConjunction(goal) => Some((match goal {
                 UniversalConjunction::Vacuous => Quantified::Vacuous,
                 UniversalConjunction::Impossible => Quantified::Impossible,
                 UniversalConjunction::Output(bounds) => Quantified::Output(bounds),
                 UniversalConjunction::OutputAvoiding(both) => Quantified::Avoiding(Some(&both.0), &both.1),
-            }),
+            }, None)),
+            TypedProofGoal::Existential { relation, witness, witness_in_domain } => Some((
+                Quantified::Comparison(None, *relation, witness), Some(!*witness_in_domain),
+            )),
+            TypedProofGoal::ConjunctiveExistential(goal) => {
+                let ConjunctiveWitness::Literal(candidate, _) = &goal.witness else { return Err(ProjectCheck::Unsupported); };
+                Some((Quantified::Comparison(Some(&goal.output), goal.relation, candidate),
+                    Some(goal.domain.first_intersection_point(candidate, candidate).is_none())))
+            }
+            TypedProofGoal::DependentWitness(goal) => Some((match goal {
+                DependentWitness::Unavailable | DependentWitness::OutsideDomain => Quantified::Impossible,
+                DependentWitness::Comparison(relation, bound) => Quantified::Comparison(None, *relation, bound),
+                DependentWitness::Avoiding(excluded) => Quantified::Avoiding(None, excluded),
+                DependentWitness::Output(bounds) => Quantified::Output(bounds),
+                DependentWitness::OutputAvoiding(both) => Quantified::Avoiding(Some(&both.0), &both.1),
+            }, Some(matches!(goal, DependentWitness::OutsideDomain)))),
             _ => None,
         };
-        if let Some(claim) = quantified {
-            if citation.is_some() || qualified_leaf || !plan.has_no_authored_steps()
-                || plan.typed.measure.is_some() || !valid_arbitrary_proof_body(body)
+        if let Some((goal_claim, witness)) = quantified {
+            if citation.is_some() || qualified_leaf || plan.typed.measure.is_some() || !valid_arbitrary_proof_body(body)
                 || !body.checker_pure_calling_frame() || !body.callable_escapes.is_empty()
                 || !body.structure.module_storage_uses.is_empty() || body.contextual_formal().is_some()
             {
@@ -6944,11 +6958,22 @@ impl<'a> MainFlowProofCase<'a> {
             }
             let filter = plan.filter.as_deref().unwrap_or_default();
             let guard = checked_scalar_guard_slots::<false>(body, filter, false, false).ok_or(ProjectCheck::Unsupported)?;
-            let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+            let ensures = child(plan.proof, SyntaxKind::ProofEnsures)?;
+            let (claim, goal, failed_step) = if let Some(witness_outside) = witness {
+                authored_witness_argument(&plan.steps)?;
+                let [ScalarBlockItem::Expression(step)] = plan.steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+                let exists = child(&ensures, SyntaxKind::ProofExists)?;
+                let goal = child(&exists, SyntaxKind::Expression)?;
+                let failed_step = witness_outside.then(|| super::typecheck::expression_span(step));
+                (if witness_outside { Quantified::Impossible } else { goal_claim }, goal, failed_step)
+            } else {
+                if !plan.has_no_authored_steps() { return Err(ProjectCheck::Unsupported); }
+                (goal_claim, child(&ensures, SyntaxKind::Expression)?, None)
+            };
             return Ok((Self {
                 proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
                 goal: wosy_syntax::byte_span(&goal), guard, filter, relation: None,
-                bound: MainFlowProofBound::Quantified(claim), qualified_leaf, literal_leaf: None,
+                bound: MainFlowProofBound::Quantified { claim, failed_step }, qualified_leaf, literal_leaf: None,
             }, None));
         }
         if let TypedProofGoal::ResultPair(pair) = &plan.typed.goal {
@@ -7355,7 +7380,7 @@ impl<'a> MainFlowProofTarget<'a> {
         let qualified_leaf = first.qualified_leaf;
         let literal_leaf = first.literal_leaf;
         let result_pair = first.result_pair().is_some();
-        let quantified_return = matches!(first.bound, MainFlowProofBound::Quantified(_));
+        let quantified_return = matches!(first.bound, MainFlowProofBound::Quantified { .. });
         let cases = if let Some(step) = step {
             MainFlowProofCases::Authored(vec![(first, Some(step))])
         } else {
@@ -7458,7 +7483,7 @@ impl<'a> MainFlowProofObserver<'a> {
         let citation_output_type = MainFlowProofTarget::citation_output_type(proof.1.as_ref());
         let has_case_citations = matches!(&proof.1, Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations());
         let nested_case_work = MainFlowProofTarget::nested_case_work(&proof.0, proof.1.as_ref());
-        let quantified_return = matches!(proof.0.bound, MainFlowProofBound::Quantified(_));
+        let quantified_return = matches!(proof.0.bound, MainFlowProofBound::Quantified { .. });
         if self.first.0 == target {
             self.first.1.quantified_return |= quantified_return;
             self.first.1.issuer = None;
@@ -7753,12 +7778,12 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         continue;
                     }
                     self.active = true;
-                    if let MainFlowProofBound::Quantified(claim) = proof.bound {
+                    if let MainFlowProofBound::Quantified { claim, failed_step } = proof.bound {
                         let Some(failure) = claim.rejected_point(value, value, &mut self.named_exact_work) else {
                             self.incomplete = true;
                             return;
                         };
-                        if failure.is_some() && !emit(proof, None) {
+                        if failure.is_some() && !emit(proof, failed_step) {
                             self.incomplete = true;
                             return;
                         }
@@ -10929,7 +10954,7 @@ impl SelectedProofObserver<'_> {
                             bounds.0.holds_value(value) && !bounds.1.covers_closed(value, value),
                     }),
                     TypedProofGoal::DependentWitness(witness) => match witness {
-                        DependentWitness::Unavailable => None,
+                        DependentWitness::Unavailable | DependentWitness::OutsideDomain => None,
                         DependentWitness::Comparison(relation, bound) => relation.accepts(value.cmp(bound)).then_some(true),
                         DependentWitness::Avoiding(domain) => (!domain.covers_closed(value, value)).then_some(true),
                         DependentWitness::Output(output) => output.holds_value(value).then_some(true),
@@ -11152,6 +11177,7 @@ enum UniversalConjunction {
 #[cfg(feature = "internal-checker")]
 enum DependentWitness {
     Unavailable,
+    OutsideDomain,
     Comparison(IntegerRelation, BigInt),
     Avoiding(IntegerSet),
     Output(Box<IntegerShowConstraints<'static>>),
@@ -11202,7 +11228,7 @@ impl TypedProofGoal {
             Self::Disjunction(allowed) => path.output_within(allowed),
             Self::UniversalNotEqual(domain) => path.output_disjoint_from(domain),
             Self::DependentWitness(witness) => match witness {
-                DependentWitness::Unavailable => None,
+                DependentWitness::Unavailable | DependentWitness::OutsideDomain => None,
                 DependentWitness::Comparison(relation, bound) => path.output_satisfies(*relation, bound)?.then_some(true),
                 DependentWitness::Avoiding(domain) => path.output_disjoint_from(domain)?.then_some(true),
                 DependentWitness::Output(output) => path.output_satisfies_constraints(output)?.then_some(true),
@@ -11421,6 +11447,7 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     }).transpose()?;
     let mut unavailable = false;
     let mut impossible = false;
+    let mut outside_domain = false;
     let mut forbidden = OwnedIntegerUnion::default();
     for (slot, ((forall, binder), relation)) in declarations.into_iter().zip(relations).enumerate() {
         let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
@@ -11428,9 +11455,12 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
             unavailable = true;
             continue;
         };
-        if unavailable || impossible {
-            continue;
+        if let Some((chosen, existential)) = &admission {
+            if slot == *chosen && !domain.is_subset_of(existential) {
+                outside_domain = true;
+            }
         }
+        if unavailable || impossible || outside_domain { continue; }
         let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
             (true, false, _) => Some(true),
             (false, true, _) => Some(false),
@@ -11439,12 +11469,6 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
             (true, true, false) => None,
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if let Some((chosen, existential)) = &admission {
-            if slot == *chosen && !domain.is_subset_of(existential) {
-                impossible = true;
-                continue;
-            }
-        }
         let Some(lower) = lower else {
             forbidden.push(domain);
             continue;
@@ -11455,6 +11479,9 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     }
     if unavailable {
         return Err(ProjectCheck::Unsupported);
+    }
+    if outside_domain {
+        return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain));
     }
     if impossible {
         return Ok(if DEPENDENT {
@@ -11624,23 +11651,20 @@ fn dependent_witness_conjunction(
     universal: IntegerSet, existential: &IntegerSet,
 ) -> Result<DependentWitness, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
+    if !universal.is_subset_of(existential) {
+        return Ok(DependentWitness::OutsideDomain);
+    }
     let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
         (true, false, _) => true,
         (false, true, _) => false,
         (false, false, true) if universal.singleton_value().is_some() => true,
         (false, false, _) => return Ok(DependentWitness::Unavailable),
         (true, true, false) => {
-            if !universal.is_subset_of(existential) {
-                return Ok(DependentWitness::Unavailable);
-            }
             output.normalize();
             return Ok(DependentWitness::OutputAvoiding(Box::new((output, universal))));
         }
         _ => return Err(ProjectCheck::Unsupported),
     };
-    if !universal.is_subset_of(existential) {
-        return Ok(DependentWitness::Unavailable);
-    }
     let bound = universal.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
     output.add(relation, Cow::Owned(bound));
     output.normalize();
@@ -11686,9 +11710,9 @@ fn typed_named_dependent_witness(
     if universal_domain.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
-    let witness = if (operator == BinaryOperator::Equal && universal_domain.singleton_value().is_none())
-        || !universal_domain.is_subset_of(&existential_domain)
-    {
+    let witness = if !universal_domain.is_subset_of(&existential_domain) {
+        DependentWitness::OutsideDomain
+    } else if operator == BinaryOperator::Equal && universal_domain.singleton_value().is_none() {
         DependentWitness::Unavailable
     } else {
         match operator {
@@ -21249,6 +21273,71 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(failed.symbolic_diagnostic.is_none() && failed.additional_symbolic_diagnostics.is_empty());
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_mixed_scalar_witnesses_distinguish_admission_from_predicate_failure() {
+        use super::super::checker_flow::take_array_return_observations;
+        let text = r#"%%start
+            u8(u8) ordinary = fn(value) { value };
+            u8(u8) dependent = fn(value) { value };
+            u8[1]() make = fn { [7] };
+            proof literal_choice for ordinary(entry) -> (out) where (entry >= 4 && entry <= 5)
+                ensures (exists (u8 picked where picked >= 3 && picked <= 6) { out > picked && out <= 5 })
+                { core.witness(3); }
+            proof dependent_choice for dependent(entry) -> (out) where (entry >= 4 && entry <= 5)
+                forall (u8 candidate where candidate == 2 || candidate == 4)
+                forall (u8 forbidden where forbidden == 1 || forbidden == 7)
+                ensures (exists (u8 selection where selection == 2 || selection == 4) { out >= selection && out != forbidden })
+                { core.witness(candidate); }
+            proof array_choice for make() -> (out)
+                ensures (exists (u64 index where index == 0) { out[index] == 7 })
+                { core.witness(0); }
+        %%end"#;
+        let run = |source, scope| check_array_proof_cohort(source, scope).unwrap();
+        let package = ScalarCheckerScope::CurrentPackage;
+        let _ = take_array_return_observations();
+        let passed = run(text, package);
+        assert!(passed.active && passed.directives.is_empty() && passed.diagnostics.is_empty()
+            && passed.symbolic_diagnostic.is_none() && passed.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (1, 0));
+
+        let failed_domains = text.replace("picked >= 3", "picked >= 4")
+            .replace("selection == 2 || selection == 4", "selection == 2");
+        let failed = run(&failed_domains, package);
+        let first = failed.symbolic_diagnostic.unwrap();
+        let [second] = failed.additional_symbolic_diagnostics.as_slice() else { panic!("two domain refutations"); };
+        for (failure, expected) in [(&first, "core.witness(3)"), (second, "core.witness(candidate)")] {
+            let step = failure.failed_step.as_ref().unwrap().range;
+            assert_eq!(&failed_domains[step.start as usize..step.end as usize], expected);
+            assert_eq!(failure.returned, BigInt::from(4));
+        }
+        assert!(first.proof.range.start < second.proof.range.start && failed.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (1, 0));
+
+        let failed_predicates = text.replace("out > picked", "out < picked")
+            .replace("out >= selection", "out > selection");
+        let failed = run(&failed_predicates, package);
+        let first = failed.symbolic_diagnostic.unwrap();
+        let [second] = failed.additional_symbolic_diagnostics.as_slice() else { panic!("two false predicates"); };
+        assert!(first.failed_step.is_none() && second.failed_step.is_none() && failed.aggregate_diagnostics.is_empty());
+        assert_eq!(first.returned, BigInt::from(4));
+        assert_eq!(second.returned, BigInt::from(4));
+        assert_eq!(take_array_return_observations(), (1, 0));
+
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let dormant = run(&failed_domains, main);
+        assert!(!dormant.active && dormant.symbolic_diagnostic.is_none() && dormant.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (0, 0));
+        let reached = failed_domains.replace("%%end", "u8 first = ordinary(4); u8 second = dependent(first); u8[1] cells = make(); %%end");
+        let report = run(&reached, main);
+        assert!(report.symbolic_diagnostic.is_none() && report.aggregate_diagnostics.is_empty());
+        let [first, second] = report.diagnostics.as_slice() else { panic!("two actual owner activation failures"); };
+        assert_ne!(first.invocation.call, second.invocation.call);
+        assert!(first.failed_step.is_some() && second.failed_step.is_some());
+        assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
+        assert_eq!(take_array_return_observations(), (0, 1));
     }
 
     #[cfg(feature = "internal-checker")]

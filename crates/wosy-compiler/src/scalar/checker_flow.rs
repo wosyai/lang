@@ -615,6 +615,7 @@ pub(super) enum QuantifiedIntegerReturn<'a> {
     Vacuous,
     Impossible,
     Output(&'a IntegerShowConstraints<'static>),
+    Comparison(Option<&'a IntegerShowConstraints<'static>>, IntegerRelation, &'a BigInt),
     Avoiding(Option<&'a IntegerShowConstraints<'static>>, &'a IntegerSet),
 }
 
@@ -629,6 +630,14 @@ impl QuantifiedIntegerReturn<'_> {
             Self::Output(bounds) => {
                 charge_call_work(work, bounds.interval_lookup_work())?;
                 bounds.first_violation_in_interval(low, high)
+            }
+            Self::Comparison(bounds, relation, bound) => {
+                charge_call_work(work, 3 + bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?;
+                let rejected = relation.complement();
+                bounds.and_then(|bounds| bounds.first_violation_in_interval(low, high))
+                    .or_else(|| rejected.accepts(low.cmp(bound)).then_some(low))
+                    .or_else(|| rejected.accepts(high.cmp(bound)).then_some(high))
+                    .or_else(|| (rejected.accepts(std::cmp::Ordering::Equal) && low < bound && bound < high).then_some(bound))
             }
             Self::Avoiding(bounds, excluded) => {
                 let depth = (usize::BITS - excluded.interval_count().leading_zeros()) as usize + 1;
