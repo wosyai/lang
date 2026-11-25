@@ -230,6 +230,19 @@ mod tests {
             for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
                 let approved = run(program, scope).unwrap();
                 assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+                // u32::MAX + 1 wraps to 0; the second write uses that
+                // current value, while core.old is still u32::MAX.
+                let ordered = program.replace("*p = *p +@ 1;", "*p = *p +@ 1; *p = *p +@ 2;")
+                    .replace("core.old(*p) +@ 1", "core.old(*p) +@ 3")
+                    .replace("core.require(local == 0", "core.require(local == 2");
+                let approved = run(&ordered, scope).unwrap();
+                assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+                let stale = ordered.replace("core.require(local == 2", "core.require(local == 0");
+                let witnessed = run(&stale, scope).unwrap();
+                let [failed] = witnessed.directives.as_slice() else { panic!("ordered caller requirement"); };
+                assert_eq!(&stale[failed.condition.start as usize..failed.condition.end as usize], "local == 0");
+                let two = BigInt::from(2);
+                assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&two, &two)]));
 
                 let old = program.replace("core.require(local == 0", "core.require(local == 4294967295");
                 let witnessed = run(&old, scope).unwrap();
@@ -283,6 +296,14 @@ mod tests {
             assert_eq!(slice(&failure.write), "*p");
             assert_ne!(failure.read, failure.write);
             assert_eq!(failure.read.source, source);
+            let wrong_final = program.replace("*p = *p +@ 1;", "*p = *p +@ 1; *p = *p +@ 2;")
+                .replace("core.old(*p) +@ 1", "core.old(*p) +@ 2");
+            let final_failure = run(&wrong_final, package).unwrap().pointer_effect_diagnostic.unwrap();
+            assert_eq!(final_failure.entry, BigInt::from(0));
+            assert_eq!(final_failure.observed, BigInt::from(3));
+            assert_eq!(final_failure.expected, BigInt::from(2));
+            assert_eq!(final_failure.read.range.start as usize, wrong_final.find("= *p +@ 1").unwrap() + 2);
+            assert_eq!(final_failure.write.range.start as usize, wrong_final.find("*p = *p +@ 2").unwrap());
             let idle = run(&wrong, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!idle.active && idle.pointer_effect_diagnostic.is_none());
 
@@ -290,7 +311,7 @@ mod tests {
                 program.replace("core.old(*p)", "*p"),
                 program.replace("core.old(*p)", "core.old(*other)"),
                 program.replace("= *p +@", "= *p +"),
-                program.replace("*p = *p +@ 1;", "*p = *p +@ 1; *p = *p +@ 2;"),
+                program.replace("*p = *p +@ 1;", "*p = *p +@ 1; *p = *p + 2;"),
                 program.replace("ensures", "where (true) ensures"),
                 program.replace("%%end", "unit() start = fn { u32 local = 15; local = 16; increment(&!local); }; start(); %%end"),
             ] {
