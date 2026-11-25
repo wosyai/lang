@@ -20,6 +20,19 @@ pub struct ClientSourceUsage {
     pub encoded_bytes: usize,
 }
 
+impl ClientSourceUsage {
+    pub(crate) fn admit(self, limits: ClientSourceLimits) -> Result<(), ClientSourceError> {
+        let exceeded = if self.nodes > limits.nodes {
+            Some((SourceLimit::Nodes, limits.nodes))
+        } else if self.encoded_bytes > limits.encoded_bytes {
+            Some((SourceLimit::EncodedBytes, limits.encoded_bytes))
+        } else { None };
+        if let Some((field, limit)) = exceeded {
+            Err(ClientSourceError::LimitExceeded { field, limit })
+        } else { Ok(()) }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceLimit {
     Nodes,
@@ -67,13 +80,6 @@ enum NextSelection {
 }
 
 impl StagedSourceRefresh<'_> {
-    pub(crate) fn observation_counts(&self) -> (usize, usize) {
-        match &self.data {
-            NextSelection::Same { parsed, reused } => (*parsed, *reused),
-            NextSelection::Replace { source, .. } => (source.parsed, source.reused),
-        }
-    }
-
     pub fn root(&self) -> NodeId {
         match &self.data {
             NextSelection::Same { .. } => self.owner.current.root,
@@ -120,12 +126,6 @@ impl StagedSourceRefresh<'_> {
 }
 
 impl RetainedSources {
-    pub(crate) fn from_persisted(
-        current: PreparedSources, files: Files, usage: ClientSourceUsage, limits: ClientSourceLimits,
-    ) -> Self {
-        Self { current, files, usage, limits }
-    }
-
     pub fn observe(
         project: &Path, target: Option<&str>, limits: ClientSourceLimits,
     ) -> Result<Self, ClientSourceError> {
@@ -147,10 +147,7 @@ impl RetainedSources {
         let data = if self.current.root == source.root {
             NextSelection::Same { parsed: source.parsed, reused: source.reused }
         } else {
-            let closure = reachable(source.root, &source.delta, Some(&self.current.delta), self.limits)?;
-            source.delta.nodes.retain(|id, _| {
-                closure.nodes.contains(id) && !self.current.delta.nodes.contains_key(id)
-            });
+            let closure = sparse_delta(&mut source, &self.current.delta, self.limits)?;
             NextSelection::Replace { source, files, closure }
         };
         Ok(StagedSourceRefresh { owner: self, data })
@@ -163,9 +160,21 @@ impl RetainedSources {
         &self.current
     }
 
+    pub(crate) fn into_prepared(self) -> PreparedSources {
+        self.current
+    }
+
     pub fn usage(&self) -> ClientSourceUsage {
         self.usage
     }
+}
+
+pub(crate) fn sparse_delta(
+    source: &mut PreparedSources, base: &Delta, limits: ClientSourceLimits,
+) -> Result<Closure, ClientSourceError> {
+    let closure = reachable(source.root, &source.delta, Some(base), limits)?;
+    source.delta.nodes.retain(|id, _| closure.nodes.contains(id) && !base.nodes.contains_key(id));
+    Ok(closure)
 }
 
 pub(crate) struct Closure {

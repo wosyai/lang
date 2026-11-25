@@ -1,8 +1,10 @@
 //! Project-local source selection and recovery. Compiler queries and the
 //! public current.json view are not stored here.
-use crate::source_preparation::{Files, PreparedSources};
-use crate::source_recovery::{trace_reachable, ClientSourceLimits, ClientSourceUsage, RetainedSources};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use crate::source_preparation::{prepare_with_files, Files, PreparedSources};
+use crate::source_recovery::{
+    sparse_delta, trace_reachable, ClientSourceLimits, ClientSourceUsage, RetainedSources,
+};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig};
 
@@ -44,6 +46,7 @@ pub struct SourceStage {
     pub reused: usize,
     pub new_nodes: usize,
     pub new_bytes: usize,
+    pub storage_reads: usize,
     pub pending: Option<SourceAttempt>,
 }
 
@@ -59,11 +62,10 @@ pub struct SourceReplay {
     pub attempt: Option<SourceAttempt>,
 }
 
-struct SavedGeneration {
+struct Observation {
     source: PreparedSources,
-    usage: ClientSourceUsage,
-    config: SourceConfig,
-    files: Vec<NodeId>,
+    usage_to_record: Option<ClientSourceUsage>,
+    storage_reads: usize,
 }
 
 impl SqliteSourceState {
@@ -107,8 +109,15 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 1;
                  PRAGMA cst.user_version = 1;",
             )?,
-            (1, 1) => {}
+            (1 | 2, 1) => {}
             _ => return Err("incompatible local source state schema".into()),
+        }
+        if version < 2 {
+            tx.execute_batch(
+                "CREATE TABLE source_root_usage (root BLOB PRIMARY KEY, receipt BLOB NOT NULL)
+                 STRICT, WITHOUT ROWID;
+                 PRAGMA main.user_version = 2;",
+            )?;
         }
         tx.commit()?;
         Ok(Self { project, db, limits })
@@ -125,43 +134,43 @@ impl SqliteSourceState {
     pub fn stage(&mut self, target: &str) -> Result<SourceStage> {
         let before = self.selection(target)?;
         if before.pending.is_some() { return Err("an exact source upload is already pending".into()); }
-        let mut previous = before.selected
-            .map(|root| self.load(target, root)).transpose()?;
-        if let Some(previous) = previous.as_mut() {
-            let staged = previous.stage_refresh(&self.project, Some(target))?;
-            let (parsed, reused) = staged.observation_counts();
-            let update = staged.submission();
-            self.record(target, before, update.root, update.added, parsed, reused)
+        if let Some(root) = before.selected {
+            let observation = self.observe_again(target, root)?;
+            self.record(target, before, observation)
         } else {
             let initial = RetainedSources::observe(&self.project, Some(target), self.limits)?;
-            let source = initial.selected();
-            self.record(target, before, source.root, Some(&source.delta), source.parsed, source.reused)
+            let usage_to_record = Some(initial.usage());
+            self.record(target, before, Observation {
+                source: initial.into_prepared(), usage_to_record, storage_reads: 0,
+            })
         }
     }
 
-    fn record(
-        &mut self, target: &str, prior: SourceSelection, root: NodeId, added: Option<&Delta>,
-        parsed: usize, reused: usize,
-    ) -> Result<SourceStage> {
-        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if read_selection(&tx, target)? != prior {
-            return Err("local source selection advanced during observation".into());
-        }
+    fn record(&mut self, target: &str, prior: SourceSelection, observation: Observation) -> Result<SourceStage> {
+        let Observation {
+            source: PreparedSources { root, delta, parsed, reused }, usage_to_record, storage_reads,
+        } = observation;
         let pending = if prior.selected != Some(root) {
             let generation = prior.generation.checked_add(1).ok_or("local source generation exhausted")?;
             Some(SourceAttempt::new(root, generation))
         } else { None };
+        let behavior = if pending.is_some() || usage_to_record.is_some() {
+            TransactionBehavior::Immediate
+        } else { TransactionBehavior::Deferred };
+        let tx = self.db.transaction_with_behavior(behavior)?;
+        if read_selection(&tx, target)? != prior {
+            return Err("local source selection advanced during observation".into());
+        }
         let (mut new_nodes, mut new_bytes) = (0, 0);
         if let Some(attempt) = pending {
-            if let Some(delta) = added {
-                let mut insert = tx.prepare(
-                    "INSERT INTO cst.nodes (digest, payload) VALUES (?1, ?2) ON CONFLICT(digest) DO NOTHING",
-                )?;
-                for (id, bytes) in &delta.nodes {
-                    if insert.execute(params![id.0, bytes])? == 1 {
-                        new_nodes += 1;
-                        new_bytes += bytes.len();
-                    }
+            let mut insert = tx.prepare(
+                "INSERT INTO cst.nodes (digest, payload) VALUES (?1, ?2) ON CONFLICT(digest) DO NOTHING",
+            )?;
+            let mut equal = tx.prepare("SELECT payload = ?2 FROM cst.nodes WHERE digest = ?1")?;
+            for (id, bytes) in delta.nodes {
+                if insert_exact(&mut insert, &mut equal, id, &bytes, "stored CST bytes differ from admitted source")? {
+                    new_nodes += 1;
+                    new_bytes += bytes.len();
                 }
             }
             tx.execute(
@@ -170,8 +179,17 @@ impl SqliteSourceState {
                 params![target, attempt.root.0, attempt.generation],
             )?;
         }
+        if let Some(usage) = usage_to_record {
+            let mut insert = tx.prepare(
+                "INSERT INTO source_root_usage (root, receipt) VALUES (?1, ?2)
+                 ON CONFLICT(root) DO NOTHING",
+            )?;
+            let mut equal = tx.prepare("SELECT receipt = ?2 FROM source_root_usage WHERE root = ?1")?;
+            insert_exact(&mut insert, &mut equal, root, &usage_receipt(root, usage)?,
+                "stored source observation receipt differs from admitted source")?;
+        }
         tx.commit()?;
-        Ok(SourceStage { root, parsed, reused, new_nodes, new_bytes, pending })
+        Ok(SourceStage { root, parsed, reused, new_nodes, new_bytes, storage_reads, pending })
     }
 
     /// A complete resubmission for a reopened client and an empty or reopened
@@ -182,9 +200,12 @@ impl SqliteSourceState {
             ReplaySource::Selected => (state.selected, None),
             ReplaySource::Pending => (state.pending.map(SourceAttempt::root), state.pending),
         };
-        root.map(|root| self.read_immutable(target, root).map(|saved| SourceReplay {
-            source: saved.source, usage: saved.usage, attempt,
-        })).transpose()
+        root.map(|root| {
+            let mut read = StoredNodes::new(&self.db)?;
+            self.header(&mut read, target, root)?;
+            let (delta, usage) = read.closure(root, self.limits)?;
+            Ok(SourceReplay { source: PreparedSources { root, delta, parsed: 0, reused: 0 }, usage, attempt })
+        }).transpose()
     }
 
     /// The caller passes the exact root acknowledged by the source store, not
@@ -206,20 +227,10 @@ impl SqliteSourceState {
         )? == 1)
     }
 
-    fn read_immutable(&self, target: &str, root: NodeId) -> Result<SavedGeneration> {
-        let mut nodes = Delta::default();
-        let mut get = self.db.prepare("SELECT payload FROM cst.nodes WHERE digest = ?1")?;
-        let closure = trace_reachable::<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>(
-            root, self.limits, |id| {
-                let bytes: Vec<u8> = get.query_row([id.0], |row| row.get(0)).optional()?
-                    .ok_or("persisted source generation is not closed")?;
-                if Node::id(&bytes) != id { return Err("persisted source node hash mismatch".into()); }
-                Ok(bytes)
-            }, |id, bytes| { nodes.nodes.insert(id, bytes); },
-        )?;
-        let top = decode_node(&nodes, root)?;
+    fn header(&self, read: &mut StoredNodes<'_>, target: &str, root: NodeId) -> Result<(SourceConfig, Vec<NodeId>)> {
+        let top = read.record(root)?;
         let parts = source_preparation_parts(&top).ok_or("unsupported persisted source schema")?;
-        let config = decode_node(&nodes, parts.config)?;
+        let config = read.record(parts.config)?;
         if config.kind != Kind::Config { return Err("expected persisted source configuration".into()); }
         let config: SourceConfig = serde_json::from_slice(&config.data)?;
         if config.target != target || top.data != config.schema()
@@ -230,18 +241,18 @@ impl SqliteSourceState {
         {
             return Err("persisted source does not match this project, target, or parser".into());
         }
-        Ok(SavedGeneration {
-            source: PreparedSources { root, delta: nodes, parsed: 0, reused: 0 },
-            usage: closure.usage(), config, files: parts.files.to_vec(),
-        })
+        Ok((config, parts.files.to_vec()))
     }
 
-    fn load(&self, target: &str, root: NodeId) -> Result<RetainedSources> {
-        let SavedGeneration { source, usage, config, files: entries } = self.read_immutable(target, root)?;
+    fn observe_again(&self, target: &str, root: NodeId) -> Result<Observation> {
+        let mut read = StoredNodes::new(&self.db)?;
+        let (config, entries) = self.header(&mut read, target, root)?;
+        let budget = load_usage(&self.db, root)?;
+        if let Some(usage) = budget { usage.admit(self.limits)?; }
         let parser = config.parser.id();
         let mut files = Files::new();
         for id in entries {
-            let file = FileEntry::from_node(id, decode_node(&source.delta, id)?)?;
+            let file = FileEntry::from_node(id, read.record(id)?)?;
             if file.metadata.policy != parser
                 || files.insert(FileKey::from(&file.metadata.source), file).is_some()
             {
@@ -249,13 +260,104 @@ impl SqliteSourceState {
             }
         }
         if !files.contains_key(&config.entry) { return Err("persisted entry file is missing".into()); }
-        Ok(RetainedSources::from_persisted(source, files, usage, self.limits))
+        let (mut source, _) = prepare_with_files(&self.project, Some(target), Some(&files))?;
+        // An unchanged observation only compares the selected root. An
+        // attempt to use or publish canonical bytes must still visit the
+        // complete hash-checked closure, regardless of this budget receipt.
+        let usage_to_record = if source.root != root {
+            let (base, _) = read.closure(root, self.limits)?;
+            Some(sparse_delta(&mut source, &base, self.limits)?.usage())
+        } else if budget.is_none() {
+            // A v1 database has no recorded usage. Validate once before
+            // storing a receipt rather than assuming the earlier limits.
+            Some(read.closure(root, self.limits)?.1)
+        } else { None };
+        Ok(Observation { source, usage_to_record, storage_reads: read.count })
     }
 }
 
-fn decode_node(delta: &Delta, id: NodeId) -> Result<Node> {
-    delta.nodes.get(&id).and_then(|bytes| Node::decode(bytes))
-        .ok_or_else(|| "invalid persisted source record".into())
+/// A deduplication hit must be byte-identical. It can belong to a historical
+/// root outside the currently validated base closure.
+fn insert_exact(
+    insert: &mut Statement<'_>, equal: &mut Statement<'_>, id: NodeId, bytes: &[u8], mismatch: &'static str,
+) -> Result<bool> {
+    if insert.execute(params![id.0, bytes])? == 1 { return Ok(true); }
+    if !equal.query_row(params![id.0, bytes], |row| row.get::<_, bool>(0))? {
+        return Err(mismatch.into());
+    }
+    Ok(false)
+}
+
+struct StoredNodes<'a> {
+    query: Statement<'a>,
+    checked: Delta,
+    count: usize,
+}
+
+impl<'a> StoredNodes<'a> {
+    fn new(db: &'a Connection) -> Result<Self> {
+        Ok(Self { query: db.prepare("SELECT payload FROM cst.nodes WHERE digest = ?1")?, checked: Delta::default(), count: 0 })
+    }
+
+    fn fetch(&mut self, id: NodeId) -> Result<Vec<u8>> {
+        self.count += 1;
+        let bytes: Vec<u8> = self.query.query_row([id.0], |row| row.get(0)).optional()?
+            .ok_or("persisted source generation is not closed")?;
+        if Node::id(&bytes) != id { return Err("persisted source node hash mismatch".into()); }
+        Ok(bytes)
+    }
+
+    fn record(&mut self, id: NodeId) -> Result<Node> {
+        let decode = |bytes: &[u8]| Node::decode(bytes).ok_or("invalid persisted source record");
+        if let Some(bytes) = self.checked.nodes.get(&id) {
+            return Ok(decode(bytes)?);
+        }
+        let bytes = self.fetch(id)?;
+        let record = decode(&bytes)?;
+        self.checked.nodes.insert(id, bytes);
+        Ok(record)
+    }
+
+    fn closure(&mut self, root: NodeId, limits: ClientSourceLimits) -> Result<(Delta, ClientSourceUsage)> {
+        let mut nodes = Delta::default();
+        let closure = trace_reachable(root, limits, |id| {
+            match self.checked.nodes.remove(&id) {
+                Some(bytes) => Ok(bytes),
+                None => self.fetch(id),
+            }
+        }, |id, bytes| { nodes.nodes.insert(id, bytes); })?;
+        Ok((nodes, closure.usage()))
+    }
+}
+
+fn usage_digest(root: NodeId, counts: [u8; 16]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new_derive_key("wosy selected source observation usage v1");
+    hash.update(&root.0);
+    hash.update(&counts);
+    *hash.finalize().as_bytes()
+}
+
+fn usage_receipt(root: NodeId, usage: ClientSourceUsage) -> Result<[u8; 48]> {
+    let mut counts = [0; 16];
+    counts[..8].copy_from_slice(&u64::try_from(usage.nodes)?.to_be_bytes());
+    counts[8..].copy_from_slice(&u64::try_from(usage.encoded_bytes)?.to_be_bytes());
+    let mut receipt = [0; 48];
+    receipt[..16].copy_from_slice(&counts);
+    receipt[16..].copy_from_slice(&usage_digest(root, counts));
+    Ok(receipt)
+}
+
+fn load_usage(db: &Connection, root: NodeId) -> Result<Option<ClientSourceUsage>> {
+    let receipt: Option<[u8; 48]> = db.query_row(
+        "SELECT receipt FROM source_root_usage WHERE root = ?1", [root.0], |row| row.get(0),
+    ).optional()?;
+    let Some(receipt) = receipt else { return Ok(None); };
+    let counts: [u8; 16] = receipt[..16].try_into()?;
+    if usage_digest(root, counts) != receipt[16..] { return Err("invalid source observation usage receipt".into()); }
+    let nodes = usize::try_from(u64::from_be_bytes(counts[..8].try_into()?))?;
+    let encoded_bytes = usize::try_from(u64::from_be_bytes(counts[8..].try_into()?))?;
+    if nodes == 0 || encoded_bytes == 0 { return Err("invalid source observation usage receipt".into()); }
+    Ok(Some(ClientSourceUsage { nodes, encoded_bytes }))
 }
 
 fn read_selection(sql: &Connection, target: &str) -> Result<SourceSelection> {

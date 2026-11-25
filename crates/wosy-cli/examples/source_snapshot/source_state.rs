@@ -14,16 +14,22 @@ pub(super) async fn run(
     let target = args.next().ok_or("expected fixture target")?;
     let mode = args.next().ok_or("expected local source action")?;
     let start = Instant::now();
-    let limits = ClientSourceLimits { nodes: 25_000, encoded_bytes: 16 << 20 };
+    let limits = if mode == "stage-limited" {
+        ClientSourceLimits {
+            nodes: args.next().ok_or("expected fixture node limit")?.parse()?,
+            encoded_bytes: args.next().ok_or("expected fixture byte limit")?.parse()?,
+        }
+    } else { ClientSourceLimits { nodes: 25_000, encoded_bytes: 16 << 20 } };
     let mut client = SqliteSourceState::open(project, limits)?;
     let open_ms = milliseconds(start);
     let start = Instant::now();
     let output = match mode.as_str() {
-        "stage" => {
+        "stage" | "stage-limited" => {
             let stage = client.stage(&target)?;
             serde_json::json!({
                 "root": stage.root.hex(), "parsed": stage.parsed, "reused": stage.reused,
                 "new_nodes": stage.new_nodes, "new_bytes": stage.new_bytes,
+                "storage_reads": stage.storage_reads,
                 "attempt": stage.pending.map(SourceAttempt::generation),
                 "stage_ms": milliseconds(start),
             })

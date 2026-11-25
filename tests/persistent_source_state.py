@@ -49,7 +49,8 @@ with tempfile.TemporaryDirectory() as directory:
     lib = root / "stdlib/src"
     source.mkdir(parents=True)
     lib.mkdir(parents=True)
-    (root / "wosy.toml").write_text(standard + "\n" + second)
+    active_manifest = standard + "\n" + second
+    (root / "wosy.toml").write_text(active_manifest)
     (lib.parent / "wosy.toml").write_text('[package]\nname="std"\nsource_root="src"\n')
     leaves = 24
     for i in range(leaves):
@@ -80,6 +81,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert initial["selected"] is None and initial_root == initial["result"]["root"]
     assert initial["result"]["parsed"] == leaves + 2 and initial["result"]["reused"] == 0
     assert initial["result"]["new_nodes"] > 5000 and initial["result"]["new_bytes"] > 500_000
+    assert initial["result"]["storage_reads"] == 0
     assert db.stat().st_dev == nodes.stat().st_dev
     assert db.read_bytes()[:16] == nodes.read_bytes()[:16] == b"SQLite format 3\x00"
     invoke(root, primary, "app", "stage", failure="already pending")
@@ -104,6 +106,36 @@ with tempfile.TemporaryDirectory() as directory:
     assert warm["result"]["parsed"] == 0 and warm["result"]["reused"] == leaves + 2
     assert warm["selected"] == initial_root and warm["result"]["attempt"] is None
     assert warm["result"]["new_nodes"] == warm["result"]["new_bytes"] == 0 and inventory() == prior_count
+    assert warm["result"]["storage_reads"] == leaves + 4
+
+    # The fast observation path still enforces both of the current caller's
+    # limits. A missing/malformed receipt cannot turn into valid budget data.
+    args = (str(prior_count[0]), str(prior_count[1]))
+    exact = invoke(root, primary, "app", "stage-limited", *args)
+    assert exact["result"]["root"] == initial_root and exact["result"]["storage_reads"] == leaves + 4
+    nodes_low, bytes_low = prior_count[0] - 1, prior_count[1] - 1
+    invoke(root, primary, "app", "stage-limited", str(nodes_low), args[1],
+           failure=f"LimitExceeded {{ field: Nodes, limit: {nodes_low} }}")
+    invoke(root, primary, "app", "stage-limited", args[0], str(bytes_low),
+           failure=f"LimitExceeded {{ field: EncodedBytes, limit: {bytes_low} }}")
+    with sqlite3.connect(db) as client_db:
+        (receipt,) = client_db.execute("SELECT receipt FROM source_root_usage WHERE root = ?",
+                                      (bytes.fromhex(initial_root),)).fetchone()
+        client_db.execute("UPDATE source_root_usage SET receipt = ? WHERE root = ?",
+                          (bytes([receipt[0] ^ 1]) + receipt[1:], bytes.fromhex(initial_root)))
+    invoke(root, primary, "app", "stage", failure="invalid source observation usage receipt")
+    intact = invoke(root, primary, "app", "submit-selected", *suffix)
+    assert intact["selected"] == initial_root and intact["result"]["authored"] == original
+    # Reproduce the actual v1 schema on this owned SQLite pair, preserving
+    # the confirmed selection and every canonical CST row.
+    with sqlite3.connect(db) as client_db:
+        client_db.executescript("DROP TABLE source_root_usage; PRAGMA user_version=1;")
+    migrated = invoke(root, primary, "app", "stage")
+    assert migrated["selected"] == initial_root and migrated["pending"] is None
+    assert migrated["result"]["parsed"] == 0 and migrated["result"]["new_nodes"] == 0
+    assert migrated["result"]["storage_reads"] == prior_count[0] and inventory() == prior_count
+    migrated_warm = invoke(root, primary, "app", "stage")
+    assert migrated_warm["result"]["storage_reads"] == leaves + 4 and inventory() == prior_count
 
     # Same authored source, separate actual configured target and selection.
     other = invoke(root, primary, "second", "stage")
@@ -119,6 +151,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert changed["attempt"] == 2
     assert changed["selected"] == initial_root and changed_root != initial_root
     assert (changed["result"]["parsed"], changed["result"]["reused"]) == (1, leaves + 1)
+    assert changed["result"]["storage_reads"] == prior_count[0]
     assert 0 < changed["result"]["new_nodes"] < 100
     assert inventory() == tuple(a + b for a, b in zip(other_count, (
         changed["result"]["new_nodes"], changed["result"]["new_bytes"])))
@@ -168,18 +201,78 @@ with tempfile.TemporaryDirectory() as directory:
     assert not earlier_abandon["result"]["abandoned"] and earlier_abandon["attempt"] == restaged["attempt"]
     discard = invoke(root, replacement, "app", "abandon", abandoned_root, str(restaged["attempt"]))
     assert discard["result"]["abandoned"] and discard["selected"] == changed_root and discard["pending"] is None
+
+    # Falling back to a historical canonical root still compares actual
+    # duplicate records. Its novel token is outside the selected base.
+    canceled_token = "# WHY: cancelado 🌱".encode()
+    with sqlite3.connect(nodes) as conn:
+        [(canceled_id, payload)] = conn.execute(
+            "SELECT digest, payload FROM nodes WHERE substr(payload, ?) = ?",
+            (-len(canceled_token), canceled_token),
+        ).fetchall()
+        conn.execute("UPDATE nodes SET payload = ? WHERE digest = ?", (payload + b"damaged", canceled_id))
+    damaged_count = inventory()
+    invoke(root, replacement, "app", "stage", failure="stored CST bytes differ from admitted source")
+    state = invoke(root, replacement, "app", "state")
+    assert state["selected"] == changed_root and state["pending"] is None and inventory() == damaged_count
+    with sqlite3.connect(nodes) as conn:
+        conn.execute("UPDATE nodes SET payload = ? WHERE digest = ?", (payload, canceled_id))
+    with sqlite3.connect(db) as client_db:
+        historical_key = bytes.fromhex(abandoned_root)
+        (historical_receipt,) = client_db.execute(
+            "SELECT receipt FROM source_root_usage WHERE root = ?", (historical_key,),
+        ).fetchone()
+        client_db.execute("UPDATE source_root_usage SET receipt = ? WHERE root = ?",
+                          (historical_receipt + b"damaged", historical_key))
+    invoke(root, replacement, "app", "stage", failure="stored source observation receipt differs from admitted source")
+    state = invoke(root, replacement, "app", "state")
+    assert state["selected"] == changed_root and state["pending"] is None
+    with sqlite3.connect(db) as client_db:
+        client_db.execute("UPDATE source_root_usage SET receipt = ? WHERE root = ?",
+                          (historical_receipt, historical_key))
+
     fresh = base / "fresh"
     selected = invoke(root, fresh, "app", "submit-selected", *suffix)
     assert selected["result"]["authored"] == editing and not selected["result"]["known"]
     assert not selected["result"]["confirmed"] and selected["selected"] == changed_root
     assert view.read_bytes() == b'{"ordinary_tool_view":"preserved"}\n'
 
+    # Same path, source bytes and profile, but changing the configured parser
+    # policy must choose new file identities and actually parse every file.
+    file.write_text(editing)
+    (root / "wosy.toml").write_text(active_manifest.replace('["WHY"]', '["WHY", "NOTE"]'))
+    policy = invoke(root, replacement, "app", "stage")
+    assert (policy["result"]["parsed"], policy["result"]["reused"]) == (leaves + 2, 0)
+    assert policy["pending"] not in (None, changed_root) and policy["selected"] == changed_root
+    invoke(root, replacement, "app", "abandon", policy["pending"], str(policy["attempt"]))
+    (root / "wosy.toml").write_text(active_manifest)
+
+    # Damage a descendant outside the verified observation metadata. A
+    # no-op observation is not a health attestation, but full replay and
+    # every new staged generation still reject corrupt base source bytes.
+    authored_token = "# WHY: edição 🚀".encode()
+    with sqlite3.connect(nodes) as conn:
+        [(token_id, token)] = conn.execute("SELECT digest, payload FROM nodes WHERE substr(payload, ?) = ?",
+                                          (-len(authored_token), authored_token)).fetchall()
+        conn.execute("UPDATE nodes SET payload = ? WHERE digest = ?", (token + b"damaged", token_id))
+    observer = invoke(root, replacement, "app", "stage")
+    assert observer["result"]["storage_reads"] == leaves + 4
+    assert observer["selected"] == changed_root and observer["pending"] is None
+    no_store = base / "no-store"
+    invoke(root, no_store, "app", "submit-selected", *suffix, failure="persisted source node hash mismatch")
+    assert not no_store.exists()
+    file.write_text(original)
+    invoke(root, replacement, "app", "stage", failure="persisted source node hash mismatch")
+    state = invoke(root, replacement, "app", "state")
+    assert state["selected"] == changed_root and state["pending"] is None
+    with sqlite3.connect(nodes) as conn:
+        conn.execute("UPDATE nodes SET payload = ? WHERE digest = ?", (token, token_id))
+
     # Model bad local disk bytes in this owned disposable fixture only; they
     # must not silently act as old parser state or get sent to a fresh store.
     with sqlite3.connect(nodes) as conn:
         (old,) = conn.execute("SELECT payload FROM nodes WHERE digest = ?", (bytes.fromhex(changed_root),)).fetchone()
         conn.execute("UPDATE nodes SET payload = ? WHERE digest = ?", (old + b"damaged", bytes.fromhex(changed_root)))
-    no_store = base / "no-store"
     invoke(root, no_store, "app", "submit-selected", *suffix, failure="persisted source node hash mismatch")
     assert not no_store.exists()
     invoke(root, replacement, "app", "stage", failure="persisted source node hash mismatch")
@@ -209,6 +302,10 @@ with tempfile.TemporaryDirectory() as directory:
         "client_sqlite_bytes": db.stat().st_size, "cst_sqlite_bytes": nodes.stat().st_size,
         "initial_nodes": initial["result"]["new_nodes"], "initial_node_bytes": initial["result"]["new_bytes"],
         "cold_stage_ms": round(initial["result"]["stage_ms"], 3), "warm_stage_ms": round(warm["result"]["stage_ms"], 3),
+        "warm_cst_reads": warm["result"]["storage_reads"], "migration_cst_reads": migrated["result"]["storage_reads"],
+        "migration_open_ms": round(migrated["open_ms"], 3),
+        "migration_stage_ms": round(migrated["result"]["stage_ms"], 3),
+        "post_migration_warm_stage_ms": round(migrated_warm["result"]["stage_ms"], 3),
         "edit_stage_ms": round(changed["result"]["stage_ms"], 3), "edit_new_nodes": changed["result"]["new_nodes"],
         "edit_new_bytes": changed["result"]["new_bytes"], "replay_ms": round(result["replay_ms"], 3),
         "restore_store_ms": round(result["publish_ms"], 3), "restore_process_ms": round(recovered["wall_ms"], 3),
