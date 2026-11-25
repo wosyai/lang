@@ -5036,6 +5036,7 @@ pub struct MainFlowProofDiagnostic {
     pub goal: wosy_syntax::SourceSpan,
     pub failed_step: Option<wosy_syntax::SourceSpan>,
     pub entry_dependent_witness: bool,
+    pub quantified_witness: Option<(String, BigInt)>,
     pub invocation: Rc<MainFlowProofInvocation>,
 }
 
@@ -5068,6 +5069,7 @@ pub struct SymbolicProofDiagnostic {
     pub directive_position: usize,
     pub witness: ScalarCheckerIntegerWitness,
     pub ieee_entry: Option<ScalarCheckerIeeeEntry>,
+    pub quantified_witness: Option<(String, BigInt)>,
     pub returned: BigInt,
     pub returned_literal: Option<ScalarCheckerProofLiteral>,
     pub result_slot: Option<usize>,
@@ -5493,6 +5495,7 @@ impl SelectedSymbolicProof<'_, '_> {
         let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
         let mut hidden = false;
         let mut diagnostic = SymbolicProofDiagnostic {
+            quantified_witness: proof.bound.quantified_witness().cloned(),
             proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failed_step.map(proof_span),
             callable: callable_span(function.name_span), output: callable_span(failure.output), other_output: None,
             directive_position: position,
@@ -5567,6 +5570,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 }
             };
             self.publish_failure(SymbolicProofDiagnostic {
+                quantified_witness: None,
                 proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failure.step.map(proof_span),
                 callable: callable_span(function.name_span), output: callable_span(output), other_output,
                 directive_position: effects.records.len(),
@@ -6309,7 +6313,7 @@ impl SelectedSymbolicProof<'_, '_> {
         }
         if group.quantified_return {
             let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
-            let MainFlowProofBound::Quantified { claim: goal, failed_step } = first.bound else { return Err(ProjectCheck::Unsupported); };
+            let MainFlowProofBound::Quantified { claim: goal, failed_step, .. } = first.bound else { return Err(ProjectCheck::Unsupported); };
             if !rest.is_empty() || first.proof_source != source || first.owner != source {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -6765,7 +6769,10 @@ impl ShowEqualityIndex {
 
 #[cfg(feature = "internal-checker")]
 enum MainFlowProofBound<'a> {
-    Quantified { claim: super::checker_flow::QuantifiedIntegerReturn<'a>, failed_step: Option<ByteSpan> },
+    Quantified {
+        claim: super::checker_flow::QuantifiedIntegerReturn<'a>, failed_step: Option<ByteSpan>,
+        original_witness: Option<&'a (String, BigInt)>,
+    },
     ResultPair(&'a super::checker_flow::ResultPairProof),
     Literal(&'a BigInt),
     Entry(usize),
@@ -6774,6 +6781,13 @@ enum MainFlowProofBound<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofBound<'a> {
+    fn quantified_witness(&self) -> Option<&'a (String, BigInt)> {
+        match self {
+            Self::Quantified { original_witness, .. } => *original_witness,
+            _ => None,
+        }
+    }
+
     fn literal(&self) -> Option<&'a BigInt> {
         match self {
             Self::Literal(value) => Some(value),
@@ -6983,12 +6997,13 @@ impl<'a> MainFlowProofCase<'a> {
                 ConjunctiveWitness::Formal(_) => return Err(ProjectCheck::Unsupported),
             },
             TypedProofGoal::DependentWitness(goal) => Some((match goal {
-                DependentWitness::Unavailable | DependentWitness::OutsideDomain => Quantified::Impossible,
+                DependentWitness::Vacuous => Quantified::Vacuous,
+                DependentWitness::Unavailable | DependentWitness::OutsideDomain(_) => Quantified::Impossible,
                 DependentWitness::Comparison(relation, bound) => Quantified::Comparison(None, *relation, bound),
                 DependentWitness::Avoiding(excluded) => Quantified::Avoiding(None, excluded),
                 DependentWitness::Output(bounds) => Quantified::Output(bounds),
                 DependentWitness::OutputAvoiding(both) => Quantified::Avoiding(Some(&both.0), &both.1),
-            }, Some(matches!(goal, DependentWitness::OutsideDomain)))),
+            }, Some(matches!(goal, DependentWitness::OutsideDomain(_))))),
             _ => None,
         };
         if let Some((goal_claim, witness)) = quantified {
@@ -7012,10 +7027,14 @@ impl<'a> MainFlowProofCase<'a> {
                 if !plan.has_no_authored_steps() { return Err(ProjectCheck::Unsupported); }
                 (goal_claim, child(&ensures, SyntaxKind::Expression)?, None)
             };
+            let original_witness = match &plan.typed.goal {
+                TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(witness)) => Some(witness),
+                _ => None,
+            };
             return Ok((Self {
                 proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
                 goal: wosy_syntax::byte_span(&goal), guard, filter, relation: None,
-                bound: MainFlowProofBound::Quantified { claim, failed_step }, qualified_leaf, literal_leaf: None,
+                bound: MainFlowProofBound::Quantified { claim, failed_step, original_witness }, qualified_leaf, literal_leaf: None,
             }, None));
         }
         if let TypedProofGoal::ResultPair(pair) = &plan.typed.goal {
@@ -7710,6 +7729,7 @@ fn make_main_flow_proof_failure(
         goal: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.goal },
         failed_step: failed_step.map(|range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range }),
         entry_dependent_witness: matches!(proof.bound, MainFlowProofBound::Quantified { claim, .. } if claim.uses_entry()),
+        quantified_witness: proof.bound.quantified_witness().cloned(),
         invocation,
     }
 }
@@ -7821,7 +7841,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         continue;
                     }
                     self.active = true;
-                    if let MainFlowProofBound::Quantified { claim, failed_step } = proof.bound {
+                    if let MainFlowProofBound::Quantified { claim, failed_step, .. } = proof.bound {
                         let Some(failure) = claim.rejected_at_call(value, arguments, &mut self.named_exact_work) else {
                             self.incomplete = true;
                             return;
@@ -8348,6 +8368,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                     }
                 };
                 self.failure = Some(SymbolicProofDiagnostic {
+                    quantified_witness: None,
                     proof: proof_span(wosy_syntax::byte_span(self.plan.proof)),
                     goal: proof_span(goal), failed_step,
                     callable: callable_span(function.name_span),
@@ -11004,7 +11025,8 @@ impl SelectedProofObserver<'_> {
                             bounds.0.holds_value(value) && !bounds.1.covers_closed(value, value),
                     }),
                     TypedProofGoal::DependentWitness(witness) => match witness {
-                        DependentWitness::Unavailable | DependentWitness::OutsideDomain => None,
+                        DependentWitness::Vacuous => Some(true),
+                        DependentWitness::Unavailable | DependentWitness::OutsideDomain(_) => None,
                         DependentWitness::Comparison(relation, bound) => relation.accepts(value.cmp(bound)).then_some(true),
                         DependentWitness::Avoiding(domain) => (!domain.covers_closed(value, value)).then_some(true),
                         DependentWitness::Output(output) => output.holds_value(value).then_some(true),
@@ -11226,8 +11248,9 @@ enum UniversalConjunction {
 
 #[cfg(feature = "internal-checker")]
 enum DependentWitness {
+    Vacuous,
     Unavailable,
-    OutsideDomain,
+    OutsideDomain((String, BigInt)),
     Comparison(IntegerRelation, BigInt),
     Avoiding(IntegerSet),
     Output(Box<IntegerShowConstraints<'static>>),
@@ -11278,7 +11301,8 @@ impl TypedProofGoal {
             Self::Disjunction(allowed) => path.output_within(allowed),
             Self::UniversalNotEqual(domain) => path.output_disjoint_from(domain),
             Self::DependentWitness(witness) => match witness {
-                DependentWitness::Unavailable | DependentWitness::OutsideDomain => None,
+                DependentWitness::Vacuous => Some(true),
+                DependentWitness::Unavailable | DependentWitness::OutsideDomain(_) => None,
                 DependentWitness::Comparison(relation, bound) => path.output_satisfies(*relation, bound)?.then_some(true),
                 DependentWitness::Avoiding(domain) => path.output_disjoint_from(domain)?.then_some(true),
                 DependentWitness::Output(output) => path.output_satisfies_constraints(output)?.then_some(true),
@@ -11459,7 +11483,9 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
         };
         let ScalarExpression::Name { name, .. } = witness_source else { return Err(ProjectCheck::Unsupported); };
         let chosen = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
-        Some((exists, existential, chosen, translated))
+        let shift = translated.map(|argument| checked_quantified_witness_offset(argument, name, ty))
+            .transpose()?.flatten();
+        Some((exists, existential, chosen, shift))
     } else {
         None
     };
@@ -11502,8 +11528,10 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
         Ok::<_, ProjectCheck>((chosen, domain, translation))
     }).transpose()?;
     let mut unavailable = false;
+    let mut vacuous = false;
+    let mut overflow = false;
     let mut impossible = false;
-    let mut outside_domain = false;
+    let mut outside_domain = None;
     let mut forbidden = OwnedIntegerUnion::default();
     let charge_translated_union = admission.as_ref().is_some_and(|(_, _, translation)| translation.is_some());
     let mut exclusion_intervals = 0usize;
@@ -11541,23 +11569,29 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     for (slot, ((forall, binder), relation)) in declarations.into_iter().zip(relations).enumerate() {
         let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
         let admission = admission.as_ref().filter(|(chosen, _, _)| slot == *chosen);
-        let translation = admission.and_then(|(_, _, translation)| *translation);
-        if domain.is_empty() || (relation.is_none() && translation.is_none()) {
-            unavailable = true;
-            continue;
-        }
-        let image = if let Some(argument) = translation {
-            let (image, shift) = checked_quantified_witness_translation(argument, &binder, &domain, ty, &mut work)?;
-            let (Cow::Owned(image), Some(_)) = (image, shift) else { return Err(ProjectCheck::Unsupported); };
+        let translation = admission.and_then(|(_, _, shift)| shift.as_ref());
+        if relation.is_none() && translation.is_none() { unavailable = true; }
+        if domain.is_empty() { vacuous = true; }
+        if unavailable || vacuous { continue; }
+        let image = if let Some(shift) = translation {
+            let Some(image) = checked_quantified_witness_image(&domain, shift, ty, &mut work)? else {
+                // A well-typed shift need not execute if a later independent
+                // coordinate closes the entire quantified product.
+                overflow = true;
+                continue;
+            };
             let (_, existential, _) = admission.ok_or(ProjectCheck::Unsupported)?;
             let cost = image.interval_count().checked_add(existential.interval_count()).ok_or(ProjectCheck::Unsupported)?;
             super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
             Some(image)
         } else { None };
         if let Some((_, existential, _)) = admission {
-            outside_domain |= !image.as_ref().unwrap_or(&domain).is_subset_of(existential);
+            if let Some(missing) = image.as_ref().unwrap_or(&domain).first_uncovered_from(existential) {
+                let original = if let Some(shift) = translation { missing - shift } else { missing };
+                outside_domain = Some((binder, original));
+            }
         }
-        if unavailable || impossible || outside_domain { continue; }
+        if unavailable || impossible || outside_domain.is_some() { continue; }
         // The same original assignment supplies x and x±k, but universal
         // conjunction distributes over these distinct pointwise predicates.
         // Their rows must not be intersected as if the coordinates were equal.
@@ -11571,8 +11605,16 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     if unavailable {
         return Err(ProjectCheck::Unsupported);
     }
-    if outside_domain {
-        return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain));
+    if vacuous {
+        return Ok(if DEPENDENT {
+            TypedProofGoal::DependentWitness(DependentWitness::Vacuous)
+        } else {
+            TypedProofGoal::UniversalConjunction(UniversalConjunction::Vacuous)
+        });
+    }
+    if overflow { return Err(ProjectCheck::Unsupported); }
+    if let Some(original) = outside_domain {
+        return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(original)));
     }
     if impossible {
         return Ok(if DEPENDENT {
@@ -11739,12 +11781,9 @@ fn typed_existential_conjuncts(
 #[cfg(feature = "internal-checker")]
 fn dependent_witness_conjunction(
     relation: IntegerRelation, mut output: IntegerShowConstraints<'static>,
-    universal: IntegerSet, existential: &IntegerSet,
+    universal: IntegerSet,
 ) -> Result<DependentWitness, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
-    if !universal.is_subset_of(existential) {
-        return Ok(DependentWitness::OutsideDomain);
-    }
     let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
         (true, false, _) => true,
         (false, true, _) => false,
@@ -11763,30 +11802,45 @@ fn dependent_witness_conjunction(
 }
 
 #[cfg(feature = "internal-checker")]
-fn checked_quantified_witness_translation<'a>(
-    argument: &ScalarExpression, universal: &str, domain: &'a IntegerSet, ty: &ScalarType, work: &mut usize,
-) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
+fn checked_quantified_witness_offset(
+    argument: &ScalarExpression, universal: &str, ty: &ScalarType,
+) -> Result<Option<BigInt>, ProjectCheck> {
     let universal_name = |expression: &ScalarExpression|
         matches!(expression, ScalarExpression::Name { name, .. } if name == universal);
-    if universal_name(argument) {
-        return Ok((Cow::Borrowed(domain), None));
-    }
+    if universal_name(argument) { return Ok(None); }
     let ScalarExpression::Binary { operator, left, right, .. } = argument else { return Err(ProjectCheck::Unsupported); };
     if !universal_name(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
         return Err(ProjectCheck::Unsupported);
     }
     let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
     if !integer_literal_fits_type(&literal, ty) { return Err(ProjectCheck::Unsupported); }
-    let shift = if *operator == BinaryOperator::Subtract { -literal } else { literal };
-    // Monotonicity and both typed endpoints prove no overflow for every
-    // admitted original value, without enumerating even a full-width set.
+    Ok(Some(if *operator == BinaryOperator::Subtract { -literal } else { literal }))
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_quantified_witness_image(
+    domain: &IntegerSet, shift: &BigInt, ty: &ScalarType, work: &mut usize,
+) -> Result<Option<IntegerSet>, ProjectCheck> {
+    // Both endpoints authenticate type-width arithmetic on every admitted
+    // value; no evaluation is needed on an empty typed domain.
     if domain.extremes().is_some_and(|(min, max)|
-        !integer_literal_fits_type(&(min + &shift), ty) || !integer_literal_fits_type(&(max + &shift), ty))
+        !integer_literal_fits_type(&(min + shift), ty) || !integer_literal_fits_type(&(max + shift), ty))
     {
-        return Err(ProjectCheck::Unsupported);
+        return Ok(None);
     }
     super::checker_flow::charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
-    Ok((Cow::Owned(domain.affine_unit(false, &shift, false)), Some(shift)))
+    Ok(Some(domain.affine_unit(false, shift, false)))
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_quantified_witness_translation<'a>(
+    argument: &ScalarExpression, universal: &str, domain: &'a IntegerSet, ty: &ScalarType, work: &mut usize,
+) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
+    let Some(shift) = checked_quantified_witness_offset(argument, universal, ty)? else {
+        return Ok((Cow::Borrowed(domain), None));
+    };
+    let image = checked_quantified_witness_image(domain, &shift, ty, work)?.ok_or(ProjectCheck::Unsupported)?;
+    Ok((Cow::Owned(image), Some(shift)))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11799,25 +11853,30 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::InvalidProof);
     }
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
-    let witness_domains = || -> Result<(IntegerSet, IntegerSet), ProjectCheck> {
+    let witness_domain = || -> Result<Result<IntegerSet, (String, BigInt)>, ProjectCheck> {
         let argument = authored_witness_argument(steps)?;
         let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
         let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
-        if universal_domain.is_empty() { return Err(ProjectCheck::Unsupported); }
         let mut work = 0;
         let (image, shift) = checked_quantified_witness_translation(argument, &universal, &universal_domain, ty, &mut work)?;
         if shift.is_some() {
             let cost = image.interval_count().checked_add(existential_domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
             super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
         }
-        Ok((match image { Cow::Borrowed(_) => universal_domain, Cow::Owned(image) => image }, existential_domain))
+        if let Some(missing) = image.first_uncovered_from(&existential_domain) {
+            let original = if let Some(shift) = shift { missing - shift } else { missing };
+            return Ok(Err((universal.clone(), original)));
+        }
+        Ok(Ok(match image { Cow::Borrowed(_) => universal_domain, Cow::Owned(image) => image }))
     };
     if matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
         let (relation, output_bounds) = typed_existential_conjuncts(&predicate, &existential, output, inputs, ty)?;
-        let (image, existential_domain) = witness_domains()?;
-        return Ok(TypedProofGoal::DependentWitness(dependent_witness_conjunction(
-            relation, output_bounds, image, &existential_domain,
-        )?));
+        let image = match witness_domain()? {
+            Ok(image) => image,
+            Err(original) => return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(original))),
+        };
+        if image.is_empty() { return Ok(TypedProofGoal::DependentWitness(DependentWitness::Vacuous)); }
+        return Ok(TypedProofGoal::DependentWitness(dependent_witness_conjunction(relation, output_bounds, image)?));
     }
     let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
         return Err(ProjectCheck::Unsupported);
@@ -11828,9 +11887,12 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::Unsupported);
     }
     let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
-    let (image, existential_domain) = witness_domains()?;
-    let witness = if !image.is_subset_of(&existential_domain) {
-        DependentWitness::OutsideDomain
+    let image = match witness_domain()? {
+        Ok(image) => image,
+        Err(original) => return Ok(TypedProofGoal::DependentWitness(DependentWitness::OutsideDomain(original))),
+    };
+    let witness = if image.is_empty() {
+        DependentWitness::Vacuous
     } else if operator == BinaryOperator::Equal && image.singleton_value().is_none() {
         DependentWitness::Unavailable
     } else {
@@ -21457,6 +21519,56 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_quantifier_products_distinguish_vacuity_and_authored_admission() {
+        let source = r#"%%start
+            u8(u8) check = fn(value) { value };
+            proof witness for check(input) -> (out) where (input == 5)
+                forall (u8 seed where seed == 1 || seed == 3)
+                forall (u8 unrelated where unrelated == 0 || unrelated == 7)
+                ensures (exists (u8 picked where picked == 2 || picked == 4) {
+                    out > picked && out != unrelated
+                })
+                { core.witness(seed + 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 reached = check(5); %%end");
+        let without_second = |text: &str| text.replace("                forall (u8 unrelated where unrelated == 0 || unrelated == 7)
+", "")
+            .replace(" && out != unrelated", "");
+        let empty_seed = source.replace("seed == 1 || seed == 3", "seed == 1 && seed == 3")
+            .replace("picked == 2 || picked == 4", "picked == 2 && picked == 4");
+        let empty_companion = source.replace("seed == 1 || seed == 3", "seed == 255")
+            .replace("unrelated == 0 || unrelated == 7", "unrelated == 0 && unrelated == 7");
+        let empty_pure_universal = source.replace("unrelated == 0 || unrelated == 7", "unrelated == 0 && unrelated == 7")
+            .replace("exists (u8 picked where picked == 2 || picked == 4) {", "")
+            .replace("out > picked && out != unrelated", "out < seed && out != unrelated")
+            .replace("                })
+                { core.witness(seed + 1); }", "                ) {}");
+        for valid in [&without_second(&empty_seed), &empty_seed, &empty_companion, &empty_pure_universal] {
+            let symbolic = check_array_proof_cohort(valid, package).unwrap();
+            assert!(symbolic.active && symbolic.symbolic_diagnostic.is_none());
+            let reached = check_array_proof_cohort(&actual(valid), main).unwrap();
+            assert!(reached.active && reached.diagnostics.is_empty());
+        }
+        assert!(matches!(check_array_proof_cohort(&empty_companion.replace("seed + 1", "seed * 1"), package),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let sparse = source.replace("picked == 2 || picked == 4", "picked == 2");
+        let empty_exists = source.replace("picked == 2 || picked == 4", "picked == 2 && picked == 4");
+        for (text, point) in [(&sparse, 3), (&without_second(&sparse), 3), (&empty_exists, 1)] {
+            let symbolic = check_array_proof_cohort(text, package).unwrap().symbolic_diagnostic.unwrap();
+            assert_eq!(symbolic.quantified_witness, Some(("seed".into(), BigInt::from(point))));
+            assert!(symbolic.failed_step.is_some());
+            let reached = check_array_proof_cohort(&actual(text), main).unwrap();
+            let [failure] = reached.diagnostics.as_slice() else { panic!("one witness admission"); };
+            assert_eq!(failure.quantified_witness, Some(("seed".into(), BigInt::from(point))));
+            assert_eq!(failure.invocation.returned, BigInt::from(5));
+            assert!(failure.failed_step.is_some());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

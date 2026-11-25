@@ -1151,6 +1151,9 @@ fn check_command(
         } else if let Some(slot) = failure.invocation.result_slot {
             format!("call returned output {} = {value}", slot + 1)
         } else { format!("call returned {value}") }];
+        if let Some((name, value)) = &failure.quantified_witness {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
         if (failure.entry_dependent_witness || failure.invocation.outer_call.is_some()
             || failure.invocation.result_slot.is_some() || failure.invocation.returned_pair.is_some()
             || matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_))))
@@ -1209,6 +1212,9 @@ fn check_command(
         } else if let Some(slot) = failure.result_slot {
             format!("symbolic call can return output {} = {value}", slot + 1)
         } else { format!("symbolic call can return {value}") }];
+        if let Some((name, value)) = &failure.quantified_witness {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
         if let Some(ieee) = &failure.ieee_entry {
             let name = entry_binding_name(&ieee.binding.source, ieee.binding.range, publication.texts).unwrap_or("argument 1");
             use wosy_compiler::ScalarCheckerIeeeValue;

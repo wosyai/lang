@@ -579,6 +579,23 @@ impl IntegerSet {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn first_uncovered_from(&self, allowed: &Self) -> Option<BigInt> {
+        let mut enclosing = allowed.0.iter().peekable();
+        for range in &self.0 {
+            while enclosing.peek().is_some_and(|allowed| allowed.last < range.first) {
+                enclosing.next();
+            }
+            let Some(interval) = enclosing.peek().filter(|allowed| allowed.first <= range.first) else {
+                return Some(range.first.clone());
+            };
+            if interval.last < range.last {
+                return Some(&interval.last + 1u8);
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn is_disjoint(&self, other: &Self) -> bool {
         let (Some((first, last)), Some((other_first, other_last))) = (self.extremes(), other.extremes()) else {
             return true;
