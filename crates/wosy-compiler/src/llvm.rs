@@ -301,10 +301,14 @@ fn runtime_allocation_access<'ctx>(
     if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
         // This exact install updates pointer and returned extent together.
         if plan.replacement_index_observation.is_some() {
-            if let Some(crate::scalar::ClosedLiteralArray::Replacement { call, destination, .. }) = plan.literal_array {
-                if plan.array_descriptor_calls.contains(&call) {
-                    if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
-                        proved_extent_writes.insert(producer, binding);
+            if let Some(crate::scalar::ClosedLiteralArray::Replacement { call, destination, unit, .. }) = plan.literal_array {
+                for (call, destination) in std::iter::once((call, destination)).chain(
+                    unit.and_then(|unit| unit.other_writer).map(|writer| (writer.call, writer.destination)))
+                {
+                    if plan.array_descriptor_calls.contains(&call) {
+                        if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
+                            proved_extent_writes.insert(producer, binding);
+                        }
                     }
                 }
             }

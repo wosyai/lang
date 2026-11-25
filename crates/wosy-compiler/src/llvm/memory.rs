@@ -492,8 +492,9 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     || !is_loaded_from(base_pointer.into(), *slot)
                     || !runtime_extent.is_some_and(|length| is_loaded_from(length.into(), *length_slot))
                 {
-                    return Err("signed element offset differs from its checked selector or current owner pair".into());
+                    return Err("returned array index differs from its checked selector or current owner pair".into());
                 }
+                super::aggregate_transfer::authenticate_replacement_index_storage(state, *slot, *length_slot)?;
             }
             let signed_selector_maximum = runtime_offset.and_then(|receipt| match receipt.address {
                 crate::scalar::ReturnedArrayAddress::Signed(maximum) => Some(maximum),

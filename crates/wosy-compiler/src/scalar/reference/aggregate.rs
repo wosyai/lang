@@ -1857,16 +1857,24 @@ impl AggregateFlowFacts {
                     if call == *rhs_point && &target.binding == binding && target.projections.is_empty()
                         && active_write.is_some_and(|write|
                             write.rhs == *rhs_point && write.writer == point.id) => Replaced,
-                (Replaced | IndexSelector(_), CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. })
-                    if root && unit.is_none() && self.literal_array_index_output.is_some_and(|index|
+                (phase @ (Replaced | JoinedOriginal | JoinedFresh | JoinedOtherFresh | IndexSelector(_)),
+                    CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. })
+                    if root && self.literal_array_index_output.is_some_and(|index|
                         point.id < index.read
-                            && match state.literal_array_phase {
-                                Replaced => point.id == index.first,
+                            && match phase {
+                                Replaced => unit.is_none() && point.id == index.first,
+                                JoinedOriginal | JoinedFresh | JoinedOtherFresh =>
+                                    unit.is_some() && point.id == index.first,
                                 IndexSelector(expected) => point.id == expected,
                                 _ => false,
                             }
                             && point.successors.as_slice() == [CfgPointId(point.id.0 + 1)]) =>
-                    IndexSelector(CfgPointId(point.id.0 + 1)),
+                {
+                    // Complete outgoing coverage remains mandatory. A later
+                    // bad read/return still marks the entire route unknown.
+                    result.literal_array_join.observe_exit(phase);
+                    IndexSelector(CfgPointId(point.id.0 + 1))
+                }
                 (IndexSelector(expected), CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, .. },
                     pointer_point: None, candidates, reads_origin: false })
                     if point.id == expected && self.literal_array_index_output.is_some_and(|index| point.id == index.read)
@@ -1892,7 +1900,7 @@ impl AggregateFlowFacts {
                         (self.literal_array_write, self.scope_exits.get(&exit))
                     {
                         completed = Some(LiteralArrayRoute::Replacement { original: allocation,
-                            write, exit, block, unit: None });
+                            write, exit, block, unit });
                         Finished
                     } else {
                         Unknown
@@ -8044,7 +8052,7 @@ fn closed_aggregates<'a>(
                 })
             })().ok_or_else(|| format!("returned array index byte offset is not representable in {source:?}"))?;
             let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
-                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { unit: None, .. })))
+                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { .. })))
             else { return Err(format!("returned array index requires an exact replacement in {source:?}")); };
             plan.replacement_index_observation = Some(receipt);
         }
@@ -8060,8 +8068,9 @@ fn closed_aggregates<'a>(
         for &(key, body, _) in &returned_index_requirements {
             let source = body.source;
             if !result.bodies.get(&key).is_some_and(|plan|
-                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, .. })
-                    if plan.array_descriptor_calls.contains(&call)))
+                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, unit, .. })
+                    if plan.array_descriptor_calls.contains(&call) && unit.and_then(|unit| unit.other_writer)
+                        .is_none_or(|writer| plan.array_descriptor_calls.contains(&writer.call))))
             {
                 return Err(format!("returned array index requires a closed returned extent in {source:?}"));
             }

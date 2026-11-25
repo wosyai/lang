@@ -1803,8 +1803,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
         region: &ConditionalRegion,
     ) -> Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide, Option<ReferenceBindingId>)> {
         let calls = self.call_sites;
+        let root = &calls.structure.blocks[calls.structure.root.0];
+        let indexed_tail = || {
+            let [_, _, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] = root.items.as_slice()
+            else { return false; };
+            if output.output != 0 || !matches!(calls.boundary.root_outputs.as_slice(),
+                [output] if aggregate::ordinary_value(&output.ty)) { return false; }
+            let Some(OccurrenceNode::Place(place)) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(output.expression), OccurrenceEdge::ExpressionPlace,
+            )) else { return false; };
+            calls.structure.edges.contains_key(&(OccurrenceParent::Place(*place), OccurrenceEdge::PlaceIndex))
+        };
         if scope != ReferenceScopeId(0) || self.aggregate_facts.literal_array_bind.is_none()
-            || !calls.boundary.root_outputs.is_empty()
+            || (!calls.boundary.root_outputs.is_empty() && !indexed_tail())
             || (else_branch.is_some()
                 && !matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Unit)))
             || !matches!(calls.structure.blocks[calls.structure.root.0].items.get(1)
@@ -5999,10 +6010,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let returned_index_tail = scope == ReferenceScopeId(0)
                         && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
                         && matches!((region.items.as_slice(), block.items.as_slice()),
-                            ([_, BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
-                                BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
-                             [_, _, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
-                                if slot.output == 0 && matches!(place, ScalarPlace::Index { base, index, .. }
+                            ([_, item, BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
+                             [_, authored, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
+                                if slot.output == 0 && matches!((&item.kind, authored),
+                                    (BlockItemKind::Assignment { .. }, ScalarBlockItem::Assignment(_)) |
+                                    (BlockItemKind::Evaluation { .. }, ScalarBlockItem::Expression(
+                                        ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. })))
+                                    && matches!(place, ScalarPlace::Index { base, index, .. }
                                     if matches!(base.as_ref(), ScalarPlace::Name { .. })
                                         && Self::returned_array_index_selector_syntax(index)));
                     if binding.is_allocation
@@ -6178,7 +6192,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             self.proof_points.pending_returned_extent = Some(value_point);
                         }
                         if scope == ReferenceScopeId(0) && slot.output == 0
-                            && self.aggregate_facts.literal_array_unit.is_none()
                             && self.aggregate_facts.literal_array_write.is_some()
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
                             && matches!(expression, ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, index, .. }, .. }

@@ -17155,3 +17155,70 @@ fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
         }
     }
 }
+
+#[test]
+fn closed_runtime_replacement_indexes_actual_pair_after_all_writer_arms() {
+    let text = "%%start
+u16[](u64) fabricate = fn(count) { u16[count] fresh; fresh };
+u16(u64) retain_or_replace = fn(count) {
+    u16[2] cells;
+    if (count == 7) { cells = fabricate(count); };
+    cells[count ^ 1]
+};
+u16(u64) either_writer = fn(count) {
+    u16[2] cells;
+    if (count == 7) { cells = fabricate(count); } else { cells = fabricate(count); };
+    cells[count ^ 1]
+};
+if (retain_or_replace(0) != 9 || retain_or_replace(7) != 37
+    || either_writer(7) != 37 || either_writer(3) != 19) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+        let factory = project_function_name(&source, "fabricate");
+        for (name, writers) in [("retain_or_replace", 1), ("either_writer", 2)] {
+            let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, name));
+            assert_eq!(body.matches(&format!("call {{ ptr, i64 }} @{factory}(")).count(), writers, "{body}");
+            let extent = body.find(" = load i64, ptr %cells_length,").unwrap();
+            let backing = body[..extent].lines().rev()
+                .find(|line| line.contains(" = load ptr, ptr %cells_backing,")).unwrap();
+            let address_source = backing.trim().split_once(" = ").unwrap().0;
+            assert!(body.find(backing).unwrap() < extent && body.contains("store i64 2, ptr %cells_length"), "{body}");
+            assert_eq!(body.lines().filter(|line| line.contains("store i64 %array_descriptor_extent")
+                && line.contains(", ptr %cells_length,")).count(), writers, "{body}");
+            let selector = body.lines().find(|line| line.contains(" = xor i64 ") && line.ends_with(", 1")).unwrap();
+            let index = selector.trim().split_once(" = ").unwrap().0;
+            let check = format!("call void @{helper}(i64 {index}, i64 %runtime_extent)");
+            assert_eq!(body.matches(&check).count(), 1, "{body}");
+            let check = body.find(&check).unwrap();
+            assert!(extent < body.find(selector).unwrap() && body.find(selector).unwrap() < check, "{body}");
+            if layout == ScalarTargetLayout::WASM32 {
+                let cast = format!("trunc i64 {index} to i32");
+                let narrow = body.lines().find(|line| line.contains(&cast)).unwrap();
+                let narrowed = narrow.trim().split_once(" = ").unwrap().0;
+                let address = body.find(&format!("getelementptr i16, ptr {address_source}, i32 {narrowed}")).unwrap();
+                let narrow = body.find(narrow).unwrap();
+                assert!(check < narrow && narrow < address && !body.contains("getelementptr inbounds i16"), "{body}");
+            } else {
+                assert!(check < body.find(&format!("getelementptr inbounds i16, ptr {address_source}, i64 {index}")).unwrap(), "{body}");
+            }
+        }
+        if let Some(out) = std::env::var_os("WOSY_JOINED_PORTABLE_RETURNED_ARRAY_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

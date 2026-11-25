@@ -75,9 +75,9 @@ enum LiteralArrayReceipt<'ctx> {
     },
     Fresh {
         base: PointerValue<'ctx>,
-        joined_storage: Option<PointerValue<'ctx>>,
+        joined_storage: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
     },
-    Joined(PointerValue<'ctx>),
+    Joined((PointerValue<'ctx>, PointerValue<'ctx>)),
     Finished,
 }
 
@@ -1094,6 +1094,21 @@ pub(super) fn capture_checked_array_argument_extent<'ctx>(
     Ok(())
 }
 
+pub(super) fn authenticate_replacement_index_storage<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    backing_slot: PointerValue<'ctx>,
+    extent_slot: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let aggregate = state.aggregate.as_ref().ok_or("missing closed replacement index plan")?;
+    if matches!(aggregate.plan.literal_array, Some(ClosedLiteralArray::Replacement { unit: Some(_), .. }))
+        && !matches!(aggregate.literal_array_receipt,
+            LiteralArrayReceipt::Joined(pair) if pair == (backing_slot, extent_slot))
+    {
+        return Err("returned array index requires the completed backing/extent join".into());
+    }
+    Ok(())
+}
+
 pub(super) fn check_replacement_extent_observation(
     state: &EmitState<'_, '_>,
     expression: &ScalarExpression,
@@ -1182,7 +1197,7 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     state.builder.build_store(destination, fresh).map_err(builder_error)?;
     state.builder.build_store(length_slot, length).map_err(builder_error)?;
     state.aggregate.as_mut().expect("checked literal array replacement").literal_array_receipt =
-        LiteralArrayReceipt::Fresh { base: fresh, joined_storage: unit.map(|_| destination) };
+        LiteralArrayReceipt::Fresh { base: fresh, joined_storage: unit.map(|_| (destination, length_slot)) };
     Ok(())
 }
 
@@ -2248,7 +2263,7 @@ pub(super) fn release_scope<'ctx>(
         let receipt = std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished);
         let backing = match (unit, receipt) {
             (None, LiteralArrayReceipt::Fresh { base, joined_storage: None }) => base,
-            (Some(_), LiteralArrayReceipt::Joined(storage)) => state.builder
+            (Some(_), LiteralArrayReceipt::Joined((storage, _))) => state.builder
                 .build_load(context.ptr_type(AddressSpace::default()), storage, "joined_array_owner")
                 .map_err(builder_error)?.into_pointer_value(),
             _ => return Err("checked literal array exit has no matching receipt".into()),
