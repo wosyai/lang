@@ -642,6 +642,7 @@ struct VerifiedContextualOutcome {
     caller_source: SourceIdentity,
     occurrence: OccurrenceOrdinal,
     entry: BigInt,
+    explicit_entry: Option<BigInt>,
     exit: BigInt,
 }
 
@@ -708,13 +709,14 @@ impl ReachedContextualProof {
     fn reusable_exit(
         &self, target: PreparedCallable, body: &FunctionCallSites, binding: &ReferenceBindingId,
         ty: &ScalarType, call: (&SourceIdentity, OccurrenceOrdinal, ByteSpan), entry: &BigInt,
+        explicit: Option<&BigInt>,
     ) -> Option<&BigInt> {
         let receipt = self.verified.as_ref()?;
         if self.refutation.is_some() || self.reusable_body != Some(std::ptr::from_ref(body))
             || self.target != target || body.contextual_formal() != Some((&self.formal, &self.ty))
             || &self.ty != ty || &receipt.exact_binding != binding || call.0 != &self.formal.source
             || !receipt.matches_call(call.0, call.1, call.2)
-            || &receipt.entry != entry
+            || &receipt.entry != entry || receipt.explicit_entry.as_ref() != explicit
         {
             return None;
         }
@@ -729,7 +731,7 @@ impl ReachedContextualProof {
     ) -> Result<(), ProjectCheck> {
         let explicit = match (self.explicit.as_ref(), explicit, body.boundary.parameters.as_slice()) {
             (None, None, []) => None,
-            (Some(name), Some(value), [parameter]) if !reused && parameter.ordinal == 0
+            (Some(name), Some(value), [parameter]) if parameter.ordinal == 0
                 && integer_literal_fits_type(value, &parameter.ty) => Some((name, value)),
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -740,7 +742,7 @@ impl ReachedContextualProof {
             return Err(ProjectCheck::Unsupported);
         }
         let proved = if reused {
-            if self.reusable_exit(self.target, body, binding, ty, site, entry) != Some(exit) {
+            if self.reusable_exit(self.target, body, binding, ty, site, entry, explicit.map(|(_, value)| value)) != Some(exit) {
                 return Err(ProjectCheck::Unsupported);
             }
             true
@@ -761,12 +763,12 @@ impl ReachedContextualProof {
             };
             if proved {
                 self.saw_proved_occurrence = true;
-                if explicit.is_none() && !reused && self.verified.is_none() && call_source == &formal.source
+                if !reused && self.verified.is_none() && call_source == &formal.source
                     && self.reusable_body == Some(std::ptr::from_ref(body))
                 {
                     self.verified = Some(VerifiedContextualOutcome {
                         exact_binding: binding.clone(), leaf_call: call, caller_source: call_source.clone(),
-                        occurrence: occurrence_id, entry: entry.clone(), exit: exit.clone(),
+                        occurrence: occurrence_id, entry: entry.clone(), explicit_entry: explicit.map(|(_, value)| value.clone()), exit: exit.clone(),
                     });
                 }
                 if self.retain_observations { self.observations.push(occurrence()); }
@@ -3716,9 +3718,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 [value] if unary_context => Some((*value).clone()),
                 _ => return Err(ProjectCheck::Unsupported),
             };
-            let verified_exit = explicit.is_none().then_some(collection).flatten().and_then(|ordered| {
+            let verified_exit = collection.and_then(|ordered| {
                 let effects = ordered.failures.borrow();
-                effects.contextual_proofs.entries.get(&target)?.reusable_exit(target, body, origin.0, ty, (parent.source, call, span), &value).cloned()
+                effects.contextual_proofs.entries.get(&target)?.reusable_exit(
+                    target, body, origin.0, ty, (parent.source, call, span), &value, explicit.as_ref(),
+                ).cloned()
             });
             let verified_result = if let Some(exit) = verified_exit {
                 Some((value, exit))
@@ -24246,7 +24250,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 function_span: ByteSpan::new(0, 60),
             },
             leaf_call: call, caller_source: app.clone(), occurrence,
-            entry: BigInt::from(3), exit: BigInt::from(2),
+            entry: BigInt::from(3), explicit_entry: None, exit: BigInt::from(2),
         };
         assert!(outcome.matches_call(&app, occurrence, call));
         assert!(!outcome.matches_call(&leaf, occurrence, call));
@@ -25133,6 +25137,75 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             vec![app.clone()], inputs()).is_err());
         let second_proof = text.replace("%%end", "proof ordinary for unused(value) -> (null) ensures (true) {} %%end");
         assert!(run(&second_proof, ScalarCheckerScope::CurrentPackage).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_contextual_summary_keys_repeated_ordinary_arguments_and_shadowed_binding() {
+        let app = source("src/main.w", "explicit-contextual-summary-occurrence");
+        let text = r#"%%start
+            unit(u8) debit = fn(charged) { core.context.credit = core.context.credit - charged; };
+            unit(u8) relay = fn(cost) { debit(cost); };
+            unit() entry = fn {
+                u8 core.context.credit = 7;
+                relay(2);
+                core.require(core.context.credit == 5, { .stdout = ""; .stderr = "first"; .code = 91; .files = []; });
+                core.context.credit = 7;
+                relay(2);
+                core.require(core.context.credit == 5, { .stdout = ""; .stderr = "repeated"; .code = 92; .files = []; });
+                core.context.credit = 7;
+                relay(3);
+                core.require(core.context.credit == 4, { .stdout = ""; .stderr = "changed"; .code = 93; .files = []; });
+                if (true) {
+                    u8 core.context.credit = 7;
+                    relay(2);
+                    core.require(core.context.credit == 5, { .stdout = ""; .stderr = "shadowed"; .code = 94; .files = []; });
+                };
+                core.require(core.context.credit == 4, { .stdout = ""; .stderr = "restored"; .code = 95; .files = []; });
+            };
+            proof spend for debit(cost) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - cost) {}
+            entry();
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |program: &str, scope| {
+                let (_, source) = crate::parse_configured_root_proof_source(app.clone(), program.to_owned(), &[]).ok().unwrap();
+                let headers = source.contextual_proofs.into_iter().map(|header| (app.clone(), header)).collect();
+                check_prepared_contextual_proofs(vec![(source.declarations, Vec::new())], vec![app.clone()],
+                    headers, ScalarPreparationInputs { target_layout }, scope, true).unwrap()
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let valid = run(text, scope);
+                assert!(valid.directives.is_empty());
+                assert_eq!(valid.contextual_proofs.entries.len(), 1);
+                let proof = valid.contextual_proofs.entries.values().next().unwrap();
+                let [first, repeat, changed, shadowed] = proof.observations.as_slice() else { panic!("four concrete calls"); };
+                assert!(!first.reused && repeat.reused && !changed.reused && !shadowed.reused);
+                assert_eq!(first.call, repeat.call);
+                assert_ne!(first.supplying_call, repeat.supplying_call);
+                assert_eq!(first.binding, changed.binding);
+                assert_ne!(first.binding, shadowed.binding);
+                assert_eq!((repeat.entry.clone(), repeat.exit.clone()), (7.into(), 5.into()));
+                assert_eq!(changed.explicit, Some(("cost".into(), 3.into())));
+                assert_eq!((changed.entry.clone(), changed.exit.clone()), (7.into(), 4.into()));
+                assert!(proof.verified.is_some() && proof.refutation.is_none());
+                // Opposite arithmetic agrees with the theorem only at
+                // zero cost. It first creates a valid receipt, then must
+                // re-observe cost 3 and remove the receipt on refutation.
+                let stale = text.replace("core.context.credit - charged", "core.context.credit + charged")
+                    .replacen("relay(2)", "relay(0)", 2)
+                    .replacen("core.context.credit == 5", "core.context.credit == 7", 2);
+                let refuted = run(&stale, scope);
+                assert_eq!(refuted.contextual_proofs.entries.len(), 1);
+                let proof = refuted.contextual_proofs.entries.values().next().unwrap();
+                assert!(proof.verified.is_none());
+                let failure = proof.refutation.as_ref().unwrap();
+                assert_eq!(failure.explicit, Some(("cost".into(), 3.into())));
+                assert_eq!((failure.entry.clone(), failure.exit.clone()), (7.into(), 10.into()));
+                assert_eq!(&stale[failure.supplying_call.start as usize..failure.supplying_call.end as usize], "relay(3)");
+                assert_eq!(&stale[failure.call.start as usize..failure.call.end as usize], "debit(cost)");
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]

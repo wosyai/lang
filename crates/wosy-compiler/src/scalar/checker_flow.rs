@@ -10174,8 +10174,7 @@ pub(super) fn exact_contextual_summary_leaf(calls: &FunctionCallSites) -> bool {
     fn eligible(calls: &FunctionCallSites) -> Option<()> {
         let (formal, ty) = calls.contextual_formal()?;
         let structure = &calls.structure;
-        if !calls.boundary.parameters.is_empty()
-            || !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
+        if !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
             || structure.blocks.len() != 1 || calls.assignments.len() != 1
             || !calls.arms.is_empty() || !calls.call_occurrences.is_empty()
             || !calls.allocation_length_calls.is_empty() || !structure.checker_directives.is_empty()
@@ -10186,9 +10185,18 @@ pub(super) fn exact_contextual_summary_leaf(calls: &FunctionCallSites) -> bool {
         let BlockItemKind::Assignment { group } = item.kind else { return None; };
         let update = structure.checker_contextual_counter_updates.get(&(group.block, group.item))?;
         let (binding, target_type, rhs, destination) = checked_scalar_assignment(calls, group)?;
+        let amount_matches = match (calls.boundary.parameters.as_slice(), &update.amount) {
+            ([], super::reference::CheckerContextualCounterOperand::Literal(_)) => true,
+            ([parameter], super::reference::CheckerContextualCounterOperand::Lexical(binding)) => {
+                parameter.ordinal == 0 && &parameter.ty == ty
+                    && matches!(calls.boundary.checker_parameter_bindings.as_deref(), Some([formal]) if formal == binding)
+                    && !structure.blocks[structure.root.0].unsafe_context
+            }
+            _ => false,
+        };
         (binding == formal && target_type == ty && rhs == update.rhs
             && matches!(update.operator, BinaryOperator::Add | BinaryOperator::Subtract)
-            && matches!(update.amount, super::reference::CheckerContextualCounterOperand::Literal(_))
+            && amount_matches
             && structure.checker_contextual_occurrences.contains(&destination)).then_some(())
     }
     eligible(calls).is_some()
