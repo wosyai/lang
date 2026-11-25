@@ -1204,6 +1204,11 @@ struct GuardedScalarOwner<'ctx> {
     present: inkwell::values::IntValue<'ctx>,
 }
 
+enum GuardedAggregateInitializer<'ctx, 'module> {
+    Struct(memory::PreparedStructLiteral<'ctx, 'module>),
+    Array(Vec<EmitValue<'ctx>>),
+}
+
 pub(super) fn bind_guarded_scalar<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -1237,25 +1242,30 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     } else { None };
     let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or_else(|| "missing guarded scalar allocation function".to_owned())?;
-    let mut field_failure = None;
+    let mut member_failure = None;
+    let mut emit_member = |state: &mut EmitState<'ctx, '_>, member: &ScalarExpression, ty: &ScalarType| {
+        use super::expression::{ExpressionPath, emit_fallible_numeric_to};
+        if super::aggregate_transfer::fallible_allocation_expression_at(state, member) {
+            let failure = *member_failure.get_or_insert_with(||
+                context.append_basic_block(parent, "fallible.field_absence"));
+            let (value, _) = emit_fallible_numeric_to(context, state, member, ty, path, failure)?;
+            Ok(EmitValue::Basic(value))
+        } else {
+            match (path, member) {
+                (ExpressionPath::Project { module, modules },
+                    ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =>
+                    super::expression::emit_project_typed_expression(context, state, member, ty, module, modules),
+                _ => memory::emit_typed_expression(context, state, member, ty),
+            }
+        }
+    };
     let aggregate = match (&receiver.ty, &binding.value, value) {
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
-            Some(memory::prepare_struct_literal_with(state, id, fields, |state, field, ty| {
-                use super::expression::{ExpressionPath, emit_fallible_numeric_to};
-                if super::aggregate_transfer::fallible_allocation_expression_at(state, field) {
-                    let failure = *field_failure.get_or_insert_with(||
-                        context.append_basic_block(parent, "fallible.field_absence"));
-                    let (value, _) = emit_fallible_numeric_to(context, state, field, ty, path, failure)?;
-                    Ok(EmitValue::Basic(value))
-                } else {
-                    match (path, field) {
-                        (ExpressionPath::Project { module, modules },
-                            ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =>
-                            super::expression::emit_project_typed_expression(context, state, field, ty, module, modules),
-                        _ => memory::emit_typed_expression(context, state, field, ty),
-                    }
-                }
-            })?),
+            Some(GuardedAggregateInitializer::Struct(memory::prepare_struct_literal_with(state, id, fields, emit_member)?)),
+        (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. }, None)
+            if *length == elements.len() as u64 && matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32) =>
+            Some(GuardedAggregateInitializer::Array(elements.iter().map(|value|
+                emit_member(state, value, element)).collect::<Result<Vec<_>, _>>()?)),
         (_, _, Some(BasicValueEnum::StructValue(_))) if rhs.is_some() => None,
         (ty, _, Some(BasicValueEnum::IntValue(value)))
             if memory::integer_width(ty) == Some(value.get_type().get_bit_width())
@@ -1274,8 +1284,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         state.builder.build_conditional_branch(succeeded, allocate, continuation).map_err(builder_error)?;
         state.builder.position_at_end(allocate);
         Some(here)
-    } else if let Some(failure) = field_failure {
-        let success = state.builder.get_insert_block().ok_or("missing successful struct fields block")?;
+    } else if let Some(failure) = member_failure {
+        let success = state.builder.get_insert_block().ok_or("missing successful aggregate members block")?;
         state.builder.position_at_end(failure);
         state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
         state.builder.position_at_end(success);
@@ -1290,7 +1300,10 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state.builder.build_conditional_branch(present, initialized, continuation).map_err(builder_error)?;
     state.builder.position_at_end(initialized);
     if let Some(values) = aggregate {
-        memory::write_struct_literal(context, state, values, backing)?;
+        match values {
+            GuardedAggregateInitializer::Struct(values) => memory::write_struct_literal(context, state, values, backing)?,
+            GuardedAggregateInitializer::Array(values) => memory::write_fixed_array_literal(context, state, &receiver.ty, values, backing)?,
+        }
     } else {
         let value = if let Some(rhs) = rhs {
             state.builder.build_extract_value(rhs, 1, "fallible.rhs_payload").map_err(builder_error)?

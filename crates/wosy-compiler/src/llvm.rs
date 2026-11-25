@@ -5394,7 +5394,7 @@ fn emit_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = if matches!(binding.declared_type, ScalarType::Struct(_)) {
+                let value = if matches!(binding.declared_type, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     None
                 } else {
                     Some(take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?)
@@ -5424,7 +5424,7 @@ fn emit_project_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = if matches!(binding.declared_type, ScalarType::Struct(_)) {
+                let value = if matches!(binding.declared_type, ScalarType::Struct(_) | ScalarType::Array { .. }) {
                     None
                 } else {
                     Some(take_basic(emit_project_typed_expression(

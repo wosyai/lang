@@ -988,18 +988,7 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
     };
     let mut staged = staged;
     for (index, expression) in elements.iter().enumerate() {
-        let pointer = unsafe {
-            state.builder.build_in_bounds_gep(
-                storage,
-                destination,
-                &[
-                    context.i32_type().const_zero(),
-                    context.i32_type().const_int(index as u64, false),
-                ],
-                "array_element",
-            )
-        }
-        .map_err(builder_error)?;
+        let pointer = literal_array_element_pointer(context, state, storage, destination, index)?;
         let value = match staged.as_mut() {
             Some(staged) => staged.next().expect("one staged value per array element"),
             None => emit_typed_expression(context, state, expression, element)?,
@@ -1007,6 +996,37 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
         store_value(context, state, pointer, element, value)?;
     }
     Ok(EmitValue::Basic(destination.into()))
+}
+
+fn literal_array_element_pointer<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>, storage: BasicTypeEnum<'ctx>,
+    destination: PointerValue<'ctx>, index: usize,
+) -> Result<PointerValue<'ctx>, String> {
+    // The callers authenticate the literal's element count against its fixed
+    // layout, so this per-element index is statically in range.
+    unsafe {
+        state.builder.build_in_bounds_gep(
+            storage, destination,
+            &[context.i32_type().const_zero(), context.i32_type().const_int(index as u64, false)],
+            "array_element",
+        )
+    }.map_err(builder_error)
+}
+
+pub(super) fn write_fixed_array_literal<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, ty: &ScalarType,
+    values: Vec<EmitValue<'ctx>>, destination: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let ScalarType::Array { element, length, .. } = ty else {
+        return Err("guarded array literal requires a fixed layout".into());
+    };
+    if *length != values.len() as u64 { return Err("invalid guarded array element count".into()); }
+    let storage = storage_type(context, ty, state.layouts, state.target_layout)?;
+    for (index, value) in values.into_iter().enumerate() {
+        let pointer = literal_array_element_pointer(context, state, storage, destination, index)?;
+        store_value(context, state, pointer, element, value)?;
+    }
+    Ok(())
 }
 
 pub(super) fn emit_typed_expression<'ctx, 'module>(

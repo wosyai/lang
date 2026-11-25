@@ -370,7 +370,7 @@ impl GuardedScalarAllocation {
 enum ExpressionReadMode {
     Ordinary,
     ProjectedOrigins,
-    GuardedStructInitializer,
+    GuardedScalarAggregateInitializer,
     OrdinaryScalarAggregateInitializer,
     FallibleAliasInitializer,
     DereferenceOperand,
@@ -2559,16 +2559,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         if *length == elements.len() as u64 && aggregate::ordinary_value(element) => Some(element.as_ref()),
                     _ => None,
                 };
+                let guarded = matches!(read_mode, ExpressionReadMode::GuardedScalarAggregateInitializer);
+                if guarded && !expected_element.is_some_and(|element| matches!(element, ScalarType::U64 | ScalarType::I32)) {
+                    return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+                }
                 let mut ordinary = (matches!(read_mode, ExpressionReadMode::OrdinaryScalarAggregateInitializer)
                     && expected_element.is_some()).then(Vec::new);
                 for (position, element) in elements.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateElement(position));
                     let before = self.cursor;
-                    if ordinary.is_some() {
+                    if guarded || ordinary.is_some() {
                         let exact_type = expected_element.filter(|ty|
                             calls.structure.checked_types.expressions.get(&ordinal) == Some(*ty));
-                        self.scalar_aggregate_member(element, scope, ordinal, exact_type, false, &mut ordinary)?;
+                        if guarded && exact_type.is_none() {
+                            return Err(self.missing_context(expression_span(element), ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+                        }
+                        self.scalar_aggregate_member(element, scope, ordinal, exact_type, guarded, &mut ordinary)?;
                     } else {
                         self.expression(element, scope, ordinal)?;
                     }
@@ -2618,7 +2625,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut raw_fields = 0;
                 let mut nullable = structure_id.is_some() && self.aggregate_facts.local_array_copy_allocation.is_some();
                 let mut nullable_read = None;
-                let guarded = matches!(read_mode, ExpressionReadMode::GuardedStructInitializer);
+                let guarded = matches!(read_mode, ExpressionReadMode::GuardedScalarAggregateInitializer);
                 let mut ordinary = matches!(read_mode, ExpressionReadMode::OrdinaryScalarAggregateInitializer)
                     .then(Vec::new);
                 for (position, field) in fields.iter().enumerate() {
@@ -3521,6 +3528,30 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 BTreeSet::new(),
             );
             return Ok(ReferenceValue::Other);
+        }
+        if let Some(binding) = root_binding {
+            if let Some(owner) = self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding)) {
+                if let ScalarType::Array { element, length, .. } = &owner.ty {
+                    let exact = (|| {
+                        let CheckedReadSource::Place(ordinal) = source else { return None; };
+                        let ScalarPlace::Index { base, index, .. } = place else { return None; };
+                        if !matches!(base.as_ref(), ScalarPlace::Name { .. }) { return None; }
+                        let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None; };
+                        let parent = OccurrenceParent::Place(ordinal);
+                        let base = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
+                        let selector = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
+                        let types = &self.call_sites.structure.checked_types;
+                        (types.places.get(&base) == Some(&owner.ty)
+                            && types.places.get(&ordinal) == Some(element.as_ref())
+                            && types.expressions.get(&selector) == Some(&ScalarType::U64)
+                            && u64::try_from(value.clone()).ok().is_some_and(|index| index < *length)).then_some(())
+                    })().is_some();
+                    if !exact {
+                        return Err(self.missing_origin(span, binding.clone(),
+                            ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                    }
+                }
+            }
         }
         let reads_checked_value = match source {
             CheckedReadSource::PreparedMember { ty, .. } => {
@@ -5155,13 +5186,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                         ReferenceValue::Other
                     } else if binding.fallible_assignment.is_some()
-                        && matches!(receiver.ty, ScalarType::Struct(_))
+                        && matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. })
                     {
                         self.expression_with_read_mode(
                             primary,
                             scope,
                             primary_ordinal,
-                            ExpressionReadMode::GuardedStructInitializer,
+                            ExpressionReadMode::GuardedScalarAggregateInitializer,
                         )?
                     } else if ordinary_aggregate {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryScalarAggregateInitializer)?
@@ -5342,7 +5373,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.cfg.allocations.insert(id.clone());
                     }
                     if binding.fallible_assignment.is_some()
-                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Bool))
+                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
                     {
                         declares_fallible = true;
                         let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
@@ -9551,7 +9582,9 @@ fn require_available_fallible_read(
 ) {
     let unavailable = state.uninitialized.contains(binding);
     let Some(site) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
-    let reason = if whole && matches!(site.ty, ScalarType::Struct(_)) && !site.whole_copy {
+    let reason = if whole && matches!(site.ty, ScalarType::Array { .. }) {
+        ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess
+    } else if whole && matches!(site.ty, ScalarType::Struct(_)) && !site.whole_copy {
         ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead
     } else if unavailable {
         ReferenceAnalysisErrorReason::UnavailableFallibleAllocation
@@ -10894,7 +10927,8 @@ fn transfer_reference_facts(
             for place in read_places {
                 if let Some(bindings) = cfg.fallible_allocation_bindings {
                     if matches!(&point.kind, CfgPointKind::ReadPlace { pointer_point: None, .. })
-                        && is_lexical_field_path(&place.projections)
+                        && (is_lexical_field_path(&place.projections)
+                            || bindings.get(&place.binding).is_some_and(|owner| matches!(owner.ty, ScalarType::Array { .. })))
                     {
                         require_available_fallible_read(bindings, &state, &place.binding, point, false, &mut errors);
                     }

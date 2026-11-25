@@ -6694,6 +6694,15 @@ fn pending_fallible_operator(
             if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
         (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
             if guarded_numeric_rhs(ty, expression) => None,
+        (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+            if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
+                && *length != 0 && *length == elements.len() as u64
+                && elements.iter().all(|value| match value {
+                    ScalarExpression::Integer { .. } => true,
+                    ScalarExpression::Name { name, .. } => scope.get(name) == Some(element.as_ref()),
+                    ScalarExpression::Call { type_arguments, .. } => type_arguments.is_empty(),
+                    _ => guarded_numeric_rhs(element, value),
+                }) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
             let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return Some(operator); };
             if fields.is_empty() || structure.fields.is_empty()
