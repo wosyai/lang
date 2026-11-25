@@ -647,6 +647,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     .get(self.call_sites.call_occurrences[index].site)
             })
             .map(|site| site.target.clone())
+            .or_else(|| self.call_sites.allocation_length_call_targets.get(&ordinal).cloned())
             .ok_or_else(|| {
                 self.missing_context(
                     span,
@@ -5348,6 +5349,34 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             super::fixed_copy_to_runtime(&signature.parameters[0], ty))?;
                         Some((source.declaration_span, count))
                     })();
+                    // Count expressions have their own prepared occurrence edge.
+                    // Evaluate it before the allocation placeholder and owner
+                    // Bind; the same ordered scalar proof is used for ordinary RHS.
+                    let checked_count = (|| {
+                        if block.unsafe_context || !self.generic_parameters.is_empty()
+                            || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+                        { return None; }
+                        let BindingInitialization::Allocation { lengths } = &binding_region.initialization else { return None; };
+                        let [length] = lengths.as_slice() else { return None; };
+                        let value @ (ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =
+                            binding.receivers[0].allocation_length.as_ref()? else { return None; };
+                        let exact_call = !matches!(value, ScalarExpression::Call { .. }) || matches!(
+                            calls.allocation_length_call_targets.get(&length.expression),
+                            Some(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }));
+                        (length.position == 0 && exact_call
+                            && calls.structure.checked_types.expressions.get(&length.expression) == Some(&ScalarType::U64))
+                            .then_some((value, length.expression))
+                    })();
+                    if let Some((value, length)) = checked_count {
+                        let previous = self.capture_call_points;
+                        self.capture_call_points = true;
+                        let evaluated = self.expression(value, scope, length);
+                        self.capture_call_points = previous;
+                        evaluated?;
+                        if let Some(proof) = self.guarded_numeric_expression(value, length, &ScalarType::U64) {
+                            self.aggregate_result.ordinary_fallible_expressions.push(vec![proof]);
+                        }
+                    }
                     let before = self.cursor;
                     // SystemPanic terminates execution, not the current
                     // lexical scope via an unwind. Existing local owners
@@ -13556,6 +13585,7 @@ struct StructuralWalker<'a, 'typing> {
     named_place_roots: NamedPlaceRootFacts,
     direct_destinations: DirectDestinationFacts,
     members: MemberFacts,
+    allocation_length_unsafe_calls: BTreeSet<usize>,
     allocation_length_call_targets: HashMap<OccurrenceOrdinal, ResolvedCallTarget>,
     initialization_call_targets: HashMap<OccurrenceOrdinal, ModuleInitializationCallTarget>,
     initialization_identities: InitializationIdentities,
@@ -13606,6 +13636,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             plain_names,
             named_place_roots,
             members,
+            allocation_length_unsafe_calls: BTreeSet::new(),
             allocation_length_call_targets: HashMap::new(),
             initialization_call_targets: HashMap::new(),
             initialization_identities: InitializationIdentities::default(),
@@ -14209,12 +14240,15 @@ impl StructuralWalker<'_, '_> {
                         )?;
                     }
                     WalkMode::CallableAllocationLength(resolver) => {
-                        let (target, _) = resolver.resolve(
+                        let (target, declared_unsafe) = resolver.resolve(
                             expression,
                             names,
                             types,
                             self.checked_call_signatures.get(&ordinal),
                         )?;
+                        if declared_unsafe {
+                            self.allocation_length_unsafe_calls.insert(ordinal.0);
+                        }
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .allocation_length_call_targets
@@ -15594,7 +15628,11 @@ fn resolve_function_call_sites(
         imported_shared_readers: HashMap::new(),
         exclusive_scalar_writers: HashSet::new(),
         local_shared_call_families: HashMap::new(),
-        declared_unsafe_calls: callable.declared_unsafe_calls,
+        declared_unsafe_calls: {
+            let mut unsafe_calls = callable.declared_unsafe_calls;
+            unsafe_calls.extend(resolver.allocation_length_unsafe_calls);
+            unsafe_calls
+        },
         callable_escapes: resolver.callable_escapes,
         overload_reservation_sites: callable.overload_reservation_sites,
         self_tail_candidates: Vec::new(),

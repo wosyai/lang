@@ -15357,3 +15357,71 @@ ordinary(FIRST, SECOND);
         }
     }
 }
+
+#[test]
+fn fallible_runtime_array_length_uses_ordered_typed_expression_before_backing() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let template = "%%start
+u64(u64) _left = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) guarded = fn(first, second) {
+    u64 result =? _left(first) ^ _right(second);
+    if (&result == null) { 99 } else { result }
+};
+u64(u64, u64) ordinary = fn(first, second) {
+    u8[_left(first) ^ _right(second)] target;
+    core.array_len(&target)
+};
+if (guarded(11, 9) != 99 || guarded(7, 9) != 14 || ordinary(0, 9) != 9
+    || ordinary(4, 4) != 0) {
+    core.system_panic();
+};
+ordinary(FIRST, SECOND);
+%%end";
+    for (scenario, first, second) in [("first", "17", "9"), ("second", "19", "19")] {
+        let text = template.replace("FIRST", first).replace("SECOND", second);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let source = &prepared.project().modules[0].source;
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            for (route, project, output) in [
+                ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+                ("project", true, emit_scalar_build_project_llvm(&checked)),
+            ] {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible runtime array length");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                let ordinary = authored("ordinary");
+                let blocks = ordinary.get_basic_blocks();
+                let calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |i| i.get_next_instruction()))
+                    .filter(|&i| CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                    .collect::<Vec<_>>();
+                let [left] = calls(authored("_left"))[..] else { panic!("{llvm}") };
+                let [right] = calls(authored("_right"))[..] else { panic!("{llvm}") };
+                let [destination] = calls(module.get_function("__wosy_core_alloc").unwrap())[..] else { panic!("{llvm}") };
+                let failure = *blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.allocation_absent").unwrap();
+                fn edges<'ctx>(instruction: InstructionValue<'ctx>) -> Vec<inkwell::basic_block::BasicBlock<'ctx>> {
+                    instruction.get_operands().filter_map(|operand| operand.and_then(|operand| operand.block())).collect()
+                }
+                let left_edges = edges(left.get_parent().unwrap().get_terminator().unwrap());
+                let right_edges = edges(right.get_parent().unwrap().get_terminator().unwrap());
+                assert!(left_edges.contains(&failure) && left_edges.contains(&right.get_parent().unwrap()));
+                assert!(right_edges.contains(&failure) && right_edges.contains(&destination.get_parent().unwrap()));
+                assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                assert_eq!(CallSiteValue::try_from(failure.get_first_instruction().unwrap()).unwrap().get_called_fn_value(),
+                    module.get_function("__wosy_core_system_panic"));
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_RUNTIME_LENGTH_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(scenario).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

@@ -5279,6 +5279,7 @@ enum SnapshotUse {
 struct OrdinaryCohorts {
     private: BTreeMap<BodyKey, (OrdinaryResultCandidate, bool)>,
     transport_uses: HashMap<BodyKey, Option<Vec<(BodyKey, usize)>>>,
+    checked_length_uses: BTreeSet<(BodyKey, usize)>,
     namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
     indexed: BTreeMap<BodyKey, ClosedIndexedSnapshot>,
     terminal_indexed: BTreeMap<BodyKey, [ClosedIndexedSnapshot; 2]>,
@@ -5405,10 +5406,15 @@ impl OrdinaryCohorts {
             for escape in &sites.callable_escapes {
                 if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_transport_use(target, None); }
             }
-            for target in sites.allocation_length_call_targets.values() {
+            for (ordinal, target) in &sites.allocation_length_call_targets {
                 match target {
-                    ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
-                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); self.record_transport_use(target, None); }
+                    ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } => {
+                        if let Some(target) = selected(source, *declaration_span) {
+                            self.record(target, None);
+                            let exact = matches!(concrete, ConcreteCallSelection::Declaration)
+                                && self.checked_length_uses.contains(&(caller, ordinal.0));
+                            self.record_transport_use(target, exact.then_some((caller, ordinal.0)));
+                        }
                     }
                     ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
                     _ => {}
@@ -7234,6 +7240,11 @@ fn closed_aggregates<'a>(
             if complete && !checked.is_empty() {
                 ordinary_choices.extend(marked.into_iter().map(|ordinal| (caller, ordinal)));
                 for (ordinal, target) in checked {
+                    if module_at(caller.0).and_then(|input| input.calls.function_body(caller.1, caller.2))
+                        .is_some_and(|sites| sites.allocation_length_call_targets.contains_key(&OccurrenceOrdinal(ordinal)))
+                    {
+                        ordinary.checked_length_uses.insert((caller, ordinal));
+                    }
                     fallible_allocating_targets.get_mut(&target).expect("selected fallible target")
                         .insert((caller, ordinal));
                 }
