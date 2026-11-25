@@ -1,0 +1,440 @@
+//! One in-run cache for pure qualified provider obligations. Demand never
+//! changes symbolic root order or emits diagnostics from another root.
+use super::*;
+use super::super::checker_flow::charge_call_work;
+
+#[derive(Default)]
+pub(super) struct Cache<'proof> {
+    verified: SymbolicSummaryIndex<'proof>,
+    verdicts: HashMap<PreparedCallable, Verdict>,
+    work: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    Certified,
+    Refuted,
+    Blocked(PreparedCallable),
+    Unavailable,
+}
+
+struct Verdict {
+    active: bool,
+    scheduled: bool,
+    evidence: Evidence,
+    failure: Option<SymbolicProofDiagnostic>,
+}
+
+impl Cache<'_> {
+    fn refuter(&self, target: PreparedCallable) -> Result<PreparedCallable, ProjectCheck> {
+        let verdict = self.verdicts.get(&target).ok_or(ProjectCheck::Unsupported)?;
+        let refuter = match verdict.evidence {
+            Evidence::Refuted => target,
+            Evidence::Blocked(refuter) => refuter,
+            Evidence::Certified | Evidence::Unavailable => return Err(ProjectCheck::Unsupported),
+        };
+        let receipt = self.verdicts.get(&refuter).ok_or(ProjectCheck::Unsupported)?;
+        if receipt.evidence != Evidence::Refuted || !(receipt.scheduled || receipt.failure.is_some()) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(refuter)
+    }
+
+    pub(super) fn complete(&self) -> Result<(), ProjectCheck> {
+        for (&target, verdict) in &self.verdicts {
+            if !verdict.scheduled || verdict.failure.is_some() { return Err(ProjectCheck::Unsupported); }
+            match verdict.evidence {
+                Evidence::Certified if self.verified.lookup(target).is_none() => return Err(ProjectCheck::Unsupported),
+                Evidence::Blocked(_) => { self.refuter(target)?; }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+enum Evaluation {
+    Checked { active: bool, reusable: bool },
+    Blocked(PreparedCallable),
+}
+
+struct Job<'proof, 'run, 'case> {
+    target: PreparedCallable,
+    case: &'case MainFlowProofCase<'proof>,
+    issuer: Option<&'case SymbolicSummaryIssuer<'proof>>,
+    body: &'run FunctionCallSites,
+    function: &'run ScalarFunction,
+    owner: &'run ScalarModule,
+    origins: Vec<RankedScalarOrigin<'run>>,
+}
+
+impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
+    fn discover(
+        watched: &'case MainFlowProofObserver<'proof>, target: PreparedCallable,
+        runtime: SymbolicProofRuntime<'run>,
+    ) -> Option<Self> {
+        let group = if watched.first.0 == target { &watched.first.1 } else { watched.other.get(&target)? };
+        let MainFlowProofCases::Bare { first, rest } = &group.cases else { return None; };
+        let owner = runtime.project.modules.get(target.0)?;
+        if group.seen || !rest.is_empty() || first.proof_source != &owner.source || first.owner != &owner.source
+            || first.bound.literal().is_none()
+            || runtime.visits?.get(target.0) != Some(&InitializationVisit::Completed)
+        {
+            return None;
+        }
+        let ScalarItem::Function(function) = owner.items.get(target.1)? else { return None; };
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
+        let body = runtime.calls.function_body(target.0, target.1, None)?;
+        let origins = ranked_scalar_return_origins(body)?;
+        if origins.iter().any(|(callee, _, _, _)| callee.0 == target.0) {
+            return None;
+        }
+        Some(Self { target, case: first, issuer: group.qualified_issuer.as_ref(), body, function, owner, origins })
+    }
+
+    fn export_issuer(&self) -> Option<&'case SymbolicSummaryIssuer<'proof>> {
+        // New exported dependencies are deliberately exact unary forwarding
+        // definitions. Non-exported qualified clients retain their existing
+        // multiple-import behavior. All declared entry restrictions survive.
+        let issuer = self.issuer.filter(|issuer| std::ptr::eq(issuer.body, self.body))?;
+        let [parameter] = self.body.boundary.parameters.as_slice() else { return None; };
+        let case = self.case;
+        if self.origins.len() != 1 || !is_integer_type(&parameter.ty)
+            || case.guard.always_rejects || case.guard.domain.is_some() || case.guard.arity != 1
+            || case.guard.boolean.iter().any(Option::is_some)
+            || case.relation != IntegerRelation::from_operator(&BinaryOperator::Equal)
+            || !case.filter.iter().all(|guard| matches!(guard, CheckerPredicate::Integer(_) | CheckerPredicate::Boolean(true)))
+            || !self.body.callable_escapes.is_empty() || !self.body.structure.module_storage_uses.is_empty()
+            || self.body.contextual_formal().is_some()
+        {
+            return None;
+        }
+        Some(issuer)
+    }
+
+    fn summary(&self) -> Option<VerifiedSymbolicSummary<'proof>> {
+        let issuer = self.export_issuer()?;
+        let case = self.case;
+        Some(VerifiedSymbolicSummary {
+            target: self.target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
+            result: VerifiedSymbolicResult::Constant { bound: case.bound.literal()?, shared: std::cell::OnceCell::new() },
+            guards: VerifiedSymbolicGuards::Derived(case.guard.comparisons.clone()),
+        })
+    }
+}
+
+fn checked_edge(
+    caller: &ScalarModule, body: &FunctionCallSites, (target, _, origin, occurrence): RankedScalarOrigin<'_>,
+    canonical: &ResolvedCallTarget, provider_body: &FunctionCallSites, runtime: SymbolicProofRuntime<'_>,
+) -> Result<(), ProjectCheck> {
+    let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
+    let signature = body.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let [output] = provider_body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let site = body.sites.get(occurrence.site).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    if &caller.source == &owner.source
+        || !completed_namespace_owner(&caller.source, &owner.source, target.0, runtime.visits)
+        || !std::ptr::eq(runtime.calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?, provider_body)
+        || output.ordinal != 0
+        || !production_bound_reuse::matching_call(
+            canonical, owner.target_layout, &provider_body.boundary.parameters, &output.ty,
+            caller.target_layout, body, origin, &site.target, signature,
+        )
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(())
+}
+
+impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
+    fn qualify_edge(
+        &self, caller: &ScalarModule, body: &FunctionCallSites, origin: RankedScalarOrigin<'_>,
+        runtime: SymbolicProofRuntime<'_>, ranked: &HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
+    ) -> Result<(), ProjectCheck> {
+        let (target, _, argument, _) = origin;
+        if let Some(provider) = ranked.get(&target) {
+            let owner = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
+            if !provider.allow_qualified_demand || provider.plan.proof_source != &owner.source
+                || !matches!(argument.arguments, super::super::reference::CheckerIntegerCallArguments::Wide(_))
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            return checked_edge(caller, body, origin, provider.plan.canonical_target, provider.plan.typed.body, runtime);
+        }
+        if argument.arguments.as_slice().len() != 1 { return Err(ProjectCheck::Unsupported); }
+        if let Some(summary) = self.qualified.verified.lookup(target) {
+            return checked_edge(caller, body, origin, summary.canonical_target, summary.body, runtime);
+        }
+        let provider = Job::discover(self.watched, target, runtime).ok_or(ProjectCheck::Unsupported)?;
+        let issuer = provider.export_issuer().ok_or(ProjectCheck::Unsupported)?;
+        checked_edge(caller, body, origin, issuer.canonical_target, issuer.body, runtime)
+    }
+
+    fn ensure_qualified_provider(
+        &mut self, first: PreparedCallable, requesting: PreparedCallable, runtime: SymbolicProofRuntime<'_>,
+        ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
+    ) -> Result<(), ProjectCheck> {
+        let watched = self.watched;
+        let mut stack = Vec::new();
+        let mut current = first;
+        loop {
+            charge_call_work(&mut self.qualified.work, 1).ok_or(ProjectCheck::Unsupported)?;
+            if current == requesting || stack.iter().any(|job: &Job<'_, '_, '_>| job.target == current) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            if self.qualified.verified.lookup(current).is_some() || self.qualified.verdicts.contains_key(&current) { break; }
+            if let Some(provider) = ranked.get_mut(&current) {
+                let source = &runtime.project.modules.get(current.0).ok_or(ProjectCheck::MissingRoot)?.source;
+                provider.verify_qualified_demand()?;
+                let summary = ranked_symbolic_equality(provider.plan, source).ok_or(ProjectCheck::Unsupported)?;
+                self.qualified.verified.insert(summary);
+                break;
+            }
+            if stack.len() == MAX_SYMBOLIC_SUMMARY_LINEAGE { return Err(ProjectCheck::Unsupported); }
+            let job = Job::discover(watched, current, runtime).ok_or(ProjectCheck::Unsupported)?;
+            let [edge] = job.origins.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            self.qualify_edge(job.owner, job.body, *edge, runtime, ranked)?;
+            current = edge.0;
+            stack.push(job);
+        }
+        // Iterative postorder. The closed ranked leaf has already been
+        // verified, or a previous demand recorded why it cannot be used.
+        for job in stack.into_iter().rev() {
+            self.verify_qualified_job(job)?;
+        }
+        if self.qualified.verified.lookup(first).is_none() {
+            self.qualified.refuter(first)?;
+        }
+        Ok(())
+    }
+
+    fn verify_qualified_job(&mut self, job: Job<'proof, '_, 'case>) -> Result<(), ProjectCheck> {
+        let index = std::mem::take(&mut self.qualified.verified);
+        let previous_failure = self.failure.take();
+        let evaluated = (|| {
+            let mut imports = Vec::with_capacity(job.origins.len());
+            for &(callee, position, origin, occurrence) in &job.origins {
+                let Some(summary) = index.lookup(callee) else {
+                    return Ok(Evaluation::Blocked(self.qualified.refuter(callee)?));
+                };
+                let import = summary.import_local(job.target, job.body, position, origin, occurrence, true, Some(job.owner.target_layout))?
+                    .ok_or(ProjectCheck::Unsupported)?;
+                imports.push(Some(import));
+            }
+            let mut scratch = OrderedFailures::default();
+            let (active, reusable) = self.check_ranked_scalar_import(
+                job.case, job.body, job.function, &job.owner.source, &mut scratch, &mut imports,
+            )?;
+            if !scratch.records.is_empty() { return Err(ProjectCheck::Unsupported); }
+            Ok(Evaluation::Checked { active: active.unwrap_or(false), reusable })
+        })();
+        let failure = self.failure.take();
+        self.failure = previous_failure;
+        self.qualified.verified = index;
+        let (active, evidence) = match evaluated? {
+            Evaluation::Blocked(refuter) if failure.is_none() => (false, Evidence::Blocked(refuter)),
+            Evaluation::Blocked(_) => return Err(ProjectCheck::Unsupported),
+            Evaluation::Checked { active, .. } if failure.is_some() => (active, Evidence::Refuted),
+            Evaluation::Checked { active, reusable } => {
+                let certified = reusable && match (job.summary(), job.origins.as_slice()) {
+                    (Some(summary), [provider]) => self.qualified.verified.insert_linked(summary, provider.0, true).is_some(),
+                    _ => false,
+                };
+                (active, if certified { Evidence::Certified } else { Evidence::Unavailable })
+            }
+        };
+        if self.qualified.verdicts.insert(job.target, Verdict { active, scheduled: false, evidence, failure }).is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(())
+    }
+
+    pub(super) fn try_collect_qualified_provider(
+        &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity,
+        effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        let watched = self.watched;
+        let Some(job) = Job::discover(watched, target, runtime) else { return Ok(None); };
+        if !std::ptr::eq(job.body, calls) || job.owner.source != *source { return Err(ProjectCheck::Unsupported); }
+        // Do not take over unrelated existing narrow qualified routes.
+        // The old ranked route still owns wide imports; new unary
+        // qualification needs an explicitly enrolled pure owner proof.
+        if job.origins.iter().any(|(callee, _, origin, _)| {
+            !matches!(origin.arguments, super::super::reference::CheckerIntegerCallArguments::Wide(_))
+                && Job::discover(watched, *callee, runtime).and_then(|plan| plan.export_issuer()).is_none()
+        }) {
+            return Ok(None);
+        }
+        if !self.qualified.verdicts.contains_key(&target) {
+            for &origin in &job.origins {
+                self.qualify_edge(job.owner, job.body, origin, runtime, ranked)?;
+                self.ensure_qualified_provider(origin.0, target, runtime, ranked)?;
+            }
+            self.verify_qualified_job(job)?;
+        }
+        let verdict = self.qualified.verdicts.get_mut(&target).ok_or(ProjectCheck::Unsupported)?;
+        if std::mem::replace(&mut verdict.scheduled, true) { return Err(ProjectCheck::Unsupported); }
+        if let Some(mut failure) = verdict.failure.take() {
+            if verdict.evidence != Evidence::Refuted { return Err(ProjectCheck::Unsupported); }
+            failure.directive_position = effects.records.len();
+            self.failure = Some(failure);
+        } else if verdict.evidence == Evidence::Refuted {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(Some(verdict.active))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_one_qualified_ancestor_invalidates_the_transitive_lineage() {
+        let identities = ["a", "b", "c", "other"].map(|name| {
+            SourceIdentity::new("project".into(), "package".into(), format!("src/{name}.w"), name.into())
+        });
+        let declarations = identities.iter().map(|source| {
+            let parsed = crate::parse_source(source.clone(), "%%start u8() fixed = fn { 7 }; %%end".to_owned(), &[]);
+            (crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())
+        }).collect::<Vec<_>>();
+        let layout = ScalarTargetLayout::NATIVE64;
+        let prepared = prepare_checker_project(declarations, identities.to_vec(), ScalarPreparationInputs { target_layout: layout }).unwrap();
+        let (project, calls) = prepared.parts();
+        let keys = project.modules.iter().map(|module| {
+            let ScalarItem::Function(function) = &module.items[0] else { panic!("prepared fixed callable"); };
+            ResolvedCallTarget::ModuleCallable {
+                source: module.source.clone(), declaration_span: function.name_span,
+                concrete: ConcreteCallSelection::Declaration,
+            }
+        }).collect::<Vec<_>>();
+        let value = BigInt::from(7);
+        let make = |module| VerifiedSymbolicSummary {
+            target: (module, 0), canonical_target: &keys[module], layout,
+            body: calls.function_body(module, 0, None).unwrap(),
+            result: VerifiedSymbolicResult::Constant { bound: &value, shared: std::cell::OnceCell::new() },
+            guards: if module == 0 || module == 3 { VerifiedSymbolicGuards::Bare(None) }
+                else { VerifiedSymbolicGuards::Derived(Vec::new()) },
+        };
+        let mut index = SymbolicSummaryIndex::default();
+        index.insert(make(0));
+        index.insert(make(3));
+        index.insert_linked(make(1), (0, 0), true).unwrap();
+        index.insert_linked(make(2), (1, 0), true).unwrap();
+        assert!(index.lookup((1, 0)).is_some() && index.lookup((2, 0)).is_some());
+        index.insert(make(0));
+        assert!(index.lookup((1, 0)).is_none() && index.lookup((2, 0)).is_none());
+        assert!(index.lookup((3, 0)).is_some());
+        assert!(index.insert_linked(make(1), (0, 0), true).is_none());
+    }
+
+    #[test]
+    fn qualified_provider_demand_preserves_original_root_and_guard() {
+        let app = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "app".into());
+        let mid = SourceIdentity::new("project".into(), "package".into(), "src/relay.w".into(), "relay".into());
+        let lib = SourceIdentity::new("project".into(), "package".into(), "src/lib.w".into(), "lib".into());
+        let main = r#"%%start
+            bridge = namespace package "src/relay.w";
+            u8(u8) client = fn(input) { u8 observed = bridge.relay(input); observed };
+            u8(u8) second = fn(input) { u8 observed = bridge.relay(input); observed };
+            proof first_client for client(input) -> (out) where (input <= 2) ensures (out == 7) {}
+            proof later_client for second(input) -> (out) where (input <= 1) ensures (out == 7) {}
+        %%end"#;
+        let relay = r#"%%start
+            leaf = namespace package "src/lib.w";
+            u8(u8) relay = fn(input) { u8 forwarded = leaf.descend(input, 2, input, 4); forwarded };
+            proof exported for relay(input) -> (out) where (input <= 3) ensures (out == 7) {}
+        %%end"#;
+        let library = r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {
+                if (left == 0) { 7 } else { descend(page, slot, left - 1, quota) }
+            };
+            proof rank for descend(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && quota == 4)
+                ensures (out == 7) decreases (left) {
+                if (left == 0) { core.show(out == 7); }
+                else { core.use(rank(page, slot, left - 1, quota)); }
+            }
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |main: &str, relay: &str, library: &str, scope| {
+                let parse = |identity: &SourceIdentity, code: &str| crate::parse_proof_source(identity.clone(), code.to_owned(), &[])
+                    .ok().unwrap().1;
+                let import = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                    binding: binding.to_owned(), target: target.clone(), span: ByteSpan::new(0, 0),
+                };
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [
+                    (parse(&app, main), vec![import("bridge", &mid)]),
+                    (parse(&mid, relay), vec![import("leaf", &lib)]),
+                    (parse(&lib, library), Vec::new()),
+                ], vec![app.clone(), mid.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let run_chain = |count: usize| {
+                let mut owners = vec![mid.clone()];
+                owners.extend((1..count).map(|index| {
+                    SourceIdentity::new("project".into(), "package".into(), format!("src/relay{index}.w"), index.to_string())
+                }));
+                let parser = |source: &SourceIdentity, text: &str| {
+                    crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1
+                };
+                let edge = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                    binding: binding.to_owned(), target: target.clone(), span: ByteSpan::new(0, 0),
+                };
+                let mut catalogs = vec![(parser(&app, main), vec![edge("bridge", &mid)])];
+                for (index, owner) in owners.iter().enumerate() {
+                    let (text, child) = if let Some(next) = owners.get(index + 1) {
+                        (relay.replace("src/lib.w", &format!("src/relay{}.w", index + 1))
+                            .replace("leaf.descend(input, 2, input, 4)", "leaf.relay(input)"), next)
+                    } else {
+                        (relay.to_owned(), &lib)
+                    };
+                    catalogs.push((parser(owner, &text), vec![edge("leaf", child)]));
+                }
+                catalogs.push((parser(&lib, library), Vec::new()));
+                let order = std::iter::once(app.clone()).chain(owners).chain(std::iter::once(lib.clone())).collect();
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), catalogs, order, ScalarPreparationInputs { target_layout }, package, Vec::new(),
+                )
+            };
+            let capped = run_chain(MAX_SYMBOLIC_SUMMARY_LINEAGE).unwrap();
+            assert!(capped.active && capped.symbolic_diagnostic.is_none() && capped.directives.is_empty());
+            assert!(matches!(run_chain(MAX_SYMBOLIC_SUMMARY_LINEAGE + 1), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let covered = run(main, relay, library, package).unwrap();
+            assert!(covered.active && covered.directives.is_empty() && covered.symbolic_diagnostic.is_none());
+            let bad_clients = main.replace("ensures (out == 7)", "ensures (out == 8)");
+            let refuted = run(&bad_clients, relay, library, package).unwrap();
+            let failures = refuted.symbolic_diagnostic.iter().chain(&refuted.additional_symbolic_diagnostics);
+            assert!(failures.map(|failure| {
+                assert_eq!(failure.returned, BigInt::from(7));
+                assert_eq!(failure.proof.source, app);
+                &bad_clients[failure.proof.range.start as usize..failure.proof.range.end as usize]
+            }).zip(["proof first_client", "proof later_client"]).all(|(actual, expected)| actual.starts_with(expected)));
+            assert_eq!(refuted.additional_symbolic_diagnostics.len(), 1);
+            let bad_relay = relay.replace("ensures (out == 7)", "ensures (out == 8)");
+            let refuted = run(&bad_clients, &bad_relay, library, package).unwrap();
+            assert!(refuted.active && refuted.additional_symbolic_diagnostics.is_empty() && refuted.directives.is_empty());
+            let failure = refuted.symbolic_diagnostic.unwrap();
+            assert_eq!(failure.proof.source, mid);
+            assert_eq!(failure.returned, BigInt::from(7));
+            let with_earlier_effect = bad_clients.replace("%%end", r#"
+                core.require(false, { .stdout = ""; .stderr = "root output"; .code = 61; .files = []; });
+            %%end"#);
+            let ordered = run(&with_earlier_effect, &bad_relay, library, package).unwrap();
+            assert_eq!(ordered.directives.len(), 1);
+            assert_eq!(ordered.directives[0].code(), &BigInt::from(61));
+            let provider = ordered.symbolic_diagnostic.unwrap();
+            assert_eq!(provider.proof.source, mid);
+            assert_eq!(provider.directive_position, 1);
+            let idle = run(&bad_clients, &bad_relay, library, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!idle.active && idle.symbolic_diagnostic.is_none());
+            for malformed in [
+                relay.replace("where (input <= 3)", "where (input <= 4)"),
+                relay.replace("input, 2, input, 4", "input, 2, input, 5"),
+                relay.replace("forwarded };", "forwarded + 0 };"),
+            ] {
+                assert!(matches!(run(main, &malformed, library, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+}

@@ -11,6 +11,8 @@ mod case_splits;
 #[cfg(feature = "internal-checker")]
 mod catalog_composition;
 #[cfg(feature = "internal-checker")]
+mod qualified_demand;
+#[cfg(feature = "internal-checker")]
 mod pointer_proof;
 #[cfg(feature = "internal-checker")]
 mod ranked;
@@ -545,6 +547,7 @@ fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
                 prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
             ),
         }?;
+        proof.complete()?;
         E::finish_symbolic(proof)
     } else {
         E::SymbolicReport::default()
@@ -1147,6 +1150,8 @@ trait SymbolicRootProof {
     const FIXED_ARRAY_RETURN: bool = false;
 
     fn seed(&self, _: &mut HashMap<usize, HashSet<usize>>, _: &HashSet<PreparedCallable>) {}
+
+    fn complete(&self) -> Result<(), ProjectCheck> { Ok(()) }
 
     fn watches_literal_leaf(&self, _: PreparedCallable) -> bool { false }
     fn watches_result_pair(&self, _: PreparedCallable) -> bool { false }
@@ -5042,6 +5047,7 @@ pub struct ScalarCheckerIeeeEntry {
 struct SelectedSymbolicProof<'a, 'case> {
     watched: &'case MainFlowProofObserver<'a>,
     equalities: SymbolicSummaryIndex<'a>,
+    qualified: qualified_demand::Cache<'a>,
     failure: Option<SymbolicProofDiagnostic>,
     additional_failures: Vec<SymbolicProofDiagnostic>,
     snapshot_work: usize,
@@ -5115,7 +5121,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
         };
         if scalar_return || matches!(&origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
             let eligible = matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
-                || (scalar_return && qualified_layout.is_none() && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
+                || (scalar_return && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
                     && origin.arguments.as_slice().len() == 1);
             if !eligible || !matches!(result, ImportedVerifiedReturn::Constant { .. })
             {
@@ -5297,8 +5303,13 @@ impl<'a> SymbolicSummaryIndex<'a> {
     }
 
     fn insert_derived(&mut self, summary: VerifiedSymbolicSummary<'a>, provider: PreparedCallable) -> Option<()> {
+        self.insert_linked(summary, provider, false)
+    }
+
+    fn insert_linked(&mut self, summary: VerifiedSymbolicSummary<'a>, provider: PreparedCallable, qualified: bool) -> Option<()> {
         let target = summary.target;
-        if target.0 != provider.0 || provider.1 >= target.1 || self.generation.contains_key(&target)
+        let ordered = if qualified { target.0 != provider.0 } else { target.0 == provider.0 && provider.1 < target.1 };
+        if !ordered || self.generation.contains_key(&target)
             || self.generation.get(&provider) != Some(&1) || self.lookup(provider).is_none()
         {
             return None;
@@ -5408,58 +5419,6 @@ impl SelectedSymbolicProof<'_, '_> {
             self.record(case, function, source, effects.records.len(), failure, None)?;
         }
         Ok((Some(active || returned), reusable))
-    }
-
-    fn try_collect_qualified_ranked_scalar(
-        &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
-        source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
-        ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, '_>>,
-    ) -> Result<Option<bool>, ProjectCheck> {
-        let watched = self.watched;
-        let group = if watched.first.0 == target { Some(&watched.first.1) } else { watched.other.get(&target) };
-        let Some(MainFlowProofCases::Bare { first, rest }) = group.map(|group| &group.cases) else { return Ok(None); };
-        if !rest.is_empty() || first.proof_source != source || first.owner != source || first.bound.literal().is_none() {
-            return Ok(None);
-        }
-        let Some(origins) = ranked_scalar_return_origins(calls) else { return Ok(None); };
-        if origins.iter().any(|(callee, _, origin, _)| callee.0 == target.0
-            || !matches!(origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)))
-        {
-            return Ok(None);
-        }
-        let importing = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
-        if importing.source != *source { return Err(ProjectCheck::Unsupported); }
-        for &(callee, _, _, occurrence) in &origins {
-            let provider = ranked.get_mut(&callee).ok_or(ProjectCheck::Unsupported)?;
-            let owner = runtime.project.modules.get(callee.0).ok_or(ProjectCheck::MissingRoot)?;
-            if !provider.allow_qualified_demand
-                || !completed_namespace_owner(source, &owner.source, callee.0, runtime.visits)
-                || provider.plan.proof_source != &owner.source
-                || !std::ptr::eq(runtime.calls.function_body(callee.0, callee.1, None).ok_or(ProjectCheck::Unsupported)?,
-                    provider.plan.typed.body)
-                || calls.sites.get(occurrence.site).map(|site| &site.target) != Some(provider.plan.canonical_target)
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            provider.verify_qualified_demand()?;
-            if provider.demand_descriptor.is_none() {
-                provider.demand_descriptor = Some(ranked_symbolic_equality(provider.plan, &owner.source)
-                    .ok_or(ProjectCheck::Unsupported)?);
-            }
-        }
-        // Each provider remains private to this immutable analysis run.
-        // The existing ordered evaluator installs each bound only when its
-        // original lexical call and full guard are reached. Its output can
-        // feed the next prepared call, never the provider's verification.
-        let mut imports = Vec::with_capacity(origins.len());
-        for (callee, position, origin, occurrence) in origins {
-            let descriptor = ranked.get(&callee).and_then(|provider| provider.demand_descriptor.as_ref())
-                .ok_or(ProjectCheck::Unsupported)?;
-            let import = descriptor.import_local(target, calls, position, origin, occurrence, true, Some(importing.target_layout))?
-                .ok_or(ProjectCheck::Unsupported)?;
-            imports.push(Some(import));
-        }
-        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut imports).map(|(result, _)| result)
     }
 
     fn record(
@@ -7244,6 +7203,7 @@ struct MainFlowProofTarget<'a> {
     nested_observation_work: usize,
     cases: MainFlowProofCases<'a>,
     issuer: Option<SymbolicSummaryIssuer<'a>>,
+    qualified_issuer: Option<SymbolicSummaryIssuer<'a>>,
     seen: bool,
     required_nested: usize,
     observed_nested: HashSet<wosy_syntax::SourceSpan>,
@@ -7304,7 +7264,7 @@ impl<'a> MainFlowProofTarget<'a> {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
         Self { citation_output_type, exact_citations: None, has_case_citations, case_citations: None,
-            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, issuer: None, seen: false,
+            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, issuer: None, qualified_issuer: None, seen: false,
             required_nested: 0, observed_nested: HashSet::new() }
     }
 
@@ -7974,7 +7934,7 @@ impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
     fn symbolic(&self) -> Self::Symbolic<'_> {
         SelectedSymbolicProof {
             watched: &self.observed,
-            equalities: SymbolicSummaryIndex::default(),
+            equalities: SymbolicSummaryIndex::default(), qualified: qualified_demand::Cache::default(),
             failure: None, additional_failures: Vec::new(), snapshot_work: 0,
         }
     }
@@ -8058,7 +8018,6 @@ struct RankedOrderedSymbolic<'a, 'proof> {
     allow_summary: bool,
     allow_qualified_demand: bool,
     verification: QualifiedRankVerification,
-    demand_descriptor: Option<VerifiedSymbolicSummary<'proof>>,
     verified: Option<VerifiedSymbolicSummary<'proof>>,
 }
 
@@ -8108,7 +8067,7 @@ impl<'a, 'proof> OrderedRunEvidence for RankedOrderedEvidence<'a, 'proof> {
             } else {
                 QualifiedRankVerification::Unexamined
             },
-            demand_descriptor: None, verified: None,
+            verified: None,
         }
     }
 
@@ -8336,6 +8295,10 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
         }
     }
 
+    fn complete(&self) -> Result<(), ProjectCheck> {
+        self.bare.as_ref().map_or(Ok(()), |bare| bare.qualified.complete())
+    }
+
     fn watches_literal_leaf(&self, target: PreparedCallable) -> bool {
         self.bare.as_ref().is_some_and(|bare| bare.watches_literal_leaf(target))
     }
@@ -8357,8 +8320,8 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
             }
             (active, rank.failure.take(), Vec::new())
         } else if let Some(bare) = &mut self.bare {
-            let active = if let Some(active) = bare.try_collect_qualified_ranked_scalar(
-                target, calls, function, source, effects, runtime, &mut self.ranked,
+            let active = if let Some(active) = bare.try_collect_qualified_provider(
+                target, calls, source, effects, runtime, &mut self.ranked,
             )? {
                 Some(active)
             } else {
@@ -8439,6 +8402,20 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
             observer.insert(scope, plan.proof_source == &prepared.source, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
         } else {
             observed = Some(MainFlowProofObserver::from_first_plan(scope, &prepared.source, plan)?);
+        }
+        if LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage
+            && plan.target.0 < startup_count && plan.proof_source == &plan.typed.target.source
+            && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        {
+            let observer = observed.as_mut().ok_or(ProjectCheck::MissingRoot)?;
+            let group = if observer.first.0 == plan.target { &mut observer.first.1 }
+                else { observer.other.get_mut(&plan.target).ok_or(ProjectCheck::MissingRoot)? };
+            // Candidate authority is kept separate from legacy local issuers.
+            // Job discovery rejects sibling proofs; the qualified edge and
+            // full caller check must succeed before any summary is published.
+            group.qualified_issuer = Some(SymbolicSummaryIssuer {
+                canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body: plan.typed.body,
+            });
         }
     }
     if scope == ScalarCheckerScope::CurrentPackage {
