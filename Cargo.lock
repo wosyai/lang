@@ -1773,8 +1773,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "rowan",
+ "serde",
  "serde_json",
  "surrealkv",
+ "tokio",
+ "wosy-compiler",
  "wosy-project",
  "wosy-protocol",
  "wosy-syntax",

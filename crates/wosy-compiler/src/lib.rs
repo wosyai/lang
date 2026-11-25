@@ -27,7 +27,7 @@ pub use scalar::{
     ScalarProgram, ScalarProject, ScalarProjectPreparationRejection, ScalarProjectValidation,
     ScalarSourceDeclarations, ScalarStruct, ScalarStructField, ScalarStructFieldId, ScalarStructId,
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
-    ScalarValidation, UnaryOperator,
+    ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
 
 mod llvm;

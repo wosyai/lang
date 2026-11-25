@@ -34,6 +34,7 @@ pub enum Kind {
     Config,
     SourcePreparation,
     NamespaceFacts,
+    BaseDeclarations,
 }
 
 impl Kind {
@@ -42,6 +43,7 @@ impl Kind {
         let tags = [
             Token, Syntax, Annotations, File, ExecutableFile, AnnotationFile, Executables,
             AnnotationTree, Dependencies, Module, Config, SourcePreparation, NamespaceFacts,
+            BaseDeclarations,
         ];
         tags.get(tag.checked_sub(1)? as usize).copied()
     }

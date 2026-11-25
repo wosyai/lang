@@ -13,5 +13,8 @@ surrealkv = { version = "1.4", default-features = false }
 wosy-protocol = { path = "../wosy-protocol" }
 blake3.workspace = true
 rowan.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 wosy-project.workspace = true
+wosy-compiler.workspace = true
+serde.workspace = true
+tokio = { version = "1", features = ["sync"] }

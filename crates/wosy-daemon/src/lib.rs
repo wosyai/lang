@@ -1,7 +1,7 @@
 //! Internal source-preparation store. No socket or build/check query yet.
 use rowan::GreenNodeBuilder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use surrealkv::{Durability, Mode, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
@@ -9,7 +9,8 @@ use wosy_protocol::{
     NodeId, SourceConfig,
 };
 use wosy_syntax::{
-    typed_comment_from_token, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind, TypedComment,
+    typed_comment_from_token, AuthoredSpanMap, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind,
+    TypedComment,
 };
 
 const NODES: u8 = 1;
@@ -39,7 +40,14 @@ fn edge(tag: u8, from: NodeId, kind: Edge, to: NodeId) -> [u8; 66] {
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
-pub struct SourceStore(Tree);
+mod base_declarations;
+pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
+
+pub struct SourceStore {
+    tree: Tree,
+    blobs: PathBuf,
+    base_flights: base_declarations::Flights,
+}
 
 #[derive(Default)]
 pub struct PublishReport {
@@ -56,18 +64,18 @@ impl SourceStore {
             .with_versioning(false, 0)
             .with_enable_vlog(false)
             .build()?;
-        Ok(Self(tree))
+        Ok(Self { tree, blobs: dir.join("cas"), base_flights: Default::default() })
     }
 
     pub async fn close(self) -> Result<()> {
-        self.0.close().await?;
+        self.tree.close().await?;
         Ok(())
     }
 
     /// A race restarts publication against a complete committed snapshot.
     pub async fn publish(&self, root: NodeId, delta: &Delta) -> Result<PublishReport> {
         loop {
-            let mut tx = self.0.begin()?;
+            let mut tx = self.tree.begin()?;
             tx.set_durability(Durability::Eventual);
             if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_some() {
                 return Ok(PublishReport::default());
@@ -84,7 +92,7 @@ impl SourceStore {
     }
 
     pub fn snapshot(&self, root: NodeId) -> Result<Option<SourceView>> {
-        let tx = self.0.begin_with_mode(Mode::ReadOnly)?;
+        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
         if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() {
             return Ok(None);
         }
@@ -179,7 +187,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         ExecutableFile | AnnotationFile => count == 1,
         Executables | AnnotationTree | Dependencies => node.data.is_empty(),
         SourcePreparation => supported_top(node),
-        NamespaceFacts => count == 1,
+        NamespaceFacts | BaseDeclarations => count == 1,
     };
     if good { Ok(()) } else { Err("invalid base source schema or node shape".into()) }
 }
@@ -205,6 +213,7 @@ enum Edge {
     Imports,
     NamespaceSource,
     NamespaceAuthority,
+    DeclarationSource,
 }
 
 fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
@@ -232,6 +241,7 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
             _ => (Edge::Files, Exact(File)),
         },
         NamespaceFacts => (Edge::NamespaceSource, Exact(Syntax)),
+        BaseDeclarations => (Edge::DeclarationSource, Exact(Syntax)),
         Token | Annotations | Config => unreachable!("validated leaf"),
     }
 }
@@ -437,24 +447,10 @@ fn restore_authored_spans(imports: &mut [Import], comments: &[TypedComment]) {
     if comments.is_empty() || imports.is_empty() {
         return;
     }
-    // Canonical declarations are in source order and cannot overlap. At an
-    // equal removal boundary, starts are right-biased, exclusive ends left.
-    let mut removed = 0;
-    let mut rest = comments.iter().peekable();
-    let mut expand = |position: u32, include_equal: bool| {
-        while let Some(comment) = rest.peek() {
-            let offset = comment.span.start - removed;
-            if offset > position || (offset == position && !include_equal) {
-                break;
-            }
-            removed += comment.span.end - comment.span.start;
-            rest.next();
-        }
-        position + removed
-    };
+    let authored = AuthoredSpanMap::from_comments(comments);
     for import in imports {
-        import.span.start = expand(import.span.start, true);
-        import.span.end = expand(import.span.end, false);
+        let span = authored.project(wosy_syntax::ByteSpan::new(import.span.start, import.span.end));
+        import.span = wosy_project::ByteSpan::new(span.start, span.end);
     }
 }
 
@@ -550,36 +546,43 @@ pub struct AuthoredFile {
     pub comments: Vec<TypedComment>,
 }
 
+fn file_source(file: &FileEntry) -> Result<SourceIdentity> {
+    let source = &file.metadata.source;
+    let path = source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
+    Ok(SourceIdentity::new(
+        source.project.clone(), source.package.clone(), path.to_owned(), file.metadata.revision.hex(),
+    ))
+}
+
+fn read_cst(tx: &Transaction, root: NodeId) -> Result<CstNode> {
+    let mut green = GreenNodeBuilder::new();
+    let mut stack = vec![Some(root)];
+    while let Some(id) = stack.pop() {
+        let Some(id) = id else {
+            green.finish_node();
+            continue;
+        };
+        let node = read_node(tx, id)?;
+        let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
+        match node.kind {
+            Kind::Syntax => {
+                green.start_node(kind);
+                stack.push(None);
+                stack.extend(node.children.into_iter().rev().map(Some));
+            }
+            Kind::Token => green.token(kind, token_text(&node)?),
+            _ => return Err("invalid CST child".into()),
+        }
+    }
+    Ok(CstNode::new_root(green.finish()))
+}
+
 impl SourceView {
     /// Reconstitute the real Rowan tree from the selected root without reparsing.
     pub fn authored(&self, key: &FileKey) -> Result<AuthoredFile> {
         let file = self.files.get(key).ok_or("file outside selected source root")?;
-        let source = &file.metadata.source;
-        let path = source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
-        let identity = SourceIdentity::new(
-            source.project.clone(), source.package.clone(), path.to_owned(), file.metadata.revision.hex(),
-        );
-        let mut green = GreenNodeBuilder::new();
-        let mut stack = vec![Some(file.authored)];
-        while let Some(id) = stack.pop() {
-            let Some(id) = id else {
-                green.finish_node();
-                continue;
-            };
-            let node = read_node(&self.tx, id)?;
-            let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
-            match node.kind {
-                Kind::Syntax => {
-                    green.start_node(kind);
-                    stack.push(None);
-                    stack.extend(node.children.into_iter().rev().map(Some));
-                }
-                Kind::Token => green.token(kind, token_text(&node)?),
-                _ => return Err("invalid CST child".into()),
-            }
-        }
         Ok(AuthoredFile {
-            cst: CanonicalCstRoot::new(identity, CstNode::new_root(green.finish())),
+            cst: CanonicalCstRoot::new(file_source(file)?, read_cst(&self.tx, file.authored)?),
             comments: read_comments(&self.tx, file.annotation)?,
         })
     }

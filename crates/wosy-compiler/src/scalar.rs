@@ -2268,6 +2268,11 @@ pub struct ScalarValidation {
     pub diagnostics: Vec<super::Diagnostic>,
 }
 
+/// Upgrade the query ABI when this derived representation or its compatible
+/// declaration rules change.
+pub const BASE_DECLARATION_ABI: &str = "wosy base scalar declarations v1";
+
+#[derive(Serialize, Deserialize)]
 pub struct ScalarSourceDeclarations {
     source: SourceIdentity,
     items: Vec<ScalarItem>,
@@ -2283,6 +2288,10 @@ impl ScalarSourceDeclarations {
 
     pub fn diagnostics(&self) -> &[super::Diagnostic] {
         &self.diagnostics
+    }
+
+    pub fn items(&self) -> &[ScalarItem] {
+        &self.items
     }
 
     pub fn namespaces(&self) -> impl Iterator<Item = &ScalarNamespace> {

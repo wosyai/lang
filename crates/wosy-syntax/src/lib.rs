@@ -466,6 +466,34 @@ pub struct TypedComment {
     pub valid: bool,
 }
 
+/// Project executable coordinates through the typed-comment tokens omitted by
+/// that CST. The offsets include original UTF-8 byte widths, not characters.
+pub struct AuthoredSpanMap(Vec<(u32, u32)>);
+
+impl AuthoredSpanMap {
+    pub fn from_comments(comments: &[TypedComment]) -> Self {
+        let mut omitted = 0;
+        Self(comments.iter().map(|comment| {
+            let boundary = comment.span.start - omitted;
+            omitted += comment.span.end - comment.span.start;
+            (boundary, omitted)
+        }).collect())
+    }
+
+    pub fn project(&self, span: ByteSpan) -> ByteSpan {
+        let start = self.expand(span.start, true);
+        let end = if span.start == span.end { start } else { self.expand(span.end, false) };
+        ByteSpan::new(start, end)
+    }
+
+    fn expand(&self, offset: u32, include_equal: bool) -> u32 {
+        let i = self.0.partition_point(|&(boundary, _)| {
+            boundary < offset || (include_equal && boundary == offset)
+        });
+        offset + i.checked_sub(1).map_or(0, |previous| self.0[previous].1)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyntaxError {
     pub span: ByteSpan,
