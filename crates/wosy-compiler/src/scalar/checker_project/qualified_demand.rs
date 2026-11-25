@@ -66,6 +66,7 @@ struct Job<'proof, 'run, 'case> {
     function: &'run ScalarFunction,
     owner: &'run ScalarModule,
     origins: Vec<RankedScalarOrigin<'run>>,
+    conditional_return: bool,
 }
 
 fn qualified_boolean_condition(
@@ -176,15 +177,15 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
         let ScalarItem::Function(function) = owner.items.get(target.1)? else { return None; };
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
         let body = runtime.calls.function_body(target.0, target.1, None)?;
-        let origins = if body.call_occurrences.is_empty() {
+        let (origins, conditional_return) = if body.call_occurrences.is_empty() {
             if !group.qualified_closed_leaf || !body.checker_pure_calling_frame()
                 || !body.structure.checker_direct_targets.is_empty() || !valid_arbitrary_proof_body(body)
             {
                 return None;
             }
-            Vec::new()
+            (Vec::new(), false)
         } else {
-            ranked_scalar_return_origins(body)?
+            scalar_return_origins(body, first.bound.literal().is_none())?
         };
         if (!origins.is_empty() && !origins.iter().any(|(callee, _, _, _)| callee.0 != target.0))
             || origins.iter().any(|(callee, _, _, _)| callee.0 == target.0 && callee.1 >= target.1)
@@ -200,7 +201,7 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
         {
             return None;
         }
-        Some(Self { target, case: first, issuer: group.qualified_issuer.as_ref(), body, function, owner, origins })
+        Some(Self { target, case: first, issuer: group.qualified_issuer.as_ref(), body, function, owner, origins, conditional_return })
     }
 
     fn export_issuer(&self) -> Option<&'case SymbolicSummaryIssuer<'proof>> {
@@ -389,7 +390,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
                 };
                 let (active, directives, returned, failure) =
                     super::super::checker_flow::collect_imported_root_entry_relationship(
-                        job.body, &job.function.body, expected, job.case.filter, &mut imports,
+                        job.body, &job.function.body, expected, job.case.filter, &mut imports, job.conditional_return,
                     ).ok_or(ProjectCheck::Unsupported)?;
                 if active || !directives.is_empty() { return Err(ProjectCheck::Unsupported); }
                 if let Some(failure) = failure {
@@ -802,6 +803,26 @@ mod tests {
             let dormant_affine = run(&wrong_affine_join, &reflected_wrapper, increment, &reflected_leaf,
                 ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_affine.active && dormant_affine.directives.is_empty());
+            let branched_provider = pass_through.replace("second.shift(input); forwarded",
+                "second.shift(input); if (input <= 127) { forwarded } else { input }");
+            let passed = run(symbolic, &branched_provider, increment, exact_alias, package).unwrap();
+            assert!(passed.active && passed.directives.is_empty() && passed.symbolic_diagnostic.is_none());
+            let report = run(&false_entry, &branched_provider, increment, exact_alias, package).unwrap();
+            let [failure] = report.directives.as_slice() else { panic!("qualified branch summary reaches the original caller"); };
+            assert_eq!(failure.code(), &BigInt::from(78));
+            let non_identity_leaf = exact_alias.replace("fn(input) { input }",
+                "fn(input) { u8 reflected = 255 - input; reflected }")
+                .replace("out == core.old(input)", "out == 255 - core.old(input)");
+            let invalidated = run(symbolic, &branched_provider, increment, &non_identity_leaf, package).unwrap();
+            assert!(invalidated.directives.is_empty());
+            let failure = invalidated.symbolic_diagnostic.unwrap();
+            assert_eq!(failure.proof.source, hub);
+            assert_eq!(failure.returned, BigInt::from(255u8));
+            let zero = BigInt::default();
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+            let narrower_provider = exact_alias.replace("ensures", "where (input <= 127) ensures");
+            assert!(matches!(run(symbolic, &branched_provider, increment, &narrower_provider, package),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let enum_source = r#"%%start
                 joined = namespace package "src/hub.w";
                 next = namespace package "src/right.w";

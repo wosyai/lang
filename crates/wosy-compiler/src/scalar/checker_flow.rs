@@ -760,6 +760,7 @@ struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
     goal: OrderedReturnedGoal<'observation>,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
     imported_binding: Option<&'a ReferenceBindingId>,
+    qualified_conditional_return: bool,
     imported_relation_work: Option<&'observation std::cell::RefCell<usize>>,
     observed: &'observation std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
 }
@@ -787,6 +788,11 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
         let axis = match (value, self.imported_binding) {
+            // Admission already authenticated the two exact lexical return
+            // occurrences. Do not require both to be the final imported slot
+            // or collapse distinct lanes before checking their entry relation.
+            (IntegerReturn::Alias(binding), Some(_)) if self.qualified_conditional_return =>
+                Some(roots.lookup(binding)?.0),
             (IntegerReturn::Alias(binding), Some(expected)) if binding == expected => {
                 let (axis, _) = roots.lookup(binding)?;
                 if axis < roots.parameters { return None; }
@@ -3682,7 +3688,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<TOTAL>(
-        calls, body, OrderedReturnedGoal::Literal(relation, bound), predicate, entry_filter, &mut [],
+        calls, body, OrderedReturnedGoal::Literal(relation, bound), predicate, entry_filter, &mut [], false,
     )
 }
 
@@ -3692,7 +3698,7 @@ pub(super) fn collect_imported_root_literal_proof<'a>(
     entry_filter: &[CheckerPredicate], imports: &mut [Option<ImportedLocal<'a>>],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<true>(
-        calls, body, OrderedReturnedGoal::Literal(relation, bound), None, Some(entry_filter), imports,
+        calls, body, OrderedReturnedGoal::Literal(relation, bound), None, Some(entry_filter), imports, false,
     )
 }
 
@@ -3700,11 +3706,12 @@ pub(super) fn collect_imported_root_literal_proof<'a>(
 pub(super) fn collect_imported_root_entry_relationship<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, expected: &IntegerAffineTransform,
     entry_filter: &[CheckerPredicate], imports: &mut [Option<ImportedLocal<'a>>],
+    qualified_conditional_return: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let [input] = calls.boundary.parameters.as_slice() else { return None; };
     if imports.is_empty() || &input.ty != integer_tail_type(calls)? { return None; }
     collect_ordered_root_literal_proof_with_imports::<true>(
-        calls, body, OrderedReturnedGoal::Entry(expected), None, Some(entry_filter), imports,
+        calls, body, OrderedReturnedGoal::Entry(expected), None, Some(entry_filter), imports, qualified_conditional_return,
     )
 }
 
@@ -3714,7 +3721,7 @@ pub(super) fn collect_ordered_root_quantified_proof<'a>(
     entry_filter: &[CheckerPredicate],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<true>(
-        calls, body, OrderedReturnedGoal::Quantified(goal), None, Some(entry_filter), &mut [],
+        calls, body, OrderedReturnedGoal::Quantified(goal), None, Some(entry_filter), &mut [], false,
     )
 }
 
@@ -3722,7 +3729,7 @@ pub(super) fn collect_ordered_root_quantified_proof<'a>(
 fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, goal: OrderedReturnedGoal<'_>,
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
-    imports: &mut [Option<ImportedLocal<'a>>],
+    imports: &mut [Option<ImportedLocal<'a>>], qualified_conditional_return: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let bounds;
     let guard = if let Some(predicate) = predicate {
@@ -3766,7 +3773,7 @@ fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let scope = OrderedRootLiteralProof::<TOTAL> {
-        conditions: OrderedRootConditions(body, false), goal, guard: guard.as_ref(), imported_binding,
+        conditions: OrderedRootConditions(body, false), goal, guard: guard.as_ref(), imported_binding, qualified_conditional_return,
         imported_relation_work: imported_relation_work.as_ref(), observed: &observed,
     };
     let active = if TOTAL {

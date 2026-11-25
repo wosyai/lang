@@ -5786,6 +5786,13 @@ type RankedScalarOrigin<'a> = (PreparedCallable, usize, &'a CheckerIntegerCallOr
 
 #[cfg(feature = "internal-checker")]
 fn ranked_scalar_return_origins(calls: &FunctionCallSites) -> Option<Vec<RankedScalarOrigin<'_>>> {
+    scalar_return_origins(calls, false).map(|(origins, _)| origins)
+}
+
+#[cfg(feature = "internal-checker")]
+fn scalar_return_origins(
+    calls: &FunctionCallSites, allow_qualified_conditional: bool,
+) -> Option<(Vec<RankedScalarOrigin<'_>>, bool)> {
     if !calls.checker_pure_calling_frame() { return None; }
     let [result] = calls.boundary.results.as_slice() else { return None; };
     let occurrences = &calls.call_occurrences;
@@ -5816,9 +5823,34 @@ fn ranked_scalar_return_origins(calls: &FunctionCallSites) -> Option<Vec<RankedS
     if !matches!(calls.prepared_plain_name(final_output.expression),
         Some(super::reference::PlainNameIdentity::Lexical(binding)) if binding == &last.binding)
     {
-        return None;
+        if !allow_qualified_conditional || root.unsafe_context { return None; }
+        let [formal] = calls.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+        let [input] = calls.boundary.parameters.as_slice() else { return None; };
+        if input.ty != result.ty { return None; }
+        let allowed = |binding: &ReferenceBindingId| binding == formal
+            || origins.iter().any(|(_, _, origin, _)| binding == &origin.binding);
+        let ConditionalRegion::Value { condition, then_block, else_block, .. } =
+            calls.conditionals.get(&final_output.expression)? else { return None; };
+        let CheckerPredicate::Integer(predicate) = structure.checker_branches.get(condition)? else { return None; };
+        if predicate.ty != result.ty || !allowed(&predicate.binding)
+            || then_block == else_block || *then_block == structure.root || *else_block == structure.root
+        {
+            return None;
+        }
+        for arm in [then_block, else_block] {
+            let region = structure.blocks.get(arm.0)?;
+            let [BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }] = region.items.as_slice() else { return None; };
+            if region.unsafe_context || slot.output != 0
+                || structure.checked_types.expressions.get(&slot.expression)? != &result.ty
+                || !matches!(calls.prepared_plain_name(slot.expression),
+                    Some(super::reference::PlainNameIdentity::Lexical(binding)) if allowed(binding))
+            {
+                return None;
+            }
+        }
+        return Some((origins, true));
     }
-    Some(origins)
+    Some((origins, false))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -13758,7 +13790,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                             // scheduler must authenticate each completed owner
                             // and check this goal on the exact imported row.
                             matches!(body.boundary.parameters.as_slice(), [input] if input.ty == result.ty)
-                                && ranked_scalar_return_origins(body).is_some_and(|origins|
+                                && scalar_return_origins(body, true).is_some_and(|(origins, _)|
                                     origins.iter().any(|(target, _, _, _)| target.0 != owner))
                         })))
             {
