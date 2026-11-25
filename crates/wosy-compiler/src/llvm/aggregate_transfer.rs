@@ -686,8 +686,10 @@ pub(super) fn definition_type<'ctx>(
             return Err("invalid array descriptor declaration".into());
         };
         let forward = plan.guarded_array_descriptor_forward.is_some();
-        if (forward && (parameters.as_slice() != [ScalarType::U64] || plan.literal_array.is_some()))
-            || (!forward && !matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. })))
+        let choice = plan.guarded_array_descriptor_producer_choice.is_some();
+        if (forward && choice)
+            || ((forward || choice) && (parameters.as_slice() != [ScalarType::U64] || plan.literal_array.is_some()))
+            || (!(forward || choice) && !matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. })))
             || !matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty: ScalarType::RuntimeArray { .. }, .. }])
             || !dynamic_return_outputs(function.span, cfg).is_empty()
         {
@@ -1471,7 +1473,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
-        || plan.array_descriptor_observer.is_some()
+        || plan.array_descriptor_observer.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 
@@ -2401,6 +2403,19 @@ pub(super) fn commit_return<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(());
     };
+    if let Some(occurrence) = aggregate.plan.guarded_array_descriptor_producer_choice {
+        let bound = block.final_expressions().next().and_then(|(expression, _)|
+            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+        let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = result else {
+            return Err("missing selected guarded array descriptor".into());
+        };
+        if bound != Some(occurrence) || pair.get_type() != array_descriptor_type(context)
+            || aggregate.array_descriptor_result.replace(*pair).is_some()
+        {
+            return Err("selected guarded array descriptor did not match its exact output".into());
+        }
+        return Ok(());
+    }
     if let Some(ClosedLiteralArray::FreshLeaf { output, .. }) = aggregate.plan.literal_array {
         let bound = block.final_expressions().next()
             .and_then(|(expression, _)| state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));

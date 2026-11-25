@@ -4079,6 +4079,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             ScalarExpression::Boolean { .. } => true,
                             ScalarExpression::Name { .. } => matches!(sites.prepared_plain_name(*predicate),
                                 Some(PlainNameIdentity::Lexical(_))),
+                            ScalarExpression::Binary { operator: BinaryOperator::Equal | BinaryOperator::NotEqual,
+                                left, right, .. } =>
+                                [(left.as_ref(), OccurrenceEdge::BinaryLeft), (right.as_ref(), OccurrenceEdge::BinaryRight)]
+                                    .into_iter().all(|(value, edge)| {
+                                        let Some(OccurrenceNode::Expression(operand)) = sites.structure.edges
+                                            .get(&(OccurrenceParent::Expression(*predicate), edge)) else { return false; };
+                                        sites.structure.checked_types.expressions.get(operand) == Some(&ScalarType::U64)
+                                            && match value {
+                                                ScalarExpression::Integer { .. } => true,
+                                                ScalarExpression::Name { .. } => matches!(sites.prepared_plain_name(*operand),
+                                                    Some(PlainNameIdentity::Lexical(_))),
+                                                _ => false,
+                                            }
+                                    }),
                             _ => false,
                         }
                     { return None; }
@@ -5668,7 +5682,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         ExpressionReadMode::Ordinary
                     };
-                    let value = self.expression_with_read_mode(expression, scope, ordinal, mode)?;
+                    let guarded_owner_choice = !block.unsafe_context && self.generic_parameters.is_empty()
+                        && scope == ReferenceScopeId(0)
+                        && matches!(region.items.as_slice(), [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }]
+                            if row.output == 0 && row.expression == ordinal)
+                        && matches!(calls.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
+                        && matches!(expression, ScalarExpression::If { .. })
+                        && matches!(calls.boundary.root_outputs.as_slice(), [output]
+                            if matches!(&output.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element)))
+                        && super::typecheck::guarded_runtime_rhs(expression);
+                    let previous = self.capture_call_points;
+                    self.capture_call_points |= guarded_owner_choice;
+                    let value = self.expression_with_read_mode(expression, scope, ordinal, mode);
+                    self.capture_call_points = previous;
+                    let value = value?;
+                    if guarded_owner_choice {
+                        let ty = &calls.boundary.root_outputs[0].ty;
+                        if let Some(paths) = self.guarded_runtime_call_paths(expression, ordinal, ty) {
+                            self.aggregate_result.guarded_array_producer_choice = Some((ordinal, paths));
+                        }
+                    }
                     let value_point = self.cursor.expect("evaluated output expression");
                     let widened_arm = self.aggregate_result.widened_join_arms.get(&ordinal.0)
                         .is_some_and(|declaration| matches!(expression, ScalarExpression::Name { span, .. }
@@ -16804,6 +16837,7 @@ impl FunctionReferenceResult {
             if self.aggregate.has_observations()
                 || !self.aggregate.ordinary_fallible_call_candidates.is_empty()
                 || !self.aggregate.ordinary_fallible_expressions.is_empty()
+                || self.aggregate.guarded_array_producer_choice.is_some()
             {
                 facts.insert((item, arm), self.aggregate);
             }

@@ -1335,6 +1335,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
     pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) guarded_array_choices: BTreeSet<usize>,
+    pub(super) guarded_array_producer_choice: Option<(OccurrenceOrdinal, Vec<(CfgPointId, OccurrenceOrdinal)>)>,
     pub(super) ordinary_fallible_expressions: Vec<Vec<GuardedNumericExpression>>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
@@ -3054,6 +3055,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_return: bool,
     pub(crate) guarded_array_descriptor_leaf: bool,
     pub(crate) guarded_array_descriptor_forward: Option<usize>,
+    pub(crate) guarded_array_descriptor_producer_choice: Option<usize>,
     pub(crate) guarded_array_descriptor_choices: BTreeSet<usize>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
@@ -7217,6 +7219,7 @@ fn closed_aggregates<'a>(
     enum GuardedArrayRoute {
         Fresh(ClosedLiteralArray),
         Forward(OccurrenceOrdinal),
+        Choice(OccurrenceOrdinal),
     }
     let guarded_array_cohort = |target: BodyKey| {
         // Pure forwards need not be present in the observation-only body map.
@@ -7239,15 +7242,25 @@ fn closed_aggregates<'a>(
                 receipt: OriginalArrayReceipt { origin: allocation.bind, allocation: (allocation.position.block.0, allocation.position.item) },
                 length_occurrence: allocation.length_occurrence.0, extent: allocation.extent, output: occurrence.0,
             };
-            return (allocation.extent == FreshArrayExtent::Formal).then_some((GuardedArrayRoute::Fresh(route), None, &output.ty));
+            return (allocation.extent == FreshArrayExtent::Formal).then_some((GuardedArrayRoute::Fresh(route), Vec::new(), &output.ty));
         }
         let root = sites.structure.blocks.get(sites.structure.root.0)?;
         let [item] = root.items.as_slice() else { return None; };
         let BlockItemKind::FinalOutput(final_value) = &item.kind else { return None; };
+        if final_value.output != 0 || !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty() {
+            return None;
+        }
+        if let Some((choice, paths)) = facts.and_then(|facts| facts.guarded_array_producer_choice.as_ref()) {
+            if *choice != final_value.expression || paths.len() != sites.call_occurrences.len() {
+                return None;
+            }
+            let dependencies = paths.iter().map(|&(point, occurrence)|
+                Some((target_body(&declarations, cfg, point)?, occurrence)))
+                .collect::<Option<Vec<_>>>()?;
+            return Some((GuardedArrayRoute::Choice(*choice), dependencies, &output.ty));
+        }
         let [call] = sites.call_occurrences.as_slice() else { return None; };
-        if final_value.output != 0 || final_value.expression != call.ordinal
-            || !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
-        { return None; }
+        if final_value.expression != call.ordinal { return None; }
         let signature = sites.checked_call_signatures.get(&call.ordinal)?;
         if signature.parameters.as_slice() != [ScalarType::U64]
             || !matches!(signature.outputs.outputs.as_slice(), [actual] if same_runtime_array_type(&actual.ty, &output.ty))
@@ -7276,43 +7289,52 @@ fn closed_aggregates<'a>(
                     }
             })
         { return None; }
-        Some((GuardedArrayRoute::Forward(call.ordinal), Some(target_body(&declarations, cfg, point.id)?), &output.ty))
+        Some((GuardedArrayRoute::Forward(call.ordinal), vec![(target_body(&declarations, cfg, point.id)?, call.ordinal)], &output.ty))
     };
+    let invalid = || "guarded owned array call requires an exact private fresh dynamic producer or sealed forwarding path".to_owned();
     let mut guarded_array_cohorts = BTreeMap::<BodyKey, (GuardedArrayRoute, &ScalarType, BTreeSet<(BodyKey, usize)>)>::new();
-    for (caller, cfg, point, ordinal) in guarded_array_requests {
-        let invalid = || "guarded owned array call requires an exact private fresh dynamic producer or sealed forwarding path".to_owned();
-        let mut current = target_body(&declarations, cfg, point).ok_or_else(invalid)?;
-        let mut incoming = (caller, ordinal.0);
-        let mut previous_type = None;
-        let mut visited = BTreeSet::new();
-        let mut pending = Vec::new();
-        loop {
-            if let Some((_, ty, sites)) = guarded_array_cohorts.get_mut(&current) {
-                if previous_type.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
-                sites.insert(incoming);
-                break;
-            }
-            if !visited.insert(current) { return Err(invalid()); }
-            let (route, next, ty) = guarded_array_cohort(current).ok_or_else(invalid)?;
-            if previous_type.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
-            pending.push((current, route, ty, incoming));
-            match (route, next) {
-                (GuardedArrayRoute::Fresh(_), None) => break,
-                (GuardedArrayRoute::Forward(call), Some(next)) => {
-                    incoming = (current, call.0);
-                    current = next;
-                    previous_type = Some(ty);
-                }
-                _ => return Err(invalid()),
-            }
+    let mut waiting = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
+    let mut unresolved = BTreeMap::<BodyKey, usize>::new();
+    let mut ready = Vec::new();
+    let mut pending = guarded_array_requests.into_iter().map(|(caller, cfg, point, occurrence)|
+        Ok((target_body(&declarations, cfg, point).ok_or_else(invalid)?, (caller, occurrence.0), None)))
+        .collect::<Result<Vec<_>, String>>()?;
+    // First collect each reachable shape once, recording all exact incoming
+    // call occurrences including shared suffixes and duplicate targets.
+    while let Some((target, incoming, expected)) = pending.pop() {
+        if let Some((_, ty, sites)) = guarded_array_cohorts.get_mut(&target) {
+            if expected.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
+            sites.insert(incoming);
+            continue;
         }
-        // Cache only fully grounded suffixes. Their incoming uses remain
-        // subject to the global closed-use check, including relay call sites.
-        for (body, route, ty, incoming) in pending {
-            ordinary.transport_uses.entry(body).or_insert_with(|| Some(Vec::new()));
-            guarded_array_cohorts.insert(body, (route, ty, BTreeSet::from([incoming])));
+        let (route, dependencies, ty) = guarded_array_cohort(target).ok_or_else(invalid)?;
+        if expected.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
+        ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
+        guarded_array_cohorts.insert(target, (route, ty, BTreeSet::from([incoming])));
+        if dependencies.is_empty() {
+            if !matches!(route, GuardedArrayRoute::Fresh(_)) { return Err(invalid()); }
+            ready.push(target);
+        } else {
+            unresolved.insert(target, dependencies.len());
+            for (child, occurrence) in dependencies {
+                waiting.entry(child).or_default().push(target);
+                pending.push((child, (target, occurrence.0), Some(ty)));
+            }
         }
     }
+    // Only fresh leaves seed completion. A relay/selection is authorized
+    // after every alternative drains; an ungrounded cycle cannot do so.
+    while let Some(grounded) = ready.pop() {
+        for parent in waiting.remove(&grounded).into_iter().flatten() {
+            let remaining = unresolved.get_mut(&parent).ok_or_else(invalid)?;
+            *remaining -= 1;
+            if *remaining == 0 {
+                unresolved.remove(&parent);
+                ready.push(parent);
+            }
+        }
+    }
+    if !unresolved.is_empty() { return Err(invalid()); }
     ordinary.census(reservations, &module_at, &declarations);
     for (target, (_, _, sites)) in &guarded_array_cohorts {
         let observed = ordinary.transport_uses.get(target).and_then(Option::as_ref)
@@ -7728,6 +7750,10 @@ fn closed_aggregates<'a>(
                 GuardedArrayRoute::Forward(call) => {
                     if target.literal_array.is_some() { return Err("conflicting guarded owned array relay plan".into()); }
                     target.guarded_array_descriptor_forward = Some(call.0);
+                }
+                GuardedArrayRoute::Choice(choice) => {
+                    if target.literal_array.is_some() { return Err("conflicting guarded owned array producer selection plan".into()); }
+                    target.guarded_array_descriptor_producer_choice = Some(choice.0);
                 }
             }
             target.array_descriptor_return = true;

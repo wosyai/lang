@@ -6680,6 +6680,17 @@ fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     calls
 }
 
+pub(super) fn guarded_runtime_predicate(expression: &ScalarExpression) -> bool {
+    let atom = |value: &ScalarExpression| matches!(value,
+        ScalarExpression::Name { .. } | ScalarExpression::Integer { .. });
+    match expression {
+        ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. } => true,
+        ScalarExpression::Binary { operator: BinaryOperator::Equal | BinaryOperator::NotEqual,
+            left, right, .. } => atom(left) && atom(right),
+        _ => false,
+    }
+}
+
 pub(super) fn guarded_runtime_rhs(expression: &ScalarExpression) -> bool {
     let mut nodes = vec![expression];
     while let Some(node) = nodes.pop() {
@@ -6688,7 +6699,7 @@ pub(super) fn guarded_runtime_rhs(expression: &ScalarExpression) -> bool {
                 if type_arguments.is_empty()
                     && matches!(arguments.as_slice(), [ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }]) => {},
             ScalarExpression::If { condition, then_branch, else_branch, .. }
-                if matches!(condition.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. }) =>
+                if guarded_runtime_predicate(condition) =>
             {
                 for arm in [else_branch, then_branch] {
                     let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };

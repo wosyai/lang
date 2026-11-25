@@ -14523,7 +14523,15 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
         "observed(true, 3, 9, 1) != 99 || observed(false, 9, 2, 1) != 99\n    || observed(false, 9, 0, 0) != 0 || observed(true, 3, 9, 2) != 3\n    || observed(false, 9, 2, 1) != 2 || observed(false, 9, 2, 4294967297) != 0",
     );
     assert_ne!(conditional, text);
-    for (text, choice) in [(text, false), (conditional.as_str(), true)] {
+    let producer_choice = text.replace(
+        "u64(u64, u64) observed",
+        "u64[](u64) _choose = fn(count) { if (count == 3) { _forward(count) } else { _make(count) } };\nu64(u64, u64) observed",
+    ).replace("u64[] held =? _forward(count);", "u64[] held =? _choose(count);")
+        .replace("observed(3, 1) != 99 ||", "observed(3, 1) != 99 || observed(2, 1) != 99 ||");
+    assert_ne!(producer_choice, text);
+    for (text, receiver_choice, producer_choice) in [
+        (text, false, false), (conditional.as_str(), true, false), (producer_choice.as_str(), false, true),
+    ] {
         let absent_extent = text.replace("    if (&held == null)", "    core.array_len(&held); if (&held == null)");
         let mixed = text.replace("%%end", "u64() other = fn { u64[] item = _make(3); item; 0 }; other();\n%%end");
         for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -14585,22 +14593,33 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
                     assert_eq!(known_field_operand(call, 0), relay.get_first_param());
                     assert_eq!(known_field_operand(returned, 0).unwrap().as_instruction_value(), Some(call));
                 }
-                let [returned] = calls_to(observed, forward)[..] else { panic!("{llvm}") };
+                let chooser = if producer_choice { authored("_choose") } else { observed };
+                let [chosen_left] = calls_to(chooser, forward)[..] else { panic!("{llvm}") };
                 let [release] = calls_to(observed, free)[..] else { panic!("{llvm}") };
-                let descriptor_origin = if choice {
-                    let [other] = calls_to(observed, make)[..] else { panic!("{llvm}") };
-                    let join = instructions(observed).find(|instruction| instruction.get_opcode() == InstructionOpcode::Phi
+                let selected = if receiver_choice || producer_choice {
+                    let [other] = calls_to(chooser, make)[..] else { panic!("{llvm}") };
+                    let join = instructions(chooser).find(|instruction| instruction.get_opcode() == InstructionOpcode::Phi
                         && inkwell::values::PhiValue::try_from(*instruction).is_ok_and(|phi| phi.as_basic_value().get_type() == descriptor.into())).unwrap();
                     let phi = inkwell::values::PhiValue::try_from(join).unwrap();
                     assert_eq!(phi.count_incoming(), 2);
                     let incoming = [phi.get_incoming(0).unwrap(), phi.get_incoming(1).unwrap()];
-                    for call in [returned, other] {
+                    for call in [chosen_left, other] {
                         assert!(incoming.iter().any(|(value, predecessor)|
                             value.as_instruction_value() == Some(call) && Some(*predecessor) == call.get_parent()));
                     }
                     assert_ne!(incoming[0].1, incoming[1].1);
                     join
-                } else { returned };
+                } else { chosen_left };
+                let descriptor_origin = if producer_choice {
+                    assert_eq!(chooser.get_linkage(), inkwell::module::Linkage::Internal);
+                    assert_eq!(chooser.get_type().get_return_type(), Some(descriptor.into()));
+                    assert!(calls_to(chooser, alloc).is_empty() && calls_to(chooser, free).is_empty());
+                    let returned = selected.get_next_instruction().unwrap();
+                    assert_eq!(returned.get_opcode(), InstructionOpcode::Return);
+                    assert_eq!(known_field_operand(returned, 0).unwrap().as_instruction_value(), Some(selected));
+                    let [result] = calls_to(observed, chooser)[..] else { panic!("{llvm}") };
+                    result
+                } else { selected };
                 let backing = descriptor_origin.get_next_instruction().unwrap();
                 let extent = backing.get_next_instruction().unwrap();
                 assert_eq!(backing.get_indices(), vec![0]);
@@ -14620,7 +14639,9 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
                     assert_eq!(check.get_icmp_predicate(), Some(inkwell::IntPredicate::UGE));
                     assert_eq!(known_field_operand(check, 1).unwrap().as_instruction_value(), Some(extent));
                 }
-                if let Some(out) = std::env::var_os(if choice {
+                if let Some(out) = std::env::var_os(if producer_choice {
+                    "WOSY_GUARDED_RUNTIME_ARRAY_PRODUCER_CHOICE_IR_DIR"
+                } else if receiver_choice {
                     "WOSY_GUARDED_RUNTIME_ARRAY_CHOICE_IR_DIR"
                 } else { "WOSY_GUARDED_RETURNED_RUNTIME_ARRAY_IR_DIR" }) {
                     let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
