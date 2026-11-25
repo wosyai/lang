@@ -11,7 +11,7 @@ pub(super) struct AuthoredMatch {
 struct Arm {
     variant: String,
     body: ScalarBlock,
-    binder: Option<String>,
+    binders: Vec<String>,
     span: ByteSpan,
 }
 
@@ -25,7 +25,7 @@ pub(super) struct MatchArm<'a> {
     #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
     pub(super) tag: u32,
     pub(super) body: &'a ScalarBlock,
-    pub(super) binder: Option<(&'a str, &'a ScalarType)>,
+    pub(super) binders: Vec<(&'a str, &'a ScalarType)>,
 }
 
 pub(super) enum Selector<'a> {
@@ -33,7 +33,7 @@ pub(super) enum Selector<'a> {
         #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
         tag: u32,
         #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
-        payload: Option<Payload>,
+        payload: Vec<Payload>,
     },
     If { condition: &'a ScalarExpression, then_branch: Box<Selector<'a>>, else_branch: Box<Selector<'a>> },
 }
@@ -84,15 +84,14 @@ impl AuthoredMatch {
                 .filter_map(|element| element.into_token())
                 .filter(|token| token.kind() == SyntaxKind::Identifier)
                 .map(|token| token.text().to_owned()).collect::<Vec<_>>();
-            let binder = match binders.as_slice() {
-                [] => None,
-                [binder] => Some(binder.clone()),
-                _ => return Err(MatchError::unsupported(span, "authored match supports at most one scalar payload binder")),
-            };
+            let unique = binders.iter().collect::<HashSet<_>>();
+            if unique.len() != binders.len() {
+                return Err(MatchError::invalid(span, "duplicate enum payload binder"));
+            }
             let variant = direct_token(&node, SyntaxKind::Identifier)
                 .ok_or_else(|| MatchError::invalid(span, "missing enum variant pattern"))?.text().to_owned();
             let body = derive_block(&child(&node, SyntaxKind::Block)?);
-            arms.push(Arm { variant, body, binder, span });
+            arms.push(Arm { variant, body, binders, span });
         }
         Ok(Self { selector, arms, span })
     }
@@ -100,31 +99,33 @@ impl AuthoredMatch {
     pub(super) fn resolve<'a>(&'a self, source: &SourceIdentity, enums: &'a [ScalarEnum],
         inputs: &impl Fn(&str, &ScalarType) -> bool, work: &mut usize,
     ) -> Result<ResolvedMatch<'a>, MatchError> {
-        let mut resolver = Resolver { enums, source, enumeration: None, work };
+        let mut resolver = Resolver { enums, source, enumeration: None, variants: HashMap::new(), work };
         let selector = resolver.resolve(&self.selector, inputs, 0)?;
         let enumeration = resolver.enumeration.ok_or_else(|| MatchError::unsupported(self.span,
             "authored match requires a resolved enum selector"))?;
-        charge(work, enumeration.variants().len(), self.span)?;
+        let mut tags = resolver.variants;
+        charge(work, self.arms.len(), self.span)?;
         if self.arms.len() != enumeration.variants().len() {
             return Err(MatchError::invalid(self.span, "authored match must cover every enum variant exactly once"));
-        }
-        let mut tags = enumeration.variants().iter().map(|variant| (variant.name.as_str(), variant))
-            .collect::<HashMap<_, _>>();
-        if tags.len() != enumeration.variants().len() {
-            return Err(MatchError::invalid(self.span, "ambiguous enum variant declarations"));
         }
         let mut arms = Vec::with_capacity(self.arms.len());
         for arm in &self.arms {
             let variant = tags.remove(arm.variant.as_str()).ok_or_else(|| MatchError::invalid(arm.span,
                 "duplicate or unknown enum variant pattern"))?;
-            let binder = match (variant.payload.as_slice(), arm.binder.as_deref()) {
-                ([], None) => None,
-                ([slot], Some(binder)) if is_integer_type(&slot.ty) => Some((binder, &slot.ty)),
-                ([], Some(_)) => return Err(MatchError::unsupported(arm.span, "tag-only variant has no payload binder")),
-                ([slot], _) if is_integer_type(&slot.ty) => return Err(MatchError::invalid(arm.span, "variant pattern requires its payload binder")),
-                _ => return Err(MatchError::unsupported(arm.span, "authored match supports one scalar integer payload")),
-            };
-            arms.push(MatchArm { tag: variant.tag, body: &arm.body, binder });
+            charge(work, variant.payload.len(), arm.span)?;
+            if variant.payload.len() != arm.binders.len() {
+                let error = if variant.payload.is_empty() {
+                    MatchError::unsupported(arm.span, "tag-only variant has no payload binder")
+                } else { MatchError::invalid(arm.span, "variant pattern does not match the payload arity") };
+                return Err(error);
+            }
+            let binders = arm.binders.iter().zip(&variant.payload).map(|(name, slot)| {
+                if !is_integer_type(&slot.ty) {
+                    return Err(MatchError::unsupported(arm.span, "authored match supports integer payloads"));
+                }
+                Ok((name.as_str(), &slot.ty))
+            }).collect::<Result<_, _>>()?;
+            arms.push(MatchArm { tag: variant.tag, body: &arm.body, binders });
         }
         Ok(ResolvedMatch { selector, arms })
     }
@@ -134,6 +135,7 @@ struct Resolver<'a, 'w> {
     enums: &'a [ScalarEnum],
     source: &'w SourceIdentity,
     enumeration: Option<&'a ScalarEnum>,
+    variants: HashMap<&'a str, &'a ScalarEnumVariant>,
     work: &'w mut usize,
 }
 
@@ -151,8 +153,8 @@ impl<'a> Resolver<'a, '_> {
             _ => None,
         };
         if let Some((receiver, name, arguments)) = selected {
-            let enumeration = match self.enumeration {
-                Some(enumeration) if enumeration.name == *receiver => enumeration,
+            match self.enumeration {
+                Some(enumeration) if enumeration.name == *receiver => {},
                 Some(_) => return Err(MatchError::invalid(span, "authored match selector mixes enum declarations")),
                 None => {
                     charge(self.work, self.enums.len(), span)?;
@@ -163,38 +165,38 @@ impl<'a> Resolver<'a, '_> {
                         return Err(MatchError::invalid(span, "ambiguous authored match enum declaration"));
                     }
                     self.enumeration = Some(enumeration);
-                    enumeration
+                    charge(self.work, enumeration.variants().len(), span)?;
+                    self.variants = enumeration.variants().iter()
+                        .map(|variant| (variant.name.as_str(), variant)).collect();
+                    if self.variants.len() != enumeration.variants().len() {
+                        return Err(MatchError::invalid(span, "ambiguous enum variant declarations"));
+                    }
                 }
             };
-            charge(self.work, enumeration.variants().len(), span)?;
-            let mut variants = enumeration.variants().iter().filter(|variant| variant.name == *name);
-            let selected = variants.next().ok_or_else(|| MatchError::invalid(span, "unknown authored match selector variant"))?;
-            if variants.next().is_some() {
-                return Err(MatchError::invalid(span, "ambiguous authored match selector variant"));
+            let selected = self.variants.get(name.as_str()).ok_or_else(|| MatchError::invalid(span, "unknown authored match selector variant"))?;
+            charge(self.work, selected.payload.len().max(arguments.len()), span)?;
+            if selected.payload.len() != arguments.len() {
+                return Err(MatchError::invalid(span, "enum constructor does not match the payload arity"));
             }
-            let payload = match (selected.payload.as_slice(), arguments) {
-                ([], []) => None,
-                ([slot], [value]) if is_integer_type(&slot.ty) => {
-                    let value_span = expression_span(value);
-                    let payload = if let ScalarExpression::Name { name, .. } = value {
-                        if !inputs(name, &slot.ty) {
-                            return Err(MatchError::invalid(value_span, "payload input does not have the declared integer type"));
-                        }
-                        Payload::Entry(name.clone())
-                    } else {
-                        let literal = concrete_integer_literal(value).ok_or_else(|| MatchError::unsupported(
-                            value_span, "authored payload must be an integer literal or proof input"))?;
-                        if !integer_literal_fits_type(literal.as_ref(), &slot.ty) {
-                            return Err(MatchError::invalid(value_span, "payload literal does not fit the declared integer type"));
-                        }
-                        Payload::Literal(literal.into_owned())
-                    };
-                    Some(payload)
+            let payload = selected.payload.iter().zip(arguments).map(|(slot, value)| {
+                let value_span = expression_span(value);
+                if !is_integer_type(&slot.ty) {
+                    return Err(MatchError::unsupported(value_span, "authored match supports integer payloads"));
                 }
-                ([], _) => return Err(MatchError::invalid(span, "tag-only constructor takes no payload")),
-                ([slot], _) if is_integer_type(&slot.ty) => return Err(MatchError::invalid(span, "enum constructor requires one typed payload")),
-                _ => return Err(MatchError::unsupported(span, "authored match supports one scalar integer payload")),
-            };
+                if let ScalarExpression::Name { name, .. } = value {
+                    if !inputs(name, &slot.ty) {
+                        return Err(MatchError::invalid(value_span, "payload input does not have the declared integer type"));
+                    }
+                    Ok(Payload::Entry(name.clone()))
+                } else {
+                    let literal = concrete_integer_literal(value).ok_or_else(|| MatchError::unsupported(
+                        value_span, "authored payload must be an integer literal or proof input"))?;
+                    if !integer_literal_fits_type(literal.as_ref(), &slot.ty) {
+                        return Err(MatchError::invalid(value_span, "payload literal does not fit the declared integer type"));
+                    }
+                    Ok(Payload::Literal(literal.into_owned()))
+                }
+            }).collect::<Result<_, _>>()?;
             return Ok(Selector::Variant { tag: selected.tag, payload });
         }
         match expression {

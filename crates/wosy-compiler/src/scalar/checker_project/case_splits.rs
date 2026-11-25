@@ -24,7 +24,10 @@ pub(super) enum Verdict<F> {
 enum Claim<'a> {
     Literal(IntegerRelation, Cow<'a, BigInt>),
     Entry,
+    Payload { slot: usize, facts: Rc<PayloadFacts> },
 }
+
+type PayloadFacts = Vec<(IntegerSet, Vec<Payload>)>;
 
 impl Claim<'_> {
     fn supplies(&self, premise: &rewrite::Premise<'_>) -> bool {
@@ -36,19 +39,46 @@ impl Claim<'_> {
         }
     }
 
-    fn holds(&self, input: &BigInt, returned: &BigInt) -> bool {
-        match self {
+    fn holds(&self, input: &BigInt, returned: &BigInt) -> Option<bool> {
+        Some(match self {
             Self::Literal(relation, bound) => relation.accepts(returned.cmp(bound.as_ref())),
             Self::Entry => returned == input,
-        }
+            Self::Payload { slot, facts } => {
+                let (_, payload) = facts.iter().find(|(domain, _)| domain.contains(input))?;
+                match payload.get(*slot)? {
+                    Payload::Literal(value) => returned == value,
+                    Payload::Entry(_) => returned == input,
+                }
+            }
+        })
     }
 
-    fn goal(&self) -> PartitionedProofGoal<'_> {
-        match self {
+    fn verify<'body>(&self, producer: &'body FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
+        work: &mut usize,
+    ) -> Option<Option<SymbolicLiteralFailure<'body>>> {
+        let goal = match self {
             Self::Literal(relation, bound) => PartitionedProofGoal::Literal(*relation, bound),
             Self::Entry => PartitionedProofGoal::EntryEquality(0),
-        }
+            Self::Payload { slot, facts } => {
+                let equal = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
+                for (leaf, payload) in facts.iter() {
+                    let cost = leaf.interval_count().checked_add(domain.interval_count())?.checked_add(1)?;
+                    charge_call_work(work, cost)?;
+                    let active = intersect(domain, leaf);
+                    if active.is_empty() { continue; }
+                    let goal = match payload.get(*slot)? {
+                        Payload::Literal(value) => PartitionedProofGoal::Literal(equal, value),
+                        Payload::Entry(_) => PartitionedProofGoal::EntryEquality(0),
+                    };
+                    let failure = verify_partitioned_call_return(producer, returned, &active, false, goal, Some(work))?.failure;
+                    if failure.is_some() { return Some(failure); }
+                }
+                return Some(None);
+            }
+        };
+        Some(verify_partitioned_call_return(producer, returned, domain, false, goal, Some(work))?.failure)
     }
+
 }
 
 enum Condition {
@@ -106,7 +136,9 @@ impl<'a> CaseShows<'a> {
         ) -> Option<Verdict<ByteSpan>> {
             for step in steps {
                 match step {
-                    Step::Show(span, claim) if !claim.holds(input, returned) => return Some(Verdict::Refuted(*span)),
+                    Step::Show(span, claim) => {
+                        if !claim.holds(input, returned)? { return Some(Verdict::Refuted(*span)); }
+                    }
                     Step::Use { declaration, .. } => {
                         if !cite(*declaration)? { return Some(Verdict::Blocked); }
                     }
@@ -120,7 +152,6 @@ impl<'a> CaseShows<'a> {
                         let verdict = check(branch, input, returned, cite)?;
                         if !matches!(verdict, Verdict::Established) { return Some(verdict); }
                     }
-                    _ => {}
                 }
             }
             Some(Verdict::Established)
@@ -190,18 +221,19 @@ impl AuthoredMatch {
         let mut domains = selector.domains;
         let mut arms = Vec::with_capacity(matching.arms.len());
         for arm in matching.arms {
-            let (domain, payload) = domains.remove(&arm.tag).unwrap_or_default();
-            let binding = if let Some((name, ty)) = arm.binder {
-                if is_null_literal_name(name) || name == input || name == plan.typed.output {
+            let (domain, facts) = domains.remove(&arm.tag).unwrap_or_default();
+            let mut binders = HashMap::new();
+            for (slot, (name, ty)) in arm.binders.into_iter().enumerate() {
+                if is_null_literal_name(name) || name == input || name == plan.typed.output
+                    || binders.insert(name, (slot, ty)).is_some()
+                {
                     return Err(ProjectCheck::InvalidProof);
                 }
-                Some(ArmPayload { name, ty, value: payload.as_ref() })
-            } else {
-                None
-            };
+            }
+            let binding = ArmPayload::prepare(binders, facts, work)?;
             charge_call_work(&mut work.observation, domain.interval_count().checked_add(1)
                 .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
-            arms.push((domain, compile(arm.body, plan, entry, catalog, goal.clone(), None, binding, 1, work)?));
+            arms.push((domain, compile(arm.body, plan, entry, catalog, goal.clone(), None, Some(&binding), 1, work)?));
         }
         if !domains.is_empty() { return Err(ProjectCheck::InvalidProof); }
         Ok(Step::Match(arms))
@@ -214,7 +246,7 @@ impl AuthoredMatch {
 struct SelectorCompiler<'a, 'w> {
     plan: &'a PlannedModuleProof<'a>,
     entry: &'a ReferenceBindingId,
-    domains: HashMap<u32, (IntegerSet, Option<Payload>)>,
+    domains: HashMap<u32, (IntegerSet, PayloadFacts)>,
     work: &'w mut CompileWork,
 }
 
@@ -224,11 +256,17 @@ impl SelectorCompiler<'_, '_> {
         charge_call_work(&mut self.work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
         match selector {
             Selector::Variant { tag, payload } => {
-                let (previous, prior_payload) = self.domains.entry(*tag)
-                    .or_insert_with(|| (IntegerSet::default(), payload.clone()));
-                if prior_payload != payload { return Err(ProjectCheck::Unsupported); }
-                let cost = previous.interval_count().checked_add(domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+                let (previous, facts) = self.domains.entry(*tag).or_default();
+                let cost = previous.interval_count().checked_add(domain.interval_count())
+                    .and_then(|cost| cost.checked_add(payload.len())).ok_or(ProjectCheck::Unsupported)?;
                 charge_call_work(&mut self.work.preparation, cost).ok_or(ProjectCheck::Unsupported)?;
+                // Retain facts only for variants with payloads. Keep an empty
+                // leaf's type information for static validation and metering.
+                if !payload.is_empty() {
+                    charge_call_work(&mut self.work.preparation, domain.interval_count().checked_add(1)
+                        .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+                    facts.push((domain.clone(), payload.clone()));
+                }
                 *previous = std::mem::take(previous).join(domain);
                 Ok(())
             }
@@ -329,33 +367,59 @@ fn compile_partition(
     }
 }
 
-#[derive(Clone, Copy)]
 struct ArmPayload<'a> {
-    name: &'a str,
-    ty: &'a ScalarType,
-    value: Option<&'a Payload>,
+    binders: HashMap<&'a str, (usize, &'a ScalarType)>,
+    facts: Rc<PayloadFacts>,
+    uniform: Vec<bool>,
+    mixed_observation_cost: usize,
 }
 
-fn arm_payload_claim(payload: ArmPayload<'_>, expression: &ScalarExpression, output: &str,
-    result_type: &ScalarType, body: &FunctionCallSites,
+impl<'a> ArmPayload<'a> {
+    fn prepare(binders: HashMap<&'a str, (usize, &'a ScalarType)>, facts: PayloadFacts,
+        work: &mut CompileWork,
+    ) -> Result<Self, ProjectCheck> {
+        let mut uniform = vec![true; binders.len()];
+        let mut mixed_observation_cost = 0usize;
+        if let Some((_, first)) = facts.first() {
+            if first.len() != uniform.len() { return Err(ProjectCheck::Unsupported); }
+            for (domain, values) in &facts {
+                if values.len() != uniform.len() { return Err(ProjectCheck::Unsupported); }
+                charge_call_work(&mut work.preparation, values.len().checked_add(1)
+                    .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+                for ((is_uniform, initial), value) in uniform.iter_mut().zip(first).zip(values) {
+                    *is_uniform &= initial == value;
+                }
+                mixed_observation_cost = mixed_observation_cost.checked_add(domain.interval_count())
+                    .and_then(|cost| cost.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
+            }
+        }
+        Ok(Self { binders, facts: Rc::new(facts), uniform, mixed_observation_cost })
+    }
+}
+
+fn arm_payload_claim(payload: &ArmPayload<'_>, expression: &ScalarExpression, output: &str,
+    result_type: &ScalarType, work: &mut CompileWork,
 ) -> Result<Option<Claim<'static>>, ProjectCheck> {
     let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = expression else {
         return Ok(None);
     };
     let (ScalarExpression::Name { name: lhs, .. }, ScalarExpression::Name { name: rhs, .. }) =
         (left.as_ref(), right.as_ref()) else { return Ok(None); };
-    if !((lhs == output && rhs == payload.name) || (rhs == output && lhs == payload.name)) {
-        return Ok(None);
-    }
-    if result_type != payload.ty { return Err(ProjectCheck::InvalidProof); }
-    let claim = match payload.value.ok_or(ProjectCheck::Unsupported)? {
-        Payload::Literal(value) => Claim::Literal(IntegerRelation::from_operator(&BinaryOperator::Equal)
+    let binder = if lhs == output { rhs } else if rhs == output { lhs } else { return Ok(None); };
+    let Some(&(slot, ty)) = payload.binders.get(binder.as_str()) else { return Ok(None); };
+    if result_type != ty { return Err(ProjectCheck::InvalidProof); }
+    // Entry atoms already checked against the only sealed original formal
+    // and the declared slot. Equality additionally requires this result type.
+    let uniform = payload.uniform.get(slot).copied().ok_or(ProjectCheck::Unsupported)?
+        .then(|| payload.facts.first().and_then(|(_, values)| values.get(slot))).flatten();
+    let claim = match uniform {
+        Some(Payload::Literal(value)) => Claim::Literal(IntegerRelation::from_operator(&BinaryOperator::Equal)
             .ok_or(ProjectCheck::Unsupported)?, Cow::Owned(value.clone())),
-        Payload::Entry(_) => {
-            if !matches!(body.boundary.parameters.as_slice(), [parameter] if &parameter.ty == result_type) {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            Claim::Entry
+        Some(Payload::Entry(_)) => Claim::Entry,
+        None => {
+            charge_call_work(&mut work.observation, payload.mixed_observation_cost)
+                .ok_or(ProjectCheck::Unsupported)?;
+            Claim::Payload { slot, facts: Rc::clone(&payload.facts) }
         }
     };
     Ok(Some(claim))
@@ -364,7 +428,7 @@ fn arm_payload_claim(payload: ArmPayload<'_>, expression: &ScalarExpression, out
 fn compile<'a>(
     block: &'a ScalarBlock, plan: &'a PlannedModuleProof<'a>, entry: &ReferenceBindingId,
     catalog: Option<&PublicProofCatalog<'a>>, mut current: rewrite::Goal<'a>,
-    outer: Option<&VisibleShows<'_, 'a>>, payload: Option<ArmPayload<'_>>, depth: usize, work: &mut CompileWork,
+    outer: Option<&VisibleShows<'_, 'a>>, payload: Option<&ArmPayload<'_>>, depth: usize, work: &mut CompileWork,
 ) -> Result<Vec<Step<'a>>, ProjectCheck> {
     let typed = &plan.typed;
     if depth == MAX_ACTUAL_CALL_DEPTH || block.terminated_items.len() != block.items.len() {
@@ -412,7 +476,7 @@ fn compile<'a>(
             ScalarBlockItem::Expression(expression) => {
                 let claim = proof_show_expression(item, terminated)?;
                 let (output, names, ty) = (&typed.output, &typed.input_names, typed.result_type);
-                let payload_claim = payload.map(|payload| arm_payload_claim(payload, claim, output, ty, typed.body))
+                let payload_claim = payload.map(|payload| arm_payload_claim(payload, claim, output, ty, work))
                     .transpose()?.flatten();
                 let claim = if let Some(claim) = payload_claim {
                     claim
@@ -453,8 +517,8 @@ fn check_partitions<'body>(
     for step in steps {
         charge_call_work(work, 1)?;
         let verdict = match step {
-            Step::Show(span, claim) => verify_partitioned_call_return(producer, returned, domain, false, claim.goal(), Some(work))?
-                .failure.map_or(Verdict::Established, |failure| Verdict::Refuted((failure, *span))),
+            Step::Show(span, claim) => claim.verify(producer, returned, domain, work)?
+                .map_or(Verdict::Established, |failure| Verdict::Refuted((failure, *span))),
             Step::Use { declaration, .. } => {
                 if cite(*declaration, domain, work)? { Verdict::Established } else { Verdict::Blocked }
             }

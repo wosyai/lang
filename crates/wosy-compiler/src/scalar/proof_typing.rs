@@ -207,17 +207,19 @@ impl ProofTyping<'_, '_> {
                 let inputs = self.entry_scope.clone();
                 self.check_match_selector(&matching.selector, &inputs);
                 for arm in matching.arms {
-                    if let Some((binder, ty)) = arm.binder {
-                        if is_null_literal_name(binder) || scope.contains_key(binder) {
-                            self.diagnostics.push(module_diagnostic(self.module, "B0003", "payload binder must be a fresh proof-local name", arm.body.span));
-                            continue;
-                        }
-                        let mut local = scope.clone();
-                        local.insert(binder.to_owned(), ty.clone());
-                        self.steps(arm.body, &local, witness);
-                    } else {
+                    if arm.binders.is_empty() {
                         self.steps(arm.body, scope, witness);
+                        continue;
                     }
+                    let mut local = scope.clone();
+                    for (binder, ty) in arm.binders {
+                        if is_null_literal_name(binder) || local.contains_key(binder) {
+                            self.diagnostics.push(module_diagnostic(self.module, "B0003", "payload binder must be a fresh proof-local name", arm.body.span));
+                        } else {
+                            local.insert(binder.to_owned(), ty.clone());
+                        }
+                    }
+                    self.steps(arm.body, &local, witness);
                 }
             }
             Err((span, message)) => self.diagnostics.push(module_diagnostic(self.module, "B0003", message, span)),

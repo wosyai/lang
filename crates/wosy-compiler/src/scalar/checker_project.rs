@@ -15974,8 +15974,68 @@ mod tests {
             }
             let leaked = program.replace("out == same", "out == value");
             assert!(matches!(run(&leaked, package), Err(ProjectCheck::Unsupported)));
-            let conflicted = program.replace("Region.identity(x)", "Region.fixed(x)");
-            assert!(matches!(run(&conflicted, package), Err(ProjectCheck::Unsupported)));
+            let same_tag = program.replace("Region.identity(x)", "Region.fixed(x)");
+            assert!(run(&same_tag, package).unwrap().symbolic_diagnostic.is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_authored_enum_multiple_payload_slots_preserve_source_order() {
+        let app = source("src/main.w", "ordered-authored-enum-payload-slots");
+        let program = r#"%%start
+            enum Region { two(u8, u8); reserved; }
+            u8(u8) classify = fn(value) { if (value < 10) { 2 } else { value } };
+            proof partitioned for classify(x) -> (out) ensures (out >= 2) {
+                match (if (x < 10) { Region.two(2, 2) } else { Region.two(x, x) }) {
+                    two(primary, secondary) {
+                        core.show(out == primary);
+                        core.show(secondary == out);
+                    }
+                    reserved {}
+                }
+            }
+        %%end"#;
+        let bad = program.replace("Region.two(2, 2)", "Region.two(2, 3)")
+            .replace("Region.two(x, x)", "Region.two(9, x)");
+        let reach = |text: &str| text.replace("%%end", "u8 low = classify(5); u8 high = classify(14); %%end");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, scope| {
+                let (_, parsed) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                    Vec::new(), vec![(parsed, Vec::new())], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let main = ScalarCheckerScope::MainFlowOnly;
+            assert!(run(program, package).unwrap().symbolic_diagnostic.is_none());
+            assert!(!run(program, main).unwrap().active);
+            let symbolic = run(&bad, package).unwrap().symbolic_diagnostic.unwrap();
+            let span = symbolic.failed_step.unwrap().range;
+            assert_eq!(&bad[span.start as usize..span.end as usize], "core.show(out == primary)");
+            let ten = BigInt::from(10);
+            assert!(symbolic.witness.intervals_at(0, 0).unwrap().all(|(from, _)| from >= &ten));
+            let actual = reach(&bad);
+            for scope in [package, main] {
+                let verified = run(&reach(program), scope).unwrap();
+                assert!(verified.active && verified.diagnostics.is_empty());
+                let receipt = run(&actual, scope).unwrap();
+                let [low, high] = receipt.diagnostics.as_slice() else { panic!("both exact calls refute different steps"); };
+                let snippet = |span: ByteSpan| &actual[span.start as usize..span.end as usize];
+                assert_eq!(snippet(low.invocation.call.range), "classify(5)");
+                assert_eq!(snippet(low.failed_step.as_ref().unwrap().range), "core.show(secondary == out)");
+                assert_eq!(snippet(high.invocation.call.range), "classify(14)");
+                assert_eq!(snippet(high.failed_step.as_ref().unwrap().range), "core.show(out == primary)");
+            }
+            for invalid in [
+                program.replace("Region.two(x, x)", "Region.two(x)"),
+                program.replace("two(primary, secondary)", "two(primary, primary)"),
+                program.replace("two(primary, secondary)", "two(primary)"),
+                program.replace("Region.two(2, 2)", "Region.two(2, 256)"),
+            ] {
+                assert!(matches!(run(&invalid, package), Err(ProjectCheck::InvalidProof)));
+            }
         }
     }
 
