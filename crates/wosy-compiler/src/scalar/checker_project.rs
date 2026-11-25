@@ -4914,6 +4914,50 @@ enum VerifiedSymbolicGuards<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> VerifiedSymbolicSummary<'a> {
+    fn import_local(
+        &self, target: PreparedCallable, calls: &FunctionCallSites, position: usize,
+        origin: &CheckerIntegerCallOrigin, occurrence: &super::reference::CallOccurrence, scalar_return: bool,
+    ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
+        if target.0 != self.target.0 || target.1 <= self.target.1 {
+            return Ok(None);
+        }
+        let site = calls.sites.get(occurrence.site).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let signature = calls.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let [output] = self.body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if output.ordinal != 0 || !production_bound_reuse::matching_call(
+            self.canonical_target, self.layout, &self.body.boundary.parameters, &output.ty,
+            self.layout, calls, origin, &site.target, signature,
+        ) {
+            return Ok(None);
+        }
+        let (guards, domain, meter_rectangle) = match &self.guards {
+            VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
+            VerifiedSymbolicGuards::Partitioned { guards, .. } => (guards.as_slice(), None, true),
+            VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, guards.arity > 2),
+        };
+        use super::checker_flow::ImportedVerifiedReturn;
+        let result = match &self.result {
+            VerifiedSymbolicResult::Constant { bound, shared } => ImportedVerifiedReturn::Constant { values: shared, bound },
+            VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
+            VerifiedSymbolicResult::EntryAffine { slot, transform } => ImportedVerifiedReturn::EntryAffine { slot: *slot, transform },
+            VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
+            VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
+        };
+        if scalar_return || matches!(&origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
+            if !matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
+                || !matches!(result, ImportedVerifiedReturn::Constant { .. })
+            {
+                return Ok(None);
+            }
+        }
+        let full_ranked_meter = scalar_return
+            || matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if guard.arity > 2);
+        let values = ImportedIntegerValues::Shared {
+            result, guards, domain, meter_rectangle: meter_rectangle || full_ranked_meter, full_ranked_meter,
+        };
+        Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
+    }
+
     fn consume<'scope>(
         &self, find_additional: impl Fn(&PreparedCallable) -> Option<&'scope Self>,
         target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
@@ -4946,40 +4990,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             } else {
                 return Ok(None);
             };
-            if target.0 != summary.target.0 || target.1 <= summary.target.1 {
-                return Ok(None);
-            }
-            let site = calls.sites.get(occurrence.site).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            let signature = calls.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            let [output] = summary.body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
-            if output.ordinal != 0 || !production_bound_reuse::matching_call(
-                summary.canonical_target, summary.layout, &summary.body.boundary.parameters, &output.ty,
-                summary.layout, calls, origin, &site.target, signature,
-            ) {
-                return Ok(None);
-            }
-            let (guards, domain, meter_rectangle) = match &summary.guards {
-                VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
-                VerifiedSymbolicGuards::Partitioned { guards, .. } => (guards.as_slice(), None, true),
-                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, guards.arity > 2),
-            };
-            use super::checker_flow::ImportedVerifiedReturn;
-            let result = match &summary.result {
-                VerifiedSymbolicResult::Constant { bound, shared } => ImportedVerifiedReturn::Constant { values: shared, bound },
-                VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
-                VerifiedSymbolicResult::EntryAffine { slot, transform } => ImportedVerifiedReturn::EntryAffine { slot: *slot, transform },
-                VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
-                VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
-            };
-            if let super::reference::CheckerIntegerCallArguments::Wide(_) = &origin.arguments {
-                if !matches!(&summary.guards, VerifiedSymbolicGuards::Ranked(guard) if guard.arity > 2)
-                    || !matches!(result, ImportedVerifiedReturn::Constant { .. })
-                {
-                    return Ok(None);
-                }
-            }
-            let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
-            Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
+            summary.import_local(target, calls, position, origin, occurrence, false)
         };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
         if occurrences.len() > 2 {
@@ -5040,6 +5051,34 @@ impl<'a> SymbolicSummaryIndex<'a> {
         } else {
             self.other.insert(summary.target, summary);
         }
+    }
+
+    fn ranked_scalar_return_import(
+        &self, target: PreparedCallable, calls: &FunctionCallSites,
+    ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
+        if !calls.checker_pure_calling_frame() { return Ok(None); }
+        let [result] = calls.boundary.results.as_slice() else { return Ok(None); };
+        if !is_integer_type(&result.ty) { return Ok(None); }
+        let [occurrence] = calls.call_occurrences.as_slice() else { return Ok(None); };
+        let structure = &calls.structure;
+        let Some(root) = structure.blocks.get(structure.root.0) else { return Ok(None); };
+        let [binding, output] = root.items.as_slice() else { return Ok(None); };
+        let (BlockItemKind::Binding(binding_region), BlockItemKind::FinalOutput(final_output)) = (&binding.kind, &output.kind)
+            else { return Ok(None); };
+        let [receiver] = binding_region.receivers() else { return Ok(None); };
+        let Some(origin) = structure.checker_integer_call_locals.get(&(structure.root, binding.position))
+            else { return Ok(None); };
+        if occurrence.ordinal != origin.call || receiver.contextual_storage.is_some() || receiver.ty != result.ty
+            || final_output.output != 0 || structure.checked_types.expressions.get(&final_output.expression) != Some(&result.ty)
+            || !matches!(calls.prepared_plain_name(final_output.expression),
+                Some(super::reference::PlainNameIdentity::Lexical(binding)) if binding == &origin.binding)
+        {
+            return Ok(None);
+        }
+        let Some(callee) = structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
+        let Some(summary) = self.first.as_ref().filter(|summary| summary.target == *callee)
+            .or_else(|| self.other.get(callee)) else { return Ok(None); };
+        summary.import_local(target, calls, binding.position, origin, occurrence, true)
     }
 
     fn consume(
@@ -5925,6 +5964,29 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         }
         if named_exact_mixed_pair(&calls.boundary.parameters, |entry| &entry.ty) {
             return self.verify_calling_pair(target, calls, function, source, effects, runtime, group);
+        }
+        if let MainFlowProofCases::Bare { first, rest } = &group.cases {
+            if rest.is_empty() && first.proof_source == source && first.owner == source {
+                if let Some(bound) = first.bound.literal() {
+                    // The imported local holds borrowed prepared data. Keep the
+                    // index separate while publishing into the diagnostic sink.
+                    let index = std::mem::take(&mut self.equalities);
+                    let result = (|| {
+                        let Some(import) = index.ranked_scalar_return_import(target, calls)? else { return Ok(None); };
+                        let (active, directives, returned, failure) = super::checker_flow::collect_imported_root_literal_proof(
+                            calls, &function.body, first.relation()?, bound, first.filter, import,
+                        ).ok_or(ProjectCheck::Unsupported)?;
+                        for directive in directives { effects.push_callable(calls, source, directive); }
+                        if let Some(failure) = failure {
+                            self.record(first, function, source, effects.records.len(), failure, None)?;
+                        }
+                        // This checked consumer never issues a new summary.
+                        Ok(Some(active || returned))
+                    })();
+                    self.equalities = index;
+                    if let Some(active) = result? { return Ok(Some(active)); }
+                }
+            }
         }
         if !calls.call_occurrences.is_empty() || !calls.structure.checker_direct_targets.is_empty() {
             return self.verify_calling_producer(target, calls, function, source, effects, runtime);
@@ -18573,6 +18635,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(checked.symbolic_diagnostic.unwrap().returned, BigInt::from(4));
         let [later] = checked.additional_symbolic_diagnostics.as_slice() else { panic!("second failure"); };
         assert_eq!(later.returned, BigInt::from(7));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_ranked_constant_refines_direct_scalar_consumer_proof() {
+        let app = source("src/main.w", "ordered-ranked-scalar-return");
+        let text = r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {
+                if (left == 0) { 7 } else { descend(page, slot, left - 1, quota) }
+            };
+            u8(u8) client = fn(input) {
+                u8 observed = descend(input, 2, input, 4);
+                observed
+            };
+            proof rank for descend(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && (quota == 4 || quota == 6))
+                ensures (out == 7) decreases (left) {
+                if (left == 0) { core.show(out == 7); }
+                else { core.use(rank(page, slot, left - 1, quota)); }
+            }
+            proof checked for client(input) -> (out) where (input <= 3) ensures (out == 7) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let proved = run(text, package).unwrap();
+        assert!(proved.active && proved.directives.is_empty() && proved.symbolic_diagnostic.is_none());
+        let wrong = text.replace("where (input <= 3) ensures (out == 7)", "where (input <= 3) ensures (out == 8)");
+        let checked = run(&wrong, package).unwrap();
+        let failure = checked.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(7));
+        assert_eq!(&wrong[failure.output.range.start as usize..failure.output.range.end as usize], "observed");
+        assert_eq!(&wrong[failure.goal.range.start as usize..failure.goal.range.end as usize], "out == 8");
+        assert!(checked.directives.is_empty() && checked.additional_symbolic_diagnostics.is_empty());
+        let main = run(&wrong, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.symbolic_diagnostic.is_none());
+        for rejected in [
+            text.replace("input <= 3", "input <= 4"),
+            text.replace("input, 2, input, 4", "input, 2, input, 5"),
+            text.replace("input, 2, input, 4", "input, 2, input + 0, 4"),
+            text.replace("                observed", "                observed + 0"),
+            text.replace("decreases (left)", "decreases (page)"),
+        ] {
+            assert!(matches!(run(&rejected, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

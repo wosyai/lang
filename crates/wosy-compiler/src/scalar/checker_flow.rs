@@ -122,6 +122,7 @@ pub(super) enum ImportedIntegerValues<'a> {
         guards: &'a [ImportedEntryGuard<'a>],
         domain: Option<(usize, &'a IntegerSet)>,
         meter_rectangle: bool,
+        full_ranked_meter: bool,
     },
     #[cfg(feature = "internal-checker")]
     Deferred {
@@ -618,6 +619,7 @@ struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
     relation: IntegerRelation,
     bound: &'observation BigInt,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
+    imported_binding: Option<&'a ReferenceBindingId>,
     observed: &'observation std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
 }
 
@@ -643,7 +645,15 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
     fn observe_return(
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
-        let axis = symbolic_return_axis(value, roots)?;
+        let axis = match (value, self.imported_binding) {
+            (IntegerReturn::Alias(binding), Some(expected)) if binding == expected => {
+                let (axis, _) = roots.lookup(binding)?;
+                if axis < roots.parameters { return None; }
+                Some(axis)
+            }
+            (_, Some(_)) => return None,
+            _ => symbolic_return_axis(value, roots)?,
+        };
         let mut observed = self.observed.borrow_mut();
         if observed.1.is_some() {
             return Some(());
@@ -673,6 +683,10 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             };
             let returned = match (value, axis) {
                 (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound)).then_some(value),
+                (IntegerReturn::Alias(_), Some(axis)) if axis >= roots.parameters => {
+                    let returned = row.get(axis)?.singleton_value()?;
+                    rejected.accepts(returned.cmp(self.bound)).then_some(returned)
+                }
                 (IntegerReturn::Alias(_), Some(axis)) => row.get(axis)?.first_comparison_point(rejected, self.bound),
                 _ => return None,
             };
@@ -686,7 +700,10 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
         }
         observed.0 |= applicable;
         if let Some((row, returned, entry)) = failing {
-            observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, returned, entry));
+            // The return is reported separately; the diagnostic state still
+            // contains only the callable's entry coordinates.
+            let entry_axis = axis.filter(|&axis| axis < roots.parameters);
+            observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, entry_axis, returned, entry));
         }
         Some(())
     }
@@ -3221,6 +3238,27 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    collect_ordered_root_literal_proof_with_imports::<TOTAL>(
+        calls, body, relation, bound, predicate, entry_filter, &mut [],
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_imported_root_literal_proof<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+    entry_filter: &[CheckerPredicate], import: ImportedLocal<'a>,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    collect_ordered_root_literal_proof_with_imports::<true>(
+        calls, body, relation, bound, None, Some(entry_filter), &mut [Some(import)],
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+    predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
+    imports: &mut [Option<ImportedLocal<'a>>],
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let bounds;
     let guard = if let Some(predicate) = predicate {
         let bindings = calls.boundary.checker_parameter_bindings.as_deref()?;
@@ -3247,19 +3285,32 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     } else {
         None
     };
+    let imported_binding = match imports {
+        [] => None,
+        [Some(import)] => Some(&calls.structure.checker_integer_call_locals
+            .get(&(calls.structure.root, import.position))?.binding),
+        _ => return None,
+    };
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let scope = OrderedRootLiteralProof::<TOTAL> {
-        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), observed: &observed,
+        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), imported_binding, observed: &observed,
     };
     let active = if TOTAL {
         let mut collected = IntegerFailureCollection {
             continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink: &mut sink,
         };
-        match run_integer_callable::<false, true, _>(
-            calls, integer_tail_type(calls), entry_filter, None, &mut [], None, None, Some(&mut collected), false, scope,
-        )?.ok()? {
+        let coverage = if imports.is_empty() {
+            run_integer_callable::<false, true, _>(
+                calls, integer_tail_type(calls), entry_filter, None, &mut [], None, None, Some(&mut collected), false, scope,
+            )
+        } else {
+            run_integer_callable::<true, true, _>(
+                calls, integer_tail_type(calls), entry_filter, None, imports, None, None, Some(&mut collected), false, scope,
+            )
+        };
+        match coverage?.ok()? {
             ProofCoverage::Applicable(active) => active,
             ProofCoverage::NoApplicableInputs => false,
         }
@@ -7285,15 +7336,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
                         #[cfg(feature = "internal-checker")]
-                        ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle } => {
+                        ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle, full_ranked_meter } => {
                             if meter_rectangle {
                                 let work = roots.ordinary_local_work.get_or_insert(0);
                                 let width = origin.arguments.as_slice().len();
                                 charge_call_work(work, 1usize.checked_add(guards.len())?
-                                    .checked_add(if width > 2 { width } else { 0 })?)?;
+                                    .checked_add(if full_ranked_meter { width } else { 0 })?)?;
                                 for row in &path.0 {
                                     let mut cost = row.len().checked_add(1)?;
-                                    if width > 2 {
+                                    if full_ranked_meter {
                                         // The per-row accounting loop visits literal
                                         // guards as well as guards on caller axes.
                                         cost = cost.checked_add(guards.len())?;
@@ -7306,7 +7357,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                             cost = cost.checked_add(row.get(axis)?.interval_count())?;
                                         }
                                     }
-                                    if width > 2 {
+                                    if full_ranked_meter {
                                         if let Some((slot, domain)) = domain {
                                             if let Some(Argument::Axis(axis)) = arguments.get(slot).copied().flatten() {
                                                 cost = cost.checked_add(row.get(axis)?.interval_count())?
