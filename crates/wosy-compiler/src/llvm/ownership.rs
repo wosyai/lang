@@ -1330,6 +1330,25 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     Ok(())
 }
 
+pub(super) fn guarded_fixed_array_extent(
+    state: &EmitState<'_, '_>,
+    base: &crate::ScalarPlace,
+    backing: PointerValue<'_>,
+    ty: &ScalarType,
+) -> Result<Option<u64>, String> {
+    let Some(sites) = &state.guarded_scalar else { return Ok(None); };
+    let Some(declaration) = state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base))
+    else { return Ok(None); };
+    let Some(&index) = sites.declarations.get(&(declaration.start, declaration.end)) else { return Ok(None); };
+    let ScalarType::Array { length, .. } = &sites.sites[index].ty else { return Ok(None); };
+    if &sites.sites[index].ty != ty
+        || !sites.active[index].is_some_and(|owner| owner.backing == backing)
+    {
+        return Err("guarded fixed-array read lost its exact prepared owner".into());
+    }
+    Ok(Some(*length))
+}
+
 pub(super) fn guarded_alias_has_non_null_proof(
     state: &EmitState<'_, '_>,
     pointer: &ScalarExpression,

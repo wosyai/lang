@@ -3536,7 +3536,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let CheckedReadSource::Place(ordinal) = source else { return None; };
                         let ScalarPlace::Index { base, index, .. } = place else { return None; };
                         if !matches!(base.as_ref(), ScalarPlace::Name { .. }) { return None; }
-                        let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None; };
                         let parent = OccurrenceParent::Place(ordinal);
                         let base = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
                         let selector = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
@@ -3544,7 +3543,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         (types.places.get(&base) == Some(&owner.ty)
                             && types.places.get(&ordinal) == Some(element.as_ref())
                             && types.expressions.get(&selector) == Some(&ScalarType::U64)
-                            && u64::try_from(value.clone()).ok().is_some_and(|index| index < *length)).then_some(())
+                            && match index.as_ref() {
+                                ScalarExpression::Integer { value, .. } =>
+                                    u64::try_from(value.clone()).ok().is_some_and(|index| index < *length),
+                                _ => true,
+                            }).then_some(())
                     })().is_some();
                     if !exact {
                         return Err(self.missing_origin(span, binding.clone(),

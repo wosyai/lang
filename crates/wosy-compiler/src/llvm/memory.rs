@@ -418,9 +418,13 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 .map_err(builder_error);
             }
             let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
-            let checked = !fixed_index_has_raw_root(state, base);
+            let guarded_extent = ownership::guarded_fixed_array_extent(state, base, base_pointer, &base_type)?;
+            let checked = guarded_extent.is_some() || !fixed_index_has_raw_root(state, base);
             if checked {
-                check_fixed_index(context, state, index, length, None)?;
+                let fallback = guarded_extent.map(|_| (
+                    "guarded_index_out_of_bounds", "guarded_index_panic", "guarded_index_continue",
+                ));
+                check_fixed_index(context, state, index, guarded_extent.unwrap_or(length), fallback)?;
             }
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
