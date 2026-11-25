@@ -17651,6 +17651,103 @@ unit(u64) write_only = fn(index) {
 }
 
 #[test]
+fn runtime_copy_fields_keep_original_extent_and_padded_layout() {
+    let text = "%%start
+struct copy Cell { u8 tag; bool ready; u64 value; }
+u64(u64,u64,u64) observe = fn(count,left,right) {
+    Cell[count] cells;
+    cells[left].tag = 5;
+    cells[left].ready = true;
+    cells[left].value = 101;
+    cells[right].tag = 7;
+    cells[right].ready = false;
+    cells[right].value = 202;
+    if (cells[left].ready && !cells[right].ready && cells[left].tag == 5 && cells[right].tag == 7) {
+        cells[left].value + cells[right].value
+    } else { 0 }
+};
+if (observe(2,0,1) != 303) { core.system_panic(); };
+%%end";
+    let whole = "%%start
+struct Cell { u8 tag; bool ready; u64 value; }
+u8(u64,u64) inspect = fn(count,index) {
+    Cell[count] cells;
+    *Cell row = &cells[index];
+    u8 observed = (*row).tag;
+    observed
+};
+%%end";
+    let unsupported = whole.replace("    observed\n", "    cells[index].tag = 5;\n    observed\n");
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, "observe"));
+        let bounds = format!("call void @{}(", project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent"));
+        let extent = loaded_runtime_extent_parameter(body, "count");
+        assert!(body.contains(&format!("mul nuw i64 {extent}, 16")), "{body}");
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 1, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        assert_eq!(body.matches(&bounds).count(), 12, "{body}");
+        let mut prior = 0;
+        let stride = "getelementptr inbounds [16 x i8], ptr ";
+        let mut fields = Vec::new();
+        for (at, _) in body.match_indices(stride) {
+            let region = &body[prior..at];
+            let guard_at = region.find(&bounds).unwrap();
+            assert_eq!(region.matches(&bounds).count(), 1, "{region}");
+            let guard = region[guard_at..].lines().next().unwrap();
+            let selector = guard.strip_prefix(&format!("{bounds}i64 ")).unwrap()
+                .strip_suffix(&format!(", i64 {extent})")).unwrap();
+            let gep = body[at..].lines().next().unwrap();
+            let picked = body[..at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap();
+            assert!(gep.ends_with(&format!("i64 {selector}")), "{gep}");
+            let next = body[at + gep.len()..].trim_start().lines().next().unwrap();
+            if let Some((_, suffix)) = next.split_once(&format!("getelementptr inbounds i8, ptr {picked}, i8 ")) {
+                fields.push(suffix.parse::<u64>().unwrap());
+            } else {
+                assert!(next.contains(&format!(", ptr {picked},")), "{next}");
+                fields.push(0);
+            }
+            prior = at + gep.len();
+        }
+        assert_eq!(fields.len(), 12, "{fields:?}");
+        assert_eq!(fields.iter().filter(|&&offset| offset == 0).count(), 4, "{fields:?}");
+        assert_eq!(fields.iter().filter(|&&offset| offset == 1).count(), 4, "{fields:?}");
+        assert_eq!(fields.iter().filter(|&&offset| offset == 8).count(), 4, "{fields:?}");
+        assert!(body.contains("store i1 true") || body.contains("store i8 1"), "{body}");
+        let whole = prepare(whole).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let whole_checked = analyze_scalar_build(&whole);
+        assert!(whole_checked.diagnostics().is_empty(), "{:?}", whole_checked.diagnostics());
+        let whole_ir = emit_scalar_build_project_llvm(&whole_checked).unwrap().to_text();
+        let whole_body = self_tail_test_body(&whole_ir, "i8", &project_function_name(&source, "inspect"));
+        assert!(whole_body.contains(&bounds) && whole_body.contains(stride), "{whole_body}");
+
+        let rejected = prepare(&unsupported).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let rejected = analyze_scalar_build(&rejected);
+        assert!(rejected.diagnostics().is_empty(), "{:?}", rejected.diagnostics());
+        assert_eq!(emit_scalar_build_project_llvm(&rejected).err().expect("unapproved field was lowered"),
+            "runtime field lacks its authenticated indexed prefix and extent");
+        if let Some(out) = std::env::var_os("WOSY_RUNTIME_COPY_FIELD_IR_DIR") {
+            let target = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
+
+#[test]
 fn local_exclusive_runtime_array_read_write_preserves_checked_backing() {
     let text = "%%start
 u16(u16) produce = fn(value) { value };

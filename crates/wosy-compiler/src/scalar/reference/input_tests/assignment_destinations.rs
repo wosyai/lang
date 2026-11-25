@@ -668,6 +668,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
                 runtime_array_read_sites: HashMap::new(),
                 runtime_array_child_sites: Vec::new(),
                 runtime_array_exclusive_sites: HashMap::new(),
+                runtime_array_field_sites: HashMap::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: facts.clone(),

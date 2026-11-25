@@ -680,6 +680,15 @@ pub(crate) struct RuntimeArrayExclusiveSite {
     pub(crate) portable_install: Option<(CfgPointId, CfgPointId)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayFieldSite {
+    pub(crate) owner: ReferenceBindingId,
+    pub(crate) field: ScalarStructFieldId,
+    pub(crate) leaf: usize,
+    pub(crate) prefix: usize,
+    pub(crate) selector: usize,
+}
+
 #[cfg_attr(not(test), derive(Clone))]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
@@ -701,6 +710,8 @@ pub struct ScalarReferenceCfg {
     pub(crate) runtime_array_child_sites: Vec<RuntimeArrayChildSite>,
     #[serde(skip)]
     pub(crate) runtime_array_exclusive_sites: HashMap<CfgPointId, RuntimeArrayExclusiveSite>,
+    #[serde(skip)]
+    pub(crate) runtime_array_field_sites: HashMap<CfgPointId, RuntimeArrayFieldSite>,
 }
 
 impl PartialEq for ScalarReferenceCfg {
@@ -739,6 +750,7 @@ impl ScalarReferenceCfg {
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
             runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
         }
     }
 
@@ -770,6 +782,30 @@ impl ScalarReferenceCfg {
         (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
             && loan.origin_place.projections.is_empty() && self.allocations.contains(&loan.origin_place.binding))
             .then_some(&loan.origin_place.binding)
+    }
+
+    pub(crate) fn runtime_array_field_site(
+        &self, point: CfgPointId, site: &RuntimeArrayFieldSite,
+    ) -> bool {
+        let Some(point) = self.points.get(point.0) else { return false; };
+        let place = match &point.kind {
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. } => {
+                let [place] = candidates.as_slice() else { return false; };
+                place
+            }
+            CfgPointKind::Assign { target, .. } => target,
+            _ => return false,
+        };
+        if place.binding != site.owner || place.declaration_span != site.owner.declaration_span
+            || !self.allocations.contains(&site.owner)
+        { return false; }
+        let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = &place.place else { return false; };
+        let ScalarPlace::Index { base, index, .. } = base.as_ref() else { return false; };
+        field == &site.field && matches!(base.as_ref(), ScalarPlace::Name { .. })
+            && matches!(place.projections.as_slice(),
+                [ReferencePlaceProjection::Index(selected),
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))]
+                if selected == index.as_ref() && actual == field)
     }
 
     pub(crate) fn runtime_array_exclusive_origin(
@@ -3880,6 +3916,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
             runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
@@ -3987,6 +4024,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     runtime_array_read_sites: HashMap::new(),
                     runtime_array_child_sites: Vec::new(),
                     runtime_array_exclusive_sites: HashMap::new(),
+                    runtime_array_field_sites: HashMap::new(),
                     observed_runtime_allocations: None,
                     guarded_scalar_allocation: None,
                     facts: Vec::new(),
@@ -4021,6 +4059,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
             runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),

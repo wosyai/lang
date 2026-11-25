@@ -374,10 +374,11 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 .map_err(builder_error)
         }
         crate::ScalarPlace::Field { base, field, .. } => {
-            let base = place_pointer(context, state, base, project)?;
             let ScalarFieldReference::Resolved(field) = field else {
                 return Err("unresolved LLVM struct field".to_owned());
             };
+            require_runtime_field_extent(state, place, base, field)?;
+            let base = place_pointer(context, state, base, project)?;
             resolved_field_pointer(context, state, base, field)
         }
         crate::ScalarPlace::Index { base, index, .. } => {
@@ -592,6 +593,51 @@ pub(super) fn place_pointer<'ctx, 'module>(
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
     }
+}
+
+fn require_runtime_field_extent(
+    state: &EmitState<'_, '_>, leaf: &ScalarPlace, base: &ScalarPlace, field: &crate::ScalarStructFieldId,
+) -> Result<(), String> {
+    if !state.require_release_checked_access { return Ok(()); }
+    let ScalarPlace::Index { base: owner, index, .. } = base else { return Ok(()); };
+    let ScalarPlace::Name { name, .. } = owner.as_ref() else { return Ok(()); };
+    let nodes = state.body_call_nodes;
+    let storage = state.storage.get(name);
+    let runtime_struct = |ty: &ScalarType| matches!(ty, ScalarType::RuntimeArray { element, .. }
+        if matches!(element.as_ref(), ScalarType::Struct(_)));
+    if !nodes.and_then(|nodes| nodes.checked_place_type(owner)).is_some_and(runtime_struct)
+        && !storage.is_some_and(|(_, ty)| runtime_struct(ty))
+    { return Ok(()); }
+    // Whole-element checks establish a count, not permission for any
+    // subsequent field. Classify the real shape before consulting a receipt.
+    let nodes = nodes.ok_or("runtime field lacks prepared occurrences")?;
+    let site = nodes.place_ordinal(leaf).and_then(|ordinal| state.runtime_borrow_index.field_sites.get(&ordinal))
+        .ok_or("runtime field lacks its authenticated indexed prefix and extent")?;
+    let Some((storage, ScalarType::RuntimeArray { element, .. })) = storage
+        else { return Err("runtime field lacks its direct runtime storage".into()); };
+    let ScalarType::Struct(id) = element.as_ref() else { return Err("runtime field changed its storage type".into()); };
+    if field != &site.field || id != &field.structure || nodes.place_ordinal(base) != Some(site.prefix)
+        || nodes.expression_ordinal(index) != Some(site.selector)
+        || nodes.lexical_place_declaration(owner) != Some(site.owner.declaration_span)
+        || !matches!(nodes.checked_place_type(base), Some(ScalarType::Struct(actual)) if actual == id)
+    { return Err("runtime field changed its prepared prefix or struct".into()); }
+    let Some((owner, LocalRuntimeExtent::Construction { signed: Some(domain), .. }, true)) =
+        state.local_runtime_extents.get(storage) else { return Err("runtime field lacks its original checked construction".into()); };
+    if *owner != site.owner.declaration_span || state.runtime_array_allocations.get(name) != Some(&true)
+        || !domain.matches_consumer(state.target_layout, element)
+    { return Err("runtime field changed its original construction domain".into()); }
+    // Allocation and index GEP already use this same indexed target layout.
+    let layout = state.layouts.aggregate(id).ok_or("runtime field lost its registered layout")?;
+    let row = layout.layout.as_ref().ok_or("runtime field has no registered stride")?;
+    let field_layout = layout.fields.get(field.index).ok_or("runtime field has no registered member layout")?;
+    let (Some(offset), Some(member)) = (field_layout.offset, field_layout.layout.as_ref())
+        else { return Err("runtime field has an invalid member layout".into()); };
+    if layout.target != state.target_layout || row.size == 0 || row.alignment == 0 || member.alignment == 0
+        || row.alignment % member.alignment != 0 || row.size % row.alignment != 0
+        || offset % member.alignment != 0 || offset.checked_add(member.size).is_none_or(|end| end > row.size)
+        || u32::try_from(row.size).is_err()
+    { return Err("runtime field geometry differs from the registered stride".into()); }
+    Ok(())
 }
 
 fn dereference_address<'ctx, 'module>(

@@ -153,6 +153,7 @@ enum LocalRuntimeExtent<'ctx> {
 struct RuntimeBorrowIndex<'ctx> {
     sites: HashMap<usize, (wosy_syntax::ByteSpan, Option<wosy_syntax::ByteSpan>)>,
     portable_places: std::collections::HashSet<usize>,
+    field_sites: HashMap<usize, crate::scalar::RuntimeArrayFieldSite>,
     owners: HashMap<wosy_syntax::ByteSpan, Option<PointerValue<'ctx>>>,
 }
 
@@ -488,6 +489,14 @@ fn runtime_allocation_access<'ctx>(
     indexed.retain(|id| !unproved_writes.contains(id));
     let mut borrowed = RuntimeBorrowIndex::default();
     if checked_access {
+        for (&point, site) in &reference_cfg.runtime_array_field_sites {
+            if !reference_cfg.runtime_array_field_site(point, site) { continue; }
+            let id = key(site.owner.declaration_span);
+            if mutable.contains(&id) { continue; }
+            indexed.insert(id);
+            not_portable.insert(id);
+            borrowed.field_sites.insert(site.leaf, site.clone());
+        }
         for (&point, site) in &reference_cfg.runtime_array_read_sites {
             let Some(owner) = reference_cfg.runtime_array_read_origin(point) else { continue; };
             let declaration = owner.declaration_span;

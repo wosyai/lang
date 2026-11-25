@@ -438,6 +438,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) checked: HashSet<ReferenceBindingId>,
     pub(super) binding_types: ReferenceBindingTypes,
     pub(super) structs: &'a [ScalarStruct],
+    copy_runtime_field_structs: Option<HashMap<ScalarStructId, bool>>,
     pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
     pub(super) dereference_points: HashMap<OccurrenceOrdinal, CfgPointId>,
@@ -601,6 +602,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             checked: HashSet::new(),
             binding_types: ReferenceBindingTypes::default(),
             structs,
+            copy_runtime_field_structs: None,
             enums,
             generic_parameters: call_sites
                 .boundary
@@ -615,6 +617,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 runtime_array_read_sites: HashMap::new(),
                 runtime_array_child_sites: Vec::new(),
                 runtime_array_exclusive_sites: HashMap::new(),
+                runtime_array_field_sites: HashMap::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
@@ -3731,6 +3734,34 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn record_runtime_array_field_site(&mut self, point: CfgPointId, ordinal: OccurrenceOrdinal, place: &ScalarPlace) {
+        let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = place else { return; };
+        let ScalarPlace::Index { base: owner, .. } = base.as_ref() else { return; };
+        let ScalarPlace::Name { span, .. } = owner.as_ref() else { return; };
+        let prefix = self.place_ordinal(OccurrenceParent::Place(ordinal), OccurrenceEdge::PlaceBase);
+        let root = self.place_ordinal(OccurrenceParent::Place(prefix), OccurrenceEdge::PlaceBase);
+        let selector = self.expression_ordinal(OccurrenceParent::Place(prefix), OccurrenceEdge::PlaceIndex);
+        let Ok(Some(PreparedPlaceRoot::Lexical(binding))) = self.prepared_place_root(root, *span) else { return; };
+        let checked = &self.call_sites.structure.checked_types;
+        if !self.cfg.allocations.contains(binding)
+            || !matches!(checked.places.get(&root),
+                Some(ScalarType::RuntimeArray { element, .. })
+                    if matches!(element.as_ref(), ScalarType::Struct(id) if id == &field.structure))
+            || !matches!(checked.places.get(&prefix), Some(ScalarType::Struct(id)) if id == &field.structure)
+            || !checked.places.get(&ordinal).is_some_and(aggregate::ordinary_value)
+            || checked.expressions.get(&selector) != Some(&ScalarType::U64)
+        { return; }
+        let copy = self.copy_runtime_field_structs.get_or_insert_with(HashMap::new)
+            .entry(field.structure.clone()).or_insert_with(||
+                self.structs.iter().find(|item| item.id == field.structure)
+                    .is_some_and(|item| item.copy_policy == CopyPolicy::Copy));
+        if *copy {
+            self.cfg.runtime_array_field_sites.insert(point, RuntimeArrayFieldSite {
+                owner: binding.clone(), field: field.clone(), leaf: ordinal.0, prefix: prefix.0, selector: selector.0,
+            });
+        }
+    }
+
     fn checked_place_read(
         &mut self,
         place: &ScalarPlace,
@@ -3913,6 +3944,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
             scope,
             (!uncomputed).then(BTreeSet::new),
         );
+        if let CheckedReadSource::Place(ordinal) = source {
+            if matches!(place, ScalarPlace::Field { .. }) {
+                let canonical = self.proof_place(place, ordinal).into_owned();
+                self.record_runtime_array_field_site(point, ordinal, &canonical);
+            }
+        }
         if checked_pointee && pointer_point.is_some() {
             self.proof_points.checked_pointee_reads.push(point);
         }
@@ -6905,6 +6942,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
                         };
                         let FrozenInstall { rhs: rhs_point, install } = emitted;
+                        if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
+                            && position == 0 && block.terminated_items.get(item_index) == Some(&true)
+                            && matches!(target.place, ScalarPlace::Field { .. })
+                        {
+                            let canonical = self.proof_place(&target.place, slot.destination).into_owned();
+                            self.record_runtime_array_field_site(install, slot.destination, &canonical);
+                        }
                         if let CfgPointKind::AssignThrough { pointer_point, .. } = self.cfg.points[install.0].kind {
                             let runtime_writer = matches!(&target.place, ScalarPlace::Index { base, .. }
                                 if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
