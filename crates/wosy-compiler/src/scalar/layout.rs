@@ -678,6 +678,7 @@ impl Clone for ScalarReferenceCfg {
             primary_call_points: self.primary_call_points.clone(),
             runtime_array_read_sites: self.runtime_array_read_sites.clone(),
             runtime_array_child_sites: self.runtime_array_child_sites.clone(),
+            runtime_array_exclusive_sites: self.runtime_array_exclusive_sites.clone(),
             guarded_scalar_allocation: self.guarded_scalar_allocation.clone(),
             observed_runtime_allocations: self.observed_runtime_allocations.clone(),
         }

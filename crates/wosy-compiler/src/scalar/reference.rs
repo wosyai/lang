@@ -614,6 +614,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 primary_call_points: HashMap::new(),
                 runtime_array_read_sites: HashMap::new(),
                 runtime_array_child_sites: Vec::new(),
+                runtime_array_exclusive_sites: HashMap::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
@@ -3813,12 +3814,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
             None
         };
         let mut runtime_read = None;
+        let mut runtime_exclusive_read = None;
         if let (ScalarPlace::Index { base, .. }, Some(ScalarType::CheckedReference { inner, mutability })) =
             (place, pointer_type)
         {
             if let ScalarType::RuntimeArray { element, .. } = inner.as_ref() {
                 let eligible = (|| {
                     let CheckedReadSource::Place(access) = source else { return None };
+                    if *mutability == ScalarReferenceMutability::Mutable {
+                        if prepared && aggregate::ordinary_value(element)
+                            && self.local_runtime_exclusive_place(place, access).is_some()
+                        {
+                            runtime_exclusive_read = Some(access);
+                            return Some((access, None));
+                        }
+                        return None;
+                    }
                     if !prepared || *mutability != ScalarReferenceMutability::Shared
                         || !aggregate::ordinary_value(element)
                     { return None; }
@@ -3836,7 +3847,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     return Err(self.missing_context(span,
                         ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
                 };
-                runtime_read = Some(site);
+                if runtime_exclusive_read.is_none() { runtime_read = Some(site); }
             }
         }
         let checked_pointee = matches!(pointer_type, Some(ScalarType::CheckedReference { .. }));
@@ -3904,6 +3915,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         );
         if checked_pointee && pointer_point.is_some() {
             self.proof_points.checked_pointee_reads.push(point);
+        }
+        if let Some(access) = runtime_exclusive_read {
+            let pointer = pointer_point.expect("typed runtime exclusive read pointer");
+            let site = self.local_runtime_exclusive_site(pointer, access).ok_or_else(||
+                self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent))?;
+            self.cfg.runtime_array_exclusive_sites.insert(point, site);
         }
         if let Some((access, handle)) = runtime_read {
             self.cfg.runtime_array_read_sites.insert(point, RuntimeArrayReadSite {
@@ -4970,6 +4987,47 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     && place.projections.is_empty() && loan.origin_place.binding == place.binding
                     && matches!(place.place, ScalarPlace::Name { .. })
                     && self.cfg.allocations.contains(&place.binding))
+    }
+
+    fn local_runtime_exclusive_place(
+        &self, place: &ScalarPlace, occurrence: OccurrenceOrdinal,
+    ) -> Option<()> {
+        let ScalarPlace::Index { base, index, .. } = place else { return None; };
+        let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+        let selector_is_literal = matches!(index.as_ref(), ScalarExpression::Integer { .. });
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+            || !matches!(index.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Integer { .. })
+        { return None; }
+        let base = self.place_ordinal(OccurrenceParent::Place(occurrence), OccurrenceEdge::PlaceBase);
+        let pointer = self.expression_ordinal(OccurrenceParent::Place(base), OccurrenceEdge::DereferencePointer);
+        let index = self.expression_ordinal(OccurrenceParent::Place(occurrence), OccurrenceEdge::PlaceIndex);
+        let checked = &self.call_sites.structure.checked_types;
+        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } =
+            checked.expressions.get(&pointer)? else { return None; };
+        let ScalarType::RuntimeArray { element, .. } = inner.as_ref() else { return None; };
+        (matches!(self.call_sites.prepared_plain_name(pointer), Some(PlainNameIdentity::Lexical(_)))
+            && checked.places.get(&occurrence) == Some(element)
+            && aggregate::ordinary_value(element)
+            && checked.expressions.get(&index) == Some(&ScalarType::U64)
+            && (selector_is_literal || matches!(self.call_sites.prepared_plain_name(index), Some(PlainNameIdentity::Lexical(_))))).then_some(())
+    }
+
+    fn local_runtime_exclusive_site(
+        &self, pointer: CfgPointId, occurrence: OccurrenceOrdinal,
+    ) -> Option<RuntimeArrayExclusiveSite> {
+        let point = self.cfg.points.get(pointer.0)?;
+        let CfgPointKind::Read { binding } = &point.kind else { return None; };
+        let origins = point.possible_origins.as_ref()?;
+        let origin = *origins.first().filter(|_| origins.len() == 1)?;
+        let ReferenceOrigin::Fresh { loan, .. } = self.cfg.facts.get(origin.0)? else { return None; };
+        if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
+            || !loan.origin_place.projections.is_empty() || !matches!(loan.origin_place.place, ScalarPlace::Name { .. })
+            || !self.cfg.allocations.contains(&loan.origin_place.binding)
+        { return None; }
+        Some(RuntimeArrayExclusiveSite {
+            occurrence: occurrence.0, pointer, handle: binding.declaration_span, origin,
+            reached: false, refused: false,
+        })
     }
 
     fn private_runtime_formal_store(
@@ -6855,14 +6913,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
                                             if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })));
                             if runtime_writer {
-                                if !self.capture_private_runtime_reads || capture.is_some()
-                                    || assignment.targets.len() != 1 || assignment.values.len() != 1 || position != 0
-                                    || !self.private_runtime_formal_store(&target.place, slot.destination, pointer_point, &output_types[position])
+                                let ordinary_store = capture.is_none()
+                                    && assignment.targets.len() == 1 && assignment.values.len() == 1 && position == 0;
+                                let local = ordinary_store && block.terminated_items.get(item_index) == Some(&true)
+                                    && group.projected_outputs().len() == 0
+                                    && self.local_runtime_exclusive_place(&target.place, slot.destination).is_some();
+                                if let Some(site) = local.then(|| self.local_runtime_exclusive_site(pointer_point, slot.destination)).flatten() {
+                                    self.cfg.runtime_array_exclusive_sites.insert(install, site);
+                                } else if self.capture_private_runtime_reads && ordinary_store
+                                    && self.private_runtime_formal_store(&target.place, slot.destination, pointer_point, &output_types[position])
                                 {
+                                    self.proof_points.private_runtime_formal_stores.insert(install, slot.destination);
+                                } else {
                                     return Err(self.missing_context(target.target_span,
                                         ReferenceAnalysisErrorReason::MissingDereferencedArrayWriteExtent));
                                 }
-                                self.proof_points.private_runtime_formal_stores.insert(install, slot.destination);
                             }
                         }
                         if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
@@ -9250,6 +9315,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     runtime_array_read_sites: Option<&'a mut HashMap<CfgPointId, RuntimeArrayReadSite>>,
     runtime_array_children: &'a mut [RuntimeArrayChildSite],
+    runtime_array_exclusive: Option<&'a mut HashMap<CfgPointId, RuntimeArrayExclusiveSite>>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
@@ -9293,6 +9359,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             allocations: &cfg.allocations,
             runtime_array_read_sites: (!cfg.runtime_array_read_sites.is_empty()).then_some(&mut cfg.runtime_array_read_sites),
             runtime_array_children: &mut cfg.runtime_array_child_sites,
+            runtime_array_exclusive: (!cfg.runtime_array_exclusive_sites.is_empty()).then_some(&mut cfg.runtime_array_exclusive_sites),
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             pending_returned_extent: proof.and_then(|proof| proof.pending_returned_extent),
@@ -10487,6 +10554,14 @@ fn runtime_child_protected_bindings<'a>(
     Some([holder, &loan.origin_place.binding])
 }
 
+fn runtime_exclusive_protected_bindings<'a>(
+    site: &RuntimeArrayExclusiveSite, points: &'a [ReferenceFlowPoint], facts: &'a [ReferenceOrigin],
+) -> Option<[&'a ReferenceBindingId; 2]> {
+    let CfgPointKind::Read { binding: holder } = &points.get(site.pointer.0)?.kind else { return None; };
+    let ReferenceOrigin::Fresh { loan, .. } = facts.get(site.origin.0)? else { return None; };
+    Some([holder, &loan.origin_place.binding])
+}
+
 fn record_runtime_child_representation_mutation(
     changes: &mut HashMap<ReferenceBindingId, bool>, kind: &CfgPointKind, original: bool,
 ) {
@@ -10531,10 +10606,15 @@ fn transfer_reference_facts(
     // Actual runtime child issuance is sparse. Index its exact owner and
     // holder identities; fold representation mutations into the graph's
     // existing topology and resolved-point staging.
-    let mut runtime_child_changes = (!cfg.runtime_array_children.is_empty()).then(|| {
+    let mut runtime_child_changes = (!cfg.runtime_array_children.is_empty() || cfg.runtime_array_exclusive.is_some()).then(|| {
         cfg.runtime_array_children.iter().filter_map(|site| runtime_child_protected_bindings(site, original_points, cfg.facts))
+            .chain(cfg.runtime_array_exclusive.iter().flat_map(|sites| sites.values())
+                .filter_map(|site| runtime_exclusive_protected_bindings(site, original_points, cfg.facts)))
             .flatten().map(|binding| (binding.clone(), false)).collect::<HashMap<_, _>>()
     });
+    if let Some(sites) = cfg.runtime_array_exclusive.as_deref_mut() {
+        for site in sites.values_mut() { site.reached = false; site.refused = !cfg.raw_address_exposures.is_empty(); }
+    }
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
@@ -10840,7 +10920,7 @@ fn transfer_reference_facts(
     }
     // Sparse exact initializer receipts: reuse the existing checked install
     // walk; don't scan unrelated definitions or infer a Bind from proximity.
-    let mut runtime_child_installs = runtime_child_changes.as_ref().map(|changes| {
+    let mut runtime_child_installs = runtime_child_changes.as_ref().filter(|_| !cfg.runtime_array_children.is_empty()).map(|changes| {
         let children = cfg.runtime_array_children.iter().map(|site| (site.borrow, None))
             .collect::<HashMap<_, _>>();
         let parents = changes.keys().cloned().map(|binding| (binding, None))
@@ -11144,6 +11224,18 @@ fn transfer_reference_facts(
             } else {
                 std::mem::replace(&mut ran_point, true)
             };
+            if let Some(site) = cfg.runtime_array_exclusive.as_deref_mut().and_then(|sites| sites.get_mut(&id)) {
+                site.reached = true;
+                site.refused |= !runtime_exclusive_protected_bindings(site, original_points, cfg.facts)
+                    .is_some_and(|[holder, owner]| {
+                        let ReferenceOrigin::Fresh { loan, .. } = &cfg.facts[site.origin.0] else { return false; };
+                        state.point_values.get(site.pointer)
+                            .is_some_and(|origins| origins.len() == 1 && origins.contains(&site.origin))
+                            && exact_live_reborrow_holder(&state, holder, site.origin)
+                            && !state.released.contains(owner) && !state.invalidated.contains(owner)
+                            && !state.uninitialized.contains(owner) && !unavailable_place(&state, &loan.origin_place)
+                    });
+            }
             let projected_rejected = projected_loan.is_some_and(|loan| {
                 !projected_authority.is_some_and(|authority| {
                     checked_projected_reborrow_parent_on_edge(&state, cfg.facts, authority, loan)
@@ -12886,6 +12978,12 @@ fn transfer_reference_facts(
         *point = observed;
     }
     if let Some(changes) = runtime_child_changes {
+        if let Some(sites) = cfg.runtime_array_exclusive.as_deref_mut() {
+            for site in sites.values_mut() {
+                site.refused |= runtime_exclusive_protected_bindings(site, original_points, cfg.facts)
+                    .is_none_or(|bindings| bindings.into_iter().any(|binding| changes.get(binding) != Some(&false)));
+            }
+        }
         for site in cfg.runtime_array_children {
             site.mutable_representation |= runtime_child_protected_bindings(site, original_points, cfg.facts)
                 .is_none_or(|bindings| bindings.into_iter().any(|binding| changes.get(binding) != Some(&false)));
@@ -17568,6 +17666,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     allocations: &template_cfg.allocations,
                     runtime_array_read_sites: None,
                     runtime_array_children: &mut [],
+                    runtime_array_exclusive: None,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     pending_returned_extent: template_result.proof_points.pending_returned_extent,
@@ -18363,6 +18462,20 @@ fn build_function_reference_cfg(
                 source_span: builder.cfg.points[point.0].source_span.clone(),
                 reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
             });
+        }
+        if !builder.cfg.runtime_array_exclusive_sites.is_empty() {
+            let mut refused: Vec<_> = builder.cfg.runtime_array_exclusive_sites.iter().filter_map(|(&point, site)|
+                builder.cfg.runtime_array_exclusive_origin(point, site).is_none().then_some(point)).collect();
+            refused.sort_unstable();
+            for point in refused {
+                let point = &builder.cfg.points[point.0];
+                errors.push(ReferenceAnalysisError::MissingContext {
+                    source_span: point.source_span.clone(),
+                    reason: if matches!(point.kind, CfgPointKind::AssignThrough { .. }) {
+                        ReferenceAnalysisErrorReason::MissingDereferencedArrayWriteExtent
+                    } else { ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent },
+                });
+            }
         }
         builder.proof_points.forward_initial_graph = forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {

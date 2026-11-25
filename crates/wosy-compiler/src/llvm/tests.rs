@@ -17651,6 +17651,118 @@ unit(u64) write_only = fn(index) {
 }
 
 #[test]
+fn local_exclusive_runtime_array_read_write_preserves_checked_backing() {
+    let text = "%%start
+u16(u16) produce = fn(value) { value };
+u16(u64,u64,u64,u16) update = fn(count,index,other,value) {
+    u16[count] cells;
+    *!(u16[]) writer = &!cells;
+    (*writer)[index] = produce(value);
+    (*writer)[other] = 71;
+    u16 first = (*writer)[index];
+    u16 second = (*writer)[other];
+    first + second
+};
+if (update(3,1,2,37) != 108) { core.system_panic(); };
+%%end";
+    let conflict = text.replace("    (*writer)[other] = 71;",
+        "    *u16 child = &(*writer)[other];\n    (*writer)[other] = 71;\n    u16 saved = *child;")
+        .replace("    first + second", "    first + second + saved");
+    let rebind = text.replace("    (*writer)[index] = produce(value);",
+        "    u16[count] different;\n    writer = &!different;\n    (*writer)[index] = produce(value);");
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i16", &project_function_name(&source, "update"));
+        let rhs = format!("call i16 @{}(", project_function_name(&source, "produce"));
+        let helper = prepared.checked_access_source().unwrap();
+        let null = format!("call void @{}(", project_function_name(helper, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(helper, "check_index_in_extent"));
+        assert_eq!(body.matches(&null).count(), 4, "{body}");
+        assert_eq!(body.matches(&bounds).count(), 4, "{body}");
+        let extent = loaded_runtime_extent_parameter(body, "count");
+        let wasm = target_layout == ScalarTargetLayout::WASM32;
+        let cap = if wasm { i32::MAX as u64 / 2 } else { i64::MAX as u64 / 2 };
+        assert!(body.lines().any(|line| line.ends_with(&format!("icmp ugt i64 {extent}, {cap}"))), "{body}");
+        let writes = [true, true, false, false];
+        let mut start = 0;
+        for ((at, _), store) in body.match_indices("getelementptr inbounds i16, ptr %deref").zip(writes) {
+            let before = &body[start..at];
+            let null_at = before.find(&null).unwrap();
+            let bounds_at = before.find(&bounds).unwrap();
+            assert!(null_at < bounds_at, "{before}");
+            assert_eq!(before.matches(&null).count(), 1, "{before}");
+            assert_eq!(before.matches(&bounds).count(), 1, "{before}");
+            let pointer_bits = if wasm { "i32" } else { "i64" };
+            let checked_address = before[null_at..].lines().next().unwrap()
+                .strip_prefix(&format!("{null}{pointer_bits} ")).unwrap().strip_suffix(')').unwrap();
+            let deref = before[null_at..bounds_at].lines().find_map(|line| {
+                let (name, op) = line.trim_start().split_once(" = ")?;
+                (op == format!("inttoptr {pointer_bits} {checked_address} to ptr")).then_some(name)
+            }).unwrap();
+            let guard = before[bounds_at..].lines().next().unwrap();
+            let checked_selector = guard.strip_prefix(&format!("{bounds}i64 ")).unwrap()
+                .strip_suffix(&format!(", i64 {extent})")).unwrap();
+            let selected = if wasm {
+                before[bounds_at..].lines().find_map(|line| {
+                    let (name, op) = line.trim_start().split_once(" = ")?;
+                    (op == format!("trunc i64 {checked_selector} to i32")).then_some(name)
+                }).unwrap()
+            } else { checked_selector };
+            let gep = body[at..].lines().next().unwrap();
+            assert_eq!(gep, format!("getelementptr inbounds i16, ptr {deref}, {pointer_bits} {selected}"));
+            let address = body[..at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap();
+            let access = body[at+gep.len()..].lines().skip(1).take(4).find(|line|
+                line.contains(&format!(", ptr {address},"))).unwrap().trim_start();
+            assert_eq!(access.starts_with("store i16 "), store, "{access}");
+            if start == 0 {
+                let rhs_at = before.find(&rhs).unwrap();
+                assert!(rhs_at < null_at, "{before}");
+                let produced = before[..rhs_at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap();
+                let actual = access.strip_prefix("store i16 ").unwrap().split_once(", ptr ").unwrap().0;
+                if actual != produced {
+                    let spill = before[rhs_at..null_at].lines().find_map(|line| line.trim_start()
+                        .strip_prefix(&format!("store i16 {produced}, ptr "))
+                        .and_then(|tail| tail.split_once(',')).map(|(slot, _)| slot)).unwrap();
+                    assert!(before[rhs_at..].lines().any(|line| line.trim_start()
+                        .starts_with(&format!("{actual} = load i16, ptr {spill},"))), "{before}\n{access}");
+                }
+            }
+            start = at + gep.len();
+        }
+        assert_eq!(body.matches("getelementptr inbounds i16, ptr %deref").count(), 4, "{body}");
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 1, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        for (source, overlap) in [(&conflict, true), (&rebind, false)] {
+            let diagnostics = match prepare(source) {
+                Ok(program) => analyze_scalar_build(&program).diagnostics().to_vec(),
+                Err(error) => error.diagnostics.clone(),
+            };
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && (!overlap
+                || diagnostic.labels.iter().any(|label| label.message == "origin of conflicting place or loan"))),
+                "{diagnostics:?}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_LOCAL_EXCLUSIVE_RUNTIME_ARRAY_IR_DIR") {
+            let name = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{name}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_element_reborrows_keep_original_extent_and_parent_loan() {
     let text = "%%start
 u16(u64,u64) read_shared = fn(count,index) {

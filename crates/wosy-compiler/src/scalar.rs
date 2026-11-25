@@ -669,6 +669,16 @@ pub(crate) struct RuntimeArrayChildInstall {
     pub(crate) child_bind: CfgPointId,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayExclusiveSite {
+    pub(crate) occurrence: usize,
+    pub(crate) pointer: CfgPointId,
+    pub(crate) handle: ByteSpan,
+    pub(crate) origin: ReferenceOriginId,
+    pub(super) reached: bool,
+    pub(super) refused: bool,
+}
+
 #[cfg_attr(not(test), derive(Clone))]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
@@ -688,6 +698,8 @@ pub struct ScalarReferenceCfg {
     pub(crate) runtime_array_read_sites: HashMap<CfgPointId, RuntimeArrayReadSite>,
     #[serde(skip)]
     pub(crate) runtime_array_child_sites: Vec<RuntimeArrayChildSite>,
+    #[serde(skip)]
+    pub(crate) runtime_array_exclusive_sites: HashMap<CfgPointId, RuntimeArrayExclusiveSite>,
 }
 
 impl PartialEq for ScalarReferenceCfg {
@@ -725,6 +737,7 @@ impl ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
         }
     }
 
@@ -756,6 +769,58 @@ impl ScalarReferenceCfg {
         (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
             && loan.origin_place.projections.is_empty() && self.allocations.contains(&loan.origin_place.binding))
             .then_some(&loan.origin_place.binding)
+    }
+
+    pub(crate) fn runtime_array_exclusive_origin(
+        &self, point: CfgPointId, site: &RuntimeArrayExclusiveSite,
+    ) -> Option<&ReferenceBindingId> {
+        if !site.reached || site.refused { return None; }
+        let access = self.points.get(point.0)?;
+        let pointer = self.points.get(site.pointer.0)?;
+        let CfgPointKind::Read { binding } = &pointer.kind else { return None; };
+        if binding.declaration_span != site.handle || pointer.scope != access.scope
+            || !pointer.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.origin))
+        { return None; }
+        let ReferenceOrigin::Fresh { loan, .. } = self.facts.get(site.origin.0)? else { return None; };
+        let owner = &loan.origin_place;
+        if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
+            || !owner.projections.is_empty() || !matches!(owner.place, ScalarPlace::Name { .. })
+            || !self.allocations.contains(&owner.binding)
+        { return None; }
+
+        let (place, candidate, read) = match &access.kind {
+            CfgPointKind::ReadPlace { place, pointer_point: Some(actual), candidates, reads_origin: false }
+                if *actual == site.pointer
+                    && access.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.origin)) =>
+            {
+                let [candidate] = candidates.as_slice() else { return None; };
+                (place, candidate, true)
+            }
+            CfgPointKind::AssignThrough { place, pointer_point: actual, candidates, .. }
+                if *actual == site.pointer =>
+            {
+                let [candidate] = candidates.as_slice() else { return None; };
+                if candidate.origin != site.origin || candidate.loan != *loan { return None; }
+                (place, &candidate.place, false)
+            }
+            _ => return None,
+        };
+        let ScalarPlace::Index { base, index, .. } = place else { return None; };
+        let ScalarPlace::Dereference { pointer: authored_pointer, .. } = base.as_ref() else { return None; };
+        if !matches!(authored_pointer.as_ref(), ScalarExpression::Name { span, .. } if *span == pointer.source_span.range)
+            || candidate.place != *place || candidate.binding != owner.binding
+            || candidate.source != owner.source || candidate.function_span != owner.function_span
+            || candidate.declaration_span != owner.declaration_span || candidate.block_span != owner.block_span
+        { return None; }
+        // Reads retain the exact traversed loan in their projection.
+        // Writes retain that loan on the AssignThrough candidate itself.
+        match (read, candidate.projections.as_slice()) {
+            (true, [ReferencePlaceProjection::Dereference(actual), ReferencePlaceProjection::Index(selected)])
+                if actual.as_ref() == loan && selected == index.as_ref() => Some(&owner.binding),
+            (false, [ReferencePlaceProjection::Index(selected)])
+                if selected == index.as_ref() => Some(&owner.binding),
+            _ => None,
+        }
     }
 
     pub(crate) fn runtime_array_portable_child(
@@ -3813,6 +3878,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
             primary_call_points: HashMap::new(),
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
@@ -3919,6 +3985,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                     primary_call_points: HashMap::new(),
                     runtime_array_read_sites: HashMap::new(),
                     runtime_array_child_sites: Vec::new(),
+                    runtime_array_exclusive_sites: HashMap::new(),
                     observed_runtime_allocations: None,
                     guarded_scalar_allocation: None,
                     facts: Vec::new(),
@@ -3952,6 +4019,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
             primary_call_points: HashMap::new(),
             runtime_array_read_sites: HashMap::new(),
             runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),

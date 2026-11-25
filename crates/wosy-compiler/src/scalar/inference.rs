@@ -211,6 +211,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     float_literal_shapes: HashMap<*const ScalarExpression, bool>,
     in_module_initialization: bool,
     private_runtime_write_formal: Option<String>,
+    nominate_local_runtime_write: bool,
     suppress_checked_occurrences: bool,
 }
 
@@ -223,6 +224,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             float_literal_shapes: HashMap::new(),
             in_module_initialization: false,
             private_runtime_write_formal: None,
+            nominate_local_runtime_write: false,
             suppress_checked_occurrences: true,
         }
     }
@@ -496,6 +498,9 @@ impl<'a> ScalarInferenceBuilder<'a> {
     pub(super) fn set_validation_root(&mut self, item: &ScalarItem) {
         self.in_module_initialization =
             matches!(item, ScalarItem::Binding(_) | ScalarItem::Executable(_));
+        self.nominate_local_runtime_write = !self.suppress_checked_occurrences
+            && matches!(item, ScalarItem::Function(function)
+                if function.overload_arms.is_empty() && function.generic_parameters.is_empty());
         self.private_runtime_write_formal = match item {
             ScalarItem::Function(function) if !self.suppress_checked_occurrences && function.overload_arms.is_empty()
                 && function.generic_parameters.is_empty() && super::typecheck::is_module_private_name(&function.name) =>
@@ -515,6 +520,29 @@ impl<'a> ScalarInferenceBuilder<'a> {
         matches!((self.private_runtime_write_formal.as_deref(), base),
             (Some(formal), ScalarPlace::Dereference { pointer, .. }) if matches!(pointer.as_ref(),
                 ScalarExpression::Name { name, .. } if name == formal))
+    }
+
+    // Type nomination only: scope types do not distinguish otherwise
+    // identical local, formal, or imported owners. The exact reference
+    // author requires a lexical holder with a Fresh local allocation,
+    // and a solved unchanged extent receipt on every incoming edge.
+    pub(super) fn nominates_local_runtime_write(
+        &self, base: &ScalarPlace, index: &ScalarExpression, index_ty: &ScalarType,
+        element: &ScalarType, scope: &BTreeMap<String, ScalarType>,
+    ) -> bool {
+        if !self.nominate_local_runtime_write || self.suppress_checked_occurrences
+            || *index_ty != ScalarType::U64 || !super::reference::aggregate::ordinary_value(element)
+        { return false; }
+        let ScalarPlace::Dereference { pointer, .. } = base else { return false; };
+        let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return false; };
+        matches!(scope.get(name), Some(ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Mutable, inner,
+        }) if matches!(inner.as_ref(), ScalarType::RuntimeArray { element: actual, .. } if actual.as_ref() == element))
+            && match index {
+                ScalarExpression::Integer { .. } => true,
+                ScalarExpression::Name { name, .. } => scope.get(name) == Some(&ScalarType::U64),
+                _ => false,
+            }
     }
 
     pub(super) fn record_assignment_outputs(
