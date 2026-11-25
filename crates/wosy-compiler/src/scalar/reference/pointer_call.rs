@@ -31,10 +31,12 @@ impl<'a> CallerPointeeEffect<'a> {
 pub(super) fn checked<'a>(
     source: &SourceIdentity, declaration: ByteSpan, function: &ScalarFunction,
     body: &'a FunctionCallSites, cfg: &'a ScalarReferenceCfg, facts: &CallablePointFacts,
-    callee: EntryPointeeWrite<'a>, claimed: &BigInt, wanted: Option<OccurrenceOrdinal>,
-) -> Option<CallerPointeeEffect<'a>> {
-    if callee.offset() != claimed || &callee.formal().source != source || cfg.points.len() > 32
-        || !(1..=4).contains(&cfg.facts.len()) || !cfg.allocations.is_empty() || function.body.unsafe_context
+    callees: &[EntryPointeeWrite<'a>], claimed: &[&BigInt], wanted: Option<OccurrenceOrdinal>,
+) -> Option<Vec<CallerPointeeEffect<'a>>> {
+    if !(1..=2).contains(&callees.len()) || callees.len() != claimed.len()
+        || !callees.iter().zip(claimed).all(|(effect, amount)| effect.offset() == *amount && &effect.formal().source == source)
+        || cfg.points.len() > 32
+        || !(1..=4 * callees.len()).contains(&cfg.facts.len()) || !cfg.allocations.is_empty() || function.body.unsafe_context
         || !function.generic_parameters.is_empty() || !body.arms.is_empty()
         || !body.boundary.parameters.is_empty() || !body.callable_escapes.is_empty()
         || !body.allocation_length_calls.is_empty() || !body.structure.module_storage_uses.is_empty()
@@ -45,11 +47,10 @@ pub(super) fn checked<'a>(
     let root = structure.root;
     struct Cell<'a> {
         binding: &'a ReferenceBindingId,
+        width: &'a ScalarType,
         entry: BigInt,
         observed: bool,
     }
-    let width = callee.width();
-    let (min, max) = super::super::typecheck::integer_bounds(width)?;
     let mut cells: Vec<Cell<'_>> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut points = Vec::new();
@@ -59,6 +60,8 @@ pub(super) fn checked<'a>(
         if let BlockItemKind::Binding(region) = &item.kind {
             let [receiver] = region.receivers() else { return None; };
             let BindingInitialization::Outputs(outputs) = &region.initialization else { return None; };
+            let width = callees.iter().find(|effect| effect.width() == &receiver.ty)?.width();
+            let (min, max) = super::super::typecheck::integer_bounds(width)?;
             if cells.len() == 4 || !outputs.secondary.is_empty() || receiver.contextual_storage.is_some()
                 || &receiver.ty != width || structure.checked_types.expressions.get(&outputs.primary)? != width
             {
@@ -79,7 +82,7 @@ pub(super) fn checked<'a>(
             }
             points.extend([value, bind]);
             previous = bind;
-            cells.push(Cell { binding, entry: entry.clone(), observed: false });
+            cells.push(Cell { binding, width, entry: entry.clone(), observed: false });
             continue;
         }
         if let BlockItemKind::Assignment { group } = item.kind {
@@ -88,6 +91,8 @@ pub(super) fn checked<'a>(
             let (destination, ty, rhs, place) =
                 super::super::checker_flow::checked_scalar_assignment(body, group)?;
             let cell = cells.iter_mut().find(|cell| cell.binding == destination && cell.observed)?;
+            let width = cell.width;
+            let (min, max) = super::super::typecheck::integer_bounds(width)?;
             if ty != width || structure.checked_types.expressions.get(&rhs)? != width
                 || structure.checked_types.places.get(&place)? != width
             {
@@ -126,46 +131,63 @@ pub(super) fn checked<'a>(
         let signature = body.checked_call_signatures.get(&call)?;
         if signature.overload.is_some() || signature.overload_origin.is_some()
             || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
-            || !matches!(signature.parameters.as_slice(),
-                [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner }] if inner.as_ref() == callee.width())
+            || signature.parameters.len() != callees.len()
         {
             return None;
         }
         let ScalarExpression::Call { receiver: None, arguments, type_arguments, .. } = expression else { return None; };
-        let [ScalarExpression::CheckedAddress {
-            mutability: ScalarReferenceMutability::Mutable, place: ScalarPlace::Name { .. }, ..
-        }] = arguments.as_slice() else { return None; };
-        if !type_arguments.is_empty() { return None; }
-        let OccurrenceNode::Expression(arg) = structure.edges.get(&(
-            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
-        ))? else { return None; };
-        let [borrow] = argument_points.as_slice() else { return None; };
-        if facts.evaluations.get(arg) != Some(borrow) || structure.checked_types.expressions.get(arg)? != &signature.parameters[0] {
-            return None;
-        }
-        let borrow_point = cfg.points.get(borrow.0)?;
-        let CfgPointKind::Borrow { place, loan } = &borrow_point.kind else { return None; };
-        let origins = borrow_point.possible_origins.as_ref()?;
-        if origins.len() != 1 { return None; }
-        let origin = origins.iter().next()?;
-        let ReferenceOrigin::Fresh { allocation, loan: issued } = cfg.facts.get(origin.0)? else { return None; };
-        let cell = cells.iter_mut().find(|cell| cell.binding == &place.binding)?;
-        if !seen.insert(*origin)
-            || &allocation.source != source || allocation.function_span != function.span
-            || allocation.declaration_span != cell.binding.declaration_span || allocation.creation_span != borrow_point.source_span.range
-            || &place.source != source || !place.projections.is_empty()
-            || &loan.origin_place != place || loan != issued || loan.parent.is_some()
-            || loan.mode != ScalarReferenceMutability::Mutable
-            || !(previous.0 < borrow.0 && borrow.0 < call_point.id.0)
-        {
-            return None;
-        }
-        let exit = super::super::typecheck::wrapping_integer_sum(&cell.entry, claimed, &min, &max)?;
-        points.extend([*borrow, call_point.id]);
-        previous = call_point.id;
-        if wanted.is_some_and(|wanted| wanted != call) {
+        if !type_arguments.is_empty() || arguments.len() != callees.len() || argument_points.len() != callees.len() { return None; }
+        let mut receipts = Vec::with_capacity(callees.len());
+        let mut call_cells = [false; 4];
+        for (slot, ((callee, &amount), borrow)) in callees.iter().zip(claimed).zip(argument_points).enumerate() {
+            let width = callee.width();
+            let (min, max) = super::super::typecheck::integer_bounds(width)?;
+            let parameter = &signature.parameters[slot];
+            if !matches!(parameter, ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } if inner.as_ref() == width)
+                || !matches!(arguments[slot], ScalarExpression::CheckedAddress {
+                    mutability: ScalarReferenceMutability::Mutable, place: ScalarPlace::Name { .. }, ..
+                })
+            {
+                return None;
+            }
+            let OccurrenceNode::Expression(arg) = structure.edges.get(&(
+                OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
+            ))? else { return None; };
+            if facts.evaluations.get(arg) != Some(borrow) || structure.checked_types.expressions.get(arg)? != parameter {
+                return None;
+            }
+            let borrow_point = cfg.points.get(borrow.0)?;
+            let CfgPointKind::Borrow { place, loan } = &borrow_point.kind else { return None; };
+            let origins = borrow_point.possible_origins.as_ref()?;
+            if origins.len() != 1 { return None; }
+            let origin = origins.iter().next()?;
+            let ReferenceOrigin::Fresh { allocation, loan: issued } = cfg.facts.get(origin.0)? else { return None; };
+            let cell_slot = cells.iter().position(|cell| cell.binding == &place.binding)?;
+            let cell = cells.get_mut(cell_slot)?;
+            if cell.width != width || std::mem::replace(call_cells.get_mut(cell_slot)?, true)
+                || !seen.insert(*origin)
+                || &allocation.source != source || allocation.function_span != function.span
+                || allocation.declaration_span != cell.binding.declaration_span || allocation.creation_span != borrow_point.source_span.range
+                || &place.source != source || !place.projections.is_empty()
+                || &loan.origin_place != place || loan != issued || loan.parent.is_some()
+                || loan.mode != ScalarReferenceMutability::Mutable
+                || !(previous.0 < borrow.0 && borrow.0 < call_point.id.0)
+            {
+                return None;
+            }
+            let exit = super::super::typecheck::wrapping_integer_sum(&cell.entry, amount, &min, &max)?;
+            points.push(*borrow);
+            previous = *borrow;
+            receipts.push(CallerPointeeEffect {
+                call: &call_point.source_span, place, loan, width, entry_epoch: call_point.id,
+                position, entry: cell.entry.clone(), exit: exit.clone(),
+            });
             cell.entry = exit;
             cell.observed = true;
+        }
+        points.push(call_point.id);
+        previous = call_point.id;
+        if wanted.is_some_and(|wanted| wanted != call) {
             position += 1;
             continue;
         }
@@ -185,10 +207,7 @@ pub(super) fn checked<'a>(
                 _ => return None,
             }
         }
-        return Some(CallerPointeeEffect {
-            call: &call_point.source_span, place, loan, width,
-            entry_epoch: call_point.id, position, entry: cell.entry.clone(), exit,
-        });
+        return Some(receipts);
     }
     None
 }

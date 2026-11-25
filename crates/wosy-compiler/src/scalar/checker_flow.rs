@@ -4071,6 +4071,14 @@ fn bounded_projection_charges_distinct_interval_sort_before_materializing() {
     assert!(projection.materialize_bounded().is_none());
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) struct LocalPointeeTransition {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) ty: ScalarType,
+    pub(super) entry: BigInt,
+    pub(super) exit: BigInt,
+}
+
 pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
     #[cfg(feature = "internal-checker")]
@@ -8444,17 +8452,35 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn resume_exact_local_update(
         &mut self, binding: &ReferenceBindingId, ty: &ScalarType, entry: BigInt, exit: BigInt,
     ) -> Option<()> {
-        if self.contextual_singleton(binding, ty)? != &entry
-            || !super::typecheck::integer_literal_fits_type(&exit, ty)
-        {
-            return None;
+        self.resume_exact_local_updates(std::iter::once(LocalPointeeTransition {
+            binding: binding.clone(), ty: ty.clone(), entry, exit,
+        }))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn resume_exact_local_updates(
+        &mut self, updates: impl ExactSizeIterator<Item = LocalPointeeTransition>,
+    ) -> Option<()> {
+        if !(1..=2).contains(&updates.len()) { return None; }
+        let mut pending: [Option<(usize, Option<BigInt>)>; 2] = [None, None];
+        for (index, update) in updates.enumerate() {
+            if self.contextual_singleton(&update.binding, &update.ty)? != &update.entry
+                || !super::typecheck::integer_literal_fits_type(&update.exit, &update.ty)
+            {
+                return None;
+            }
+            let axis = self.roots.lookup(&update.binding)?.0;
+            if pending.iter().flatten().any(|&(used, _)| used == axis) { return None; }
+            pending[index] = Some((axis, (update.entry != update.exit).then_some(update.exit)));
         }
-        if entry != exit {
-            let axis = self.roots.lookup(binding)?.0;
+        let charges = pending.iter().flatten().filter(|(_, exit)| exit.is_some()).count();
+        if charges > 0 {
             self.roots.ordinary_local_work.get_or_insert(0);
-            self.block.path.charge_local_alias_work(&mut self.roots.ordinary_local_work, 2)?;
+            self.block.path.charge_local_alias_work(&mut self.roots.ordinary_local_work, charges.checked_mul(2)?)?;
             let [row] = self.block.path.0.as_mut_slice() else { return None; };
-            row.overwrite(axis, Rc::new(IntegerSet::singleton(&exit)), false);
+            for (axis, exit) in pending.into_iter().flatten() {
+                if let Some(exit) = exit { row.overwrite(axis, Rc::new(IntegerSet::singleton(&exit)), false); }
+            }
         }
         Some(())
     }

@@ -1,8 +1,8 @@
 //! The closed authored Unit effect route for sealed entry cells. A reached
-//! single-formal call still needs its own exact receipt; no multi-formal
-//! effect is exported to a caller.
+//! call needs its own exact receipt for every independently lent formal.
 use super::*;
 use super::super::{ScalarPlace, ScalarReferenceMutability};
+use super::super::checker_flow::LocalPointeeTransition as LocalTransition;
 use wosy_syntax::SourceSpan;
 
 pub(super) struct Plan {
@@ -17,13 +17,6 @@ struct PointeeClaim {
     slot: usize,
     goal: SourceSpan,
     amount: BigInt,
-}
-
-pub(super) struct LocalTransition {
-    pub(super) binding: ReferenceBindingId,
-    pub(super) ty: ScalarType,
-    pub(super) entry: BigInt,
-    pub(super) exit: BigInt,
 }
 
 pub(super) fn is_unit_target(selected: &SelectedModuleProof<'_>) -> bool {
@@ -148,9 +141,8 @@ impl ActualIntegerObserver for &Plan {
     fn exact_pointee_update(
         &self, target: PreparedCallable, body: &FunctionCallSites, occurrence: OccurrenceOrdinal,
         source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
-    ) -> Result<Option<LocalTransition>, ProjectCheck> {
+    ) -> Result<Option<Vec<LocalTransition>>, ProjectCheck> {
         if target != self.target { return Ok(None); }
-        let [claim] = self.claims.as_slice() else { return Err(ProjectCheck::Unsupported); };
         if &self.proof.source != source
             || !matches!(runtime.visits, Some([InitializationVisit::Started]))
         {
@@ -162,11 +154,13 @@ impl ActualIntegerObserver for &Plan {
             matches!(decl, ScalarItem::Function(_)).then_some(())?;
             std::ptr::eq(body, runtime.calls.function_body(target.0, item, None)?).then_some(item)
         }).ok_or(ProjectCheck::Unsupported)?;
-        let receipt = references.pointer_caller_effect(
-            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &claim.amount, Some(occurrence),
+        let mut amounts = self.claims.iter().map(|claim| (claim.slot, &claim.amount)).collect::<Vec<_>>();
+        amounts.sort_unstable_by_key(|(slot, _)| *slot);
+        let amounts = amounts.into_iter().map(|(_, amount)| amount).collect::<Vec<_>>();
+        let receipts = references.pointer_caller_effects(
+            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &amounts, Some(occurrence),
         ).ok_or(ProjectCheck::Unsupported)?;
         let call = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
-        if &receipt.call().source != source || receipt.call().range != call { return Err(ProjectCheck::Unsupported); }
         // The receipt is immutable, but only the next real occurrence on
         // this exact caller frame may consume it. A second activation starts
         // with position zero and cannot borrow the previous epoch.
@@ -175,12 +169,16 @@ impl ActualIntegerObserver for &Plan {
             Some((owner, next)) if owner == caller => next,
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if receipt.position() != expected { return Err(ProjectCheck::Unsupported); }
+        if receipts.len() != self.claims.len() || receipts.iter().any(|receipt| {
+            receipt.position() != expected || &receipt.call().source != source || receipt.call().range != call
+        }) {
+            return Err(ProjectCheck::Unsupported);
+        }
         self.applied.set(Some((caller, expected.checked_add(1).ok_or(ProjectCheck::Unsupported)?)));
-        Ok(Some(LocalTransition {
+        Ok(Some(receipts.into_iter().map(|receipt| LocalTransition {
             binding: receipt.place().binding.clone(), ty: receipt.width().clone(),
             entry: receipt.entry().clone(), exit: receipt.exit().clone(),
-        }))
+        }).collect()))
     }
 }
 
@@ -389,12 +387,39 @@ mod tests {
                 let dormant = run(&failed, ScalarCheckerScope::MainFlowOnly).unwrap();
                 assert!(!dormant.active && dormant.pointer_effect_diagnostic.is_none());
             }
+            let reached = program.replace("%%end", r#"
+                unit() start = fn {
+                    u8 a = 255;
+                    u32 b = 42;
+                    adjust(&!a, &!b);
+                    core.require(a == 0, { .stdout = ""; .stderr = "first"; .code = 1; .files = []; });
+                    core.require(b == 44, { .stdout = ""; .stderr = "second"; .code = 1; .files = []; });
+                };
+                start();
+            %%end"#);
+            for scope in [ScalarCheckerScope::MainFlowOnly, package] {
+                let pass = run(&reached, scope).unwrap();
+                assert!(pass.active && pass.directives.is_empty() && pass.pointer_effect_diagnostic.is_none());
+                for (expected, stale) in [("a == 0", "a == 255"), ("b == 44", "b == 42")] {
+                    let wrong = reached.replace(expected, stale);
+                    let failure = run(&wrong, scope).unwrap();
+                    let [failed] = failure.directives.as_slice() else { panic!("exact per-argument requirement"); };
+                    assert_eq!(&wrong[failed.condition.start as usize..failed.condition.end as usize], stale);
+                }
+                for refused in [
+                    reached.replace("*!u32", "*!u8").replace("adjust(&!a, &!b)", "adjust(&!a, &!a)"),
+                    reached.replace("adjust(&!a, &!b)", "adjust(&!b, &!a)"),
+                    reached.replace("core.old(*second) +@ 2", "core.old(*second) +@ 4"),
+                    reached.replace("start();", "start(); start();"),
+                ] {
+                    assert!(run(&refused, scope).is_err(), "{refused}");
+                }
+            }
             for unsupported in [
                 program.replace("*first == core.old(*first)", "*first == core.old(*second)"),
                 program.replace("*first == core.old(*first) +@ 1", "*second == core.old(*second) +@ 2"),
                 program.replace("*!u32", "*!u8").replace("*p = *p +@ 2", "*p = *q +@ 2"),
                 program.replace("*q = *q +@ 2;", ""),
-                program.replace("%%end", "unit() start = fn { u8 a = 12; u32 b = 42; adjust(&!a, &!b); }; start(); %%end"),
             ] {
                 assert!(run(&unsupported, package).is_err(), "{unsupported}");
             }

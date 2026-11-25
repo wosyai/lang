@@ -2243,7 +2243,7 @@ trait ActualIntegerObserver {
     fn exact_pointee_update(
         &self, _: PreparedCallable, _: &FunctionCallSites, _: OccurrenceOrdinal,
         _: &SourceIdentity, _: SymbolicProofRuntime<'_>,
-    ) -> Result<Option<pointer_proof::LocalTransition>, ProjectCheck> { Ok(None) }
+    ) -> Result<Option<Vec<super::checker_flow::LocalPointeeTransition>>, ProjectCheck> { Ok(None) }
 
     #[cfg(feature = "internal-checker")]
     fn watches_fixed_array(&self, _: PreparedCallable) -> bool { false }
@@ -2957,9 +2957,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     target, body, occurrence, source,
                                     SymbolicProofRuntime { project: self.project, calls: self.calls, visits: ordered.visits },
                                 )? {
-                                    frame.cursor.resume_exact_local_update(
-                                        &update.binding, &update.ty, update.entry, update.exit,
-                                    ).ok_or(ProjectCheck::Unsupported)?;
+                                    frame.cursor.resume_exact_local_updates(update.into_iter()).ok_or(ProjectCheck::Unsupported)?;
                                     self.reached.insert(target);
                                     self.had_obligations = true;
                                     continue;

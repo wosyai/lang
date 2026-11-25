@@ -10802,14 +10802,22 @@ impl ProjectReferenceResults {
         &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
         module: usize, caller: usize, callee: usize, claimed: &BigInt, wanted: Option<OccurrenceOrdinal>,
     ) -> Option<pointer_call::CallerPointeeEffect<'a>> {
-        let update = self.pointer_entry_wrapping_write(modules, calls, module, callee)?;
+        self.pointer_caller_effects(modules, calls, module, caller, callee, &[claimed], wanted)?.pop()
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn pointer_caller_effects<'a>(
+        &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
+        module: usize, caller: usize, callee: usize, claimed: &[&BigInt], wanted: Option<OccurrenceOrdinal>,
+    ) -> Option<Vec<pointer_call::CallerPointeeEffect<'a>>> {
+        let updates = self.pointer_entry_wrapping_effects(modules, calls, module, callee)?;
         let owner = modules.get(module)?;
         let ScalarItem::Function(declaration) = owner.items.get(callee)? else { return None; };
         let ScalarItem::Function(function) = owner.items.get(caller)? else { return None; };
         let body = calls.function_body(module, caller, None)?;
         let result = self.function_result(module, caller, None)?;
         pointer_call::checked(&owner.source, declaration.name_span, function, body, &result.cfg,
-            &result.proof_points, update, claimed, wanted)
+            &result.proof_points, &updates, claimed, wanted)
     }
 
     pub(super) fn callable_point_facts(
