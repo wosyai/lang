@@ -4,7 +4,7 @@ use crate::source_preparation::{prepare_with_files, Files, PreparedSources};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
-use wosy_protocol::{Delta, Node, NodeId};
+use wosy_protocol::{Delta, Node, NodeId, SourceUpdate};
 
 /// Bounds one selected generation's canonical payload, not the parser, file
 /// index, candidate staging, allocator overhead, or total process RSS.
@@ -81,6 +81,19 @@ impl StagedSourceRefresh<'_> {
         }
     }
 
+    /// Borrow the exact added nodes and the immutable recovery base without
+    /// publishing or replacing this client's selected snapshot.
+    pub fn submission(&self) -> SourceUpdate<'_> {
+        let added = match &self.data {
+            NextSelection::Same { .. } => None,
+            NextSelection::Replace { source, .. } => Some(&source.delta),
+        };
+        SourceUpdate {
+            base: self.owner.current.root, root: self.root(), added,
+            base_payload: &self.owner.current.delta,
+        }
+    }
+
     pub fn commit(self) {
         let Self { owner, data } = self;
         match data {
@@ -89,10 +102,7 @@ impl StagedSourceRefresh<'_> {
                 owner.current.reused = reused;
             }
             NextSelection::Replace { mut source, files, closure } => {
-                owner.current.delta.nodes.retain(|id, _| {
-                    closure.nodes.contains(id) && !source.delta.nodes.contains_key(id)
-                });
-                source.delta.nodes.retain(|id, _| closure.nodes.contains(id));
+                owner.current.delta.nodes.retain(|id, _| closure.nodes.contains(id));
                 source.delta.nodes.append(&mut owner.current.delta.nodes);
                 owner.current = source;
                 owner.files = files;
@@ -120,11 +130,14 @@ impl RetainedSources {
     pub fn stage_refresh(
         &mut self, project: &Path, target: Option<&str>,
     ) -> Result<StagedSourceRefresh<'_>, ClientSourceError> {
-        let (source, files) = prepare_with_files(project, target, Some(&self.files)).map_err(ClientSourceError::Observe)?;
+        let (mut source, files) = prepare_with_files(project, target, Some(&self.files)).map_err(ClientSourceError::Observe)?;
         let data = if self.current.root == source.root {
             NextSelection::Same { parsed: source.parsed, reused: source.reused }
         } else {
             let closure = reachable(source.root, &source.delta, Some(&self.current.delta), self.limits)?;
+            source.delta.nodes.retain(|id, _| {
+                closure.nodes.contains(id) && !self.current.delta.nodes.contains_key(id)
+            });
             NextSelection::Replace { source, files, closure }
         };
         Ok(StagedSourceRefresh { owner: self, data })

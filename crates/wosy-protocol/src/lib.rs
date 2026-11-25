@@ -117,6 +117,17 @@ impl Delta {
     }
 }
 
+/// In-process handoff for an admitted client candidate. The predecessor
+/// payload can satisfy recovery if the store no longer knows its root.
+/// This is not a wire format or a transport capability.
+#[derive(Clone, Copy)]
+pub struct SourceUpdate<'a> {
+    pub base: NodeId,
+    pub root: NodeId,
+    pub added: Option<&'a Delta>,
+    pub base_payload: &'a Delta,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileKey {

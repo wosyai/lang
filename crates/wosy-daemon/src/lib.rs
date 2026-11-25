@@ -6,7 +6,7 @@ use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
     imports_from_cst, installed_git_source_schema, source_preparation_schema, Delta, FileEntry,
-    FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig,
+    FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourceUpdate,
 };
 use wosy_syntax::{
     typed_comment_from_token, AuthoredSpanMap, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind,
@@ -71,6 +71,26 @@ pub struct PublishReport {
     pub namespace_reused: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourcePublicationMode {
+    Existing,
+    Full,
+    Incremental,
+    Recovered,
+}
+
+pub struct SourcePublication {
+    pub mode: SourcePublicationMode,
+    pub report: PublishReport,
+    pub conflicts: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SourcePayload<'a> {
+    Full(&'a Delta),
+    Staged(SourceUpdate<'a>),
+}
+
 impl SourceStore {
     pub fn open(dir: &Path, block_cache_bytes: u64) -> Result<Self> {
         let tree = TreeBuilder::new()
@@ -93,18 +113,50 @@ impl SourceStore {
 
     /// A race restarts publication against a complete committed snapshot.
     pub async fn publish(&self, root: NodeId, delta: &Delta) -> Result<PublishReport> {
+        Ok(self.publish_source(root, SourcePayload::Full(delta)).await?.report)
+    }
+
+    /// Admit and publish a previously staged speculative source refresh.
+    /// Recover only its requested root if the predecessor was lost. This
+    /// direct operation does not confer a transport or retention capability.
+    pub async fn publish_update(&self, update: SourceUpdate<'_>) -> Result<SourcePublication> {
+        self.publish_source(update.root, SourcePayload::Staged(update)).await
+    }
+
+    async fn publish_source(&self, root: NodeId, input: SourcePayload<'_>) -> Result<SourcePublication> {
+        use SourcePublicationMode::{Existing, Full, Incremental, Recovered};
+        let mut conflicts = 0;
         loop {
             let mut tx = self.tree.begin()?;
             tx.set_durability(Durability::Eventual);
             if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_some() {
-                return Ok(PublishReport::default());
+                return Ok(SourcePublication { mode: Existing, report: PublishReport::default(), conflicts });
             }
-            let mut report = PublishReport { written: intern_closure(&mut tx, root, delta)?, ..Default::default() };
+            let (mode, added, base) = match input {
+                SourcePayload::Full(delta) => (Full, Some(delta), None),
+                SourcePayload::Staged(update) => {
+                    // If both roots are the same, the first read proved it
+                    // absent. Other predecessor reads join commit validation.
+                    let published = update.base != root
+                        && tx.get_for_update(&key(SNAPSHOT_ROOTS, update.base))?.is_some()
+                        && source_top(&tx, update.base)?.is_some();
+                    if published {
+                        (Incremental, update.added, None)
+                    } else {
+                        (Recovered, update.added, Some(update.base_payload))
+                    }
+                }
+            };
+            let written = intern_closure(&mut tx, root, |id| {
+                added.and_then(|delta| delta.nodes.get(&id))
+                    .or_else(|| base.and_then(|delta| delta.nodes.get(&id))).map(Vec::as_slice)
+            })?;
+            let mut report = PublishReport { written, ..Default::default() };
             validate_snapshot(&mut tx, root, &mut report)?;
             tx.set(&key(SNAPSHOT_ROOTS, root), &root.0)?;
             match tx.commit().await {
-                Ok(()) => return Ok(report),
-                Err(surrealkv::Error::TransactionWriteConflict) => continue,
+                Ok(()) => return Ok(SourcePublication { mode, report, conflicts }),
+                Err(surrealkv::Error::TransactionWriteConflict) => conflicts += 1,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -144,8 +196,8 @@ fn source_top(tx: &Transaction, root: NodeId) -> Result<Option<Node>> {
     Ok(supported_top(&top).then_some(top))
 }
 
-fn intern_closure(
-    tx: &mut Transaction, root: NodeId, delta: &Delta,
+fn intern_closure<'a>(
+    tx: &mut Transaction, root: NodeId, lookup: impl Fn(NodeId) -> Option<&'a [u8]>,
 ) -> Result<usize> {
     let mut work = vec![(root, Expected::Exact(Kind::SourcePreparation))];
     let mut visited = HashMap::new();
@@ -161,7 +213,7 @@ fn intern_closure(
             visited.insert(id, kind);
             continue;
         }
-        let bytes = delta.nodes.get(&id).ok_or("source delta is not closed")?;
+        let bytes = lookup(id).ok_or("source delta is not closed")?;
         if Node::id(bytes) != id {
             return Err("source delta node hash mismatch".into());
         }

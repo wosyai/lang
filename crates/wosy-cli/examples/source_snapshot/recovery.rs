@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
 use wosy_cli::source_recovery::{ClientSourceError, ClientSourceLimits, RetainedSources, SourceLimit};
-use wosy_daemon::SourceStore;
-use wosy_protocol::FileKey;
+use wosy_daemon::{SourcePublicationMode, SourceStore};
+use wosy_protocol::{FileKey, SourceUpdate};
 
 const FIXTURE_LIMITS: ClientSourceLimits = ClientSourceLimits { nodes: 20_000, encoded_bytes: 16 << 20 };
 
@@ -207,6 +207,96 @@ pub(super) async fn run_budget(project: &Path, primary: &Path, key: &FileKey) ->
         "after_cancel": after_cancel, "candidate": candidate_root.hex(), "committed": committed,
         "cancelled_repeat": cancelled_repeat, "new_publish": new_publish, "new_state": new_state,
         "stage_ms": stage_ms, "commit_ms": commit_ms,
+    }))?;
+    store.close().await
+}
+
+async fn submit_delta(store: &SourceStore, update: SourceUpdate<'_>) -> Result<serde_json::Value> {
+    let start = Instant::now();
+    let outcome = store.publish_update(update).await?;
+    Ok(serde_json::json!({
+        "mode": format!("{:?}", outcome.mode), "written": outcome.report.written,
+        "conflicts": outcome.conflicts, "elapsed_ms": milliseconds(start),
+        "added_nodes": update.added.map_or(0, |delta| delta.nodes.len()),
+        "added_bytes": update.added.map_or(0, |delta| delta.nodes.values().map(Vec::len).sum::<usize>()),
+    }))
+}
+
+pub(super) async fn run_deltas(
+    project: &Path, primary: &Path, replacement: &Path, key: &FileKey,
+) -> Result<()> {
+    let mut first = RetainedSources::observe(project, None, FIXTURE_LIMITS)?;
+    let mut second = RetainedSources::observe(project, None, FIXTURE_LIMITS)?;
+    let small = ClientSourceLimits { encoded_bytes: first.usage().encoded_bytes + 128, ..FIXTURE_LIMITS };
+    let mut constrained = RetainedSources::observe(project, None, small)?;
+    let old = first.selected().root;
+    assert_eq!(selected(&first), selected(&second));
+    assert_eq!(selected(&first), selected(&constrained));
+    let store = SourceStore::open(primary, 8 << 20)?;
+    let observed = submit(&store, &first).await?;
+    let original = inspect(&store, project, &first, key).await?;
+    report(serde_json::json!({
+        "initial": selected(&first), "original": original, "published": observed,
+    }))?;
+    next_step()?;
+
+    let denied = constrained.stage_refresh(project, None)
+        .err().ok_or("expected fixture candidate to exceed its bound")?;
+    check_limit(denied, SourceLimit::EncodedBytes, small.encoded_bytes);
+    let stage_a = first.stage_refresh(project, None)?;
+    let stage_b = second.stage_refresh(project, None)?;
+    assert_eq!(stage_a.root(), stage_b.root());
+    assert_ne!(old, stage_a.root());
+    assert_eq!(stage_a.submission().base, old);
+    assert_eq!(stage_b.submission().base, old);
+    let (result_a, result_b) = tokio::join!(
+        submit_delta(&store, stage_a.submission()), submit_delta(&store, stage_b.submission()),
+    );
+    let cohort = [result_a?, result_b?];
+    for mode in ["Incremental", "Existing"] {
+        assert_eq!(cohort.iter().filter(|report| report["mode"] == mode).count(), 1);
+    }
+    stage_a.commit();
+    stage_b.commit();
+    let same = second.stage_refresh(project, None)?;
+    assert!(same.submission().added.is_none());
+    let known = submit_delta(&store, same.submission()).await?;
+    assert_eq!(known["mode"], format!("{:?}", SourcePublicationMode::Existing));
+    same.commit();
+    let historical = inspect(&store, project, &constrained, key).await?;
+    let concurrent_state = inspect(&store, project, &first, key).await?;
+    let constrained_repeat = submit(&store, &constrained).await?;
+    store.close().await?;
+    report(serde_json::json!({
+        "cohort": cohort, "historical": historical, "constrained": selected(&constrained),
+        "concurrent": selected(&first), "concurrent_state": concurrent_state,
+        "second": selected(&second), "known": known, "constrained_repeat": constrained_repeat,
+    }))?;
+    next_step()?;
+
+    let prior = first.selected().root;
+    let staged = first.stage_refresh(project, None)?;
+    let current = staged.root();
+    let current_usage = staged.usage();
+    assert_ne!(prior, current);
+    report(serde_json::json!({
+        "base": prior.hex(), "candidate": current.hex(),
+        "candidate_nodes": current_usage.nodes, "candidate_bytes": current_usage.encoded_bytes,
+    }))?;
+    next_step()?;
+
+    let store = SourceStore::open(replacement, 8 << 20)?;
+    let fresh = store.snapshot(prior)?.is_none() && store.snapshot(current)?.is_none();
+    let recovered = submit_delta(&store, staged.submission()).await?;
+    assert_eq!(recovered["mode"], format!("{:?}", SourcePublicationMode::Recovered));
+    let repeat = submit_delta(&store, staged.submission()).await?;
+    let still_no_predecessor = store.snapshot(prior)?.is_none() && store.snapshot(old)?.is_none();
+    staged.commit();
+    let restored = inspect(&store, project, &first, key).await?;
+    report(serde_json::json!({
+        "recovered": recovered, "repeat": repeat, "fresh": fresh,
+        "still_no_predecessor": still_no_predecessor, "selected": selected(&first),
+        "restored": restored, "other_client": selected(&second),
     }))?;
     store.close().await
 }
