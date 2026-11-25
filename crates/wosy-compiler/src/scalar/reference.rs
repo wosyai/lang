@@ -1178,7 +1178,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 Some(owner.clone()),
             // A projected alias never serves as a root presence test. The
             // Borrow CFG point below must already see the same owner present.
-            ScalarPlace::Index { .. } if *mutability == ScalarReferenceMutability::Shared
+            ScalarPlace::Index { .. } if aggregate::ordinary_value(inner)
                 && self.exact_guarded_index(place, occurrence, owner, site) == Some(inner.as_ref()) =>
                 Some(owner.clone()),
             _ => None,

@@ -14201,7 +14201,6 @@ if (observed(1) != 99 || observed(1) != 46 || observed(4294967297) != 0) { core.
         let runtime_text = runtime.then(|| text.replace("u64[2] held =?", "u64[] held =?"));
         let text = runtime_text.as_deref().unwrap_or(text);
         let unavailable = text.replace("    if (&held == null)", "    held[index] = 7;\n    if (&held == null)");
-        let aliased = text.replace("        held[_index", "        *!u64 alias = &!held[0]; *alias;\n        held[_index");
         let whole = if runtime {
             text.replace("        held[_index(3, index)] = _value(5, 7);",
                 "        u64 selected = _index(3, index); selected; _value(5, 7); held;")
@@ -14209,7 +14208,6 @@ if (observed(1) != 99 || observed(1) != 46 || observed(4294967297) != 0) { core.
             "        u64 selected = _index(3, index); held = [selected, _value(5, 7)];") };
         for (source, reason) in [
             (unavailable.as_str(), "fallible allocation is not known to be available"),
-            (aliased.as_str(), "fallible allocation access is not a supported"),
             (whole.as_str(), "fallible allocation access is not a supported"),
         ] {
             let prepared = prepare_initializer_test(source, layout);
@@ -14293,7 +14291,7 @@ if (observed(1) != 99 || observed(1) != 46 || observed(4294967297) != 0) { core.
 }
 
 #[test]
-fn guarded_fallible_indexed_shared_borrow_checks_presence_extent_and_last_use() {
+fn guarded_fallible_indexed_borrow_checks_presence_extent_and_last_use() {
     use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
     let text = "%%start
 u64(u64, u64) _choose = fn(size, index) {
@@ -14309,96 +14307,108 @@ u64(u64) observed = fn(index) {
         before ^ held[0] ^ held[1]
     }
 };
-if (observed(1) != 99 || observed(0) != 7 || observed(1) != 4
-    || observed(4294967297) != 0) { core.system_panic(); };
+if (observed(1) != 99 || observed(0) != 7 || observed(1) != 4) { core.system_panic(); };
+observed(4294967297);
 %%end";
-    for (runtime, layout) in [false, true].into_iter().flat_map(|runtime|
-        [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32].into_iter().map(move |layout| (runtime, layout)))
-    {
-        let runtime_text = runtime.then(|| text.replace("u64[2] held =?", "u64[] held =?"));
-        let text = runtime_text.as_deref().unwrap_or(text);
-        let missing_presence = text.replace("    if (&held == null)", "    *u64 early = &held[index];\n    *early;\n    if (&held == null)");
-        let active_loan = text.replace("        u64 before = *cell;\n        held[1] = 7;",
-            "        held[1] = 7;\n        u64 before = *cell;");
-        let alias_guard = text.replace("u64 before = *cell;", "u64 before = if (cell == null) { 0 } else { *cell };");
-        for (case, reason) in [
-            (missing_presence.as_str(), "fallible allocation is not known to be available"),
-            (active_loan.as_str(), "read or move of unavailable place"),
-            (alias_guard.as_str(), "fallible allocation access is not a supported"),
-        ] {
-            let prepared = prepare_initializer_test(case, layout);
-            let checked = analyze_scalar_build(&prepared);
-            let diagnostic = checked.diagnostics().iter().find(|diagnostic| diagnostic.message.contains(reason))
-                .unwrap_or_else(|| panic!("{reason}: {:?}", checked.diagnostics()));
-            if case == active_loan.as_str() {
-                let borrow = case.find("&held[_choose").unwrap() as u32;
-                assert!(diagnostic.labels.iter().any(|label|
-                    label.kind == crate::DiagnosticLabelKind::Secondary
-                    && label.span.range.start == borrow
-                    && label.message == "origin of conflicting place or loan"));
+    let through_write = text.replace("*u64 cell = &held[", "*!u64 cell = &!held[")
+        .replace("        u64 before = *cell;", "        *cell = 53;\n        u64 before = *cell;")
+        .replace("observed(0) != 7 || observed(1) != 4", "observed(0) != 7 || observed(1) != 27");
+    for (mutable, text) in [(false, text), (true, through_write.as_str())] {
+        for (runtime, layout) in [false, true].into_iter().flat_map(|runtime|
+            [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32].into_iter().map(move |layout| (runtime, layout)))
+        {
+            let runtime_text = runtime.then(|| text.replace("u64[2] held =?", "u64[] held =?"));
+            let text = runtime_text.as_deref().unwrap_or(text);
+            let early = if mutable { "*!u64 early = &!held[index]; *early = 53;" }
+                else { "*u64 early = &held[index]; *early;" };
+            let missing_presence = text.replace("    if (&held == null)", &format!("    {early}\n    if (&held == null)"));
+            let active_loan = text.replace("        u64 before = *cell;\n        held[1] = 7;",
+                "        held[1] = 7;\n        u64 before = *cell;");
+            let alias_guard = text.replace("u64 before = *cell;", "u64 before = if (cell == null) { 0 } else { *cell };");
+            for (case, reason) in [
+                (missing_presence.as_str(), "fallible allocation is not known to be available"),
+                (active_loan.as_str(), "read or move of unavailable place"),
+                (alias_guard.as_str(), "fallible allocation access is not a supported"),
+            ] {
+                let prepared = prepare_initializer_test(case, layout);
+                let checked = analyze_scalar_build(&prepared);
+                let diagnostic = checked.diagnostics().iter().find(|diagnostic| diagnostic.message.contains(reason))
+                    .unwrap_or_else(|| panic!("{reason}: {:?}", checked.diagnostics()));
+                if case == active_loan.as_str() {
+                    let borrow = case.find(if mutable { "&!held[_choose" } else { "&held[_choose" }).unwrap() as u32;
+                    assert!(diagnostic.labels.iter().any(|label|
+                        label.kind == crate::DiagnosticLabelKind::Secondary
+                        && label.span.range.start == borrow
+                        && label.message == "origin of conflicting place or loan"));
+                }
             }
-        }
-        let prepared = prepare_initializer_test(text, layout);
-        let source = prepared.project().modules[0].source.clone();
-        let parsed = parse_source(source.clone(), text.into(), &[]);
-        let release = crate::prepare_scalar_project_with_access(
-            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
-            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
-            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
-        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
-        let fallback = analyze_scalar_build(&prepared);
-        let release_checked = analyze_scalar_build(&release);
-        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
-        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
-        for (route, project, release_source, output) in [
-            ("standalone", false, None, emit_scalar_build_single_module_llvm(&fallback)),
-            ("project", true, None, emit_scalar_build_project_llvm(&fallback)),
-            ("release-project", true, release.checked_access_source(), emit_scalar_build_project_llvm(&release_checked)),
-        ] {
-            let llvm = output.unwrap().to_text();
-            let context = Context::create();
-            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded shared indexed borrow");
-            let module = context.create_module_from_ir(buffer).unwrap();
-            module.verify().unwrap();
-            let authored = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
-            let observed = authored("observed");
-            let blocks = observed.get_basic_blocks();
-            fn instructions<'ctx>(block: inkwell::basic_block::BasicBlock<'ctx>) -> impl Iterator<Item = InstructionValue<'ctx>> {
-                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
-            }
-            let calls_to = |callee| blocks.iter().copied().flat_map(instructions)
-                .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
-                    .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
-            let [selector] = calls_to(authored("_choose"))[..] else { panic!("{llvm}") };
-            assert_eq!(selector.get_parent().unwrap().get_name().to_bytes(), b"if.else");
-            assert_eq!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).len(), 1);
-            assert_eq!(calls_to(module.get_function("__wosy_core_free").unwrap()).len(), 1);
-            let gep = blocks.iter().copied().flat_map(instructions).find(|instruction| {
-                if instruction.get_opcode() != InstructionOpcode::GetElementPtr { return false; }
-                let Some(index) = known_field_operand(*instruction, 2).and_then(|v| v.as_instruction_value()) else { return false; };
-                index == selector || (index.get_opcode() == InstructionOpcode::Trunc
-                    && known_field_operand(index, 0).and_then(|v| v.as_instruction_value()) == Some(selector))
-            }).unwrap_or_else(|| panic!("{llvm}"));
-            if let Some(helper_source) = release_source {
-                let helper = module.get_function(&project_function_name(helper_source, "check_index_in_extent")).unwrap();
-                let [bounds] = calls_to(helper)[..] else { panic!("{llvm}") };
-                assert_eq!(known_field_operand(bounds, 0).unwrap().as_instruction_value(), Some(selector));
-                assert_eq!(known_field_operand(bounds, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
-                assert!(std::iter::successors(bounds.get_next_instruction(), |instruction| instruction.get_next_instruction())
-                    .any(|instruction| instruction == gep));
-            } else {
-                let check = blocks.iter().copied().flat_map(instructions).find(|i|
-                    i.get_name().is_some_and(|name| name.to_bytes() == b"guarded_index_out_of_bounds")).unwrap();
-                assert_eq!(check.get_icmp_predicate(), Some(inkwell::IntPredicate::UGE));
-                assert_eq!(known_field_operand(check, 0).unwrap().as_instruction_value(), Some(selector));
-                assert_eq!(known_field_operand(check, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
-                assert_eq!(gep.get_parent().unwrap().get_name().to_bytes(), b"guarded_index_continue");
-            }
-            if let Some(out) = std::env::var_os(if runtime { "WOSY_GUARDED_RUNTIME_BORROW_IR_DIR" } else { "WOSY_GUARDED_INDEXED_BORROW_IR_DIR" }) {
-                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
-                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
-                assert_ne!(controlled, llvm);
-                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            let prepared = prepare_initializer_test(text, layout);
+            let source = prepared.project().modules[0].source.clone();
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            let release = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let fallback = analyze_scalar_build(&prepared);
+            let release_checked = analyze_scalar_build(&release);
+            assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+            assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+            for (route, project, release_source, output) in [
+                ("standalone", false, None, emit_scalar_build_single_module_llvm(&fallback)),
+                ("project", true, None, emit_scalar_build_project_llvm(&fallback)),
+                ("release-project", true, release.checked_access_source(), emit_scalar_build_project_llvm(&release_checked)),
+            ] {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded shared indexed borrow");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
+                let observed = authored("observed");
+                let blocks = observed.get_basic_blocks();
+                fn instructions<'ctx>(block: inkwell::basic_block::BasicBlock<'ctx>) -> impl Iterator<Item = InstructionValue<'ctx>> {
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+                }
+                let calls_to = |callee| blocks.iter().copied().flat_map(instructions)
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let [selector] = calls_to(authored("_choose"))[..] else { panic!("{llvm}") };
+                assert_eq!(selector.get_parent().unwrap().get_name().to_bytes(), b"if.else");
+                assert_eq!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).len(), 1);
+                assert_eq!(calls_to(module.get_function("__wosy_core_free").unwrap()).len(), 1);
+                let gep = blocks.iter().copied().flat_map(instructions).find(|instruction| {
+                    if instruction.get_opcode() != InstructionOpcode::GetElementPtr { return false; }
+                    let Some(index) = known_field_operand(*instruction, 2).and_then(|v| v.as_instruction_value()) else { return false; };
+                    index == selector || (index.get_opcode() == InstructionOpcode::Trunc
+                        && known_field_operand(index, 0).and_then(|v| v.as_instruction_value()) == Some(selector))
+                }).unwrap_or_else(|| panic!("{llvm}"));
+                if let Some(helper_source) = release_source {
+                    let helper = module.get_function(&project_function_name(helper_source, "check_index_in_extent")).unwrap();
+                    let [bounds] = calls_to(helper)[..] else { panic!("{llvm}") };
+                    assert_eq!(known_field_operand(bounds, 0).unwrap().as_instruction_value(), Some(selector));
+                    assert_eq!(known_field_operand(bounds, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
+                    assert!(std::iter::successors(bounds.get_next_instruction(), |instruction| instruction.get_next_instruction())
+                        .any(|instruction| instruction == gep));
+                } else {
+                    let check = blocks.iter().copied().flat_map(instructions).find(|i|
+                        i.get_name().is_some_and(|name| name.to_bytes() == b"guarded_index_out_of_bounds")).unwrap();
+                    assert_eq!(check.get_icmp_predicate(), Some(inkwell::IntPredicate::UGE));
+                    assert_eq!(known_field_operand(check, 0).unwrap().as_instruction_value(), Some(selector));
+                    assert_eq!(known_field_operand(check, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(2));
+                    assert_eq!(gep.get_parent().unwrap().get_name().to_bytes(), b"guarded_index_continue");
+                }
+                if let Some(out) = std::env::var_os(match (mutable, runtime) {
+                    (false, false) => "WOSY_GUARDED_INDEXED_BORROW_IR_DIR",
+                    (false, true) => "WOSY_GUARDED_RUNTIME_BORROW_IR_DIR",
+                    (true, false) => "WOSY_GUARDED_MUTABLE_INDEXED_BORROW_IR_DIR",
+                    (true, true) => "WOSY_GUARDED_MUTABLE_RUNTIME_BORROW_IR_DIR",
+                }) {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
             }
         }
     }
