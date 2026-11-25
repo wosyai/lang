@@ -18,6 +18,8 @@ mod retention;
 mod recovery;
 #[path = "source_snapshot/storage_worker.rs"]
 mod storage_worker;
+#[path = "source_snapshot/source_state.rs"]
+mod source_state;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -182,6 +184,9 @@ async fn main() -> Result<()> {
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
+    if selection.as_deref() == Some("--persistent-source") {
+        return source_state::run(&project, &dir, &mut args).await;
+    }
     if selection.as_deref() == Some("--source-worker") {
         let scope = NodeId::parse_hex(&args.next().ok_or("expected fixture scope")?)?;
         let old = NodeId::parse_hex(&args.next().ok_or("expected fixture historical root")?)?;

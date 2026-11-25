@@ -193,6 +193,33 @@ pub fn installed_git_source_schema() -> &'static [u8; 32] {
         source_preparation_schema(),
     ))
 }
+
+/// The root layout shared by the local CST store and the daemon. File
+/// provenance is indexed by these exact children, not by directory contents.
+pub struct SourcePreparationParts<'a> {
+    pub config: NodeId,
+    pub executable: NodeId,
+    pub annotation: NodeId,
+    pub dependencies: NodeId,
+    pub files: &'a [NodeId],
+}
+
+pub fn source_preparation_parts(node: &Node) -> Option<SourcePreparationParts<'_>> {
+    if node.kind != Kind::SourcePreparation
+        || (node.data != source_preparation_schema() && node.data != installed_git_source_schema())
+    {
+        return None;
+    }
+    let [config, executable, annotation, dependencies, files @ ..] = node.children.as_slice() else {
+        return None;
+    };
+    if files.is_empty() { return None; }
+    Some(SourcePreparationParts {
+        config: *config, executable: *executable, annotation: *annotation,
+        dependencies: *dependencies, files,
+    })
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParserPolicy {

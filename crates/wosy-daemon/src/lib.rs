@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
-    imports_from_cst, installed_git_source_schema, source_preparation_schema, Delta, FileEntry,
+    imports_from_cst, source_preparation_parts, source_preparation_schema, Delta, FileEntry,
     FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourceUpdate,
 };
 use wosy_syntax::{
@@ -281,9 +281,7 @@ fn validate_shape(node: &Node) -> Result<()> {
 }
 
 fn supported_top(node: &Node) -> bool {
-    node.kind == Kind::SourcePreparation
-        && node.children.len() >= 5
-        && (node.data == source_preparation_schema() || node.data == installed_git_source_schema())
+    source_preparation_parts(node).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -387,20 +385,18 @@ fn read_paths(tx: &Transaction, root: NodeId) -> Result<BTreeMap<FileKey, (NodeI
 }
 
 fn read_index(tx: &Transaction, top: Node) -> Result<Index> {
-    let [config, executable, annotation, dependencies, files @ ..] = top.children.as_slice() else {
-        return Err("incomplete source preparation".into());
-    };
+    let parts = source_preparation_parts(&top).ok_or("incomplete source preparation")?;
     let mut entries = BTreeMap::new();
-    for &id in files {
+    for &id in parts.files {
         let entry = FileEntry::from_node(id, read_node(tx, id)?)?;
         unique(&mut entries, FileKey::from(&entry.metadata.source), entry)?;
     }
-    let executable_paths = read_paths(tx, *executable)?;
-    let annotation_paths = read_paths(tx, *annotation)?;
+    let executable_paths = read_paths(tx, parts.executable)?;
+    let annotation_paths = read_paths(tx, parts.annotation)?;
     let by_projection: BTreeMap<_, _> = executable_paths.iter().map(|(key, (id, _))| (*id, key)).collect();
     let mut modules = BTreeMap::new();
     let mut module_edges = BTreeMap::new();
-    for id in read_node(tx, *dependencies)?.children {
+    for id in read_node(tx, parts.dependencies)?.children {
         let node = read_node(tx, id)?;
         let [local, imports @ ..] = node.children.as_slice() else {
             return Err("missing local module executable".into());
@@ -410,7 +406,7 @@ fn read_index(tx: &Transaction, top: Node) -> Result<Index> {
         module_edges.insert(key.clone(), imports.to_vec());
     }
     Ok(Index {
-        config: *config, executable: *executable, annotation: *annotation,
+        config: parts.config, executable: parts.executable, annotation: parts.annotation,
         files: entries, modules, executable_paths, annotation_paths, module_edges,
     })
 }

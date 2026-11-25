@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rowan.workspace = true
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 wosy-protocol = { path = "../wosy-protocol" }
 blake3.workspace = true
 clap.workspace = true

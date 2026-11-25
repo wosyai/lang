@@ -67,6 +67,13 @@ enum NextSelection {
 }
 
 impl StagedSourceRefresh<'_> {
+    pub(crate) fn observation_counts(&self) -> (usize, usize) {
+        match &self.data {
+            NextSelection::Same { parsed, reused } => (*parsed, *reused),
+            NextSelection::Replace { source, .. } => (source.parsed, source.reused),
+        }
+    }
+
     pub fn root(&self) -> NodeId {
         match &self.data {
             NextSelection::Same { .. } => self.owner.current.root,
@@ -113,6 +120,12 @@ impl StagedSourceRefresh<'_> {
 }
 
 impl RetainedSources {
+    pub(crate) fn from_persisted(
+        current: PreparedSources, files: Files, usage: ClientSourceUsage, limits: ClientSourceLimits,
+    ) -> Self {
+        Self { current, files, usage, limits }
+    }
+
     pub fn observe(
         project: &Path, target: Option<&str>, limits: ClientSourceLimits,
     ) -> Result<Self, ClientSourceError> {
@@ -155,13 +168,13 @@ impl RetainedSources {
     }
 }
 
-struct Closure {
+pub(crate) struct Closure {
     nodes: HashSet<NodeId>,
     encoded_bytes: usize,
 }
 
 impl Closure {
-    fn usage(&self) -> ClientSourceUsage {
+    pub(crate) fn usage(&self) -> ClientSourceUsage {
         ClientSourceUsage { nodes: self.nodes.len(), encoded_bytes: self.encoded_bytes }
     }
 }
@@ -169,23 +182,38 @@ impl Closure {
 fn reachable(
     root: NodeId, delta: &Delta, base: Option<&Delta>, limits: ClientSourceLimits,
 ) -> Result<Closure, ClientSourceError> {
+    trace_reachable(root, limits, |id| {
+        delta.nodes.get(&id).or_else(|| base.and_then(|base| base.nodes.get(&id)))
+            .ok_or(ClientSourceError::InvalidGeneration("client source generation is not closed"))
+    }, |_, _| ())
+}
+
+pub(crate) fn trace_reachable<B, E>(
+    root: NodeId, limits: ClientSourceLimits,
+    mut fetch: impl FnMut(NodeId) -> Result<B, E>,
+    mut keep: impl FnMut(NodeId, B),
+) -> Result<Closure, E>
+where
+    B: AsRef<[u8]>,
+    E: From<ClientSourceError>,
+{
     use ClientSourceError::{InvalidGeneration, LimitExceeded};
     let nodes_over = || LimitExceeded { field: SourceLimit::Nodes, limit: limits.nodes };
     let bytes_over = || LimitExceeded { field: SourceLimit::EncodedBytes, limit: limits.encoded_bytes };
-    if limits.nodes == 0 { return Err(nodes_over()); }
+    if limits.nodes == 0 { return Err(nodes_over().into()); }
     let mut closure = Closure { nodes: HashSet::from([root]), encoded_bytes: 0 };
     let mut pending = vec![root];
     while let Some(id) = pending.pop() {
-        let bytes = delta.nodes.get(&id).or_else(|| base.and_then(|base| base.nodes.get(&id)))
-            .ok_or(InvalidGeneration("client source generation is not closed"))?;
-        closure.encoded_bytes = closure.encoded_bytes.checked_add(bytes.len())
+        let bytes = fetch(id)?;
+        closure.encoded_bytes = closure.encoded_bytes.checked_add(bytes.as_ref().len())
             .filter(|&total| total <= limits.encoded_bytes).ok_or_else(bytes_over)?;
-        for child in Node::child_ids(bytes).ok_or(InvalidGeneration("invalid client source generation node"))? {
+        for child in Node::child_ids(bytes.as_ref()).ok_or(InvalidGeneration("invalid client source generation node"))? {
             if closure.nodes.insert(child) {
-                if closure.nodes.len() > limits.nodes { return Err(nodes_over()); }
+                if closure.nodes.len() > limits.nodes { return Err(nodes_over().into()); }
                 pending.push(child);
             }
         }
+        keep(id, bytes);
     }
     Ok(closure)
 }
