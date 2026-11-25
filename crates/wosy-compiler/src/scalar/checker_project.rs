@@ -5076,6 +5076,7 @@ enum VerifiedSymbolicGuards<'a> {
         _dependency_definitions: HashSet<PreparedCallable>,
     },
     Ranked(CheckedIntegerGuardSlots<'a>),
+    Derived(Vec<ImportedEntryGuard<'a>>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5102,6 +5103,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
             VerifiedSymbolicGuards::Partitioned { guards, .. } => (guards.as_slice(), None, true),
             VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, guards.arity > 2),
+            VerifiedSymbolicGuards::Derived(guards) => (guards.as_slice(), None, true),
         };
         use super::checker_flow::ImportedVerifiedReturn;
         let result = match &self.result {
@@ -5112,8 +5114,10 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
         };
         if scalar_return || matches!(&origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
-            if !matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
-                || !matches!(result, ImportedVerifiedReturn::Constant { .. })
+            let eligible = matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
+                || (scalar_return && qualified_layout.is_none() && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
+                    && origin.arguments.as_slice().len() == 1);
+            if !eligible || !matches!(result, ImportedVerifiedReturn::Constant { .. })
             {
                 return Ok(None);
             }
@@ -5251,15 +5255,27 @@ fn ranked_scalar_return_origin(calls: &FunctionCallSites) -> Option<RankedScalar
 }
 
 #[cfg(feature = "internal-checker")]
+const MAX_SYMBOLIC_SUMMARY_LINEAGE: usize = 4;
+
+#[cfg(feature = "internal-checker")]
 #[derive(Default)]
 struct SymbolicSummaryIndex<'a> {
     first: Option<VerifiedSymbolicSummary<'a>>,
     other: HashMap<PreparedCallable, VerifiedSymbolicSummary<'a>>,
+    // Stamps never leave this verification invocation. Provenance is
+    // flattened at issuance so a reuse neither recurses nor runs a solver.
+    generation: HashMap<PreparedCallable, usize>,
+    derived: HashMap<PreparedCallable, Vec<(PreparedCallable, usize)>>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> SymbolicSummaryIndex<'a> {
     fn insert(&mut self, summary: VerifiedSymbolicSummary<'a>) {
+        let stamp = self.generation.entry(summary.target).or_default();
+        *stamp = stamp.saturating_add(1);
+        // Preserve legacy first-summary behavior. Competing issuances never
+        // authorize a dependent receipt (a unique generation is required).
+        self.derived.remove(&summary.target);
         if self.first.is_none() {
             self.first = Some(summary);
         } else {
@@ -5267,20 +5283,49 @@ impl<'a> SymbolicSummaryIndex<'a> {
         }
     }
 
+    fn lineage_is_current(&self, target: PreparedCallable) -> bool {
+        self.derived.get(&target).is_none_or(|lineage| {
+            self.generation.get(&target) == Some(&1)
+                && lineage.iter().all(|(ancestor, stamp)| self.generation.get(ancestor) == Some(stamp))
+        })
+    }
+
+    fn lookup(&self, target: PreparedCallable) -> Option<&VerifiedSymbolicSummary<'a>> {
+        self.lineage_is_current(target).then_some(())?;
+        self.first.as_ref().filter(|summary| summary.target == target)
+            .or_else(|| self.other.get(&target))
+    }
+
+    fn insert_derived(&mut self, summary: VerifiedSymbolicSummary<'a>, provider: PreparedCallable) -> Option<()> {
+        let target = summary.target;
+        if target.0 != provider.0 || provider.1 >= target.1 || self.generation.contains_key(&target)
+            || self.generation.get(&provider) != Some(&1) || self.lookup(provider).is_none()
+        {
+            return None;
+        }
+        let ancestors = self.derived.get(&provider).map(Vec::as_slice).unwrap_or_default();
+        if ancestors.len() >= MAX_SYMBOLIC_SUMMARY_LINEAGE { return None; }
+        let mut lineage = ancestors.to_vec();
+        lineage.push((provider, 1));
+        self.insert(summary);
+        self.derived.insert(target, lineage);
+        Some(())
+    }
+
     fn ranked_scalar_return_import(
         &self, target: PreparedCallable, calls: &FunctionCallSites,
-    ) -> Result<Option<ImportedLocal<'_>>, ProjectCheck> {
+    ) -> Result<Option<(PreparedCallable, ImportedLocal<'_>)>, ProjectCheck> {
         let Some((callee, position, origin, occurrence)) = ranked_scalar_return_origin(calls) else { return Ok(None); };
-        let Some(summary) = self.first.as_ref().filter(|summary| summary.target == callee)
-            .or_else(|| self.other.get(&callee)) else { return Ok(None); };
-        summary.import_local(target, calls, position, origin, occurrence, true, None)
+        let Some(summary) = self.lookup(callee) else { return Ok(None); };
+        Ok(summary.import_local(target, calls, position, origin, occurrence, true, None)?
+            .map(|import| (callee, import)))
     }
 
     fn consume(
         &self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
         let Some(first) = &self.first else { return Ok(None); };
-        first.consume(|callee| self.other.get(callee), target, calls, source, effects)
+        first.consume(|callee| self.lookup(*callee), target, calls, source, effects)
     }
 }
 
@@ -5352,17 +5397,17 @@ impl SelectedSymbolicProof<'_, '_> {
     fn check_ranked_scalar_import<'local>(
         &mut self, case: &MainFlowProofCase<'_>, calls: &'local FunctionCallSites, function: &'local ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures, imports: &mut [Option<ImportedLocal<'local>>],
-    ) -> Result<Option<bool>, ProjectCheck> {
+    ) -> Result<(Option<bool>, bool), ProjectCheck> {
         let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
         let (active, directives, returned, failure) = super::checker_flow::collect_imported_root_literal_proof(
             calls, &function.body, case.relation()?, bound, case.filter, imports,
         ).ok_or(ProjectCheck::Unsupported)?;
+        let reusable = returned && !active && directives.is_empty() && failure.is_none();
         for directive in directives { effects.push_callable(calls, source, directive); }
         if let Some(failure) = failure {
             self.record(case, function, source, effects.records.len(), failure, None)?;
         }
-        // This checked consumer never issues a new summary.
-        Ok(Some(active || returned))
+        Ok((Some(active || returned), reusable))
     }
 
     fn try_collect_qualified_ranked_scalar(
@@ -5414,7 +5459,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 .ok_or(ProjectCheck::Unsupported)?;
             imports.push(Some(import));
         }
-        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut imports)
+        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut imports).map(|(result, _)| result)
     }
 
     fn record(
@@ -6245,10 +6290,30 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         if let MainFlowProofCases::Bare { first, rest } = &group.cases {
             if rest.is_empty() && first.proof_source == source && first.owner == source {
                 if first.bound.literal().is_some() {
-                    let index = std::mem::take(&mut self.equalities);
+                    let mut index = std::mem::take(&mut self.equalities);
                     let result = (|| {
-                        let Some(import) = index.ranked_scalar_return_import(target, calls)? else { return Ok(None); };
-                        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut [Some(import)])
+                        let Some((provider, import)) = index.ranked_scalar_return_import(target, calls)? else { return Ok(None); };
+                        let (active, reusable) = self.check_ranked_scalar_import(first, calls, function, source, effects, &mut [Some(import)])?;
+                        if reusable && !first.guard.always_rejects && first.guard.domain.is_none()
+                            && first.guard.boolean.iter().all(Option::is_none) && first.guard.arity == 1
+                            && first.relation == IntegerRelation::from_operator(&BinaryOperator::Equal)
+                            && first.filter.iter().all(|guard| matches!(guard, CheckerPredicate::Integer(_) | CheckerPredicate::Boolean(true)))
+                            && calls.callable_escapes.is_empty() && calls.structure.module_storage_uses.is_empty()
+                            && calls.contextual_formal().is_none()
+                        {
+                            if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, calls)) {
+                                let bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+                                let summary = VerifiedSymbolicSummary {
+                                    target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
+                                    result: VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
+                                    guards: VerifiedSymbolicGuards::Derived(first.guard.comparisons.clone()),
+                                };
+                                // Lack of unique fresh authority only prevents
+                                // export. The original proof verdict still holds.
+                                let _ = index.insert_derived(summary, provider);
+                            }
+                        }
+                        Ok(active)
                     })();
                     self.equalities = index;
                     if let Some(active) = result? { return Ok(Some(active)); }
@@ -19909,6 +19974,34 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let package = ScalarCheckerScope::CurrentPackage;
         let proved = run(text, package).unwrap();
         assert!(proved.active && proved.directives.is_empty() && proved.symbolic_diagnostic.is_none());
+        let cascade = text.replace("%%end", &format!(r#"
+            u8(u8) relay = fn(entry) {{ u8 next = client(entry); next }};
+            unit(u8) consumer = fn(entry) {{
+                core.narrow(entry <= 2, {OUTPUT});
+                u8 observed = relay(entry);
+                core.require(observed == 7, {OUTPUT});
+            }};
+            proof chained for relay(entry) -> (out) where (entry <= 2) ensures (out == 7) {{}}
+        %%end"#));
+        let proof = run(&cascade, package).unwrap();
+        assert!(proof.active && proof.directives.is_empty() && proof.symbolic_diagnostic.is_none());
+        let wrong_use = cascade.replace("core.require(observed == 7", "core.require(observed == 8");
+        let checked = run(&wrong_use, package).unwrap();
+        let [failed] = checked.directives.as_slice() else { panic!("exact downstream consumer"); };
+        assert_eq!(&wrong_use[failed.condition.start as usize..failed.condition.end as usize], "observed == 8");
+        let seven = BigInt::from(7);
+        assert!(failed.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        for rejected in [
+            cascade.replace("core.narrow(entry <= 2", "core.narrow(entry <= 3"),
+            cascade.replace("where (entry <= 2) ensures", "where (entry <= 4) ensures"),
+            cascade.replace("where (input <= 3) ensures (out == 7)", "where (input <= 3) ensures (out == 8)"),
+            cascade.replace("descend(input, 2, input, 4)", "descend(input, 2, input, 5)"),
+            cascade.replace("client(entry); next", "client(entry); next + 0"),
+        ] {
+            assert!(matches!(run(&rejected, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+        let idle = run(&wrong_use, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.directives.is_empty() && idle.symbolic_diagnostic.is_none());
         let wrong = text.replace("where (input <= 3) ensures (out == 7)", "where (input <= 3) ensures (out == 8)");
         let checked = run(&wrong, package).unwrap();
         let failure = checked.symbolic_diagnostic.unwrap();
