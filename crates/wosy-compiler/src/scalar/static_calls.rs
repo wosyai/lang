@@ -233,7 +233,29 @@ impl PreparedScalarProject {
         project: ScalarProject,
         access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
     ) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (mut validation, mut occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
+        Self::new_impl(project, access, None)
+    }
+
+    pub(super) fn new_anonymous_arm(
+        module: ScalarModule,
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
+        let [ScalarItem::Function(arm)] = module.items.as_slice() else {
+            unreachable!("one isolated anonymous callable");
+        };
+        assert!(arm.name.is_empty() && module.namespace_bindings.is_empty()
+            && module.members.is_empty() && module.structs.is_empty() && module.enums.is_empty());
+        let span = arm.span;
+        let source = module.source.clone();
+        Self::new_impl(ScalarProject::new(vec![module], vec![source]), None, Some(span))
+    }
+
+    fn new_impl(
+        project: ScalarProject,
+        access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
+        isolated_anonymous_arm: Option<ByteSpan>,
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
+        let (mut validation, mut occurrence_typing) =
+            super::typecheck_scalar_project_with_occurrences_for(project, isolated_anonymous_arm);
         if !validation.diagnostics.is_empty() {
             return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
         }
@@ -288,9 +310,10 @@ impl PreparedScalarProject {
             occurrence_typing.extend(typed);
         }
         let project = validation.project;
-        let calls = reference::resolve_project_call_sites_with_occurrences(
+        let calls = reference::resolve_project_call_sites_with_occurrences_for(
             &project.modules,
             occurrence_typing,
+            isolated_anonymous_arm,
         );
         let diagnostics = calls
             .lookup_errors()
@@ -466,6 +489,11 @@ pub struct ScalarBuildValidation<'a> {
 }
 
 impl<'a> ScalarBuildValidation<'a> {
+    pub(super) fn into_reference_results(self) -> reference::ProjectReferenceResults {
+        self.results
+    }
+
+
     pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
         let mut result = self.results.closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)?;
         result.install_private_runtime_reads(&self.private_runtime_reads, reservations)?;

@@ -2773,6 +2773,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
 }
 
+mod anonymous_callable;
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
@@ -2867,12 +2868,14 @@ fn collect_scalar_diagnostics(
                 lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
             }
             NodeOrToken::Node(node)
-                if node.kind() == SyntaxKind::InvalidTemporaryPlace
+                if matches!(node.kind(), SyntaxKind::InvalidTemporaryPlace | SyntaxKind::CallableLiteral)
                     || (node.kind() == SyntaxKind::ValueField
                         && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
             {
                 let message = if node.kind() == SyntaxKind::InvalidTemporaryPlace {
                     "a field of a temporary is not an assignable or borrowable place"
+                } else if node.kind() == SyntaxKind::CallableLiteral {
+                    "inline callable array elements are not available for Build yet"
                 } else {
                     "an indexed call result field is not supported"
                 };
@@ -2912,6 +2915,13 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
 
 fn typecheck_scalar_project_with_occurrences(
     project: ScalarProject,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_with_occurrences_for(project, None)
+}
+
+fn typecheck_scalar_project_with_occurrences_for(
+    project: ScalarProject,
+    isolated_anonymous_arm: Option<ByteSpan>,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
@@ -3014,6 +3024,12 @@ fn typecheck_scalar_project_with_occurrences(
                         );
                     }
                     (&binding.name, binding.span, Some(&binding.declared_type))
+                }
+                ScalarItem::Function(function) if isolated_anonymous_arm == Some(function.span) => {
+                    // The isolated arm has no declaration name or named scope
+                    // entry. Its signature and body use the ordinary checker.
+                    validate_module_type(&module.source, &function.signature, function.span, &mut diagnostics);
+                    continue;
                 }
                 ScalarItem::Function(function) => {
                     validate_identifier_style(

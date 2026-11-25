@@ -2191,6 +2191,7 @@ fn legacy_definition_function_type<'ctx>(
 
 mod aggregate_transfer;
 mod local_callable;
+pub(crate) use local_callable::closed_scalar_target;
 mod portable_reborrow;
 mod memory;
 use memory::{

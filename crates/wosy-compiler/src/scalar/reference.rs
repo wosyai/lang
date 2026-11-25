@@ -13385,6 +13385,10 @@ enum CallDeclaration<'a> {
 
 impl<'a> CallDeclarationIndex<'a> {
     fn new(modules: &[CallResolutionModule<'a>]) -> Self {
+        Self::new_for(modules, None)
+    }
+
+    fn new_for(modules: &[CallResolutionModule<'a>], isolated_anonymous_arm: Option<ByteSpan>) -> Self {
         let mut index = Self::default();
         for (module_ordinal, module) in modules.iter().enumerate() {
             let mut headers = CallDeclarationHeaders::default();
@@ -13396,6 +13400,9 @@ impl<'a> CallDeclarationIndex<'a> {
             }
             for (item_ordinal, item) in module.items.iter().enumerate() {
                 match item {
+                    ScalarItem::Function(function) if isolated_anonymous_arm == Some(function.span) => {
+                        debug_assert!(function.name.is_empty());
+                    }
                     ScalarItem::Function(function) => {
                         headers
                             .value_tokens
@@ -14250,17 +14257,26 @@ impl ProjectCallSiteResults {
 
 #[cfg(test)]
 pub(super) fn resolve_project_call_sites(modules: &[ScalarModule]) -> ProjectCallSiteResults {
-    resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly)
+    resolve_project_call_sites_impl(modules, OccurrenceTypingInputs::StructuralOnly, None)
 }
 
 pub(super) fn resolve_project_call_sites_with_occurrences(
     modules: &[ScalarModule],
     occurrence_typing: Vec<PreparationOccurrenceTyping>,
 ) -> ProjectCallSiteResults {
+    resolve_project_call_sites_with_occurrences_for(modules, occurrence_typing, None)
+}
+
+pub(super) fn resolve_project_call_sites_with_occurrences_for(
+    modules: &[ScalarModule],
+    occurrence_typing: Vec<PreparationOccurrenceTyping>,
+    isolated_anonymous_arm: Option<ByteSpan>,
+) -> ProjectCallSiteResults {
     assert_eq!(modules.len(), occurrence_typing.len());
     resolve_project_call_sites_impl(
         modules,
         OccurrenceTypingInputs::Typed(occurrence_typing.into_iter()),
+        isolated_anonymous_arm,
     )
 }
 
@@ -14273,12 +14289,13 @@ enum OccurrenceTypingInputs {
 fn resolve_project_call_sites_impl(
     modules: &[ScalarModule],
     mut occurrence_inputs: OccurrenceTypingInputs,
+    isolated_anonymous_arm: Option<ByteSpan>,
 ) -> ProjectCallSiteResults {
     let views = modules
         .iter()
         .map(CallResolutionModule::module)
         .collect::<Vec<_>>();
-    let declarations = CallDeclarationIndex::new(&views);
+    let declarations = CallDeclarationIndex::new_for(&views, isolated_anonymous_arm);
     let mut result = ProjectCallSiteResults {
         duplicate_sources: declarations.duplicate_sources.iter().map(|source| (*source).clone()).collect(),
         modules: modules

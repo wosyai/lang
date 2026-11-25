@@ -101,7 +101,7 @@ fn signature(ty: &ScalarType) -> Option<(&[ScalarType], &crate::ScalarOutputSequ
     (scalar(&output.ty) && (scalar_parameters || shared_reader)).then_some((parameters, outputs))
 }
 
-pub(super) fn closed_scalar_target(function: &ScalarFunction, cfg: &ScalarReferenceCfg) -> bool {
+pub(crate) fn closed_scalar_target(function: &ScalarFunction, cfg: &ScalarReferenceCfg) -> bool {
     if signature(&function.signature).is_none_or(|(parameters, _)| !parameters.iter().all(scalar))
         || !cfg.allocations.is_empty()
         || !matches!(cfg.points.first().map(|point| &point.kind), Some(CfgPointKind::Entry))
