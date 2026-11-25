@@ -9286,8 +9286,7 @@ fn bind_enum_match_value(
                         if source_ty != ty { return None; }
                         charge_call_work(roots.ordinary_local_work.get_or_insert(0), lane.0.len())?;
                         if lane.0.iter().any(|row| row.get(axis).is_none_or(|domain| domain.singleton_value().is_none())) {
-                            return lane.finite_ordinary_calculation(operation, (None, Some(axis)), right, ty,
-                                FiniteIntegerInstall::Append, roots.ordinary_local_work.get_or_insert(0));
+                            return append_wrapped_match_axis(roots, lane, axis, ty, offset);
                         }
                         (None, Some(axis))
                     }
@@ -9322,6 +9321,53 @@ fn bind_enum_match_value(
             Some(joined)
         }
     }
+}
+
+/// A fitted fixed-width addend can cross one endpoint at most. Retain
+/// each exact preimage row, then append its corresponding affine result.
+#[cfg(feature = "internal-checker")]
+fn append_wrapped_match_axis(
+    roots: &mut IntegerRoots<'_>, path: IntegerInputs, axis: usize, ty: &ScalarType, offset: &BigInt,
+) -> Option<IntegerInputs> {
+    use num_bigint::Sign;
+    let (min, max) = super::typecheck::integer_bounds(ty)?;
+    if offset < &min || offset > &max { return None; }
+    if offset.sign() == Sign::NoSign {
+        let mut path = path;
+        path.append_ordinary_copy(axis, roots)?;
+        return Some(path);
+    }
+    let width = &max - &min + BigInt::from(1);
+    let (bound, comparison, wrapped) = if offset.sign() == Sign::Plus {
+        (&max - offset, BinaryOperator::LessEqual, offset - &width)
+    } else {
+        (&min - offset, BinaryOperator::GreaterEqual, offset + &width)
+    };
+    let relation = IntegerRelation::from_operator(&comparison)?;
+    let [wrapped_path, plain_path] = path.ordinary_atom(
+        OrdinaryIntegerAtom::Literal(axis, relation, &bound), [true, true],
+        roots.ordinary_local_work.get_or_insert(0),
+    )?;
+    let mut joined = IntegerInputs::default();
+    for (mut lane, offset) in [(plain_path, offset.clone()), (wrapped_path, wrapped)] {
+        if lane.is_unreachable() { continue; }
+        charge_ordinary_scalar_append(roots, &lane)?;
+        let transform = Rc::new(IntegerAffineTransform { reflected: false, offset });
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        for row in &mut lane.0 {
+            let domain = row.get(axis)?;
+            // The cut establishes fit; recheck with the canonical affine
+            // domain contract before any piece can survive.
+            transform.fits(domain, &min, &max)?;
+            let plan = row.prepare_affine(axis, domain, &transform, work)?;
+            if matches!(&plan, AffineAppend::Member { .. }) {
+                roots.affine_work.get_or_insert(0);
+            }
+            row.append_affine(plan);
+        }
+        append_ordinary_scalar_lane(roots, &mut joined, &mut lane)?;
+    }
+    Some(joined)
 }
 
 #[cfg(feature = "internal-checker")]

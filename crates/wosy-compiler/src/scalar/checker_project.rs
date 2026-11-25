@@ -24439,10 +24439,49 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&maximum, &maximum)]));
             assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&zero, &zero)]));
         }
-        let broad = text.replace("if (input >= 254)", "if (input >= 0)");
-        assert!(matches!(run(&broad, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let broad = text.replace("if (input >= 254)", "if (input >= 0)")
+            .replace("input >= 254 || actual == 17", "actual != 0 || input == 255");
+        let checked = run(&broad, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(checked.active && checked.directives.is_empty());
         let double = text.replace("Region.left(input)", "Region.left(input +@ 1)");
         assert!(matches!(run(&double, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_ordinary_enum_match_wraps_full_signed_preimages_without_enumeration() {
+        let text = format!(r#"%%start
+            enum copy Region {{ live(i16); spare(i16); }}
+            unit(i16) inspect = fn(input) {{
+                i16 actual = match (Region.live(input)) {{
+                    live(value) {{ value +@ -2 }}
+                    spare(other) {{ other }}
+                }};
+                core.require(actual != 32767 || input == -32767, {OUTPUT});
+                core.require(actual != 32766 || input == -32768, {OUTPUT});
+                core.require(input != -32766 || actual == -32768, {OUTPUT});
+            }};
+        %%end"#);
+        let app = source("src/main.w", "symbolic-runtime-enum-wrap-full-signed");
+        let run = |text: &str| {
+            let parsed = parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations, Vec::new())], Vec::new(), vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap()
+        };
+        let passed = run(&text);
+        assert!(passed.active && passed.directives.is_empty());
+        let bad = text.replace("actual != 32767 || input == -32767", "actual != 32767 || input == -32768");
+        let failed = run(&bad);
+        let [only] = failed.directives.as_slice() else { panic!("only the wrong inverse fails"); };
+        let input = BigInt::from(-32767);
+        let output = BigInt::from(32767);
+        assert_eq!(only.witness.row_count(), 1);
+        assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&input, &input)]));
+        assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&output, &output)]));
     }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {
