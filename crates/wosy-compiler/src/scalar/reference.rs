@@ -19,6 +19,8 @@ use super::*;
 
 pub(crate) mod aggregate;
 pub(super) mod self_tail;
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) mod pointer_entry;
 
 #[cfg(test)]
 mod input_tests;
@@ -10737,6 +10739,20 @@ impl ProjectReferenceResults {
                 .function_result(module_ordinal, item_ordinal, arm_index)?
                 .cfg,
         )
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(super) fn pointer_entry_wrapping_write<'a>(
+        &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
+        module: usize, item: usize,
+    ) -> Option<pointer_entry::EntryPointeeWrite<'a>> {
+        if !self.errors.is_empty() { return None; }
+        let source = modules.get(module)?;
+        let ScalarItem::Function(function) = source.items.get(item)? else { return None; };
+        let body = calls.function_body(module, item, None)?;
+        let result = self.function_result(module, item, None)?;
+        pointer_entry::checked(&source.source, function, body, &result.cfg, &result.proof_points)
     }
 
     pub(super) fn callable_point_facts(

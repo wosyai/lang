@@ -375,6 +375,14 @@ pub struct ScalarBuildValidation<'a> {
 }
 
 impl<'a> ScalarBuildValidation<'a> {
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(crate) fn pointer_entry_wrapping_write(
+        &self, module: usize, item: usize,
+    ) -> Option<reference::pointer_entry::EntryPointeeWrite<'_>> {
+        self.results.pointer_entry_wrapping_write(&self.prepared.project.modules, &self.prepared.calls, module, item)
+    }
+
     pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
         self.results
             .closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)
