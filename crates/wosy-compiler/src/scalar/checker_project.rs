@@ -8484,7 +8484,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         }
         if array_quantifier::is_array_target(&selected) {
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
-            arrays.push(array_quantifier::ArrayProof::prepare(source, selected)?);
+            arrays.extend(array_quantifier::ArrayProof::prepare(source, selected, &mut array_work)?);
         } else {
             let plan = prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)?;
             if first_plan.is_none() { first_plan = Some(plan); } else { plans.push(plan); }
@@ -9598,23 +9598,31 @@ impl PreparedProofModule {
             .is_some_and(|(_, resolved)| array_quantifier::is_array_target(resolved))
         {
             let checked = single.take().ok_or(ProjectCheck::Unsupported).and_then(|result| result)
-                .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(source, resolved))
-                .and_then(|plan| {
+                .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(source, resolved, &mut 0))
+                .and_then(|plans| {
                     let startup_count = self.prepared.parts().0.initialization_order.len();
-                    let cohort = array_quantifier::Cohort::new(vec![plan], Some(self.prepared.parts().1))?;
-                    let mut run = run_prepared_ordered_check(
+                    let cohort = array_quantifier::Cohort::new(plans, Some(self.prepared.parts().1))?;
+                    let run = run_prepared_ordered_check(
                         &self.prepared, ScalarCheckerScope::CurrentPackage, startup_count, OrderedReachPolicy::Closed,
                         array_quantifier::Evidence::new(&cohort)?,
                     )?;
                     if !run.directives.is_empty() { return Err(ProjectCheck::Unsupported); }
-                    match run.symbolic.pop().flatten() {
-                        Some(ProofCoverage::Applicable(Some(_))) => Ok(ProjectCheck::Refuted),
-                        Some(ProofCoverage::Applicable(None)) => Ok(ProjectCheck::Proved),
-                        Some(ProofCoverage::NoApplicableInputs) => Ok(ProjectCheck::NoApplicableInputs),
-                        None if !run.actual.failures.is_empty() => Ok(ProjectCheck::Refuted),
-                        None if run.actual.applicable => Ok(ProjectCheck::Proved),
-                        None if run.actual.saw_single_target() => Ok(ProjectCheck::NoApplicableInputs),
-                        None => Err(ProjectCheck::Unsupported),
+                    if !run.actual.failures.is_empty() || run.symbolic.iter().any(|verdict|
+                        matches!(verdict, Some(ProofCoverage::Applicable(Some(_)))))
+                    {
+                        Ok(ProjectCheck::Refuted)
+                    } else if !run.actual.saw_single_target() && !run.symbolic.iter().all(Option::is_some) {
+                        Err(ProjectCheck::Unsupported)
+                    } else if run.actual.applicable || run.symbolic.iter().any(|verdict|
+                        matches!(verdict, Some(ProofCoverage::Applicable(None))))
+                    {
+                        Ok(ProjectCheck::Proved)
+                    } else if run.actual.saw_single_target() || run.symbolic.iter().all(|verdict|
+                        matches!(verdict, Some(ProofCoverage::NoApplicableInputs)))
+                    {
+                        Ok(ProjectCheck::NoApplicableInputs)
+                    } else {
+                        Err(ProjectCheck::Unsupported)
                     }
                 });
             return vec![module_proof_outcome(checked)];
@@ -24638,6 +24646,78 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let foreign = SourceIdentity { project: "another-project".into(), ..owner.clone() };
             assert!(matches!(run(main, provider, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn nested_authored_array_witnesses_follow_their_guarded_entry_paths() {
+        let proof = r#"%%start
+            u8[3](u8) make = fn(value) {
+                if (value < 3) { [7, 1, 1] } else {
+                    if (value < 5) { [2, 7, 2] } else { [3, 3, 7] }
+                }
+            };
+            proof cells for make(entry) -> (items)
+                where (entry <= 7)
+                ensures (exists (u64 i where i < 3) { items[i] == 7 })
+            {
+                if (entry < 3) { core.witness(0); }
+                else {
+                    if (entry < 5) { core.witness(1); }
+                    else { core.witness(2); }
+                }
+            }
+        %%end"#;
+        let app = source("src/main.w", "nested-array-witnesses");
+        let run = |text: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let idle = run(proof, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.aggregate_diagnostics.is_empty());
+        let passed = run(proof, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(passed.active && passed.aggregate_diagnostics.is_empty());
+        let reached = proof.replace("%%end", "u8[3] first = make(0); u8[3] next = make(3); u8[3] last = make(6); u8[3] outside = make(8); %%end");
+        let bad = proof.replace("core.witness(2)", "core.witness(0)");
+        let bad_reached = reached.replace("core.witness(2)", "core.witness(0)");
+        for (program, scope, entry) in [(&bad, ScalarCheckerScope::CurrentPackage, 5),
+            (&bad_reached, ScalarCheckerScope::MainFlowOnly, 6)]
+        {
+            let report = run(program, scope).unwrap();
+            let [failure] = report.aggregate_diagnostics.as_slice() else { panic!("one guarded leaf refutes"); };
+            let cell = failure.cell.as_ref().unwrap();
+            assert_eq!((&cell.index, &cell.value), (&BigInt::from(0), &BigInt::from(3)));
+            let step = failure.failed_step.as_ref().unwrap().range;
+            assert_eq!(&program[step.start as usize..step.end as usize], "core.witness(0)");
+            let entry = BigInt::from(entry);
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&entry, &entry)]));
+        }
+        let proved_actual = run(&reached, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(proved_actual.active && proved_actual.aggregate_diagnostics.is_empty());
+        assert!(run(&proof.replace("core.witness(2)", "core.witness(3)"), ScalarCheckerScope::CurrentPackage).is_err());
+
+        let (_, catalog) = crate::parse_proof_source(app.clone(), proof.to_owned(), &[]).ok().unwrap();
+        let prepared = prepare_loaded_proof_project(Vec::new(), vec![(catalog, Vec::new())],
+            vec![app.clone()], inputs(), Vec::new(), OrderedProofPreparation::All).unwrap();
+        let prepare = |work: &mut usize| array_quantifier::ArrayProof::prepare(
+            &app, prepared.select_resolved(&app, "cells").unwrap(), work,
+        );
+        let mut isolated = 0;
+        assert_eq!(prepare(&mut isolated).unwrap().len(), 3);
+        let budget = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK;
+        let mut shared = 0;
+        let mut count = 0;
+        for _ in 0..budget {
+            match prepare(&mut shared) {
+                Ok(branches) => { assert_eq!(branches.len(), 3); count += 1; }
+                Err(ProjectCheck::Unsupported) => break,
+                Err(_) => panic!("valid proof reached an unexpected pre-cohort result"),
+            }
+        }
+        assert!(count > 1 && shared > budget);
+        assert_eq!(prepare(&mut 0).unwrap().len(), 3);
     }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {

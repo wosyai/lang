@@ -28,8 +28,8 @@ pub(super) fn is_array_target(proof: &SelectedModuleProof<'_>) -> bool {
 
 impl<'a> ArrayProof<'a> {
     pub(super) fn prepare(
-        source: &'a SourceIdentity, selected: SelectedModuleProof<'a>,
-    ) -> Result<Self, ProjectCheck> {
+        source: &'a SourceIdentity, selected: SelectedModuleProof<'a>, array_work: &mut usize,
+    ) -> Result<Vec<Self>, ProjectCheck> {
         let proof = selected.node;
         let target = (selected.function.0, selected.function.1);
         let owner = selected.owner;
@@ -130,6 +130,19 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let steps = derive_block(&block);
+        if existential && witness_dependency.is_none() && witness_split(&steps).is_some() {
+            if inputs.len() != 1 { return Err(ProjectCheck::Unsupported); }
+            let mut branches = Vec::new();
+            let mut active = entry_filter.unwrap_or_default();
+            compile_witness_branches(&steps, &inputs, body, &domain, *length,
+                &mut active, &mut branches, array_work, 0)?;
+            return Ok(branches.into_iter().map(|(filter, index, step)| Self {
+                proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(&goal_node),
+                failed_step: Some(step), shifted_witness: None, entry_filter: Some(filter),
+                domain: domain.clone(), quantifier: FixedArrayQuantifier::ExplicitWitness(index),
+                relation, expected: expected.clone(), body, result: &output.ty,
+            }).collect());
+        }
         let mut failed_step = None;
         let mut shifted_witness = None;
         let quantifier_kind = if let Some((universal, target_domain)) = witness_dependency {
@@ -206,9 +219,9 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
-        Ok(Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step, shifted_witness,
+        Ok(vec![Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step, shifted_witness,
             entry_filter, domain, quantifier: quantifier_kind, relation, expected, body,
-            result: &output.ty })
+            result: &output.ty }])
     }
 
     fn check(&self) -> FixedArrayCheck<'_> {
@@ -238,6 +251,46 @@ impl<'a> ArrayProof<'a> {
         })
     }
 
+}
+
+fn witness_split(steps: &ScalarBlock) -> Option<(&ScalarExpression, &ScalarBlock, &ScalarBlock)> {
+    let [ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })]
+        = steps.items.as_slice() else { return None; };
+    (steps.terminated_items == [false] && !steps.unsafe_context)
+        .then_some((condition, then_branch, else_branch))
+}
+
+fn compile_witness_branches(
+    steps: &ScalarBlock, inputs: &[String], body: &FunctionCallSites, domain: &IntegerSet, length: u64,
+    active: &mut Vec<CheckerPredicate>, branches: &mut Vec<(Vec<CheckerPredicate>, BigInt, ByteSpan)>,
+    work: &mut usize, depth: usize,
+) -> Result<(), ProjectCheck> {
+    if depth >= MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
+    charge_call_work(work, 1).ok_or(ProjectCheck::Unsupported)?;
+    if let Some((condition, yes, no)) = witness_split(steps) {
+        for (branch, negated) in [(yes, false), (no, true)] {
+            active.push(proof_input_condition::<true>(condition, inputs, body, negated)?);
+            compile_witness_branches(branch, inputs, body, domain, length, active, branches, work, depth + 1)?;
+            active.pop();
+        }
+        return Ok(());
+    }
+    let value = concrete_integer_literal(authored_witness_argument(steps)?)
+        .ok_or(ProjectCheck::Unsupported)?.into_owned();
+    if !integer_literal_fits_type(&value, &ScalarType::U64) || !domain.contains(&value)
+        || u64::try_from(&value).ok().is_none_or(|value| value >= length)
+    {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let cost = active.iter().try_fold(domain.interval_count().checked_add(1).ok_or(ProjectCheck::Unsupported)?,
+        |total, filter| total.checked_add(match filter {
+            CheckerPredicate::EntryDomain { values, .. } => values.interval_count().checked_add(1)?,
+            _ => 1,
+        })).ok_or(ProjectCheck::Unsupported)?;
+    charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
+    branches.push((active.clone(), value, super::super::typecheck::expression_span(expression)));
+    Ok(())
 }
 
 type ArrayCoverage = ProofCoverage<Option<AggregateProofDiagnostic>>;
@@ -320,7 +373,7 @@ impl<'plan, 'proof> Evidence<'plan, 'proof> {
     }
 
     pub(super) fn saw_single_target(&self) -> bool {
-        self.cohort.plans.len() == 1 && self.seen.contains(&self.cohort.plans[0].target)
+        self.cohort.groups.len() == 1 && self.seen.contains(&self.cohort.plans[0].target)
     }
 
     pub(super) fn into_diagnostics(
