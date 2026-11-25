@@ -3250,8 +3250,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 && projections.is_empty()
                                 && matches!(proof_place.as_ref(), ScalarPlace::Name { .. })
                                 && *mutability == ScalarReferenceMutability::Shared)
-                        && !(*mutability == ScalarReferenceMutability::Shared && parent_loan.is_none()
-                            && self.exact_widened_element_borrow(place, place_ordinal, ordinal, &binding))
+                        && !(parent_loan.is_none()
+                            && self.exact_widened_element_borrow(place, place_ordinal, ordinal, &binding, *mutability))
                     {
                         return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
                     }
@@ -5073,7 +5073,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
     fn exact_widened_element_borrow(
         &self, place: &ScalarPlace, ordinal: OccurrenceOrdinal, address: OccurrenceOrdinal,
-        owner: &ReferenceBindingId,
+        owner: &ReferenceBindingId, mutability: ScalarReferenceMutability,
     ) -> bool {
         let ScalarPlace::Index { base, index, .. } = place else { return false };
         let ScalarPlace::Name { span, .. } = base.as_ref() else { return false };
@@ -5091,8 +5091,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && types.places.get(&ordinal) == Some(element.as_ref())
             && types.expressions.get(&selector) == Some(&ScalarType::U64)
             && matches!(types.expressions.get(&address), Some(ScalarType::CheckedReference {
-                mutability: ScalarReferenceMutability::Shared, inner,
-            }) if inner == element)
+                mutability: actual, inner,
+            }) if *actual == mutability && inner == element)
             && match index.as_ref() {
                 ScalarExpression::Integer { .. } => true,
                 ScalarExpression::Name { .. } => matches!(self.call_sites.prepared_plain_name(selector),
