@@ -164,7 +164,7 @@ impl ActualIntegerObserver for &Plan {
 
     fn exact_pointee_update(
         &self, target: PreparedCallable, body: &FunctionCallSites, occurrence: OccurrenceOrdinal,
-        source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
+        source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>, cursor: &ExactCallCursor<'_>,
     ) -> Result<Option<Vec<LocalTransition>>, ProjectCheck> {
         if target != self.target { return Ok(None); }
         if &self.proof.source != source
@@ -197,6 +197,11 @@ impl ActualIntegerObserver for &Plan {
         };
         if receipts.len() != self.claims.len() || receipts.iter().any(|receipt| {
             receipt.position() != expected || &receipt.call().source != source || receipt.call().range != call
+                || receipt.guard_binding().is_some_and(|binding| {
+                    let observed = cursor.contextual_singleton(binding, &ScalarType::Bool)
+                        .and_then(super::super::checker_flow::bool_result_lane).map(|lane| lane == 1);
+                    observed.is_none() || observed != guard
+                })
         }) {
             return Err(ProjectCheck::Unsupported);
         }
@@ -441,10 +446,21 @@ mod tests {
                     let receipt = run(&stale, scope).unwrap();
                     let [failed] = receipt.directives.as_slice() else { panic!("actual guarded write"); };
                     assert_eq!(&stale[failed.condition.start as usize..failed.condition.end as usize], "a == 253");
+                    let lexical = actual.replace(&format!("update(&!a, {lane})"),
+                        &format!("bool configured = {lane}; update(&!a, configured)"));
+                    let copied = lexical.replace("update(&!a, configured)", "bool choice = configured; update(&!a, choice)");
+                    for known in [&lexical, &copied] {
+                        let result = run(known, scope).unwrap();
+                        assert!(result.active && result.directives.is_empty() && result.pointer_effect_diagnostic.is_none());
+                        let stale = run(&known.replace(&format!("a == {exit}"), "a == 253"), scope).unwrap();
+                        assert_eq!(stale.directives.len(), 1);
+                    }
                     for denied in [
                         actual.replace(&format!("update(&!a, {lane})"), &format!("update(&!a, {})", !lane)),
                         refuted.replace("%%end", &entrypoint),
-                        actual.replace(&format!("update(&!a, {lane})"), &format!("bool configured = {lane}; update(&!a, configured)")),
+                        lexical.replace(&format!("bool configured = {lane}"), &format!("bool configured = {}", !lane)),
+                        lexical.replace("update(&!a, configured)", &format!("configured = {}; update(&!a, configured)", !lane)),
+                        lexical.replace("update(&!a, configured)", "update(&!a, !configured)"),
                         actual.replace("start();", "start(); start();"),
                     ] {
                         assert!(run(&denied, scope).is_err(), "{denied}");

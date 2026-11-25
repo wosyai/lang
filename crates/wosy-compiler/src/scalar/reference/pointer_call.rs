@@ -12,6 +12,7 @@ pub(crate) struct CallerPointeeEffect<'a> {
     width: &'a ScalarType,
     entry_epoch: CfgPointId,
     position: usize,
+    guard_binding: Option<&'a ReferenceBindingId>,
     entry: BigInt,
     exit: BigInt,
 }
@@ -24,6 +25,7 @@ impl<'a> CallerPointeeEffect<'a> {
     pub(crate) fn width(&self) -> &'a ScalarType { self.width }
     pub(crate) fn entry_epoch(&self) -> CfgPointId { self.entry_epoch }
     pub(crate) fn position(&self) -> usize { self.position }
+    pub(crate) fn guard_binding(&self) -> Option<&'a ReferenceBindingId> { self.guard_binding }
     pub(crate) fn entry(&self) -> &BigInt { &self.entry }
     pub(crate) fn exit(&self) -> &BigInt { &self.exit }
 }
@@ -54,6 +56,8 @@ pub(super) fn checked<'a>(
         observed: bool,
     }
     let mut cells: Vec<Cell<'_>> = Vec::new();
+    #[cfg(feature = "internal-checker")]
+    let mut booleans: Vec<(&ReferenceBindingId, bool)> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut points = Vec::new();
     let mut previous = CfgPointId(0);
@@ -62,6 +66,45 @@ pub(super) fn checked<'a>(
         if let BlockItemKind::Binding(region) = &item.kind {
             let [receiver] = region.receivers() else { return None; };
             let BindingInitialization::Outputs(outputs) = &region.initialization else { return None; };
+            #[cfg(feature = "internal-checker")]
+            if guard.is_some() && receiver.ty == ScalarType::Bool {
+                use CheckerOrdinaryScalarLocalKind::{BoolLiteral, Copy};
+                let origin = structure.checker_ordinary_scalar_locals.get(&(root, item.position))?;
+                let BindingDefinition::Initialized { bind, value } = *facts.definitions.get(&(root, item.position, 0))?
+                    else { return None; };
+                if booleans.len() == 4 || receiver.contextual_storage.is_some() || !outputs.secondary.is_empty()
+                    || origin.source != outputs.primary || structure.checked_types.expressions.get(&origin.source) != Some(&ScalarType::Bool)
+                    || facts.evaluations.get(&origin.source) != Some(&value) || !(previous.0 < value.0 && value.0 < bind.0)
+                {
+                    return None;
+                }
+                let CfgPointKind::Bind { binding } = &cfg.points.get(bind.0)?.kind else { return None; };
+                if binding != &origin.binding || &binding.source != source || binding.function_span != function.span
+                    || binding.declaration_span != receiver.span || booleans.iter().any(|(prior, _)| *prior == binding)
+                {
+                    return None;
+                }
+                let point = cfg.points.get(value.0)?;
+                let known = match &origin.kind {
+                    BoolLiteral(value) if matches!(&point.kind, CfgPointKind::Evaluate(ScalarExpression::Boolean { value: seen, .. }) if seen == value)
+                        => *value,
+                    Copy => {
+                        let PlainNameIdentity::Lexical(input) = body.prepared_plain_name(origin.source)? else { return None; };
+                        let &(_, known) = booleans.iter().find(|(source, _)| *source == input)?;
+                        match &point.kind {
+                            CfgPointKind::Read { binding } if binding == input => {}
+                            CfgPointKind::Evaluate(ScalarExpression::Name { .. }) => {}
+                            _ => return None,
+                        }
+                        known
+                    }
+                    _ => return None,
+                };
+                booleans.push((binding, known));
+                points.extend([value, bind]);
+                previous = bind;
+                continue;
+            }
             let width = callees.iter().find(|effect| effect.width() == &receiver.ty)?.width();
             let (min, max) = super::super::typecheck::integer_bounds(width)?;
             if cells.len() == 4 || !outputs.secondary.is_empty() || receiver.contextual_storage.is_some()
@@ -182,7 +225,7 @@ pub(super) fn checked<'a>(
             previous = *borrow;
             receipts.push(CallerPointeeEffect {
                 call: &call_point.source_span, place, loan, width, entry_epoch: call_point.id,
-                position, entry: cell.entry.clone(), exit: exit.clone(),
+                position, guard_binding: None, entry: cell.entry.clone(), exit: exit.clone(),
             });
             cell.entry = exit;
             cell.observed = true;
@@ -190,19 +233,34 @@ pub(super) fn checked<'a>(
         if let Some(expected) = guard {
             let slot = callees.len();
             if signature.parameters.get(slot) != Some(&ScalarType::Bool) { return None; }
-            let actual @ ScalarExpression::Boolean { value, .. } = arguments.get(slot)? else { return None; };
-            if *value != expected { return None; }
+            let actual = arguments.get(slot)?;
             let OccurrenceNode::Expression(argument) = structure.edges.get(&(
                 OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
             ))? else { return None; };
             let point = *argument_points.get(slot)?;
+            let evaluated = cfg.points.get(point.0)?;
             if facts.evaluations.get(argument) != Some(&point)
                 || structure.checked_types.expressions.get(argument) != Some(&ScalarType::Bool)
-                || cfg.points.get(point.0)?.source_span.range != body.occurrences.get(argument.0)?.span
-                || !matches!(&cfg.points.get(point.0)?.kind, CfgPointKind::Evaluate(expression) if expression == actual)
+                || evaluated.source_span.range != body.occurrences.get(argument.0)?.span
                 || !(previous.0 < point.0 && point.0 < call_point.id.0)
             {
                 return None;
+            }
+            match actual {
+                ScalarExpression::Boolean { value, .. } if *value == expected
+                    && matches!(&evaluated.kind, CfgPointKind::Evaluate(expression) if expression == actual) => {}
+                #[cfg(feature = "internal-checker")]
+                ScalarExpression::Name { .. } => {
+                    let PlainNameIdentity::Lexical(binding) = body.prepared_plain_name(*argument)? else { return None; };
+                    let &(binding, known) = booleans.iter().find(|(input, _)| *input == binding)?;
+                    if known != expected || !(matches!(&evaluated.kind, CfgPointKind::Read { binding: read } if read == binding)
+                        || matches!(&evaluated.kind, CfgPointKind::Evaluate(expression) if expression == actual))
+                    {
+                        return None;
+                    }
+                    receipts.first_mut()?.guard_binding = Some(binding);
+                }
+                _ => return None,
             }
             points.push(point);
         }
@@ -223,7 +281,7 @@ pub(super) fn checked<'a>(
             match &point.kind {
                 CfgPointKind::Entry if index == 0 => {}
                 CfgPointKind::ScopeEnter if point.scope == ReferenceScopeId(0) => {}
-                CfgPointKind::Evaluate(_) | CfgPointKind::Bind { .. } | CfgPointKind::Borrow { .. }
+                CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. } | CfgPointKind::Bind { .. } | CfgPointKind::Borrow { .. }
                     | CfgPointKind::Call { .. } | CfgPointKind::Assign { .. } if points.contains(&point.id) => {}
                 _ => return None,
             }

@@ -2242,7 +2242,7 @@ trait ActualIntegerObserver {
     #[cfg(feature = "internal-checker")]
     fn exact_pointee_update(
         &self, _: PreparedCallable, _: &FunctionCallSites, _: OccurrenceOrdinal,
-        _: &SourceIdentity, _: SymbolicProofRuntime<'_>,
+        _: &SourceIdentity, _: SymbolicProofRuntime<'_>, _: &ExactCallCursor<'_>,
     ) -> Result<Option<Vec<super::checker_flow::LocalPointeeTransition>>, ProjectCheck> { Ok(None) }
 
     #[cfg(feature = "internal-checker")]
@@ -2956,6 +2956,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 if let Some(update) = self.observer.exact_pointee_update(
                                     target, body, occurrence, source,
                                     SymbolicProofRuntime { project: self.project, calls: self.calls, visits: ordered.visits },
+                                    &frame.cursor,
                                 )? {
                                     frame.cursor.resume_exact_local_updates(update.into_iter()).ok_or(ProjectCheck::Unsupported)?;
                                     self.reached.insert(target);
