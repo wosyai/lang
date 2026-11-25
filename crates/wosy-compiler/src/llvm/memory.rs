@@ -824,6 +824,7 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     expected: &crate::ScalarType,
     fields: &[crate::ScalarStructLiteralField],
+    path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let crate::ScalarType::Struct(id) = expected else {
         return Err("struct literal requires a resolved struct type".to_owned());
@@ -840,7 +841,33 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     align_storage_alloca(destination, Some(layout.alignment))?;
-    let values = prepare_struct_literal(context, state, id, fields)?;
+    let values = if fields.iter().any(|field|
+        super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, &field.value))
+    {
+        let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+            .ok_or("missing ordinary struct literal function")?;
+        let failure = context.append_basic_block(parent, "ordinary.struct_allocation_absent");
+        let values = prepare_struct_literal_with(state, id, fields, |state, field, ty| {
+            if super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, field) {
+                let (value, _) = super::expression::emit_fallible_numeric_to(context, state, field, ty, path, failure)?;
+                Ok(EmitValue::Basic(value))
+            } else {
+                match (path, field) {
+                    (ExpressionPath::Project { module, modules },
+                        ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. }) =>
+                        emit_project_typed_expression(context, state, field, ty, module, modules),
+                    _ => emit_typed_expression(context, state, field, ty),
+                }
+            }
+        })?;
+        let success = state.builder.get_insert_block().ok_or("missing successful ordinary struct fields")?;
+        state.builder.position_at_end(failure);
+        super::expression::emit_terminal_system_panic(context, state)?;
+        state.builder.position_at_end(success);
+        values
+    } else {
+        prepare_struct_literal(context, state, id, fields)?
+    };
     write_struct_literal(context, state, values, destination)?;
     Ok(EmitValue::Basic(destination.into()))
 }
@@ -958,7 +985,7 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
             emit_utf8_literal(context, state, value, expected)
         }
         (ScalarExpression::StructLiteral { fields, .. }, ScalarType::Struct(_)) => {
-            emit_struct_literal(context, state, expected, fields)
+            emit_struct_literal(context, state, expected, fields, ExpressionPath::Single)
         }
         (ScalarExpression::ArrayLiteral { elements, .. }, ScalarType::Array { .. }) => {
             emit_array_literal(context, state, expected, elements)

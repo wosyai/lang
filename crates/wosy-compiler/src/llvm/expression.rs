@@ -375,7 +375,7 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
             ExpressionPath::Project { module, modules },
         ),
         ScalarExpression::StructLiteral { fields, .. } => {
-            emit_struct_literal(context, state, expected, fields)
+            emit_struct_literal(context, state, expected, fields, ExpressionPath::Project { module, modules })
         }
         ScalarExpression::ArrayLiteral { elements, .. } => {
             emit_array_literal(context, state, expected, elements)
@@ -831,8 +831,7 @@ fn emit_prepared_call<'ctx, 'module>(
             .map_err(builder_error)?.into_int_value();
         state.builder.build_conditional_branch(succeeded, present, absent).map_err(builder_error)?;
         state.builder.position_at_end(absent);
-        emit_core_system_panic(context, state, &[])?;
-        state.builder.build_unreachable().map_err(builder_error)?;
+        emit_terminal_system_panic(context, state)?;
         state.builder.position_at_end(present);
         let payload = state.builder.build_extract_value(result, 1, "ordinary.allocation_payload")
             .map_err(builder_error)?;
@@ -1422,6 +1421,14 @@ fn emit_core_system_panic<'ctx, 'module>(
         .build_call(panic, &[], "system_panic")
         .map_err(builder_error)?;
     Ok(EmitValue::Unit)
+}
+
+pub(super) fn emit_terminal_system_panic<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+) -> Result<(), String> {
+    emit_core_system_panic(context, state, &[])?;
+    state.builder.build_unreachable().map_err(builder_error)?;
+    Ok(())
 }
 
 fn emit_int_conversion<'ctx, 'module>(
@@ -2729,8 +2736,7 @@ fn emit_fallible_numeric<'ctx>(
     if ordinary {
         let success = state.builder.get_insert_block().ok_or("missing ordinary expression success block")?;
         state.builder.position_at_end(merge);
-        emit_core_system_panic(context, state, &[])?;
-        state.builder.build_unreachable().map_err(builder_error)?;
+        emit_terminal_system_panic(context, state)?;
         state.builder.position_at_end(success);
         return Ok(EmitValue::Basic(value));
     }

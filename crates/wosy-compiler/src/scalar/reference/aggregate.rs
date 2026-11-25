@@ -1333,7 +1333,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
-    pub(super) ordinary_fallible_expressions: Vec<GuardedNumericExpression>,
+    pub(super) ordinary_fallible_expressions: Vec<Vec<GuardedNumericExpression>>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -7171,21 +7171,26 @@ fn closed_aggregates<'a>(
         // selected by a guarded use, but must not turn an unrelated ordinary
         // callable into a checked ABI. Commit all the expression's sites or
         // none: an unsupported sibling never gets a partial checked rewrite.
-        for (caller, cfg, proof) in ordinary_expressions {
+        for (caller, cfg, expressions) in ordinary_expressions {
             let mut checked = BTreeMap::new();
-            let complete = proof.calls.iter().all(|&(point, ordinal)| {
-                let Some(target) = target_body(&declarations, cfg, point) else { return false; };
-                if fallible_allocating_targets.contains_key(&target) {
-                    checked.insert(ordinal.0, target);
-                    true
-                } else {
-                    allocation_free_integer_graph(target, &mut memo, dependencies)
-                }
+            let mut marked = Vec::new();
+            let complete = expressions.iter().all(|proof| {
+                let mut has_allocating_call = false;
+                let all_calls = proof.calls.iter().all(|&(point, ordinal)| {
+                    let Some(target) = target_body(&declarations, cfg, point) else { return false; };
+                    if fallible_allocating_targets.contains_key(&target) {
+                        checked.insert(ordinal.0, target);
+                        has_allocating_call = true;
+                        true
+                    } else {
+                        allocation_free_integer_graph(target, &mut memo, dependencies)
+                    }
+                });
+                if has_allocating_call { marked.push(proof.expression.0); }
+                all_calls && proof.proves_ordinary_arithmetic(|occurrence| checked.contains_key(&occurrence.0))
             });
-            if complete && !checked.is_empty()
-                && proof.proves_ordinary_arithmetic(|occurrence| checked.contains_key(&occurrence.0))
-            {
-                ordinary_choices.insert((caller, proof.expression.0));
+            if complete && !checked.is_empty() {
+                ordinary_choices.extend(marked.into_iter().map(|ordinal| (caller, ordinal)));
                 for (ordinal, target) in checked {
                     fallible_allocating_targets.get_mut(&target).expect("selected fallible target")
                         .insert((caller, ordinal));

@@ -13841,3 +13841,80 @@ if (both_empty(7, 9) != 0 || both_empty(0, 9) != 0 || both_empty(0, 0) != 1
         }
     }
 }
+
+#[test]
+fn ordinary_fallible_struct_fields_preserve_existing_storage_until_success() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let template = "%%start
+struct copy Pair { u64 first; u64 second; u64 tag; }
+u64(u64) _read_from_buffer = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _read_next = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) guarded = fn(first, second) {
+    Pair result =? { .second = _read_from_buffer(first); .first = _read_next(second); .tag = 7; };
+    if (&result == null) { 99 } else { result.first ^ result.second }
+};
+u64(u64, u64) construct = fn(first, second) {
+    Pair result = { .second = _read_from_buffer(first); .first = _read_next(second) ^ 0; .tag = 7; };
+    result.first ^ result.second
+};
+u64(u64, u64) replace = fn(first, second) {
+    Pair result =? { .second = 42; .first = 41; .tag = 43; };
+    if (&result != null) {
+        result = { .second = _read_from_buffer(first); .first = _read_next(second) ^ 0; .tag = 7; };
+        result.first ^ result.second
+    } else { 99 }
+};
+if (guarded(7, 9) != 14 || construct(0, 0) != 0 || replace(7, 9) != 14 || replace(FIRST, SECOND) != 0) {
+    core.system_panic();
+};
+%%end";
+    for (witness, first, second) in [("first", "11", "9"), ("middle", "13", "13")] {
+        let text = template.replace("FIRST", first).replace("SECOND", second);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "ordinary fallible struct fields");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                for (caller, assignment) in [(authored("construct"), false), (authored("replace"), true)] {
+                    assert_eq!(caller.get_type().get_return_type(), Some(context.i64_type().into()));
+                    let blocks = caller.get_basic_blocks();
+                    let calls_to = |callee| blocks.iter().flat_map(|block| std::iter::successors(
+                        block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                        .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                            .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                    let [panic] = calls_to(module.get_function("__wosy_core_system_panic").unwrap())[..] else { panic!("{llvm}") };
+                    let failure = panic.get_parent().unwrap();
+                    assert_eq!(failure.get_name().to_bytes(), b"ordinary.struct_allocation_absent");
+                    assert_eq!(failure.get_first_instruction(), Some(panic));
+                    assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                    let [first] = calls_to(authored("_read_from_buffer"))[..] else { panic!("{llvm}") };
+                    let [second] = calls_to(authored("_read_next"))[..] else { panic!("{llvm}") };
+                    let enters = |instruction: InstructionValue<'_>, block| instruction.get_operands()
+                        .any(|operand| operand.and_then(|operand| operand.block()) == Some(block));
+                    let first_branch = first.get_parent().unwrap().get_terminator().unwrap();
+                    let second_branch = second.get_parent().unwrap().get_terminator().unwrap();
+                    assert!(enters(first_branch, second.get_parent().unwrap()));
+                    assert!(enters(first_branch, failure) && enters(second_branch, failure));
+                    assert_eq!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).len(), usize::from(assignment));
+                    assert_eq!(calls_to(module.get_function("__wosy_core_free").unwrap()).len(), usize::from(assignment));
+                }
+                if let Some(out) = std::env::var_os("WOSY_ORDINARY_STRUCT_FIELDS_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(witness).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

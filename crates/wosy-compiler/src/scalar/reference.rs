@@ -371,6 +371,7 @@ enum ExpressionReadMode {
     Ordinary,
     ProjectedOrigins,
     GuardedStructInitializer,
+    OrdinaryStructInitializer,
     FallibleAliasInitializer,
     DereferenceOperand,
     ArrayLengthArgument,
@@ -2601,42 +2602,56 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut raw_fields = 0;
                 let mut nullable = structure_id.is_some() && self.aggregate_facts.local_array_copy_allocation.is_some();
                 let mut nullable_read = None;
+                let guarded = matches!(read_mode, ExpressionReadMode::GuardedStructInitializer);
+                let mut ordinary = matches!(read_mode, ExpressionReadMode::OrdinaryStructInitializer)
+                    .then(Vec::new);
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
                     let before = self.cursor;
-                    let guarded = matches!(read_mode, ExpressionReadMode::GuardedStructInitializer);
-                    let requires_field_proof = guarded && matches!(&field.value,
+                    let requires_field_proof = (guarded || ordinary.is_some()) && matches!(&field.value,
                         ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. });
                     let previous = self.capture_call_points;
                     self.capture_call_points |= requires_field_proof;
                     let result = self.expression(&field.value, scope, ordinal);
                     self.capture_call_points = previous;
                     result?;
+                    let member = calls.structure.literal_fields.get(&ordinal);
+                    let member_type = calls.structure.checked_types.expressions.get(&ordinal);
                     if requires_field_proof {
-                        let proof = calls.structure.literal_fields.get(&ordinal)
-                            .filter(|member| Some(&member.structure) == structure_id)
-                            .and_then(|_| calls.structure.checked_types.expressions.get(&ordinal))
-                            .filter(|_| self.generic_parameters.is_empty())
+                        let proof = member.filter(|member| Some(&member.structure) == structure_id)
+                            .and(member_type).filter(|_| self.generic_parameters.is_empty())
                             .and_then(|ty| self.guarded_numeric_expression(&field.value, ordinal, ty));
-                        let Some(proof) = proof else {
-                            return Err(self.missing_context(expression_span(&field.value),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
-                        };
-                        self.aggregate_result.fallible_call_expressions.push(proof);
+                        match (proof, guarded) {
+                            (Some(proof), true) => self.aggregate_result.fallible_call_expressions.push(proof),
+                            (Some(proof), false) => ordinary.as_mut().expect("candidate scalar struct").push(proof),
+                            (None, true) => return Err(self.missing_context(expression_span(&field.value),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
+                            (None, false) => ordinary = None,
+                        }
                     }
-                    if guarded && matches!(&field.value, ScalarExpression::Name { .. })
-                        && !self.cursor.is_some_and(|point| {
-                            Some(point) != before && matches!(self.cfg.points[point.0].kind, CfgPointKind::Read { .. })
-                        })
-                    {
+                    let lexical_read = || self.cursor.is_some_and(|point| {
+                        Some(point) != before && matches!(self.cfg.points[point.0].kind, CfgPointKind::Read { .. })
+                    });
+                    if guarded && matches!(&field.value, ScalarExpression::Name { .. }) && !lexical_read() {
                         return Err(self.missing_context(
                             expression_span(&field.value),
                             ReferenceAnalysisErrorReason::NonLexicalFallibleStructInitializer,
                         ));
                     }
-                    let member = calls.structure.literal_fields.get(&ordinal);
-                    let member_type = calls.structure.checked_types.expressions.get(&ordinal);
+                    if ordinary.is_some() && (!member.is_some_and(|member| Some(&member.structure) == structure_id)
+                        || !member_type.is_some_and(aggregate::ordinary_value)
+                        || (!requires_field_proof && !match &field.value {
+                            ScalarExpression::Name { .. } => lexical_read(),
+                            ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. }
+                            | ScalarExpression::Char { .. } | ScalarExpression::Float { .. } => true,
+                            ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+                                matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+                            _ => false,
+                        }))
+                    {
+                        ordinary = None;
+                    }
                     if carrier {
                         carrier = member.is_some_and(|field| Some(&field.structure) == structure_id)
                             && member_type.is_some_and(|ty| match ty {
@@ -2695,6 +2710,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     }
                     self.move_value(&field.value, scope, ordinal)?;
+                }
+                if let Some(proofs) = ordinary.filter(|proofs| !proofs.is_empty()) {
+                    self.aggregate_result.ordinary_fallible_expressions.push(proofs);
                 }
                 let literal = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -5084,6 +5102,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             OccurrenceParent::Block(calls.structure.root),
                             OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
                         )) == Some(&OccurrenceNode::Expression(primary_ordinal));
+                    let ordinary_struct = !block.unsafe_context && self.generic_parameters.is_empty()
+                        && binding.fallible_assignment.is_none() && !binding.is_allocation
+                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+                        && matches!(receiver.ty, ScalarType::Struct(_))
+                        && matches!(primary, ScalarExpression::StructLiteral { .. })
+                        && calls.structure.edges.get(&(
+                            OccurrenceParent::Block(ordinal),
+                            OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
+                        )) == Some(&OccurrenceNode::Expression(primary_ordinal));
                     let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
@@ -5111,6 +5139,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             primary_ordinal,
                             ExpressionReadMode::GuardedStructInitializer,
                         )?
+                    } else if ordinary_struct {
+                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryStructInitializer)?
                     } else if walk_fallible_expression {
                         let previous = self.capture_call_points;
                         self.capture_call_points = true;
@@ -5126,7 +5156,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && outputs.secondary.is_empty());
                         match (binding.fallible_assignment, expression) {
                             (Some(_), Some(proof)) => self.aggregate_result.fallible_call_expressions.push(proof),
-                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push(proof),
+                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push(vec![proof]),
                             (Some(_), None) => return Err(self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
                             (None, None) => {}
@@ -5693,6 +5723,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some((_, _, _, arms)) = widened_join_replace {
                         self.aggregate_result.widened_join_arms.extend(arms);
                     }
+                    let ordinary_struct_replacement = (|| {
+                        if block.unsafe_context || !self.generic_parameters.is_empty()
+                            || group.projected_outputs().len() != 0
+                        { return None; }
+                        let ([target], [ScalarExpression::StructLiteral { .. }]) =
+                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let evaluation = group.rhs_evaluations().next()?;
+                        let destination = group.destinations().next()?.destination;
+                        let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        let ty @ ScalarType::Struct(_) = self.binding_types.get(binding)? else { return None; };
+                        (calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty))
+                            .then_some(evaluation.expression)
+                    })();
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
@@ -5700,6 +5745,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .or(widened_owning_replace.map(|(call, _, owner, _)| (call, owner)));
                         let mode = match exact_move {
                             Some((call, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
+                            _ if ordinary_struct_replacement == Some(evaluation.expression) =>
+                                ExpressionReadMode::OrdinaryStructInitializer,
                             _ => ExpressionReadMode::Ordinary,
                         };
                         let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode)?;
