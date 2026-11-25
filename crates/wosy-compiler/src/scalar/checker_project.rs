@@ -5307,17 +5307,31 @@ impl<'a> SymbolicSummaryIndex<'a> {
     }
 
     fn insert_linked(&mut self, summary: VerifiedSymbolicSummary<'a>, provider: PreparedCallable, qualified: bool) -> Option<()> {
+        self.insert_dependency_links(summary, std::iter::once(provider), qualified)
+    }
+
+    fn insert_dependency_links(
+        &mut self, summary: VerifiedSymbolicSummary<'a>,
+        providers: impl IntoIterator<Item = PreparedCallable>, qualified: bool,
+    ) -> Option<()> {
         let target = summary.target;
-        let ordered = if qualified { target.0 != provider.0 } else { target.0 == provider.0 && provider.1 < target.1 };
-        if !ordered || self.generation.contains_key(&target)
-            || self.generation.get(&provider) != Some(&1) || self.lookup(provider).is_none()
-        {
-            return None;
+        if self.generation.contains_key(&target) { return None; }
+        let mut lineage = Vec::new();
+        for provider in providers {
+            let ordered = if qualified { target.0 != provider.0 } else { target.0 == provider.0 && provider.1 < target.1 };
+            if !ordered || self.generation.get(&provider) != Some(&1) || self.lookup(provider).is_none() {
+                return None;
+            }
+            let ancestors = self.derived.get(&provider).map(Vec::as_slice).unwrap_or_default();
+            for entry in ancestors.iter().copied().chain(std::iter::once((provider, 1))) {
+                if entry.0 == target { return None; }
+                if !lineage.contains(&entry) {
+                    if lineage.len() >= MAX_SYMBOLIC_SUMMARY_LINEAGE { return None; }
+                    lineage.push(entry);
+                }
+            }
         }
-        let ancestors = self.derived.get(&provider).map(Vec::as_slice).unwrap_or_default();
-        if ancestors.len() >= MAX_SYMBOLIC_SUMMARY_LINEAGE { return None; }
-        let mut lineage = ancestors.to_vec();
-        lineage.push((provider, 1));
+        if lineage.is_empty() { return None; }
         self.insert(summary);
         self.derived.insert(target, lineage);
         Some(())

@@ -93,13 +93,13 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
     }
 
     fn export_issuer(&self) -> Option<&'case SymbolicSummaryIssuer<'proof>> {
-        // New exported dependencies are deliberately exact unary forwarding
-        // definitions. Non-exported qualified clients retain their existing
-        // multiple-import behavior. All declared entry restrictions survive.
+        // Export only an exact unary forwarding definition, including a
+        // bounded ordered sequence whose dependencies are all verified.
+        // All declared entry restrictions survive.
         let issuer = self.issuer.filter(|issuer| std::ptr::eq(issuer.body, self.body))?;
         let [parameter] = self.body.boundary.parameters.as_slice() else { return None; };
         let case = self.case;
-        if self.origins.len() != 1 || !is_integer_type(&parameter.ty)
+        if !is_integer_type(&parameter.ty)
             || case.guard.always_rejects || case.guard.domain.is_some() || case.guard.arity != 1
             || case.guard.boolean.iter().any(Option::is_some)
             || case.relation != IntegerRelation::from_operator(&BinaryOperator::Equal)
@@ -174,32 +174,37 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         ranked: &mut HashMap<PreparedCallable, RankedOrderedSymbolic<'_, 'proof>>,
     ) -> Result<(), ProjectCheck> {
         let watched = self.watched;
-        let mut stack = Vec::new();
-        let mut current = first;
+        let mut stack: Vec<(Job<'_, '_, '_>, usize)> = Vec::new();
+        let mut next = Some(first);
         loop {
-            charge_call_work(&mut self.qualified.work, 1).ok_or(ProjectCheck::Unsupported)?;
-            if current == requesting || stack.iter().any(|job: &Job<'_, '_, '_>| job.target == current) {
-                return Err(ProjectCheck::Unsupported);
+            if let Some(current) = next.take() {
+                charge_call_work(&mut self.qualified.work, 1).ok_or(ProjectCheck::Unsupported)?;
+                if current == requesting || stack.iter().any(|(job, _)| job.target == current) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                if self.qualified.verified.lookup(current).is_none() && !self.qualified.verdicts.contains_key(&current) {
+                    if let Some(provider) = ranked.get_mut(&current) {
+                        let source = &runtime.project.modules.get(current.0).ok_or(ProjectCheck::MissingRoot)?.source;
+                        provider.verify_qualified_demand()?;
+                        let summary = ranked_symbolic_equality(provider.plan, source).ok_or(ProjectCheck::Unsupported)?;
+                        self.qualified.verified.insert(summary);
+                    } else {
+                        if stack.len() == MAX_SYMBOLIC_SUMMARY_LINEAGE { return Err(ProjectCheck::Unsupported); }
+                        let job = Job::discover(watched, current, runtime).ok_or(ProjectCheck::Unsupported)?;
+                        job.export_issuer().ok_or(ProjectCheck::Unsupported)?;
+                        stack.push((job, 0));
+                    }
+                }
             }
-            if self.qualified.verified.lookup(current).is_some() || self.qualified.verdicts.contains_key(&current) { break; }
-            if let Some(provider) = ranked.get_mut(&current) {
-                let source = &runtime.project.modules.get(current.0).ok_or(ProjectCheck::MissingRoot)?.source;
-                provider.verify_qualified_demand()?;
-                let summary = ranked_symbolic_equality(provider.plan, source).ok_or(ProjectCheck::Unsupported)?;
-                self.qualified.verified.insert(summary);
-                break;
+            let Some((job, index)) = stack.last_mut() else { break; };
+            if let Some(&edge) = job.origins.get(*index) {
+                self.qualify_edge(job.owner, job.body, edge, runtime, ranked)?;
+                *index += 1;
+                next = Some(edge.0);
+            } else {
+                let (job, _) = stack.pop().ok_or(ProjectCheck::Unsupported)?;
+                self.verify_qualified_job(job)?;
             }
-            if stack.len() == MAX_SYMBOLIC_SUMMARY_LINEAGE { return Err(ProjectCheck::Unsupported); }
-            let job = Job::discover(watched, current, runtime).ok_or(ProjectCheck::Unsupported)?;
-            let [edge] = job.origins.as_slice() else { return Err(ProjectCheck::Unsupported); };
-            self.qualify_edge(job.owner, job.body, *edge, runtime, ranked)?;
-            current = edge.0;
-            stack.push(job);
-        }
-        // Iterative postorder. The closed ranked leaf has already been
-        // verified, or a previous demand recorded why it cannot be used.
-        for job in stack.into_iter().rev() {
-            self.verify_qualified_job(job)?;
         }
         if self.qualified.verified.lookup(first).is_none() {
             self.qualified.refuter(first)?;
@@ -235,10 +240,9 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             Evaluation::Blocked(_) => return Err(ProjectCheck::Unsupported),
             Evaluation::Checked { active, .. } if failure.is_some() => (active, Evidence::Refuted),
             Evaluation::Checked { active, reusable } => {
-                let certified = reusable && match (job.summary(), job.origins.as_slice()) {
-                    (Some(summary), [provider]) => self.qualified.verified.insert_linked(summary, provider.0, true).is_some(),
-                    _ => false,
-                };
+                let certified = reusable && job.summary().is_some_and(|summary| {
+                    self.qualified.verified.insert_dependency_links(summary, job.origins.iter().map(|provider| provider.0), true).is_some()
+                });
                 (active, if certified { Evidence::Certified } else { Evidence::Unavailable })
             }
         };
@@ -341,8 +345,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn qualified_dependency_diamond_reaches_ordinary_requirement() {
+        let [app, hub, left, right, leaf] = ["main", "hub", "left", "right", "leaf"].map(|name| {
+            SourceIdentity::new("project".into(), "package".into(), format!("src/{name}.w"), name.into())
+        });
+        let main = r#"%%start
+            route = namespace package "src/hub.w";
+            unit() ordinary = fn() {
+                u8 observed = route.merge(2);
+                core.require(observed == 7, { .stdout = ""; .stderr = "diamond result"; .code = 64; .files = []; });
+            };
+        %%end"#;
+        let merge = r#"%%start
+            first = namespace package "src/left.w";
+            second = namespace package "src/right.w";
+            u8(u8) merge = fn(input) {
+                u8 before = first.relay(input);
+                u8 after = second.relay(before);
+                after
+            };
+            proof merge_result for merge(input) -> (out) where (input <= 3) ensures (out == 7) {}
+        %%end"#;
+        let relay = r#"%%start
+            bottom = namespace package "src/leaf.w";
+            u8(u8) relay = fn(input) { u8 returned = bottom.descend(input, 2, input, 4); returned };
+            proof guarded for relay(input) -> (out) where (input <= 7) ensures (out == 7) {}
+        %%end"#;
+        let rank = r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, n, quota) {
+                if (n == 0) { 7 } else { descend(page, slot, n - 1, quota) }
+            };
+            proof induction for descend(page, slot, n, quota) -> (out)
+                where (page <= 7 && slot <= 3 && n <= 7 && quota == 4)
+                ensures (out == 7) decreases (n) {
+                if (n == 0) { core.show(out == 7); }
+                else { core.use(induction(page, slot, n - 1, quota)); }
+            }
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |main: &str, lhs: &str, rhs: &str, scope| {
+                let parse = |source: &SourceIdentity, text: &str| {
+                    crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1
+                };
+                let edge = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                    binding: binding.to_owned(), target: target.clone(), span: ByteSpan::new(0, 0),
+                };
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(),
+                    [
+                        (parse(&app, main), vec![edge("route", &hub)]),
+                        (parse(&hub, merge), vec![edge("first", &left), edge("second", &right)]),
+                        (parse(&left, lhs), vec![edge("bottom", &leaf)]),
+                        (parse(&right, rhs), vec![edge("bottom", &leaf)]),
+                        (parse(&leaf, rank), Vec::new()),
+                    ],
+                    // Consumer roots deliberately precede suppliers, while
+                    // sibling diagnostic order is opposite to use order.
+                    vec![app.clone(), hub.clone(), right.clone(), left.clone(), leaf.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let receipt = run(main, relay, relay, scope).unwrap();
+            assert!(receipt.active && receipt.directives.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let contrary = main.replace("observed == 7", "observed == 8");
+            let failure = run(&contrary, relay, relay, scope).unwrap();
+            assert_eq!(failure.directives.len(), 1);
+            assert_eq!(failure.directives[0].code(), &BigInt::from(64));
+            let seven = BigInt::from(7);
+            assert!(failure.directives[0].witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+            assert!(failure.symbolic_diagnostic.is_none());
+            let refuted = relay.replace("ensures (out == 7)", "ensures (out == 8)");
+            let failure = run(&contrary, &refuted, &refuted, scope).unwrap();
+            assert!(failure.directives.is_empty());
+            assert_eq!(failure.symbolic_diagnostic.unwrap().proof.source, right);
+            assert_eq!(failure.additional_symbolic_diagnostics.len(), 1);
+            assert_eq!(failure.additional_symbolic_diagnostics[0].proof.source, left);
+            let uncovered = relay.replace("input <= 7", "input <= 6");
+            assert!(matches!(run(main, relay, &uncovered, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let idle = run(&contrary, &refuted, &refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!idle.active && idle.directives.is_empty() && idle.symbolic_diagnostic.is_none());
+        }
+    }
+
+    #[test]
     fn replacing_one_qualified_ancestor_invalidates_the_transitive_lineage() {
-        let identities = ["a", "b", "c", "other"].map(|name| {
+        let identities = ["a", "b", "c", "other", "d", "e"].map(|name| {
             SourceIdentity::new("project".into(), "package".into(), format!("src/{name}.w"), name.into())
         });
         let declarations = identities.iter().map(|source| {
@@ -371,10 +459,15 @@ mod tests {
         index.insert(make(0));
         index.insert(make(3));
         index.insert_linked(make(1), (0, 0), true).unwrap();
-        index.insert_linked(make(2), (1, 0), true).unwrap();
-        assert!(index.lookup((1, 0)).is_some() && index.lookup((2, 0)).is_some());
+        index.insert_linked(make(2), (0, 0), true).unwrap();
+        index.insert_dependency_links(make(4), [(1, 0), (2, 0)], true).unwrap();
+        assert_eq!(index.derived.get(&(4, 0)).unwrap().as_slice(), &[((0, 0), 1), ((1, 0), 1), ((2, 0), 1)]);
+        index.insert_linked(make(5), (4, 0), true).unwrap();
+        index.insert(make(1));
+        assert!(index.lookup((0, 0)).is_some() && index.lookup((2, 0)).is_some());
+        assert!(index.lookup((4, 0)).is_none() && index.lookup((5, 0)).is_none());
         index.insert(make(0));
-        assert!(index.lookup((1, 0)).is_none() && index.lookup((2, 0)).is_none());
+        assert!(index.lookup((2, 0)).is_none());
         assert!(index.lookup((3, 0)).is_some());
         assert!(index.insert_linked(make(1), (0, 0), true).is_none());
     }
