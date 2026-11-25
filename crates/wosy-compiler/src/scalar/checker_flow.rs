@@ -618,23 +618,36 @@ pub(super) enum QuantifiedIntegerReturn<'a> {
     Output(&'a IntegerShowConstraints<'static>),
     Comparison(Option<&'a IntegerShowConstraints<'static>>, IntegerRelation, &'a BigInt),
     Avoiding(Option<&'a IntegerShowConstraints<'static>>, &'a IntegerSet),
-    EntryWitness { relation: IntegerRelation, domain: &'a IntegerSet, bounds: Option<&'a IntegerShowConstraints<'static>> },
+    EntryWitness {
+        relation: IntegerRelation, domain: &'a IntegerSet, bounds: Option<&'a IntegerShowConstraints<'static>>,
+        translation: Option<(&'a BigInt, &'a ScalarType)>,
+    },
 }
 
 #[cfg(feature = "internal-checker")]
 impl QuantifiedIntegerReturn<'_> {
     pub(super) fn uses_entry(self) -> bool { matches!(self, Self::EntryWitness { .. }) }
 
+    fn witness_value<'a>(
+        original: &'a BigInt, translation: Option<(&BigInt, &ScalarType)>, work: &mut usize,
+    ) -> Option<Cow<'a, BigInt>> {
+        let Some((offset, ty)) = translation else { return Some(Cow::Borrowed(original)); };
+        charge_call_work(work, 1)?;
+        let translated = original + offset;
+        super::typecheck::integer_literal_fits_type(&translated, ty).then_some(Cow::Owned(translated))
+    }
+
     pub(super) fn rejected_at_call(self, returned: &BigInt, arguments: &[&BigInt], work: &mut usize)
         -> Option<Option<bool>>
     {
-        if let Self::EntryWitness { relation, domain, bounds } = self {
+        if let Self::EntryWitness { relation, domain, bounds, translation } = self {
             let [entry] = arguments else { return None; };
             let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
             charge_call_work(work, depth.checked_add(1)?)?;
-            if !domain.covers_closed(entry, entry) { return Some(Some(true)); }
+            let witness = Self::witness_value(entry, translation, work)?;
+            if !domain.covers_closed(witness.as_ref(), witness.as_ref()) { return Some(Some(true)); }
             charge_call_work(work, 1usize.checked_add(bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?)?;
-            return Some((!relation.accepts(returned.cmp(entry))
+            return Some((!relation.accepts(returned.cmp(witness.as_ref()))
                 || bounds.is_some_and(|bounds| !bounds.holds_value(returned))).then_some(false));
         }
         Some(self.rejected_point(returned, returned, work)?.map(|_| false))
@@ -757,39 +770,46 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             let work = &mut *self.imported_relation_work?.borrow_mut();
             for row in &path.0 {
                 observed.0 = true;
-                if let QuantifiedIntegerReturn::EntryWitness { relation, domain, bounds } = claim {
+                if let QuantifiedIntegerReturn::EntryWitness { relation, domain, bounds, translation } = claim {
                     if roots.parameters != 1 || axis.is_some_and(|axis| axis != 0) { return None; }
                     if matches!(value, IntegerReturn::Alias(_)) && !row.entry_alias(0, 0) { return None; }
                     let entry = row.entry_domain(0);
                     let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
                     for (low, high) in entry.intervals() {
                         charge_call_work(work, depth.checked_add(1)?)?;
-                        let outside = domain.first_uncovered_in_interval(low, high);
+                        let witness_low = QuantifiedIntegerReturn::witness_value(low, translation, work)?;
+                        let witness_high = QuantifiedIntegerReturn::witness_value(high, translation, work)?;
+                        let outside = domain.first_uncovered_in_interval(witness_low.as_ref(), witness_high.as_ref());
+                        if translation.is_some() { charge_call_work(work, 1)?; }
+                        let inversion = |witness: &BigInt| translation.map_or_else(|| witness.clone(), |(offset, _)| witness - offset);
                         let point = if let Some(point) = &outside {
-                            Some(point)
+                            Some(Cow::Owned(inversion(point)))
                         } else {
                             charge_call_work(work, 3usize.checked_add(bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?)?;
                             match value {
                                 IntegerReturn::Const(returned) => {
                                     if bounds.is_some_and(|bounds| !bounds.holds_value(returned)) {
-                                        Some(low)
+                                        Some(Cow::Borrowed(low))
                                     } else {
                                         let rejected = relation.complement();
-                                        [low, high].into_iter().find(|point| rejected.accepts(returned.cmp(*point)))
-                                            .or_else(|| (low < returned && returned < high
-                                                && rejected.accepts(std::cmp::Ordering::Equal)).then_some(returned))
+                                        [(low, &witness_low), (high, &witness_high)].into_iter()
+                                            .find_map(|(point, witness)| rejected.accepts(returned.cmp(witness.as_ref())).then_some(Cow::Borrowed(point)))
+                                            .or_else(|| (witness_low.as_ref() < returned && returned < witness_high.as_ref()
+                                                && rejected.accepts(std::cmp::Ordering::Equal)).then(|| Cow::Owned(inversion(returned))))
                                     }
                                 }
                                 IntegerReturn::Alias(_) => {
-                                    if !relation.accepts(std::cmp::Ordering::Equal) { Some(low) }
-                                    else { bounds.and_then(|bounds| bounds.first_violation_in_interval(low, high)) }
+                                    // On the same entry axis, x cmp (x+offset)
+                                    // is constant for every checked value.
+                                    if !relation.accepts(low.cmp(witness_low.as_ref())) { Some(Cow::Borrowed(low)) }
+                                    else { bounds.and_then(|bounds| bounds.first_violation_in_interval(low, high)).map(Cow::Borrowed) }
                                 }
                             }
                         };
                         if let Some(point) = point {
                             charge_call_work(work, roots.parameters.checked_add(1)?)?;
-                            let returned = match value { IntegerReturn::Const(returned) => returned, IntegerReturn::Alias(_) => point };
-                            let mut failure = SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(returned), Some((0, point)));
+                            let returned = match value { IntegerReturn::Const(returned) => returned, IntegerReturn::Alias(_) => point.as_ref() };
+                            let mut failure = SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(returned), Some((0, point.as_ref())));
                             failure.witness_outside_domain = outside.is_some();
                             observed.1 = Some(failure);
                             break;

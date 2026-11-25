@@ -6986,15 +6986,17 @@ impl<'a> MainFlowProofCase<'a> {
             TypedProofGoal::Existential { relation, witness, witness_in_domain } => Some((
                 Quantified::Comparison(None, *relation, witness), Some(!*witness_in_domain),
             )),
-            TypedProofGoal::EntryWitness { slot: 0, relation, domain } if body.boundary.parameters.len() == 1 =>
-                Some((Quantified::EntryWitness { relation: *relation, domain, bounds: None }, Some(false))),
+            TypedProofGoal::EntryWitness { slot: 0, relation, domain, offset } if body.boundary.parameters.len() == 1 =>
+                Some((Quantified::EntryWitness { relation: *relation, domain, bounds: None,
+                    translation: offset.as_ref().map(|offset| (offset, plan.typed.result_type)) }, Some(false))),
             TypedProofGoal::ConjunctiveExistential(goal) => match &goal.witness {
                 ConjunctiveWitness::Literal(candidate, _) =>
                     Some((Quantified::Comparison(Some(&goal.output), goal.relation, candidate),
                         Some(goal.domain.first_intersection_point(candidate, candidate).is_none()))),
-                ConjunctiveWitness::Formal(0) if body.boundary.parameters.len() == 1 =>
-                    Some((Quantified::EntryWitness { relation: goal.relation, domain: &goal.domain, bounds: Some(&goal.output) }, Some(false))),
-                ConjunctiveWitness::Formal(_) => return Err(ProjectCheck::Unsupported),
+                ConjunctiveWitness::Formal { slot: 0, offset } if body.boundary.parameters.len() == 1 =>
+                    Some((Quantified::EntryWitness { relation: goal.relation, domain: &goal.domain, bounds: Some(&goal.output),
+                        translation: offset.as_ref().map(|offset| (offset, plan.typed.result_type)) }, Some(false))),
+                ConjunctiveWitness::Formal { .. } => return Err(ProjectCheck::Unsupported),
             },
             TypedProofGoal::DependentWitness(goal) => Some((match goal {
                 DependentWitness::Vacuous => Quantified::Vacuous,
@@ -10406,7 +10408,7 @@ impl PreparedProofModule {
                         let holds = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds(&paths, None))
-                        } else if let TypedProofGoal::EntryWitness { slot, relation, domain } = goal {
+                        } else if let TypedProofGoal::EntryWitness { slot, relation, domain, offset: None } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds_existential_witness(&paths, domain, None))
                                 .and_then(|verified| verified.then_some(true))
@@ -11009,13 +11011,14 @@ impl SelectedProofObserver<'_> {
                         Some(relation.accepts(value.cmp(bound))),
                     TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                         (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
-                    TypedProofGoal::EntryWitness { slot, relation, domain } => {
+                    TypedProofGoal::EntryWitness { slot, relation, domain, offset: None } => {
                         let Some(candidate) = arguments.get(*slot) else {
                             self.coverage = ActualProofCoverage::Unsupported;
                             return;
                         };
                         (relation.accepts(value.cmp(candidate)) && domain.contains(candidate)).then_some(true)
                     },
+                    TypedProofGoal::EntryWitness { .. } => None,
                     TypedProofGoal::UniversalNotEqual(domain) => Some(!domain.covers_closed(value, value)),
                     TypedProofGoal::UniversalConjunction(goal) => Some(match goal {
                         UniversalConjunction::Vacuous => true,
@@ -11194,7 +11197,7 @@ fn check_proof_fragment_impl(
 #[cfg(feature = "internal-checker")]
 enum ConjunctiveWitness {
     Literal(BigInt, std::cell::OnceCell<bool>),
-    Formal(usize),
+    Formal { slot: usize, offset: Option<BigInt> },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11212,11 +11215,12 @@ impl ConjunctiveExistential {
             ConjunctiveWitness::Literal(candidate, admitted) => (self.relation.accepts(value.cmp(candidate))
                 && self.output.holds_value(value)
                 && *admitted.get_or_init(|| self.domain.contains(candidate))).then_some(true),
-            ConjunctiveWitness::Formal(slot) => {
+            ConjunctiveWitness::Formal { slot, offset: None } => {
                 let candidate = arguments.get(*slot)?;
                 (self.relation.accepts(value.cmp(candidate)) && self.output.holds_value(value)
                     && self.domain.contains(candidate)).then_some(true)
             }
+            ConjunctiveWitness::Formal { .. } => None,
         }
     }
 
@@ -11232,8 +11236,9 @@ impl ConjunctiveExistential {
                 }
                 admitted.get_or_init(|| self.domain.contains(candidate)).then_some(true)
             }
-            ConjunctiveWitness::Formal(slot) => ImmutableProofOutputComparison::prepare(body, *slot, ty, self.relation)?
+            ConjunctiveWitness::Formal { slot, offset: None } => ImmutableProofOutputComparison::prepare(body, *slot, ty, self.relation)?
                 .holds_existential_witness(paths, &self.domain, Some(&self.output))?.then_some(true),
+            ConjunctiveWitness::Formal { .. } => None,
         }
     }
 }
@@ -11276,7 +11281,7 @@ enum TypedProofGoal {
     UniversalConjunction(UniversalConjunction),
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
-    EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet },
+    EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet, offset: Option<BigInt> },
     #[cfg(feature = "internal-checker")]
     ConjunctiveExistential(Box<ConjunctiveExistential>),
     #[cfg(feature = "internal-checker")]
@@ -11938,8 +11943,8 @@ fn typed_existential_output_goal(
     if allow_named_entry_facts && matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
         let (relation, mut output_bounds) =
             typed_existential_conjuncts(&predicate, &binder, output, inputs, &ty)?;
-        let witness = if let ScalarExpression::Name { name, .. } = argument {
-            ConjunctiveWitness::Formal(checked_existential_formal(name, inputs, body, &ty)?)
+        let witness = if let Some((slot, offset)) = typed_existential_formal_argument(argument, inputs, body, &ty)? {
+            ConjunctiveWitness::Formal { slot, offset }
         } else {
             let value = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?;
             if !integer_literal_fits_type(value.as_ref(), &ty) {
@@ -11956,10 +11961,9 @@ fn typed_existential_output_goal(
     let relation = simple_relation()?;
     #[cfg(feature = "internal-checker")]
     if allow_named_entry_facts {
-        if let ScalarExpression::Name { name, .. } = argument {
-            let slot = checked_existential_formal(name, inputs, body, &ty)?;
+        if let Some((slot, offset)) = typed_existential_formal_argument(argument, inputs, body, &ty)? {
             let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
-            return Ok(TypedProofGoal::EntryWitness { slot, relation, domain });
+            return Ok(TypedProofGoal::EntryWitness { slot, relation, domain, offset });
         }
     }
     let witness = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?;
@@ -11969,6 +11973,23 @@ fn typed_existential_output_goal(
     let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
     let witness_in_domain = domain.contains(witness.as_ref());
     Ok(TypedProofGoal::Existential { relation, witness: witness.into_owned(), witness_in_domain })
+}
+
+#[cfg(feature = "internal-checker")]
+fn typed_existential_formal_argument(
+    argument: &ScalarExpression, inputs: &[String], body: &FunctionCallSites, ty: &ScalarType,
+) -> Result<Option<(usize, Option<BigInt>)>, ProjectCheck> {
+    let name = match argument {
+        ScalarExpression::Name { name, .. } => name,
+        ScalarExpression::Binary { operator: BinaryOperator::Add | BinaryOperator::Subtract, left, .. } => {
+            let ScalarExpression::Name { name, .. } = left.as_ref() else { return Ok(None); };
+            name
+        }
+        _ => return Ok(None),
+    };
+    let slot = checked_existential_formal(name, inputs, body, ty)?;
+    let offset = checked_quantified_witness_offset(argument, name, ty)?;
+    Ok(Some((slot, offset)))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -21519,6 +21540,52 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_affine_formal_witness_projects_and_inverts_one_entry_row() {
+        let source = r#"%%start
+            u8(u8) upward = fn(value) { value };
+            i8(i8) downward = fn(value) { if (value <= 0) { -2 } else { -2 } };
+            proof plus for upward(entry) -> (out) where (entry >= 4 && entry <= 6)
+                ensures (exists (u8 picked where picked >= 5 && picked <= 7) { out < picked && out <= 6 })
+                { core.witness(entry + 1); }
+            proof minus for downward(entry) -> (out) where (entry >= -2 && entry <= 0)
+                ensures (exists (i8 picked where picked >= -3 && picked <= -1) { out != picked })
+                { core.witness(entry - 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 first = upward(5); i8 second = downward(-1); %%end");
+        let pass = source.replace("out != picked", "out >= picked").replace("entry <= 0", "entry <= -1");
+        let good = check_array_proof_cohort(&pass, package).unwrap();
+        assert!(good.active && good.symbolic_diagnostic.is_none());
+        let good = check_array_proof_cohort(&actual(&pass), main).unwrap();
+        assert!(good.active && good.diagnostics.is_empty());
+        let hole = pass.replace("picked >= 5 && picked <= 7", "picked == 5 || picked == 7");
+        let symbolic = check_array_proof_cohort(&hole, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.returned, BigInt::from(5));
+        let step = symbolic.failed_step.unwrap().range;
+        assert_eq!(&hole[step.start as usize..step.end as usize], "core.witness(entry + 1)");
+        let reached = check_array_proof_cohort(&actual(&hole), main).unwrap();
+        let [failure] = reached.diagnostics.as_slice() else { panic!("one real sparse admission failure"); };
+        assert_eq!(failure.invocation.arguments[0].1, BigInt::from(5));
+        assert!(failure.failed_step.is_some());
+        let symbolic = check_array_proof_cohort(source, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.returned, BigInt::from(-2));
+        assert!(symbolic.failed_step.is_none());
+        let reached = check_array_proof_cohort(&actual(source), main).unwrap();
+        let [failure] = reached.diagnostics.as_slice() else { panic!("one real relational failure"); };
+        assert_eq!(failure.invocation.arguments[0].1, BigInt::from(-1));
+        assert_eq!(failure.invocation.returned, BigInt::from(-2));
+        assert!(failure.failed_step.is_none());
+        for overflow in [
+            pass.replace("entry >= 4 && entry <= 6", "entry == 255"),
+            pass.replace("entry >= -2 && entry <= -1", "entry == -128"),
+        ] {
+            assert!(matches!(check_array_proof_cohort(&overflow, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
