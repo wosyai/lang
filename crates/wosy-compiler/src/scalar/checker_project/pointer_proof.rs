@@ -262,8 +262,17 @@ mod tests {
                 let [failed] = refuted.directives.as_slice() else { panic!("second exact call exit"); };
                 let five = BigInt::from(5);
                 assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&five, &five)]));
+                let overwritten = repeated.replace("increment(&!local); increment", "increment(&!local); local = 9; increment")
+                    .replace("local == 5", "local == 12");
+                let approved = run(&overwritten, scope).unwrap();
+                assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+                let stale = overwritten.replace("local == 12", "local == 5");
+                let refuted = run(&stale, scope).unwrap();
+                let [failed] = refuted.directives.as_slice() else { panic!("the overwrite kills the preceding cell value"); };
+                let twelve = BigInt::from(12);
+                assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&twelve, &twelve)]));
                 for excluded in [
-                    repeated.replace("increment(&!local); increment", "increment(&!local); local = 9; increment"),
+                    repeated.replace("increment(&!local); increment", "increment(&!local); local = local +@ 1; increment"),
                     repeated.replace("            start();", "            start(); start();"),
                 ] {
                     assert!(run(&excluded, scope).is_err(), "{excluded}");

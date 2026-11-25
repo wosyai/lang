@@ -9582,7 +9582,7 @@ fn checked_literal_assignment(
     Some((binding, ty, calls.structure.checker_integer_literals.get(&rhs)?))
 }
 
-fn checked_scalar_assignment(
+pub(super) fn checked_scalar_assignment(
     calls: &FunctionCallSites, position: BlockPosition,
 ) -> Option<(&ReferenceBindingId, &ScalarType, OccurrenceOrdinal, OccurrenceOrdinal)> {
     let group = calls.assignments.get(&(position.block, position.item))?;

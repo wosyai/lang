@@ -69,8 +69,40 @@ pub(super) fn checked<'a>(
     let mut seen = BTreeSet::new();
     let mut points = Vec::new();
     let mut previous = bind;
-    for (position, item) in subsequent.iter().take(4).enumerate() {
+    let mut position = 0usize;
+    for item in subsequent.iter().take(7) {
+        if let BlockItemKind::Assignment { group } = item.kind {
+            // The initial escrow remains the literal declaration. A later
+            // ordinary overwrite must replace, not refine, the old epoch.
+            if position == 0 { return None; }
+            let (destination, ty, rhs, place) =
+                super::super::checker_flow::checked_scalar_assignment(body, group)?;
+            if destination != binding || ty != width || structure.checked_types.expressions.get(&rhs)? != width
+                || structure.checked_types.places.get(&place)? != width
+            {
+                return None;
+            }
+            let literal = structure.checker_integer_literals.get(&rhs)?;
+            if literal < &min || literal > &max { return None; }
+            let rhs_point = *facts.evaluations.get(&rhs)?;
+            let install = cfg.points.get(rhs_point.0.checked_add(1)?)?;
+            if previous.0 >= rhs_point.0
+                || !matches!(&cfg.points.get(rhs_point.0)?.kind,
+                    CfgPointKind::Evaluate(ScalarExpression::Integer { value, .. }) if value == literal)
+                || !matches!(&install.kind, CfgPointKind::Assign { target, rhs_point: exact, previous_origins, previous_loans }
+                    if *exact == rhs_point && &target.binding == binding && &target.source == source
+                        && target.projections.is_empty() && previous_origins.is_empty() && previous_loans.is_empty())
+                || install.source_span.range != body.occurrences.get(place.0)?.span
+            {
+                return None;
+            }
+            points.extend([rhs_point, install.id]);
+            previous = install.id;
+            entry = literal.clone();
+            continue;
+        }
         let BlockItemKind::Evaluation { expression: call } = item.kind else { return None; };
+        if position == 4 { return None; }
         let call_point = cfg.points.get(cfg.primary_call_point(call)?.0)?;
         if facts.evaluations.get(&call) != Some(&call_point.id) { return None; }
         let CfgPointKind::Call { expression, output: 0, target, argument_points } = &call_point.kind else { return None; };
@@ -121,10 +153,11 @@ pub(super) fn checked<'a>(
         previous = call_point.id;
         if wanted.is_some_and(|wanted| wanted != call) {
             entry = exit;
+            position += 1;
             continue;
         }
-        // The authenticated prefix contains no other operations that could
-        // change the cell between distinct call-entry epochs.
+        // All state changes on the authenticated prefix have been paired
+        // with an ordered source assignment or an exact verified call.
         for (index, point) in cfg.points.get(..=call_point.id.0)?.iter().enumerate() {
             if point.id.0 != index || &point.source_span.source != source
                 || (index < call_point.id.0 && point.successors.as_slice() != [CfgPointId(index + 1)])
@@ -134,9 +167,10 @@ pub(super) fn checked<'a>(
             match &point.kind {
                 CfgPointKind::Entry if index == 0 => {}
                 CfgPointKind::ScopeEnter if point.scope == ReferenceScopeId(0) => {}
-                CfgPointKind::Evaluate(_) if point.id == value => {}
+                CfgPointKind::Evaluate(_) if point.id == value || points.contains(&point.id) => {}
                 CfgPointKind::Bind { .. } if point.id == bind => {}
-                CfgPointKind::Borrow { .. } | CfgPointKind::Call { .. } if points.contains(&point.id) => {}
+                CfgPointKind::Borrow { .. } | CfgPointKind::Call { .. } | CfgPointKind::Assign { .. }
+                    if points.contains(&point.id) => {}
                 _ => return None,
             }
         }
