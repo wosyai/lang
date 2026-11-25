@@ -1276,6 +1276,9 @@ fn check_command(
                 message: "applicable call".to_owned() });
         }
         let mut notes = vec![note];
+        if let Some((name, value)) = failure.cell.as_ref().and_then(|cell| cell.universal.as_ref()) {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
         if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual, false) {
             notes.push(entry);
         }

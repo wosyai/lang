@@ -2695,7 +2695,27 @@ reached_fixed_array_dependent = """%%start
     i8 first_cell = first[0];
     i8 second_cell = second[2];
 %%end"""
+shifted_fixed_array_dependent = reached_fixed_array_dependent.replace(
+    "[value, -1, value]", "[-1, value, value]").replace("i == 2", "i == 1").replace(
+    "core.witness(i)", "core.witness(i + 1)")
+subtracted_fixed_array_dependent = reached_fixed_array_dependent.replace(
+    "[value, -1, value]", "[value, value, -1]").replace("i == 0", "i == 1").replace(
+    "core.witness(i)", "core.witness(i - 1)")
 cases.extend([
+    ("exact-startup-fixed-array-dependent-shift-proved", shifted_fixed_array_dependent, 0, b""),
+    ("exact-startup-fixed-array-dependent-shift-refuted", shifted_fixed_array_dependent.replace(
+        "[-1, value, value]", "[-1, value, -2]"), 1, b"proof obligation failed"),
+    ("exact-startup-fixed-array-dependent-subtract-proved", subtracted_fixed_array_dependent, 0, b""),
+    ("exact-startup-fixed-array-dependent-subtract-refuted", subtracted_fixed_array_dependent.replace(
+        "[value, value, -1]", "[value, -2, -1]"), 1, b"proof obligation failed"),
+    ("exact-startup-fixed-array-dependent-refuses-shift-overflow", shifted_fixed_array_dependent.replace(
+        "i == 0 || i == 1", "i == 18446744073709551615"), 2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-dependent-refuses-shift-underflow", subtracted_fixed_array_dependent.replace(
+        "i == 1 || i == 2", "i == 0"), 2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-dependent-refuses-shift-outside-guard", shifted_fixed_array_dependent.replace(
+        "j < 3", "j < 2"), 2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-dependent-refuses-shift-outside-array", shifted_fixed_array_dependent.replace(
+        "j < 3", "j < 4").replace("i + 1", "i + 2"), 2, b"unsupported analysis"),
     ("exact-startup-fixed-array-dependent-proved", reached_fixed_array_dependent, 0, b""),
     ("exact-startup-fixed-array-dependent-refuted", reached_fixed_array_dependent.replace(
         "[value, -1, value]", "[value, -1, -2]"), 1, b"proof obligation failed"),
@@ -3052,6 +3072,8 @@ proof_diagnostic_notes = {
     "ordinary-array-proof-cohort-distinct-rectangle-refuted": b"symbolic call entry: tag = 2, value = 1",
     "ordinary-array-proof-cohort-union-refuted": b"symbolic call entry: value = 0",
     "exact-startup-array-proof-cohort-refuted": b"call entry: tag = 1, value = 3",
+    "exact-startup-fixed-array-dependent-shift-refuted": b"call returned cell [2] = -2",
+    "exact-startup-fixed-array-dependent-subtract-refuted": b"call returned cell [1] = -2",
     "exact-startup-fixed-array-dependent-refuted": b"call returned cell [2] = -2",
     "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",
     "exact-startup-fixed-array-pair-refuted": b"call returned cell [0] = 3",
@@ -4001,6 +4023,15 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
                     if name == "ordinary-verified-unary-entry-refuted":
                         assert b"symbolic call entry: value = 1" in res.stderr,res
+                    if name in {"exact-startup-fixed-array-dependent-shift-refuted",
+                            "exact-startup-fixed-array-dependent-subtract-refuted"}:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        adding = name.endswith("-shift-refuted")
+                        quantified = (b"quantified witness input: i = 1" if adding else b"quantified witness input: i = 2")
+                        authored = b"core.witness(i + 1)" if adding else b"core.witness(i - 1)"
+                        assert len(failures) == 2 and failures[0] != failures[1], res
+                        assert all(quantified in failure and authored in failure and b"call entry: value = 3" in failure
+                            and proof_diagnostic_notes[name] in failure for failure in failures), res
                     if name == "exact-startup-fixed-array-dependent-refuted":
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         assert len(failures) == 2 and failures[0] != failures[1], res

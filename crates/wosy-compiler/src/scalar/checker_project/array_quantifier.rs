@@ -12,6 +12,7 @@ pub(super) struct ArrayProof<'a> {
     target: PreparedCallable,
     goal: ByteSpan,
     failed_step: Option<ByteSpan>,
+    shifted_witness: Option<(String, BigInt)>,
     entry_filter: Option<Vec<CheckerPredicate>>,
     domain: IntegerSet,
     quantifier: FixedArrayQuantifier<BigInt>,
@@ -83,17 +84,11 @@ impl<'a> ArrayProof<'a> {
         let index_ty = ScalarType::U64;
         let binder = index_binder(&quantifier)?;
         let target_domain = typed_quantifier_domain(&quantifier, &binder, &inputs, &index_ty)?;
-        let (domain, witness_binder) = if let Some(forall) = dependency {
+        let (mut domain, witness_dependency) = if let Some(forall) = dependency {
             let universal = index_binder(&forall)?;
             if universal == binder { return Err(ProjectCheck::InvalidProof); }
             let active = typed_quantifier_domain(&forall, &universal, &inputs, &index_ty)?;
-            // Identity substitution is valid only across the full universal
-            // domain. The existing scanner will check the predicate once per
-            // admitted cell, not search one existential per universal value.
-            if !active.is_subset_of(&target_domain) {
-                return Err(ProjectCheck::Unsupported);
-            }
-            (active, Some(universal))
+            (active, Some((universal, target_domain)))
         } else {
             (target_domain, None)
         };
@@ -136,8 +131,39 @@ impl<'a> ArrayProof<'a> {
         }
         let steps = derive_block(&block);
         let mut failed_step = None;
-        let quantifier_kind = if let Some(universal) = witness_binder {
-            if !matches!(authored_witness_argument(&steps)?, ScalarExpression::Name { name, .. } if *name == universal) {
+        let mut shifted_witness = None;
+        let quantifier_kind = if let Some((universal, target_domain)) = witness_dependency {
+            let is_universal = |expression: &ScalarExpression| matches!(expression,
+                ScalarExpression::Name { name, .. } if *name == universal);
+            let argument = authored_witness_argument(&steps)?;
+            if !is_universal(argument) {
+                let ScalarExpression::Binary { operator, left, right, .. } = argument else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+                if !is_universal(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
+                if !integer_literal_fits_type(&literal, &index_ty) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let offset = if *operator == BinaryOperator::Subtract { -literal } else { literal };
+                // Translation is monotone; checking the two extrema first
+                // proves that every authored u64 addition/subtraction is exact.
+                if domain.extremes().is_some_and(|(min, max)|
+                    !integer_literal_fits_type(&(min + &offset), &index_ty)
+                        || !integer_literal_fits_type(&(max + &offset), &index_ty))
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let mut work = 0;
+                charge_call_work(&mut work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+                domain = domain.affine_unit(false, &offset, false);
+                shifted_witness = Some((universal, offset));
+            }
+            // The image must satisfy the entire existential domain. Feed it
+            // to the existing scanner, without another pass over the cells.
+            if !domain.is_subset_of(&target_domain) {
                 return Err(ProjectCheck::Unsupported);
             }
             let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else {
@@ -180,7 +206,7 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
-        Ok(Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step,
+        Ok(Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step, shifted_witness,
             entry_filter, domain, quantifier: quantifier_kind, relation, expected, body,
             result: &output.ty })
     }
@@ -203,7 +229,11 @@ impl<'a> ArrayProof<'a> {
         Ok(AggregateProofDiagnostic {
             proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal), failed_step: self.failed_step.map(at),
             output: wosy_syntax::SourceSpan::new(source.clone(), failure.span), call,
-            cell: failure.cell.map(|(index, value)| AggregateProofCell { index: BigInt::from(index), value }),
+            cell: failure.cell.map(|(index, value)| {
+                let index = BigInt::from(index);
+                let universal = self.shifted_witness.as_ref().map(|(name, offset)| (name.clone(), &index - offset));
+                AggregateProofCell { index, value, universal }
+            }),
             witness: ScalarCheckerIntegerWitness { equal_axes, axes, state: failure.inputs },
         })
     }

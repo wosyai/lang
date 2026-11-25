@@ -4758,6 +4758,7 @@ pub struct AggregateProofDiagnostic {
 pub struct AggregateProofCell {
     pub index: BigInt,
     pub value: BigInt,
+    pub universal: Option<(String, BigInt)>,
 }
 
 #[cfg(feature = "internal-checker")]
