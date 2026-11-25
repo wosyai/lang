@@ -209,7 +209,10 @@ pub(super) fn emit_expression<'ctx, 'module>(
             left,
             right,
             ..
-        } => emit_binary(context, state, operator, left, right),
+        } => match super::ownership::guarded_scalar_condition(state, expression)? {
+            Some(value) => Ok(value),
+            None => emit_binary(context, state, operator, left, right),
+        },
         ScalarExpression::Call {
             receiver,
             name,
@@ -233,6 +236,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -241,6 +245,9 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
+            if matches!(selected, Some(PreparedCall::Core(CoreOperationId::ArrayLen))) {
+                return super::memory::emit_array_len(context, state, expression, arguments, None);
+            }
             if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(context, state, *span, arguments, None);
             }
@@ -299,12 +306,12 @@ pub(super) fn emit_expression<'ctx, 'module>(
             then_branch,
             else_branch,
             ..
-        } => emit_if(context, state, condition, then_branch, else_branch),
+        } => emit_if(context, state, expression, condition, then_branch, else_branch),
         ScalarExpression::UnitIf {
             condition,
             then_branch,
             ..
-        } => emit_unit_if(context, state, condition, then_branch),
+        } => emit_unit_if(context, state, expression, condition, then_branch),
         ScalarExpression::Block(block) => emit_block(context, state, block),
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. } => Ok(EmitValue::Basic(
@@ -335,6 +342,11 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if aggregate_transfer::fallible_allocation_expression_at(state, expression)
+        || aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression)
+    {
+        return emit_contextual_numeric(context, state, expression, expected, ExpressionPath::Project { module, modules });
+    }
     match expression {
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value, expected),
         ScalarExpression::Unary {
@@ -362,11 +374,11 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
             expected,
             ExpressionPath::Project { module, modules },
         ),
-        ScalarExpression::StructLiteral { fields, .. } => {
-            emit_struct_literal(context, state, expected, fields)
+        ScalarExpression::StructLiteral { .. } => {
+            emit_struct_literal(context, state, expected, expression, ExpressionPath::Project { module, modules })
         }
         ScalarExpression::ArrayLiteral { elements, .. } => {
-            emit_array_literal(context, state, expected, elements)
+            emit_array_literal(context, state, expected, elements, ExpressionPath::Project { module, modules })
         }
         _ => emit_project_expression(context, state, expression, module, modules),
     }
@@ -459,6 +471,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -467,6 +480,10 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
+            if matches!(selected, Some(PreparedCall::Core(CoreOperationId::ArrayLen))) {
+                return super::memory::emit_array_len(context, state, expression, arguments,
+                    Some(ProjectCallScope { module, modules }));
+            }
             if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(
                     context,
@@ -661,6 +678,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             right,
             ..
         } => {
+            if let Some(value) = super::ownership::guarded_scalar_condition(state, expression)? {
+                return Ok(value);
+            }
             emit_binary_expression(
                 context,
                 state,
@@ -680,6 +700,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             emit_project_if(
                 context,
                 state,
+                expression,
                 condition,
                 then_branch,
                 else_branch,
@@ -693,7 +714,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             ..
         } => {
             let condition = emit_project_expression(context, state, condition, module, modules)?;
-            emit_project_unit_if(context, state, condition, then_branch, module, modules)
+            emit_project_unit_if(context, state, expression, condition, then_branch, module, modules)
         }
         ScalarExpression::Block(block) => {
             emit_project_block(context, state, block, module, modules)
@@ -731,6 +752,7 @@ fn initializer_core_name(operation: CoreOperationId) -> &'static str {
         Free => "free",
         Invalidate => "invalidate",
         Rebind => "rebind",
+        ArrayLen => "array_len",
         SystemPanic => "system_panic",
         ThisArtifactId => "this_artifact_id",
         DeclareArtifact => "declare_artifact",
@@ -753,11 +775,15 @@ fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     selected: &PreparedCall<'_>,
+    expression: &ScalarExpression,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let PreparedCall::Local(key) = selected {
+        return super::local_callable::invoke(context, state, *key, arguments, project);
+    }
     let Some(target) = selected.symbol() else {
         return Err(match (project, receiver) {
             (Some(project), Some(receiver)) => {
@@ -785,8 +811,84 @@ fn emit_prepared_call<'ctx, 'module>(
     let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(target) else {
         return Err(state.missing_prepared_signature(target));
     };
+    if let Some(value) = aggregate_transfer::emit_private_runtime_access_call(
+        context, state, expression, target, arguments, parameters, project,
+    )? {
+        return Ok(value);
+    }
+    if let Some(value) = aggregate_transfer::emit_borrowed_extent_call(
+        context, state, expression, target, arguments, parameters, project,
+    )? {
+        return Ok(value);
+    }
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    let ordinary_fallible = aggregate_transfer::ordinary_fallible_allocation_call_at(state, expression);
+    if ordinary_fallible || aggregate_transfer::fallible_allocation_call_at(state, expression) {
+        let result = emit_sealed_allocation_call_values(context, state, target, &values)?;
+        if !ordinary_fallible {
+            return Ok(EmitValue::Basic(result.into()));
+        }
+        let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+            .ok_or("missing sealed ordinary allocation caller")?;
+        let present = context.append_basic_block(parent, "ordinary.allocation_present");
+        let absent = context.append_basic_block(parent, "ordinary.allocation_absent");
+        let succeeded = state.builder.build_extract_value(result, 0, "ordinary.allocation_succeeded")
+            .map_err(builder_error)?.into_int_value();
+        state.builder.build_conditional_branch(succeeded, present, absent).map_err(builder_error)?;
+        state.builder.position_at_end(absent);
+        emit_terminal_system_panic(context, state)?;
+        state.builder.position_at_end(present);
+        let payload = state.builder.build_extract_value(result, 1, "ordinary.allocation_payload")
+            .map_err(builder_error)?;
+        return Ok(EmitValue::Basic(payload));
+    }
+    if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
+        return Ok(value);
+    }
+    reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
+    aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;
     emit_call_values(context, state, target, values)
+}
+
+fn emit_sealed_allocation_call_values<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>, target: &str, values: &[EmitValue<'ctx>],
+) -> Result<inkwell::values::StructValue<'ctx>, String> {
+    let [EmitValue::Basic(BasicValueEnum::IntValue(count))] = values else {
+        return Err("invalid sealed fallible allocation call argument".into());
+    };
+    let callee = state.functions.get(target).ok_or("missing sealed fallible allocation callable")?;
+    let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(target) else {
+        return Err("missing sealed fallible allocation callable signature".into());
+    };
+    let [output] = outputs.outputs.as_slice() else {
+        return Err("invalid sealed fallible allocation output signature".into());
+    };
+    let pair = aggregate_transfer::fallible_allocation_result_type(context, &output.ty)?;
+    if callee.get_linkage() != Linkage::Internal
+        || callee.get_type() != pair.fn_type(&[context.i64_type().into()], false)
+    {
+        return Err("invalid sealed fallible allocation callable ABI".into());
+    }
+    let call = state.builder.build_call(*callee, &[(*count).into()], "fallible.rhs").map_err(builder_error)?;
+    let Some(BasicValueEnum::StructValue(result)) = call.try_as_basic_value().basic() else {
+        return Err("missing sealed fallible allocation result".into());
+    };
+    Ok(result)
+}
+
+fn reject_unpaired_fixed_copy_argument(
+    state: &EmitState<'_, '_>,
+    arguments: &[ScalarExpression],
+    parameters: &[ScalarType],
+) -> Result<(), String> {
+    if let ([ScalarExpression::Name { name, .. }], [parameter @ ScalarType::RuntimeArray { .. }]) = (arguments, parameters) {
+        let ty = state.storage.get(name).map(|(_, ty)| ty)
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty));
+        if ty.is_some_and(|ty| crate::scalar::fixed_copy_to_runtime(parameter, ty).is_some()) {
+            return Err("fixed Copy owning argument requires a sealed owning receiver".into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn emit_contextual_arguments<'ctx, 'module>(
@@ -832,6 +934,7 @@ fn emit_call<'ctx, 'module>(
             "LLVM callable {qualified} has no callable signature"
         ));
     };
+    reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
     let values = arguments
         .iter()
         .zip(parameters)
@@ -920,6 +1023,11 @@ fn emit_core_invalidation<'ctx, 'module>(
         .get(&(span.start, span.end))
         .cloned()
         .ok_or_else(|| "core invalidation lacks a typed CFG event".to_owned())?;
+    if operation == CoreOperationId::Free
+        && ownership::release_guarded_owner_at(context, state, span, arguments, &candidates)?
+    {
+        return Ok(EmitValue::Unit);
+    }
     let address = take_basic(match project {
         Some(scope) => {
             emit_project_expression(context, state, &arguments[0], scope.module, scope.modules)?
@@ -1238,18 +1346,7 @@ fn emit_core_alloc_values<'ctx, 'module>(
     size: BasicValueEnum<'ctx>,
     alignment: BasicValueEnum<'ctx>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let allocator = state
-        .module
-        .get_function(CORE_ALLOC_SYMBOL)
-        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
-    let pointer = state
-        .builder
-        .build_call(allocator, &[size.into(), alignment.into()], "allocation")
-        .map_err(builder_error)?
-        .try_as_basic_value()
-        .basic()
-        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())?
-        .into_pointer_value();
+    let pointer = super::ownership::emit_standard_allocation_call(state, size, alignment)?;
     let address = state
         .builder
         .build_ptr_to_int(
@@ -1334,6 +1431,14 @@ fn emit_core_system_panic<'ctx, 'module>(
         .build_call(panic, &[], "system_panic")
         .map_err(builder_error)?;
     Ok(EmitValue::Unit)
+}
+
+pub(super) fn emit_terminal_system_panic<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+) -> Result<(), String> {
+    emit_core_system_panic(context, state, &[])?;
+    state.builder.build_unreachable().map_err(builder_error)?;
+    Ok(())
 }
 
 fn emit_int_conversion<'ctx, 'module>(
@@ -2463,6 +2568,211 @@ fn checked_float_type<'a>(
         })
 }
 
+pub(super) fn emit_fallible_numeric_to<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>,
+    failure: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, Vec<inkwell::basic_block::BasicBlock<'ctx>>), String> {
+    use inkwell::basic_block::BasicBlock;
+    enum Step<'ctx, 'ast> {
+        Emit(&'ast ScalarExpression, &'ast ScalarType),
+        Binary(&'ast BinaryOperator, &'ast ScalarType),
+        Unary(&'ast crate::scalar::UnaryOperator),
+        Call(&'ast ScalarExpression, usize),
+        BeginShort { rhs: &'ast ScalarExpression, is_and: bool },
+        EndShort { skipped: BasicBlock<'ctx>, join: BasicBlock<'ctx>, is_and: bool },
+        BeginIf { left: &'ast ScalarExpression, right: &'ast ScalarExpression, ty: &'ast ScalarType },
+        BeginElse { value: &'ast ScalarExpression, ty: &'ast ScalarType, block: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
+        EndElse { then_value: BasicValueEnum<'ctx>, then_end: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
+    }
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing fallible expression function")?;
+    let mut absent = Vec::new();
+    let take_present = |state: &mut EmitState<'ctx, '_>, tagged: inkwell::values::StructValue<'ctx>,
+        ty: &ScalarType, absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
+        let pair = aggregate_transfer::fallible_allocation_result_type(context, ty)?;
+        if tagged.get_type() != pair { return Err("invalid sealed fallible numeric payload".into()); }
+        let test = state.builder.get_insert_block().ok_or("missing fallible operand test block")?;
+        let present = context.append_basic_block(function, "fallible.binary_present");
+        let succeeded = state.builder.build_extract_value(tagged, 0, "fallible.operand_succeeded")
+            .map_err(builder_error)?.into_int_value();
+        state.builder.build_conditional_branch(succeeded, present, failure).map_err(builder_error)?;
+        absent.push(test);
+        state.builder.position_at_end(present);
+        let value = state.builder.build_extract_value(tagged, 1, "fallible.operand_payload")
+            .map_err(builder_error)?;
+        Ok(EmitValue::Basic(value))
+    };
+    let mut values = Vec::new();
+    let mut stack = vec![Step::Emit(expression, payload)];
+    while let Some(step) = stack.pop() {
+        let (node, ty) = match step {
+            Step::Emit(node, ty) => (node, ty),
+            Step::Binary(operator, ty) => {
+                let right = values.pop().ok_or("missing fallible binary right operand")?;
+                let left = values.pop().ok_or("missing fallible binary left operand")?;
+                values.push(emit_binary_values(state, operator, left, right, *ty == ScalarType::U64)?);
+                continue;
+            }
+            Step::Unary(operator) => {
+                let value = take_basic(values.pop().ok_or("missing fallible unary operand")?)?;
+                values.push(emit_unary_value(state, operator, value)?);
+                continue;
+            }
+            Step::Call(call, arity) => {
+                let keep = values.len().checked_sub(arity).ok_or("missing sealed staged call arguments")?;
+                let arguments = values.split_off(keep);
+                let Some(PreparedCall::Symbol(target)) = state.prepared_call(call)? else {
+                    return Err("missing sealed direct staged call target".into());
+                };
+                if !arguments.iter().all(|argument|
+                    matches!(argument, EmitValue::Basic(BasicValueEnum::IntValue(value))
+                        if value.get_type() == context.i64_type()))
+                { return Err("invalid sealed staged call arguments".into()); }
+                let value = if aggregate_transfer::fallible_allocation_call_at(state, call) {
+                    let tagged = emit_sealed_allocation_call_values(context, state, &target, &arguments)?;
+                    take_present(state, tagged, &ScalarType::U64, &mut absent)?
+                } else {
+                    let callee = state.functions.get(target.as_ref()).ok_or("missing exact ordinary staged call")?;
+                    let types = vec![context.i64_type().into(); arity];
+                    if callee.get_type() != context.i64_type().fn_type(&types, false) {
+                        return Err("invalid sealed ordinary staged call ABI".into());
+                    }
+                    emit_call_values(context, state, &target, arguments)?
+                };
+                values.push(value);
+                continue;
+            }
+            Step::BeginShort { rhs, is_and } => {
+                let condition = take_basic(values.pop().ok_or("missing short-circuit left operand")?)?.into_int_value();
+                let skipped = state.builder.get_insert_block().ok_or("missing short-circuit left block")?;
+                let rhs_block = context.append_basic_block(function, "short_circuit.rhs");
+                let join = context.append_basic_block(function, "short_circuit.merge");
+                let (yes, no) = if is_and { (rhs_block, join) } else { (join, rhs_block) };
+                state.builder.build_conditional_branch(condition, yes, no).map_err(builder_error)?;
+                state.builder.position_at_end(rhs_block);
+                stack.push(Step::EndShort { skipped, join, is_and });
+                stack.push(Step::Emit(rhs, &ScalarType::Bool));
+                continue;
+            }
+            Step::EndShort { skipped, join, is_and } => {
+                let rhs = take_basic(values.pop().ok_or("missing short-circuit right operand")?)?.into_int_value();
+                let rhs_end = state.builder.get_insert_block().ok_or("missing short-circuit right block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(join);
+                let phi = state.builder.build_phi(context.bool_type(), "short_circuit.value").map_err(builder_error)?;
+                let skip_value = context.bool_type().const_int(u64::from(!is_and), false);
+                phi.add_incoming(&[(&skip_value, skipped), (&rhs, rhs_end)]);
+                values.push(EmitValue::Basic(phi.as_basic_value()));
+                continue;
+            }
+            Step::BeginIf { left, right, ty } => {
+                let condition = take_basic(values.pop().ok_or("missing fallible if predicate")?)?.into_int_value();
+                let then_block = context.append_basic_block(function, "if.then");
+                let else_block = context.append_basic_block(function, "if.else");
+                let join = context.append_basic_block(function, "if.merge");
+                state.builder.build_conditional_branch(condition, then_block, else_block).map_err(builder_error)?;
+                state.builder.position_at_end(then_block);
+                stack.push(Step::BeginElse { value: right, ty, block: else_block, join });
+                stack.push(Step::Emit(left, ty));
+                continue;
+            }
+            Step::BeginElse { value, ty, block, join } => {
+                let then_value = take_basic(values.pop().ok_or("missing fallible then value")?)?;
+                let then_end = state.builder.get_insert_block().ok_or("missing fallible then block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(block);
+                stack.push(Step::EndElse { then_value, then_end, join });
+                stack.push(Step::Emit(value, ty));
+                continue;
+            }
+            Step::EndElse { then_value, then_end, join } => {
+                let else_value = take_basic(values.pop().ok_or("missing fallible else value")?)?;
+                let else_end = state.builder.get_insert_block().ok_or("missing fallible else block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(join);
+                if then_value.get_type() != else_value.get_type() {
+                    return Err("sealed fallible conditional has divergent payload types".into());
+                }
+                let phi = state.builder.build_phi(then_value.get_type(), "fallible.selected_payload")
+                    .map_err(builder_error)?;
+                phi.add_incoming(&[(&then_value, then_end), (&else_value, else_end)]);
+                values.push(EmitValue::Basic(phi.as_basic_value()));
+                continue;
+            }
+        };
+        match node {
+            ScalarExpression::Unary { operator, operand, .. }
+                if crate::scalar::fallible_total_unary_bound(ty, operator).is_some() =>
+            {
+                stack.push(Step::Unary(operator));
+                stack.push(Step::Emit(operand, ty));
+            }
+            ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
+                stack.push(Step::BeginShort { rhs: right, is_and: *operator == BinaryOperator::And });
+                stack.push(Step::Emit(left, &ScalarType::Bool));
+            }
+            ScalarExpression::Binary { operator, left, right, .. } => {
+                stack.push(Step::Binary(operator, ty));
+                stack.push(Step::Emit(right, ty));
+                stack.push(Step::Emit(left, ty));
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                let [ScalarBlockItem::Expression(then_value)] = then_branch.items.as_slice()
+                    else { return Err("missing sealed fallible then expression".into()); };
+                let [ScalarBlockItem::Expression(else_value)] = else_branch.items.as_slice()
+                    else { return Err("missing sealed fallible else expression".into()); };
+                stack.push(Step::BeginIf { left: then_value, right: else_value, ty });
+                stack.push(Step::Emit(condition, &ScalarType::Bool));
+            }
+            ScalarExpression::Call { arguments, .. } if state.body_call_nodes.is_some_and(|nodes|
+                nodes.prepared_call_has_callful_arguments(node)) => {
+                    if *ty != ScalarType::U64 { return Err("invalid sealed staged call result type".into()); }
+                    stack.push(Step::Call(node, arguments.len()));
+                    for argument in arguments.iter().rev() { stack.push(Step::Emit(argument, &ScalarType::U64)); }
+                }
+            ScalarExpression::Call { .. } if aggregate_transfer::fallible_allocation_call_at(state, node) => {
+                let BasicValueEnum::StructValue(result) = take_basic(path.emit(context, state, node)?)? else {
+                    return Err("missing sealed fallible operand result".into());
+                };
+                values.push(take_present(state, result, ty, &mut absent)?);
+            }
+            ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } | ScalarExpression::Name { .. } | ScalarExpression::Call { .. } =>
+                values.push(emit_contextual_numeric(context, state, node, ty, path)?),
+            _ => return Err("invalid sealed fallible expression node".into()),
+        }
+    }
+    if values.len() != 1 || absent.is_empty() { return Err("invalid sealed fallible expression result".into()); }
+    Ok((take_basic(values.pop().expect("one sealed fallible expression output"))?, absent))
+}
+
+fn emit_fallible_numeric<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>, ordinary: bool,
+) -> Result<EmitValue<'ctx>, String> {
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing fallible expression function")?;
+    let merge = context.append_basic_block(function,
+        if ordinary { "ordinary.allocation_absent" } else { "fallible.binary_merge" });
+    let (value, absent) = emit_fallible_numeric_to(context, state, expression, payload, path, merge)?;
+    if ordinary {
+        let success = state.builder.get_insert_block().ok_or("missing ordinary expression success block")?;
+        state.builder.position_at_end(merge);
+        emit_terminal_system_panic(context, state)?;
+        state.builder.position_at_end(success);
+        return Ok(EmitValue::Basic(value));
+    }
+    let computed = aggregate_transfer::present_fallible_allocation_result(context, state, value, payload)?;
+    let computed_end = state.builder.get_insert_block().ok_or("missing fallible expression present block")?;
+    state.builder.build_unconditional_branch(merge).map_err(builder_error)?;
+    state.builder.position_at_end(merge);
+    let phi = state.builder.build_phi(computed.get_type(), "fallible.binary_result").map_err(builder_error)?;
+    let zero = computed.get_type().const_zero();
+    for test in absent { phi.add_incoming(&[(&zero, test)]); }
+    phi.add_incoming(&[(&computed, computed_end)]);
+    Ok(EmitValue::Basic(phi.as_basic_value()))
+}
+
 pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -2470,6 +2780,10 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     expected: &ScalarType,
     path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    let ordinary = aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression);
+    if ordinary || aggregate_transfer::fallible_allocation_expression_at(state, expression) {
+        return emit_fallible_numeric(context, state, expression, expected, path, ordinary);
+    }
     let float = matches!(expected, ScalarType::F32 | ScalarType::F64);
     let integer = !float && integer_width(expected).is_some();
     match expression {
@@ -2500,7 +2814,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
-            emit_if_value(context, state, condition, then_branch, else_branch, |state, block| {
+            emit_if_value(context, state, condition, then_branch, else_branch, expression, |state, block| {
                 path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
             })
         }
@@ -2532,7 +2846,22 @@ fn emit_binary_expression<'ctx, 'module>(
             return emit_binary_values(state, operator, left, EmitValue::Basic(right.into()), false);
         }
     }
-    let unsigned = match prepared_initializer_unsigned(state, left)? {
+    let checked_call_signedness = if matches!(
+        operator, BinaryOperator::Less | BinaryOperator::LessEqual
+            | BinaryOperator::Greater | BinaryOperator::GreaterEqual
+    ) && matches!(left, ScalarExpression::Call { .. }) {
+        // Ordered calls in prepared function bodies have their result type
+        // recorded on the exact expression, independent of source spelling.
+        let ty = state.body_call_nodes.and_then(|nodes| nodes.checked_expression_type(left));
+        match ty {
+            Some(ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128) => Some(true),
+            Some(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128) => Some(false),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let unsigned = match checked_call_signedness.or(prepared_initializer_unsigned(state, left)?) {
         Some(unsigned) => unsigned,
         None => match path {
             ExpressionPath::Single => expression_is_unsigned(state, left),
@@ -2873,23 +3202,27 @@ pub(super) fn emit_unary_value<'ctx, 'module>(
 fn emit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
-    emit_if_value(
+    emit_if_value_with_route(
         context,
         state,
         condition,
         then_branch,
         else_branch,
+        expression,
+        true,
         |state, block| emit_block(context, state, block),
     )
 }
 fn emit_project_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: EmitValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
@@ -2897,12 +3230,14 @@ fn emit_project_if<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(condition)?.into_int_value();
-    emit_if_value(
+    emit_if_value_with_route(
         context,
         state,
         condition,
         then_branch,
         else_branch,
+        expression,
+        true,
         |state, block| emit_project_block(context, state, block, module, modules),
     )
 }
@@ -2910,15 +3245,16 @@ fn emit_project_if<'ctx, 'module>(
 fn emit_unit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
-    let function = state
+    let bypass = state
         .builder
         .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let function = bypass.get_parent()
         .ok_or_else(|| "missing function".to_owned())?;
     let then_block = context.append_basic_block(function, "if.then");
     let merge = context.append_basic_block(function, "if.merge");
@@ -2927,29 +3263,36 @@ fn emit_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let enrolled = aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
+    )?;
     emit_block(context, state, then_branch)?;
+    let then_end = state.builder.get_insert_block().ok_or_else(|| "missing if arm terminal".to_owned())?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, bypass)?;
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
 
 fn emit_project_unit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: EmitValue<'ctx>,
     then_branch: &ScalarBlock,
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(condition)?.into_int_value();
-    let function = state
+    let bypass = state
         .builder
         .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let function = bypass.get_parent()
         .ok_or_else(|| "missing function".to_owned())?;
     let then_block = context.append_basic_block(function, "if.then");
     let merge = context.append_basic_block(function, "if.merge");
@@ -2958,12 +3301,18 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let enrolled = aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
+    )?;
     emit_project_block(context, state, then_branch, module, modules)?;
+    let then_end = state.builder.get_insert_block().ok_or_else(|| "missing if arm terminal".to_owned())?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, bypass)?;
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
 
@@ -2973,6 +3322,23 @@ pub(super) fn emit_if_value<'ctx, 'module, F>(
     condition: inkwell::values::IntValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
+    expression: &ScalarExpression,
+    emit: F,
+) -> Result<EmitValue<'ctx>, String>
+where
+    F: Fn(&mut EmitState<'ctx, 'module>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
+{
+    emit_if_value_with_route(context, state, condition, then_branch, else_branch, expression, false, emit)
+}
+
+fn emit_if_value_with_route<'ctx, 'module, F>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    condition: inkwell::values::IntValue<'ctx>,
+    then_branch: &ScalarBlock,
+    else_branch: &ScalarBlock,
+    expression: &ScalarExpression,
+    literal_array_route: bool,
     emit: F,
 ) -> Result<EmitValue<'ctx>, String>
 where
@@ -2992,6 +3358,9 @@ where
         .build_conditional_branch(condition, then_block, else_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let then_writer = literal_array_route && aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Then,
+    )?;
     let incoming_owners = state.return_owner_flags.clone();
     state.return_owner_flags = incoming_owners.clone();
     let then_value = emit(state, then_branch)?;
@@ -3002,6 +3371,9 @@ where
         .map_err(builder_error)?;
     let then_end = state.builder.get_insert_block().expect("then block");
     state.builder.position_at_end(else_block);
+    let else_writer = literal_array_route && aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Else,
+    )?;
     state.return_owner_flags = incoming_owners.clone();
     let else_value = emit(state, else_branch)?;
     let else_owners = state.return_owner_flags.clone();
@@ -3011,6 +3383,12 @@ where
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, else_end)?;
+    let enrolled = then_writer || else_writer;
+    if enrolled && !matches!((&then_value, &else_value), (EmitValue::Unit, EmitValue::Unit)) {
+        return Err("checked array conditional did not have two Unit arms".into());
+    }
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     state.return_owner_flags = incoming_owners;
     for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
         match (then_owners.get(&output), else_owners.get(&output)) {

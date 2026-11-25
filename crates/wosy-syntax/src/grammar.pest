@@ -53,7 +53,10 @@ conditional_unterminated = { !";" ~ !"}" }
 block_item = { local_binding | unsafe_block_item ~ !";" | expression ~ ";" }
 unsafe_block_item = { unsafe_expr }
 final_output_list = { output_list }
-local_binding = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
+local_binding = { allocation_binding | fallible_receiver_list ~ fallible_assignment_operator ~ single_output_list ~ ";" | receiver_list ~ "=" ~ output_list ~ ";" }
+fallible_receiver_list = { receiver }
+fallible_assignment_operator = @{ "=?" }
+single_output_list = { expression }
 allocation_binding = { runtime_receiver ~ ";" }
 runtime_receiver = { type_name ~ "[" ~ expression ~ "]" ~ identifier }
 expression = { conditional_expr | unsafe_expr | assignment | logical_or }
@@ -63,7 +66,7 @@ conditional_else = !{ &ANY ~ "else" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 assignment = { assignment_targets ~ "=" ~ output_list }
 assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
-assignment_target = { indexed_value_place | dereference | qualified_member | dereferenced_field | identifier }
+assignment_target = { indexed_value_place | indexed_dereference_place | dereference | qualified_member | dereferenced_field | identifier }
 receiver_list = { receiver ~ ("," ~ receiver)* }
 receiver = { type_spec ~ identifier }
 output_list = { expression ~ ("," ~ expression)* }
@@ -80,7 +83,7 @@ unary = { unary_operator ~ unary | primary }
 primary = { call_primary | raw_address | checked_address | parenthesized_primary | (!"(" ~ (indexed_value_place | field_access)) | dereference | struct_literal | array_literal | boolean | identifier | float | integer | char | string }
 call_primary = ${ call ~ parenthesized_field_suffix? }
 parenthesized_primary = ${ parenthesized ~ parenthesized_primary_suffix? }
-parenthesized_primary_suffix = ${ parenthesized_field_suffix ~ parenthesized_index_suffix? }
+parenthesized_primary_suffix = ${ (parenthesized_field_suffix ~ parenthesized_index_suffix?) | parenthesized_index_suffix }
 parenthesized_field_suffix = !{ &ANY ~ "." ~ identifier }
 parenthesized_index_suffix = !{ &ANY ~ index_suffix+ }
 parenthesized = !{ "(" ~ expression ~ ")" }
@@ -88,9 +91,10 @@ struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
 array_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 raw_address = { "&?" ~ place_target }
-checked_address = { "&" ~ checked_address_mutability? ~ (place_target | parenthesized_dereference_place) }
+checked_address = { "&" ~ checked_address_mutability? ~ (place_target | indexed_dereference_place | parenthesized_dereference_place) }
 checked_address_mutability = { "!" }
 parenthesized_dereference_place = { "(" ~ dereference ~ ")" }
+indexed_dereference_place = { parenthesized_dereference_place ~ index_suffix+ }
 place_target = { indexed_place | non_indexed_assignment_target }
 non_indexed_assignment_target = { dereference | qualified_member | dereferenced_field | identifier }
 indexed_place = { indexed_place_body }

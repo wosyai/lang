@@ -1,0 +1,13 @@
+[package]
+name = "wosy-stdlib-source"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+include = ["Cargo.toml", "src/release_component.rs", "src/checked_access.w", "wosy.toml"]
+
+[lib]
+path = "src/release_component.rs"
+
+[dependencies]
+blake3.workspace = true

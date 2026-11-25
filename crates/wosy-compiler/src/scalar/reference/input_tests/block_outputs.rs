@@ -41,6 +41,12 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: HashMap::new(),
+            runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
+            observed_runtime_allocations: None,
+            guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -216,6 +222,12 @@ fn check_detached_tail_conditional(text: &str, check: impl Fn(&ScalarReferenceCf
             overload_arms: Vec::new(),
             reference_cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                runtime_array_read_sites: HashMap::new(),
+                runtime_array_child_sites: Vec::new(),
+                runtime_array_exclusive_sites: HashMap::new(),
+                runtime_array_field_sites: HashMap::new(),
+                observed_runtime_allocations: None,
+                guarded_scalar_allocation: None,
                 facts: Vec::new(),
                 points: Vec::new(),
                 initial_points: Vec::new(),
@@ -685,7 +697,7 @@ bool() unknown_effect = fn { true };
             }
             let mut result = derive_function_reference_result(
                 &source, function, &HashSet::from(["captured".to_owned()]), prepared.function_calls(0, item),
-                &module.structs, &module.enums, true, &mut Vec::new(),
+                &module.structs, &module.enums, None, ReferenceCapture { call_points: true, ..Default::default() }, &mut Vec::new(),
             );
             assert!(!result.aggregate.checked_producer_authoritative);
             let contracts = ReferenceOutputContracts::default();
@@ -720,5 +732,290 @@ bool() unknown_effect = fn { true };
             checked += 1;
         }
         assert_eq!(checked, 6);
+    }
+}
+
+#[test]
+fn checked_block_observes_the_exact_terminal_before_scope_exit_and_converges() {
+    let text = r#"%%start
+*u8(*u8) forward = fn(input) { input };
+*u8(*u8) frozen = fn(input) { unsafe { input } };
+*u8(*u8) relay = fn(input) {
+    *u8 result = unsafe { forward(input) };
+    result
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+        for (item, expected_frozen) in [(1, true), (2, false)] {
+            let result = &results[item].1;
+            let [(wrapper, terminal)] = result.proof_points.checked_block_values.as_slice() else {
+                panic!("expected exactly one closed block terminal in body {item}")
+            };
+            let points = &result.cfg.points;
+            assert!(matches!(&points[wrapper.0].kind, CfgPointKind::Evaluate(ScalarExpression::Block(_))));
+            assert!(points[terminal.0 + 1..wrapper.0].iter().any(|point| matches!(point.kind, CfgPointKind::ScopeExit)));
+            assert_eq!(result.cfg.initial_points[wrapper.0].possible_origins.is_some(), expected_frozen);
+            assert_eq!(points[wrapper.0].possible_origins, points[terminal.0].possible_origins);
+            assert_eq!(points[wrapper.0].possible_origins.is_some(), expected_frozen);
+            let ScalarItem::Function(function) = &public.program.items[item] else {
+                panic!("expected checked function")
+            };
+            let cfg = &function.reference_cfg;
+            let observed = cfg.points[wrapper.0].possible_origins.as_ref().expect("proven block value");
+            assert_eq!(cfg.points[terminal.0].possible_origins.as_ref(), Some(observed));
+            assert_eq!(observed.len(), 1);
+            assert!(matches!(&cfg.facts[observed.first().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter: 0, .. }));
+        }
+    }
+}
+
+#[test]
+fn checked_ordinary_join_preserves_null_and_missing_provenance_on_separate_arms() {
+    let text = r#"%%start
+*u8(*u8) forward = fn(input) { input };
+*u8(*u8, bool) select = fn(input, flag) {
+    *u8 selected = if (flag) { forward(input) } else { null };
+    selected
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (mut results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let result = &mut results[1].1;
+        let [(join, [Some(then_point), Some(else_point)])] = result.proof_points.checked_join_values.as_slice() else {
+            panic!("expected ordered exact checked arm terminals")
+        };
+        let (join, then_point, else_point) = (*join, *then_point, *else_point);
+        assert!(then_point < else_point && else_point < join);
+        let points = &result.cfg.points;
+        assert!(matches!(points[join.0].kind, CfgPointKind::Join));
+        assert!(matches!(&points[then_point.0].kind,
+            CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { .. }, .. }));
+        assert!(points[then_point.0].possible_origins.is_none());
+        let null = points[else_point.0].possible_origins.as_ref().expect("known null arm");
+        assert_eq!(null.len(), 1);
+        assert!(matches!(&result.cfg.facts[null.first().unwrap().0], ReferenceOrigin::Null { .. }));
+        assert_eq!(points[join.0].possible_origins.as_ref(), Some(null));
+
+        let contracts = ReferenceOutputContracts::default();
+        let mut replays = Vec::new();
+        transfer_function_output_contracts(
+            result, &contracts, &contracts, &mut HashMap::new(), &mut replays, &mut 0,
+        );
+        let selected_span = text.find("selected =").unwrap() as u32;
+        assert!(replays[0].errors.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::MissingOrigin {
+                binding_id, reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin, ..
+            } if binding_id.declaration_span.start == selected_span
+        )), "{:?}", replays[0].errors);
+
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+        let ScalarItem::Function(function) = &public.program.items[1] else {
+            panic!("expected checked function")
+        };
+        let cfg = &function.reference_cfg;
+        let known_then = cfg.points[then_point.0].possible_origins.as_ref().expect("converged checked call");
+        let known_else = cfg.points[else_point.0].possible_origins.as_ref().expect("preserved null arm");
+        assert_eq!(known_then.len(), 1);
+        assert_eq!(known_else.len(), 1);
+        assert!(matches!(&cfg.facts[known_then.first().unwrap().0], ReferenceOrigin::BorrowedFrom { parameter: 0, .. }));
+        assert!(matches!(&cfg.facts[known_else.first().unwrap().0], ReferenceOrigin::Null { .. }));
+        assert_eq!(cfg.points[join.0].possible_origins.as_ref(), Some(&known_then.union(known_else).copied().collect()));
+    }
+}
+
+#[test]
+fn mixed_tail_branch_returns_transport_each_distinct_backing() {
+    let source = source();
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(u32, Packet)(u64, bool) choose = fn(count, first) {
+	if (first) {
+		u8[count] left;
+		left[0] = 19;
+		*?u8 address = null;
+		unsafe { address = &?left[0]; };
+		Packet packet = { .data = address; .length = count; };
+		37, packet
+	} else {
+		u8[count] right;
+		right[0] = 23;
+		*?u8 address = null;
+		unsafe { address = &?right[0]; };
+		Packet packet = { .data = address; .length = count; };
+		43, packet
+	}
+};
+u64(bool) receive = fn(take_left) {
+	u32 status, Packet packet = choose(2, take_left);
+	u8 byte = unsafe { core.load<u8>(packet.data) };
+	core.int_extend<u64>(status) + core.int_extend<u64>(byte) + packet.length
+};
+u64 left_result = receive(true);
+u64 right_result = receive(false);
+if (left_result != 58 || right_result != 68) { core.system_panic(); };
+%%end"#;
+    let forwarded_text = text.replace("u64(bool) receive", r#"(u32, Packet)(u64, bool) relay = fn(amount, use_left) {
+	u32 status, Packet packet = choose(amount, use_left);
+	status, packet
+};
+u64(bool) receive"#).replace("choose(2, take_left)", "relay(2, take_left)");
+    verify_mixed_tail_branch_route(&source, text, false);
+    verify_mixed_tail_branch_route(&source, &forwarded_text, true);
+}
+
+fn verify_mixed_tail_branch_route(source: &SourceIdentity, text: &str, forwarded: bool) {
+    use aggregate::{MixedArmBacking, OwnerSource};
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &prepared.project().modules[0];
+        let (item, function) = module.items.iter().enumerate().find_map(|(item, declaration)| {
+            match declaration {
+                ScalarItem::Function(function) if function.name == "choose" => Some((item, function)),
+                _ => None,
+            }
+        }).expect("real prepared conditional producer");
+        let calls = prepared.function_calls(0, item);
+        let result = derive_function_reference_result(
+            source, function, &HashSet::new(), calls, &module.structs, &module.enums, None, ReferenceCapture { call_points: true, ..Default::default() }, &mut Vec::new(),
+        );
+        let [MixedArmBacking::Exact(left), MixedArmBacking::Exact(right)] = result.aggregate.mixed_arm_backings
+            else { panic!("{:?}", result.aggregate.mixed_arm_backings) };
+        assert_ne!(left, right);
+        let [_, owner] = calls.boundary.root_outputs.as_slice() else { panic!("mixed callable outputs") };
+        assert_eq!(owner.output, 1);
+        let return_owners = result.aggregate.returns.iter().find_map(|(point, owners)| {
+            matches!(result.cfg.points[point.0].kind, CfgPointKind::ReturnOutput { output: 1, .. }).then_some(owners)
+        }).expect("canonical result lane");
+        assert_eq!(return_owners, &BTreeSet::from([
+            Some(OwnerSource::Allocation(left)), Some(OwnerSource::Allocation(right)),
+        ]));
+        let (producer, arm_outputs, allocations) = result.aggregate.mixed_branch_return_locations()
+            .expect("sealed canonical branch metadata");
+        let ConditionalRegion::Value { then_block, else_block, .. } = &calls.conditionals[&producer]
+            else { panic!("value conditional") };
+        assert_eq!([allocations[0].block, allocations[1].block], [*then_block, *else_block]);
+        assert_eq!(
+            [(allocations[0].block.0, allocations[0].item), (allocations[1].block.0, allocations[1].item)],
+            [result.aggregate.allocation_slots[&left], result.aggregate.allocation_slots[&right]],
+        );
+        let owner_return = result.cfg.points.iter().find_map(|point| match point.kind {
+            CfgPointKind::ReturnOutput { output: 1, value_point, .. } => Some(value_point),
+            _ => None,
+        }).expect("canonical owner return");
+        assert!(matches!(result.cfg.points[owner_return.0].kind,
+            CfgPointKind::ConditionalOutput { then_point, else_point } if [then_point, else_point] == arm_outputs));
+        let ScalarType::Callable { outputs, .. } = &function.signature else { panic!("callable") };
+        let lanes = aggregate::mixed_owned_struct_result(outputs).unwrap();
+        assert_eq!(result.aggregate.sealed_mixed_owner(&result.cfg, lanes),
+            Some(aggregate::SealedMixedOwner::Branches { lanes }));
+        let reversed = aggregate::MixedOwnerResultLanes { owner: lanes.scalar, scalar: lanes.owner };
+        assert_eq!(result.aggregate.sealed_mixed_owner(&result.cfg, reversed), None);
+        let build = crate::scalar::analyze_scalar_build(&prepared);
+        for project in [false, true] {
+            let llvm = if project { crate::llvm::emit_scalar_build_project_llvm(&build) }
+                else { crate::llvm::emit_scalar_build_single_module_llvm(&build) }
+                .unwrap_or_else(|error| panic!("{target_layout:?}/{project}: {error}")).to_text();
+            let context = inkwell::context::Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed-branch");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            use inkwell::values::AnyValue;
+            let get_function = |name: &[u8]| {
+                if !project {
+                    return module.get_function(std::str::from_utf8(name).unwrap()).unwrap();
+                }
+                let suffix = format!("__{}", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+                module.get_functions().find(|function| function.get_name().to_str().unwrap().ends_with(&suffix)).unwrap()
+            };
+            use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode, PhiValue};
+            let producer_fn = get_function(b"choose");
+            let producer = producer_fn.print_to_string().to_string();
+            let receiver = get_function(b"receive").print_to_string().to_string();
+            if forwarded {
+                let relay = get_function(b"relay");
+                let relay_ir = relay.print_to_string().to_string();
+                let relay_instructions = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                    .collect::<Vec<_>>();
+                let calls = relay_instructions.iter().copied().filter_map(|inst| {
+                    CallSiteValue::try_from(inst).ok().map(|call| (inst, call))
+                }).collect::<Vec<_>>();
+                let [(instruction, call)] = calls.as_slice() else { panic!("{relay_ir}") };
+                assert_eq!(call.get_called_fn_value(), Some(producer_fn));
+                assert_eq!(instruction.get_operand(2).unwrap().value(), relay.get_last_param());
+                let returned = relay_instructions.iter().find(|inst| inst.get_opcode() == InstructionOpcode::Return)
+                    .expect("forwarded mixed pair returned directly");
+                assert_eq!(returned.get_operand(0).unwrap().value(), call.try_as_basic_value().basic());
+                assert!(relay_instructions.iter().all(|inst| !matches!(inst.get_opcode(),
+                    InstructionOpcode::ExtractValue | InstructionOpcode::InsertValue)), "{relay_ir}");
+            }
+            let destination = producer_fn.get_last_param().expect("closed caller destination");
+            let instructions = producer_fn.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions());
+            let phis = instructions.filter_map(|instruction| PhiValue::try_from(instruction).ok()).collect::<Vec<_>>();
+            let [pair] = phis.as_slice() else { panic!("{producer}") };
+            assert_eq!(pair.count_incoming(), 2, "{producer}");
+            let mut allocations = Vec::with_capacity(2);
+            let mut incoming_blocks = Vec::with_capacity(2);
+            for (incoming, block) in pair.get_incomings() {
+                let committed = incoming.as_instruction_value().expect("arm receipt construction");
+                assert_eq!(committed.get_opcode(), InstructionOpcode::InsertValue);
+                assert_eq!(committed.get_parent(), Some(block));
+                let ordered = committed.get_operand(0).unwrap().value().unwrap();
+                let allocation = committed.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+                let allocator = CallSiteValue::try_from(allocation).unwrap().get_called_fn_value().unwrap();
+                assert_eq!(allocator.get_name().to_str().unwrap(), "__wosy_core_alloc");
+                allocations.push(allocation);
+                incoming_blocks.push(block);
+                let installs = block.get_instructions()
+                    .filter(|inst| CallSiteValue::try_from(*inst).ok()
+                        .and_then(|call| call.get_called_fn_value())
+                        .is_some_and(|fun| fun.get_name().to_bytes().starts_with(b"llvm.memmove"))
+                        && inst.get_operand(0).and_then(|dest| dest.value()) == Some(destination))
+                    .collect::<Vec<_>>();
+                let [install] = installs.as_slice() else { panic!("{producer}") };
+                assert!(block.get_instructions().take_while(|inst| *inst != committed).any(|inst| inst == *install));
+                let descriptor = install.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+                assert_eq!(descriptor.get_opcode(), InstructionOpcode::ExtractValue);
+                assert_eq!(descriptor.get_operand(0).unwrap().value(), Some(ordered));
+                assert!(descriptor.print_to_string().to_string().ends_with(", 1"));
+            }
+            assert_ne!(allocations[0], allocations[1]);
+            assert_ne!(incoming_blocks[0], incoming_blocks[1]);
+            assert!(!producer.contains("call void @__wosy_core_free"), "{producer}");
+            assert_eq!(receiver.matches("call void @__wosy_core_free").count(), 1, "{receiver}");
+            assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
+            let release = receiver.find("call void @__wosy_core_free(ptr %aggregate_base)").unwrap();
+            assert!(receiver[..release].contains("load i8"), "{receiver}");
+        }
+
     }
 }

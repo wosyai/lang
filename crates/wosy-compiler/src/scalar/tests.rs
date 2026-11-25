@@ -260,6 +260,21 @@ fn generic_template_copy_policy_resolves_at_concrete_call_points_in_both_validat
             assert_eq!(specialized.template_point, deferred.id);
             assert_eq!(specialized.policy, expected);
             assert_eq!(selection.substitutions.get("T"), Some(&specialized.ty));
+            if let ScalarType::CheckedReference { mutability, .. } = &specialized.ty {
+                let CfgPointKind::Call { argument_points, .. } = &call.kind else { unreachable!() };
+                let [argument] = argument_points.as_slice() else { panic!("exact unary formal") };
+                let roots = call.possible_origins.as_ref().expect("concrete compared checked origin");
+                assert_eq!(roots.len(), 1);
+                assert_eq!(Some(roots), function.reference_cfg.points[argument.0].possible_origins.as_ref());
+                assert!(matches!(&function.reference_cfg.facts[roots.first().unwrap().0],
+                    ReferenceOrigin::BorrowedFrom { parameter: 0, loan } if &loan.mode == mutability));
+                let returned = function.reference_cfg.points.iter().find(|point| matches!(point.kind,
+                    CfgPointKind::ReturnOutput { value_point, output: 0, checked: true } if value_point == call.id))
+                    .expect("checked return remains that exact call");
+                assert_eq!(returned.possible_origins.as_ref(), Some(roots));
+            } else {
+                assert!(call.possible_origins.as_ref().is_none_or(BTreeSet::is_empty));
+            }
             let moves = function.reference_cfg.points.iter().filter(|point| matches!(&point.kind, CfgPointKind::Move { owner, .. } if owner.declaration_span == function.parameter_spans[0])).collect::<Vec<_>>();
             assert_eq!(
                 moves.len(),
@@ -699,7 +714,7 @@ fn whole_checked_aggregate_reads_preserve_source_places_in_both_validators() {
 
 #[test]
 fn whole_checked_aggregate_move_keeps_joined_owner_candidates() {
-    let text = "%%start\nstruct Payload { u8 value; }\nPayload(*!Payload, *!Payload, bool) choose = fn(first, second, flag) { *!Payload writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = *writer; moved };\n%%end";
+    let text = "%%start\nstruct Payload { u8 value; }\nPayload(*!Payload, *!Payload, bool) choose = fn(first, second, flag) { *!Payload writer = null; if (flag) { writer = first; } else { writer = second; }; Payload moved = *writer; moved };\n%%end";
     let single = validate_text(text);
     let parsed = parse_source(source(), text.to_owned(), &[]);
     let project = validate_scalar_project(ScalarProject::new(
@@ -917,7 +932,7 @@ fn checked_dereference_field_move_uses_parent_loan_and_original_owner() {
 
 #[test]
 fn joined_checked_dereference_move_preserves_both_parent_loans() {
-    let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) { *!Holder writer = first; if (flag) { writer = first; } else { writer = second; }; Payload moved = (*writer).nested; moved };\n%%end";
+    let text = "%%start\nstruct Payload { i32 value; }\nstruct Holder { Payload nested; }\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) { *!Holder writer = null; if (flag) { writer = first; } else { writer = second; }; Payload moved = (*writer).nested; moved };\n%%end";
     let single = validate_text(text);
     let parsed = parse_source(source(), text.to_owned(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -981,7 +996,7 @@ fn uneven_checked_dereference_move_preserves_both_parent_loans() {
         (format!("{delay} writer = first;"), "writer = second;".to_owned()),
     ] {
         let text = format!(
-            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) {{ *!Holder writer = first; if (flag) {{ {then_arm} }} else {{ {else_arm} }}; Payload moved = (*writer).nested; i32 observed = (*writer).sibling; observed; moved }};\n%%end"
+            "%%start\nstruct Payload {{ i32 value; }}\nstruct Holder {{ Payload nested; i32 sibling; }}\nPayload(*!Holder, *!Holder, bool) choose = fn(first, second, flag) {{ *!Holder writer = null; if (flag) {{ {then_arm} }} else {{ {else_arm} }}; Payload moved = (*writer).nested; i32 observed = (*writer).sibling; observed; moved }};\n%%end"
         );
         let single = validate_text(&text);
         let parsed = parse_source(source(), text.clone(), &[]);
@@ -1123,17 +1138,39 @@ fn copyable_checked_dereference_remains_a_read_in_both_validators() {
 }
 
 #[test]
-fn indexed_dereference_of_fixed_array_is_rejected_by_current_grammar() {
-    let text = "%%start\nstruct Payload { i32 value; }\nPayload(Payload[2], u64) take = fn(values, index) { *!(Payload[2]) writer = &!values; (*writer)[index] };\n%%end";
+fn indexed_dereference_of_fixed_array_is_a_canonical_read_place() {
+    let text = "%%start\nu8(*(u8[3]), u64) read = fn(view, index) { (*view)[index] };\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);
-    assert!(
-        parsed
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "S0001"),
-        "{:?}",
-        parsed.diagnostics
-    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let validated = derive_scalar_program(&parsed.result);
+    assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+    let program = validated.program;
+    let function = program.items.iter().find_map(|item| match item {
+        ScalarItem::Function(function) => Some(function),
+        _ => None,
+    }).unwrap();
+    let expression = function.body.expressions.last().unwrap();
+    assert!(matches!(expression, ScalarExpression::IndexedRead {
+        place: ScalarPlace::Index { base, index, .. }, ..
+    } if matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+        if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. } if name == "view"))
+        && matches!(index.as_ref(), ScalarExpression::Name { name, .. } if name == "index")));
+    assert!(function.reference_cfg.points.iter().any(|point| matches!(&point.kind,
+        CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, .. }, pointer_point: Some(_), .. }
+            if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))));
+    let temporary = text.replace("(*view)[index]", "(view)[index]");
+    let parsed = parse_source(source(), temporary, &[]);
+    assert!(parsed.diagnostics.iter().any(|diagnostic| diagnostic.code == "S0001"), "{:?}", parsed.diagnostics);
+    let runtime = derive_scalar_program(&parse_source(source(), text.replace("u8[3]", "u8[]"), &[]).result);
+    assert!(runtime.diagnostics.iter().any(|diagnostic|
+        diagnostic.message.contains("extent of the dereferenced backing")), "{:?}", runtime.diagnostics);
+    let raw = parse_source(source(),
+        "%%start\nstruct Packet { u8[3] bytes; }\nu8(*?Packet, u64) read = fn(view, index) { (*view).bytes[index] };\n%%end".to_owned(), &[]);
+    assert!(raw.diagnostics.is_empty(), "{:?}", raw.diagnostics);
+    let raw = derive_scalar_program(&raw.result);
+    assert!(raw.diagnostics.iter().any(|diagnostic|
+        diagnostic.code == "B0012" && diagnostic.message == "raw dereference requires an unsafe block"),
+        "{:?}", raw.diagnostics);
 }
 
 #[test]
@@ -1565,6 +1602,646 @@ fn inner_scope_exit_preserves_outer_owner_move_in_both_validators() {
 }
 
 #[test]
+fn moved_mutable_checked_handle_has_unavailable_place_diagnostic() {
+    let text = "%%start
+unit() check_handle = fn {
+    u8 item = 1;
+    *!u8 first = &!item;
+    *!u8 second = first;
+    *second = 3;
+    first;
+};
+%%end";
+    let moved = text.find("first;").unwrap() as u32;
+    let read = text.rfind("first;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for (diagnostics, source) in [
+        (&single.diagnostics, &single.program.source),
+        (&project.diagnostics, &project.project.modules[0].source),
+    ] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected a single unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(
+            diagnostic.labels[0].span,
+            SourceSpan::new(source.clone(), ByteSpan::new(read, read + 5)),
+        );
+        assert_eq!(
+            diagnostic.labels[1].span,
+            SourceSpan::new(source.clone(), ByteSpan::new(moved, moved + 5)),
+        );
+        assert_eq!(
+            diagnostic.labels[1].kind,
+            super::super::DiagnosticLabelKind::Secondary,
+        );
+    }
+}
+
+#[test]
+fn mutable_checked_handle_transfer_reborrow_and_reinitialization_remain_valid() {
+    let text = "%%start
+unit() check_handle = fn {
+    u8 item = 1;
+    u8 other = 2;
+    *!u8 first = &!item;
+    *!u8 second = first;
+    *second = 3;
+    if (true) {
+        *!u8 child = &!(*second);
+        u8 observed = *child;
+        observed;
+    };
+    *second = 5;
+    first = &!other;
+    *first = 6;
+};
+unit(*!u8) transfer_parameter = fn(first) {
+    *!u8 second = first;
+    *second = 7;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn mutable_child_write_preserves_ancestor_loan_after_last_child_use() {
+    let text = "%%start
+unit(*!u8) check_parent = fn(parent) {
+    *!u8 child = &!(*parent);
+    *child = 3;
+    u8 observed = *child;
+    observed;
+    *parent = 4;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else {
+            panic!("expected callable");
+        };
+        let assignments = function
+            .reference_cfg
+            .points
+            .iter()
+            .filter_map(|point| match &point.kind {
+                CfgPointKind::AssignThrough {
+                    candidates,
+                    previous_origins,
+                    previous_loans,
+                    ..
+                } => Some((candidates, previous_origins, previous_loans)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(child, previous_origins, previous_loans), (parent, _, _)] = assignments.as_slice()
+        else {
+            panic!("expected child and parent writes");
+        };
+        assert!(previous_origins.is_empty(), "{previous_origins:?}");
+        assert!(previous_loans.is_empty(), "{previous_loans:?}");
+        assert_eq!(child.len(), 1);
+        assert_eq!(parent.len(), 1);
+        assert_eq!(child[0].loan.parent.as_deref(), Some(&parent[0].loan));
+    }
+}
+
+#[test]
+fn parent_write_rejects_a_mutable_child_with_a_later_use() {
+    let text = "%%start
+unit(*!u8) check_parent = fn(parent) {
+    *!u8 child = &!(*parent);
+    *parent = 3;
+    u8 observed = *child;
+    observed;
+};
+%%end";
+    let write = text.find("parent = 3").unwrap() as u32;
+    let child = text.find("&!(*parent)").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels[0].span.range.start == write
+            })
+            .unwrap_or_else(|| panic!("{diagnostics:?}"));
+        assert!(diagnostic.labels.iter().any(|label| {
+            label.kind == super::super::DiagnosticLabelKind::Secondary
+                && label.span.range.start == child
+        }), "{diagnostic:?}");
+    }
+}
+
+#[test]
+fn parent_pointee_read_rejects_a_mutable_child_with_a_later_use() {
+    let text = "%%start
+unit(*!u8) check_read = fn(parent) {
+    *!u8 child = &!(*parent);
+    u8 observed = *parent;
+    u8 through_child = *child;
+    observed;
+    through_child;
+};
+%%end";
+    let read = text.find("*parent;").unwrap() as u32;
+    let child = text.find("&!(*parent)").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one suspension diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 7));
+        assert_eq!(
+            diagnostic.labels[1].span.range,
+            ByteSpan::new(child, child + "&!(*parent)".len() as u32),
+        );
+        assert_eq!(
+            diagnostic.labels[1].kind,
+            super::super::DiagnosticLabelKind::Secondary,
+        );
+    }
+}
+
+#[test]
+fn parent_and_child_pointee_reads_respect_last_use_sharing_and_unrelated_origins() {
+    for body in [
+        "unit(*!u8) check_read = fn(parent) {
+            *!u8 child = &!(*parent);
+            u8 before = *child;
+            u8 after = *parent;
+            before; after;
+        };",
+        "unit(*!u8) check_read = fn(parent) {
+            *u8 child = &(*parent);
+            u8 through_parent = *parent;
+            u8 through_child = *child;
+            through_parent; through_child;
+        };",
+        "unit(*!u8) check_read = fn(parent) {
+            *!u8 child = &!(*parent);
+            u8 first = *child;
+            u8 second = *child;
+            first; second;
+        };",
+        "unit(*!u8, *!u8) check_read = fn(parent, unrelated) {
+            *!u8 child = &!(*parent);
+            u8 other = *unrelated;
+            u8 through_child = *child;
+            other; through_child;
+        };",
+    ] {
+        let text = format!("%%start\n{body}\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn moved_mutable_checked_field_rejects_joined_field_and_whole_reads() {
+    for read in ["parcel.handle", "parcel"] {
+        let text = format!("%%start
+struct Bag {{ *!u8 handle; u8 other; }}
+unit(u8, bool) check_field = fn(value, condition) {{
+    Bag parcel = {{ .handle = null; .other = 1; }};
+    parcel.handle = &!value;
+    if (condition) {{
+        *!u8 taken = parcel.handle;
+        *taken = 3;
+    }};
+    parcel.other = 2;
+    {read};
+}};
+%%end");
+        let moved = text.find("taken = parcel.handle").unwrap() as u32 + "taken = ".len() as u32;
+        let start = text.rfind(&format!("{read};")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one unavailable-place diagnostic for {read}: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(start, start + read.len() as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].span.range,
+                ByteSpan::new(moved, moved + "parcel.handle".len() as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+        }
+    }
+}
+
+#[test]
+fn mutable_checked_field_transfer_allows_sibling_and_reinitialized_reads() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8) check_field = fn(value, replacement) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    parcel.other;
+    parcel.handle = &!replacement;
+    *!u8 renewed = parcel.handle;
+    renewed;
+    parcel = { .handle = null; .other = 2; };
+    parcel;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn definite_checked_alias_write_reinitializes_a_moved_handle_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8) check_field = fn(value, replacement) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    *!Bag writer = &!parcel;
+    (*writer).handle = &!replacement;
+    *!u8 renewed = parcel.handle;
+    *renewed = 4;
+};
+%%end";
+    let (single, project) = both_reference_functions(text);
+    assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+    assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+}
+
+#[test]
+fn conditional_checked_alias_write_does_not_reinitialize_an_unwritten_handle_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8, u8, bool) check_field = fn(value, replacement, choose) {
+    Bag parcel = { .handle = null; .other = 1; };
+    Bag other = { .handle = null; .other = 2; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 3;
+    *!Bag writer = null;
+    if (choose) { writer = &!parcel; } else { writer = &!other; };
+    (*writer).handle = &!replacement;
+    parcel.handle;
+};
+%%end";
+    let moved = text.find("taken = parcel.handle").unwrap() + "taken = ".len();
+    let read = text.rfind("parcel.handle").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 13));
+        assert_eq!(
+            diagnostic.labels[1].span.range,
+            ByteSpan::new(moved as u32, moved as u32 + 13),
+        );
+    }
+}
+
+#[test]
+fn checked_alias_product_read_rejects_a_moved_field() {
+    let text = "%%start
+struct Bag { *!u8 handle; u8 other; }
+unit(u8) check = fn(value) {
+    Bag parcel = { .handle = null; .other = 1; };
+    parcel.handle = &!value;
+    *!u8 taken = parcel.handle;
+    *taken = 2;
+    *!Bag writer = &!parcel;
+    Bag whole = *writer;
+    whole.other;
+};
+%%end";
+    let moved = text.find("taken = parcel.handle").unwrap() as u32 + "taken = ".len() as u32;
+    let read = text.find("*writer;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 7));
+        assert_eq!(diagnostic.labels[1].span.range, ByteSpan::new(moved, moved + 13));
+    }
+}
+
+#[test]
+fn checked_alias_write_does_not_restore_the_transferred_parameter_handle() {
+    let text = "%%start
+unit(*!u8) check = fn(parent) {
+    *!u8 received = parent;
+    *received = 3;
+    parent;
+};
+%%end";
+    let moved = text.find("parent;").unwrap() as u32;
+    let read = text.rfind("parent;").unwrap() as u32;
+    let (single, project) = both_reference_functions(text);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("expected one unavailable-place diagnostic: {diagnostics:?}");
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "read or move of unavailable place");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(read, read + 6));
+        assert_eq!(diagnostic.labels[1].span.range, ByteSpan::new(moved, moved + 6));
+    }
+}
+
+#[test]
+fn checked_alias_product_reads_preserve_siblings_restored_fields_and_transferred_pointees() {
+    for body in [
+        "unit(u8) check = fn(value) {
+            Bag parcel = { .handle = null; .other = 1; };
+            parcel.handle = &!value;
+            *!u8 taken = parcel.handle;
+            *taken = 2;
+            *!Bag writer = &!parcel;
+            u8 sibling = (*writer).other;
+            sibling;
+        };",
+        "unit(u8, u8) check = fn(value, replacement) {
+            Bag parcel = { .handle = null; .other = 1; };
+            parcel.handle = &!value;
+            *!u8 taken = parcel.handle;
+            *taken = 2;
+            *!Bag writer = &!parcel;
+            (*writer).handle = &!replacement;
+            Bag whole = *writer;
+            whole.other;
+        };",
+        "unit(*!Bag) check = fn(parent) {
+            *!Bag received = parent;
+            Bag whole = *received;
+            whole.other;
+        };",
+    ] {
+        let text = format!("%%start\nstruct Bag {{ *!u8 handle; u8 other; }}\n{body}\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn incompatible_fresh_checked_borrows_report_the_earlier_live_loan() {
+    for (first, second, still_live) in [
+        ("*!u8 first = &!value;", "*!u8 second = &!value;", "first"),
+        ("*u8 first = &value;", "*!u8 second = &!value;", "first"),
+        ("*!u8 first = &!value;", "*u8 second = &value;", "first"),
+        (
+            "*!u8 first = &!value; *!u8 child = &!(*first);",
+            "*!u8 second = &!value;",
+            "child",
+        ),
+    ] {
+        let text = format!("%%start
+unit() check_fresh = fn {{
+    u8 value = 1;
+    {first}
+    {second}
+    u8 before = *{still_live};
+    u8 after = *second;
+    before; after;
+}};
+%%end");
+        let earlier = text.find(first).unwrap() + first.rfind('&').unwrap();
+        let later = text.find(second).unwrap() + second.find('&').unwrap();
+        let earlier_length = first[first.rfind('&').unwrap()..].trim_end_matches(';').len();
+        let later_length = second[second.find('&').unwrap()..].trim_end_matches(';').len();
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one incompatible-loan diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(
+                diagnostic.labels[0].span.range,
+                ByteSpan::new(later as u32, (later + later_length) as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].span.range,
+                ByteSpan::new(earlier as u32, (earlier + earlier_length) as u32),
+            );
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+        }
+    }
+}
+
+#[test]
+fn compatible_fresh_checked_borrows_remain_valid() {
+    for body in [
+        "u8 value = 1;
+        *u8 first = &value; *u8 second = &value;
+        u8 before = *first; u8 after = *second; before; after;",
+        "u8 value = 1;
+        *!u8 first = &!value; u8 before = *first;
+        *!u8 second = &!value; u8 after = *second; before; after;",
+        "Pair value = { .left = 1; .right = 2; };
+        *!u8 first = &!value.left; *!u8 second = &!value.right;
+        u8 before = *first; u8 after = *second; before; after;",
+        "u8 value = 1;
+        *!u8 parent = &!value; *!u8 child = &!(*parent);
+        u8 before = *child; u8 after = *parent; before; after;",
+        "u8 value = 1; *!u8 selected = null;
+        if (choose) { selected = &!value; } else { selected = &!value; };
+        u8 observed = *selected; observed;",
+    ] {
+        let signature = if body.contains("choose") {
+            "unit(bool) check_fresh = fn(choose)"
+        } else {
+            "unit() check_fresh = fn"
+        };
+        let text = format!(
+            "%%start\nstruct Pair {{ u8 left; u8 right; }}\n{signature} {{ {body} }};\n%%end"
+        );
+        let (single, project) = both_reference_functions(&text);
+        assert!(single.diagnostics.is_empty(), "{body}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{body}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn incompatible_sibling_reborrow_reports_live_peer_without_labeling_parent() {
+    for (first, second) in [
+        ("*!u8 first = &!(*parent);", "*!u8 second = &!(*parent);"),
+        ("*u8 first = &(*parent);", "*!u8 second = &!(*parent);"),
+        ("*!u8 first = &!(*parent);", "*u8 second = &(*parent);"),
+    ] {
+        let text = format!("%%start
+unit(*!u8) check_siblings = fn(parent) {{
+    {first}
+    {second}
+    u8 before = *first;
+    u8 after = *second;
+    u8 resumed = *parent;
+    before; after; resumed;
+}};
+%%end");
+        let span = |borrow: &str| {
+            let prefix = borrow.find('&').unwrap();
+            let start = text.find(borrow).unwrap() + prefix;
+            ByteSpan::new(start as u32, (start + borrow.len() - prefix - 1) as u32)
+        };
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            let [diagnostic] = diagnostics.as_slice() else {
+                panic!("expected one overlapping sibling diagnostic: {diagnostics:?}");
+            };
+            assert_eq!(diagnostic.code, "B0003");
+            assert_eq!(diagnostic.message, "read or move of unavailable place");
+            assert_eq!(diagnostic.labels[0].span.range, span(second));
+            assert_eq!(diagnostic.labels[1].span.range, span(first));
+            assert_eq!(
+                diagnostic.labels[1].kind,
+                super::super::DiagnosticLabelKind::Secondary,
+            );
+            assert_eq!(diagnostic.labels.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn explicit_named_reborrow_accepts_sharing_last_use_ancestors_and_exclusive_arms() {
+    for text in [
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *u8 first = &(*parent); *u8 second = &(*parent);
+          u8 before = *first; u8 after = *second; before; after;
+        };
+        %%end",
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *!u8 first = &!(*parent); u8 before = *first;
+          *!u8 second = &!(*parent); u8 after = *second;
+          u8 resumed = *parent; before; after; resumed;
+        };
+        %%end",
+        "%%start
+        unit(*!u8) check_siblings = fn(parent) {
+          *!u8 child = &!(*parent); *!u8 grandchild = &!(*child);
+          u8 first = *grandchild; u8 second = *child; u8 third = *parent;
+          first; second; third;
+        };
+        %%end",
+        "%%start
+        unit(bool) check_siblings = fn(choose) {
+          u8 left = 1; u8 right = 2; *!u8 selected = null;
+          if (choose) { *!u8 parent = &!left; selected = &!(*parent); }
+          else { *!u8 parent = &!right; selected = &!(*parent); };
+          u8 observed = *selected; observed;
+        };
+        %%end",
+    ] {
+        let (single, project) = both_reference_functions(text);
+        assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
+        assert!(project.diagnostics.is_empty(), "{text}: {:?}", project.diagnostics);
+    }
+}
+
+#[test]
+fn post_join_parent_reads_preserve_the_authoritative_origin_input() {
+    for (body, expected) in [
+        (
+            "u8 first = 1; *!u8 parent = &!first;
+             if (choose) { u8 inside = 9; inside; };",
+            &["&!first"][..],
+        ),
+        (
+            "u8 first = 1; u8 second = 2; *!u8 parent = null;
+             if (choose) { parent = &!first; } else { parent = &!second; };",
+            &["&!first", "&!second"][..],
+        ),
+    ] {
+        let text = format!("%%start
+unit(bool) check_join = fn(choose) {{
+    {body}
+    u8 observed = *parent;
+    observed;
+}};
+%%end");
+        let read = text.find("*parent;").unwrap() as u32;
+        let expected = expected
+            .iter()
+            .map(|spelling| text.find(spelling).unwrap() as u32)
+            .collect::<BTreeSet<_>>();
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else {
+                panic!("expected callable");
+            };
+            let cfg = &function.reference_cfg;
+            let pointer = cfg
+                .initial_points
+                .iter()
+                .find_map(|point| match &point.kind {
+                    CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. }
+                        if point.source_span.range.start == read => Some(*pointer),
+                    _ => None,
+                })
+                .expect("canonical checked-pointee read pointer");
+            let original = &cfg.initial_points[pointer.0];
+            let CfgPointKind::Read { binding } = &original.kind else {
+                panic!("expected named parent read");
+            };
+            let parent = text.find("parent =").unwrap() as u32;
+            assert_eq!(binding.declaration_span, ByteSpan::new(parent, parent + 6));
+            assert!(original.possible_origins.is_none());
+            let origins = cfg.points[pointer.0].possible_origins.as_ref().unwrap();
+            let found = origins
+                .iter()
+                .map(|origin| match &cfg.facts[origin.0] {
+                    ReferenceOrigin::Fresh { loan, .. } => {
+                        assert!(loan.parent.is_none());
+                        assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+                        loan.creation_span.start
+                    }
+                    other => panic!("unexpected origin {other:?}"),
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(origins.len(), expected.len());
+            assert_eq!(found, expected);
+        }
+    }
+}
+
+#[test]
 fn checked_aggregate_conflicts_label_the_initiating_loan_in_both_pipelines() {
     for (text, primary, origin) in [
             ("%%start\nstruct Payload { u8 value; }\nunit() f = fn { Payload specimen = { .value = 1; }; *!Payload writer = &!specimen; Payload taken = *writer; Payload again = *writer; taken; again; };\n%%end", "*writer; taken", "&!specimen"),
@@ -1598,6 +2275,49 @@ fn checked_aggregate_copy_and_single_move_are_accepted_in_both_pipelines() {
             assert!(single.diagnostics.is_empty(), "{text}: {:?}", single.diagnostics);
             assert!(project.diagnostics.is_empty(), "{text}: {:?}", project.diagnostics);
         }
+}
+
+#[test]
+fn direct_indexed_reads_and_borrows_use_the_live_loan_path() {
+    let cases = [
+        ("u8 observed = bytes[0]; observed; retained;", Some("bytes[0]; observed")),
+        ("u8 observed = bytes[index]; observed; retained;", Some("bytes[index]")),
+        ("u8 observed = bytes[1]; observed; retained;", None),
+        ("retained; u8 observed = bytes[0]; observed;", None),
+        ("*u8 reader = &bytes[0]; reader; retained;", Some("&bytes[0]; reader")),
+        ("*u8 reader = &bytes[1]; reader; retained;", None),
+        ("*!u8 writer = &!bytes[index]; writer; retained;", Some("&!bytes[index]")),
+    ];
+    for (parameters, formals, storage) in [
+        ("", "", "u8[2] bytes = [7, 9];"),
+        ("u64", "length", "u8[length] bytes; bytes[0] = 7; bytes[1] = 9;"),
+    ] {
+        for (body, overlap) in cases {
+            let (parameters, formals) = match (body.contains("[index]"), parameters.is_empty()) {
+                (true, true) => ("u64", "index"),
+                (true, false) => ("u64, u64", "index, length"),
+                (false, _) => (parameters, formals),
+            };
+            let function = if formals.is_empty() { "fn".to_owned() } else { format!("fn({formals})") };
+            let text = format!(
+                "%%start\nunit({parameters}) f = {function} {{ {storage} *!u8 retained = &!bytes[0]; {body} }};\n%%end",
+            );
+            let (single, project) = both_reference_functions(&text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                if let Some(overlap) = overlap {
+                    let access = text.find(overlap).unwrap() as u32;
+                    let origin = text.find("&!bytes[0]").unwrap() as u32;
+                    assert!(diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "B0003"
+                            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                            && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)
+                    }), "{text}: {diagnostics:?}");
+                } else {
+                    assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2374,6 +3094,40 @@ fn checked_core_free_records_typed_owner_and_expires_derived_loans_in_both_valid
                     && diagnostic.labels[0].span.range.start == use_start),
             "{diagnostics:?}"
         );
+    }
+}
+
+#[test]
+fn owner_endpoints_retire_only_projected_slots_with_stale_origins() {
+    for (signature, endpoint) in [
+        ("unit(u64) update = fn(count)", "unsafe { core.free(&first); };"),
+        ("unit(u64) update = fn(count)", "unsafe { core.invalidate(&first); };"),
+        (
+            "unit(u64, *?u8) update = fn(count, raw)",
+            "unsafe { core.invalidate(&first); core.rebind(&first, raw, count); };",
+        ),
+    ] {
+        for reset in [false, true] {
+            let overwrite = if reset { "refs[0] = null;" } else { "" };
+            let text = format!("%%start\n{signature} {{ u8[count] first; u8[count] second; (*u8)[2] refs = [null, null]; refs[0] = &first[0]; refs[1] = &second[0]; {endpoint} {overwrite} *u8 sibling = refs[1]; sibling; *u8 observed = refs[0]; observed; }};\n%%end");
+            let sibling = text.rfind("refs[1]").unwrap() as u32;
+            let observed = text.rfind("refs[0]").unwrap() as u32;
+            let (single, project) = both_reference_functions(&text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                if reset {
+                    assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+                } else {
+                    let at = |diagnostic: &super::Diagnostic, offset| {
+                        diagnostic.code == "B0003"
+                            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == offset)
+                    };
+                    assert!(diagnostics.iter().any(|diagnostic| at(diagnostic, observed)),
+                        "{text}: {diagnostics:?}");
+                    assert!(!diagnostics.iter().any(|diagnostic| at(diagnostic, sibling)),
+                        "{text}: {diagnostics:?}");
+                }
+            }
+        }
     }
 }
 
@@ -4233,6 +4987,240 @@ fn projected_checked_constant_indices_preserve_disjoint_origins() {
 }
 
 #[test]
+fn fixed_projected_reference_keeps_its_local_loan_live_until_last_use() {
+    for (body, conflict) in [
+        ("bytes[0] = 8; *u8 observed = refs[0]; observed;", true),
+        ("*u8 observed = refs[0]; observed; bytes[0] = 8;", false),
+        ("*u8 observed = refs[0]; observed; bytes[0] = 8; u8 other = *unrelated; other;", false),
+        ("bytes[0] = 8; u8 other = *unrelated; other; *u8 observed = refs[0]; observed;", true),
+        ("bytes[0] = 8; refs[0] = null; *u8 observed = refs[0]; observed;", false),
+        ("bytes[0] = 8; *u8 observed = refs[1]; observed;", false),
+        ("bytes[0] = 8; if (take) { *u8 observed = refs[0]; observed; };", true),
+        ("bytes[0] = 8; if (take) { refs[0] = null; }; *u8 observed = refs[0]; observed;", true),
+    ] {
+        let function = if body.contains("take") {
+            "unit(bool) f = fn(take)"
+        } else if body.contains("unrelated") {
+            "unit(*u8) f = fn(unrelated)"
+        } else {
+            "unit() f = fn"
+        };
+        let text = format!("%%start\n{function} {{ u8[2] bytes = [7, 9]; (*u8)[2] refs = [null, null]; refs[0] = &bytes[0]; refs[1] = null; {body} }};\n%%end");
+        let access = text.find("bytes[0] = 8").unwrap() as u32;
+        let origin = text.find("&bytes[0]").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)
+                }), "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn singleton_checked_pointer_store_keeps_projected_local_loan_live() {
+    for (install, uses, conflict) in [
+        ("parcel.item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "*u8 seen = parcel.item; seen; value = 8;", false),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.sibling; seen;", false),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; parcel.item = null; *u8 seen = parcel.item; seen;", false),
+    ] {
+        let text = format!(
+            "%%start\nstruct Bag {{ *u8 item; *u8 sibling; }}\nunit() update = fn {{ u8 value = 7; Bag parcel = {{ .item = null; .sibling = null; }}; parcel.sibling = null; {install} {uses} }};\n%%end"
+        );
+        let access = text.find("value = 8").unwrap() as u32;
+        let origin = text.find("&value").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn conditional_checked_pointer_store_preserves_unwritten_projected_loans() {
+    for (overwrite, conflict) in [("", true), ("first.item = null;", false)] {
+        let text = format!(
+            "%%start
+struct Bag {{ *u8 item; }}
+unit(bool) update = fn(choose) {{
+    u8 value = 7;
+    Bag first = {{ .item = null; }};
+    Bag second = {{ .item = null; }};
+    first.item = &value;
+    second.item = null;
+    *!Bag writer = null;
+    if (choose) {{ writer = &!first; }} else {{ writer = &!second; }};
+    (*writer).item = null;
+    {overwrite}
+    value = 8;
+    *u8 observed = first.item;
+    observed;
+}};
+%%end"
+        );
+        let access = text.find("value = 8").unwrap() as u32;
+        let origin = text.find("&value").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
+    for (branch_owner, expired) in [("local; refs[0] = &local;", true), ("local; refs[0] = &outer;", false)] {
+        let text = format!(
+            "%%start\nunit(bool) update = fn(take) {{ u8 outer = 1; (*u8)[2] refs = [null, null]; refs[0] = &outer; refs[1] = &outer; if (take) {{ u8 local = 2; {branch_owner} }}; *u8 sibling = refs[1]; sibling; *u8 observed = refs[0]; observed; }};\n%%end"
+        );
+        let sibling = text.rfind("refs[1]").unwrap() as u32;
+        let observed = text.rfind("refs[0]").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if expired {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == observed)),
+                    "{text}: {diagnostics:?}");
+                assert!(!diagnostics.iter().any(|diagnostic|
+                    diagnostic.labels.first().is_some_and(|label| label.span.range.start == sibling)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn checked_alias_loaded_while_projected_owner_is_live_cannot_outlive_owner() {
+    for (referent, expired) in [("inner", true), ("outer", false)] {
+        let text = format!(
+            "%%start\nunit(bool) update = fn(take) {{ u8 outer = 1; *u8 observed = &outer; if (take) {{ u8 inner = 2; inner; (*u8)[2] refs = [null, null]; refs[0] = &{referent}; *u8 loaded = refs[0]; observed = loaded; }}; observed; }};\n%%end"
+        );
+        let final_read = text.rfind("observed").unwrap() as u32;
+        let inner_read = text.find("loaded;").unwrap() as u32;
+        let creation = text.find("&inner");
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if expired {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == final_read)
+                    && diagnostic.labels.iter().skip(1).any(|label|
+                        label.span.range.start == creation.unwrap() as u32)),
+                    "{text}: {diagnostics:?}");
+                assert!(!diagnostics.iter().any(|diagnostic| diagnostic.labels.first()
+                    .is_some_and(|label| label.span.range.start == inner_read)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn indexed_checked_holder_relays_one_unchanged_formal_selector() {
+    let text = "%%start\nunit(u64, *u8, *u8, *u8) update = fn(index, first, second, third) { (*u8)[2] refs = [null, null]; refs[0] = first; refs[1] = second; refs[index] = third; *u8 selected = refs[index]; *u8 sibling = refs[1]; refs[0] = first; *u8 possible = refs[index]; selected; sibling; possible; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+        let reads = function.reference_cfg.points.iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { reads_origin: true, .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 3);
+        for (read, expected) in reads.into_iter().zip([&[3][..], &[2, 3], &[1, 3]]) {
+            let mut actual = read.possible_origins.as_ref().unwrap().iter().map(|id|
+                match &function.reference_cfg.facts[id.0] {
+                    ReferenceOrigin::BorrowedFrom { parameter, .. } => *parameter,
+                    origin => panic!("unexpected origin {origin:?}"),
+                }).collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn indexed_checked_holder_relays_independent_arrays_and_selectors() {
+    for (left_read, expected) in [
+        ("*u8 a = left[i]; a;", &[2, 3][..]),
+        ("i = 0;", &[3][..]),
+    ] {
+        let text = format!("%%start\nunit(u64, u64, *u8, *u8) update = fn(i, j, first, second) {{ (*u8)[2] left = [null, null]; (*u8)[2] right = [null, null]; left[i] = first; right[j] = second; {left_read} *u8 b = right[j]; b; }};\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+            let actual = function.reference_cfg.points.iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { reads_origin: true, .. }))
+                .map(|point| match sole_fact(function, point) {
+                    ReferenceOrigin::BorrowedFrom { parameter, .. } => *parameter,
+                    origin => panic!("unexpected origin {origin:?}"),
+                }).collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn indexed_checked_holder_does_not_widen_a_fresh_local_into_an_outer_slot() {
+    let text = "%%start\nunit(bool, u64, *u8) update = fn(take, index, argument) { (*u8)[2] refs = [null, null]; refs[0] = argument; if (take) { u8 local = 1; refs[0] = &local; refs[index] = argument; }; *u8 observed = refs[0]; observed; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let read = text.rfind("refs[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.labels.first().is_some_and(|label| label.span.range.start == read)
+        }), "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn indexed_checked_holder_declines_local_owners_and_mutated_selectors() {
+    for (signature, parameters, setup, replacement, after) in [
+        ("u64", "index", "u8 local = 1;", "&local", ""),
+        ("u64, *u8", "index, argument", "", "argument", "index = 0;"),
+    ] {
+        let text = format!("%%start\nunit({signature}) update = fn({parameters}) {{ {setup} (*u8)[2] refs = [null, null]; refs[index] = {replacement}; {after} *u8 observed = refs[index]; observed; }};\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        let start = text.rfind("refs[index]").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)),
+                "{text}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
 fn checked_dereference_field_write_transfers_checked_rhs() {
     let text = "%%start\nstruct Bag { *u8 item; }\nunit(u8) update = fn(value) { Bag parcel = { .item = null; }; *!Bag writer = &!parcel; (*writer).item = &value; *u8 reader = parcel.item; reader; };\n%%end";
     let (single, project) = both_reference_functions(text);
@@ -4446,6 +5434,122 @@ fn validates_runtime_array_callable_transport() {
         validation.diagnostics,
         validation.program
     );
+}
+
+#[test]
+fn recursive_runtime_array_transfer_requires_the_correct_live_owner_at_the_join() {
+    for (prefix, install, suffix, expected_conflict) in [
+        ("", "bytes", "u8 observed = bytes[0]; observed", None),
+        ("*u8 view = &bytes[0]; u8 prior = *view; prior;", "bytes",
+            "u8 observed = bytes[0]; observed", None),
+        ("u8[length] next;", "next", "u8 observed = next[0]; observed", None),
+        ("u8[length] next;", "next", "u8 observed = next[0]; observed; bytes[0]", Some("old")),
+        ("*u8 view = &bytes[0];", "bytes", "u8 observed = *view; observed", Some("loan")),
+    ] {
+        let text = format!(r#"%%start
+(u8[], u64)(u8[], u64, u64) carry = fn(values, depth, count) {{
+    if (depth != 0) {{
+        u64 one = 1;
+        values, count = carry(values, depth - one, count);
+    }};
+    values, count
+}};
+u8(u64, bool) drive = fn(length, choose) {{
+    u8[length] bytes;
+    bytes[0] = 17;
+    u64 stamp = 1;
+    {prefix}
+    if (choose) {{
+        {install}, stamp = carry(bytes, length, stamp);
+    }};
+    {suffix}
+}};
+%%end"#);
+        let transfer = text.find("carry(bytes, length, stamp)").unwrap() as u32 + "carry(".len() as u32;
+        let owner_declaration = text.find("bytes;").unwrap() as u32;
+        let installed_declaration = if install == "bytes" {
+            owner_declaration
+        } else {
+            text.find("next;").unwrap() as u32
+        };
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let find_cfg = |name| items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == name => Some(&function.reference_cfg),
+                _ => None,
+            }).unwrap_or_else(|| panic!("typed {name}: {diagnostics:?}"));
+            let check_move_and_reinstall = |cfg: &ScalarReferenceCfg, declaration, move_span, install_declaration| {
+                let moved = cfg.points.iter().find(|point| point.source_span.range.start == move_span
+                    && matches!(&point.kind, CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. }, .. }
+                        if place.binding == *owner && owner.declaration_span.start == declaration
+                            && place.projections.is_empty())
+                ).unwrap_or_else(|| panic!("actual owning argument move for {install}: {diagnostics:?}"));
+                let call = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::Call { expression: ScalarExpression::Call { receiver: None, name, .. },
+                        output: 0, .. } if name == "carry")
+                ).expect("canonical call result");
+                let write = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::Assign { target, rhs_point, .. } if *rhs_point == call.id
+                        && target.binding.declaration_span.start == install_declaration
+                        && target.projections.is_empty())
+                ).unwrap_or_else(|| panic!("ownership result installed into {install}: {diagnostics:?}"));
+                let join = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Join)
+                    && point.id > write.id).expect("post-reinstall branch join");
+                assert!(moved.id < call.id && call.id < write.id && write.id < join.id);
+                let branch = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Branch { .. })
+                    && point.id < moved.id).expect("conditional transfer");
+                assert_eq!(branch.successors.len(), 2);
+                assert!(branch.successors.contains(&join.id), "untaken edge bypasses transfer");
+                assert_eq!(cfg.points.iter().filter(|point| point.successors.contains(&join.id)).count(), 2);
+                (moved.id, join.id)
+            };
+            let recursive = text.find("carry(values, depth - one, count)").unwrap() as u32 + "carry(".len() as u32;
+            let parameter = text.find("fn(values,").unwrap() as u32 + "fn(".len() as u32;
+            check_move_and_reinstall(find_cfg("carry"), parameter, recursive, parameter);
+            let drive = find_cfg("drive");
+            let (moved, joined) = check_move_and_reinstall(drive, owner_declaration, transfer, installed_declaration);
+            let read = |target: &str, declaration| {
+                let start = text.rfind(target).unwrap() as u32;
+                let out = start..start + target.len() as u32;
+                drive.points.iter().find(|point| point.id > joined
+                    && out.contains(&point.source_span.range.start)
+                    && matches!(&point.kind, CfgPointKind::ReadPlace { candidates, .. }
+                        if candidates.iter().any(|place| place.binding.declaration_span.start == declaration)))
+                    .unwrap_or_else(|| panic!("actual post-join read of {target}: {diagnostics:?}"))
+            };
+            match expected_conflict {
+                Some("old") => {
+                    read("next[0]", installed_declaration);
+                    let old = read("bytes[0]", owner_declaration);
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span == old.source_span)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span == drive.points[moved.0].source_span)
+                    ), "{diagnostics:?}");
+                }
+                Some("loan") => {
+                    let borrow = text.find("&bytes[0]").unwrap() as u32;
+                    let future_use = text.rfind("*view").unwrap() as u32 + 1;
+                    assert!(drive.points.iter().any(|point| point.id > joined
+                        && point.source_span.range.start == future_use
+                        && matches!(&point.kind, CfgPointKind::Read { .. })));
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == transfer)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+                    ), "{diagnostics:?}");
+                }
+                None => {
+                    read(if install == "bytes" { "bytes[0]" } else { "next[0]" }, installed_declaration);
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
 }
 
 #[test]
@@ -7537,47 +8641,6 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
         assert!(diagnostic.labels[0].span.range.start >= literal_start);
         assert!(diagnostic.labels[0].span.range.end <= literal_end);
     }
-}
-
-#[test]
-fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
-    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
-    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
-        if node.kind == kind && node.text.starts_with(spelling) {
-            return node.clone();
-        }
-        for child in &node.children {
-            if let Element::Node(child) = child {
-                if child.text.contains(spelling) {
-                    return find(child, kind, spelling);
-                }
-            }
-        }
-        panic!("missing declaration {spelling}");
-    }
-    let text = "%%start
-struct First { i32 value; }
-enum Early { zero; }
-struct Last { i32 value; }
-enum Late { one; }
-%%end";
-    let parsed = parse_source(source(), text.into(), &[]);
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let mut snapshot = parsed.result.canonical_cst().snapshot();
-    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
-    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
-    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
-    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
-        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
-        _ => None,
-    }).unwrap();
-    selected.children.extend([Element::Node(last), Element::Node(late)]);
-    snapshot.root.children.push(Element::Node(first));
-    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
-    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
-        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
-    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
-        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
 }
 
 #[test]
@@ -10964,4 +12027,2376 @@ fn validates_scoped_fixed_array_callable_transport_and_preserves_module_collisio
         "{:?}",
         project.diagnostics
     );
+}
+
+#[test]
+fn deferred_formal_reborrow_after_an_unrelated_join_keeps_one_canonical_child() {
+    let text = r#"%%start
+unit(*!u8, bool) inspect = fn(parent, choose) {
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    u8 before = *child;
+    before;
+    u8 after = *parent;
+    after;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected formal borrower") };
+        let cfg = &function.reference_cfg;
+        let expected = text.find("&!(*parent)").unwrap() as u32;
+        let find_child = |points: &[ReferenceFlowPoint]| points.iter().filter(|point| {
+            point.source_span.range.start == expected && matches!(point.kind, CfgPointKind::Borrow { .. })
+        }).map(|point| point.id).collect::<Vec<_>>();
+        let children = find_child(&cfg.points);
+        let [child] = children.as_slice() else { panic!("expected exactly one materialized child") };
+        assert_eq!(find_child(&cfg.initial_points), children);
+        let initial = &cfg.initial_points[child.0];
+        let observed = &cfg.points[child.0];
+        assert_eq!(initial, observed);
+        let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = sole_fact(function, observed) else {
+            panic!("expected child of the first formal");
+        };
+        assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+        let parent = loan.parent.as_ref().expect("canonical formal parent");
+        assert!(parent.parent.is_none());
+        assert_eq!(parent.origin_place.binding.declaration_span, function.parameter_spans[0]);
+    }
+}
+
+#[test]
+fn deferred_formal_reborrow_never_authorizes_a_changed_or_exposed_formal_cell() {
+    for prefix in ["parent = null;", "&parent;"] {
+        let text = format!(r#"%%start
+unit(*!u8, bool) inspect = fn(parent, choose) {{
+    {prefix}
+    if (choose) {{ u8 inside = 9; inside; }};
+    &!(*parent);
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let borrow = text.find("&!(*parent)").unwrap() as u32;
+        let ScalarItem::Function(function) = &single.program.items[0] else { panic!("expected typed formal") };
+        let unsolved = function.reference_cfg.initial_points.iter().filter(|point|
+            point.source_span.range.start == borrow
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ).collect::<Vec<_>>();
+        assert!(matches!(unsolved.as_slice(), [point] if point.possible_origins.is_none()),
+            "{prefix}: expected to reach the typed pending event, without acceptance");
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "missing required dereference origin"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == borrow)
+            }), "{prefix}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn deferred_local_reborrow_retains_the_exact_same_block_allocation() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    u8 before = *child;
+    before;
+    u8 after = *parent;
+    after;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected local borrower") };
+        let cfg = &function.reference_cfg;
+        let find = |start: &str| {
+            let span = text.find(start).unwrap() as u32;
+            cfg.points.iter().find(|point| point.source_span.range.start == span
+                && matches!(point.kind, CfgPointKind::Borrow { .. })
+            ).expect("canonical borrow")
+        };
+        let root = find("&!owner");
+        let child = find("&!(*parent)");
+        assert_eq!(&cfg.initial_points[child.id.0], child);
+        let ReferenceOrigin::Fresh { allocation, loan } = sole_fact(function, root) else {
+            panic!("expected allocation root");
+        };
+        let ReferenceOrigin::Fresh { allocation: child_allocation, loan: child_loan } = sole_fact(function, child) else {
+            panic!("expected same rooted child");
+        };
+        assert_eq!(allocation, child_allocation);
+        assert_eq!(child_loan.parent.as_deref(), Some(loan));
+        assert_eq!(loan.origin_place.binding.declaration_span.start, text.find("owner =").unwrap() as u32);
+    }
+}
+
+#[test]
+fn deferred_local_reborrow_refuses_owner_mutation_and_owner_or_handle_exposure() {
+    for (before, after) in [("owner = 8;", ""), ("unsafe { &?owner; };", ""), ("", "&parent;")] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    {before}
+    *!u8 parent = &!owner;
+    {after}
+    if (choose) {{ u8 inside = 9; inside; }};
+    &!(*parent);
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let target = text.find("&!(*parent)").unwrap() as u32;
+        let ScalarItem::Function(function) = &single.program.items[0] else { panic!("expected typed local") };
+        assert!(function.reference_cfg.initial_points.iter().any(|point|
+            point.source_span.range.start == target && point.possible_origins.is_none()
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ), "{before} {after}: expected a genuine refused pending event");
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "missing required dereference origin"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == target)
+            }), "{before} {after}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn deferred_same_root_siblings_use_the_exact_last_use_and_peer_span() {
+    for (uses, overlapping) in [
+        ("u8 left_value = *left; *!u8 right = &!(*parent); u8 right_value = *right;", false),
+        ("*!u8 right = &!(*parent); u8 left_value = *left; u8 right_value = *right;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 left = &!(*parent);
+    {uses}
+    u8 resumed = *parent;
+    left_value; right_value; resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let starts = text.match_indices("&!(*parent)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if overlapping {
+                let [diagnostic] = diagnostics.as_slice() else { panic!("expected exact sibling conflict: {diagnostics:?}") };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [current, peer] = diagnostic.labels.as_slice() else { panic!("expected current and peer labels") };
+                assert_eq!(current.span.range, starts[1]);
+                assert_eq!(peer.span.range, starts[0]);
+                assert!(cfg.initial_points.iter().all(|point| !starts.contains(&point.source_span.range)
+                    || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let children = cfg.points.iter().filter(|point| starts.contains(&point.source_span.range)
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).collect::<Vec<_>>();
+            let [first, second] = children.as_slice() else { panic!("expected two exact canonical children") };
+            assert!(first.id < second.id);
+            for &point in &children {
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+            }
+            let ReferenceOrigin::Fresh { allocation: left, loan: left_loan } = sole_fact(function, first) else {
+                panic!("expected first local child");
+            };
+            let ReferenceOrigin::Fresh { allocation: right, loan: right_loan } = sole_fact(function, second) else {
+                panic!("expected second local child");
+            };
+            assert_eq!(left, right);
+            assert_eq!(left_loan.parent, right_loan.parent);
+            assert_ne!(left_loan.creation_span, right_loan.creation_span);
+        }
+    }
+}
+
+#[test]
+fn deferred_same_root_siblings_do_not_freeze_a_transported_child() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 left = &!(*parent);
+    *!u8 transported = left;
+    u8 left_value = *transported;
+    *!u8 right = &!(*parent);
+    u8 right_value = *right;
+    left_value; right_value;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let starts = text.match_indices("&!(*parent)").map(|(start, _)| start as u32).collect::<Vec<_>>();
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == starts[0])
+        }), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected typed borrower") };
+        let unresolved = function.reference_cfg.initial_points.iter().filter(|point|
+            starts.contains(&point.source_span.range.start) && point.possible_origins.is_none()
+                && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+        ).count();
+        assert_eq!(unresolved, 2);
+    }
+}
+
+#[test]
+fn deferred_sibling_scalar_writes_use_the_exact_child_and_count_as_last_uses() {
+    for (body, overlaps) in [
+        ("*left = 8; *!u8 right = &!(*parent); *right = 9;", false),
+        ("*!u8 right = &!(*parent); *left = 8; *right = 9;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 left = &!(*parent);
+    {body}
+    u8 resumed = *parent;
+    resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let sites = text.match_indices("&!(*parent)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            if overlaps {
+                let [diagnostic] = diagnostics.as_slice() else { panic!("expected exact live sibling conflict: {diagnostics:?}") };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else { panic!("expected current and peer") };
+                assert_eq!(requested.span.range, sites[1]);
+                assert_eq!(existing.span.range, sites[0]);
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let cfg = &function.reference_cfg;
+            let children = cfg.points.iter().filter(|point| sites.contains(&point.source_span.range)
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).collect::<Vec<_>>();
+            assert_eq!(children.len(), 2);
+            let writes = cfg.points.iter().filter_map(|point| match &point.kind {
+                CfgPointKind::AssignThrough { pointer_point, candidates, .. } => Some((*pointer_point, candidates)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(writes.len(), children.len());
+            for (child, (pointer, candidates)) in children.into_iter().zip(writes) {
+                assert_eq!(&cfg.initial_points[child.id.0], child);
+                let [actual] = candidates.as_slice() else { panic!("expected singleton exact write target") };
+                assert_eq!(child.possible_origins, Some(BTreeSet::from([actual.origin])));
+                assert_eq!(cfg.points[pointer.0].possible_origins, child.possible_origins);
+                let ReferenceOrigin::Fresh { loan, .. } = sole_fact(function, child) else {
+                    panic!("expected local child allocation")
+                };
+                assert_eq!(&actual.loan, loan);
+                assert!(loan.parent.is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_reborrow_resumes_both_ancestors_after_the_descendant_last_use() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    *!u8 grandchild = &!(*child);
+    *grandchild = 8;
+    u8 intermediate = *child;
+    u8 resumed = *parent;
+    intermediate; resumed;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        let cfg = &function.reference_cfg;
+        let origin = |spelling: &str| {
+            let start = text.find(spelling).unwrap() as u32;
+            let point = cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact canonical loan");
+            assert_eq!(&cfg.initial_points[point.id.0], point);
+            let ReferenceOrigin::Fresh { loan, allocation } = sole_fact(function, point) else {
+                panic!("expected rooted allocation")
+            };
+            (loan, allocation)
+        };
+        let (root, owner) = origin("&!owner");
+        let (child, child_owner) = origin("&!(*parent)");
+        let (grandchild, grandchild_owner) = origin("&!(*child)");
+        assert_eq!(child.parent.as_deref(), Some(root));
+        assert_eq!(grandchild.parent.as_deref(), Some(child));
+        assert_eq!(child_owner, owner);
+        assert_eq!(grandchild_owner, owner);
+        assert!(matches!(grandchild.origin_place.projections.as_slice(),
+            [ReferencePlaceProjection::Dereference(parent)] if **parent == *child));
+    }
+}
+
+#[test]
+fn deferred_nested_reborrow_preserves_live_descendant_conflicts_without_partial_sealing() {
+    for (access, primary, tail) in [
+        ("u8 early = *child;", "*child;", "early;"),
+        ("*parent = 8;", "parent = 8", ""),
+        ("*!u8 sibling = &!(*parent);", "&!(*parent);", "u8 later = *sibling; later;"),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *!u8 grandchild = &!(*child);
+    {access}
+    u8 observed = *grandchild;
+    observed; {tail}
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let requested = text.rfind(primary).unwrap() as u32;
+        let descendant = text.find("&!(*child)").unwrap() as u32;
+        let children = [text.find("&!(*parent)").unwrap() as u32, descendant, requested];
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let diagnostic = diagnostics.iter().find(|diagnostic| {
+                diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+            }).unwrap_or_else(|| panic!("{access}: {diagnostics:?}"));
+            assert!(diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == descendant));
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            assert!(function.reference_cfg.initial_points.iter().all(|point|
+                !children.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_sibling_reborrows_require_last_use_before_the_next_loan() {
+    for (body, overlaps) in [
+        ("*left = 8; *!u8 right = &!(*child); *right = 9;", false),
+        ("*!u8 right = &!(*child); *left = 8; *right = 9;", true),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *!u8 left = &!(*child);
+    {body}
+    u8 intermediate = *child;
+    u8 resumed = *parent;
+    intermediate; resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        let sites = text.match_indices("&!(*child)").map(|(start, spelling)|
+            ByteSpan::new(start as u32, (start + spelling.len()) as u32)
+        ).collect::<Vec<_>>();
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if overlaps {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("expected exact live nested sibling conflict: {diagnostics:?}")
+                };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else {
+                    panic!("expected current and peer")
+                };
+                assert_eq!(requested.span.range, sites[1]);
+                assert_eq!(existing.span.range, sites[0]);
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || (point.source_span.range.start != direct && !sites.contains(&point.source_span.range))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let child = cfg.points.iter().find(|point| point.source_span.range.start == direct
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact direct child");
+            let ReferenceOrigin::Fresh { loan: child_loan, allocation } = sole_fact(function, child) else {
+                panic!("expected local allocation")
+            };
+            let nested = sites.iter().map(|site| cfg.points.iter().find(|point| point.source_span.range == *site
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact nested child")).collect::<Vec<_>>();
+            assert_ne!(nested[0].possible_origins, nested[1].possible_origins);
+            for point in nested {
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+                let ReferenceOrigin::Fresh { loan, allocation: nested_allocation } = sole_fact(function, point) else {
+                    panic!("expected rooted allocation")
+                };
+                assert_eq!(nested_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(child_loan));
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(parent)] if **parent == *child_loan));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_reborrow_in_a_contained_arm_resumes_ancestors_at_the_join() {
+    for bad in [false, true] {
+        let access = if bad { "u8 too_early = *child; too_early;" } else { "" };
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    if (choose) {{
+        *!u8 inside = &!(*child);
+        {access}
+        *inside = 8;
+    }};
+    u8 intermediate = *child;
+    u8 resumed = *parent;
+    intermediate; resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        let nested = text.find("&!(*child)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if bad {
+                let expected_read = text.find("*child; too_early").unwrap() as u32;
+                let diagnostic = diagnostics.iter().find(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == expected_read)
+                }).unwrap_or_else(|| panic!("expected ancestor conflict: {diagnostics:?}"));
+                assert!(diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == nested));
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || ![direct, nested].contains(&point.source_span.range.start)));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let find = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact canonical loan");
+            let (child, inside) = (find(direct), find(nested));
+            assert_ne!(child.scope, inside.scope);
+            assert_eq!(&cfg.initial_points[inside.id.0], inside);
+            let ReferenceOrigin::Fresh { loan: child, allocation } = sole_fact(function, child) else {
+                panic!("expected local allocation")
+            };
+            let ReferenceOrigin::Fresh { loan, allocation: inside_allocation } = sole_fact(function, inside) else {
+                panic!("expected rooted allocation")
+            };
+            assert_eq!(inside_allocation, allocation);
+            assert_eq!(loan.parent.as_deref(), Some(child));
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_reborrow_in_a_contained_arm_does_not_seal_a_transported_loan() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    u8 other = 9;
+    *!u8 parent = &!owner;
+    *!u8 carried = &!other;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    if (choose) {
+        *!u8 inside = &!(*child);
+        carried = inside;
+    };
+    u8 seen = *carried;
+    seen;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let starts = [text.find("&!(*parent)").unwrap() as u32, text.find("&!(*child)").unwrap() as u32];
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        assert!(function.reference_cfg.initial_points.iter().all(|point|
+            !starts.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}
+
+#[test]
+fn deferred_nested_shared_leaf_allows_reads_but_blocks_live_ancestor_writes() {
+    for (body, conflict) in [
+        ("u8 ancestor = *child; u8 seen = *shared; *child = 8; ancestor; seen;", None),
+        ("*child = 8; u8 seen = *shared; seen;", Some("child = 8")),
+        ("*parent = 8; u8 seen = *shared; seen;", Some("parent = 8")),
+    ] {
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *u8 shared = &(*child);
+    {body}
+    u8 resumed = *parent;
+    resumed;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        let leaf = text.find("&(*child)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(spelling) = conflict {
+                let requested = text.find(spelling).unwrap() as u32;
+                let diagnostic = diagnostics.iter().find(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                }).unwrap_or_else(|| panic!("expected shared-loan conflict: {diagnostics:?}"));
+                assert!(diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf));
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || ![direct, leaf].contains(&point.source_span.range.start)));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let find = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+            let shared = find(leaf);
+            assert_eq!(&cfg.initial_points[shared.id.0], shared);
+            let ReferenceOrigin::Fresh { loan: child, allocation } = sole_fact(function, find(direct)) else {
+                panic!("expected exact child")
+            };
+            let ReferenceOrigin::Fresh { loan, allocation: leaf_allocation } = sole_fact(function, shared) else {
+                panic!("expected exact leaf")
+            };
+            assert_eq!(leaf_allocation, allocation);
+            assert_eq!(loan.mode, ScalarReferenceMutability::Shared);
+            assert_eq!(loan.parent.as_deref(), Some(child));
+        }
+    }
+}
+
+#[test]
+fn deferred_nested_shared_leaf_does_not_seal_a_transported_handle() {
+    let text = r#"%%start
+unit(bool) inspect = fn(choose) {
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) { u8 inside = 9; inside; };
+    *!u8 child = &!(*parent);
+    *u8 shared = &(*child);
+    *u8 alias = null;
+    alias = shared;
+    u8 seen = *alias;
+    seen;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let sites = [text.find("&!(*parent)").unwrap() as u32, text.find("&(*child)").unwrap() as u32];
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        assert!(function.reference_cfg.initial_points.iter().all(|point|
+            !sites.contains(&point.source_span.range.start) || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}
+
+#[test]
+fn deferred_nested_shared_and_mutable_siblings_use_their_actual_live_modes() {
+    for (first_mutable, second_mutable, first_ends_early, conflicts) in [
+        (false, false, false, false),
+        (false, true, false, true),
+        (true, false, false, true),
+        (false, true, true, false),
+        (true, false, true, false),
+    ] {
+        let qualifier = |mutable| if mutable { "!" } else { "" };
+        let first_q = qualifier(first_mutable);
+        let second_q = qualifier(second_mutable);
+        let observe_first = "u8 seen_first = *first;";
+        let early = if first_ends_early { observe_first } else { "" };
+        let late = if first_ends_early { "" } else { observe_first };
+        let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 inside = 9; inside; }};
+    *!u8 child = &!(*parent);
+    *{first_q}u8 first = &{first_q}(*child);
+    {early}
+    *{second_q}u8 second = &{second_q}(*child);
+    {late}
+    u8 seen_second = *second;
+    *child = 8;
+    seen_first; seen_second;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let find_address = |binding, q| {
+            let spelling = format!("{binding} = &{q}(*child)");
+            let start = text.find(&spelling).expect("written sibling") + spelling.find('&').unwrap();
+            ByteSpan::new(start as u32, start as u32 + format!("&{q}(*child)").len() as u32)
+        };
+        let first_span = find_address("first", first_q);
+        let second_span = find_address("second", second_q);
+        let direct = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if conflicts {
+                let [diagnostic] = diagnostics.as_slice() else {
+                    panic!("expected one live mixed-mode conflict: {diagnostics:?}")
+                };
+                assert_eq!(diagnostic.code, "B0003");
+                assert_eq!(diagnostic.message, "read or move of unavailable place");
+                let [requested, existing] = diagnostic.labels.as_slice() else {
+                    panic!("expected current and peer")
+                };
+                assert_eq!(requested.span.range, second_span);
+                assert_eq!(existing.span.range, first_span);
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || (point.source_span.range.start != direct && ![first_span, second_span].contains(&point.source_span.range))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let child = cfg.points.iter().find(|point| point.source_span.range.start == direct
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("exact direct child");
+            let ReferenceOrigin::Fresh { loan: child_loan, allocation } = sole_fact(function, child) else {
+                panic!("expected local allocation")
+            };
+            for (span, mutable) in [(first_span, first_mutable), (second_span, second_mutable)] {
+                let point = cfg.points.iter().find(|point| point.source_span.range == span
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed sibling");
+                assert_eq!(&cfg.initial_points[point.id.0], point);
+                let ReferenceOrigin::Fresh { loan, allocation: nested_allocation } = sole_fact(function, point) else {
+                    panic!("expected rooted allocation")
+                };
+                assert_eq!(nested_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(child_loan));
+                assert_eq!(loan.mode, if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared });
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_direct_shared_leaf_uses_exact_local_or_formal_root() {
+    for (parameters, formal, setup) in [
+        ("bool", "", "u8 owner = 7; *!u8 parent = &!owner;"),
+        ("*!u8, bool", "parent, ", ""),
+    ] {
+        for (body, result) in [
+            ("u8 prior = *parent; u8 observed = *leaf; *parent = 8; prior; observed;", 0),
+            ("*parent = 8; u8 observed = *leaf; observed;", 1),
+            ("*u8 copy = null; copy = leaf; u8 observed = *copy; observed;", 2),
+        ] {
+            let text = format!(r#"%%start
+unit({parameters}) inspect = fn({formal}choose) {{
+    {setup}
+    if (choose) {{ u8 ignored = 9; ignored; }};
+    *u8 leaf = &(*parent);
+    {body}
+}};
+%%end"#);
+            let (single, project) = both_reference_functions(&text);
+            let leaf = text.find("&(*parent)").unwrap() as u32;
+            for (items, diagnostics) in [
+                (&single.program.items, &single.diagnostics),
+                (&project.project.modules[0].items, &project.diagnostics),
+            ] {
+                let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+                let cfg = &function.reference_cfg;
+                let point = cfg.initial_points.iter().find(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. } | CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. })))
+                    .expect("canonical loan or deferred expression");
+                if result != 0 {
+                    assert!(matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+                        && point.possible_origins.is_none());
+                    if result == 2 {
+                        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+                    } else {
+                        let requested = text.find("parent = 8").unwrap() as u32;
+                        assert!(diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                        }), "{diagnostics:?}");
+                    }
+                    continue;
+                }
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                assert!(matches!(point.kind, CfgPointKind::Borrow { .. }));
+                assert_eq!(point, &cfg.points[point.id.0]);
+                let loan = match (formal.is_empty(), sole_fact(function, point)) {
+                    (true, ReferenceOrigin::Fresh { loan, .. }) => loan,
+                    (false, ReferenceOrigin::BorrowedFrom { parameter: 0, loan }) => loan,
+                    _ => panic!("expected precise root provenance"),
+                };
+                assert_eq!(loan.mode, ScalarReferenceMutability::Shared);
+                let ancestor = loan.parent.as_deref().expect("canonical immediate root");
+                assert_eq!(ancestor.mode, ScalarReferenceMutability::Mutable);
+                assert!(ancestor.parent.is_none());
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(parent)] if **parent == *ancestor));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_direct_shared_in_a_contained_arm_ends_at_arm_exit() {
+    for bad in [false, true] {
+        let access = if bad { "*parent = 8;" } else { "u8 prior = *parent; prior;" };
+        let text = format!(r#"%%start
+u8(bool) update = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    if (choose) {{
+        *u8 leaf = &(*parent);
+        {access}
+        u8 seen = *leaf;
+        seen;
+    }};
+    *parent = 11;
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        let root = text.find("&!owner").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if bad {
+                let requested = text.find("parent = 8").unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                }), "{diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && point.possible_origins.is_none()
+                    && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))));
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let borrow = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+            let (root, branch) = (borrow(root), borrow(leaf));
+            assert_ne!(root.scope, branch.scope);
+            assert_eq!(&cfg.initial_points[branch.id.0], branch);
+            let ReferenceOrigin::Fresh { loan: root, allocation } = sole_fact(function, root) else {
+                panic!("expected exact local root")
+            };
+            let ReferenceOrigin::Fresh { loan: shared, allocation: leaf_allocation } = sole_fact(function, branch) else {
+                panic!("expected exact shared leaf")
+            };
+            assert_eq!(leaf_allocation, allocation);
+            assert_eq!(shared.mode, ScalarReferenceMutability::Shared);
+            assert_eq!(shared.parent.as_deref(), Some(root));
+        }
+    }
+}
+
+#[test]
+fn deferred_shared_reborrow_does_not_infer_escape_for_checked_reference_result() {
+    let text = r#"%%start
+*u8(*!u8, bool) inspect = fn(parent, choose) {
+    if (choose) { u8 marker = 9; marker; };
+    *u8 leaf = &(*parent);
+    leaf
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let leaf = text.find("&(*parent)").unwrap() as u32;
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "missing required dereference origin"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == leaf)
+        }), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+        assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+            || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+    }
+}
+
+#[test]
+fn deferred_shared_leaf_copy_keeps_one_loan_live_under_either_binding() {
+    for root in ["parent", "child"] {
+        for (body, expected) in [
+            ("u8 seen = *alias; *parent = 11; seen;", 0),
+            ("*parent = 11; u8 seen = *alias; seen;", 1),
+            ("u8 prior = *alias; *parent = 11; u8 seen = *leaf; prior; seen;", 1),
+            ("*u8 copy = alias; u8 seen = *copy; seen;", 2),
+            ("*u8 copy = null; copy = alias; u8 seen = *copy; seen;", 2),
+        ] {
+            let child = if root == "child" { "*!u8 child = &!(*parent);" } else { "" };
+            let text = format!(r#"%%start
+unit(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    {child}
+    *u8 leaf = &(*{root});
+    *u8 alias = leaf;
+    {body}
+}};
+%%end"#);
+            let (single, project) = both_reference_functions(&text);
+            let leaf = text.find(&format!("&(*{root})")).unwrap() as u32;
+            let alias_read = (text.find("alias = leaf").unwrap() + "alias = ".len()) as u32;
+            for (items, diagnostics) in [
+                (&single.program.items, &single.diagnostics),
+                (&project.project.modules[0].items, &project.diagnostics),
+            ] {
+                let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+                let cfg = &function.reference_cfg;
+                if expected != 0 {
+                    assert!(cfg.initial_points.iter().any(|point| {
+                        point.source_span.range.start == leaf && point.possible_origins.is_none()
+                            && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))
+                    }), "{root}, case {body}: {diagnostics:?}");
+                    if expected == 2 {
+                        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                            && diagnostic.message == "missing required dereference origin"), "{diagnostics:?}");
+                    } else {
+                        let write = text.find("parent = 11").unwrap() as u32;
+                        assert!(diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                        }), "{diagnostics:?}");
+                    }
+                    continue;
+                }
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                let borrow = cfg.points.iter().find(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+                assert_eq!(&cfg.initial_points[borrow.id.0], borrow);
+                let read = cfg.points.iter().find(|point| point.source_span.range.start == alias_read
+                    && matches!(point.kind, CfgPointKind::Read { .. })).expect("exact alias initializer");
+                let [bind] = read.successors.as_slice() else { panic!("immediate alias binding") };
+                let bind = &cfg.points[bind.0];
+                assert!(matches!(bind.kind, CfgPointKind::Bind { .. }));
+                assert_eq!(borrow.possible_origins, read.possible_origins);
+                assert_eq!(borrow.possible_origins, bind.possible_origins);
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_local_owner_store_requires_every_actual_borrowers_last_use() {
+    for (body, blocking) in [
+        ("u8 copied = *alias; u8 original = *leaf; u8 root = *parent; owner = 11; copied; original; root;", None),
+        ("u8 original = *leaf; owner = 11; u8 copied = *alias; copied; original;", Some("&(*parent)")),
+        ("u8 copied = *alias; owner = 11; u8 original = *leaf; copied; original;", Some("&(*parent)")),
+        ("u8 copied = *alias; u8 original = *leaf; owner = 11; u8 root = *parent; copied; original; root;", Some("&!owner")),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    *u8 leaf = &(*parent);
+    *u8 alias = leaf;
+    {body}
+    owner
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let write = text.find("owner = 11").unwrap() as u32;
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(blocking) = blocking {
+                let blocking = text.find(blocking).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == blocking)
+                }), "{body}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && point.possible_origins.is_none()
+                    && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. }))));
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == leaf
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })));
+                assert!(cfg.points.iter().any(|point| point.source_span.range.start == write
+                    && matches!(&point.kind, CfgPointKind::Assign { target, .. } if target.projections.is_empty())));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_local_owner_store_does_not_weaken_structural_exclusions() {
+    for (early, late) in [
+        ("owner = 11;", ""),
+        ("", "if (choose) { owner = 11; };"),
+        ("", "u8 other = 3; owner, other = 11, 13; other;"),
+        ("", "parent = null;"),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ u8 marker = 9; marker; }};
+    {early}
+    *u8 leaf = &(*parent);
+    u8 observed = *leaf;
+    {late}
+    observed; owner
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"), "{early}; {late}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+                || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+        }
+    }
+}
+
+#[test]
+fn deferred_mutable_reborrow_inside_a_contained_arm_checks_ancestors_and_siblings() {
+    for (access, requested) in [
+        ("*leaf = 8;", None),
+        ("u8 early = *parent; early; *leaf = 8;", Some("*parent;")),
+        ("*parent = 8; *leaf = 9;", Some("parent = 8")),
+        ("*u8 rival = &(*parent); *leaf = 8; u8 seen = *rival; seen;", Some("&(*parent)")),
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ bool marker = true; marker; }};
+    if (choose) {{
+        *!u8 leaf = &!(*parent);
+        {access}
+    }} else {{
+        *parent = 9;
+    }};
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let root = text.find("&!owner").unwrap() as u32;
+        let leaf = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            let cfg = &function.reference_cfg;
+            if let Some(requested) = requested {
+                let requested = text.find(requested).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == leaf)
+                }), "{access}: {diagnostics:?}");
+                assert!(cfg.initial_points.iter().all(|point| !matches!(point.kind, CfgPointKind::Borrow { .. })
+                    || ![leaf, requested].contains(&point.source_span.range.start)));
+            } else {
+                assert!(diagnostics.is_empty(), "{access}: {diagnostics:?}");
+                let find = |start| cfg.points.iter().find(|point| point.source_span.range.start == start
+                    && matches!(point.kind, CfgPointKind::Borrow { .. })).expect("sealed loan");
+                let (root, child) = (find(root), find(leaf));
+                assert_ne!(root.scope, child.scope);
+                assert_eq!(&cfg.initial_points[child.id.0], child);
+                let ReferenceOrigin::Fresh { loan: root_loan, allocation } = sole_fact(function, root) else {
+                    panic!("expected exact local borrow")
+                };
+                let ReferenceOrigin::Fresh { loan, allocation: child_allocation } = sole_fact(function, child) else {
+                    panic!("expected exact scoped loan")
+                };
+                assert_eq!(child_allocation, allocation);
+                assert_eq!(loan.parent.as_deref(), Some(root_loan));
+                assert_eq!(loan.mode, ScalarReferenceMutability::Mutable);
+                let write = text.find("leaf = 8").unwrap() as u32;
+                let writer = cfg.points.iter().find(|point| point.source_span.range.start == write
+                    && matches!(point.kind, CfgPointKind::AssignThrough { .. })).expect("actual scoped scalar store");
+                assert!(matches!(&writer.kind, CfgPointKind::AssignThrough { candidates, .. }
+                    if matches!(candidates.as_slice(), [candidate] if &candidate.loan == loan)));
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_mutable_reborrow_inside_a_contained_arm_rejects_noncanonical_holder_use() {
+    for body in [
+        "&!(*parent);",
+        "*!u8 leaf = &!(*parent); *!u8 forwarded = leaf; u8 seen = *forwarded; seen;",
+        "*!u8 leaf = &!(*parent); owner = 8; *leaf = 9;",
+    ] {
+        let text = format!(r#"%%start
+u8(bool) inspect = fn(choose) {{
+    u8 owner = 7;
+    *!u8 parent = &!owner;
+    if (choose) {{ bool marker = true; marker; }};
+    if (choose) {{ {body} }};
+    *parent
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let leaf = text.find("&!(*parent)").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "missing required dereference origin"), "{body}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected checked callable") };
+            assert!(function.reference_cfg.initial_points.iter().all(|point| point.source_span.range.start != leaf
+                || !matches!(point.kind, CfgPointKind::Borrow { .. })));
+        }
+    }
+}
+
+#[test]
+fn known_checked_loans_track_disjoint_fields_and_block_live_whole_owner_writes() {
+    for (field, early, late, failure) in [
+        ("left", "", "", Some("second")),
+        ("right", "", "", None),
+        ("right", "", "owner = { .left = 3; .right = 4; }; owner.left;", None),
+        ("right", "owner = { .left = 3; .right = 4; };", "", Some("owner")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!u8 first = &!owner.left;
+    *!u8 second = &!owner.{field};
+    {early}
+    *first = 8;
+    *second = 9;
+    u8 a = *first;
+    u8 b = *second;
+    {late}
+    a; b;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let initial = text.find("&!owner.left").unwrap() as u32;
+        let sibling = (text.find("second = ").unwrap() + "second = ".len()) as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+            let cfg = &function.reference_cfg;
+            let expected_fields = [(initial, 0), (sibling, if field == "right" { 1 } else { 0 })];
+            for (address, field) in expected_fields {
+                let point = cfg.initial_points.iter().find(|point| point.source_span.range.start == address
+                    && matches!(point.kind, CfgPointKind::Borrow { .. }))
+                    .unwrap_or_else(|| panic!("direct typed borrow at {address}: {diagnostics:?}"));
+                let ReferenceOrigin::Fresh { loan, .. } = sole_fact(function, point) else { panic!("exact field allocation") };
+                assert!(matches!(loan.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(resolved))]
+                        if loan.parent.is_none() && resolved.index == field));
+            }
+            if let Some(failure) = failure {
+                let requested = if failure == "second" { sibling } else { text.find("owner =").unwrap() as u32 };
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == requested)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == initial)
+                }), "{field}; {early}: {diagnostics:?}");
+                continue;
+            }
+            assert!(diagnostics.is_empty(), "{field}; {late}: {diagnostics:?}");
+            for (name, (loan_start, _)) in [("first = 8", expected_fields[0]), ("second = 9", expected_fields[1])] {
+                let store = text.find(name).unwrap() as u32;
+                let write = cfg.points.iter().find(|point| point.source_span.range.start == store
+                    && matches!(point.kind, CfgPointKind::AssignThrough { .. })).expect("exact checked field write");
+                assert!(matches!(&write.kind, CfgPointKind::AssignThrough { candidates, .. }
+                    if matches!(candidates.as_slice(), [candidate] if candidate.loan.creation_span.start == loan_start)));
+            }
+        }
+    }
+}
+
+#[test]
+fn known_shared_field_loans_block_only_a_write_to_their_actual_whole_owner() {
+    for (prefix, store, conflicts) in [
+        ("", "owner = { .left = 3; .right = 4; };", true),
+        ("Pair other = { .left = 1; .right = 2; };",
+            "other = { .left = 3; .right = 4; }; other.left;", false),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {prefix}
+    *u8 left = &owner.left;
+    *u8 right = &owner.right;
+    {store}
+    u8 a = *left;
+    u8 b = *right;
+    a; b;
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find("&owner.left").unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()))
+                .unwrap_or_else(|| panic!("known direct shared field loan: {diagnostics:?}"));
+            if conflicts {
+                let write = text.find("owner =").unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }), "{store}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{store}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn known_field_loan_in_one_arm_does_not_affect_another_arms_same_spelling_owner() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(bool) inspect = fn(choose) {
+    if (choose) {
+        Pair owner = { .left = 1; .right = 2; };
+        *u8 left = &owner.left;
+        u8 seen = *left;
+        seen;
+    } else {
+        Pair owner = { .left = 1; .right = 2; };
+        owner = { .left = 3; .right = 4; };
+        owner.left;
+    };
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("expected typed callable") };
+        let cfg = &function.reference_cfg;
+        let borrowed = cfg.initial_points.iter().find_map(|point| match &point.kind {
+            CfgPointKind::Borrow { place, loan } if loan.parent.is_none() && !place.projections.is_empty() =>
+                Some(&place.binding),
+            _ => None,
+        }).expect("borrowed owner");
+        let written = cfg.initial_points.iter().find_map(|point| match &point.kind {
+            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => Some(&target.binding),
+            _ => None,
+        }).expect("other owner written");
+        assert_ne!(borrowed, written);
+    }
+}
+
+#[test]
+fn known_direct_copy_reads_respect_the_live_mode_and_extent_of_a_field_loan() {
+    for (prefix, body, conflict) in [
+        ("!", "u8 disjoint = owner.right; u8 seen = *leaf; disjoint; seen;", None),
+        ("", "Pair snapshot = owner; u8 seen = *leaf; snapshot.right; seen;", None),
+        ("!", "u8 seen = *leaf; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = *leaf; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "u8 overlap = owner.left; u8 seen = *leaf; overlap; seen;", Some("owner.left; u8 seen")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *{prefix}u8 leaf = &{prefix}owner.left;
+    {body}
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find(&format!("&{prefix}owner.left")).unwrap() as u32;
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none()
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0)
+                    && loan.mode == if prefix.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }))
+                .unwrap_or_else(|| panic!("known direct field loan: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let read = text.find(conflict).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == read)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }), "{prefix}; {body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{prefix}; {body}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn known_direct_consuming_reads_do_not_repeat_the_existing_move_conflict() {
+    let text = r#"%%start
+struct Pair { u8 left; u8 right; }
+unit(Pair) inspect = fn(owner) {
+    *!u8 leaf = &!owner.left;
+    Pair moved = owner;
+    u8 seen = *leaf;
+    moved.right; seen;
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let source = text.find("owner;").unwrap() as u32;
+    let loan = text.find("&!owner.left").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        let conflicts = diagnostics.iter().filter(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == source)
+                && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == loan)
+        }).count();
+        assert_eq!(conflicts, 1, "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn known_whole_loan_checks_direct_owner_copy_reads_and_writes_until_last_use() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "Pair snapshot = owner; u8 seen = (*holder).left; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*holder).left; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*holder).left; owner = { .left = 7; .right = 8; }; owner.right; seen;", None),
+        ("", "u8 seen = (*holder).left; owner = { .left = 7; .right = 8; }; owner.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = (*holder).left; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "u8 direct = owner.right; u8 seen = (*holder).left; direct; seen;", Some("owner.right; u8 seen")),
+        ("!", "owner = { .left = 7; .right = 8; }; u8 seen = (*holder).left; seen;", Some("owner =")),
+        ("", "owner = { .left = 7; .right = 8; }; u8 seen = (*holder).left; seen;", Some("owner =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *{mode}Pair holder = &{mode}owner;
+    {body}
+}};
+%%end"#);
+        let (single, project) = both_reference_functions(&text);
+        let loan = text.find(&format!("&{mode}owner")).unwrap() as u32;
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| point.source_span.range.start == loan
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none()
+                    && loan.origin_place.projections.is_empty()
+                    && matches!(loan.origin_place.place, ScalarPlace::Name { .. })
+                    && loan.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }))
+                .unwrap_or_else(|| panic!("known direct whole loan: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                if !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003" && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)
+                }) {
+                    missed.push((validator, mode, conflict, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode}; {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_projected_shared_leaf_stays_with_its_exact_named_shared_owner_and_holder() {
+    for (body, conflict) in [
+        ("u8 read = *leaf; u8 base = (*parent).right; owner = { .left = 3; .right = 4; }; read; base;", None),
+        ("u8 direct = owner.right; u8 base = (*parent).left; u8 read = *leaf; direct; base; read;", None),
+        ("owner = { .left = 3; .right = 4; }; u8 read = *leaf; read;", Some("owner =")),
+        ("owner.left = 3; u8 base = (*parent).right; u8 read = *leaf; base; read;", Some("left =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *Pair parent = &owner;
+    *u8 leaf = &(*parent).left;
+    {body}
+}};
+%%end"#);
+        let root = text.find("&owner").unwrap() as u32;
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| {
+                point.source_span.range.start == projected
+                    && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                        if loan.mode == ScalarReferenceMutability::Shared
+                            && loan.parent.as_deref().is_some_and(|parent| {
+                                parent.creation_span.start == root
+                                    && parent.mode == ScalarReferenceMutability::Shared
+                                    && parent.origin_place.binding == place.binding
+                            })
+                            && matches!(place.projections.as_slice(),
+                                [ReferencePlaceProjection::Dereference(_),
+                                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                                if field.index == 0))
+            }).unwrap_or_else(|| panic!("actual projected checked borrow: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                assert!(function.reference_cfg.points[borrow.id.0].possible_origins.as_ref()
+                    .is_some_and(|origins| origins.len() == 1));
+            }
+        }
+    }
+}
+
+#[test]
+fn root_projected_leaf_can_be_read_in_a_contained_conditional() {
+    for (marker, before, after, blocked) in [
+        ("", "", "owner.left = 9;", false),
+        ("", "owner.left = 9;", "", true),
+        ("!", "", "owner.left = 9;", false),
+        ("!", "owner.left = 9;", "", true),
+    ] {
+        let text = format!("%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, choose) {{ *{marker}Pair parent = &{marker}owner; *{marker}u8 leaf = &{marker}(*parent).left; {before} if (choose) {{ u8 a = *leaf; a; }} else {{ u8 b = *leaf; b; }}; {after} }};
+%%end");
+        let (single, project) = both_reference_functions(&text);
+        let child_span = text.find(&format!("&{marker}(*parent).left")).unwrap() as u32;
+        let mode = if marker.is_empty() { ScalarReferenceMutability::Shared }
+            else { ScalarReferenceMutability::Mutable };
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let child = cfg.initial_points.iter().find(|point| point.source_span.range.start == child_span
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.parent.as_ref().is_some_and(|parent| parent.mode == mode) && loan.mode == mode)).unwrap();
+            let observed = cfg.points[child.id.0].possible_origins.as_ref().unwrap();
+            assert_eq!(observed.len(), 1, "{diagnostics:#?}");
+            if blocked {
+                let write = text.find("owner.left =").unwrap() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start >= write
+                        && label.span.range.start < write + "owner.left =".len() as u32)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == child.source_span.range)),
+                    "{diagnostics:#?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn known_projected_shared_leaf_keeps_noncanonical_transports_closed() {
+    for (parent, body, child) in [
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; leaf = null;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "&(*parent).left;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { *u8 alias = leaf; u8 read = *alias; read; };", "&(*parent).left"),
+        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;", "&(*parent).left"),
+        ("*!Pair parent = &!owner;", "*!u8 leaf = &!(*parent).left; if (true) { *!u8 alias = leaf; *alias = 9; };", "&!(*parent).left"),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {parent}
+    {body}
+}};
+%%end"#);
+        let projected = text.find(child).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                "{parent} {body}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn known_projected_shared_leaf_rejects_nonlocal_authority_and_result_forms() {
+    let declarations = "struct copy Nested { u8 value; }\nstruct copy Pair { u8 left; Nested nested; u8[2] bytes; }";
+    let standard = "*Pair parent = &owner; *u8 leaf = &(*parent).left;";
+    for (name, definitions, target) in [
+        ("return", format!("*u8(Pair) inspect = fn(owner) {{ {standard} leaf }};"), "&(*parent).left"),
+        ("call", format!("unit(*u8) consume = fn(value) {{ value; }}; unit(Pair) inspect = fn(owner) {{ {standard} consume(leaf); }};"), "&(*parent).left"),
+        ("raw owner", format!("unit(Pair) inspect = fn(owner) {{ unsafe {{ &?owner; }}; {standard} u8 value = *leaf; value; }};"), "&(*parent).left"),
+        ("borrowed formal", "unit(*Pair) inspect = fn(parent) { *u8 leaf = &(*parent).left; u8 value = *leaf; value; };".into(), "&(*parent).left"),
+        ("raw parent", "unit(*?Pair) inspect = fn(parent) { *u8 leaf = &(*parent).left; u8 value = *leaf; value; };".into(), "&(*parent).left"),
+        ("aggregate leaf", "unit(Pair) inspect = fn(owner) { *Pair parent = &owner; *Nested leaf = &(*parent).nested; leaf; };".into(), "&(*parent).nested"),
+        ("indexed leaf", "unit(Pair) inspect = fn(owner) { *Pair parent = &owner; *u8 leaf = &(*parent).bytes[0]; leaf; };".into(), "&(*parent).bytes"),
+    ] {
+        let text = format!("%%start\n{declarations}\n{definitions}\n%%end");
+        let range = text.find(target).expect("projected expression") as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == range)),
+                "{name}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn known_shared_named_reborrow_preserves_mutable_ancestor_through_last_child_use() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "Pair snapshot = owner; u8 seen = (*child).left; snapshot.right; seen;", None),
+        ("!", "u8 seen = (*child).left; Pair snapshot = owner; snapshot.right; seen;", None),
+        ("!", "Pair snapshot = owner; u8 seen = (*child).left; snapshot.right; seen;", Some("owner; u8 seen")),
+        ("!", "if (flag) { u8 seen = (*child).left; seen; }; Pair snapshot = owner; snapshot.right;", None),
+        ("!", "u8 direct = owner.right; u8 seen = (*child).left; direct; seen;", Some("owner.right; u8 seen")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    flag;
+    *{mode}Pair parent = &{mode}owner;
+    *Pair child = &(*parent);
+    {body}
+}};
+%%end"#);
+        let root = text.find(&format!("&{mode}owner")).unwrap() as u32;
+        let child = text.find("&(*parent)").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let borrow = function.reference_cfg.initial_points.iter().find(|point| {
+                point.source_span.range.start == child
+                    && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                        if loan.mode == ScalarReferenceMutability::Shared
+                            && loan.parent.as_deref().is_some_and(|parent| {
+                                parent.creation_span.start == root
+                                    && parent.origin_place.binding == place.binding
+                                    && parent.mode == if mode.is_empty() {
+                                        ScalarReferenceMutability::Shared
+                                    } else {
+                                        ScalarReferenceMutability::Mutable
+                                    }
+                            }))
+            }).unwrap_or_else(|| panic!("actual whole-name checked reborrow: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.find(conflict).unwrap() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range))
+                {
+                    missed.push((validator, conflict, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_shared_child_of_mutable_field_preserves_disjoint_owner_reads() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+u8(Pair) inspect = fn(owner) {
+    *!u8 parent = &!owner.left;
+    *u8 child = &(*parent);
+    *u8 peer = &owner.right;
+    owner.right + *child + *peer
+};
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    let child_span = text.find("&(*parent)").unwrap() as u32;
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        assert!(function.reference_cfg.points.iter().any(|point| {
+            point.source_span.range.start == child_span
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Shared
+                        && loan.parent.as_deref().is_some_and(|parent| {
+                            parent.mode == ScalarReferenceMutability::Mutable
+                                && matches!(parent.origin_place.projections.as_slice(),
+                                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0)
+                        }))
+        }));
+    }
+}
+
+#[test]
+fn known_projected_shared_leaf_does_not_originate_a_loan_from_a_null_parent() {
+    let plain = "%%start\nu8() plain = fn { *u8 pointer = null; *pointer };\n%%end";
+    let checked_read = plain.find("*pointer").unwrap() as u32;
+    let (single, project) = both_reference_functions(plain);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "plain checked null stays a runtime guard: {diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        let cfg = &function.reference_cfg;
+        let checked = cfg.points.iter().find(|point| point.source_span.range.start == checked_read
+            && matches!(point.kind, CfgPointKind::ReadPlace { pointer_point: Some(_), .. }))
+            .expect("plain checked scalar dereference");
+        let CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. } = &checked.kind else { unreachable!() };
+        let pointer = &cfg.points[pointer.0];
+        assert!(matches!(pointer.kind, CfgPointKind::Read { .. })
+            && pointer.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1
+                && origins.first().is_some_and(|origin|
+                    matches!(cfg.facts.get(origin.0), Some(ReferenceOrigin::Null { .. })))));
+
+    }
+    for (parent, null_kind) in [
+        ("*Pair parent = &owner;", None),
+        ("*Pair parent = null;", Some(false)),
+        ("*Pair parent = &owner; parent = null;", Some(false)),
+        ("*Pair parent = &owner; if (flag) { parent = null; };", Some(true)),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    owner.left;
+    flag;
+    {parent}
+    *u8 leaf = &(*parent).left;
+    u8 value = *leaf;
+    value;
+}};
+%%end"#);
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let initial_parent = text.find("&owner").map(|offset| offset as u32);
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let expressions = cfg.points.iter().filter(|point| point.source_span.range.start == projected).collect::<Vec<_>>();
+            let bind = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Bind { binding }
+                if binding.declaration_span.start == holder));
+            let read = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding }
+                if binding.declaration_span.start == holder));
+            let useful_origins = |point: &ReferenceFlowPoint| {
+                point.possible_origins.iter().flatten().copied()
+                    .filter(|origin| matches!(cfg.facts.get(origin.0), Some(ReferenceOrigin::Fresh { .. }
+                        | ReferenceOrigin::BorrowedFrom { .. })))
+                    .collect::<BTreeSet<_>>()
+            };
+            match null_kind {
+                None => {
+                    let expr = expressions.iter().copied().find(|point| {
+                        matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                            if loan.mode == ScalarReferenceMutability::Shared
+                                && loan.parent.as_ref().is_some_and(|parent| Some(parent.creation_span.start) == initial_parent))
+                    }).unwrap_or_else(|| panic!("actual projected authority: {diagnostics:?}; {expressions:?}"));
+                    let expected = useful_origins(expr);
+                    assert!(diagnostics.is_empty() && expected.len() == 1, "{diagnostics:?}; {expr:?}");
+                    assert_eq!(useful_origins(bind.expect("child holder")), expected);
+                    assert_eq!(useful_origins(read.expect("actual child read")), expected);
+                }
+                Some(false) => {
+                    assert!(expressions.iter().copied().chain(bind).chain(read)
+                        .all(|point| useful_origins(point).is_empty()), "{parent}: {diagnostics:?}; {expressions:?}; {bind:?}; {read:?}");
+                }
+                Some(true) => {
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                        "{parent}: {diagnostics:?}; {expressions:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn known_shared_named_reborrow_retains_exclusive_parent_against_new_owner_loans() {
+    let mut missed = Vec::new();
+    for (mode, body, conflict) in [
+        ("", "*Pair peer = &owner; u8 left = (*child).left; u8 right = (*peer).right; left; right;", false),
+        ("!", "u8 left = (*child).left; *Pair peer = &owner; u8 right = (*peer).right; left; right;", false),
+        ("!", "*Pair peer = &(*parent); u8 left = (*child).left; u8 right = (*peer).right; left; right;", false),
+        ("!", "if (flag) { u8 left = (*child).left; left; }; *Pair peer = &owner; (*peer).right;", false),
+        ("!", "*Pair peer = &owner; u8 left = (*child).left; u8 right = (*peer).right; left; right;", true),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair, bool) inspect = fn(owner, flag) {{
+    flag;
+    *{mode}Pair parent = &{mode}owner;
+    *Pair child = &(*parent);
+    {body}
+}};
+%%end"#);
+        let active_child = text.find("&(*parent)").unwrap() as u32;
+        let requested = text.rfind("&owner").map(|offset| offset as u32);
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let held_child = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == active_child
+                    && loan.mode == ScalarReferenceMutability::Shared
+                    && loan.parent.as_deref().is_some_and(|parent|
+                        parent.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} {mode} {body}: {diagnostics:?}"));
+            if let Some(requested) = requested {
+                assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == requested
+                    && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                        if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+                            && loan.origin_place.projections.is_empty()
+                            && loan.origin_place.binding == held_child.origin_place.binding)),
+                    "{validator} {mode} {body}: {diagnostics:?}");
+            }
+            if conflict {
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| Some(label.span.range.start) == requested)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == active_child))
+                {
+                    missed.push((validator, body, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {mode} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_shared_projected_child_retains_whole_parent_against_new_mutable_field_loans() {
+    let mut missed = Vec::new();
+    for (parent, child, body, whole_parent, early) in [
+        ("*Pair parent = &owner;", "&(*parent).left", "*!u8 peer = &!owner.right; u8 left = *child; u8 right = *peer; left; right;", true, true),
+        ("*Pair parent = &owner;", "&(*parent).left", "u8 left = *child; *!u8 peer = &!owner.right; u8 right = *peer; left; right;", true, false),
+        ("*u8 parent = &owner.left;", "&(*parent)", "*!u8 peer = &!owner.right; u8 left = *child; u8 right = *peer; left; right;", false, false),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    {parent}
+    *u8 child = {child};
+    {body}
+}};
+%%end"#);
+        let root_span = text.find("&owner").unwrap() as u32;
+        let child_span = text.find(child).unwrap() as u32;
+        let peer_span = text.find("&!owner.right").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let child = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == child_span
+                    && loan.mode == ScalarReferenceMutability::Shared
+                    && loan.parent.as_deref().is_some_and(|parent| parent.mode == ScalarReferenceMutability::Shared
+                        && parent.creation_span.start == root_span
+                        && parent.origin_place.projections.is_empty() == whole_parent) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} {parent} {body}: {diagnostics:?}"));
+            if whole_parent {
+                assert!(matches!(child.origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                        if field.index == 0));
+            } else {
+                assert!(matches!(child.origin_place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_)]));
+                assert!(matches!(child.parent.as_ref().unwrap().origin_place.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 0));
+            }
+            assert!(cfg.initial_points.iter().any(|point| point.source_span.range.start == peer_span
+                && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
+                    if loan.mode == ScalarReferenceMutability::Mutable && loan.parent.is_none()
+                        && loan.origin_place.binding == child.origin_place.binding
+                        && matches!(loan.origin_place.projections.as_slice(),
+                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == 1))),
+                "{validator} {parent} {body}: {diagnostics:?}");
+            if early {
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == peer_span)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == child_span))
+                {
+                    missed.push((validator, body, diagnostics.clone()));
+                }
+            } else {
+                assert!(diagnostics.is_empty(), "{validator} {parent} {body}: {diagnostics:?}");
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_projected_shared_leaf_retains_mutable_whole_parent_until_its_last_use() {
+    for (body, conflict) in [
+        ("u8 next = (*parent).right; u8 value = *leaf; next; value;", None),
+        ("u8 value = *leaf; (*parent).left = 3; u8 next = owner.right; value; next;", None),
+        ("u8 value = *leaf; (*parent).left = 3; *!u8 next = &!owner.right; *next; value;", None),
+        ("u8 next = owner.right; u8 value = *leaf; next; value;", Some("owner.right")),
+        ("*u8 next = &owner.right; u8 value = *leaf; *next; value;", Some("&owner.right")),
+        ("*!u8 next = &!owner.right; u8 value = *leaf; *next; value;", Some("&!owner.right")),
+        ("owner.left = 3; u8 value = *leaf; value;", Some("owner.left")),
+        ("(*parent).left = 3; u8 value = *leaf; value;", Some("(*parent).left")),
+        ("*!Pair next = &!(*parent); u8 value = *leaf; u8 other = (*next).right; value; other;", Some("&!(*parent)")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *u8 leaf = &(*parent).left;
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == projected
+                && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                    if loan.mode == ScalarReferenceMutability::Shared
+                        && loan.parent.as_deref().is_some_and(|root| {
+                            root.creation_span.start == parent
+                                && root.mode == ScalarReferenceMutability::Mutable
+                                && root.origin_place.binding == place.binding
+                                && root.origin_place.projections.is_empty()
+                        })
+                        && matches!(place.projections.as_slice(),
+                            [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == 0)))
+                .unwrap_or_else(|| panic!("actual Mutable→Shared projected borrow: {body}: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                let child = &cfg.points[borrow.id.0].possible_origins;
+                assert!(child.as_ref().is_some_and(|origins| origins.len() == 1));
+                for operation in [
+                    cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding.declaration_span.start == holder)),
+                    cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == holder)),
+                ] {
+                    assert_eq!(&operation.expect("projected child used through its typed holder").possible_origins, child);
+                }
+            }
+        }
+    }
+    let unsupported = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *u8 leaf = &(*parent).left;
+    *parent = { .left = 3; .right = 4; };
+    u8 value = *leaf;
+    value;
+};
+%%end"#;
+    let assignment = unsupported.find("*parent =").unwrap() as u32;
+    let (single, project) = both_reference_functions(unsupported);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "assignment place requires a scalar leaf type"
+            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == assignment)),
+            "{diagnostics:?}");
+    }
+
+}
+
+#[test]
+fn known_projected_mutable_leaf_uses_exact_checked_scalar_store_and_last_use() {
+    for (body, conflict) in [
+        ("u8 sibling = (*parent).right; *leaf = 7; u8 value = *leaf; sibling; value;", None),
+        ("*leaf = 7; (*parent).left = 8; u8 value = owner.left; value;", None),
+        ("u8 value = (*parent).left; *leaf = 7; value;", Some("(*parent).left;")),
+        ("(*parent).left = 3; *leaf = 7;", Some("(*parent).left =")),
+        ("u8 value = owner.right; *leaf = 7; value;", Some("owner.right;")),
+        ("owner.left = 3; *leaf = 7;", Some("owner.left =")),
+        ("*u8 next = &owner.right; *leaf = 7; *next;", Some("&owner.right")),
+        ("*!u8 next = &!owner.right; *leaf = 7; *next;", Some("&!owner.right")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 leaf = &!(*parent).left;
+    {body}
+}};
+%%end"#);
+        let root = text.find("&!owner").unwrap() as u32;
+        let projected = text.find("&!(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let (borrow, loan) = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { place, loan }
+                    if point.source_span.range.start == projected && loan.mode == ScalarReferenceMutability::Mutable
+                        && loan.parent.as_ref().is_some_and(|parent| parent.creation_span.start == root
+                            && parent.mode == ScalarReferenceMutability::Mutable && parent.origin_place.binding == place.binding)
+                        && matches!(place.projections.as_slice(),
+                            [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                                if field.index == 0) => Some((point, loan)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("typed scoped mutable projected loan: {body}: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                let child = cfg.points[borrow.id.0].possible_origins.as_ref().expect("child origins");
+                let origin = *child.first().expect("sole projected child");
+                assert_eq!(child.len(), 1);
+                let write = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::AssignThrough { pointer_point, .. }
+                        if matches!(&cfg.points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                            if binding.declaration_span.start == holder))).expect("actual checked scalar store for the child holder");
+                let CfgPointKind::AssignThrough { pointer_point, rhs_point, candidates, .. } = &write.kind
+                    else { unreachable!() };
+                assert!(rhs_point < pointer_point);
+                let [candidate] = candidates.as_slice() else { panic!("exact store candidate: {write:?}") };
+                assert_eq!(candidate.origin, origin);
+                assert_eq!(&candidate.loan, loan);
+                let pointer = &cfg.points[pointer_point.0];
+                assert!(matches!(&pointer.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == holder));
+                assert_eq!(pointer.possible_origins.as_ref(), Some(child));
+            }
+        }
+    }
+}
+
+#[test]
+fn known_projected_mutable_leaf_refuses_transport_and_nonscalar_store_shapes() {
+    let specimen = |body: &str| format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+(u8, bool)(bool) values = fn(flag) {{ u8 value = 7; value, flag }};
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 leaf = &!(*parent).left;
+    {body}
+}};
+%%end"#);
+    for body in [
+        "*!u8 alias = leaf; *alias = 7;",
+        "unsafe { &?owner; }; *leaf = 7;",
+        "bool other = false; *leaf, other = values(true); other;",
+        "bool other = false; if (true) { *leaf, other = values(true); other; };",
+    ] {
+        let text = specimen(body);
+        let projected = text.find("&!(*parent).left").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                "{body}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn root_projected_mutable_children_store_disjoint_fields_in_contained_conditional() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(Pair, bool) inspect = fn(owner, choose) {
+	*!Pair parent = &!owner;
+	*!u8 left = &!(*parent).left;
+	*!u8 right = &!(*parent).right;
+	if (choose) { *left = 3; *right = 5; } else { *right = 11; *left = 7; };
+	u8 a = *left;
+	u8 b = *right;
+	if (choose) { if (a != 3 || b != 5) { core.system_panic(); }; } else { if (a != 7 || b != 11) { core.system_panic(); }; };
+};
+Pair initial = { .left = 1; .right = 2; };
+inspect(initial, true);
+inspect(initial, false);
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        for (holder, ordinal, spans) in [
+            ("left", 0, ["*left = 3", "*left = 7"]),
+            ("right", 1, ["*right = 5", "*right = 11"]),
+        ] {
+            let owner = text.find(&format!("{holder} = &!")).unwrap() as u32;
+            for source in spans {
+                let start = text.find(source).unwrap() as u32 + 1;
+                let target = ByteSpan::new(start, start + holder.len() as u32);
+                let points = &function.reference_cfg.points;
+                let pointer = points.iter().find(|point| point.source_span.range == target
+                    && matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == owner)).unwrap();
+                let store = points.get(pointer.id.0 + 1).unwrap();
+                let CfgPointKind::AssignThrough { pointer_point, candidates, .. } = &store.kind else { unreachable!() };
+                let span = store.source_span.range;
+                assert!(span.start < target.end && target.start < span.end, "{span:?} {target:?}");
+                assert_eq!(pointer.successors.as_slice(), [store.id]);
+                assert_eq!(*pointer_point, pointer.id);
+                assert_ne!(store.scope, ReferenceScopeId(0));
+                assert_eq!(pointer.scope, store.scope);
+                let [candidate] = candidates.as_slice() else { panic!("exact candidate: {candidates:#?}") };
+                let child = text.find(&format!("&!(*parent).{holder}")).unwrap() as u32;
+                assert_eq!(candidate.loan.creation_span.start, child);
+                assert_eq!(candidate.loan.mode, ScalarReferenceMutability::Mutable);
+                let [ReferencePlaceProjection::Dereference(parent),
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =
+                    candidate.place.projections.as_slice() else { panic!("exact field reborrow: {candidate:#?}") };
+                assert_eq!(field.index, ordinal);
+                assert_eq!(candidate.loan.parent.as_deref(), Some(parent.as_ref()));
+                assert_eq!(candidate.place.binding, parent.origin_place.binding);
+                assert_eq!(candidate.place.projections, candidate.loan.origin_place.projections);
+                assert_eq!(pointer.possible_origins.as_ref(), Some(&BTreeSet::from([candidate.origin])));
+                assert!(matches!(sole_fact(function, pointer),
+                    ReferenceOrigin::Fresh { loan, .. } if *loan == candidate.loan));
+            }
+        }
+    }
+
+    let targeted = text.replace("if (choose) { *left = 3; *right = 5; }",
+        "if (choose) { (*parent).left = 9; *left = 3; *right = 5; }");
+    let (single, project) = both_reference_functions(&targeted);
+    let access = targeted.find("(*parent).left = 9").unwrap() as u32;
+    let child = targeted.find("&!(*parent).left").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.labels.first()
+            .is_some_and(|label| (access..access + 17).contains(&label.span.range.start))
+            && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == child)), "{diagnostics:#?}");
+    }
+}
+
+#[test]
+fn known_projected_mutable_siblings_only_conflict_when_field_or_ancestor_overlaps() {
+    let mut missed = Vec::new();
+    for (second, body, conflict) in [
+        ("right", "*left = 7; *right = 8; u8 first = *left; u8 second = *right; first; second;", None),
+        ("right", "*right = 8; *left = 7; u8 first = *right; u8 second = *left; first; second;", None),
+        ("right", "*left = 7; *right = 8; (*parent).left = 9; u8 result = owner.left; result;", None),
+        ("left", "*left = 7; *right = 8; u8 first = *left; u8 second = *right; first; second;", Some("&!(*parent).left")),
+        ("right", "(*parent).left = 9; *left = 7; *right = 8;", Some("(*parent).left =")),
+        ("right", "owner = { .left = 3; .right = 4; }; *left = 7; *right = 8;", Some("owner =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 left = &!(*parent).left;
+    *!u8 right = &!(*parent).{second};
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let first = text.find("&!(*parent).left").unwrap() as u32;
+        let right = text.find("right =").unwrap();
+        let second_span = text[right..].find("&!(*parent)").map(|offset| (offset + right) as u32).unwrap();
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let exact = |span, field_index| cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == span
+                    && loan.mode == ScalarReferenceMutability::Mutable
+                    && loan.parent.as_ref().is_some_and(|base| base.creation_span.start == parent
+                        && base.mode == ScalarReferenceMutability::Mutable
+                        && base.origin_place.binding == loan.origin_place.binding
+                        && base.origin_place.projections.is_empty())
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                        if field.index == field_index) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("actual canonical siblings: {validator}: {diagnostics:?}"));
+            let left = exact(first, 0);
+            let right = exact(second_span, usize::from(second == "right"));
+            assert_eq!(left.parent, right.parent);
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == first))
+                {
+                    missed.push((validator, second, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                missed.push((validator, second, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_projected_mutable_store_respects_disjoint_shared_sibling_permissions() {
+    let mut mismatches = Vec::new();
+    for (write_field, reverse, body, conflict) in [
+        ("right", false, "*writer = 7; u8 read = *reader; read;", None),
+        ("right", true, "*writer = 7; u8 read = *reader; read;", None),
+        ("right", false, "u8 read = *reader; *writer = 7; (*parent).left = read;", None),
+        ("left", false, "*writer = 7; u8 read = *reader; read;", Some("&!(*parent).left")),
+        ("right", false, "(*parent).left = 3; *writer = 7; u8 read = *reader; read;", Some("(*parent).left =")),
+        ("right", false, "owner = { .left = 3; .right = 4; }; *writer = 7; u8 read = *reader; read;", Some("owner =")),
+    ] {
+        let reader = "*u8 reader = &(*parent).left;";
+        let writer = format!("*!u8 writer = &!(*parent).{write_field};");
+        let (first, second) = if reverse { (writer.as_str(), reader) } else { (reader, writer.as_str()) };
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    {first}
+    {second}
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let reader = text.find("&(*parent).left").unwrap() as u32;
+        let writer = text.find(&format!("&!(*parent).{write_field}")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let projected = |span, mode, field_index| cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == span
+                    && loan.mode == mode && loan.parent.as_ref().is_some_and(|base| {
+                        base.creation_span.start == parent && base.mode == ScalarReferenceMutability::Mutable
+                            && base.origin_place.binding == loan.origin_place.binding
+                            && base.origin_place.projections.is_empty()
+                    })
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == field_index) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} actual mixed projected siblings: {diagnostics:?}"));
+            let held = projected(reader, ScalarReferenceMutability::Shared, 0);
+            let written = projected(writer, ScalarReferenceMutability::Mutable, usize::from(write_field == "right"));
+            assert_eq!(held.parent, written.parent);
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let requested = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| requested.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == reader))
+                {
+                    mismatches.push((validator, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                mismatches.push((validator, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn known_checked_parent_field_store_respects_live_projected_child_extent() {
+    let mut mismatches = Vec::new();
+    for (mode, body, through, field_index, conflict) in [
+        ("!", "(*parent).right = 7; u8 value = *child; value;", true, 1, None),
+        ("", "(*parent).right = 7; u8 value = *child; value;", true, 1, None),
+        ("!", "u8 value = *child; (*parent).left = 7; u8 after = owner.right; value; after;", true, 0, None),
+        ("!", "(*parent).left = 7; u8 value = *child; value;", true, 0, Some("(*parent).left =")),
+        ("", "(*parent).left = 7; u8 value = *child; value;", true, 0, Some("(*parent).left =")),
+        ("!", "owner.right = 7; u8 value = *child; value;", false, 1, Some("owner.right =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *{mode}u8 child = &{mode}(*parent).left;
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let holder = text.find("parent =").unwrap() as u32;
+        let borrowed = text.find(&format!("&{mode}(*parent).left")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let (loan_point, loan) = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == borrowed
+                    && loan.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }
+                    && loan.parent.as_ref().is_some_and(|root| root.creation_span.start == parent
+                        && root.mode == ScalarReferenceMutability::Mutable && root.origin_place.binding == loan.origin_place.binding
+                        && root.origin_place.projections.is_empty())
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == 0) => Some((point, loan)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} actual projected child: {body}: {diagnostics:?}"));
+            assert!(cfg.initial_points.iter().any(|point| point.scope == loan_point.scope && match &point.kind {
+                CfgPointKind::AssignThrough { place: ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                    pointer_point, .. } if through =>
+                    field.index == field_index && matches!(base.as_ref(), ScalarPlace::Dereference { .. })
+                        && matches!(&cfg.initial_points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                            if binding.declaration_span.start == holder),
+                CfgPointKind::Assign { target, .. } if !through => {
+                    target.binding == loan.origin_place.binding && matches!(target.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == field_index)
+                }
+                _ => false,
+            }), "{validator} actual parent or owner field store: {body}: {diagnostics:?}");
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrowed))
+                {
+                    mismatches.push((validator, mode, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                mismatches.push((validator, mode, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn known_checked_parent_field_store_does_not_infer_projected_loans_from_unknown_authority() {
+    for text in [
+        r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(*!Pair) inspect = fn(parent) {
+    *!u8 child = &!(*parent).left;
+    (*parent).right = 7;
+    u8 value = *child;
+    value;
+};
+%%end"#,
+        r#"%%start
+struct copy Pair { u8 left; u8 right; }
+*!Pair(*!Pair) identity = fn(value) { value };
+unit(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *!u8 child = &!(*identity(parent)).left;
+    u8 value = *child;
+    value;
+};
+%%end"#,
+    ] {
+        let borrowed = text.find("&!(*").unwrap() as u32;
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == borrowed)),
+                "{diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
+        if node.kind == kind && node.text.starts_with(spelling) {
+            return node.clone();
+        }
+        for child in &node.children {
+            if let Element::Node(child) = child {
+                if child.text.contains(spelling) {
+                    return find(child, kind, spelling);
+                }
+            }
+        }
+        panic!("missing declaration {spelling}");
+    }
+    let text = "%%start
+struct First { i32 value; }
+enum Early { zero; }
+struct Last { i32 value; }
+enum Late { one; }
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
+    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
+    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
+    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
+        _ => None,
+    }).unwrap();
+    selected.children.extend([Element::Node(last), Element::Node(late)]);
+    snapshot.root.children.push(Element::Node(first));
+    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
+    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
+    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
+}
+
+#[test]
+fn type_derivation_owns_erased_suffixes_at_their_cst_level() {
+    let parsed = parse_source(source(), "%%start
+unit(*(u8[]), *u8[], *(u8[])[], u8[][]) shapes = fn(view, refs, views, nested) {
+    view; refs; views; nested;
+};
+*(u8[])(*(u8[])) identity = fn(view) { view };
+%%end".into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let signature = |name| declarations.items.iter().find_map(|item| match item {
+        ScalarItem::Function(function) if function.name == name => Some(&function.signature),
+        _ => None,
+    }).unwrap();
+    let ScalarType::Callable { parameters, .. } = signature("shapes") else { panic!() };
+    let [view, refs, views, nested] = parameters.as_slice() else { panic!("{parameters:?}") };
+    let is_u8_array = |ty: &ScalarType| matches!(ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8);
+    let is_view = |ty: &ScalarType| matches!(ty, ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Shared, inner,
+    } if is_u8_array(inner));
+    assert!(is_view(view), "{view:?}");
+    assert!(matches!(refs, ScalarType::RuntimeArray { element, .. } if matches!(element.as_ref(),
+        ScalarType::CheckedReference { inner, .. } if **inner == ScalarType::U8)), "{refs:?}");
+    assert!(matches!(views, ScalarType::RuntimeArray { element, .. } if is_view(element)), "{views:?}");
+    assert!(matches!(nested, ScalarType::RuntimeArray { element, .. } if is_u8_array(element)), "{nested:?}");
+    let ScalarType::Callable { parameters, outputs } = signature("identity") else { panic!() };
+    assert!(matches!(parameters.as_slice(), [ty] if is_view(ty)), "{parameters:?}");
+    assert!(matches!(outputs.outputs.as_slice(), [output] if is_view(&output.ty)), "{outputs:?}");
 }

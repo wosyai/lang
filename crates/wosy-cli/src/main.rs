@@ -17,8 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_artifact_llvm,
     emit_scalar_build_single_module_artifact_llvm, emit_scalar_build_wasm_root_exports_artifact_llvm,
-    parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
-    LlvmPartition, ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    parse_source_with_snapshot, prepare_scalar_project_with_access,
+    publication, LlvmPartition,
+    serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -27,9 +28,9 @@ use wosy_project::{
     SourceIdentity as ProjectSourceIdentity, SourceNodeInput, SourceObservation,
     SourceSpan as ProjectSourceSpan,
 };
-#[cfg(test)]
-use wosy_compiler::parse_source;
 use wosy_syntax::SourceIdentity;
+
+mod checked_access_component;
 
 #[derive(Parser)]
 #[command(name = "wosy")]
@@ -170,12 +171,8 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
         revision,
     );
     let (fresh, diagnostics) = parse_source_with_snapshot(source, text, &project.comment_categories);
-    persist_cst(
-        &root,
-        &fresh.result().source.revision,
-        &fresh.snapshot_json_serializable(),
-    )?;
-    let output = ParseOutput {
+    persist_cst(&root, &fresh.result().source.revision, &fresh.snapshot_json_serializable())?;
+    let output = wosy_compiler::ParseOutput {
         result: fresh.into_result(),
         diagnostics,
     };
@@ -205,12 +202,8 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
     let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
-    let (llvm, source_observations) = compile_project(
-        &root,
-        &project,
-        &configuration,
-        target_layout,
-        artifact_profile.exports.as_ref(),
+    let (llvm, source_observations) = compile_project_partition(
+        &root, &project, &configuration, target_layout, artifact_profile.exports.as_ref(),
     )?;
     let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
@@ -373,25 +366,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let current_observations = manifest
         .source_observations
         .iter()
-        .map(|observation| {
-            let content_revision = if let Some((package, checkout)) =
-                configuration.git_package(&observation.source.package)?
-            {
-                if observation.source.project != package.identity.project {
-                    return Err("artifact manifest is stale".to_owned());
-                }
-                let relative = observation.source.path.as_path();
-                let file = checkout.source(relative)?
-                    .ok_or_else(|| "artifact manifest is stale".to_owned())?;
-                observe_open_source(file, relative)?
-            } else {
-                observe_source_revision(&source_observation_path(observation))?
-            };
-            Ok(SourceObservation {
-                source: observation.source.clone(),
-                content_revision,
-            })
-        })
+        .map(|observation| current_source_observation(&configuration, observation))
         .collect::<Result<Vec<_>, String>>()?;
     let builder = configuration
         .builders
@@ -435,6 +410,32 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
     std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
 }
 
+fn current_source_observation(
+    configuration: &ProjectConfiguration,
+    observation: &SourceObservation,
+) -> Result<SourceObservation, String> {
+    if let Some(component) = checked_access_component::refresh_observation(&observation.source)? {
+        return Ok(component);
+    }
+    let content_revision = if let Some((package, checkout)) =
+        configuration.git_package(&observation.source.package)?
+    {
+        if observation.source.project != package.identity.project {
+            return Err("artifact manifest is stale".to_owned());
+        }
+        let relative = observation.source.path.as_path();
+        let file = checkout.source(relative)?
+            .ok_or_else(|| "artifact manifest is stale".to_owned())?;
+        observe_open_source(file, relative)?
+    } else {
+        observe_source_revision(&source_observation_path(observation))?
+    };
+    Ok(SourceObservation {
+        source: observation.source.clone(),
+        content_revision,
+    })
+}
+
 fn observe_source_revision(path: &std::path::Path) -> Result<ContentRevision, String> {
     let read_error = |error| format!("failed to read {}: {error}", path.display());
     let file = fs::File::open(path).map_err(read_error)?;
@@ -448,11 +449,60 @@ fn observe_open_source(file: fs::File, path: &std::path::Path) -> Result<Content
     Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
 }
 
+#[cfg(test)]
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    compile_project_with_root_exports(root, project, configuration, target_layout, None)
+}
+
+#[cfg(test)]
+fn compile_project_with_root_exports(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    root_exports: Option<&BTreeMap<String, String>>,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    compile_project_partition(root, project, configuration, target_layout, root_exports)
+        .map(|(partition, sources)| (partition.to_text(), sources))
+}
+
+fn compile_project_partition(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    root_exports: Option<&BTreeMap<String, String>>,
+) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
+    compile_project_with_access_policy(
+        root, project, configuration, target_layout,
+        Some(checked_access_component::CheckedAccessComponent::linked()), true, root_exports,
+    )
+}
+
+#[cfg(test)]
+fn compile_project_with_component(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    component: Option<checked_access_component::CheckedAccessComponent>,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    compile_project_with_access_policy(root, project, configuration, target_layout, component, false, None)
+        .map(|(partition, sources)| (partition.to_text(), sources))
+}
+
+fn compile_project_with_access_policy(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    component: Option<checked_access_component::CheckedAccessComponent>,
+    demand_only: bool,
     root_exports: Option<&BTreeMap<String, String>>,
 ) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
@@ -501,8 +551,7 @@ fn compile_project(
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
-        let (fresh, diagnostics) =
-            parse_source_with_snapshot(source, text, &project.comment_categories);
+        let (fresh, diagnostics) = parse_source_with_snapshot(source, text, &project.comment_categories);
         let result = fresh.result();
         let source = &result.source;
         render_diagnostics(&result.text, &diagnostics, source);
@@ -560,7 +609,7 @@ fn compile_project(
         let graph_source = ProjectSourceIdentity::new(
             source.project.clone(),
             source.package.clone(),
-            path.clone(),
+            path,
         );
         let node = SourceNodeInput {
             source: graph_source.clone(),
@@ -572,27 +621,40 @@ fn compile_project(
         } else {
             nodes.push(node);
         }
-        declarations_by_path.insert((package, path), declarations);
+        declarations_by_path.insert(graph_source.clone(), declarations);
         texts.insert(graph_source, fresh.into_result().text);
     }
     drop((discovered, pending));
 
     let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(&packages, root_node, nodes).map_err(|error| {
+    let mut graph = load_reachable_source_graph(&packages, root_node, nodes).map_err(|error| {
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
-    let source_identities: Vec<_> = graph
-        .nodes
-        .iter()
-        .map(|node| compiler_source_identity(&node.source, &node.content_revision))
-        .collect();
-    let root_exports = root_exports.map(|exports| (exports, source_identities[0].clone()));
+    let mut demanded_component = None;
+    if let Some(component) = component {
+        if demand_only {
+            let (node, access) = component.into_source();
+            texts.insert(node.source.clone(), access.text().to_owned());
+            demanded_component = Some((node, access));
+        } else {
+            let (node, declarations, text) = component.into_preparation()?;
+            #[cfg(test)]
+            routing_observations::record(|counts| counts.extractions += 1);
+            declarations_by_path.insert(node.source.clone(), declarations);
+            texts.insert(node.source.clone(), text);
+            graph.append_independent_leaf(node)?;
+        }
+    }
     let mut project_declarations = Vec::with_capacity(graph.nodes.len());
+    let sources: Vec<_> = graph.nodes.iter().map(|node| {
+        compiler_source_identity(&node.source, &node.content_revision)
+    }).collect();
+    let export_root = root_exports.map(|_| sources[0].clone());
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
         let declarations = declarations_by_path
-            .remove(&(node.source.package.as_str(), node.source.path.clone()))
+            .remove(&node.source)
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",
@@ -605,7 +667,7 @@ fn compile_project(
             .iter()
             .map(|edge| ScalarNamespaceBinding {
                 binding: edge.binding.clone(),
-                target: source_identities[edge.target.0].clone(),
+                target: sources[edge.target.0].clone(),
                 span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
             })
             .collect();
@@ -618,21 +680,34 @@ fn compile_project(
     let initialization_order = graph
         .initialization_order
         .iter()
-        .map(|id| source_identities[id.0].clone())
+        .map(|id| sources[id.0].clone())
         .collect();
-    drop(source_identities);
+    drop(sources);
     drop(declarations_by_path);
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
-    let prepared = prepare_scalar_project(
+    let (node, access) = match demanded_component {
+        Some((node, access)) => (Some(node), Some(access)),
+        None => (None, None),
+    };
+    let prepared = prepare_scalar_project_with_access(
         project_declarations,
         initialization_order,
         ScalarPreparationInputs { target_layout },
+        access,
     )
     .map_err(|rejected| {
         render_project_diagnostics(&rejected.into_ordered_diagnostics(), &texts);
         "build rejected by semantic diagnostics".to_owned()
     })?;
+    if let (Some(node), Some(source)) = (node, prepared.checked_access_source()) {
+        if compiler_source_identity(&node.source, &node.content_revision) != *source {
+            return Err("release checked-access source identity changed during preparation".to_owned());
+        }
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        graph.append_independent_leaf(node)?;
+    }
     #[cfg(test)]
     routing_observations::record(|counts| counts.builds += 1);
     let validation = analyze_scalar_build(&prepared);
@@ -641,15 +716,16 @@ fn compile_project(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     drop(texts);
-    let llvm = if let Some((exports, source)) = root_exports {
-        emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, &source, exports)?
-    } else if graph.nodes.len() == 1 {
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.single_module_emissions += 1);
+    let singleton = graph.nodes.len() == 1;
+    #[cfg(test)]
+    routing_observations::record(|counts| {
+        if singleton { counts.single_module_emissions += 1; } else { counts.project_emissions += 1; }
+    });
+    let llvm = if let (Some(exports), Some(root)) = (root_exports, export_root.as_ref()) {
+        emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, root, exports)?
+    } else if singleton {
         emit_scalar_build_single_module_artifact_llvm(&validation)?
     } else {
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.project_emissions += 1);
         emit_scalar_build_project_artifact_llvm(&validation)?
     };
     let source_observations = graph
@@ -911,7 +987,7 @@ fn artifact_identity(
 }
 
 fn compiler_identity() -> String {
-    wosy_compiler::COMPILER_IDENTITY.to_owned()
+    format!("{}+checked-access-fixed-runtime-local-v1+configured-wasm-web-v1", wosy_compiler::COMPILER_IDENTITY)
 }
 
 fn llvm_identity() -> String {
@@ -1033,6 +1109,15 @@ mod routing_observations {
         project: &ProjectContext,
         configuration: &ProjectConfiguration,
     ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+        observe(|| compile_project(
+            &project.root,
+            project,
+            configuration,
+            ScalarTargetLayout::NATIVE64,
+        ))
+    }
+
+    pub(super) fn observe<T>(compile: impl FnOnce() -> T) -> (T, Counts) {
         struct Restore(Option<Counts>);
 
         impl Drop for Restore {
@@ -1042,14 +1127,7 @@ mod routing_observations {
         }
 
         let _restore = Restore(COUNTS.replace(Some(Counts::default())));
-        let result = compile_project(
-            &project.root,
-            project,
-            configuration,
-            ScalarTargetLayout::NATIVE64,
-            None,
-        )
-        .map(|(llvm, sources)| (llvm.to_text(), sources));
+        let result = compile();
         (result, COUNTS.get().expect("active routing observations"))
     }
 }
@@ -1105,6 +1183,276 @@ mod tests {
         (project, configuration)
     }
 
+    #[test]
+    fn default_build_wires_release_checked_access_without_a_user_std_import() {
+        let text = r#"%%start
+struct copy Entry { u8 value; }
+struct RawBytes { u8[3] values; }
+Entry[2] entries = [{ .value = 1; }, { .value = 2; }];
+u64(u64) select_index = fn(index) { index };
+u8(u8) replacement = fn(value) { value };
+unit(u64, u8) aggregate_update = fn(index, value) {
+    entries[select_index(index)] = { .value = replacement(value); };
+};
+u8(u64, u8) scalar_index = fn(index, value) {
+    u8[3] cells = [7, 8, 9];
+    cells[index] = value;
+    cells[index]
+};
+u8(*u8) read_checked = fn(value) { *value };
+u8() witness = fn {
+    u8 byte = 42;
+    read_checked(&byte)
+};
+u8(u64) read_explicit_raw = fn(index) {
+    RawBytes record = { .values = [4, 5, 6]; };
+    unsafe {
+        *?RawBytes raw = &?record;
+        *?u8 element = &?(*raw).values[index];
+        core.load<u8>(element)
+    }
+};
+aggregate_update(1, 12);
+if (scalar_index(2, 23) != 23 || witness() != 42 || read_explicit_raw(1) != 5) { core.system_panic(); };
+%%end"#;
+        let (project, configuration) = routing_test_project("default-release-access", &[("main.w", text)]);
+        let hex = |name: &str| name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (llvm, observations) = compile_project(&project.root, &project, &configuration, layout).unwrap();
+            let [_, access] = observations.as_slice() else { panic!("expect one release component") };
+            assert_eq!(current_source_observation(&configuration, access).unwrap(), *access);
+            let release = hex(&access.content_revision.0);
+            let bounds = format!("__{release}__{}", hex("check_index_in_extent"));
+            let non_null = format!("__{release}__{}", hex("check_non_null_address"));
+            let body = |name: &str| {
+                let suffix = format!("__{}(", hex(name));
+                let (_, rest) = llvm.lines().find(|line| line.starts_with("define ") && line.contains(&suffix))
+                    .and_then(|line| llvm.split_once(line)).expect("ordinary function definition");
+                rest.split_once("\n}").unwrap().0
+            };
+            let aggregate = body("aggregate_update");
+            let stage_rhs = aggregate.find(&format!("__{}(", hex("replacement"))).unwrap();
+            let selector = format!("__{}(", hex("select_index"));
+            let stage_index = aggregate.find(&selector).unwrap();
+            let check = aggregate.find(&bounds).unwrap();
+            let address = aggregate[check..].find("getelementptr inbounds").unwrap() + check;
+            assert!(stage_rhs < stage_index && stage_index < check && check < address);
+            assert_eq!(aggregate.matches(&selector).count(), 1);
+            assert_eq!(aggregate.matches(&bounds).count(), 1);
+            assert!(!aggregate.contains("assignment_index_out_of_bounds"));
+            let call = aggregate.lines().find(|line| line.contains(&bounds)).unwrap();
+            let (index, extent) = call.split_once("(i64 ").unwrap().1.split_once(", i64 ").unwrap();
+            assert_eq!(extent, "2)");
+            let assert_guarded_address = |between: &str, gep: &str, index: &str| {
+                let narrowing = format!(" = trunc i64 {index} to i32");
+                if layout == ScalarTargetLayout::WASM32 {
+                    let mut narrowed = between.lines().filter_map(|l| l.trim().strip_suffix(&narrowing));
+                    let selected = narrowed.next().expect("narrow the guarded u64 after checking it");
+                    assert!(narrowed.next().is_none());
+                    assert!(gep.ends_with(&format!(", i32 {selected}")), "{gep}");
+                } else {
+                    assert!(!between.contains(&narrowing));
+                    assert!(gep.ends_with(&format!(", i64 {index}")), "{gep}");
+                }
+            };
+            assert_guarded_address(&aggregate[check..address], aggregate[address..].lines().next().unwrap(), index);
+
+            let scalar = body("scalar_index");
+            let mut checks = 0;
+            let mut outstanding = None;
+            let mut offset = 0;
+            for line in scalar.split_inclusive('\n') {
+                let at = offset;
+                offset += line.len();
+                let line = line.trim_end();
+                if line.contains(&bounds) {
+                    assert!(outstanding.is_none(), "index guard was not consumed by an address");
+                    let arguments = line.split_once("(i64 ").unwrap().1;
+                    let (index, length) = arguments.split_once(", i64 ").unwrap();
+                    assert_eq!(length, "3)");
+                    outstanding = Some((at, index));
+                    checks += 1;
+                }
+                if line.contains("getelementptr inbounds [3 x i8]")
+                    && line.rsplit_once(", ").is_some_and(|(_, operand)| operand.contains(" %"))
+                {
+                    let (from, index) = outstanding.take().expect("dynamic fixed-array GEP needs a guard");
+                    assert_guarded_address(&scalar[from..at], line, index);
+                }
+            }
+            assert_eq!(checks, 2);
+            assert!(outstanding.is_none());
+
+            let dereference = body("read_checked");
+            assert_eq!(dereference.matches(&non_null).count(), 1);
+            let check = dereference.lines().find(|line| line.contains(&non_null)).unwrap();
+            let width = layout.pointer_size * 8;
+            let argument = check.split_once(&format!("(i{width} ")).unwrap().1.trim_end_matches(')');
+            assert!(!argument.is_empty());
+            assert!(dereference.find(&non_null).unwrap()
+                < dereference.find(&format!("inttoptr i{width} {argument} to ptr")).unwrap());
+            assert!(!dereference.contains("deref_is_null"));
+            assert!(!dereference.contains("__wosy_core_system_panic"));
+            let raw = body("read_explicit_raw");
+            assert!(raw.contains("getelementptr inbounds [3 x i8]"));
+            assert!(!raw.contains(&non_null) && !raw.contains(&bounds), "{raw}");
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn default_build_preserves_original_runtime_extent_in_local_and_same_backing_routes() {
+        let fixtures = [
+            (
+                "runtime-local-extent",
+                include_str!("../../../tests/fixtures/build/checked_access_release/project/src/main.w"),
+                "runtime_update",
+                false,
+            ),
+            (
+                "runtime-closed-rebind",
+                include_str!("../../../tests/fixtures/build/checked_access_release/project/src/runtime_rebound.w"),
+                "drive",
+                true,
+            ),
+        ];
+        let hex = |name: &str| name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        for (name, text, function, rebound) in fixtures {
+            let (project, configuration) = routing_test_project(name, &[("main.w", text)]);
+            for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+                let (llvm, observations) = compile_project(&project.root, &project, &configuration, target).unwrap();
+                let [_, access] = observations.as_slice() else { panic!("{name}: missing release bounds source") };
+                let guard = format!("__{}__{}", hex(&access.content_revision.0), hex("check_index_in_extent"));
+                let fn_suffix = format!("__{}(", hex(function));
+                let definition = llvm.lines().find(|line| line.starts_with("define ") && line.contains(&fn_suffix))
+                    .unwrap_or_else(|| panic!("{name}: missing {function}"));
+                let body = llvm.split_once(definition).unwrap().1.split_once("\n}").unwrap().0;
+                if rebound {
+                    let after_rebind = body.rsplit_once(&format!("__{}(", hex("carry"))).unwrap().1;
+                    for (owner, index) in [("left", "1"), ("right", "0")] {
+                        let extent_ssa = after_rebind.lines().find_map(|line| line
+                            .split_once(&format!(" = load i64, ptr %{owner}_length,"))
+                            .map(|(value, _)| value.trim()))
+                            .unwrap_or_else(|| panic!("{name}: missing {owner} extent snapshot"));
+                        let call = format!("{guard}(i64 {index}, i64 {extent_ssa})");
+                        let location = after_rebind.find(&call).expect("check uses actual retained length slot");
+                        assert!(after_rebind[location..].contains("getelementptr inbounds i8"));
+                    }
+                } else {
+                    let count_symbol = format!("__{}(", hex("construction_count"));
+                    assert_eq!(body.matches(&count_symbol).count(), 1);
+                    let original_count = body.lines().find(|line| line.contains(&count_symbol))
+                        .unwrap().split_once(" = call i64 ").unwrap().0.trim();
+                    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+                    let unique_line = |message, predicate: &dyn Fn(&str) -> bool| {
+                        let matches = lines.iter().enumerate().filter(|(_, line)| predicate(line))
+                            .collect::<Vec<_>>();
+                        assert_eq!(matches.len(), 1, "{message}: {body}");
+                        (matches[0].0, *matches[0].1)
+                    };
+                    let (count_at, _) = unique_line("construction count", &|line| line.contains(&count_symbol));
+                    let alloc = format!(" = call ptr @__wosy_core_alloc(i64 {original_count}, i64 1)");
+                    let (backing_at, allocation) = unique_line("allocation of original count", &|line| line.ends_with(&alloc));
+                    let backing = allocation.strip_suffix(&alloc).unwrap();
+                    let selector_symbol = format!("__{}(", hex("select_index"));
+                    let (selector_at, selector) = unique_line("effectful selector", &|line| {
+                        line.contains(" = call i64 @") && line.contains(&selector_symbol)
+                    });
+                    let selection = selector.split_once(" = call i64 @").unwrap().0;
+                    let guard_call = format!("{guard}(i64 {selection}, i64 {original_count})");
+                    let (guard_at, _) = unique_line("full-width guard of selector result", &|line| {
+                        line.starts_with("call void @") && line.ends_with(&guard_call)
+                    });
+                    let gep_operands = format!(" = getelementptr inbounds i8, ptr {backing}, i64 {selection}");
+                    let (gep_at, _) = unique_line("indexed GEP from same backing and selector result", &|line| {
+                        line.ends_with(&gep_operands)
+                    });
+                    assert!(count_at < backing_at && backing_at < selector_at && selector_at < guard_at
+                        && guard_at < gep_at, "{name}: {body}");
+                    let checks = body.lines().filter(|line| line.contains(&guard)).collect::<Vec<_>>();
+                    assert_eq!(checks.len(), 2);
+                    assert!(checks.iter().all(|line| line.ends_with(&format!(", i64 {original_count})"))));
+                    assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1);
+                }
+            }
+            fs::remove_dir_all(&project.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn release_checked_access_component_is_an_ordinary_independent_graph_leaf() {
+        let user = "%%start\nu64() value = fn { 42 };\nvalue();\n%%end";
+        let (project, configuration) = routing_test_project("release-access", &[("main.w", user)]);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (plain, plain_observations) =
+                compile_project(&project.root, &project, &configuration, layout).unwrap();
+            let (linked, observations) = compile_project_with_component(
+                &project.root, &project, &configuration, layout,
+                Some(checked_access_component::CheckedAccessComponent::linked()),
+            ).unwrap();
+            assert_eq!(plain_observations.len(), 1);
+            assert_eq!(observations.len(), 2);
+            assert_eq!(observations[0], plain_observations[0]);
+            assert_eq!(current_source_observation(&configuration, &observations[1]).unwrap(), observations[1]);
+            assert!(!plain.contains("636865636b5f696e6465785f696e5f657874656e74"));
+            assert!(linked.lines().any(|line| line.starts_with("define void ")
+                && line.contains("636865636b5f696e6465785f696e5f657874656e74")));
+            assert!(linked.contains("ret i64 42"));
+            let mut stale = observations[1].clone();
+            stale.content_revision = ContentRevision("old-source-or-contract".to_owned());
+            assert_ne!(current_source_observation(&configuration, &stale).unwrap(), stale);
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn lookalike_user_namespace_cannot_supply_the_release_checked_access_source() {
+        let (mut project, configuration) = routing_test_project(
+            "release-access-lookalike",
+            &[("main.w", "%%start\nuser = namespace wosy_toolchain_stdlib \"src/checked_access.w\";\nuser.check_index_in_extent(2, 3);\nu8(u64) read = fn(index) { u8[3] values = [7, 8, 9]; values[index] };\nread(2);\n%%end")],
+        );
+        // Even the same package and relative path are not the same qualified
+        // source. Ordinary user resolution continues to call its own function.
+        project.package = "wosy_toolchain_stdlib".to_owned();
+        fs::create_dir_all(project.root.join("src")).unwrap();
+        let fake = "%%start\nunit(u64, u64) check_index_in_extent = fn(index, count) { index; count; };\n%%end";
+        fs::write(project.root.join("src/checked_access.w"), fake).unwrap();
+
+        let (llvm, observations) = compile_project_with_component(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            Some(checked_access_component::CheckedAccessComponent::linked()),
+        ).unwrap();
+        let path = PackageRelativePath::new("src/checked_access.w".into()).unwrap();
+        let same_path = observations.iter().filter(|entry| entry.source.path == path).collect::<Vec<_>>();
+        let [user, release] = same_path.as_slice() else { panic!("expected two independently qualified sources") };
+        assert_ne!(user.source, release.source);
+        assert_ne!(user.content_revision, release.content_revision);
+        assert_eq!(user.source.project, project.root.to_string_lossy());
+        assert_eq!(current_source_observation(&configuration, release).unwrap(), **release);
+        let symbol_suffix = "__636865636b5f696e6465785f696e5f657874656e74";
+        let user_revision = user.content_revision.0.bytes()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let definitions = llvm.lines().filter(|line| line.starts_with("define void ")
+            && line.contains(symbol_suffix)).count();
+        assert_eq!(definitions, 2);
+        let calls = llvm.lines().filter(|line| line.contains("call void @")
+            && line.contains(symbol_suffix)).collect::<Vec<_>>();
+        let [called] = calls.as_slice() else { panic!("{calls:?}") };
+        assert!(called.contains(&user_revision), "{called}");
+        let (migrated, migrated_sources) = compile_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+        ).unwrap();
+        assert_eq!(migrated_sources, observations);
+        let release_revision = release.content_revision.0.bytes()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let migrated_calls = migrated.lines().filter(|line| line.contains("call void @")
+            && line.contains(symbol_suffix)).collect::<Vec<_>>();
+        assert_eq!(migrated_calls.len(), 2);
+        assert_eq!(migrated_calls.iter().filter(|call| call.contains(&user_revision)).count(), 1);
+        assert_eq!(migrated_calls.iter().filter(|call| call.contains(&release_revision)).count(), 1);
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
     fn assert_wasm_root_forwarder(llvm: &str, label: &str, result: &str, types: &[&str]) {
         let header = format!("define {result} @{label}(");
         let body = llvm
@@ -1132,13 +1480,159 @@ mod tests {
     }
 
     #[test]
+    fn selected_wasm_root_exports_keep_mixed_abi_and_exact_root_identity() {
+        let sources = [
+            (
+                "main.w",
+                "%%start\nmath = namespace app \"math.w\";\ni32(f32,i32,f32) score = fn(left,points,right) { if (left < right) { math.score() + points } else { points } };\nunit(f32,f32,f32,i32,f32) step = fn(a,b,c,n,d) { if (a + b + c > d) { if (n > 0) {}; }; };\n%%end\n",
+            ),
+            ("math.w", "%%start\ni32() score = fn { 42 };\ni32() hidden = fn { 7 };\n%%end\n"),
+        ];
+        let (project, configuration) = routing_test_project("explicit-wasm-root-exports", &sources);
+        let compile = |exports| {
+            compile_project_with_root_exports(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let exports = BTreeMap::from([
+            ("demo_score".into(), "score".into()),
+            ("tick".into(), "step".into()),
+        ]);
+        let (llvm, _) = compile(Some(&exports)).expect("emit selected root exports");
+        assert_wasm_root_forwarder(&llvm, "demo_score", "i32", &["float", "i32", "float"]);
+        assert_wasm_root_forwarder(&llvm, "tick", "void", &["float", "float", "float", "i32", "float"]);
+        let (default_llvm, _) = compile(None).expect("emit the unchanged implicit partition");
+        assert!(!default_llvm.contains("@demo_score"), "{default_llvm}");
+        assert!(!default_llvm.contains("@tick"), "{default_llvm}");
+        let absent = BTreeMap::from([("demo_score".into(), "hidden".into())]);
+        assert!(compile(Some(&absent)).expect_err("dependency is not the root").contains("no root function"));
+        let reserved = BTreeMap::from([("_start".into(), "score".into())]);
+        assert!(compile(Some(&reserved)).expect_err("runtime label is reserved").contains("reserved"));
+        fs::remove_dir_all(&project.root).expect("remove routing fixture");
+    }
+
+    #[test]
+    fn singleton_wasm_root_export_keeps_identity_and_rejects_symbol_collision() {
+        let sources = [(
+            "main.w",
+            "%%start\ni32() score = fn { 42 };\ni32() occupied = fn { 7 };\n%%end\n",
+        )];
+        let (project, configuration) = routing_test_project("singleton-root-export", &sources);
+        let compile = |exports| {
+            compile_project_with_root_exports(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let same = BTreeMap::from([("score".into(), "score".into())]);
+        let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");
+        let (default_llvm, _) = compile(None).expect("ordinary singleton");
+        assert_eq!(llvm, default_llvm);
+        let collision = BTreeMap::from([("occupied".into(), "score".into())]);
+        assert!(
+            compile(Some(&collision))
+                .expect_err("cannot reuse another function's emitted symbol")
+                .contains("collides with an emitted symbol")
+        );
+        fs::remove_dir_all(&project.root).expect("remove singleton routing fixture");
+    }
+
+    #[test]
+    fn configured_wasm_root_exports_preserve_dev4_language_admission() {
+        let root = "%%start\ni32(i32) score = fn(points) { points };\n";
+        let fixture = format!("{root}%%end");
+        let (project, configuration) =
+            routing_test_project("wasm-root-exports-language-admission", &[("main.w", &fixture)]);
+        let exports = BTreeMap::from([("score".into(), "score".into())]);
+        let compile = |exports| {
+            compile_project_with_root_exports(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, exports,
+            )
+        };
+        assert_eq!(compile(Some(&exports)).unwrap(), compile(None).unwrap());
+
+        // Named Dev3 proof declarations are not part of this Dev4 baseline.
+        // Selecting an export must not introduce another frontend or admit them.
+        let proof = "proof impossible for score(points) -> (out) ensures (false) {}";
+        fs::write(project.root.join("main.w"), format!("{root}{proof}\n%%end")).unwrap();
+        for configured in [None, Some(&exports)] {
+            assert_eq!(compile(configured).unwrap_err(), "build rejected by syntax diagnostics");
+        }
+
+        // Supported syntax still goes through the ordinary type checker.
+        fs::write(project.root.join("main.w"), fixture.replace("{ points }", "{ points == 0 }")).unwrap();
+        for configured in [None, Some(&exports)] {
+            assert_eq!(compile(configured).unwrap_err(), "build rejected by semantic diagnostics");
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn configured_web_export_keeps_checked_release_leaf_and_guarded_owner() {
+        let text = r#"%%start
+u64(u64) observe = fn(index) {
+    u8[3] cells = [7, 8, 9];
+    u64 amount = core.int_extend<u64>(cells[index]);
+    u64 held =? amount;
+    if (&held == null) { 0 } else { held }
+};
+unit() stop = fn { core.system_panic(); };
+%%end"#;
+        let (project, configuration) =
+            routing_test_project("web-checked-release-root", &[("main.w", text)]);
+        let exports = BTreeMap::from([
+            ("observe_value".into(), "observe".into()),
+            ("stop_now".into(), "stop".into()),
+        ]);
+        let ((partition, observations), counts) = routing_observations::observe(|| {
+            compile_project_partition(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, Some(&exports),
+            ).expect("canonical checked-access project with exports")
+        });
+        let llvm = partition.to_text();
+        let [root, release] = observations.as_slice() else { panic!("{observations:?}") };
+        assert_ne!(root.source.project, release.source.project);
+        assert_eq!((counts.preparations, counts.builds, counts.project_emissions, counts.single_module_emissions),
+            (1, 1, 1, 0));
+        assert_wasm_root_forwarder(&llvm, "observe_value", "i64", &["i64"]);
+        assert!(llvm.contains("define void @stop_now("));
+        let symbol = |name: &str| name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let bounds = format!("__{}__{}(", symbol(&release.content_revision.0), symbol("check_index_in_extent"));
+        assert_eq!(llvm.lines().filter(|row| row.contains("call void @") && row.contains(&bounds)).count(), 1);
+        assert_eq!(llvm.matches("call ptr @__wosy_core_alloc(i64 8, i64 8)").count(), 1);
+        assert_eq!(llvm.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1);
+        let (baseline, baseline_observations) =
+            compile_project(&project.root, &project, &configuration, ScalarTargetLayout::WASM32).unwrap();
+        assert_eq!(baseline_observations, observations);
+        assert!(!baseline.contains("@observe_value") && !baseline.contains("@stop_now"));
+        let directory = std::env::var_os("WOSY_CONFIGURED_WEB_IR_DIR");
+        let path = directory.as_ref().map_or_else(|| project.root.join("partition.ll"),
+            |directory| std::path::PathBuf::from(directory).join("partition.ll"));
+        let written_identity = write_llvm_partition(&path, &partition).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), llvm.as_bytes());
+        assert_eq!(written_identity, blake3::hash(llvm.as_bytes()).to_hex().as_str());
+        if let Some(directory) = directory {
+            fs::write(std::path::PathBuf::from(directory).join("runtime.ll"),
+                wosy_compiler::core_runtime("llvm", "wasm-web").unwrap()).unwrap();
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
     fn writes_partition_and_hashes_exact_canonical_bytes() {
         let sources = [(
             "main.w",
             "%%start\nenv = extern wasm \"host\" { unit() log; };\nenv.log();\n%%end\n",
         )];
         let (project, configuration) = routing_test_project("streamed-partition", &sources);
-        let (partition, observations) = compile_project(
+        let (partition, observations) = compile_project_partition(
             &project.root,
             &project,
             &configuration,
@@ -1170,70 +1664,24 @@ mod tests {
     }
 
     #[test]
-    fn selected_wasm_root_exports_keep_mixed_abi_and_exact_root_identity() {
-        let sources = [
-            (
-                "main.w",
-                "%%start\nmath = namespace app \"math.w\";\ni32(f32,i32,f32) score = fn(left,points,right) { if (left < right) { math.score() + points } else { points } };\nunit(f32,f32,f32,i32,f32) step = fn(a,b,c,n,d) { if (a + b + c > d) { if (n > 0) {}; }; };\n%%end\n",
-            ),
-            ("math.w", "%%start\ni32() score = fn { 42 };\ni32() hidden = fn { 7 };\n%%end\n"),
-        ];
-        let (project, configuration) = routing_test_project("explicit-wasm-root-exports", &sources);
-        let compile = |exports| {
-            compile_project(
-                &project.root,
-                &project,
-                &configuration,
-                ScalarTargetLayout::WASM32,
-                exports,
-            )
-            .map(|(llvm, sources)| (llvm.to_text(), sources))
-        };
-        let exports = BTreeMap::from([
-            ("demo_score".into(), "score".into()),
-            ("tick".into(), "step".into()),
-        ]);
-        let (llvm, _) = compile(Some(&exports)).expect("emit selected root exports");
-        assert_wasm_root_forwarder(&llvm, "demo_score", "i32", &["float", "i32", "float"]);
-        assert_wasm_root_forwarder(&llvm, "tick", "void", &["float", "float", "float", "i32", "float"]);
-        let (default_llvm, _) = compile(None).expect("emit the unchanged implicit partition");
-        assert!(!default_llvm.contains("@demo_score"), "{default_llvm}");
-        assert!(!default_llvm.contains("@tick"), "{default_llvm}");
-        let absent = BTreeMap::from([("demo_score".into(), "hidden".into())]);
-        assert!(compile(Some(&absent)).expect_err("dependency is not the root").contains("no root function"));
-        let reserved = BTreeMap::from([("_start".into(), "score".into())]);
-        assert!(compile(Some(&reserved)).expect_err("runtime label is reserved").contains("reserved"));
-        fs::remove_dir_all(&project.root).expect("remove routing fixture");
-    }
-
-    #[test]
-    fn singleton_wasm_root_export_keeps_identity_and_rejects_symbol_collision() {
-        let sources = [(
-            "main.w",
-            "%%start\ni32() score = fn { 42 };\ni32() occupied = fn { 7 };\n%%end\n",
-        )];
-        let (project, configuration) = routing_test_project("singleton-root-export", &sources);
-        let compile = |exports| {
-            compile_project(
-                &project.root,
-                &project,
-                &configuration,
-                ScalarTargetLayout::WASM32,
-                exports,
-            )
-            .map(|(llvm, sources)| (llvm.to_text(), sources))
-        };
-        let same = BTreeMap::from([("score".into(), "score".into())]);
-        let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");
-        let (default_llvm, _) = compile(None).expect("ordinary singleton");
-        assert_eq!(llvm, default_llvm);
-        let collision = BTreeMap::from([("occupied".into(), "score".into())]);
-        assert!(
-            compile(Some(&collision))
-                .expect_err("cannot reuse another function's emitted symbol")
-                .contains("collides with an emitted symbol")
+    fn streamed_source_revision_preserves_raw_bytes_and_read_errors() {
+        let path = snapshot_test_path("streamed-source-revision");
+        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(147_459).collect();
+        fs::write(&path, &bytes).expect("write multichunk non-UTF-8 source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read source revision"),
+            ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
         );
-        fs::remove_dir_all(&project.root).expect("remove singleton routing fixture");
+
+        fs::write(&path, []).expect("empty source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read empty source revision"),
+            ContentRevision(blake3::hash(&[]).to_hex().to_string()),
+        );
+
+        fs::remove_file(&path).expect("remove fixture");
+        let error = observe_source_revision(&path).expect_err("report missing file");
+        assert!(error.starts_with(&format!("failed to read {}: ", path.display())));
     }
 
     #[test]
@@ -1366,17 +1814,13 @@ mod tests {
         let root = snapshot_test_path("deep").with_extension("");
         let path = root.join(".wosy/cst/r1.json");
         let tree = fresh.result().canonical_cst();
-        let borrowed = serde_json::to_vec_pretty(&tree.snapshot_json_serializable())
+        let snapshot = fresh.snapshot_json_serializable();
+        let borrowed = serde_json::to_vec_pretty(&snapshot)
             .expect("serialize borrowed CST snapshot");
         let owned = serde_json::to_vec_pretty(&tree.snapshot())
             .expect("serialize owned CST snapshot");
         assert!(borrowed == owned, "borrowed CST snapshot changed bytes");
-        persist_cst(
-            &root,
-            &fresh.result().source.revision,
-            &fresh.snapshot_json_serializable(),
-        )
-        .expect("publish archived snapshot");
+        persist_cst(&root, &fresh.result().source.revision, &snapshot).expect("publish archived snapshot");
         assert!(fs::read(&path).unwrap() == borrowed, "streamed CST snapshot changed bytes");
 
         let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");
@@ -1466,7 +1910,7 @@ mod tests {
             "src/main.w".into(),
             "r1".into(),
         );
-        let output = parse_source(source, "%%start\n%%end".into(), &[]);
+        let output = wosy_compiler::parse_source(source, "%%start\n%%end".into(), &[]);
         let mut bytes = serde_json::to_vec(&output.result.canonical_cst().snapshot())
             .expect("serialize canonical CST snapshot");
         bytes.extend_from_slice(b" trailing");
@@ -1489,27 +1933,6 @@ mod tests {
         assert_eq!(target.package, "std");
         assert_eq!(target.path, "src/math.w");
         assert_eq!(target.revision, "rev");
-    }
-
-    #[test]
-    fn streamed_source_revision_preserves_raw_bytes_and_read_errors() {
-        let path = snapshot_test_path("streamed-source-revision");
-        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(147_459).collect();
-        fs::write(&path, &bytes).expect("write multichunk non-UTF-8 source");
-        assert_eq!(
-            observe_source_revision(&path).expect("read source revision"),
-            ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
-        );
-
-        fs::write(&path, []).expect("empty source");
-        assert_eq!(
-            observe_source_revision(&path).expect("read empty source revision"),
-            ContentRevision(blake3::hash(&[]).to_hex().to_string()),
-        );
-
-        fs::remove_file(&path).expect("remove fixture");
-        let error = observe_source_revision(&path).expect_err("report missing file");
-        assert!(error.starts_with(&format!("failed to read {}: ", path.display())));
     }
 
     #[test]

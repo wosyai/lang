@@ -17,7 +17,7 @@ pub use scalar::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
     derive_scalar_program, derive_scalar_program_from_cst,
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
-    prepare_scalar_project, validate_scalar_project, BinaryOperator, PreparedScalarProject,
+    prepare_scalar_project, prepare_scalar_project_with_access, validate_scalar_project, BinaryOperator, PreparedScalarProject,
     ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,
@@ -141,6 +141,34 @@ mod tests {
     }
 
     #[test]
+    fn standard_allocator_checks_portable_bounds_before_backing_requests() {
+        for output in ["native", "wasm-wasip1", "wasm-wasip2", "wasm-web"] {
+            let runtime = core_runtime("llvm", output).unwrap();
+            let (_, allocator) = runtime.split_once("define ptr @__wosy_core_alloc(i64 %size, i64 %alignment) {")
+                .expect("standard allocator");
+            let (allocator, _) = allocator.split_once("\n}").expect("allocator end");
+            let (entry, rest) = allocator.split_once(if output == "native" { "\nsize_padding:" } else { "\nprepare:" })
+                .expect("allocation validation before backing");
+            for guard in [
+                "%size_fits = icmp ule i64 %size, 4294967295",
+                "%alignment_fits = icmp ule i64 %alignment, 2147483648",
+                "%range_valid = and i1 %size_fits, %alignment_fits",
+                "%valid = and i1 %range_valid, %alignment_valid",
+            ] {
+                assert!(entry.contains(guard), "{output}: {entry}");
+            }
+            assert!(entry.contains(if output == "native" {
+                "br i1 %valid, label %size_padding, label %failure"
+            } else {
+                "br i1 %valid, label %prepare, label %failure"
+            }));
+            assert!(!entry.contains("call "), "{output}: {entry}");
+            assert!(rest.contains("failure:\n  ret ptr null"));
+            assert!(rest.contains(if output == "native" { "call ptr @malloc" } else { "call i32 @llvm.wasm.memory.grow.i32" }));
+        }
+    }
+
+    #[test]
     fn reports_unsupported_runtime_target() {
         assert_eq!(
             core_runtime("custom", "artifact"),
@@ -168,6 +196,105 @@ mod tests {
         let start = text.find("while").unwrap() as u32;
         assert!(range.start <= start && range.end > start);
         assert_eq!(output.result.reconstruct(), text);
+    }
+
+    #[test]
+    fn fallible_local_assignment_is_rejected_before_build_lowering() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        let text = "%%start\nbool() example = fn {\n\tbool result =? true;\n\tresult\n};\n%%end";
+        let output = parse_source(source.clone(), text.into(), &[]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let mut scalar = derive_scalar_program(&output.result);
+        let [diagnostic] = scalar.diagnostics.as_slice() else {
+            panic!("{:?}", scalar.diagnostics);
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer, bool, char, or float fields initialized by literals or same-type lexical bindings");
+        let range = diagnostic.labels[0].span.range;
+        assert_eq!(&text[range.start as usize..range.end as usize], "=?");
+        assert!(emit_scalar_llvm(&scalar).is_err());
+        scalar.diagnostics.clear();
+        assert!(emit_scalar_llvm(&scalar).is_err());
+
+        let ordinary = parse_source(source, text.replace("=?", "="), &[]);
+        assert!(ordinary.diagnostics.is_empty(), "{:?}", ordinary.diagnostics);
+        let scalar = derive_scalar_program(&ordinary.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        emit_scalar_llvm(&scalar).expect("ordinary assignment LLVM");
+    }
+
+    #[test]
+    fn source_fallible_allocation_rejects_unproved_read_and_unsupported_access() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (body, expected) in [
+            ("result", "fallible allocation is not known to be available"),
+            ("if (&result == null) { result } else { 7 }", "fallible allocation is not known to be available"),
+            ("7", "local binding or parameter has no required static use"),
+            ("result = 19;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
+            ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
+        ] {
+            let text = format!("%%start\ni32() example = fn {{\n\ti32 result =? 3;\n\t{body}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut checked = derive_scalar_program(&parsed.result);
+            let diagnostic = checked.diagnostics.iter().find(|diagnostic| diagnostic.message == expected)
+                .unwrap_or_else(|| panic!("{body}: {:?}", checked.diagnostics));
+            if body == "7" {
+                // An unused declaration is rejected by static-use validation
+                // before reference analysis can diagnose its missing guard.
+                assert_eq!(diagnostic.code, "B0009");
+                let span = diagnostic.labels[0].span.range;
+                assert_eq!(&parsed.result.text[span.start as usize..span.end as usize], "i32 result =? 3;");
+            }
+            assert!(emit_scalar_llvm(&checked).is_err());
+            checked.diagnostics.clear();
+            assert!(emit_scalar_llvm(&checked).is_err());
+        }
+    }
+
+    #[test]
+    fn guarded_integer_allocation_rejects_literal_overflow_before_emission() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (ty, literal) in [
+            ("u8", "256"), ("i16", "32768"), ("u64", "18446744073709551616"),
+            ("u128", "340282366920938463463374607431768211456"),
+        ] {
+            let text = format!("%%start\n{ty}() example = fn {{\n\t{ty} result =? {literal};\n\tif (&result == null) {{ 0 }} else {{ result }}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            for layout in [crate::ScalarTargetLayout::NATIVE64, crate::ScalarTargetLayout::WASM32] {
+                let validated = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+                assert!(validated.diagnostics.iter().any(|diagnostic|
+                    diagnostic.message == "integer literal is outside the resolved target type range"),
+                    "{ty}: {}", validated.diagnostics.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join(", "));
+                assert!(emit_scalar_llvm(&validated).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_dynamic_integer_initializer_keeps_ordinary_type_and_effect_rules() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (parameter, rhs, expected) in [
+            ("i64", "input", "expression type does not match expected type"),
+            ("i32", "produce(produce(input))", "fallible call initializer requires a checked allocation-free scalar callable"),
+        ] {
+            let text = format!("%%start\ni32(i32) produce = fn(item) {{ item }};\ni32({parameter}) example = fn(input) {{\n\ti32 result =? {rhs};\n\tif (&result == null) {{ 3 }} else {{ result }}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let checked = derive_scalar_program(&parsed.result);
+            assert!(checked.diagnostics.iter().any(|diagnostic| diagnostic.message == expected),
+                "{parameter} {rhs}: {:?}", checked.diagnostics);
+            assert!(emit_scalar_llvm(&checked).is_err());
+        }
     }
 
     #[test]

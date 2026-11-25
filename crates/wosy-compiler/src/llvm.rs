@@ -106,15 +106,55 @@ struct MemberName<'module> {
     unsigned: bool,
 }
 
+struct CheckedAccessSymbols {
+    non_null: String,
+    in_extent: String,
+}
+
 struct ProjectNames<'ctx, 'module> {
     scopes: Vec<ModuleNames<'ctx, 'module>>,
     positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
+    checked_access: Option<CheckedAccessSymbols>,
+    private_runtime_portable_symbols: std::collections::HashSet<String>,
+
+    require_release_checked_access: bool,
+
 }
 
 impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
     fn for_module(&self, module: &ScalarModule) -> &ModuleNames<'ctx, 'module> {
         &self.scopes[self.positions[&module.source]]
     }
+}
+
+#[derive(Clone, Copy)]
+enum LocalRuntimeExtent<'ctx> {
+    Construction {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
+    PortableConstruction {
+        length: inkwell::values::IntValue<'ctx>,
+        domain: memory::PortableRuntimeAddressDomain,
+    },
+    OrdinaryDescriptor {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
+    WidenedLiteral {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: Option<memory::SignedRuntimeAddressDomain>,
+    },
+    OwningFormal(inkwell::values::IntValue<'ctx>),
+    ManagedLengthSlot(PointerValue<'ctx>),
+}
+
+#[derive(Default)]
+struct RuntimeBorrowIndex<'ctx> {
+    sites: HashMap<usize, (wosy_syntax::ByteSpan, Option<wosy_syntax::ByteSpan>)>,
+    portable_places: std::collections::HashSet<usize>,
+    field_sites: HashMap<usize, crate::scalar::RuntimeArrayFieldSite>,
+    owners: HashMap<wosy_syntax::ByteSpan, Option<PointerValue<'ctx>>>,
 }
 
 type StorageBinding<'ctx> = (PointerValue<'ctx>, ScalarType);
@@ -168,11 +208,16 @@ impl<'ctx> StorageBindings<'ctx> {
 
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
+    require_release_checked_access: bool,
+
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
-    initializer_symbols: Option<&'module InitializerSymbols>,
+    local_callable_slots: HashMap<(u32, u32), local_callable::LocalCallableSlot<'ctx>>,
+    local_callable_arrays: HashMap<wosy_syntax::ByteSpan, local_callable::LocalCallableArray<'ctx>>,
+    guarded_scalar: Option<Box<ownership::GuardedScalarSites<'ctx>>>,
+    initializer_symbols: Option<&'module InitializerSymbols<'module>>,
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -196,6 +241,15 @@ struct EmitState<'ctx, 'module> {
     runtime_array_owners: BTreeMap<String, bool>,
     runtime_array_allocations: BTreeMap<String, bool>,
     runtime_array_lengths: BTreeMap<String, PointerValue<'ctx>>,
+    // Exact emitted storage identity: shadowed/unproved bindings cannot
+    // reuse this extent by name, and scoped restoration naturally selects
+    // only the backing (or paired replacement slot) still installed.
+    local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>, bool)>,
+    indexed_runtime_allocations: BTreeSet<(u32, u32)>,
+    portable_runtime_allocations: BTreeSet<(u32, u32)>,
+    runtime_borrow_index: RuntimeBorrowIndex<'ctx>,
+    observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
+
     runtime_array_live: BTreeMap<String, PointerValue<'ctx>>,
     mutable_runtime_allocations: BTreeSet<(u32, u32)>,
     invalidations: BTreeMap<
@@ -232,28 +286,258 @@ enum CheckedAssignmentOwner {
     Borrowed,
 }
 
-fn mutable_runtime_allocations(reference_cfg: &ScalarReferenceCfg) -> BTreeSet<(u32, u32)> {
-    let mut result = BTreeSet::new();
+fn portable_lexical_runtime_body(
+    target: ScalarTargetLayout,
+    release: bool,
+    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
+) -> bool {
+    // Don't inspect the signature or classify an unrelated scalar Wasm body.
+    target == ScalarTargetLayout::WASM32 && release && !reference_cfg.allocations.is_empty()
+        && function.generic_parameters.is_empty()
+        && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
+            if parameters.iter().all(memory::ordinary_scalar_storage)
+                && outputs.outputs.iter().all(|output| output.ty == ScalarType::Unit
+                    || memory::ordinary_scalar_storage(&output.ty)))
+}
+
+type RuntimeAllocationAccess<'ctx> = (
+    BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>, BTreeSet<(u32, u32)>,
+);
+
+fn portable_runtime_plan_allows_plain_storage(plan: &crate::scalar::ClosedBody) -> bool {
+    !plan.fallible_allocation_leaf && !plan.guarded_array_descriptor_leaf
+        && plan.literal_array.is_none()
+}
+
+fn runtime_allocation_access<'ctx>(
+    reference_cfg: &ScalarReferenceCfg,
+    body_nodes: Option<&CallableBodyCallNodes<'_>>,
+    plan: Option<&crate::scalar::ClosedBody>,
+    checked_access: bool,
+    mut portable_body: bool,
+    allow_private_pair_transport: bool,
+) -> RuntimeAllocationAccess<'ctx> {
+    let mut mutable = BTreeSet::new();
+    let mut indexed = BTreeSet::new();
+    let mut unproved_writes = BTreeSet::new();
+    let mut not_portable = std::collections::HashSet::new();
+    let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
+    let mut reborrows = portable_body.then(|| portable_reborrow::Census::new(reference_cfg)).flatten();
+    let portable_private_sites = (portable_body && allow_private_pair_transport).then(|| {
+        let mut calls = HashMap::new();
+        let mut borrows = HashMap::new();
+        if let Some(plan) = plan {
+            for site in plan.private_runtime_access_calls.values() {
+                if let Some((call, borrow)) = site.portable_birth {
+                    calls.insert(call, (borrow, site.owner));
+                    borrows.insert(borrow, site.owner);
+                }
+            }
+        }
+        (calls, borrows)
+    });
+    let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
+        .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
+    let widened_owning_install = plan.and_then(|plan| plan.widened_owning_roundtrip).map(|(_, install, _)| install);
+    let widened_join_replacements = plan.filter(|plan| !plan.widened_join_replacements.is_empty())
+        .map(|plan| plan.widened_join_replacements.values().map(|(_, install, _)| *install)
+            .collect::<std::collections::HashSet<_>>());
+    let widened_owning_replacements = plan.filter(|plan| !plan.widened_owning_receives.is_empty())
+        .map(|plan| plan.widened_owning_receives.values()
+            .filter_map(|(_, _, replace)| replace.map(|(install, _)| install))
+            .collect::<std::collections::HashSet<_>>());
+    let mut proved_extent_writes = HashMap::new();
+    if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
+        // This exact install updates pointer and returned extent together.
+        if plan.replacement_index_observation.is_some() {
+            if let Some(crate::scalar::ClosedLiteralArray::Replacement { call, destination, unit, .. }) = plan.literal_array {
+                for (call, destination) in std::iter::once((call, destination)).chain(
+                    unit.and_then(|unit| unit.other_writer).map(|writer| (writer.call, writer.destination)))
+                {
+                    if plan.array_descriptor_calls.contains(&call) {
+                        if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
+                            proved_extent_writes.insert(producer, binding);
+                        }
+                    }
+                }
+            }
+        }
+        for (&call, &destination) in &plan.same_array_rebinds {
+            if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
+                proved_extent_writes.insert(producer, binding);
+            }
+        }
+    }
+    let record_index = |indexed: &mut BTreeSet<_>, place: &crate::scalar::ReferencePlaceId| {
+        if checked_access && matches!(&place.place, crate::ScalarPlace::Index { base, .. }
+            if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
+            && reference_cfg.allocations.contains(&place.binding)
+        {
+            indexed.insert(key(place.declaration_span));
+        }
+    };
     for point in &reference_cfg.points {
+        // No portable authority is inferred from a type or given to an
+        // independently lowered address. Only already sealed private pair
+        // calls can transport it out of the exact standard owner.
+        if portable_body {
+            let exact_reborrow = reborrows.as_mut().is_some_and(|census|
+                census.observe(reference_cfg, point, &mut not_portable));
+            let mut exclude = |binding: &crate::scalar::ReferenceBindingId| {
+                if reference_cfg.allocations.contains(binding) {
+                    not_portable.insert(key(binding.declaration_span));
+                }
+            };
+            let direct_index = |place: &crate::scalar::ReferencePlaceId| {
+                matches!((&place.place, place.projections.as_slice()),
+                    (crate::ScalarPlace::Index { base, .. }, [crate::scalar::ReferencePlaceProjection::Index(_)])
+                        if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
+            };
+            match &point.kind {
+                _ if exact_reborrow => {}
+                CfgPointKind::Read { binding } => exclude(binding),
+                CfgPointKind::Assign { target, .. } => {
+                    if !direct_index(target) { exclude(&target.binding); }
+                }
+                CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
+                    for place in candidates {
+                        if !direct_index(place) { exclude(&place.binding); }
+                    }
+                }
+                CfgPointKind::Borrow { place, loan } => {
+                    let exact_length = loan.mode == crate::scalar::ScalarReferenceMutability::Shared
+                        && loan.parent.is_none() && place.projections.is_empty()
+                        && matches!(place.place, crate::ScalarPlace::Name { .. })
+                        && matches!(point.successors.as_slice(), [call] if matches!(
+                            reference_cfg.points.get(call.0).map(|next| &next.kind),
+                            Some(CfgPointKind::Call {
+                                output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
+                                argument_points, ..
+                            }) if argument_points.as_slice() == [point.id]));
+                    let exact_private = portable_private_sites.as_ref().and_then(|(_, borrows)| borrows.get(&point.id))
+                        == Some(&place.binding.declaration_span)
+                        && loan.parent.is_none() && place.projections.is_empty()
+                        && matches!(place.place, crate::ScalarPlace::Name { .. });
+                    if !exact_length && !exact_private { exclude(&place.binding); }
+                }
+                CfgPointKind::Call { argument_points, .. }
+                    if portable_private_sites.as_ref().and_then(|(calls, _)| calls.get(&point.id))
+                        .is_some_and(|(borrow, _)| argument_points.first() == Some(borrow)) => {}
+                CfgPointKind::Call { target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), .. }
+                | CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+                | CfgPointKind::Bind { .. } | CfgPointKind::Branch { .. } | CfgPointKind::Join
+                | CfgPointKind::ReturnOutput { .. } | CfgPointKind::Return
+                | CfgPointKind::ConditionalOutput { .. }
+                | CfgPointKind::CaptureAssignmentPrevious { .. } => {}
+                CfgPointKind::Evaluate(expression)
+                    if !matches!(expression, ScalarExpression::RawAddress { .. }) => {}
+                _ => portable_body = false,
+            }
+        }
         match &point.kind {
-            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
-                result.insert((target.declaration_span.start, target.declaration_span.end));
+            CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
+                if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id))
+                    || widened_owning_install == Some(point.id)
+                    || widened_join_replacements.as_ref().is_some_and(|points| points.contains(&point.id))
+                    || widened_owning_replacements.as_ref().is_some_and(|points| points.contains(&point.id))
+                {
+                    // This dominating existing-owner transfer re-keys the
+                    // original pointer and extent, rather than storing either
+                    // into an independently mutable slot.
+                    continue;
+                }
+                let id = key(target.declaration_span);
+                mutable.insert(id);
+                if checked_access && reference_cfg.allocations.contains(&target.binding)
+                    && proved_extent_writes.get(rhs_point) != Some(&&target.binding)
+                {
+                    unproved_writes.insert(id);
+                }
             }
             CfgPointKind::Release {
                 target: ReleaseTarget::Checked { candidates, .. },
             }
             | CfgPointKind::Invalidate { candidates, .. } => {
                 for candidate in candidates {
-                    result.insert((
-                        candidate.place.declaration_span.start,
-                        candidate.place.declaration_span.end,
-                    ));
+                    let id = key(candidate.place.declaration_span);
+                    mutable.insert(id);
+                    if checked_access && reference_cfg.allocations.contains(&candidate.place.binding) {
+                        unproved_writes.insert(id);
+                    }
                 }
+            }
+            CfgPointKind::Assign { target, .. } => record_index(&mut indexed, target),
+            CfgPointKind::Borrow { place, .. } => record_index(&mut indexed, place),
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
+                for place in candidates { record_index(&mut indexed, place); }
             }
             _ => {}
         }
     }
-    result
+    if let Some(plan) = plan {
+        for &owner in &plan.private_runtime_access_owners {
+            let id = key(owner);
+            indexed.insert(id);
+        }
+        for site in plan.private_runtime_access_calls.values() {
+            if !allow_private_pair_transport || site.portable_birth.is_none() {
+                not_portable.insert(key(site.owner));
+            }
+        }
+    }
+    indexed.retain(|id| !unproved_writes.contains(id));
+    let mut borrowed = RuntimeBorrowIndex::default();
+    if checked_access {
+        for (&point, site) in &reference_cfg.runtime_array_field_sites {
+            if !reference_cfg.runtime_array_field_site(point, site) { continue; }
+            let id = key(site.owner.declaration_span);
+            if mutable.contains(&id) { continue; }
+            indexed.insert(id);
+            not_portable.insert(id);
+            borrowed.field_sites.insert(site.leaf, site.clone());
+        }
+        for (&point, site) in &reference_cfg.runtime_array_read_sites {
+            let Some(owner) = reference_cfg.runtime_array_read_origin(point) else { continue; };
+            let declaration = owner.declaration_span;
+            // A general mutable pointer slot is not an extent receipt.
+            if mutable.contains(&key(declaration)) { continue; }
+            indexed.insert(key(declaration));
+            borrowed.sites.insert(site.occurrence, (declaration, site.handle));
+            not_portable.insert(key(declaration));
+            borrowed.owners.entry(declaration).or_insert(None);
+        }
+        for (&point, site) in &reference_cfg.runtime_array_exclusive_sites {
+            let Some(owner) = reference_cfg.runtime_array_exclusive_origin(point, site) else { continue; };
+            let declaration = owner.declaration_span;
+            if mutable.contains(&key(declaration)) { continue; }
+            indexed.insert(key(declaration));
+            if reborrows.as_ref().is_some_and(|census| census.contains_direct(point)) {
+                borrowed.portable_places.insert(site.occurrence);
+            } else {
+                not_portable.insert(key(declaration));
+            }
+            borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
+            borrowed.owners.entry(declaration).or_insert(None);
+        }
+        for site in &reference_cfg.runtime_array_child_sites {
+            let Some(owner) = reference_cfg.runtime_array_child_origin(site) else { continue; };
+            let declaration = owner.declaration_span;
+            if mutable.contains(&key(declaration)) { continue; }
+            indexed.insert(key(declaration));
+            if !reborrows.as_ref().is_some_and(|census| census.contains(reference_cfg, site)) {
+                not_portable.insert(key(declaration));
+            } else {
+                borrowed.portable_places.insert(site.occurrence);
+            }
+            borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
+            borrowed.owners.entry(declaration).or_insert(None);
+        }
+    }
+    let portable = if portable_body {
+        indexed.iter().copied().filter(|key| !mutable.contains(key) && !not_portable.contains(key)).collect()
+    } else { BTreeSet::new() };
+    (mutable, indexed, borrowed, portable)
 }
 
 fn resolved_invalidations(
@@ -307,6 +591,7 @@ enum RuntimeArrayResultProvenance {
     ParameterAlias,
     FixedWidening,
     FreshCall,
+    CheckedReceipt,
 }
 
 impl RuntimeArrayResultProvenance {
@@ -511,6 +796,9 @@ fn emit_wasm_root_export_wrappers<'ctx>(
         if implementation.get_type() != expected || implementation.get_call_conventions() != 0 {
             return Err(format!("Wasm root export {:?} has a non-direct ABI", export.label));
         }
+        if export.label == export.symbol && implementation.get_linkage() != Linkage::External {
+            return Err(format!("Wasm root export {:?} has a private implementation symbol", export.label));
+        }
         if module.get_global(export.label).is_some()
             || (export.label != export.symbol && module.get_function(export.label).is_some())
         {
@@ -658,6 +946,8 @@ fn emit_single_module_llvm<'a>(
             continue;
         }
         let cfg = require_cfg(item_ordinal, None, function)?;
+        if prepared_render { initializer_symbols.scalar_local_target(source, function, cfg,
+            generic_input.has_closed_shared_scalar_reader(0, function.name_span)); }
         definitions.push((function, cfg, function.name.as_str(), item_ordinal, None));
     }
     let ordinary_count = definitions.len();
@@ -688,7 +978,11 @@ fn emit_single_module_llvm<'a>(
         str::to_owned,
         prepared_overloads.remove(source).into_iter().flatten(),
     );
-    let mut reservations = crate::scalar::AggregateReservations::default();
+    let mut reservations = crate::scalar::AggregateReservations {
+        checked_access: matches!(generic_input, GenericInitializerInput::PreparedRows(prepared) if prepared.checked_access().is_some()),
+        target_layout: Some(target_layout),
+        ..Default::default()
+    };
     reservations.modules.push(0);
     for &(_, _, _, item, arm) in &definitions {
         reservations.bodies.insert((0, item, arm), true);
@@ -831,6 +1125,7 @@ fn emit_single_module_llvm<'a>(
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
         emit_function(
             prepared_render,
+            generic_input.requires_release_checked_access(),
             aggregates.body(0, item, arm),
             &context,
             &builder,
@@ -854,6 +1149,7 @@ fn emit_single_module_llvm<'a>(
     }
     emit_main(
         prepared_render,
+        generic_input.requires_release_checked_access(),
         aggregates.initializer(source),
         &context,
         &builder,
@@ -1081,6 +1377,8 @@ fn emit_project_llvm<'a>(
                     continue;
                 }
                 let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
+                if prepared_render { initializer_symbols.scalar_local_target(&source_module.source, function, cfg,
+                    generic_input.has_closed_shared_scalar_reader(module_ordinal, function.name_span)); }
                 declarations.push(Declaration::Ordinary(definitions.len()));
                 definitions.push((
                     module_ordinal,
@@ -1162,7 +1460,11 @@ fn emit_project_llvm<'a>(
                 .flatten(),
         ));
     }
-    let mut reservations = crate::scalar::AggregateReservations::default();
+    let mut reservations = crate::scalar::AggregateReservations {
+        checked_access: matches!(generic_input, GenericInitializerInput::PreparedRows(prepared) if prepared.checked_access().is_some()),
+        target_layout: Some(target_layout),
+        ..Default::default()
+    };
     reservations.modules.extend(ordered_modules.iter().map(|&(ordinal, _)| ordinal));
     for &(ordinal, _, _, _, _, item, arm) in &definitions {
         reservations.bodies.insert((ordinal, item, arm), true);
@@ -1180,25 +1482,58 @@ fn emit_project_llvm<'a>(
     if prepared_render && reservations.modules.len() > 1 {
         reservations.snapshot_struct = Some(&snapshot_struct);
     }
-    let aggregates = close_aggregates(&reservations)?;
+    let mut aggregates = close_aggregates(&reservations)?;
+    let mut planned_runtime_access = HashMap::new();
+    if target_layout == ScalarTargetLayout::WASM32 && reservations.checked_access
+        && !aggregates.private_runtime_pair_members().is_empty()
+    {
+        // Only exact member owners enter the pre-definition census. The
+        // result is consumed at body emission instead of walking those CFGs
+        // twice. Unrelated ordinary and managed bodies stay on their path.
+        let mut portable_calls = HashMap::new();
+        for &key @ (ordinal, item, arm) in aggregates.private_runtime_pair_members() {
+            let plan = aggregates.body(ordinal, item, arm).expect("indexed private runtime member");
+            if !plan.private_runtime_access_calls.values().any(|site| site.portable_birth.is_some())
+                || !portable_runtime_plan_allows_plain_storage(plan)
+                || !plan.fallible_relay_allocations.is_empty() || !plan.same_array_rebinds.is_empty()
+                || plan.replacement_index_observation.is_some()
+            {
+                continue;
+            }
+            let Some(ScalarItem::Function(function)) = project.modules[ordinal].items.get(item) else {
+                return Err("portable runtime owner body lost its prepared function".into());
+            };
+            let cfg = require_cfg(ordinal, item, arm, function)?;
+            if !portable_lexical_runtime_body(target_layout, true, function, cfg) {
+                continue;
+            }
+            // This exact class has no managed rebind requiring body nodes
+            // in runtime_allocation_access; every private Call/Borrow is
+            // authenticated against its sealed CFG points instead.
+            let mut access = runtime_allocation_access(cfg, None, Some(plan), true, true, true);
+            for owner in access.2.owners.keys() {
+                access.3.remove(&(owner.start, owner.end));
+            }
+            let admitted: std::collections::HashSet<_> = plan.private_runtime_access_calls.iter().filter_map(|(&call, site)|
+                access.3.contains(&(site.owner.start, site.owner.end)).then_some(call)).collect();
+            if !admitted.is_empty() { portable_calls.insert(key, admitted); }
+            planned_runtime_access.insert(key, access);
+        }
+        aggregates.mark_private_runtime_portable(portable_calls)?;
+    }
+    let mut private_runtime_portable_symbols = std::collections::HashSet::new();
     for declaration in declarations {
         match declaration {
             Declaration::Ordinary(index) => {
                 let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let plan = aggregates.body(module_ordinal, item_ordinal, None);
+                if plan.is_some_and(|plan| plan.private_runtime_portable_formal) {
+                    private_runtime_portable_symbols.insert(name.clone());
+                }
                 let value = module.add_function(
                     &name,
-                    aggregate_transfer::definition_type(
-                        &context,
-                        function,
-                        cfg,
-                        target_layout,
-                        aggregates.body(module_ordinal, item_ordinal, None),
-                    )?,
-                    aggregate_transfer::linkage(aggregates.body(
-                        module_ordinal,
-                        item_ordinal,
-                        None,
-                    )),
+                    aggregate_transfer::definition_type(&context, function, cfg, target_layout, plan)?,
+                    aggregate_transfer::linkage(plan),
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
                     if let Some(argument) = value.get_nth_param(index as u32) {
@@ -1330,6 +1665,14 @@ fn emit_project_llvm<'a>(
     let names = ProjectNames {
         scopes,
         positions: module_positions,
+        require_release_checked_access: generic_input.requires_release_checked_access(),
+        private_runtime_portable_symbols,
+        checked_access: project_build.and_then(|build| build.prepared().checked_access()).map(|access| {
+            CheckedAccessSymbols {
+                non_null: project_function_name(&access.source, &access.non_null),
+                in_extent: project_function_name(&access.source, &access.in_extent),
+            }
+        }),
     };
     for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
@@ -1384,6 +1727,7 @@ fn emit_project_llvm<'a>(
             &all_structs,
             &layouts,
             target_layout,
+            planned_runtime_access.remove(&(ordinal, item, arm)),
         )?;
     }
     emit_project_main(
@@ -1764,6 +2108,8 @@ fn definition_function_type<'ctx>(
 }
 
 mod aggregate_transfer;
+mod local_callable;
+mod portable_reborrow;
 mod memory;
 use memory::{
     aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
@@ -1778,6 +2124,9 @@ fn emit_binding_value<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::binding_value(context, state, binding, None)? {
+        return Ok(value);
+    }
     if binding.output_sequence.outputs.len() == 1 {
         return emit_typed_expression(context, state, &binding.value, &binding.declared_type);
     }
@@ -1809,6 +2158,9 @@ fn store_binding_outputs<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
+    if local_callable::store_binding(context, state, binding, &value)? {
+        return Ok(());
+    }
     if binding.is_allocation {
         let receiver = binding
             .receivers
@@ -1821,74 +2173,24 @@ fn store_binding_outputs<'ctx, 'module>(
             .allocation_length
             .as_ref()
             .ok_or_else(|| "runtime allocation has no length".to_owned())?;
-        let length = take_basic(emit_typed_expression(
-            context,
-            state,
-            length,
-            &ScalarType::U64,
-        )?)?
-        .into_int_value();
-        let slot = emit_runtime_array_allocation(context, state, element, length)?;
-        aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
-        if !state
-            .mutable_runtime_allocations
-            .contains(&(receiver.name_span.start, receiver.name_span.end))
-        {
-            state
-                .storage
-                .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
-            state
-                .runtime_array_owners
-                .insert(receiver.name.clone(), true);
-            state
-                .runtime_array_allocations
-                .insert(receiver.name.clone(), true);
-            return Ok(());
-        }
-        let backing = entry_alloca(
-            state,
-            context.ptr_type(AddressSpace::default()).into(),
-            &format!("{}_backing", receiver.name),
-        )?;
-        state
-            .builder
-            .build_store(backing, slot)
-            .map_err(builder_error)?;
-        let length_slot = entry_alloca(
-            state,
-            context.i64_type().into(),
-            &format!("{}_length", receiver.name),
-        )?;
-        state
-            .builder
-            .build_store(length_slot, length)
-            .map_err(builder_error)?;
-        state
-            .runtime_array_lengths
-            .insert(receiver.name.clone(), length_slot);
-        let live = entry_alloca(
-            state,
-            context.bool_type().into(),
-            &format!("{}_live", receiver.name),
-        )?;
-        state
-            .builder
-            .build_store(live, context.bool_type().const_int(1, false))
-            .map_err(builder_error)?;
-        aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
-        state.runtime_array_live.insert(receiver.name.clone(), live);
-        state
-            .storage
-            .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-        state
-            .runtime_array_owners
-            .insert(receiver.name.clone(), true);
-        state
-            .runtime_array_allocations
-            .insert(receiver.name.clone(), false);
+        let length = match aggregate_transfer::checked_array_formal_extent(state, binding, length)? {
+            Some(length) => length,
+            None => take_basic(emit_typed_expression(context, state, length, &ScalarType::U64)?)?
+                .into_int_value(),
+        };
+        return store_runtime_allocation(context, state, binding, receiver, element, length, false, |_, _| Ok(()));
+    }
+    if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
-    if aggregate_transfer::store_received_binding(state, binding, &value)? {
+    if aggregate_transfer::install_ordinary_array_descriptor(context, state, binding, &value)?
+        || aggregate_transfer::install_widened_owning_receiver(context, state, binding, &value)? {
+        return Ok(());
+    }
+    if store_widened_join(context, state, binding, &value)? {
+        return Ok(());
+    }
+    if store_widened_move(state, binding, &value)? {
         return Ok(());
     }
     let receivers = binding_receivers(binding);
@@ -1911,6 +2213,334 @@ fn store_binding_outputs<'ctx, 'module>(
         )?;
     }
     Ok(())
+}
+
+fn store_widened_join<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_receivers.is_empty()) else { return Ok(false) };
+    let [receiver] = binding.receivers.as_slice() else { return Ok(false) };
+    if !plan.widened_join_receivers.contains(&(receiver.name_span.start, receiver.name_span.end)) {
+        return Ok(false);
+    }
+    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, (false, None), value)?;
+    Ok(true)
+}
+
+fn install_widened_join<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    (name, declaration, ty): (&str, wosy_syntax::ByteSpan, &ScalarType),
+    replace: bool,
+    (nullable, signed): (bool, Option<memory::SignedRuntimeAddressDomain>),
+    value: &EmitValue<'ctx>,
+) -> Result<(), String> {
+    let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
+        return Err("missing checked widened array join descriptor".into());
+    };
+    if pair.get_type() != aggregate_transfer::array_descriptor_type(context) {
+        return Err("invalid checked widened array join descriptor".into());
+    }
+    let backing = state.builder.build_extract_value(*pair, 0, "widened_join_backing")
+        .map_err(builder_error)?.into_pointer_value();
+    let count = state.builder.build_extract_value(*pair, 1, "widened_join_extent")
+        .map_err(builder_error)?.into_int_value();
+    if nullable {
+        aggregate_transfer::require_ordinary_array_backing(context, state, backing)?;
+    }
+    if replace {
+        let (previous, _) = state.storage.get(name).cloned().ok_or("missing widened join predecessor")?;
+        if state.runtime_array_owners.get(name) != Some(&true)
+            || state.runtime_array_allocations.get(name) != Some(&true)
+            || !matches!(state.local_runtime_extents.get(&previous),
+                Some((owner, LocalRuntimeExtent::WidenedLiteral { .. }, true)) if *owner == declaration)
+        { return Err("widened join predecessor lost its exact owner".into()); }
+        ownership::consume_runtime_array_release(context, state,
+            ownership::RuntimeArrayRelease { pointer: previous.into(), live: None })?;
+        state.local_runtime_extents.remove(&previous);
+    }
+    install_runtime_array_binding_owner(state, name, true, true, None);
+    state.storage.insert(name.to_owned(), (backing, ty.clone()));
+    state.local_runtime_extents.insert(backing, (declaration, LocalRuntimeExtent::WidenedLiteral { length: count, signed }, true));
+    Ok(())
+}
+
+fn pack_widened_join_arm<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    value: &EmitValue<'ctx>,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_arms.is_empty()) else { return Ok(None) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened array join")?;
+    let Some(declaration) = nodes.expression_ordinal(expression).and_then(|ordinal| plan.widened_join_arms.get(&ordinal))
+    else { return Ok(None) };
+    let ScalarExpression::Name { name, .. } = expression else { return Err("invalid widened join arm".into()) };
+    let EmitValue::Basic(BasicValueEnum::PointerValue(backing)) = value else {
+        return Err("missing widened join arm backing".into());
+    };
+    let Some(&(owner, LocalRuntimeExtent::WidenedLiteral { length: count, .. }, true)) = state.local_runtime_extents.get(backing)
+    else { return Err("missing widened join arm extent".into()) };
+    if owner != *declaration || nodes.lexical_expression_declaration(expression) != Some(owner)
+        || state.runtime_array_owners.get(name) != Some(&true)
+        || state.runtime_array_allocations.get(name) != Some(&true)
+    { return Err("widened join arm lacks its original owner".into()); }
+    let pair = state.builder.build_insert_value(aggregate_transfer::array_descriptor_type(context).get_undef(),
+        *backing, 0, "widened_arm_backing").map_err(builder_error)?.into_struct_value();
+    let pair = state.builder.build_insert_value(pair, count, 1, "widened_arm_extent").map_err(builder_error)?;
+    // The packed value now carries the sole cleanup obligation. An ordinary
+    // block result's inferred output type is not the transfer authority here.
+    ownership::retire_named_runtime_array_return(state, name);
+    state.local_runtime_extents.remove(backing);
+    Ok(Some(EmitValue::Basic(pair.into_struct_value().into())))
+}
+
+fn store_widened_move<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    if !matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) { return Ok(false); }
+    let ScalarExpression::Name { name: source, .. } = &binding.value else { return Ok(false) };
+    let Some((backing, _)) = state.storage.get(source) else { return Ok(false) };
+    let backing = *backing;
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral { .. }, checked)) =
+        state.local_runtime_extents.get(&backing)
+    else { return Ok(false) };
+    let [receiver] = binding.receivers.as_slice() else {
+        return Err("widened array move requires one exact destination".into());
+    };
+    let Some(nodes) = state.body_call_nodes else { return Err("missing prepared widened array move".into()) };
+    if nodes.lexical_expression_declaration(&binding.value) != Some(declaration)
+        || nodes.binding_position(binding).is_none()
+        || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+        || !matches!(value, EmitValue::Basic(BasicValueEnum::PointerValue(actual)) if *actual == backing)
+        || state.runtime_array_owners.get(source) != Some(&true)
+        || state.runtime_array_allocations.get(source) != Some(&true)
+    {
+        return Err("widened array move changed its prepared owner".into());
+    }
+    // The ordinary ownership transition retires the source. Re-key the
+    // existing extent under the sole receiving declaration, with no load,
+    // store, new backing, or independent runtime owner.
+    install_runtime_array_binding_owner(state, &receiver.name, true, true, Some(source));
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.local_runtime_extents.insert(backing, (receiver.name_span, extent, checked));
+    Ok(true)
+}
+
+fn store_runtime_allocation<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    receiver: &crate::ScalarOutputReceiver,
+    element: &ScalarType,
+    length: inkwell::values::IntValue<'ctx>,
+    widened: bool,
+    initialize: impl FnOnce(&mut EmitState<'ctx, 'module>, PointerValue<'ctx>) -> Result<(), String>,
+) -> Result<(), String> {
+    let declaration = (receiver.name_span.start, receiver.name_span.end);
+    let mutable = state.mutable_runtime_allocations.contains(&declaration);
+    if widened && mutable {
+        return Err("widened array backing must remain in its original local binding".into());
+    }
+    let private_literal = aggregate_transfer::has_literal_array_plan(state);
+    let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
+    let checked_extent = widened || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+        || (prepared && state.require_release_checked_access && state.indexed_runtime_allocations.contains(&declaration));
+    let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
+        .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
+    aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
+    let relay_site = state.aggregate.as_ref().and_then(|aggregate| {
+        let owners = &aggregate.plan().fallible_relay_allocations;
+        (!owners.is_empty()).then_some((owners.get(aggregate.fallible_relay_next).copied(),
+            aggregate.fallible_relay_next + 1 < owners.len(), aggregate.fallible_relay_unwind))
+    });
+    if relay_site.is_some_and(|(expected, _, _)|
+        expected != Some(receiver.name_span) || !prepared || mutable || widened || !tracked_extent)
+    {
+        return Err("invalid sealed fallible allocation relay backing".into());
+    }
+    let relay_unwind = match relay_site {
+        None => None,
+        Some((_, _, Some(unwind))) => Some(unwind),
+        Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
+    };
+    let portable = (prepared && checked_extent && !widened && !mutable && relay_unwind.is_none()
+        && state.portable_runtime_allocations.contains(&declaration)
+        && state.aggregate.as_ref().is_none_or(|aggregate| portable_runtime_plan_allows_plain_storage(aggregate.plan()))).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
+    let allocation = ownership::emit_runtime_array_allocation_with_absence(
+        context, state, element, length, checked_extent && portable.is_none(), relay_unwind,
+    )?;
+    let slot = allocation.backing;
+    if let Some((target, producer_element)) = state.aggregate.as_ref()
+        .filter(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+        .and_then(|aggregate| aggregate.plan().signed_array_descriptor_result.as_ref())
+    {
+        if *target != state.target_layout || producer_element != element
+            || !allocation.signed.is_some_and(|domain| domain.matches_consumer(*target, producer_element))
+        {
+            return Err("private array descriptor lost producer address-domain authority".into());
+        }
+    }
+    initialize(state, slot)?;
+    aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
+    if !mutable {
+        if tracked_extent {
+            let extent = if let Some(domain) = portable {
+                LocalRuntimeExtent::PortableConstruction { length: allocation.length, domain }
+            } else if widened {
+                LocalRuntimeExtent::WidenedLiteral { length, signed: None }
+            } else {
+                LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed }
+            };
+            state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
+            if let Some(backing) = state.runtime_borrow_index.owners.get_mut(&receiver.name_span) {
+                if widened || !checked_extent || backing.replace(slot).is_some() {
+                    return Err("invalid checked borrow backing construction".into());
+                }
+            }
+        }
+        state
+            .storage
+            .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+        if private_literal {
+            aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, None)?;
+        } else {
+            state.runtime_array_owners.insert(receiver.name.clone(), true);
+        }
+        state
+            .runtime_array_allocations
+            .insert(receiver.name.clone(), true);
+        if let (Some((_, has_next, _)), Some(unwind)) = (relay_site, relay_unwind) {
+            let unwind = if has_next {
+                ownership::emit_relay_unwind(context, state, slot, unwind)?
+            } else {
+                unwind
+            };
+            let aggregate = state.aggregate.as_mut().ok_or("missing sealed fallible relay plan")?;
+            aggregate.fallible_relay_next += 1;
+            aggregate.fallible_relay_unwind = Some(unwind);
+        }
+        return Ok(());
+    }
+    let backing = entry_alloca(
+        state,
+        context.ptr_type(AddressSpace::default()).into(),
+        &format!("{}_backing", receiver.name),
+    )?;
+    state
+        .builder
+        .build_store(backing, slot)
+        .map_err(builder_error)?;
+    let length_slot = entry_alloca(
+        state,
+        context.i64_type().into(),
+        &format!("{}_length", receiver.name),
+    )?;
+    state
+        .builder
+        .build_store(length_slot, length)
+        .map_err(builder_error)?;
+    state
+        .runtime_array_lengths
+        .insert(receiver.name.clone(), length_slot);
+    if private_literal {
+        aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, Some((backing, length_slot)))?;
+    } else {
+        let live = entry_alloca(
+            state, context.bool_type().into(), &format!("{}_live", receiver.name),
+        )?;
+        state.builder.build_store(live, context.bool_type().const_int(1, false))
+            .map_err(builder_error)?;
+        aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
+        state.runtime_array_live.insert(receiver.name.clone(), live);
+        state.runtime_array_owners.insert(receiver.name.clone(), true);
+    }
+    if tracked_extent {
+        state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot), checked_extent));
+    }
+    state
+        .storage
+        .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+
+    state
+        .runtime_array_allocations
+        .insert(receiver.name.clone(), false);
+    Ok(())
+}
+
+fn store_widened_local_array<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    if let Some((source, count)) = state.aggregate.as_ref()
+        .and_then(|aggregate| {
+            let [receiver] = binding.receivers.as_slice() else { return None };
+            aggregate.plan().widened_fixed_copies.get(&(receiver.name_span.start, receiver.name_span.end)).copied()
+        })
+    {
+        let [receiver] = binding.receivers.as_slice() else { unreachable!() };
+        let ScalarExpression::Name { name, .. } = &binding.value else { return Err("widening requires an exact fixed Copy source".into()); };
+        let nodes = state.body_call_nodes.ok_or("missing checked fixed Copy operand")?;
+        if nodes.lexical_expression_declaration(&binding.value) != Some(source) || nodes.binding_position(binding).is_none() {
+            return Err("fixed Copy widening changed its prepared binding".into());
+        }
+        let (source, fixed_ty) = state.storage.get(name).cloned().ok_or("missing fixed Copy storage")?;
+        let (element, actual) = crate::scalar::widened_fixed_copy(binding, &fixed_ty)
+            .ok_or("widened Copy backing must be fixed")?;
+        if actual != count { return Err("fixed Copy widening changed its exact extent".into()); }
+        let count = context.i64_type().const_int(count, false);
+        store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing|
+            memory::copy_fixed_aggregate(context, state, backing, source, &fixed_ty))?;
+        return Ok(true);
+    }
+    let Some((element, values, _)) = crate::scalar::widened_local_literal(binding) else {
+        if matches!(binding.declared_type, ScalarType::RuntimeArray { .. })
+            && matches!(&binding.value, ScalarExpression::Name { name, .. }
+                if state.storage.get(name).is_some_and(|(_, ty)| crate::scalar::widened_fixed_copy(binding, ty).is_some()))
+        {
+            return Err("fixed Copy widening requires an exact prepared backing plan".into());
+        }
+        return Ok(false);
+    };
+    let [receiver] = binding.receivers.as_slice() else { return Err("invalid widened array receiver".into()) };
+    let count = context.i64_type().const_int(values.len() as u64, false);
+    let mut staged = memory::stage_ordinary_array_elements(context, state, values, element,
+        match project {
+            Some(project) => ExpressionPath::Project { module: project.module, modules: project.modules },
+            None => ExpressionPath::Single,
+        })?;
+    store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing| {
+        let item = storage_type(context, element, state.layouts, state.target_layout)?;
+        for (position, expression) in values.iter().enumerate() {
+            let value = if let Some(staged) = staged.as_mut() {
+                staged.next().expect("one staged value per widened array element")
+            } else {
+                match project {
+                    Some(project) => emit_project_typed_expression(context, state, expression, element,
+                        project.module, project.modules)?,
+                    None => emit_typed_expression(context, state, expression, element)?,
+                }
+            };
+            // This index comes from the exact same literal count supplied to
+            // the successful allocation, not from an authored index.
+            let destination = unsafe { state.builder.build_in_bounds_gep(
+                item, backing, &[pointer_integer_type(context, state.target_layout).const_int(position as u64, false)],
+                "widened_array_cell",
+            ) }.map_err(builder_error)?;
+            store_value(context, state, destination, element, value)?;
+        }
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 fn transition_automatic_return_result_binding_initialization(
@@ -2065,15 +2695,24 @@ fn transition_runtime_array_binding_initialization(
         return Ok(());
     }
     let provenance = runtime_array_assignment_provenance(state, value)?;
-    let owns = provenance.result.owns();
+    install_runtime_array_binding_owner(state, name, provenance.result.owns(), false, provenance.source_name.as_deref());
+    Ok(())
+}
+
+fn install_runtime_array_binding_owner(
+    state: &mut EmitState<'_, '_>,
+    name: &str,
+    owns: bool,
+    direct_backing: bool,
+    source: Option<&str>,
+) {
     state.runtime_array_owners.insert(name.into(), owns);
-    state.runtime_array_allocations.insert(name.into(), false);
+    state.runtime_array_allocations.insert(name.into(), direct_backing);
     if owns {
-        if let Some(source) = provenance.source_name.filter(|source| source != name) {
-            state.runtime_array_owners.insert(source, false);
+        if let Some(source) = source.filter(|source| *source != name) {
+            state.runtime_array_owners.insert(source.into(), false);
         }
     }
-    Ok(())
 }
 
 fn runtime_array_assignment_provenance(
@@ -2162,6 +2801,9 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::binding_value(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+        return Ok(value);
+    }
     if binding.output_sequence.outputs.len() == 1 {
         return emit_project_typed_expression(
             context,
@@ -2198,6 +2840,7 @@ fn emit_project_binding_value<'ctx, 'module>(
 
 fn emit_function<'ctx, 'module>(
     prepared_render: bool,
+    require_release_checked_access: bool,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -2210,7 +2853,7 @@ fn emit_function<'ctx, 'module>(
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     name: &str,
     names: &'module ModuleNames<'ctx, 'module>,
     module: &'module Module<'ctx>,
@@ -2223,13 +2866,26 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
+    let array_descriptor_forward = aggregate_plan.and_then(|plan| plan.array_descriptor_forward);
+    if array_descriptor_forward.is_none() && array_descriptor_observer.is_none()
+        && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
+    if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
+        return aggregate_transfer::emit_identity_relay(builder, value, slot);
+    }
     let (fresh_return_outputs, branch_return_outputs) =
         fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
+        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access,
+            portable_lexical_runtime_body(target_layout, require_release_checked_access, function, reference_cfg), false);
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2238,6 +2894,9 @@ fn emit_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
+        guarded_scalar: ownership::GuardedScalarSites::from_cfg(reference_cfg),
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2269,8 +2928,13 @@ fn emit_function<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations,
+        portable_runtime_allocations,
+        runtime_borrow_index,
+        observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: &names.globals,
@@ -2283,6 +2947,19 @@ fn emit_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    use aggregate_transfer::ArrayDescriptorForward;
+    if let Some(call) = array_descriptor_forward {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Owned);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.private_runtime_read_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::PrivateSharedIndex);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Borrowed);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.guarded_array_descriptor_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::GuardedProducer);
+    }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
@@ -2305,6 +2982,17 @@ fn emit_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
+                aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
+            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+                let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
+                    context, builder, argument,
+                )?;
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                backing
+            } else {
+                argument
+            };
             store_value(
                 context,
                 &mut state,
@@ -2330,7 +3018,7 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let single_output = if function.body.items.len() == 1 {
@@ -2340,7 +3028,7 @@ fn emit_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
@@ -2375,6 +3063,9 @@ fn emit_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if array_descriptor_observer.is_some() {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(returned) =
         aggregate_transfer::finish_return(&mut state)?
     {
@@ -2385,6 +3076,7 @@ fn emit_function<'ctx, 'module>(
 
 fn emit_main<'ctx, 'module>(
     prepared_render: bool,
+    require_release_checked_access: bool,
     initializer_plan: Option<&'module crate::scalar::ClosedInitializer>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -2398,7 +3090,7 @@ fn emit_main<'ctx, 'module>(
     items: &[ScalarItem],
     initialization_region: &ModuleInitializationRegion,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -2411,10 +3103,14 @@ fn emit_main<'ctx, 'module>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access,
         aggregate: None,
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
         body_call_nodes: None,
+        local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
+        guarded_scalar: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2439,6 +3135,11 @@ fn emit_main<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations: BTreeSet::new(),
+        portable_runtime_allocations: BTreeSet::new(),
+        runtime_borrow_index: RuntimeBorrowIndex::default(),
+        observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
@@ -2522,7 +3223,7 @@ fn emit_project_function<'ctx, 'module>(
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
@@ -2533,19 +3234,34 @@ fn emit_project_function<'ctx, 'module>(
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
+    planned_runtime_access: Option<RuntimeAllocationAccess<'ctx>>,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
+    let array_descriptor_forward = aggregate_plan.and_then(|plan| plan.array_descriptor_forward);
+    if array_descriptor_forward.is_none() && array_descriptor_observer.is_none()
+        && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
+    if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
+        return aggregate_transfer::emit_identity_relay(builder, value, slot);
+    }
     let (fresh_return_outputs, branch_return_outputs) =
         fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
+        planned_runtime_access.unwrap_or_else(|| runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan,
+            project_names.require_release_checked_access,
+            portable_lexical_runtime_body(target_layout, project_names.require_release_checked_access, function, reference_cfg), false));
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access: project_names.require_release_checked_access,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2554,6 +3270,9 @@ fn emit_project_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
+        guarded_scalar: ownership::GuardedScalarSites::from_cfg(reference_cfg),
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2585,8 +3304,13 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations,
+        portable_runtime_allocations,
+        runtime_borrow_index,
+        observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: &names.globals,
@@ -2599,6 +3323,19 @@ fn emit_project_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    use aggregate_transfer::ArrayDescriptorForward;
+    if let Some(call) = array_descriptor_forward {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Owned);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.private_runtime_read_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::PrivateSharedIndex);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Borrowed);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.guarded_array_descriptor_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::GuardedProducer);
+    }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
@@ -2621,6 +3358,17 @@ fn emit_project_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
+                aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
+            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+                let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
+                    context, builder, argument,
+                )?;
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                backing
+            } else {
+                argument
+            };
             store_value(
                 context,
                 &mut state,
@@ -2646,7 +3394,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2665,7 +3413,7 @@ fn emit_project_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
@@ -2715,6 +3463,9 @@ fn emit_project_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if array_descriptor_observer.is_some() {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(returned) =
         aggregate_transfer::finish_return(&mut state)?
     {
@@ -2737,7 +3488,7 @@ fn emit_project_main<'ctx, 'module>(
     regions: &[&ModuleInitializationRegion],
     names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2753,10 +3504,14 @@ fn emit_project_main<'ctx, 'module>(
     let empty_unit_values = BTreeSet::new();
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access: names.require_release_checked_access,
         aggregate: None,
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes: None,
+        local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
+        guarded_scalar: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2781,6 +3536,11 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations: BTreeSet::new(),
+        portable_runtime_allocations: BTreeSet::new(),
+        runtime_borrow_index: RuntimeBorrowIndex::default(),
+        observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
@@ -3067,6 +3827,7 @@ impl<'a> BlockEmission<'a> {
 }
 
 struct CanonicalTailIf<'syntax, 'signature> {
+    expression: &'syntax ScalarExpression,
     condition: &'syntax ScalarExpression,
     then_branch: &'syntax ScalarBlock,
     else_branch: &'syntax ScalarBlock,
@@ -3089,6 +3850,7 @@ fn canonical_tail_if<'syntax, 'signature>(
             else_branch,
             ..
         } => Some(CanonicalTailIf {
+            expression,
             condition,
             then_branch,
             else_branch,
@@ -3125,14 +3887,23 @@ fn emit_block_at<'ctx, 'module>(
         emit_block_item(context, state, item)?;
     }
     let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
-        emit_final_outputs(context, state, block, emission)?
+        let ancestors = matches!(emission, BlockEmission::Ordinary | BlockEmission::ContextualNumeric(_))
+            .then_some(&runtime_array_owners);
+        emit_final_outputs(context, state, block, emission, ancestors)?
     } else {
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = aggregate_transfer::commit_named_result_arm(context, state, block, result)?;
+    let result = if let BlockEmission::TailArm(outputs) = emission {
+        aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
+    } else {
+        result
+    };
     if let BlockEmission::Return(outputs) = emission {
-        aggregate_transfer::commit_return(context, state, &result, outputs)?;
+        aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
+    ownership::release_guarded_scalar(context, state, block.span)?;
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     if matches!(emission, BlockEmission::Return(_)) {
@@ -3196,7 +3967,14 @@ fn emit_project_block_at<'ctx, 'module>(
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
         match item {
+            ScalarBlockItem::LocalBinding(binding) if binding.fallible_assignment.is_some() => {
+                emit_project_block_item(context, state, item, module, modules)?;
+            }
             ScalarBlockItem::LocalBinding(binding) => {
+                if ownership::move_guarded_runtime_owner(context, state, binding)?
+                    || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                    continue;
+                }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 store_binding_outputs(context, state, binding, value)?;
             }
@@ -3209,14 +3987,23 @@ fn emit_project_block_at<'ctx, 'module>(
         }
     }
     let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
-        emit_project_final_outputs(context, state, block, module, modules, emission)?
+        let ancestors = matches!(emission, BlockEmission::Ordinary | BlockEmission::ContextualNumeric(_))
+            .then_some(&runtime_array_owners);
+        emit_project_final_outputs(context, state, block, module, modules, emission, ancestors)?
     } else {
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = aggregate_transfer::commit_named_result_arm(context, state, block, result)?;
+    let result = if let BlockEmission::TailArm(outputs) = emission {
+        aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
+    } else {
+        result
+    };
     if let BlockEmission::Return(outputs) = emission {
-        aggregate_transfer::commit_return(context, state, &result, outputs)?;
+        aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
+    ownership::release_guarded_scalar(context, state, block.span)?;
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     if matches!(emission, BlockEmission::Return(_)) {
@@ -3257,8 +4044,15 @@ fn emit_final_outputs<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
+    retained_ancestor_owners: Option<&BTreeMap<String, bool>>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(tail) = canonical_tail_if(block, emission) {
+        if matches!(emission, BlockEmission::Return(_)) {
+            aggregate_transfer::match_mixed_branch_conditional(state, tail.expression)?;
+        }
         let condition =
             take_basic(emit_expression(context, state, tail.condition)?)?.into_int_value();
         return emit_if_value(
@@ -3267,6 +4061,7 @@ fn emit_final_outputs<'ctx, 'module>(
             condition,
             tail.then_branch,
             tail.else_branch,
+            tail.expression,
             |state, branch| {
                 emit_block_at(context, state, branch, BlockEmission::TailArm(tail.outputs))
             },
@@ -3279,7 +4074,7 @@ fn emit_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
             transfer_automatic_return_result(state, expression);
             let value = emit_expression(context, state, expression)?;
             if !state
@@ -3291,12 +4086,7 @@ fn emit_final_outputs<'ctx, 'module>(
             return Ok(value);
         }
         let ty = emission.expected_numeric().unwrap_or(&output.ty);
-        let snapshot = if matches!(expression, ScalarExpression::IndexedRead { .. }) {
-            aggregate_transfer::emit_checked_ordinary_snapshot(context, state, expression, None)?
-        } else {
-            None
-        };
-        let value = match snapshot {
+        let value = match aggregate_transfer::emit_checked_ordinary_snapshot(context, state, expression, None)? {
             Some(value) => value,
             None => emit_typed_expression(context, state, expression, ty)?,
         };
@@ -3306,7 +4096,10 @@ fn emit_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        if let Some(pair) = pack_widened_join_arm(context, state, expression, &value)? {
+            return Ok(pair);
+        }
+        transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3341,7 +4134,7 @@ fn emit_final_outputs<'ctx, 'module>(
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
         let expression = final_output_expression(block, position);
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
@@ -3354,8 +4147,15 @@ fn emit_project_final_outputs<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
+    retained_ancestor_owners: Option<&BTreeMap<String, bool>>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(tail) = canonical_tail_if(block, emission) {
+        if matches!(emission, BlockEmission::Return(_)) {
+            aggregate_transfer::match_mixed_branch_conditional(state, tail.expression)?;
+        }
         let condition = take_basic(emit_project_expression(
             context,
             state,
@@ -3370,6 +4170,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
             condition,
             tail.then_branch,
             tail.else_branch,
+            tail.expression,
             |state, branch| {
                 emit_project_block_at(
                     context,
@@ -3389,7 +4190,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
             transfer_automatic_return_result(state, expression);
             let value = emit_project_expression(context, state, expression, module, modules)?;
             if !state
@@ -3413,7 +4214,10 @@ fn emit_project_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        if let Some(pair) = pack_widened_join_arm(context, state, expression, &value)? {
+            return Ok(pair);
+        }
+        transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3448,7 +4252,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
         let expression = final_output_expression(block, position);
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
@@ -3481,7 +4285,7 @@ fn emit_ordered_final_outputs<'ctx, 'module>(
     }
     record_named_branch_return_owners(context, state, block)?;
     for ((expression, _), output) in block.final_expressions().zip(&outputs.outputs) {
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, None);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, outputs, values)
@@ -3560,16 +4364,22 @@ struct AssignmentValue<'ctx> {
     value: EmitValue<'ctx>,
     ty: ScalarType,
     provenance: RuntimeArrayAssignmentProvenance,
+    // Output ordinal within this evaluated RHS (not the group's LHS slot).
+    output_position: usize,
     call_flag: Option<inkwell::values::IntValue<'ctx>>,
     joined_source: Option<JoinedAssignmentSource<'ctx>>,
     runtime_array_source: Option<PointerValue<'ctx>>,
-    same_array_rebind: bool,
+    checked_rebind_destination: Option<usize>,
+    literal_array_replacement: Option<(usize, usize)>,
+    fresh_array_recommit: Option<(crate::scalar::ClosedFreshRecommit, inkwell::values::IntValue<'ctx>)>,
 }
 
 struct RuntimeArrayAssignment<'ctx> {
     owns: bool,
     previous: Option<ownership::RuntimeArrayRelease<'ctx>>,
     same_array_rebind: bool,
+    literal_array_call: Option<usize>,
+    fresh_array_slots: Option<(PointerValue<'ctx>, PointerValue<'ctx>, inkwell::values::IntValue<'ctx>)>,
 }
 
 fn stage_runtime_array_assignments<'ctx>(
@@ -3630,15 +4440,30 @@ fn stage_runtime_array_assignments<'ctx>(
         .zip(destinations)
         .enumerate()
     {
-        let crate::ScalarPlace::Name { name, .. } = &target.place else {
-            staged.push(None);
-            continue;
-        };
-        if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
-            staged.push(None);
+        if let Some((call, expected)) = value.literal_array_replacement {
+            if state.body_call_nodes.and_then(|nodes| nodes.place_ordinal(&target.place)) != Some(expected)
+                || !matches!(value.ty, ScalarType::RuntimeArray { .. })
+                || !matches!(target.place, crate::ScalarPlace::Name { .. })
+                || !matches!(destination, AssignmentDestination::Existing(_))
+            {
+                return Err("checked literal array replacement does not match its assignment".into());
+            }
+            staged.push(Some(RuntimeArrayAssignment {
+                owns: false, previous: None, same_array_rebind: false,
+                literal_array_call: Some(call),
+                fresh_array_slots: None,
+            }));
             continue;
         }
-        if value.same_array_rebind {
+        if let Some(expected) = value.checked_rebind_destination {
+            if state.body_call_nodes.and_then(|nodes| nodes.place_ordinal(&target.place)) != Some(expected)
+                || !matches!(value.ty, ScalarType::RuntimeArray { .. })
+            {
+                return Err("proved runtime-array rebind does not match the assignment destination".into());
+            }
+            let crate::ScalarPlace::Name { name, .. } = &target.place else {
+                return Err("proved runtime-array rebind has no lexical destination".into());
+            };
             if !matches!(destination, AssignmentDestination::Existing(_))
                 || state.runtime_array_allocations.get(name) != Some(&false)
             {
@@ -3648,6 +4473,46 @@ fn stage_runtime_array_assignments<'ctx>(
                 owns: false,
                 previous: None,
                 same_array_rebind: true,
+                literal_array_call: None,
+                fresh_array_slots: None,
+            }));
+            continue;
+        }
+        let crate::ScalarPlace::Name { name, .. } = &target.place else {
+            staged.push(None);
+            continue;
+        };
+        if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
+            staged.push(None);
+            continue;
+        }
+        if let Some((proof, length)) = value.fresh_array_recommit {
+            if state.body_call_nodes.and_then(|nodes| nodes.place_ordinal(&target.place)) != Some(proof.destination)
+                || !matches!(destination, AssignmentDestination::Existing(_))
+                || !matches!(&value.value, EmitValue::Basic(BasicValueEnum::PointerValue(_)))
+                || retains_storage[position]
+            {
+                return Err("fresh owner recommit differs from prepared destination".into());
+            }
+            let previous = ownership::capture_runtime_array_release(context, state, name)?;
+            let fresh_array_slots = if proof.forward {
+                if previous.is_some() {
+                    return Err("forwarding fresh owner cannot discard a local allocation".into());
+                }
+                None
+            } else {
+                if previous.is_none() {
+                    return Err("fresh owner recommit has no displaced local allocation".into());
+                }
+                Some((
+                    *state.runtime_array_lengths.get(name).ok_or("fresh owner recommit lacks extent storage")?,
+                    *state.runtime_array_live.get(name).ok_or("fresh owner recommit lacks live storage")?,
+                    length,
+                ))
+            };
+            staged.push(Some(RuntimeArrayAssignment {
+                owns: !proof.forward, previous, same_array_rebind: false,
+                literal_array_call: None, fresh_array_slots,
             }));
             continue;
         }
@@ -3662,6 +4527,8 @@ fn stage_runtime_array_assignments<'ctx>(
             owns: owns[position],
             previous,
             same_array_rebind: false,
+            literal_array_call: None,
+            fresh_array_slots: None,
         }));
     }
     for (name, slot) in sources {
@@ -3786,7 +4653,7 @@ fn retain_assignment_destination<'ctx>(
             ))
         }
         place => Ok(AssignmentDestination::Existing(place_pointer(
-            context, state, place, None,
+            context, state, place, project,
         )?)),
     }
 }
@@ -3810,11 +4677,133 @@ fn install_assignment_destination<'ctx>(
     }
 }
 
+fn emit_widened_join_replace<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_replacements.is_empty()) else { return Ok(false) };
+    let ([target], [rhs]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened join replacement")?;
+    let Some(destination) = nodes.place_ordinal(&target.place) else { return Ok(false) };
+    let Some((expected, _, owner)) = plan.widened_join_replacements.get(&destination).copied()
+    else { return Ok(false) };
+    let nullable = plan.ordinary_array_descriptor_replacements.contains(&destination);
+    if !nullable && !matches!(rhs, ScalarExpression::If { .. }) {
+        return Err("widened replacement changed the prepared conditional".into());
+    }
+    let crate::ScalarPlace::Name { name, .. } = &target.place
+    else { return Err("widened join replacement requires a lexical owner".into()); };
+    if nodes.expression_ordinal(rhs) != Some(expected)
+        || nodes.lexical_existing_destination_span(&target.place) != Some(owner)
+    { return Err("widened join replacement changed its prepared operands".into()); }
+    let (_, ty) = state.storage.get(name).cloned().ok_or("missing widened join target declaration")?;
+    let signed = memory::SignedRuntimeAddressDomain::for_closed_receiver(state.target_layout, &ty,
+        plan.signed_ordinary_array_descriptor_replacements.get(&destination))?;
+    let pair = match project {
+        Some(project) => emit_project_typed_expression(context, state, rhs, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, rhs, &ty)?,
+    };
+    install_widened_join(context, state, (name, owner, &ty), true, (nullable, signed), &pair)?;
+    Ok(true)
+}
+
+fn emit_widened_owning_replace<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_owning_receives.is_empty()) else { return Ok(false) };
+    let ([target], [call @ ScalarExpression::Call { arguments, .. }]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened owning replacement")?;
+    let Some((source, receiver, Some((_, destination)))) = nodes.expression_ordinal(call)
+        .and_then(|call| plan.widened_owning_receives.get(&call)).copied()
+    else { return Ok(false) };
+    let (crate::ScalarPlace::Name { name: target_name, .. }, [source_arg @ ScalarExpression::Name { name: source_name, .. }]) =
+        (&target.place, arguments.as_slice()) else { return Err("invalid widened owning replacement".into()); };
+    if nodes.place_ordinal(&target.place) != Some(destination)
+        || nodes.lexical_existing_destination_span(&target.place) != Some(receiver)
+        || nodes.lexical_expression_declaration(source_arg) != Some(source)
+    { return Err("widened owning replacement changed its prepared operands".into()); }
+    let (_, ty) = state.storage.get(target_name).cloned().ok_or("missing widened target declaration")?;
+    let value = match project {
+        Some(project) => emit_project_typed_expression(context, state, call, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, call, &ty)?,
+    };
+    aggregate_transfer::install_widened_owning_local(context, state, (source_name, source),
+        (target_name, receiver, &ty), true, &value)?;
+    Ok(true)
+}
+
+fn emit_widened_rebind<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_rebinds.is_empty()) else { return Ok(false) };
+    let ([target], [value @ ScalarExpression::Name { name: source, .. }]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened array rebind")?;
+    let Some(proof) = nodes.place_ordinal(&target.place).and_then(|ordinal| plan.widened_rebinds.get(&ordinal)).copied()
+    else { return Ok(false) };
+    let crate::ScalarPlace::Name { name: target, .. } = &target.place
+    else { return Err("widened rebind requires an exact lexical destination".into()) };
+    if nodes.lexical_expression_declaration(value) != Some(proof.source) || source == target {
+        return Err("widened rebind differs from its checked source".into());
+    }
+    let (backing, ty) = state.storage.get(source).cloned().ok_or("missing widened rebind source")?;
+    let (previous, target_ty) = state.storage.get(target).cloned().ok_or("missing widened rebind destination")?;
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral { .. }, checked)) =
+        state.local_runtime_extents.get(&backing)
+    else { return Err("missing exact widened rebind extent".into()) };
+    if declaration != proof.source || backing == previous
+        || !state.local_runtime_extents.get(&previous).is_some_and(|(declaration, extent, _)|
+            *declaration == proof.target && matches!(extent, LocalRuntimeExtent::WidenedLiteral { .. }))
+        || [source, target].into_iter().any(|name| state.runtime_array_allocations.get(name) != Some(&true)
+            || state.runtime_array_owners.get(name) != Some(&true))
+    {
+        return Err("widened rebind lacks two original live backing receipts".into());
+    }
+    let rhs = match project {
+        Some(project) => emit_project_typed_expression(context, state, value, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, value, &ty)?,
+    };
+    if !matches!(rhs, EmitValue::Basic(BasicValueEnum::PointerValue(actual)) if actual == backing) {
+        return Err("widened rebind changed the original source pointer".into());
+    }
+    ownership::consume_runtime_array_release(context, state,
+        ownership::RuntimeArrayRelease { pointer: previous.into(), live: None })?;
+    install_runtime_array_binding_owner(state, target, true, true, Some(source));
+    state.storage.insert(target.clone(), (backing, target_ty));
+    state.local_runtime_extents.remove(&previous);
+    state.local_runtime_extents.insert(backing, (proof.target, extent, checked));
+    Ok(true)
+}
+
 fn emit_assignment<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
+    if ownership::replace_guarded_runtime_owner(context, state, assignment)? {
+        return Ok(EmitValue::Unit);
+    }
+    if emit_widened_join_replace(context, state, assignment, None)?
+        || emit_widened_owning_replace(context, state, assignment, None)?
+        || emit_widened_rebind(context, state, assignment, None)? {
+        return Ok(EmitValue::Unit);
+    }
+    if let Some(value) = local_callable::replace(context, state, assignment, None)? {
+        return Ok(value);
+    }
     let expected = assignment
         .targets
         .iter()
@@ -3864,10 +4853,13 @@ fn emit_assignment<'ctx, 'module>(
             value,
             ty,
             provenance: _,
+            output_position,
             call_flag,
             joined_source: _,
             runtime_array_source: _,
-            same_array_rebind: _,
+            checked_rebind_destination: _,
+            literal_array_replacement: _,
+            fresh_array_recommit: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3883,15 +4875,16 @@ fn emit_assignment<'ctx, 'module>(
             state,
             target,
             expression,
-            position,
+            output_position,
             previous,
             &ty,
             value,
             call_flag,
             joined_owner,
         )?;
-        transition_runtime_array_assignment(context, state, target, runtime_array)?;
-        store_value(context, state, destination, &ty, value)?;
+        if transition_runtime_array_assignment(context, state, target, &value, runtime_array)? {
+            store_value(context, state, destination, &ty, value)?;
+        }
         aggregate_transfer::enroll_scalar_descriptor(state, target, expression, position, &ty, call_flag)?;
     }
     Ok(EmitValue::Unit)
@@ -3903,6 +4896,17 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if ownership::replace_guarded_runtime_owner(context, state, assignment)? {
+        return Ok(EmitValue::Unit);
+    }
+    if emit_widened_join_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
+        || emit_widened_owning_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
+        || emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
+        return Ok(EmitValue::Unit);
+    }
+    if let Some(value) = local_callable::replace(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
+        return Ok(value);
+    }
     let names = state.project_names.expect("project emission names");
     let scope = names.for_module(module);
     let expected = assignment
@@ -3979,10 +4983,13 @@ fn emit_project_assignment<'ctx, 'module>(
             value,
             ty,
             provenance: _,
+            output_position,
             call_flag,
             joined_source: _,
             runtime_array_source: _,
-            same_array_rebind: _,
+            checked_rebind_destination: _,
+            literal_array_replacement: _,
+            fresh_array_recommit: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3998,15 +5005,16 @@ fn emit_project_assignment<'ctx, 'module>(
             state,
             target,
             expression,
-            position,
+            output_position,
             previous,
             &ty,
             value,
             call_flag,
             joined_owner,
         )?;
-        transition_runtime_array_assignment(context, state, target, runtime_array)?;
-        store_value(context, state, destination, &ty, value)?;
+        if transition_runtime_array_assignment(context, state, target, &value, runtime_array)? {
+            store_value(context, state, destination, &ty, value)?;
+        }
         aggregate_transfer::enroll_scalar_descriptor(state, target, expression, position, &ty, call_flag)?;
     }
     Ok(EmitValue::Unit)
@@ -4179,21 +5187,30 @@ fn transition_runtime_array_assignment<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     target: &crate::scalar::ScalarAssignmentTarget,
+    value: &EmitValue<'ctx>,
     staged: Option<RuntimeArrayAssignment<'ctx>>,
-) -> Result<(), String> {
-    let Some(staged) = staged else { return Ok(()) };
+) -> Result<bool, String> {
+    let Some(staged) = staged else { return Ok(true) };
     let crate::ScalarPlace::Name { name, .. } = &target.place else {
-        return Ok(());
+        return Ok(true);
     };
+    if let Some(call) = staged.literal_array_call {
+        aggregate_transfer::install_literal_array_replacement(context, state, call, name, value)?;
+        return Ok(false);
+    }
     if staged.same_array_rebind {
-        return Ok(());
+        return Ok(true);
     }
     if let Some(previous) = staged.previous {
         ownership::consume_runtime_array_release(context, state, previous)?;
     }
+    if let Some((length_slot, live_slot, length)) = staged.fresh_array_slots {
+        state.builder.build_store(length_slot, length).map_err(builder_error)?;
+        state.builder.build_store(live_slot, context.bool_type().const_int(1, false)).map_err(builder_error)?;
+    }
     state.runtime_array_owners.insert(name.clone(), staged.owns);
     state.runtime_array_allocations.insert(name.clone(), false);
-    Ok(())
+    Ok(true)
 }
 
 fn assignment_target_type<'ctx, 'module>(
@@ -4258,6 +5275,14 @@ fn core_pointer_cast_dereference_type(
     }
 }
 
+fn immediate_checked_borrow_type<'module>(
+    state: &EmitState<'_, 'module>, pointer: &ScalarExpression,
+) -> Option<&'module ScalarType> {
+    if !matches!(pointer, ScalarExpression::CheckedAddress { .. }) { return None; }
+    state.body_call_nodes?.checked_expression_type(pointer)
+        .filter(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+}
+
 fn pointer_target_type<'ctx, 'module>(
     state: &EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
@@ -4275,6 +5300,10 @@ fn pointer_target_type<'ctx, 'module>(
                 }
                 _ => None,
             }),
+        ScalarExpression::CheckedAddress { .. } => match immediate_checked_borrow_type(state, expression)? {
+            ScalarType::CheckedReference { inner, .. } => Some(*inner.clone()),
+            _ => None,
+        },
         ScalarExpression::RawAddress { place, .. } => assignment_place_type(state, place),
         ScalarExpression::Call { .. } if state.has_prepared_calls() => {
             match state.prepared_call_output(expression).ok().flatten()? {
@@ -4351,6 +5380,7 @@ fn dereference_requires_null_guard<'ctx, 'module>(
             .map(|(_, ty)| ty)
             .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
             .is_some_and(|ty| matches!(ty, ScalarType::CheckedReference { .. })),
+        ScalarExpression::CheckedAddress { .. } => immediate_checked_borrow_type(state, expression).is_some(),
         ScalarExpression::Call { .. } if state.has_prepared_calls() => {
             matches!(
                 state.prepared_call_output(expression),
@@ -4413,6 +5443,12 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     address: inkwell::values::IntValue<'ctx>,
 ) -> Result<(), String> {
+    if let Some(access) = state.project_names.and_then(|names| names.checked_access.as_ref()) {
+        return emit_checked_access_call(state, &access.non_null, &[address.into()]);
+    }
+    if state.require_release_checked_access {
+        return Err("checked dereference lacks its prepared release helper".to_owned());
+    }
     let is_null = state
         .builder
         .build_int_compare(
@@ -4423,6 +5459,28 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
         )
         .map_err(builder_error)?;
     emit_checked_place_guard(context, state, is_null, "deref_null_panic", "deref_null_continue")
+}
+
+fn emit_checked_access_call<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    symbol: &str,
+    arguments: &[BasicMetadataValueEnum<'ctx>],
+) -> Result<(), String> {
+    let function = state.functions.get(symbol).copied()
+        .ok_or_else(|| "missing sealed release checked-access function".to_owned())?;
+    let ty = function.get_type();
+    let parameters = ty.get_param_types();
+    if ty.get_return_type().is_some() || parameters.len() != arguments.len()
+        || !parameters.iter().zip(arguments).all(|(expected, value)| {
+            matches!((expected, value),
+                (BasicMetadataTypeEnum::IntType(expected), BasicMetadataValueEnum::IntValue(value))
+                    if *expected == value.get_type())
+        })
+    {
+        return Err("invalid release checked-access function ABI".to_owned());
+    }
+    state.builder.build_call(function, arguments, "").map_err(builder_error)?;
+    Ok(())
 }
 
 fn emit_checked_place_guard<'ctx>(
@@ -4473,11 +5531,27 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
-        let same_array_rebind = state.aggregate.as_ref().is_some_and(|aggregate| {
-            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
-                .is_some_and(|ordinal| aggregate.same_array_rebind(ordinal))
-        });
-        let provenance = runtime_array_assignment_provenance(state, expression)?;
+        let (checked_rebind_destination, literal_array_replacement, fresh_recommit) = state.aggregate.as_ref()
+            .and_then(|aggregate| {
+                let call = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))?;
+                Some((
+                    aggregate.same_array_rebind_destination(call),
+                    aggregate.literal_array_replacement(call)
+                        .or_else(|| aggregate.rebound_array_destination(call))
+                        .map(|destination| (call, destination)),
+                    aggregate.fresh_array_recommit(call).map(|proof| (call, proof)),
+                ))
+            })
+            .unwrap_or_default();
+        let provenance = if literal_array_replacement.is_some() || checked_rebind_destination.is_some() || fresh_recommit.is_some() {
+            // Checked receipt routes do not acquire a second lexical owner.
+            RuntimeArrayAssignmentProvenance {
+                result: RuntimeArrayResultProvenance::CheckedReceipt,
+                source_name: None,
+            }
+        } else {
+            runtime_array_assignment_provenance(state, expression)?
+        };
         let runtime_array_source = if provenance.result.owns() {
             provenance.source_name.as_ref().map(|name| {
                 state
@@ -4491,6 +5565,19 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
         };
         let expected_type = expected(position);
         let value = emit(state, expression, expected_type)?;
+        let fresh_recommit = if let Some((call, proof)) = fresh_recommit {
+            use crate::scalar::RecommittedArrayExtent;
+            let extent = match (proof.size, proof.argument) {
+                (RecommittedArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
+                (RecommittedArrayExtent::Formal(_), Some(_)) => state.aggregate.as_mut()
+                    .and_then(|aggregate| aggregate.fresh_recommit_extent.take())
+                    .filter(|(captured, _)| *captured == call)
+                    .map(|(_, length)| length)
+                    .ok_or("missing captured fresh recommit extent")?,
+                _ => return Err("invalid prepared fresh recommit extent".into()),
+            };
+            Some((proof, extent))
+        } else { None };
         let joined_source = if let ScalarExpression::Name { name, .. } = expression {
             if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
                 let storage = state
@@ -4522,44 +5609,68 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
         for (output_position, ty) in output_types.into_iter().enumerate() {
+            let checked_rebind_destination = if output_position == 0 {
+                checked_rebind_destination
+            } else {
+                None
+            };
+            let literal_array_replacement = if output_position == 0 {
+                literal_array_replacement
+            } else {
+                None
+            };
             let value = extract_output(state, &value, output_position)?;
             if ty == ScalarType::Unit {
                 values.push(AssignmentValue {
                     value: EmitValue::Unit,
                     ty,
                     provenance: provenance.clone(),
+                    output_position,
                     call_flag: None,
                     joined_source: None,
                     runtime_array_source: None,
-                    same_array_rebind: false,
+                    checked_rebind_destination,
+                    literal_array_replacement,
+                    fresh_array_recommit: None,
                 });
                 position += 1;
                 continue;
             }
-            let temporary = entry_storage_alloca(context, state, &ty, "assignment_value")?;
-            store_value(context, state, temporary, &ty, value)?;
-            let value = if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
-                EmitValue::Basic(temporary.into())
+            let value = if literal_array_replacement.is_some()
+                && matches!(&value, EmitValue::Basic(BasicValueEnum::StructValue(_)))
+            {
+                // The sealed call result is an already evaluated paired SSA
+                // value. Do not materialize it through a legacy pointer slot.
+                value
             } else {
-                EmitValue::Basic(
-                    state
-                        .builder
-                        .build_load(
-                            basic_type(context, &ty, state.target_layout)?,
-                            temporary,
-                            "assignment_value",
-                        )
-                        .map_err(builder_error)?,
-                )
+                let temporary = entry_storage_alloca(context, state, &ty, "assignment_value")?;
+                store_value(context, state, temporary, &ty, value)?;
+                if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+                    EmitValue::Basic(temporary.into())
+                } else {
+                    EmitValue::Basic(
+                        state
+                            .builder
+                            .build_load(
+                                basic_type(context, &ty, state.target_layout)?,
+                                temporary,
+                                "assignment_value",
+                            )
+                            .map_err(builder_error)?,
+                    )
+                }
             };
             values.push(AssignmentValue {
                 value,
                 ty,
                 provenance: provenance.clone(),
+                output_position,
                 call_flag: state.call_owner_flags.get(&output_position).copied(),
                 joined_source,
                 runtime_array_source,
-                same_array_rebind: same_array_rebind && output_position == 0,
+                checked_rebind_destination,
+                literal_array_replacement,
+                fresh_array_recommit: if output_position == 0 { fresh_recommit } else { None },
             });
             position += 1;
         }
@@ -4601,6 +5712,21 @@ fn emit_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.fallible_assignment.is_some() {
+                let value = if matches!(&binding.value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }) {
+                    None
+                } else {
+                    Some(take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?)
+                };
+                ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Single)?;
+                return Ok(EmitValue::Unit);
+            }
+            if ownership::move_guarded_runtime_owner(context, state, binding)? {
+                return Ok(EmitValue::Unit);
+            }
+            if store_widened_local_array(context, state, binding, None)? {
+                return Ok(EmitValue::Unit);
+            }
             let value = emit_binding_value(context, state, binding)?;
             store_binding_outputs(context, state, binding, value)?;
             Ok(EmitValue::Unit)
@@ -4619,6 +5745,21 @@ fn emit_project_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.fallible_assignment.is_some() {
+                let value = if matches!(&binding.value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }) {
+                    None
+                } else {
+                    Some(take_basic(emit_project_typed_expression(
+                        context, state, &binding.value, &binding.declared_type, module, modules,
+                    )?)?)
+                };
+                ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Project { module, modules })?;
+                return Ok(EmitValue::Unit);
+            }
+            if ownership::move_guarded_runtime_owner(context, state, binding)?
+                || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                return Ok(EmitValue::Unit);
+            }
             if binding.is_allocation {
                 let receiver = binding
                     .receivers
@@ -4721,6 +5862,7 @@ fn emit_project_block_item<'ctx, 'module>(
 mod expression;
 mod self_tail;
 use expression::{
+    ExpressionPath,
     emit_expression, emit_if_value, emit_project_expression, emit_project_typed_expression,
 };
 mod return_memory;
@@ -4825,8 +5967,16 @@ enum GenericInitializerInput<'a> {
 }
 
 impl GenericInitializerInput<'_> {
+    fn requires_release_checked_access(&self) -> bool {
+        matches!(self, Self::PreparedRows(prepared) if prepared.requires_release_checked_access())
+    }
+
     fn prepared_render(self) -> bool {
         matches!(self, Self::PreparedRows(_))
+    }
+
+    fn has_closed_shared_scalar_reader(self, module: usize, declaration: wosy_syntax::ByteSpan) -> bool {
+        matches!(self, Self::PreparedRows(prepared) if prepared.has_closed_shared_scalar_reader(module, declaration))
     }
 
     fn visit_body_overloads(

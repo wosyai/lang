@@ -1173,6 +1173,11 @@ pub(super) fn block_item_type_in_module(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if let Some(operator) = pending_fallible_operator(binding, module.structs, scope) {
+                diagnostics.push(fallible_assignment_diagnostic(module.source, operator));
+                scope.insert(binding.name.clone(), ScalarType::Error);
+                return ScalarType::Unit;
+            }
             for receiver in &binding.receivers {
                 validate_identifier_style(
                     &module.source,
@@ -1221,9 +1226,10 @@ pub(super) fn block_item_type_in_module(
                 }
                 return ScalarType::Unit;
             }
+            let widening = widened_local_literal_type(binding);
             let actual = expression_type_in_module_expected(
                 &binding.value,
-                Some(&binding.declared_type),
+                Some(widening.as_ref().unwrap_or(&binding.declared_type)),
                 scope,
                 visible_names,
                 folded_names,
@@ -1246,7 +1252,8 @@ pub(super) fn block_item_type_in_module(
             );
             expect_module_type(
                 module,
-                &binding.declared_type,
+                widening.as_ref().or_else(|| super::widened_fixed_copy(binding, &actual).map(|_| &actual))
+                    .unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,
@@ -1331,7 +1338,7 @@ fn assignment_type_in_module(
             )
         })
         .collect::<Vec<_>>();
-    validate_assignment_target_distinctness_in_module(assignment, module, diagnostics);
+    validate_assignment_target_distinctness_in_module(assignment, scope, module, diagnostics);
     let outputs = assignment
         .values
         .iter()
@@ -1504,30 +1511,50 @@ fn assignment_target_type_in_module(
 
 fn validate_assignment_target_distinctness_in_module(
     assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
     module: &ScalarModuleTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    for (index, target) in assignment.targets.iter().enumerate() {
-        for previous in &assignment.targets[..index] {
-            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            } else if place_contains_dynamic_index(&target.place)
-                || place_contains_dynamic_index(&previous.place)
-            {
-                diagnostics.push(module_diagnostic(
-                    module,
-                    "B0002",
-                    "assignment targets require a distinctness proof",
-                    target.target_span,
-                ));
-            }
-        }
+    for (span, message) in assignment_target_distinctness(assignment, scope) {
+        diagnostics.push(module_diagnostic(module, "B0002", message, span));
     }
+}
+
+fn widened_local_literal_type(binding: &ScalarBinding) -> Option<ScalarType> {
+    let (element, values, span) = super::widened_local_literal(binding).or_else(|| super::guarded_runtime_literal(binding))?;
+    Some(ScalarType::Array {
+        element: Box::new(element.clone()), length: values.len() as u64,
+        length_span: span, span,
+    })
+}
+
+fn array_len_address<'a>(
+    expression: &ScalarExpression,
+    arguments: &'a [ScalarExpression],
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<&'a ScalarExpression> {
+    let ScalarExpression::Call { type_arguments, .. } = expression else { return None };
+    let [address @ ScalarExpression::CheckedAddress {
+        mutability: ScalarReferenceMutability::Shared, place, ..
+    }] = arguments else { return None };
+    if !type_arguments.is_empty() { return None; }
+    match place {
+        ScalarPlace::Name { .. } => Some(address),
+        ScalarPlace::Dereference { pointer, .. } => {
+            let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None };
+            // Runtime views must acquire an exact extent transport after normal
+            // checked reference analysis; a source pointer alone proves no count.
+            matches!(scope.get(name), Some(ScalarType::CheckedReference { inner, .. })
+                if matches!(inner.as_ref(), ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }))
+                .then_some(address)
+        }
+        _ => None,
+    }
+}
+
+fn is_array_len_operand(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::CheckedReference { inner, .. }
+        if matches!(inner.as_ref(), ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }))
 }
 
 fn type_core_memory_in_module(
@@ -1722,6 +1749,22 @@ fn type_core_memory_in_module(
                 vec![actual]
             };
             (parameters, ScalarType::Unit)
+        }
+        "array_len" => {
+            let Some(address) = array_len_address(expression, arguments, scope) else {
+                diagnostics.push(module_diagnostic(module, "B0003",
+                    "core.array_len requires the shared address of a named array place", span));
+                return ScalarType::Error;
+            };
+            let actual = expression_type_in_module(address, scope, visible_names, folded_names, module, modules, diagnostics, unsafe_context, overloads, inference);
+            if !is_array_len_operand(&actual) {
+                if !is_error_type(&actual) {
+                    diagnostics.push(module_diagnostic(module, "B0003",
+                        "core.array_len requires the shared address of a named array place", span));
+                }
+                return ScalarType::Error;
+            }
+            (vec![actual], ScalarType::U64)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -1929,6 +1972,22 @@ fn type_core_memory(
                 vec![actual]
             };
             (parameters, ScalarType::Unit)
+        }
+        "array_len" => {
+            let Some(address) = array_len_address(expression, arguments, scope) else {
+                diagnostics.push(diagnostic(program, "B0003",
+                    "core.array_len requires the shared address of a named array place", span));
+                return ScalarType::Error;
+            };
+            let actual = expression_type(address, scope, visible_names, folded_names, program, diagnostics, unsafe_context, overloads, inference);
+            if !is_array_len_operand(&actual) {
+                if !is_error_type(&actual) {
+                    diagnostics.push(diagnostic(program, "B0003",
+                        "core.array_len requires the shared address of a named array place", span));
+                }
+                return ScalarType::Error;
+            }
+            (vec![actual], ScalarType::U64)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -3360,7 +3419,7 @@ fn check_expression_type_in_module(
             if is_error_type(&ty) {
                 return ScalarType::Error;
             }
-            match checked_value_field(&ty, name, modules.iter().flat_map(|module| module.structs.iter())) {
+            match checked_value_field(&ty, name, |id| modules.get(overloads.module_ordinal_for_source(&id.source)?)?.structs.get(id.index)) {
                 Ok(field) => {
                     inference.record_value_field(expression, &field.id);
                     field.ty.clone()
@@ -3397,7 +3456,7 @@ fn check_expression_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
-                true,
+                PlaceTypeMode::RawAddress,
             );
             inference.record_place_type(place, &ty);
             ScalarType::RawPointer(Box::new(ty))
@@ -3428,15 +3487,14 @@ fn check_expression_type_in_module(
             overloads,
             inference,
         ),
-        ScalarExpression::IndexedRead { place, .. } => place_type_in_module(
-            place,
-            scope,
-            module,
-            modules,
-            diagnostics,
-            overloads,
-            inference,
-        ),
+        ScalarExpression::IndexedRead { place, .. } => {
+            let ty = check_place_type_in_module(
+                place, scope, module, modules, diagnostics, overloads, inference,
+                PlaceTypeMode::IndexedRead { unsafe_context },
+            );
+            inference.record_place_type(place, &ty);
+            ty
+        },
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
             diagnostics.push(module_diagnostic(
@@ -3823,7 +3881,7 @@ fn check_expression_type_in_module(
             if receiver.as_deref() == Some("core")
                 && matches!(
                     name.as_str(),
-                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                    "alloc" | "free" | "invalidate" | "rebind" | "array_len" | "system_panic"
                 )
             {
                 return type_core_memory_in_module(
@@ -4171,7 +4229,13 @@ fn check_expression_type_in_module(
                     overloads,
                     inference,
                 );
-                expect_module_type(target, parameter, &actual, *span, diagnostics);
+                let fixed_copy = !unsafe_callable && parameters.len() == 1 && type_arguments.is_empty()
+                    && matches!(argument, ScalarExpression::Name { .. })
+                    && super::fixed_copy_owning_signature(&parameters, &outputs)
+                    && super::fixed_copy_to_runtime(parameter, &actual).is_some();
+                if !fixed_copy {
+                    expect_module_type(target, parameter, &actual, *span, diagnostics);
+                }
                 error_argument |= is_error_type(&actual);
             }
             if unsafe_callable && !unsafe_context {
@@ -4668,6 +4732,9 @@ fn check_expression_type_in_module_expected(
             ));
             return ScalarType::Error;
         };
+        if structure.copy_policy == CopyPolicy::Copy {
+            inference.record_copy_struct_literal(expression);
+        }
         let mut seen = BTreeSet::new();
         let mut initialized = BTreeSet::new();
         for field in fields {
@@ -5042,14 +5109,13 @@ fn utf8_type_from_context(
 fn checked_value_field<'a>(
     receiver: &ScalarType,
     name: &str,
-    structs: impl Iterator<Item = &'a ScalarStruct>,
+    lookup: impl FnOnce(&ScalarStructId) -> Option<&'a ScalarStruct>,
 ) -> Result<&'a ScalarStructField, &'static str> {
     let ScalarType::Struct(id) = receiver else {
         return Err("field value receiver must be a copy struct");
     };
-    let structure = structs
-        .filter(|structure| structure.copy_policy == CopyPolicy::Copy)
-        .find(|structure| &structure.id == id)
+    let structure = lookup(id)
+        .filter(|structure| &structure.id == id && structure.copy_policy == CopyPolicy::Copy)
         .ok_or("field value receiver must be a copy struct")?;
     let field = structure.fields.iter().find(|field| field.name == name)
         .ok_or("unknown struct field")?;
@@ -5119,6 +5185,80 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     }
 }
 
+fn permits_named_checked_field_borrow(
+    place: &ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> bool {
+    let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(_), .. } = place else {
+        return false;
+    };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return false };
+    let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return false };
+    matches!(scope.get(name), Some(ScalarType::CheckedReference {
+        mutability, inner,
+    }) if (mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+        && matches!(inner.as_ref(), ScalarType::Struct(_)))
+}
+
+fn named_checked_fixed_projection_index<'a>(
+    place: &'a ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<(&'a ScalarPlace, &'a ScalarExpression)> {
+    let ScalarPlace::Index { base, index, .. } = place else { return None };
+    let direct = matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+        if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. }
+            if matches!(scope.get(name), Some(ScalarType::CheckedReference { mutability, inner })
+                if (mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+                    && matches!(inner.as_ref(), ScalarType::Array { .. }))));
+    (direct || permits_named_checked_field_borrow(base, mode, scope)).then_some((base, index))
+}
+
+fn named_checked_runtime_projection_index<'a>(
+    place: &'a ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<(&'a ScalarPlace, &'a ScalarExpression)> {
+    let ScalarPlace::Index { base, index, .. } = place else { return None; };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+    let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None; };
+    let ScalarType::CheckedReference { mutability, inner } = scope.get(name)? else { return None; };
+    ((mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+        && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+            if super::reference::aggregate::ordinary_value(element)))
+        .then_some((base, index))
+}
+
+fn checked_projected_element(
+    place: &ScalarPlace,
+    index: &ScalarExpression,
+    index_type: ScalarType,
+    base: ScalarType,
+    mutability: ScalarReferenceMutability,
+    inference: &mut ScalarInferenceBuilder<'_>,
+    diagnose: impl FnOnce(&str),
+) -> ScalarType {
+    match base {
+        ScalarType::Array { element, length, .. }
+            if super::reference::aggregate::ordinary_value(&element)
+                && index_type == ScalarType::U64
+                && match index {
+                    ScalarExpression::Integer { value, .. } => value >= &0.into() && value < &length.into(),
+                    _ => true, // The prepared borrow checker must prove a concrete in-range value.
+                } =>
+        {
+            inference.record_place_type(place, &element);
+            ScalarType::CheckedReference { mutability, inner: element }
+        }
+        ScalarType::Error => ScalarType::Error,
+        _ => {
+            diagnose("checked projected borrow requires an in-range index into a fixed ordinary scalar array");
+            ScalarType::Error
+        }
+    }
+}
+
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
     !matches!(
         ty,
@@ -5136,6 +5276,24 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if let Some((base, index)) = named_checked_fixed_projection_index(place, mutability, scope) {
+        let array = checked_dereference_type(base, span, scope, program, diagnostics, false, overloads, inference);
+        let index_type = expression_type_expected(index, &ScalarType::U64, scope,
+            &BTreeSet::new(), &BTreeMap::new(), program, diagnostics, false, overloads, inference);
+        return checked_projected_element(place, index, index_type, array, mutability, inference,
+            |message| diagnostics.push(diagnostic(program, "B0003", message, span)));
+    }
+    if permits_named_checked_field_borrow(place, mutability, scope) {
+        let inner = checked_dereference_type(place, span, scope, program, diagnostics, false, overloads, inference);
+        if super::reference::aggregate::ordinary_value(&inner) {
+            return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+        }
+        if inner != ScalarType::Error {
+            diagnostics.push(diagnostic(program, "B0003",
+                "checked projected borrow requires an ordinary Copy field", span));
+        }
+        return ScalarType::Error;
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(diagnostic(
             program,
@@ -5216,6 +5374,40 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if let Some((base, index)) = named_checked_runtime_projection_index(place, mutability, scope) {
+        let array = checked_dereference_type_in_module(base, span, scope, module, modules,
+            diagnostics, false, overloads, inference);
+        let selector = expression_type_in_module_expected(index, Some(&ScalarType::U64), scope,
+            &BTreeSet::new(), &BTreeMap::new(), module, modules, diagnostics, false, overloads, inference);
+        if let ScalarType::RuntimeArray { element, .. } = array {
+            if selector == ScalarType::U64 && matches!(index, ScalarExpression::Name { .. }) {
+                inference.record_place_type(place, &element);
+                return ScalarType::CheckedReference { mutability, inner: element };
+            }
+        }
+        diagnostics.push(module_diagnostic(module, "B0003",
+            "checked runtime element borrow requires an exact lexical u64 selector", span));
+        return ScalarType::Error;
+    }
+    if let Some((base, index)) = named_checked_fixed_projection_index(place, mutability, scope) {
+        let array = checked_dereference_type_in_module(base, span, scope, module, modules,
+            diagnostics, false, overloads, inference);
+        let index_type = expression_type_in_module_expected(index, Some(&ScalarType::U64), scope,
+            &BTreeSet::new(), &BTreeMap::new(), module, modules, diagnostics, false, overloads, inference);
+        return checked_projected_element(place, index, index_type, array, mutability, inference,
+            |message| diagnostics.push(module_diagnostic(module, "B0003", message, span)));
+    }
+    if permits_named_checked_field_borrow(place, mutability, scope) {
+        let inner = checked_dereference_type_in_module(place, span, scope, module, modules, diagnostics, false, overloads, inference);
+        if super::reference::aggregate::ordinary_value(&inner) {
+            return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+        }
+        if inner != ScalarType::Error {
+            diagnostics.push(module_diagnostic(module, "B0003",
+                "checked projected borrow requires an ordinary Copy field", span));
+        }
+        return ScalarType::Error;
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
             module,
@@ -5500,7 +5692,7 @@ fn writable_path_type(
             diagnostics,
             overloads,
             inference,
-            false,
+            PlaceTypeMode::Ordinary,
         ),
         ScalarPlace::Dereference { pointer, span } => match expression_type(
             pointer,
@@ -5579,6 +5771,11 @@ fn writable_path_type(
                 diagnostics,
             );
             match base_type {
+                ScalarType::RuntimeArray { .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. }) => {
+                    diagnostics.push(diagnostic(program, "B0003",
+                        "checked runtime array write requires the extent of the dereferenced backing", *span));
+                    ScalarType::Error
+                }
                 ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
                     *element
                 }
@@ -5617,7 +5814,7 @@ fn writable_path_type_in_module(
             diagnostics,
             overloads,
             inference,
-            false,
+            PlaceTypeMode::Ordinary,
         ),
         ScalarPlace::Dereference { pointer, span } => match expression_type_in_module(
             pointer,
@@ -5726,6 +5923,13 @@ fn writable_path_type_in_module(
                 diagnostics,
             );
             match base_type {
+                ScalarType::RuntimeArray { ref element, .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. })
+                    && !inference.allows_private_runtime_write_candidate(base.as_ref())
+                    && !inference.nominates_local_runtime_write(base, index, &index_type, element, scope) => {
+                    diagnostics.push(module_diagnostic(module, "B0003",
+                        "checked runtime array write requires the extent of the dereferenced backing", *span));
+                    ScalarType::Error
+                }
                 ScalarType::Array { element, .. } | ScalarType::RuntimeArray { element, .. } => {
                     *element
                 }
@@ -5746,6 +5950,30 @@ fn writable_path_type_in_module(
     ty
 }
 
+#[derive(Clone, Copy)]
+enum PlaceTypeMode {
+    Ordinary,
+    RawAddress,
+    IndexedRead { unsafe_context: bool },
+}
+
+impl PlaceTypeMode {
+    fn projected(self) -> Self {
+        // RawAddress historically authorizes only the outer dereference.
+        match self {
+            Self::RawAddress => Self::Ordinary,
+            _ => self,
+        }
+    }
+
+    fn unsafe_pointer_expression(self) -> bool {
+        match self {
+            Self::IndexedRead { unsafe_context } => unsafe_context,
+            _ => true,
+        }
+    }
+}
+
 pub(super) fn place_type(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,
@@ -5761,7 +5989,7 @@ pub(super) fn place_type(
         diagnostics,
         overloads,
         inference,
-        false,
+        PlaceTypeMode::Ordinary,
     );
     inference.record_place_type(place, &ty);
     ty
@@ -5774,7 +6002,7 @@ fn check_place_type(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
-    raw_address: bool,
+    mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5784,7 +6012,10 @@ fn check_place_type(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type(base, scope, program, diagnostics, overloads, inference);
+            let base_type = check_place_type(
+                base, scope, program, diagnostics, overloads, inference, mode.projected(),
+            );
+            inference.record_place_type(base, &base_type);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -5822,12 +6053,16 @@ fn check_place_type(
             &BTreeMap::new(),
             program,
             diagnostics,
-            true,
+            mode.unsafe_pointer_expression(),
             overloads,
             inference,
         ) {
+            ScalarType::RawPointer(_) if matches!(mode, PlaceTypeMode::IndexedRead { unsafe_context: false }) => {
+                diagnostics.push(diagnostic(program, "B0012", "raw dereference requires an unsafe block", *span));
+                ScalarType::Error
+            }
             ScalarType::RawPointer(inner) => *inner,
-            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
+            ScalarType::CheckedReference { inner, .. } if !matches!(mode, PlaceTypeMode::Ordinary) => *inner,
             _ => {
                 diagnostics.push(diagnostic(
                     program,
@@ -5844,7 +6079,10 @@ fn check_place_type(
             span,
             index_span,
         } => {
-            let base_type = place_type(base, scope, program, diagnostics, overloads, inference);
+            let base_type = check_place_type(
+                base, scope, program, diagnostics, overloads, inference, mode.projected(),
+            );
+            inference.record_place_type(base, &base_type);
             let index_type = expression_type_expected(
                 index,
                 &ScalarType::U64,
@@ -5900,7 +6138,7 @@ pub(super) fn place_type_in_module(
         diagnostics,
         overloads,
         inference,
-        false,
+        PlaceTypeMode::Ordinary,
     );
     inference.record_place_type(place, &ty);
     ty
@@ -5914,7 +6152,7 @@ fn check_place_type_in_module(
     diagnostics: &mut Vec<super::Diagnostic>,
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
-    raw_address: bool,
+    mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
@@ -5929,12 +6167,16 @@ fn check_place_type_in_module(
             module,
             modules,
             diagnostics,
-            true,
+            mode.unsafe_pointer_expression(),
             overloads,
             inference,
         ) {
+            ScalarType::RawPointer(_) if matches!(mode, PlaceTypeMode::IndexedRead { unsafe_context: false }) => {
+                diagnostics.push(module_diagnostic(module, "B0012", "raw dereference requires an unsafe block", *span));
+                ScalarType::Error
+            }
             ScalarType::RawPointer(inner) => *inner,
-            ScalarType::CheckedReference { inner, .. } if raw_address => *inner,
+            ScalarType::CheckedReference { inner, .. } if !matches!(mode, PlaceTypeMode::Ordinary) => *inner,
             _ => {
                 diagnostics.push(module_diagnostic(
                     module,
@@ -5948,7 +6190,7 @@ fn check_place_type_in_module(
         ScalarPlace::Field {
             base, field, span, ..
         } => {
-            let base_type = place_type_in_module(
+            let base_type = check_place_type_in_module(
                 base,
                 scope,
                 module,
@@ -5956,7 +6198,9 @@ fn check_place_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
+                mode.projected(),
             );
+            inference.record_place_type(base, &base_type);
             let id = match base_type {
                 ScalarType::Struct(id) => id,
                 ScalarType::RawPointer(inner) => match inner.as_ref() {
@@ -6025,7 +6269,7 @@ fn check_place_type_in_module(
             span,
             index_span,
         } => {
-            let base_type = place_type_in_module(
+            let base_type = check_place_type_in_module(
                 base,
                 scope,
                 module,
@@ -6033,7 +6277,9 @@ fn check_place_type_in_module(
                 diagnostics,
                 overloads,
                 inference,
+                mode.projected(),
             );
+            inference.record_place_type(base, &base_type);
             let index_type = expression_type_in_module_expected(
                 index,
                 Some(&ScalarType::U64),
@@ -6468,6 +6714,191 @@ pub(super) fn module_diagnostic(
     span: ByteSpan,
 ) -> super::Diagnostic {
     source_diagnostic(&module.source, code, message, span)
+}
+
+fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::Bool | ScalarType::Char) || is_integer_type(ty) || is_float_type(ty)
+}
+
+fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
+    if !matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
+        || !super::fallible_composite_expression(expression)
+    { return false; }
+    let mut stack = vec![(expression, ty)];
+    let mut calls = false;
+    while let Some((node, ty)) = stack.pop() {
+        match node {
+            ScalarExpression::Name { .. } => {}
+            ScalarExpression::Integer { .. } if *ty != ScalarType::Bool => {}
+            ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {}
+            ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty() => calls = true,
+            ScalarExpression::Unary { operator, operand, .. }
+                if super::fallible_total_unary_bound(ty, operator).is_some() => stack.push((operand, ty)),
+            ScalarExpression::Binary { operator, left, right, .. }
+                if (*ty == ScalarType::Bool && matches!(operator, BinaryOperator::And | BinaryOperator::Or))
+                    || (*ty != ScalarType::Bool && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor))
+                    || *ty == ScalarType::U64 && *operator == BinaryOperator::Add =>
+            {
+                stack.push((right, ty));
+                stack.push((left, ty));
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                for arm in [else_branch, then_branch] {
+                    let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };
+                    if arm.unsafe_context { return false; }
+                    stack.push((value, ty));
+                }
+                stack.push((condition, &ScalarType::Bool));
+            }
+            _ => return false,
+        }
+    }
+    calls
+}
+
+pub(super) fn guarded_runtime_predicate(expression: &ScalarExpression) -> bool {
+    let atom = |value: &ScalarExpression| matches!(value,
+        ScalarExpression::Name { .. } | ScalarExpression::Integer { .. });
+    match expression {
+        ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. } => true,
+        ScalarExpression::Binary { operator: BinaryOperator::Equal | BinaryOperator::NotEqual,
+            left, right, .. } => atom(left) && atom(right),
+        _ => false,
+    }
+}
+
+pub(super) fn guarded_runtime_rhs(expression: &ScalarExpression) -> bool {
+    let mut nodes = vec![expression];
+    while let Some(node) = nodes.pop() {
+        match node {
+            ScalarExpression::Call { arguments, type_arguments, .. }
+                if type_arguments.is_empty()
+                    && matches!(arguments.as_slice(), [ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }]) => {},
+            ScalarExpression::If { condition, then_branch, else_branch, .. }
+                if guarded_runtime_predicate(condition) =>
+            {
+                for arm in [else_branch, then_branch] {
+                    let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };
+                    if arm.unsafe_context { return false; }
+                    nodes.push(value);
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn guarded_inline_struct_literal(
+    id: &ScalarStructId,
+    fields: &[ScalarStructLiteralField],
+    structs: &[ScalarStruct],
+    scope: &BTreeMap<String, ScalarType>,
+) -> bool {
+    let mut pending = vec![(id, fields, false)];
+    while let Some((id, fields, nested)) = pending.pop() {
+        let Some(structure) = structs.get(id.index).filter(|structure| &structure.id == id) else { return false; };
+        if fields.is_empty() || structure.fields.is_empty()
+            || (nested && structure.copy_policy != CopyPolicy::Copy)
+        { return false; }
+        let member_types = structure.fields.iter().map(|field| (field.name.as_str(), &field.ty))
+            .collect::<BTreeMap<_, _>>();
+        for field in fields {
+            let Some(ty) = member_types.get(field.name.as_str()).copied() else { return false; };
+            match (ty, &field.value) {
+                (ScalarType::Struct(inner), ScalarExpression::StructLiteral { fields, .. }) =>
+                    pending.push((inner, fields, true)),
+                (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+                    if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
+                        && *length != 0 && *length == elements.len() as u64 =>
+                {
+                    if !elements.iter().all(|value| guarded_inline_leaf(element, value, scope)) { return false; }
+                }
+                (_, value) if guarded_inline_leaf(ty, value, scope) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+fn guarded_inline_leaf(ty: &ScalarType, value: &ScalarExpression, scope: &BTreeMap<String, ScalarType>) -> bool {
+    if !is_guarded_struct_field_type(ty) { return false; }
+    match value {
+        ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } |
+        ScalarExpression::Char { .. } | ScalarExpression::Float { .. } => true,
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+            matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+        ScalarExpression::Name { name, .. } => scope.get(name) == Some(ty),
+        expression => matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
+            && (matches!(expression, ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty())
+                || guarded_numeric_rhs(ty, expression)),
+    }
+}
+
+fn pending_fallible_operator(
+    binding: &ScalarBinding,
+    structs: &[ScalarStruct],
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<ByteSpan> {
+    let operator = binding.fallible_assignment?;
+    let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
+    let array_element = |element: &ScalarType, value: &ScalarExpression| match value {
+        ScalarExpression::Integer { .. } => true,
+        ScalarExpression::Name { name, .. } => scope.get(name) == Some(element),
+        ScalarExpression::Call { type_arguments, .. } => type_arguments.is_empty(),
+        _ => guarded_numeric_rhs(element, value),
+    };
+    if let Some((element, values, _)) = super::guarded_runtime_literal(binding) {
+        return (!values.iter().all(|value| array_element(element, value))).then_some(operator);
+    }
+    match (&receiver.ty, &binding.value) {
+        (ty, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
+            if is_integer_type(ty) => None,
+        (ty, ScalarExpression::Call { type_arguments, .. })
+            if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
+        (ty, expression) if guarded_numeric_rhs(ty, expression) => None,
+        (ScalarType::RuntimeArray { element, .. }, expression)
+            if super::reference::aggregate::ordinary_value(element) && guarded_runtime_rhs(expression) => None,
+        (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
+            if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
+                && *length != 0 && *length == elements.len() as u64
+                && elements.iter().all(|value| array_element(element, value)) => None,
+        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
+            if super::has_inline_aggregate_field(fields) {
+                return (!guarded_inline_struct_literal(id, fields, structs, scope)).then_some(operator);
+            }
+            let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return Some(operator); };
+            if fields.is_empty() || structure.fields.is_empty()
+                || !structure.fields.iter().all(|field| is_guarded_struct_field_type(&field.ty))
+            { return Some(operator); }
+            let member_types = structure.fields.iter().map(|member| (member.name.as_str(), &member.ty))
+                .collect::<BTreeMap<_, _>>();
+            if fields.iter().all(|field| match &field.value {
+                ScalarExpression::Integer { .. }
+                | ScalarExpression::Boolean { .. }
+                | ScalarExpression::Char { .. }
+                | ScalarExpression::Float { .. } => true,
+                ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+                    matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+                ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_guarded_struct_field_type),
+                expression => member_types.get(field.name.as_str()).is_some_and(|ty|
+                    matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
+                    && (matches!(expression, ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty())
+                        || guarded_numeric_rhs(ty, expression))),
+            }) { None } else { Some(operator) }
+        }
+        _ => Some(operator),
+    }
+}
+
+fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> super::Diagnostic {
+    source_diagnostic(
+        source,
+        "B0003",
+        "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer, bool, char, or float fields initialized by literals or same-type lexical bindings",
+        span,
+    )
 }
 
 fn source_diagnostic(
@@ -7312,8 +7743,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
         match expression {
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
-            ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } =>
-                self.expression(operand),
+            ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
             ScalarExpression::Binary { left, right, .. } => {
                 self.expression(left);
                 self.expression(right);
@@ -7605,6 +8035,11 @@ fn block_item_type(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if let Some(operator) = pending_fallible_operator(binding, program.structs, scope) {
+                diagnostics.push(fallible_assignment_diagnostic(program.source, operator));
+                scope.insert(binding.name.clone(), ScalarType::Error);
+                return ScalarType::Unit;
+            }
             for receiver in &binding.receivers {
                 validate_program_identifier_style(
                     program,
@@ -7652,9 +8087,10 @@ fn block_item_type(
                 }
                 return ScalarType::Unit;
             }
+            let widening = widened_local_literal_type(binding);
             let actual = expression_type_expected(
                 &binding.value,
-                &binding.declared_type,
+                widening.as_ref().unwrap_or(&binding.declared_type),
                 scope,
                 visible_names,
                 folded_names,
@@ -7675,7 +8111,8 @@ fn block_item_type(
             );
             expect_type(
                 program,
-                &binding.declared_type,
+                widening.as_ref().or_else(|| super::widened_fixed_copy(binding, &actual).map(|_| &actual))
+                    .unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,
@@ -7748,7 +8185,7 @@ fn assignment_type(
             assignment_target_type(target, scope, program, diagnostics, overloads, inference)
         })
         .collect::<Vec<_>>();
-    validate_assignment_target_distinctness(assignment, program, diagnostics);
+    validate_assignment_target_distinctness(assignment, scope, program, diagnostics);
     let outputs = assignment
         .values
         .iter()
@@ -7886,30 +8323,62 @@ fn assignment_target_type(
 
 fn validate_assignment_target_distinctness(
     assignment: &ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
     program: &ScalarProgramTyping<'_>,
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
-    for (index, target) in assignment.targets.iter().enumerate() {
-        for previous in &assignment.targets[..index] {
-            if scalar_place_identity(&target.place) == scalar_place_identity(&previous.place) {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "duplicate assignment target",
-                    target.target_span,
-                ));
-            } else if place_contains_dynamic_index(&target.place)
-                || place_contains_dynamic_index(&previous.place)
-            {
-                diagnostics.push(diagnostic(
-                    program,
-                    "B0002",
-                    "assignment targets require a distinctness proof",
-                    target.target_span,
-                ));
-            }
-        }
+    for (span, message) in assignment_target_distinctness(assignment, scope) {
+        diagnostics.push(diagnostic(program, "B0002", message, span));
     }
+}
+
+// Only inline value storage contributes an independent root here. This does
+// not infer anything from the spelling of a pointer, namespace or projection;
+// those continue to need separate prepared alias/relationship evidence.
+fn direct_inline_assignment_root<'a>(
+    target: &'a ScalarAssignmentTarget,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<&'a str> {
+    use super::reference::aggregate::ordinary_value;
+    match &target.place {
+        ScalarPlace::Name { name, .. } if scope.get(name).is_some_and(ordinary_value) => Some(name),
+        ScalarPlace::Index { base, .. } => {
+            let ScalarPlace::Name { name, .. } = base.as_ref() else { return None; };
+            matches!(scope.get(name), Some(ScalarType::Array { element, .. }) if ordinary_value(element))
+                .then_some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn assignment_target_distinctness<'a>(
+    assignment: &'a ScalarAssignment,
+    scope: &BTreeMap<String, ScalarType>,
+) -> impl Iterator<Item = (ByteSpan, &'static str)> + 'a {
+    let targets = if assignment.targets.len() > 1 { assignment.targets.as_slice() } else { &[] };
+    let facts = targets.iter().map(|target| (
+        scalar_place_identity(&target.place),
+        place_contains_dynamic_index(&target.place),
+        direct_inline_assignment_root(target, scope),
+    )).collect::<Vec<_>>();
+    facts.into_iter()
+        .scan(Vec::new(), move |previous, (identity, dynamic, root)| {
+            let span = targets[previous.len()].target_span;
+            let failures = previous.iter().filter_map(|(previous_identity, previous_dynamic, previous_root)| {
+                if &identity == previous_identity {
+                    Some((span, "duplicate assignment target"))
+                } else if (dynamic || *previous_dynamic)
+                    && !matches!((root, *previous_root), (Some(left), Some(right)) if left != right)
+                {
+                    Some((span, "assignment targets require a distinctness proof"))
+                } else {
+                    None
+                }
+            }).collect::<Vec<_>>();
+            previous.push((identity, dynamic, root));
+            Some(failures)
+        })
+        .flatten()
 }
 
 fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {
@@ -7973,7 +8442,7 @@ fn check_expression_type(
             if is_error_type(&ty) {
                 return ScalarType::Error;
             }
-            match checked_value_field(&ty, name, program.structs.iter()) {
+            match checked_value_field(&ty, name, |id| program.structs.get(id.index)) {
                 Ok(field) => {
                     inference.record_value_field(expression, &field.id);
                     field.ty.clone()
@@ -8000,7 +8469,7 @@ fn check_expression_type(
                 diagnostics,
                 overloads,
                 inference,
-                true,
+                PlaceTypeMode::RawAddress,
             );
             inference.record_place_type(place, &ty);
             ScalarType::RawPointer(Box::new(ty))
@@ -8030,7 +8499,12 @@ fn check_expression_type(
             inference,
         ),
         ScalarExpression::IndexedRead { place, .. } => {
-            place_type(place, scope, program, diagnostics, overloads, inference)
+            let ty = check_place_type(
+                place, scope, program, diagnostics, overloads, inference,
+                PlaceTypeMode::IndexedRead { unsafe_context },
+            );
+            inference.record_place_type(place, &ty);
+            ty
         }
         ScalarExpression::StructLiteral { .. } => ScalarType::Error,
         ScalarExpression::ArrayLiteral { span, .. } => {
@@ -8393,7 +8867,7 @@ fn check_expression_type(
             if receiver.as_deref() == Some("core")
                 && matches!(
                     name.as_str(),
-                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                    "alloc" | "free" | "invalidate" | "rebind" | "array_len" | "system_panic"
                 )
             {
                 return type_core_memory(
@@ -8724,7 +9198,13 @@ fn check_expression_type(
                     overloads,
                     inference,
                 );
-                expect_type(program, parameter, &actual, *span, diagnostics);
+                let fixed_copy = !unsafe_callable && parameters.len() == 1 && type_arguments.is_empty()
+                    && matches!(argument, ScalarExpression::Name { .. })
+                    && super::fixed_copy_owning_signature(&parameters, &outputs)
+                    && super::fixed_copy_to_runtime(parameter, &actual).is_some();
+                if !fixed_copy {
+                    expect_type(program, parameter, &actual, *span, diagnostics);
+                }
                 error_argument |= is_error_type(&actual);
             }
             if unsafe_callable && !unsafe_context {

@@ -26,6 +26,7 @@ Reads `.wosy/artifacts/app/dev/main/partition.ll`, writes
 diagnostics otherwise.
 """
 
+import json
 import re
 import shutil
 import sys
@@ -34,6 +35,25 @@ PARTITION = ".wosy/artifacts/app/dev/main/partition.ll"
 NORMALIZED = "partition.normalized.ll"
 
 PACKAGE = "706f696e7465722d636173742d636865636b6564"
+
+
+def release_non_null_symbol():
+    artifact = ".wosy/artifacts/app/dev/main/artifact-manifest.json"
+    with open(artifact, encoding="utf-8") as file:
+        observations = json.load(file)["source_observations"]
+    qualified = [
+        entry for entry in observations
+        if entry["source"]["project"] == "wosy-release://stdlib"
+        and entry["source"]["package"] == "wosy_toolchain_stdlib"
+        and entry["source"]["path"].replace(chr(92), "/") == "src/checked_access.w"
+    ]
+    if len(qualified) != 1:
+        raise ValueError("expected one qualified release checked-access observation")
+    revision = qualified[0]["content_revision"]
+    if not re.fullmatch(r"[0-9a-f]{64}", revision):
+        raise ValueError("invalid release checked-access revision")
+    fields = ("wosy_toolchain_stdlib", "src/checked_access.w", revision, "check_non_null_address")
+    return "wosy_fn__" + "__".join(field.encode().hex() for field in fields)
 
 
 def project_slice(text):
@@ -66,9 +86,29 @@ def main():
         failures.append("missing pass-through store into the shared assertion")
     if "ptr %writer" not in body:
         failures.append("missing pass-through store into the exclusive assertion")
-    guards = re.findall(r"deref_null", body)
-    if not guards:
-        failures.append("missing null guards on the bound checked uses")
+    try:
+        guard = release_non_null_symbol()
+    except (OSError, ValueError, KeyError) as error:
+        failures.append(str(error))
+        guard = ""
+    calls = [] if not guard else list(re.finditer(
+        r"call void @" + re.escape(guard) + r"\(i32 (%\w+)\)", body
+    ))
+    if len(calls) != 4:
+        failures.append(f"expected 4 release null checks, found {len(calls)}")
+    for call in calls:
+        if not re.match(r"\n  %deref\d* = inttoptr i32 " + re.escape(call.group(1)) + r" to ptr",
+                        body[call.end():]):
+            failures.append("checked address must be used immediately after the matching release guard")
+    all_null_checks = re.findall(
+        r"call void @wosy_fn__[^ (]+__" + "check_non_null_address".encode().hex() + r"\(", body
+    )
+    if len(all_null_checks) != len(calls):
+        failures.append("unexpected noncanonical null-check call")
+    if "deref_null" in body or "deref_is_null" in body:
+        failures.append("unexpected legacy inline null guard")
+    if re.search(r"call void @wosy_fn__[^ (]+__" + "check_index_in_extent".encode().hex() + r"\(", body):
+        failures.append("unexpected fixed-array extent guard on pointer-only path")
     if "bitcast" in body:
         failures.append("unexpected bitcast conversion in project function")
     if failures:
@@ -82,7 +122,7 @@ def main():
         return 1
     print(
         "check-partition: shared/exclusive pass-through stores present, "
-        f"checked-use guards present (x{len(guards)}), no bitcast"
+        f"checked-use guards present (x{len(calls)}), no bitcast"
     )
     return 0
 

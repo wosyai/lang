@@ -57,8 +57,8 @@ fn actual_project_origin_stage_copies_one_aggregate_inventory_and_preserves_conv
         let calls = resolve_project_call_sites(&derived.modules);
         let scope = layout::observations::Scope::new();
         let stages = stage_observations::Scope::new();
-        let (mut updates, errors, _) =
-            derive_project_reference_origins(&derived.modules, &calls, false);
+        let (mut updates, errors, _, _) =
+            derive_project_reference_origins(&derived.modules, &calls, ReferenceCapture::default());
         assert!(errors.is_empty(), "{errors:?}");
         let counts = scope.counts();
         assert_eq!(counts.program_copies, 0);
@@ -488,6 +488,9 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
         calls.modules,
         vec![Ok(ModuleCallSites {
             functions: BTreeMap::new(),
+            shared_scalar_read_effects: HashMap::new(),
+            shared_reader_forwarders: Vec::new(),
+            exclusive_writer_declarations: HashSet::new(),
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),
@@ -865,4 +868,42 @@ if (true) { flag, number = reverse(); };
             }
         }
     }
+}
+
+#[test]
+fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
+    let reader = "u8(*u8) sample = fn(value) { *value };";
+    let non_reader = "u8(*u8) sample = fn(value) { *value + *value };";
+    let other = "        *u8(*u8) escape = fn(value) { value };\n        u8(*u8) alias = fn(value) { *u8 copy = value; *copy };\n        u8(*!u8) exclusive = fn(value) { *value };\n        u8(u8) by_value = fn(value) { value };";
+    let native = ScalarTargetLayout::NATIVE64;
+    let raw = project(vec![
+        raw_module("reader.w", &format!("%%start\n{reader}\n{other}\n%%end"), native),
+        raw_module("other.w", &format!("%%start\n{non_reader}\n%%end"), native),
+    ]);
+    let (typed, occurrences) = typecheck_scalar_project_with_occurrences(raw);
+    assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+    let modules = &typed.project.modules;
+    let calls = resolve_project_call_sites_with_occurrences(modules, occurrences);
+    let reader_call_sites = calls.module(0);
+    let other_call_sites = calls.module(1);
+    let declaration = |module: &ScalarModule, name: &str| {
+        module.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == name => Some(function.name_span),
+            _ => None,
+        }).unwrap()
+    };
+    let reader_span = declaration(&modules[0], "sample");
+    let identity_span = declaration(&modules[0], "escape");
+    assert_eq!(reader_span, declaration(&modules[1], "sample"));
+    assert_eq!(
+        reader_call_sites.shared_scalar_read_effects,
+        HashMap::from([
+            (reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false }),
+            (identity_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true }),
+        ]),
+    );
+    assert!(calls.has_closed_shared_scalar_reader(0, reader_span));
+    assert!(!calls.has_closed_shared_scalar_reader(0, identity_span));
+    assert!(!calls.has_closed_shared_scalar_reader(1, reader_span));
+    assert!(other_call_sites.shared_scalar_read_effects.is_empty());
 }

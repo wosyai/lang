@@ -180,14 +180,7 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
         span,
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
-        reference_cfg: ScalarReferenceCfg {
-            primary_call_points: Default::default(),
-            facts,
-            points,
-            initial_points: Vec::new(),
-            allocations: BTreeSet::new(),
-            specialized_policies: Vec::new(),
-        },
+        reference_cfg: ScalarReferenceCfg::unsealed_for_test(facts, points),
     }
 }
 

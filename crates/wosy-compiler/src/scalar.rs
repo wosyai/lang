@@ -65,7 +65,7 @@ pub enum ScalarType {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ScalarReferenceMutability {
     Shared,
     Mutable,
@@ -422,6 +422,7 @@ pub enum CoreOperationId {
     Free,
     Invalidate,
     Rebind,
+    ArrayLen,
     SystemPanic,
     ThisArtifactId,
     DeclareArtifact,
@@ -446,6 +447,7 @@ impl CoreOperationId {
             "free" => Self::Free,
             "invalidate" => Self::Invalidate,
             "rebind" => Self::Rebind,
+            "array_len" => Self::ArrayLen,
             "system_panic" => Self::SystemPanic,
             "this_artifact_id" => Self::ThisArtifactId,
             "declare_artifact" => Self::DeclareArtifact,
@@ -541,6 +543,11 @@ pub enum CfgPointKind {
         place: ReferencePlaceId,
         loan: ReferenceLoanId,
     },
+    ReborrowThrough {
+        mode: ScalarReferenceMutability,
+        place: ScalarPlace,
+        pointer_point: CfgPointId,
+    },
     Bind {
         binding: ReferenceBindingId,
     },
@@ -625,6 +632,63 @@ pub enum CfgPointKind {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RuntimeArrayReadOrigin {
+    Unseen,
+    Null,
+    Local(ReferenceOriginId),
+    Formal(ReferenceOriginId),
+    Refused,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayReadSite {
+    pub(crate) occurrence: usize,
+    pub(crate) handle: Option<ByteSpan>,
+    // One backing shared by every reachable non-null origin.
+    pub(super) origin: RuntimeArrayReadOrigin,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayChildSite {
+    pub(super) borrow: CfgPointId,
+    pub(crate) occurrence: usize,
+    pub(crate) handle: ByteSpan,
+    pub(super) pointer: CfgPointId,
+    pub(super) parent: ReferenceOriginId,
+    pub(super) mutable_representation: bool,
+    pub(super) lexical_install: Option<RuntimeArrayChildInstall>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeArrayChildInstall {
+    pub(crate) parent_borrow: CfgPointId,
+    pub(crate) parent_bind: CfgPointId,
+    pub(crate) parent_read: CfgPointId,
+    pub(crate) child_borrow: CfgPointId,
+    pub(crate) child_bind: CfgPointId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayExclusiveSite {
+    pub(crate) occurrence: usize,
+    pub(crate) pointer: CfgPointId,
+    pub(crate) handle: ByteSpan,
+    pub(crate) origin: ReferenceOriginId,
+    pub(super) reached: bool,
+    pub(super) refused: bool,
+    pub(crate) portable_install: Option<(CfgPointId, CfgPointId)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayFieldSite {
+    pub(crate) owner: ReferenceBindingId,
+    pub(crate) field: ScalarStructFieldId,
+    pub(crate) leaf: usize,
+    pub(crate) prefix: usize,
+    pub(crate) selector: usize,
+}
+
 #[cfg_attr(not(test), derive(Clone))]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
@@ -635,7 +699,19 @@ pub struct ScalarReferenceCfg {
     #[serde(skip)]
     pub specialized_policies: Vec<SpecializedCopyPolicy>,
     #[serde(skip)]
+    guarded_scalar_allocation: Option<Box<[reference::GuardedScalarAllocation]>>,
+    #[serde(skip)]
+    pub(crate) observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
+    #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
+    #[serde(skip)]
+    pub(crate) runtime_array_read_sites: HashMap<CfgPointId, RuntimeArrayReadSite>,
+    #[serde(skip)]
+    pub(crate) runtime_array_child_sites: Vec<RuntimeArrayChildSite>,
+    #[serde(skip)]
+    pub(crate) runtime_array_exclusive_sites: HashMap<CfgPointId, RuntimeArrayExclusiveSite>,
+    #[serde(skip)]
+    pub(crate) runtime_array_field_sites: HashMap<CfgPointId, RuntimeArrayFieldSite>,
 }
 
 impl PartialEq for ScalarReferenceCfg {
@@ -651,6 +727,167 @@ impl PartialEq for ScalarReferenceCfg {
 impl Eq for ScalarReferenceCfg {}
 
 impl ScalarReferenceCfg {
+    pub(crate) fn guarded_scalar_allocations(&self) -> &[reference::GuardedScalarAllocation] {
+        self.guarded_scalar_allocation.as_deref().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guarded_scalar_allocation(&self) -> Option<&reference::GuardedScalarAllocation> {
+        match self.guarded_scalar_allocations() { [site] => Some(site), _ => None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unsealed_for_test(facts: Vec<ReferenceOrigin>, points: Vec<ReferenceFlowPoint>) -> Self {
+        Self {
+            facts,
+            points,
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            specialized_policies: Vec::new(),
+            observed_runtime_allocations: None,
+            guarded_scalar_allocation: None,
+            primary_call_points: HashMap::new(),
+            runtime_array_read_sites: HashMap::new(),
+            runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
+        }
+    }
+
+    /// A direct formal loan origin, not an extent. The private call cohort
+    /// must supply the extent before this pending read can be admitted.
+    pub(super) fn pending_runtime_array_formal(
+        &self, id: CfgPointId,
+    ) -> Option<(usize, &ReferenceBindingId)> {
+        let CfgPointKind::ReadPlace { pointer_point: Some(pointer), reads_origin: false, .. } =
+            &self.points.get(id.0)?.kind else { return None };
+        let RuntimeArrayReadOrigin::Formal(origin) = self.runtime_array_read_sites.get(&id)?.origin
+        else { return None; };
+        if !self.points.get(id.0)?.possible_origins.as_ref()?.contains(&origin) { return None; }
+        let ReferenceOrigin::BorrowedFrom { parameter, loan } = self.facts.get(origin.0)? else { return None; };
+        let CfgPointKind::Read { binding } = &self.points.get(pointer.0)?.kind else { return None; };
+        (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+            && loan.origin_place.projections.is_empty() && loan.origin_place.binding == *binding)
+            .then_some((*parameter, binding))
+    }
+
+    pub(crate) fn runtime_array_read_origin(&self, id: CfgPointId) -> Option<&ReferenceBindingId> {
+        let read = self.points.get(id.0)?;
+        let CfgPointKind::ReadPlace { pointer_point: Some(_), reads_origin: false, .. } = &read.kind
+        else { return None; };
+        let RuntimeArrayReadOrigin::Local(origin) = self.runtime_array_read_sites.get(&id)?.origin
+        else { return None; };
+        if !read.possible_origins.as_ref()?.contains(&origin) { return None; }
+        let ReferenceOrigin::Fresh { loan, .. } = self.facts.get(origin.0)? else { return None; };
+        (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+            && loan.origin_place.projections.is_empty() && self.allocations.contains(&loan.origin_place.binding))
+            .then_some(&loan.origin_place.binding)
+    }
+
+    pub(crate) fn runtime_array_field_site(
+        &self, point: CfgPointId, site: &RuntimeArrayFieldSite,
+    ) -> bool {
+        let Some(point) = self.points.get(point.0) else { return false; };
+        let place = match &point.kind {
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. } => {
+                let [place] = candidates.as_slice() else { return false; };
+                place
+            }
+            CfgPointKind::Assign { target, .. } => target,
+            _ => return false,
+        };
+        if place.binding != site.owner || place.declaration_span != site.owner.declaration_span
+            || !self.allocations.contains(&site.owner)
+        { return false; }
+        let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = &place.place else { return false; };
+        let ScalarPlace::Index { base, index, .. } = base.as_ref() else { return false; };
+        field == &site.field && matches!(base.as_ref(), ScalarPlace::Name { .. })
+            && matches!(place.projections.as_slice(),
+                [ReferencePlaceProjection::Index(selected),
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))]
+                if selected == index.as_ref() && actual == field)
+    }
+
+    pub(crate) fn runtime_array_exclusive_origin(
+        &self, point: CfgPointId, site: &RuntimeArrayExclusiveSite,
+    ) -> Option<&ReferenceBindingId> {
+        if !site.reached || site.refused { return None; }
+        let access = self.points.get(point.0)?;
+        let pointer = self.points.get(site.pointer.0)?;
+        let CfgPointKind::Read { binding } = &pointer.kind else { return None; };
+        if binding.declaration_span != site.handle || pointer.scope != access.scope
+            || !pointer.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.origin))
+        { return None; }
+        let ReferenceOrigin::Fresh { loan, .. } = self.facts.get(site.origin.0)? else { return None; };
+        let owner = &loan.origin_place;
+        if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
+            || !owner.projections.is_empty() || !matches!(owner.place, ScalarPlace::Name { .. })
+            || !self.allocations.contains(&owner.binding)
+        { return None; }
+
+        let (place, candidate, read) = match &access.kind {
+            CfgPointKind::ReadPlace { place, pointer_point: Some(actual), candidates, reads_origin: false }
+                if *actual == site.pointer
+                    && access.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.origin)) =>
+            {
+                let [candidate] = candidates.as_slice() else { return None; };
+                (place, candidate, true)
+            }
+            CfgPointKind::AssignThrough { place, pointer_point: actual, candidates, .. }
+                if *actual == site.pointer =>
+            {
+                let [candidate] = candidates.as_slice() else { return None; };
+                if candidate.origin != site.origin || candidate.loan != *loan { return None; }
+                (place, &candidate.place, false)
+            }
+            _ => return None,
+        };
+        let ScalarPlace::Index { base, index, .. } = place else { return None; };
+        let ScalarPlace::Dereference { pointer: authored_pointer, .. } = base.as_ref() else { return None; };
+        if !matches!(authored_pointer.as_ref(), ScalarExpression::Name { span, .. } if *span == pointer.source_span.range)
+            || candidate.place != *place || candidate.binding != owner.binding
+            || candidate.source != owner.source || candidate.function_span != owner.function_span
+            || candidate.declaration_span != owner.declaration_span || candidate.block_span != owner.block_span
+        { return None; }
+        // Reads retain the exact traversed loan in their projection.
+        // Writes retain that loan on the AssignThrough candidate itself.
+        match (read, candidate.projections.as_slice()) {
+            (true, [ReferencePlaceProjection::Dereference(actual), ReferencePlaceProjection::Index(selected)])
+                if actual.as_ref() == loan && selected == index.as_ref() => Some(&owner.binding),
+            (false, [ReferencePlaceProjection::Index(selected)])
+                if selected == index.as_ref() => Some(&owner.binding),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn runtime_array_portable_child(
+        &self, site: &RuntimeArrayChildSite,
+    ) -> Option<(RuntimeArrayChildInstall, ReferenceOriginId, ReferenceOriginId, &ReferenceBindingId)> {
+        let owner = self.runtime_array_child_origin(site)?;
+        let install = site.lexical_install?;
+        let child = *self.points.get(install.child_borrow.0)?.possible_origins.as_ref()?.first()?;
+        Some((install, site.parent, child, owner))
+    }
+
+    pub(crate) fn runtime_array_child_origin(&self, site: &RuntimeArrayChildSite) -> Option<&ReferenceBindingId> {
+        if site.mutable_representation { return None; }
+        let point = self.points.get(site.borrow.0)?;
+        let CfgPointKind::Read { binding } = &self.points.get(site.pointer.0)?.kind else { return None; };
+        if binding.declaration_span != site.handle { return None; }
+        let CfgPointKind::Borrow { place, loan } = &point.kind else { return None; };
+        let origins = point.possible_origins.as_ref()?;
+        let child = *origins.first().filter(|_| origins.len() == 1)?;
+        let ReferenceOrigin::Fresh { loan: issued, allocation } = self.facts.get(child.0)? else { return None; };
+        let ReferenceOrigin::Fresh { loan: parent, allocation: original } = self.facts.get(site.parent.0)? else { return None; };
+        (loan == issued && allocation == original && loan.parent.as_deref() == Some(parent)
+            && (loan.mode == ScalarReferenceMutability::Shared || parent.mode == ScalarReferenceMutability::Mutable)
+            && parent.parent.is_none() && parent.origin_place.projections.is_empty()
+            && matches!(parent.origin_place.place, ScalarPlace::Name { .. })
+            && place.binding == parent.origin_place.binding && place == &loan.origin_place
+            && self.allocations.contains(&place.binding))
+            .then_some(&place.binding)
+    }
+
     pub(crate) fn primary_call_point(
         &self,
         ordinal: reference::OccurrenceOrdinal,
@@ -681,11 +918,24 @@ pub struct SpecializedCopyPolicy {
 pub enum ReferenceAnalysisErrorReason {
     MissingResolvedBinding,
     MissingResolvedCallTarget,
+    UnprovedLocalSharedCallableFamily,
     MissingCheckedExpressionResult { ordinal: usize },
     MissingCheckedPlaceType { ordinal: usize },
     MissingCheckedCallSignature { ordinal: usize },
     MissingCheckedReferenceOrigin,
+    UnavailableFallibleAllocation,
+    UnsupportedFallibleAllocationAccess,
+    UnsupportedFallibleWholeAggregateRead,
+    NonLexicalFallibleStructInitializer,
+    MissingGuardedAllocationProof,
+    UnprovedArrayLength,
+    UnprovedWidenedArrayTransfer,
+    UnprovedFallibleCallInitializer,
+    UnprovedReturnedArraySelector,
     MissingRequiredDereferenceOrigin,
+    UnprovedCheckedArrayIndex,
+    MissingDereferencedArrayExtent,
+    MissingDereferencedArrayWriteExtent,
     MoveFromArrayElement,
     MovedPlace,
 }
@@ -695,11 +945,24 @@ impl ReferenceAnalysisErrorReason {
         match self {
             Self::MissingResolvedBinding => "missing resolved binding",
             Self::MissingResolvedCallTarget => "missing resolved call target",
+            Self::UnprovedLocalSharedCallableFamily => "local shared callable family has no closed checked-read authority",
             Self::MissingCheckedExpressionResult { .. } => "missing checked expression result",
             Self::MissingCheckedPlaceType { .. } => "missing checked place type",
             Self::MissingCheckedCallSignature { .. } => "missing checked call signature",
             Self::MissingCheckedReferenceOrigin => "missing checked-reference origin",
+            Self::UnavailableFallibleAllocation => "fallible allocation is not known to be available",
+            Self::UnsupportedFallibleAllocationAccess => "fallible allocation access is not a supported whole Copy overwrite or direct guarded read",
+            Self::UnsupportedFallibleWholeAggregateRead => "whole fallible struct read requires a proven Copy type",
+            Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
+            Self::UnprovedReturnedArraySelector => "returned array index requires an exact bounded selector",
+            Self::UnprovedArrayLength => "core.array_len requires an exact local array extent",
+            Self::UnprovedFallibleCallInitializer => "fallible call initializer requires a checked allocation-free scalar callable",
+            Self::UnprovedWidenedArrayTransfer => "widened array backing must remain in its original local binding",
+            Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
+            Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
+            Self::MissingDereferencedArrayExtent => "checked runtime array indexing requires the extent of the dereferenced backing",
+            Self::MissingDereferencedArrayWriteExtent => "checked runtime array write requires the extent of the dereferenced backing",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
             Self::MovedPlace => "read or move of unavailable place",
         }
@@ -806,7 +1069,7 @@ pub struct ScalarAutomaticReturnResult {
     pub state: ScalarAutomaticReturnResultState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ScalarEnumId {
     pub source: SourceIdentity,
     pub index: usize,
@@ -927,6 +1190,16 @@ pub enum ScalarPlace {
     },
 }
 
+// Shape only; callers must authenticate the prepared borrow and backing.
+pub(crate) fn immediate_shared_array_place(place: &ScalarPlace) -> Option<(&ScalarPlace, ByteSpan)> {
+    let ScalarPlace::Dereference { pointer, .. } = place else { return None; };
+    match pointer.as_ref() {
+        ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
+            place: source @ ScalarPlace::Name { .. }, span } => Some((source, *span)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarPlaceIdentity {
     Name(String),
@@ -980,7 +1253,7 @@ enum ScalarExpressionIdentity {
     Block(ScalarBlockIdentity),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ScalarTypeIdentity {
     Unit,
     Bool,
@@ -1352,6 +1625,11 @@ pub struct ScalarStructLiteralField {
     pub name_span: ByteSpan,
     pub value: ScalarExpression,
     pub span: ByteSpan,
+}
+
+pub(crate) fn has_inline_aggregate_field(fields: &[ScalarStructLiteralField]) -> bool {
+    fields.iter().any(|field| matches!(&field.value,
+        ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2054,6 +2332,8 @@ pub struct ScalarBinding {
     pub output_values: Vec<ScalarOutputValue>,
     pub output_origin: ScalarBindingOutputOrigin,
     pub is_allocation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallible_assignment: Option<ByteSpan>,
     pub span: ByteSpan,
 }
 
@@ -2598,7 +2878,9 @@ fn collect_scalar_diagnostics(
             }
             NodeOrToken::Node(node)
                 if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl) =>
-                record_declaration(node),
+            {
+                record_declaration(node);
+            }
             _ => {}
         }
     }
@@ -3107,6 +3389,17 @@ pub fn prepare_scalar_project(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+    prepare_scalar_project_with_access(declarations, initialization_order, inputs, None)
+}
+
+/// Prepare ordinary user sources once. A source supplied by the build host
+/// may satisfy the checked-access capability; it is not a user import.
+pub fn prepare_scalar_project_with_access(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    checked_access: Option<wosy_stdlib_source::CheckedAccessComponent>,
+) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -3134,7 +3427,7 @@ pub fn prepare_scalar_project(
             },
         ));
     }
-    PreparedScalarProject::new(project)
+    PreparedScalarProject::new_with_access(project, checked_access.map(|source| (source, inputs.target_layout)))
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
@@ -3328,6 +3621,8 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_values,
         output_origin,
         is_allocation: outputs.is_empty(),
+        fallible_assignment: direct_token(node, SyntaxKind::FallibleAssignmentOperator)
+            .as_ref().map(token_span),
         span: wosy_syntax::byte_span(node),
     }
 }
@@ -3618,6 +3913,12 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: HashMap::new(),
+            runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
+            observed_runtime_allocations: None,
+            guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -3720,6 +4021,12 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
                     primary_call_points: HashMap::new(),
+                    runtime_array_read_sites: HashMap::new(),
+                    runtime_array_child_sites: Vec::new(),
+                    runtime_array_exclusive_sites: HashMap::new(),
+                    runtime_array_field_sites: HashMap::new(),
+                    observed_runtime_allocations: None,
+                    guarded_scalar_allocation: None,
                     facts: Vec::new(),
                     points: Vec::new(),
                     initial_points: Vec::new(),
@@ -3749,6 +4056,12 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: HashMap::new(),
+            runtime_array_child_sites: Vec::new(),
+            runtime_array_exclusive_sites: HashMap::new(),
+            runtime_array_field_sites: HashMap::new(),
+            observed_runtime_allocations: None,
+            guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -3762,12 +4075,60 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
+pub(crate) use reference::aggregate::{private_runtime_read_signature, private_runtime_write_signature, mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,
     ScalarProjectPreparationRejection,
 };
+pub(crate) fn fallible_total_unary_bound(ty: &ScalarType, op: &UnaryOperator) -> Option<u64> {
+    match (ty, op) {
+        (ScalarType::Bool, UnaryOperator::LogicalNot) => Some(1),
+        (ScalarType::I32, UnaryOperator::BitwiseNot) => Some(u64::from(u32::MAX)),
+        (ScalarType::U64, UnaryOperator::BitwiseNot) => Some(u64::MAX),
+        _ => None,
+    }
+}
+
+pub(crate) fn fallible_composite_expression(expression: &ScalarExpression) -> bool {
+    matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. }
+        | ScalarExpression::Unary { operator: UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot, .. })
+}
+
+pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarType, &[ScalarExpression], ByteSpan)> {
+    let ScalarType::RuntimeArray { element, .. } = &binding.declared_type else { return None };
+    let ScalarExpression::ArrayLiteral { elements, span } = &binding.value else { return None };
+    (!binding.is_allocation && binding.fallible_assignment.is_none() && binding.receivers.len() == 1
+        && reference::aggregate::ordinary_value(element))
+        .then_some((element, elements, *span))
+}
+
+pub(crate) fn guarded_runtime_literal(binding: &ScalarBinding) -> Option<(&ScalarType, &[ScalarExpression], ByteSpan)> {
+    let ScalarType::RuntimeArray { element, .. } = &binding.declared_type else { return None; };
+    let ScalarExpression::ArrayLiteral { elements, span } = &binding.value else { return None; };
+    (!binding.is_allocation && binding.fallible_assignment.is_some() && binding.receivers.len() == 1
+        && matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32) && !elements.is_empty())
+        .then_some((element, elements, *span))
+}
+
+fn fixed_copy_owning_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
+    reference::aggregate::neutral_array_signature(parameters, outputs)
+}
+
+pub(crate) fn fixed_copy_to_runtime<'a>(target: &ScalarType, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
+    let ScalarType::RuntimeArray { element: target, .. } = target else { return None };
+    let ScalarType::Array { element, length, .. } = actual else { return None };
+    (element == target && reference::aggregate::ordinary_value(element)).then_some((element.as_ref(), *length))
+}
+
+pub(crate) fn widened_fixed_copy<'a>(binding: &ScalarBinding, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
+    if binding.is_allocation || binding.fallible_assignment.is_some()
+        || binding.receivers.len() != 1 || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+        || !matches!(binding.value, ScalarExpression::Name { .. })
+    { return None; }
+    fixed_copy_to_runtime(&binding.declared_type, actual)
+}
+
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()
@@ -3907,7 +4268,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
         };
     }
     for _ in node
-        .children()
+        .children_with_tokens()
         .filter(|child| child.kind() == SyntaxKind::ErasedArraySuffix)
     {
         ty = ScalarType::RuntimeArray {
@@ -3915,23 +4276,10 @@ fn derive_type(node: &CstNode) -> ScalarType {
             span: wosy_syntax::byte_span(node),
         };
     }
-    if !matches!(ty, ScalarType::Callable { .. }) {
-        let erased_suffixes = node.text().to_string().match_indices("[]").count();
-        for _ in runtime_array_depth(&ty)..erased_suffixes {
-            ty = ScalarType::RuntimeArray {
-                element: Box::new(ty),
-                span: wosy_syntax::byte_span(node),
-            };
-        }
-    }
+    // Suffixes belong to the current CST owner. A suffix inside a
+    // parenthesized pointee is applied by deriving that pointee, not again at
+    // the enclosing checked reference or callable parameter.
     ty
-}
-
-fn runtime_array_depth(ty: &ScalarType) -> usize {
-    match ty {
-        ScalarType::RuntimeArray { element, .. } => 1 + runtime_array_depth(element),
-        _ => 0,
-    }
 }
 
 fn derive_callable_array_type(node: &CstNode) -> ScalarType {
@@ -4564,7 +4912,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| {
                     matches!(
                         child.kind(),
-                        SyntaxKind::PlaceTarget | SyntaxKind::ParenthesizedDereferencePlace
+                        SyntaxKind::PlaceTarget | SyntaxKind::ParenthesizedDereferencePlace | SyntaxKind::IndexedPlace
                     )
                 })
                 .expect("checked address target");
@@ -4627,8 +4975,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
 fn derive_place(node: &CstNode) -> ScalarPlace {
     match node.kind() {
         SyntaxKind::ParenthesizedDereferencePlace => derive_place(
-            &direct_nodes(node)
-                .into_iter()
+            &node.descendants()
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("parenthesized dereference place"),
         ),

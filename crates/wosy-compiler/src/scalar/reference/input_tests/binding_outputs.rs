@@ -343,3 +343,182 @@ fn raw_binding_outputs_use_canonical_primary_and_real_secondary() {
         }
     }
 }
+
+#[test]
+fn checked_binding_initializer_retains_both_borrow_arms_and_the_pre_move_read() {
+    let text = r#"%%start
+*u8(*u8, *u8, bool) choose = fn(first, second, flag) {
+    *u8 selected = if (flag) { &(*first) } else { &(*second) };
+    selected
+};
+unit(*!u8) transfer = fn(input) {
+    *!u8 output = input;
+    *output = 3;
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, choose), (1, transfer)] = results.as_slice() else {
+            panic!("expected the two resolved source bodies")
+        };
+        let [(bind, initializer)] = choose.proof_points.checked_binding_initializers.as_slice() else {
+            panic!("expected a single lexical checked initialization")
+        };
+        let points = &choose.cfg.points;
+        let origins = points[bind.0].possible_origins.as_ref().expect("checked binding origins");
+        assert_eq!(points[initializer.0].possible_origins.as_ref(), Some(origins));
+        assert_eq!(origins.len(), 2);
+        let parameters = origins.iter().map(|id| match &choose.cfg.facts[id.0] {
+            ReferenceOrigin::BorrowedFrom { parameter, loan } if loan.parent.is_some() => *parameter,
+            origin => panic!("expected either reborrowed parameter, got {origin:?}"),
+        }).collect::<BTreeSet<_>>();
+        assert_eq!(parameters, BTreeSet::from([0, 1]));
+        let [(bind, initializer)] = transfer.proof_points.checked_binding_initializers.as_slice() else {
+            panic!("expected the exact checked initializer before the move")
+        };
+        let points = &transfer.cfg.points;
+        assert!(matches!(points[initializer.0].kind, CfgPointKind::Read { .. }));
+        assert!(points[initializer.0 + 1..bind.0].iter().any(|point| matches!(point.kind, CfgPointKind::Move { .. })));
+        assert_eq!(points[bind.0].possible_origins, points[initializer.0].possible_origins);
+        let public = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
+    }
+}
+
+#[test]
+fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
+    for (comparison, then_value, otherwise_value, present_on_then) in [
+        ("&result == null", "7", "result", false),
+        ("null != &result", "result", "7", true),
+    ] {
+        let text = format!("%%start\ni32() example = fn {{\n\ti32 result = 42;\n\tif ({comparison}) {{ {then_value} }} else {{ {otherwise_value} }}\n}};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let ScalarItem::Function(function) = &mut program.items[0] else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
+            panic!("local receiver");
+        };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, result)] = results.as_slice() else { panic!("example reference result") };
+        let [(branch, edge)] = result.proof_points.guarded_allocation_edges.iter().collect::<Vec<_>>()[..] else {
+            panic!("one typed guard");
+        };
+        let [then, otherwise] = result.cfg.points[branch.0].successors.as_slice() else {
+            panic!("exact branch successors");
+        };
+        let carrier = result.cfg.guarded_scalar_allocation().expect("installed guarded allocation");
+        assert_eq!((carrier.binding(), carrier.branch(), carrier.present_on_then()), (&edge.binding, *branch, present_on_then));
+        let region = calls.functions[&0].conditionals.values().next().expect("resolved condition");
+        let ConditionalRegion::Value { condition, .. } = region else { panic!("value condition"); };
+        assert_eq!(carrier.condition(), condition.0);
+        assert_eq!((edge.present, edge.absent), if present_on_then { (*then, Some(*otherwise)) } else { (*otherwise, Some(*then)) });
+        assert!(result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding == &edge.binding)));
+        assert!(!result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == edge.binding)));
+    }
+}
+
+#[test]
+fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
+    use ReferenceAnalysisErrorReason::{UnavailableFallibleAllocation as Unavailable, UnsupportedFallibleAllocationAccess as Unsupported};
+    for (body, expected) in [
+        ("if (&result == null) { 7 } else { result }", None),
+        ("if (&result != null) { result } else { 7 }", None),
+        ("result", Some(Unavailable)),
+        ("if (&result == null) { result } else { 7 }", Some(Unavailable)),
+        ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tresult", Some(Unavailable)),
+        ("result = 19;\n\t7", Some(Unsupported)),
+        ("*i32 alias = &result;\n\talias;\n\t7", Some(Unsupported)),
+    ] {
+        let text = format!("%%start\ni32() example = fn {{\n\ti32 result = 42;\n\t{body}\n}};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let ScalarItem::Function(function) = &mut program.items[0] else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
+            panic!("local receiver");
+        };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        let [(_, result)] = results.as_slice() else { panic!("example reference result"); };
+        assert_eq!(result.cfg.guarded_scalar_allocation().is_none(), expected.is_some(), "{body}");
+        assert_eq!(errors.len(), usize::from(expected.is_some()), "{body}: {errors:?}");
+        assert!(errors.iter().all(|error| Some(error.reason()) == expected));
+    }
+}
+
+#[test]
+fn prepared_fallible_field_reads_require_the_exact_present_root() {
+    use ReferenceAnalysisErrorReason::UnavailableFallibleAllocation;
+    for (body, needs_refusal) in [
+        ("if (&held == null) { 7 } else { held.value }", false),
+        ("if (null != &held) { held.value } else { 7 }", false),
+        ("if (&held == null) { held.value } else { 7 }", true),
+        ("i32 prior = if (&held == null) { 7 } else { held.value };\n\tprior + held.value", true),
+        ("held.value", true),
+    ] {
+        let text = format!("%%start\nstruct Record {{ i32 value; }}\ni32() example = fn {{\n\tRecord held = {{ .value = 42; }};\n\t{body}\n}};\n%%end");
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let [ScalarItem::Function(function)] = program.items.as_mut_slice() else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else { panic!("record receiver") };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        let [(_, result)] = results.as_slice() else { panic!("example reference result"); };
+        let reads = result.cfg.points.iter().filter(|point| matches!(&point.kind,
+            CfgPointKind::ReadPlace { candidates, pointer_point: None, .. } if candidates.iter().any(|place|
+                matches!(place.projections.as_slice(), [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))])
+            )));
+        assert!(reads.count() >= 1, "{body}");
+        assert_eq!(result.cfg.guarded_scalar_allocation().is_none(), needs_refusal, "{body}");
+        assert_eq!(errors.len(), usize::from(needs_refusal), "{body}: {errors:?}");
+        assert!(errors.iter().all(|error| error.reason() == UnavailableFallibleAllocation), "{body}: {errors:?}");
+    }
+}
+
+#[test]
+fn whole_fallible_copy_overwrite_preserves_the_presence_requirement() {
+    use ReferenceAnalysisErrorReason::{UnavailableFallibleAllocation as Unavailable, UnsupportedFallibleAllocationAccess as Unsupported};
+    for present in [true, false] {
+        assert_eq!(guarded_allocation_overwrite_error(true, true, !present), (!present).then_some(Unavailable));
+        assert_eq!(guarded_allocation_overwrite_error(true, false, !present), Some(Unsupported));
+        assert_eq!(guarded_allocation_overwrite_error(false, true, !present), Some(Unsupported));
+    }
+}

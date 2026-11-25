@@ -118,6 +118,17 @@ fn argument_is_representable(
                 .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
                 == Some(expected)
         }
+        ScalarExpression::CheckedAddress {
+            mutability: crate::scalar::ScalarReferenceMutability::Mutable,
+            place,
+            ..
+        } if nodes.has_checked_self_tail() => {
+            let crate::ScalarPlace::Dereference { pointer, .. } = place else {
+                return false;
+            };
+            matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+                && argument_is_representable(context, state, pointer, expected, false)
+        }
         ScalarExpression::Integer { .. } => integer_width(expected).is_some(),
         ScalarExpression::Float { .. } => matches!(expected, ScalarType::F32 | ScalarType::F64),
         ScalarExpression::Boolean { .. } => *expected == ScalarType::Bool,

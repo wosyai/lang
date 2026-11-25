@@ -7,7 +7,7 @@ use super::super::reference::{
 use super::super::typecheck::expression_span;
 use super::super::{
     CoreOperationId, ResolvedCallTarget, ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock,
-    ScalarBlockItem, ScalarBlockItemRole, ScalarExpression, ScalarPlace,
+    ScalarAssignment, ScalarBlockItem, ScalarBlockItemRole, ScalarExpression, ScalarPlace,
 };
 use super::*;
 
@@ -202,6 +202,7 @@ struct CallableProofNodes<'a> {
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
     blocks: HashMap<*const ScalarBlock, BlockOrdinal>,
     final_outputs: HashMap<*const ScalarExpression, usize>,
+    callable_array_statements: std::collections::HashSet<*const ScalarAssignment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -680,11 +681,69 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.blocks.get(&std::ptr::from_ref(block)).map(|ordinal| ordinal.0)
     }
 
+    pub(crate) fn prepared_call_has_callful_arguments(&self, expression: &ScalarExpression) -> bool {
+        let Some(calls) = self.proof_nodes.calls else { return false; };
+        self.expression_ordinal(expression).is_some_and(|ordinal|
+            calls.structure.callful_arguments.contains(&OccurrenceOrdinal(ordinal)))
+    }
+
     pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
         self.proof_nodes
             .expressions
             .get(&std::ptr::from_ref(expression))
             .map(|ordinal| ordinal.0)
+    }
+
+    pub(crate) fn local_shared_call_closed(&self, expression: &ScalarExpression) -> bool {
+        let Some(&ordinal) = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression)) else { return false };
+        self.proof_nodes.calls.is_some_and(|calls| calls.local_shared_call_families.get(&ordinal) == Some(&true))
+    }
+
+    pub(crate) fn is_callable_array_statement(&self, statement: &ScalarAssignment) -> bool {
+        self.proof_nodes.callable_array_statements.contains(&std::ptr::from_ref(statement))
+    }
+
+    pub(crate) fn lexical_existing_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
+        match self.direct_destination(place)? {
+            DirectDestinationIdentity::Existing(binding) => Some(binding.declaration_span),
+            DirectDestinationIdentity::Module(_) | DirectDestinationIdentity::Introduce { .. } => None,
+        }
+    }
+
+    pub(crate) fn callable_value_declaration(&self, expression: &ScalarExpression) -> Option<&'a SourceSpan> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        match self.proof_nodes.calls?.prepared_plain_name(ordinal)? {
+            super::super::reference::PlainNameIdentity::ModuleValue(declaration) => Some(declaration),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lexical_expression_declaration(&self, expression: &ScalarExpression) -> Option<ByteSpan> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        match self.proof_nodes.calls?.prepared_plain_name(ordinal)? {
+            super::super::reference::PlainNameIdentity::Lexical(binding) => Some(binding.declaration_span),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lexical_place_declaration(&self, place: &ScalarPlace) -> Option<ByteSpan> {
+        let NamedPlaceRootIdentity::Lexical(binding) = self.named_place_root(place)? else {
+            return None;
+        };
+        Some(binding.declaration_span)
+    }
+
+    pub(crate) fn existing_array_rebind_event(
+        &self,
+        cfg: &ScalarReferenceCfg,
+        call: usize,
+        destination: usize,
+    ) -> Option<(CfgPointId, &'a super::super::ReferenceBindingId)> {
+        let calls = self.proof_nodes.calls?;
+        let DirectDestinationIdentity::Existing(binding) =
+            calls.prepared_direct_destination(OccurrenceOrdinal(destination))?
+        else { return None };
+        Some((cfg.primary_call_point(OccurrenceOrdinal(call))?, binding))
     }
 
     pub(crate) fn place_ordinal(&self, place: &ScalarPlace) -> Option<usize> {
@@ -1169,7 +1228,29 @@ impl<'a> Binder<'a, '_> {
             nodes.blocks.insert(std::ptr::from_ref(block), ordinal);
         }
         for (index, (item, role)) in block.items_with_output_roles().enumerate() {
+            let ordinary = matches!(role, ScalarBlockItemRole::Ordinary);
             self.item(parent, index, item, role)?;
+            let ScalarBlockItem::Assignment(statement) = item else { continue; };
+            let ([destination], [rhs]) = (statement.targets.as_slice(), statement.values.as_slice()) else { continue; };
+            let ScalarPlace::Index { base, .. } = &destination.place else { continue; };
+            if !matches!(base.as_ref(), ScalarPlace::Name { .. })
+                || !ordinary || block.terminated_items.get(index) != Some(&true)
+            { continue; }
+            let (Some(nodes), Parent::Block(ordinal)) = (&mut self.proof_nodes, parent) else { continue; };
+            let Some(calls) = nodes.calls else { continue; };
+            let Some(group) = calls.assignments.get(&(ordinal, index)) else { continue; };
+            let slots = group.destinations().as_slice();
+            let inputs = group.rhs_evaluations().as_slice();
+            if matches!((slots, inputs), ([slot], [input])
+                if slot.position == 0 && input.position == 0
+                    && nodes.places.get(&std::ptr::from_ref(&destination.place)) == Some(&slot.destination)
+                    && nodes.expressions.get(&std::ptr::from_ref(rhs)) == Some(&input.expression)
+                    && matches!(&slot.replacement, AssignmentReplacement::Resolved(ScalarType::Callable { .. }))
+                    && !calls.structure.resolved_namespace_places.contains_key(&slot.destination))
+                && group.projected_outputs().len() == 0
+            {
+                nodes.callable_array_statements.insert(std::ptr::from_ref(statement));
+            }
         }
         Ok(())
     }

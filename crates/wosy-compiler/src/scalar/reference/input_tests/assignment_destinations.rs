@@ -665,6 +665,12 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
             );
             let mut grouped = ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                runtime_array_read_sites: HashMap::new(),
+                runtime_array_child_sites: Vec::new(),
+                runtime_array_exclusive_sites: HashMap::new(),
+                runtime_array_field_sites: HashMap::new(),
+                observed_runtime_allocations: None,
+                guarded_scalar_allocation: None,
                 facts: facts.clone(),
                 points,
                 initial_points: Vec::new(),
@@ -674,7 +680,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
             let mut per_write = grouped.clone();
             per_write.points[6].kind = CfgPointKind::Join;
             grouped.initial_points = grouped.points.clone();
-            let errors = transfer_reference_facts((&mut grouped).into(), &BTreeMap::new(), &HashMap::new(), None, None);
+            let errors = transfer_reference_facts(ReferenceTransferCfg::new(&mut grouped, None), &BTreeMap::new(), &HashMap::new(), None, None);
             assert!(
                 errors.is_empty(),
                 "seeded={seeded} through={through}: {errors:?}"
@@ -708,7 +714,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
             );
             assert!(!previous_origins.contains(&ReferenceOriginId(1)));
             per_write.initial_points = per_write.points.clone();
-            let errors = transfer_reference_facts((&mut per_write).into(), &BTreeMap::new(), &HashMap::new(), None, None);
+            let errors = transfer_reference_facts(ReferenceTransferCfg::new(&mut per_write, None), &BTreeMap::new(), &HashMap::new(), None, None);
             assert!(errors.is_empty(), "{errors:?}");
             let (previous_origins, previous_loans) = match &per_write.points[8].kind {
                 CfgPointKind::Assign {

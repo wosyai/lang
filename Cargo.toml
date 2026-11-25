@@ -7,6 +7,7 @@ members = [
     "crates/wosy-protocol",
     "crates/wosy-daemon",
     "crates/wosy-cli",
+    "stdlib",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ toml_edit = "0.22"
 wosy-compiler = { path = "crates/wosy-compiler" }
 wosy-project = { path = "crates/wosy-project" }
 wosy-syntax = { path = "crates/wosy-syntax" }
+wosy-stdlib-source = { path = "stdlib" }
 
 [profile.dev]
 debug = "line-tables-only"

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
 use super::{
@@ -17,15 +17,194 @@ pub(crate) use initializer_call_nodes::{
     InitializerFactsError,
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum ForwardInitialGraph {
+    Branched,
+    Linear,
+}
+
+pub(super) struct GuardedAllocationEdge {
+    pub(super) condition: OccurrenceOrdinal,
+    pub(super) binding: super::ReferenceBindingId,
+    pub(super) present: super::CfgPointId,
+    pub(super) absent: Option<super::CfgPointId>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GuardedAllocationScope {
+    pub(super) scope: super::ReferenceScopeId,
+    pub(super) entry: super::CfgPointId,
+    pub(super) exit: super::CfgPointId,
+}
+
+pub(super) struct GuardedAllocationBinding {
+    pub(super) scope: super::ReferenceScopeId,
+    pub(super) ty: ScalarType,
+    pub(super) whole_copy: bool,
+    pub(super) runtime_literal_length: Option<u64>,
+    pub(super) runtime_returned: bool,
+}
+
+impl GuardedAllocationBinding {
+    pub(super) fn has_indexed_extent(&self) -> bool { self.runtime_returned || self.indexed_extent().is_some() }
+    pub(super) fn has_runtime_extent(&self) -> bool { self.runtime_returned || self.runtime_literal_length.is_some() }
+    pub(super) fn indexed_extent(&self) -> Option<u64> {
+        match &self.ty {
+            ScalarType::Array { length, .. } => Some(*length),
+            ScalarType::RuntimeArray { .. } => self.runtime_literal_length,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
+    pub(super) local_borrow: Option<Box<super::reference::local_borrow::Sealed>>,
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
+    // None is the explicit detached/unprepared transfer mode.
+    pub(super) scope_exit_bindings: Option<HashMap<super::CfgPointId, ScopeExitBindings>>,
+    pub(super) forward_initial_graph: Option<ForwardInitialGraph>,
+    pub(super) has_grouped_assignment_capture: Option<bool>,
+    pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
+    pub(super) indexed_holders: Option<Box<super::reference::SelectedIndexedHolders>>,
+    pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
+    pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
+    pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, GuardedAllocationBinding>>,
+    pub(super) pending_returned_extent: Option<super::CfgPointId>,
+    pub(super) widened_rebind_points: Option<HashSet<super::CfgPointId>>,
+    pub(super) array_length_owners: HashSet<super::ReferenceBindingId>,
+    pub(super) ordinary_array_receivers: HashMap<super::ReferenceBindingId, OccurrenceOrdinal>,
+    pub(super) fallible_aliases: HashMap<super::ReferenceBindingId, super::ReferenceBindingId>,
+    pub(super) fallible_alias_accesses: Vec<(OccurrenceOrdinal, super::ReferenceBindingId)>,
+    pub(super) guarded_indexed_stores: HashSet<super::CfgPointId>,
+    pub(super) guarded_runtime_receivers: HashSet<super::ReferenceBindingId>,
+    pub(super) guarded_runtime_moves: BTreeMap<super::CfgPointId, super::reference::GuardedRuntimeMove>,
+    pub(super) guarded_releases: BTreeMap<super::CfgPointId, super::ReferenceBindingId>,
+    pub(super) guarded_allocation_scopes: HashMap<usize, GuardedAllocationScope>,
+    pub(super) guarded_allocation_edges: BTreeMap<super::CfgPointId, GuardedAllocationEdge>,
+    pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) resolved_checked_call_outputs: Vec<super::CfgPointId>,
+    pub(super) checked_named_scalar_stores: Vec<super::CfgPointId>,
+    pub(super) private_runtime_formal_stores: HashMap<super::CfgPointId, OccurrenceOrdinal>,
+    pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
+    pub(super) joined_reborrow_descendants: Vec<super::CfgPointId>,
+    pub(super) joined_shared_aliases: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) exclusive_scalar_write_moves: Vec<(super::CfgPointId, super::CfgPointId, super::CfgPointId)>,
+    pub(super) shared_scalar_read_calls: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) joined_shared_return_calls: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) joined_checked_releases: Vec<super::CfgPointId>,
+    pub(super) named_reborrow_parents: Vec<NamedReborrowParent>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
     pub(super) has_nonlexical_install: bool,
+}
+
+impl CallablePointFacts {
+    pub(super) fn record_guarded_allocation(
+        &mut self,
+        branch: super::CfgPointId,
+        condition: OccurrenceOrdinal,
+        binding: super::ReferenceBindingId,
+        [then, otherwise]: [super::CfgPointId; 2],
+        present_on_then: bool,
+    ) {
+        if then == otherwise {
+            return;
+        }
+        let (present, absent) = if present_on_then { (then, otherwise) } else { (otherwise, then) };
+        self.guarded_allocation_edges.entry(branch).or_insert(GuardedAllocationEdge {
+            condition,
+            binding,
+            present,
+            absent: Some(absent),
+        });
+    }
+
+    pub(super) fn record_implied_allocation_presence(
+        &mut self,
+        branch: super::CfgPointId,
+        condition: OccurrenceOrdinal,
+        binding: super::ReferenceBindingId,
+        present: super::CfgPointId,
+    ) {
+        self.guarded_allocation_edges.entry(branch).or_insert(GuardedAllocationEdge {
+            condition, binding, present, absent: None,
+        });
+    }
+}
+
+#[derive(Default)]
+pub(super) struct ScopeExitBindings {
+    uniform_block_span: Option<ByteSpan>,
+    bindings: HashSet<super::ReferenceBindingId>,
+}
+
+impl ScopeExitBindings {
+    pub(super) fn insert(&mut self, binding: super::ReferenceBindingId) {
+        if self.bindings.is_empty() {
+            self.uniform_block_span = Some(binding.block_span);
+        } else if self.uniform_block_span != Some(binding.block_span) {
+            self.uniform_block_span = None;
+        }
+        self.bindings.insert(binding);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &super::ReferenceBindingId> {
+        self.bindings.iter()
+    }
+
+    pub(super) fn singleton(&self) -> Option<&super::ReferenceBindingId> {
+        if self.bindings.len() != 1 {
+            return None;
+        }
+        self.bindings.iter().next()
+    }
+
+    pub(super) fn contains(&self, binding: &super::ReferenceBindingId) -> bool {
+        // A different span can only rule out membership. Matching spans
+        // still require the entire checked identity.
+        self.uniform_block_span.is_none_or(|span| span == binding.block_span)
+            && self.bindings.contains(binding)
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum DeferredReborrowRoot {
+    Formal { parameter: usize },
+    Local {
+        owner: super::ReferenceBindingId,
+        borrow: super::CfgPointId,
+    },
+}
+
+pub(super) struct PendingReborrowSite {
+    pub(super) point: super::CfgPointId,
+    pub(super) read: super::CfgPointId,
+    pub(super) holder: Option<super::CfgPointId>,
+    pub(super) parent: Option<(super::CfgPointId, super::CfgPointId)>,
+}
+
+pub(super) struct PendingNamedReborrow {
+    pub(super) sites: Vec<PendingReborrowSite>,
+    pub(super) entry: super::CfgPointId,
+    pub(super) handle: super::ReferenceBindingId,
+    pub(super) root: DeferredReborrowRoot,
+    pub(super) origin: super::ReferenceOriginId,
+}
+
+pub(super) struct NamedReborrowParent {
+    pub(super) borrow: super::CfgPointId,
+    pub(super) pointer: super::CfgPointId,
+    pub(super) origin: super::ReferenceOriginId,
+    pub(super) runtime_selector: Option<super::CfgPointId>,
 }
 
 #[derive(Default)]

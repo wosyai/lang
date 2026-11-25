@@ -74,7 +74,7 @@ void CHECKPOINT(int event, u64 iteration, __UINTPTR_TYPE__ address_bits) {
         phase = SCRATCH_USED;
         break;
     case LEAVE_STEP: {
-        require(phase == SCRATCH_RELEASED && !scratch.address && completed < 3);
+        require(phase == SCRATCH_RELEASED && address == backing && !scratch.address && completed < 3);
         require(released_generation == completed + 1);
         const byte *expected = expected_backing[completed++];
         require(backing[0] == expected[0] && backing[1] == expected[1] && backing[2] == expected[2]);
@@ -82,7 +82,7 @@ void CHECKPOINT(int event, u64 iteration, __UINTPTR_TYPE__ address_bits) {
         break;
     }
     case BASE:
-        require(phase == BETWEEN_STEPS && completed == 3 && !scratch.address);
+        require(phase == BETWEEN_STEPS && address == backing && completed == 3 && !scratch.address);
         phase = BASE_REACHED;
         break;
     case CLOSE:

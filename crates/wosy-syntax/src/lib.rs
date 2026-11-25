@@ -93,6 +93,7 @@ pub enum SyntaxKind {
     CopyModifier,
     IndexFieldSuffix,
     DirectFieldChainTail,
+    FallibleAssignmentOperator,
     ValueField,
     InvalidTemporaryPlace,
 }
@@ -187,8 +188,9 @@ impl Language for WosyLanguage {
             80 => SyntaxKind::CopyModifier,
             81 => SyntaxKind::IndexFieldSuffix,
             82 => SyntaxKind::DirectFieldChainTail,
-            83 => SyntaxKind::ValueField,
-            84 => SyntaxKind::InvalidTemporaryPlace,
+            83 => SyntaxKind::FallibleAssignmentOperator,
+            84 => SyntaxKind::ValueField,
+            85 => SyntaxKind::InvalidTemporaryPlace,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -682,7 +684,28 @@ fn build_parenthesized_primary(
         return;
     };
     let mut suffix = suffix.into_inner();
-    let field = suffix.next().expect("parenthesized field suffix");
+    let first = suffix.next().expect("parenthesized primary suffix");
+    if first.as_rule() == Rule::parenthesized_index_suffix {
+        if !is_dereference_primary(head.clone()) {
+            let range = ByteSpan::new(head.as_span().start() as u32, first.as_span().end() as u32);
+            builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::InvalidTemporaryPlace));
+            add_gap(builder, &text[range.start as usize..range.end as usize], range.start as usize, comments);
+            builder.finish_node();
+            errors.push(SyntaxError {
+                span: range,
+                message: "a parenthesized index requires a dereferenced place".to_owned(),
+            });
+            return;
+        }
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::IndexedPlace));
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::ParenthesizedDereferencePlace));
+        build_pair(builder, head, text, comments, errors);
+        builder.finish_node();
+        build_pair(builder, first, text, comments, errors);
+        builder.finish_node();
+        return;
+    }
+    let field = first;
     let indices = suffix.next();
     if !is_dereference_primary(head.clone()) {
         build_value_field(builder, head, field, indices, text, comments, errors);
@@ -908,9 +931,10 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::enum_variant => SyntaxKind::EnumVariant,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
-        Rule::receiver_list => SyntaxKind::ReceiverList,
+        Rule::receiver_list | Rule::fallible_receiver_list => SyntaxKind::ReceiverList,
+        Rule::fallible_assignment_operator => SyntaxKind::FallibleAssignmentOperator,
         Rule::receiver => SyntaxKind::Receiver,
-        Rule::output_list => SyntaxKind::OutputList,
+        Rule::output_list | Rule::single_output_list => SyntaxKind::OutputList,
         Rule::assignment_targets => SyntaxKind::AssignmentTargets,
         Rule::struct_literal => SyntaxKind::StructLiteral,
         Rule::struct_literal_field => SyntaxKind::StructLiteralField,
@@ -920,7 +944,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
         Rule::parenthesized_dereference_place => SyntaxKind::ParenthesizedDereferencePlace,
-        Rule::indexed_place | Rule::indexed_value_place => SyntaxKind::IndexedPlace,
+        Rule::indexed_place | Rule::indexed_value_place | Rule::indexed_dereference_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
         Rule::index_field_suffix => SyntaxKind::IndexFieldSuffix,
         Rule::direct_field_chain_tail => SyntaxKind::DirectFieldChainTail,
@@ -1007,6 +1031,25 @@ mod tests {
         assert_eq!(result.reconstruct(), BASE);
         assert_eq!(result.range(), ByteSpan::new(0, BASE.len() as u32));
     }
+    #[test]
+    fn fallible_local_assignment_preserves_a_distinct_operator() {
+        let text = "%%start\ni32() example = fn {\n\ti32 result =? 3;\n\tresult\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let local = result.root.descendants()
+            .find(|node| node.kind() == SyntaxKind::LocalBinding).expect("local binding");
+        let operator = local.children_with_tokens().find_map(|element| {
+            let token = element.into_token()?;
+            (token.kind() == SyntaxKind::FallibleAssignmentOperator).then_some(token)
+        }).expect("fallible assignment mode");
+        assert_eq!(operator.text(), "=?");
+        for body in ["i32 a, i32 b =? 1;", "i32 a =? 1, 2;", "i32 a = ? 1;"] {
+            let text = format!("%%start\nunit() example = fn {{\n\t{body}\n}};\n%%end");
+            assert!(!parse(identity(), text, &[]).is_valid(), "{body}");
+        }
+    }
+
     #[test]
     fn fixed_array_types_and_literals_are_structural_and_lossless() {
         let text = "%%start\nu8[2][3] values = [[1, 2], [3, 4], [5, 6]];\n%%end";

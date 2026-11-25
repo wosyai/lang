@@ -180,6 +180,33 @@ pub(super) fn emit_return<'ctx, 'module>(
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
 ) -> Result<(), String> {
+    if let Some(aggregate) = state.aggregate.as_ref().filter(|aggregate| aggregate.plan().fallible_allocation_relay) {
+        if aggregate.fallible_relay_next != aggregate.plan().fallible_relay_allocations.len() {
+            return Err("incomplete sealed fallible allocation relay backing".into());
+        }
+        let payload = aggregate.plan().fallible_allocation_payload.as_ref()
+            .ok_or("missing sealed fallible relay payload type")?;
+        let expected = super::aggregate_transfer::fallible_allocation_result_type(context, payload)?;
+        let value = take_basic(value)?;
+        if !matches!(value, BasicValueEnum::StructValue(pair) if pair.get_type() == expected)
+        {
+            return Err("invalid sealed fallible allocation relay result".into());
+        }
+        state.builder.build_return(Some(&value)).map_err(builder_error)?;
+        return Ok(());
+    }
+    if let Some(aggregate) = state.aggregate.as_ref().filter(|aggregate| aggregate.plan().fallible_allocation_leaf) {
+        if aggregate.fallible_relay_next != aggregate.plan().fallible_relay_allocations.len() {
+            return Err("incomplete sealed terminal fallible allocation backing".into());
+        }
+        let payload = aggregate.plan().fallible_allocation_payload.as_ref()
+            .ok_or("missing sealed fallible leaf payload type")?;
+        let value = super::aggregate_transfer::present_fallible_allocation_result(
+            context, state, take_basic(value)?, payload,
+        )?;
+        state.builder.build_return(Some(&value)).map_err(builder_error)?;
+        return Ok(());
+    }
     let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
     for (output, slot) in &state.return_owner_slots {
         let owned = state
