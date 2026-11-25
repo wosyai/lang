@@ -18840,8 +18840,23 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(matches!(run(&nested, library, &lib, ScalarCheckerScope::CurrentPackage),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
         assert!(run(&nested, library, &lib, ScalarCheckerScope::MainFlowOnly).unwrap().diagnostics.is_empty());
-        let reached_nested = nested.replace("%%end", "i8 next = via(3); %%end");
-        assert!(matches!(run(&reached_nested, library, &lib, ScalarCheckerScope::MainFlowOnly),
+        // The observed wrapper uses the independently verified provider
+        // in the resolved namespace and exposes its actual scalar result.
+        let reached_nested = nested.replace("%%end", &format!(
+            "i8 next = via(3); core.require(next == 7, {OUTPUT}); %%end"));
+        let main_flow = ScalarCheckerScope::MainFlowOnly;
+        let nested_pass = run(&reached_nested, library, &lib, main_flow).unwrap();
+        assert!(nested_pass.active && nested_pass.diagnostics.is_empty()
+            && nested_pass.directives.is_empty() && nested_pass.symbolic_diagnostic.is_none());
+        let wrong_nested = reached_nested.replace("next == 7", "next == 6");
+        let nested_failure = run(&wrong_nested, library, &lib, main_flow).unwrap();
+        let [requirement] = nested_failure.directives.as_slice() else { panic!("the nested result must reach the later requirement"); };
+        assert!(nested_failure.diagnostics.is_empty() && nested_failure.symbolic_diagnostic.is_none());
+        let condition = requirement.condition;
+        assert_eq!(&wrong_nested[condition.start as usize..condition.end as usize], "next == 6");
+        assert_eq!(requirement.operation, ScalarCheckerOperation::Require);
+        let wrong_owner = SourceIdentity { project: "other-project".into(), ..lib.clone() };
+        assert!(matches!(run(&reached_nested, library, &wrong_owner, main_flow),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let unrelated = reached.replace("%%end", "i8(i8) via_local = fn(n) { i8 result = value(n); result }; %%end");
         assert!(run(&unrelated, library, &lib, ScalarCheckerScope::CurrentPackage).unwrap().diagnostics.is_empty());
