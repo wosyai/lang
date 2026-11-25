@@ -213,6 +213,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     private_runtime_write_formal: Option<String>,
     nominate_local_runtime_write: bool,
     suppress_checked_occurrences: bool,
+    anonymous_element_sites: HashSet<*const ScalarExpression>,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -226,6 +227,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             private_runtime_write_formal: None,
             nominate_local_runtime_write: false,
             suppress_checked_occurrences: true,
+            anonymous_element_sites: HashSet::new(),
         }
     }
 
@@ -248,6 +250,18 @@ impl<'a> ScalarInferenceBuilder<'a> {
             },
             self.occurrences,
         )
+    }
+
+    pub(super) fn nominate_inline_elements(&mut self, binding: &ScalarBinding) {
+        if self.in_module_initialization || self.suppress_checked_occurrences { return; }
+        let Some(elements) = super::anonymous_callable::candidate_fixed_elements(binding) else { return; };
+        self.anonymous_element_sites.extend(elements.iter()
+            .filter(|item| matches!(item, ScalarExpression::AnonymousCallable { .. }))
+            .map(std::ptr::from_ref));
+    }
+
+    pub(super) fn is_nominated_inline_element(&self, expression: &ScalarExpression) -> bool {
+        self.anonymous_element_sites.contains(&std::ptr::from_ref(expression))
     }
 
     pub(super) fn memoized_float_literal_shape(

@@ -90,6 +90,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::AnonymousCallable { .. } => Err("unprepared inline callable".into()),
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
                 return Ok(EmitValue::Basic(
@@ -392,6 +393,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::AnonymousCallable { .. } => Err("unprepared inline callable".into()),
         ScalarExpression::Member {
             receiver,
             name,

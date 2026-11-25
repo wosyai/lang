@@ -407,6 +407,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
+        | ScalarExpression::AnonymousCallable { span, .. }
         | ScalarExpression::Binary { span, .. }
         | ScalarExpression::Unary { span, .. }
         | ScalarExpression::Call { span, .. }
@@ -1227,6 +1228,9 @@ pub(super) fn block_item_type_in_module(
                 return ScalarType::Unit;
             }
             let widening = widened_local_literal_type(binding);
+            if !unsafe_context {
+                inference.nominate_inline_elements(binding);
+            }
             let actual = expression_type_in_module_expected(
                 &binding.value,
                 Some(widening.as_ref().unwrap_or(&binding.declared_type)),
@@ -3407,6 +3411,10 @@ fn check_expression_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::AnonymousCallable { span, .. } => {
+            diagnostics.push(module_diagnostic(module, "B0003", "inline callable lacks its prepared fixed array owner", *span));
+            ScalarType::Error
+        }
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
@@ -4663,6 +4671,13 @@ fn check_expression_type_in_module_expected(
         let utf8 = utf8_type_from_namespace_target(module, modules, *span, diagnostics);
         expect_module_type(module, &utf8, expected, *span, diagnostics);
         return ScalarType::Error;
+    }
+    if let ScalarExpression::AnonymousCallable { .. } = expression {
+        if inference.is_nominated_inline_element(expression) {
+            if let Some(signature) = expected.filter(|ty| super::anonymous_callable::closed_scalar_signature(ty)) {
+                return signature.clone();
+            }
+        }
     }
     if let ScalarExpression::ArrayLiteral { elements, span } = expression {
         let Some(ScalarType::Array {
@@ -7142,6 +7157,7 @@ fn validate_unit_if_position(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match expression {
+        ScalarExpression::AnonymousCallable { .. } => {}
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -7758,6 +7774,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
 
     fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
+            ScalarExpression::AnonymousCallable { .. } => {}
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
             ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
@@ -8447,6 +8464,10 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::AnonymousCallable { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0003", "inline callable lacks its prepared fixed array owner", *span));
+            ScalarType::Error
+        }
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));

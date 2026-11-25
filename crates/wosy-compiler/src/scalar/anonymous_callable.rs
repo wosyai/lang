@@ -45,11 +45,113 @@ fn scalar(ty: &ScalarType) -> bool {
         | ScalarType::U32 | ScalarType::U64 | ScalarType::U128 | ScalarType::F32 | ScalarType::F64)
 }
 
+pub(super) fn closed_scalar_signature(ty: &ScalarType) -> bool {
+    let ScalarType::Callable { parameters, outputs } = ty else { return false; };
+    matches!(outputs.outputs.as_slice(), [ScalarOutput { ty, .. }] if scalar(ty)) && parameters.iter().all(scalar)
+}
+
+pub(super) fn candidate_fixed_elements(binding: &ScalarBinding) -> Option<&[ScalarExpression]> {
+    if binding.receivers.len() != 1 || binding.fallible_assignment.is_some() || binding.is_allocation { return None; }
+    let ScalarType::Array { element, length, .. } = &binding.declared_type else { return None; };
+    let ScalarExpression::ArrayLiteral { elements, .. } = &binding.value else { return None; };
+    if !closed_scalar_signature(element) || *length != elements.len() as u64
+        || !elements.iter().any(|item| matches!(item, ScalarExpression::AnonymousCallable { .. }))
+        || !elements.iter().all(|item| matches!(item, ScalarExpression::AnonymousCallable { .. } | ScalarExpression::Name { .. }))
+    { return None; }
+    Some(elements)
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct PreparedInlineOwner {
+    module: usize,
+    item: usize,
+    block: usize,
+    binding: usize,
+    ordinal: usize,
+    rank: usize,
+}
+
+struct OwnerTiedAnonymousPool {
+    outer: PreparedScalarProject,
+    outer_references: reference::ProjectReferenceResults,
+    arms: HashMap<PreparedInlineOwner, PreparedAnonymousCallable>,
+}
+
+impl OwnerTiedAnonymousPool {
+    fn arm_for(
+        &self, module: usize, item: usize, binding: &ScalarBinding, rank: usize,
+    ) -> Option<&PreparedAnonymousCallable> {
+        let ScalarItem::Function(function) = self.outer.project().modules.get(module)?.items.get(item)?
+            else { return None; };
+        let nodes = self.outer.bind_callable_body_call_nodes(module, item, None, &function.body).ok()?;
+        let (block, position) = nodes.binding_position(binding)?;
+        let value = candidate_fixed_elements(binding)?.get(rank)?;
+        let ordinal = nodes.expression_ordinal(value)?;
+        self.arms.get(&PreparedInlineOwner { module, item, block, binding: position, ordinal, rank })
+    }
+}
+
+fn prepare_owner_tied_pool(
+    canonical: &CanonicalCstRoot, target: ScalarTargetLayout,
+) -> Result<OwnerTiedAnonymousPool, Vec<Diagnostic>> {
+    let declarations = derive_scalar_declarations_with_inline_analysis(canonical, true);
+    if !declarations.diagnostics.is_empty() { return Err(declarations.diagnostics); }
+    let source = declarations.source;
+    let mut module = ScalarModule::new(source.clone(), declarations.items, Vec::new());
+    module.structs = declarations.structs;
+    module.enums = declarations.enums;
+    module.target_layout = target;
+    let outer = PreparedScalarProject::new(ScalarProject::new(vec![module], vec![source.clone()]))
+        .map_err(|error| error.diagnostics.clone())?;
+    let checked = analyze_scalar_build(&outer);
+    if !checked.diagnostics().is_empty() { return Err(checked.diagnostics().to_vec()); }
+    let outer_references = checked.into_reference_results();
+    let mut arms = HashMap::new();
+    for (module, actual) in outer.project().modules.iter().enumerate() {
+        for (item, value) in actual.items.iter().enumerate() {
+            let ScalarItem::Function(fun) = value else { continue; };
+            let candidates = fun.body.items.iter().filter_map(|item| match item {
+                ScalarBlockItem::LocalBinding(binding) => candidate_fixed_elements(binding).map(|elements| (binding, elements)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            if candidates.is_empty() { continue; }
+            let nodes = outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
+                .map_err(|_| vec![arm_diagnostic(&source, fun.span, "missing prepared inline callable owner")])?;
+            for (binding, values) in candidates {
+                let (block, position) = nodes.binding_position(binding)
+                    .ok_or_else(|| vec![arm_diagnostic(&source, binding.span, "missing prepared inline callable binding")])?;
+                let ScalarType::Array { element, .. } = &binding.declared_type else { unreachable!("typed fixed array"); };
+                for (rank, value) in values.iter().enumerate() {
+                    if !matches!(value, ScalarExpression::AnonymousCallable { .. }) { continue; }
+                    let ordinal = nodes.expression_ordinal(value)
+                        .filter(|_| nodes.checked_expression_type(value) == Some(element.as_ref()))
+                        .ok_or_else(|| vec![arm_diagnostic(&source, expression_span(value), "missing actual typed inline callable element")])?;
+                    let key = PreparedInlineOwner { module, item, block, binding: position, ordinal, rank };
+                    let arm = check_isolated_arm(&source, value.clone(), element.as_ref().clone(), target)?;
+                    if arms.insert(key, arm).is_some() {
+                        return Err(vec![arm_diagnostic(&source, expression_span(value), "duplicate prepared inline callable element")]);
+                    }
+                }
+            }
+        }
+    }
+    // The analysis-only entry is not a general collector or a Build mode.
+    let authored_count = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::CallableLiteral).count();
+    if arms.len() != authored_count {
+        return Err(vec![diagnostic(&source, &canonical.root, "inline callable is outside the admitted direct lexical array owner")]);
+    }
+    Ok(OwnerTiedAnonymousPool { outer, outer_references, arms })
+}
+
 fn diagnostic(source: &SourceIdentity, at: &CstNode, message: &str) -> Diagnostic {
+    arm_diagnostic(source, wosy_syntax::byte_span(at), message)
+}
+
+fn arm_diagnostic(source: &SourceIdentity, at: ByteSpan, message: &str) -> Diagnostic {
     Diagnostic {
         code: "B0003".to_owned(), severity: DiagnosticSeverity::Error, message: message.to_owned(),
         labels: vec![DiagnosticLabel { kind: DiagnosticLabelKind::Primary,
-            span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(at)), message: message.to_owned() }],
+            span: SourceSpan::new(source.clone(), at), message: message.to_owned() }],
         notes: Vec::new(),
     }
 }
@@ -100,7 +202,8 @@ fn prepare_anonymous_pool(
             let key = AnonymousCallableSite { source: source.clone(), owner: wosy_syntax::byte_span(&owner),
                 binding: wosy_syntax::byte_span(&binding), element: wosy_syntax::byte_span(&literal),
                 body: wosy_syntax::byte_span(&body), ordinal };
-            let checked = check_isolated_arm(source, &literal, &body, signature.clone(), target)?;
+            let authored = derive_expression(&literal);
+            let checked = check_isolated_arm(source, authored, signature.clone(), target)?;
             if pool.arms.insert(key, checked).is_some() {
                 return Err(vec![diagnostic(source, &literal, "duplicate anonymous callable occurrence")]);
             }
@@ -110,28 +213,20 @@ fn prepare_anonymous_pool(
 }
 
 fn check_isolated_arm(
-    source: &SourceIdentity, literal: &CstNode, body: &CstNode, signature: ScalarType,
+    source: &SourceIdentity, expression: ScalarExpression, signature: ScalarType,
     target: ScalarTargetLayout,
 ) -> Result<PreparedAnonymousCallable, Vec<Diagnostic>> {
     let ScalarType::Callable { parameters: inputs, outputs } = &signature else { unreachable!("sealed scalar signature") };
-    let mut parameters = Vec::new();
-    let mut parameter_spans = Vec::new();
-    if let Some(list) = literal.children().find(|node| node.kind() == SyntaxKind::Parameters) {
-        for token in list.children_with_tokens().filter_map(NodeOrToken::into_token)
-            .filter(|token| token.kind() == SyntaxKind::Identifier)
-        {
-            parameters.push(token.text().to_owned());
-            parameter_spans.push(token_span(&token));
-        }
+    let ScalarExpression::AnonymousCallable { parameters: authored, body, span } = expression
+        else { unreachable!("authored anonymous callable") };
+    if authored.len() != inputs.len() {
+        return Err(vec![arm_diagnostic(source, span, "inline callable parameter count differs from its array element signature")]);
     }
-    if parameters.len() != inputs.len() {
-        return Err(vec![diagnostic(source, literal, "inline callable parameter count differs from its array element signature")]);
-    }
-    let mut body = derive_block(body);
+    let (parameters, parameter_spans) = authored.into_iter().unzip();
+    let mut body = *body;
     for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
         value.ty = output.ty.clone();
     }
-    let span = wosy_syntax::byte_span(literal);
     // This adapter is never added to the authored project or emitted. Empty
     // spelling is not lexable, so it cannot shadow a name or be called.
     let arm = ScalarFunction { name: String::new(), name_span: span, signature, parameters,
@@ -155,7 +250,7 @@ fn check_isolated_arm(
     let cfg = checked.reference_cfg(0, 0, None).expect("ordinary callable CFG");
     let ScalarItem::Function(arm) = &prepared.project().modules[0].items[0] else { unreachable!() };
     if !crate::llvm::closed_scalar_target(arm, cfg) {
-        return Err(vec![diagnostic(source, literal, "inline callable pool admits only closed scalar computation")]);
+        return Err(vec![arm_diagnostic(source, span, "inline callable pool admits only closed scalar computation")]);
     }
     let results = checked.into_reference_results();
     Ok(PreparedAnonymousCallable { prepared, results })
@@ -214,5 +309,43 @@ unit() store = fn {
         assert!(inspect(&incomplete, target).is_err());
         let wrong_return = ordinary.replace("fn() { 1 }", "fn() { true }");
         assert!(inspect(&wrong_return, target).is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn anonymous_elements_are_tied_to_actual_prepared_fixed_array_owners() {
+    let text = "%%start
+u8() named = fn { 7 };
+unit() owner = fn {
+    u8()[2] first = [fn() { 1 }, fn() { 2 }];
+    u8()[2] second = [named, fn() { 3 }];
+    first;
+    second;
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/owner-inline.w".into(), "r1".into());
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let canonical = parsed.result.canonical_cst();
+        let pool = prepare_owner_tied_pool(canonical, target).unwrap_or_else(|diagnostics| panic!("{diagnostics:?}"));
+        assert_eq!(pool.arms.len(), 3);
+        let [ScalarItem::Function(_), ScalarItem::Function(owner)] = pool.outer.project().modules[0].items.as_slice()
+            else { panic!("exact authored owner") };
+        let [ScalarBlockItem::LocalBinding(first), ScalarBlockItem::LocalBinding(second), ..] = owner.body.items.as_slice()
+            else { panic!("both actual array bindings") };
+        assert!(pool.outer_references.reference_cfg(0, 1, None).is_some());
+        let first_zero = pool.arm_for(0, 1, first, 0).expect("first[0]");
+        let first_one = pool.arm_for(0, 1, first, 1).expect("first[1]");
+        let second_one = pool.arm_for(0, 1, second, 1).expect("second[1]");
+        assert_ne!(first_zero.function().span, first_one.function().span);
+        assert_ne!(first_one.function().span, second_one.function().span);
+        assert!(pool.arm_for(0, 1, second, 0).is_none()); // named slot uses the old path
+        assert!(pool.arm_for(0, 0, first, 0).is_none()); // other function
+        assert!(pool.arm_for(0, 1, &first.clone(), 0).is_none()); // same source metadata, wrong actual node
+        assert!(pool.arm_for(0, 1, first, 2).is_none()); // wrong rank
+        let diagnostics = derive_scalar_declarations_from_cst(canonical).diagnostics;
+        assert_eq!(diagnostics.iter().filter(|d| d.message == "inline callable array elements are not available for Build yet").count(), 3);
     }
 }
