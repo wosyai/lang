@@ -16,6 +16,8 @@ mod typed_preparation;
 mod retention;
 #[path = "source_snapshot/recovery.rs"]
 mod recovery;
+#[path = "source_snapshot/storage_worker.rs"]
+mod storage_worker;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -180,6 +182,12 @@ async fn main() -> Result<()> {
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
+    if selection.as_deref() == Some("--source-worker") {
+        let scope = NodeId::parse_hex(&args.next().ok_or("expected fixture scope")?)?;
+        let old = NodeId::parse_hex(&args.next().ok_or("expected fixture historical root")?)?;
+        return std::thread::spawn(move || storage_worker::run(&dir, scope, old))
+            .join().map_err(|_| "storage worker fixture panicked")?;
+    }
     if selection.as_deref() == Some("--reconcile-source") {
         let replacement = args.next().ok_or("expected a replacement fixture store")?;
         let key = FileKey {

@@ -45,6 +45,7 @@ mod pins;
 mod project_declarations;
 mod prepared_project;
 mod retention_plan;
+mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use pins::SourcePin;
 pub use project_declarations::{
@@ -52,6 +53,7 @@ pub use project_declarations::{
 };
 pub use prepared_project::{BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
+pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 
 pub struct SourceStore {
     tree: Tree,

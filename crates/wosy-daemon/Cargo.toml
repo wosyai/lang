@@ -17,4 +17,4 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 wosy-project.workspace = true
 wosy-compiler.workspace = true
 serde.workspace = true
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["rt", "sync"] }

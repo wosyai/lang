@@ -33,6 +33,7 @@ impl Drop for SourceRead {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct SourceRetentionPlan {
     /// Exact logical protection inputs observed in a single MVCC transaction.
     /// This is not an authorization or token for a subsequent sweep.
@@ -51,7 +52,7 @@ pub struct SourceRetentionPlan {
     pub candidate_only_cas_references: usize,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub struct SourceCasInventory {
     pub referenced: usize,
     /// Files absent at inspection time. Availability is not a checksum or
@@ -59,6 +60,7 @@ pub struct SourceCasInventory {
     pub missing: usize,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct SourceRetentionInventory {
     pub plan: SourceRetentionPlan,
     /// Includes CAS references shared with nominated roots.
