@@ -24720,6 +24720,59 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(prepare(&mut 0).unwrap().len(), 3);
     }
 
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn nested_authored_array_dependent_witnesses_use_leaf_specific_affine_images() {
+        let text = r#"%%start
+            u8[4](u8) make = fn(value) {
+                if (value < 3) { [7, 7, 0, 0] } else {
+                    if (value < 5) { [0, 7, 7, 0] } else { [0, 0, 7, 7] }
+                }
+            };
+            proof cells for make(entry) -> (items)
+                where (entry <= 7)
+                forall (u64 j where j < 2)
+                ensures (exists (u64 i where i < 4) { items[i] == 7 })
+            {
+                if (entry < 3) { core.witness(j); }
+                else {
+                    if (entry < 5) { core.witness(j + 1); }
+                    else { core.witness(j + 2); }
+                }
+            }
+        %%end"#;
+        let app = source("src/main.w", "nested-array-dependent-witness");
+        let run = |program: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), program.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let reached = text.replace("%%end", "u8[4] first = make(0); u8[4] next = make(3); u8[4] last = make(6); u8[4] outside = make(8); %%end");
+        for (program, scope, entry) in [(text, ScalarCheckerScope::CurrentPackage, 5),
+            (reached.as_str(), ScalarCheckerScope::MainFlowOnly, 6)]
+        {
+            let checked = run(program, scope).unwrap();
+            assert!(checked.active && checked.aggregate_diagnostics.is_empty());
+            let wrong = program.replace("core.witness(j + 2)", "core.witness(j + 1)");
+            let checked = run(&wrong, scope).unwrap();
+            let [failure] = checked.aggregate_diagnostics.as_slice() else { panic!("only the selected affine witness refutes"); };
+            let cell = failure.cell.as_ref().unwrap();
+            assert_eq!((&cell.index, &cell.value), (&BigInt::from(1), &BigInt::from(0)));
+            assert_eq!(cell.universal, Some(("j".into(), BigInt::from(0))));
+            let step = failure.failed_step.as_ref().unwrap().range;
+            assert_eq!(&wrong[step.start as usize..step.end as usize], "core.witness(j + 1)");
+            let entry = BigInt::from(entry);
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&entry, &entry)]));
+        }
+        let untouched = run(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!untouched.active && untouched.aggregate_diagnostics.is_empty());
+        for invalid in ["j + 3", "j - 1", "j +@ 2"] {
+            let wrong = text.replace("j + 2", invalid);
+            assert!(matches!(run(&wrong, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
     fn source(path: &str, revision: &str) -> SourceIdentity {
         SourceIdentity::new("local".into(), "demo".into(), path.into(), revision.into())
     }

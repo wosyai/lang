@@ -130,74 +130,50 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let steps = derive_block(&block);
-        if existential && witness_dependency.is_none() && witness_split(&steps).is_some() {
+        if existential && witness_split(&steps).is_some() {
             if inputs.len() != 1 { return Err(ProjectCheck::Unsupported); }
             let mut branches = Vec::new();
             let mut active = entry_filter.unwrap_or_default();
-            compile_witness_branches(&steps, &inputs, body, &domain, *length,
-                &mut active, &mut branches, array_work, 0)?;
-            return Ok(branches.into_iter().map(|(filter, index, step)| Self {
-                proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(&goal_node),
-                failed_step: Some(step), shifted_witness: None, entry_filter: Some(filter),
-                domain: domain.clone(), quantifier: FixedArrayQuantifier::ExplicitWitness(index),
-                relation, expected: expected.clone(), body, result: &output.ty,
-            }).collect());
+            compile_witness_branches(&steps, &inputs, body, &mut active, array_work, 0,
+                &mut |leaf, filter, work| {
+                    let argument = authored_witness_argument(leaf)?;
+                    let (image, quantifier, shifted_witness) = if let Some((universal, target)) = &witness_dependency {
+                        let (image, shift) = dependent_witness_image(argument, universal, &domain, target, work)?;
+                        check_array_index_domain(&image, *length)?;
+                        (image, FixedArrayQuantifier::All, Some((universal.clone(), shift.unwrap_or_default())))
+                    } else {
+                        let index = checked_explicit_index(argument, &domain, *length)?;
+                        (Cow::Borrowed(&domain), FixedArrayQuantifier::ExplicitWitness(index), None)
+                    };
+                    let clone_cost = match &image {
+                        Cow::Borrowed(domain) => domain.interval_count(),
+                        Cow::Owned(_) => 0,
+                    };
+                    charge_call_work(work, clone_cost.checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    branches.push(Self {
+                        proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(&goal_node),
+                        failed_step: Some(witness_step_span(leaf)?), shifted_witness, entry_filter: Some(filter.to_vec()),
+                        domain: image.into_owned(), quantifier, relation, expected: expected.clone(), body, result: &output.ty,
+                    });
+                    Ok(())
+                })?;
+            return Ok(branches);
         }
         let mut failed_step = None;
         let mut shifted_witness = None;
         let quantifier_kind = if let Some((universal, target_domain)) = witness_dependency {
-            let is_universal = |expression: &ScalarExpression| matches!(expression,
-                ScalarExpression::Name { name, .. } if *name == universal);
             let argument = authored_witness_argument(&steps)?;
-            if !is_universal(argument) {
-                let ScalarExpression::Binary { operator, left, right, .. } = argument else {
-                    return Err(ProjectCheck::Unsupported);
-                };
-                if !is_universal(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
-                    return Err(ProjectCheck::Unsupported);
-                }
-                let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
-                if !integer_literal_fits_type(&literal, &index_ty) {
-                    return Err(ProjectCheck::Unsupported);
-                }
-                let offset = if *operator == BinaryOperator::Subtract { -literal } else { literal };
-                // Translation is monotone; checking the two extrema first
-                // proves that every authored u64 addition/subtraction is exact.
-                if domain.extremes().is_some_and(|(min, max)|
-                    !integer_literal_fits_type(&(min + &offset), &index_ty)
-                        || !integer_literal_fits_type(&(max + &offset), &index_ty))
-                {
-                    return Err(ProjectCheck::Unsupported);
-                }
-                let mut work = 0;
-                charge_call_work(&mut work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
-                domain = domain.affine_unit(false, &offset, false);
-                shifted_witness = Some((universal, offset));
-            }
-            // The image must satisfy the entire existential domain. Feed it
-            // to the existing scanner, without another pass over the cells.
-            if !domain.is_subset_of(&target_domain) {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else {
-                return Err(ProjectCheck::Unsupported);
-            };
-            failed_step = Some(super::super::typecheck::expression_span(expression));
+            let (image, shift) = dependent_witness_image(argument, &universal, &domain, &target_domain, array_work)?;
+            if let Cow::Owned(image) = image { domain = image; }
+            shifted_witness = shift.map(|offset| (universal, offset));
+            failed_step = Some(witness_step_span(&steps)?);
             FixedArrayQuantifier::All
         } else if existential && steps.items.is_empty() {
             FixedArrayQuantifier::FindWitness
         } else if existential {
-            let value = concrete_integer_literal(authored_witness_argument(&steps)?)
-                .ok_or(ProjectCheck::Unsupported)?.into_owned();
-            if !integer_literal_fits_type(&value, &index_ty) || !domain.contains(&value)
-                || u64::try_from(&value).ok().is_none_or(|value| value >= *length)
-            {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else {
-                return Err(ProjectCheck::Unsupported);
-            };
-            failed_step = Some(super::super::typecheck::expression_span(expression));
+            let value = checked_explicit_index(authored_witness_argument(&steps)?, &domain, *length)?;
+            failed_step = Some(witness_step_span(&steps)?);
             FixedArrayQuantifier::ExplicitWitness(value)
         } else {
             if !steps.items.is_empty() {
@@ -212,11 +188,8 @@ impl<'a> ArrayProof<'a> {
             }
             FixedArrayQuantifier::All
         };
-        if !matches!(quantifier_kind, FixedArrayQuantifier::ExplicitWitness(_))
-            && domain.extremes().is_some_and(|(first, last)| u64::try_from(first).is_err()
-                || u64::try_from(last).ok().is_none_or(|index| index >= *length))
-        {
-            return Err(ProjectCheck::Unsupported);
+        if !matches!(quantifier_kind, FixedArrayQuantifier::ExplicitWitness(_)) {
+            check_array_index_domain(&domain, *length)?;
         }
         let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
         Ok(vec![Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step, shifted_witness,
@@ -261,36 +234,83 @@ fn witness_split(steps: &ScalarBlock) -> Option<(&ScalarExpression, &ScalarBlock
 }
 
 fn compile_witness_branches(
-    steps: &ScalarBlock, inputs: &[String], body: &FunctionCallSites, domain: &IntegerSet, length: u64,
-    active: &mut Vec<CheckerPredicate>, branches: &mut Vec<(Vec<CheckerPredicate>, BigInt, ByteSpan)>,
+    steps: &ScalarBlock, inputs: &[String], body: &FunctionCallSites, active: &mut Vec<CheckerPredicate>,
     work: &mut usize, depth: usize,
+    emit: &mut impl FnMut(&ScalarBlock, &[CheckerPredicate], &mut usize) -> Result<(), ProjectCheck>,
 ) -> Result<(), ProjectCheck> {
     if depth >= MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
     charge_call_work(work, 1).ok_or(ProjectCheck::Unsupported)?;
     if let Some((condition, yes, no)) = witness_split(steps) {
         for (branch, negated) in [(yes, false), (no, true)] {
             active.push(proof_input_condition::<true>(condition, inputs, body, negated)?);
-            compile_witness_branches(branch, inputs, body, domain, length, active, branches, work, depth + 1)?;
+            compile_witness_branches(branch, inputs, body, active, work, depth + 1, emit)?;
             active.pop();
         }
         return Ok(());
     }
-    let value = concrete_integer_literal(authored_witness_argument(steps)?)
-        .ok_or(ProjectCheck::Unsupported)?.into_owned();
+    let cost = active.iter().try_fold(1usize, |total, filter| total.checked_add(match filter {
+        CheckerPredicate::EntryDomain { values, .. } => values.interval_count().checked_add(1)?,
+        _ => 1,
+    })).ok_or(ProjectCheck::Unsupported)?;
+    charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
+    emit(steps, active, work)
+}
+
+fn witness_step_span(steps: &ScalarBlock) -> Result<ByteSpan, ProjectCheck> {
+    let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    Ok(super::super::typecheck::expression_span(expression))
+}
+
+fn checked_explicit_index(argument: &ScalarExpression, domain: &IntegerSet, length: u64) -> Result<BigInt, ProjectCheck> {
+    let value = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?.into_owned();
     if !integer_literal_fits_type(&value, &ScalarType::U64) || !domain.contains(&value)
         || u64::try_from(&value).ok().is_none_or(|value| value >= length)
     {
         return Err(ProjectCheck::InvalidProof);
     }
-    let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    let cost = active.iter().try_fold(domain.interval_count().checked_add(1).ok_or(ProjectCheck::Unsupported)?,
-        |total, filter| total.checked_add(match filter {
-            CheckerPredicate::EntryDomain { values, .. } => values.interval_count().checked_add(1)?,
-            _ => 1,
-        })).ok_or(ProjectCheck::Unsupported)?;
-    charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
-    branches.push((active.clone(), value, super::super::typecheck::expression_span(expression)));
+    Ok(value)
+}
+
+fn check_array_index_domain(domain: &IntegerSet, length: u64) -> Result<(), ProjectCheck> {
+    if domain.extremes().is_some_and(|(first, last)| u64::try_from(first).is_err()
+        || u64::try_from(last).ok().is_none_or(|last| last >= length))
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
     Ok(())
+}
+
+fn dependent_witness_image<'a>(
+    argument: &ScalarExpression, universal: &str, domain: &'a IntegerSet, target: &IntegerSet,
+    work: &mut usize,
+) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
+    let universal_name = |expression: &ScalarExpression|
+        matches!(expression, ScalarExpression::Name { name, .. } if name == universal);
+    let (image, shift) = if universal_name(argument) {
+        (Cow::Borrowed(domain), None)
+    } else {
+        let ScalarExpression::Binary { operator, left, right, .. } = argument else { return Err(ProjectCheck::Unsupported); };
+        if !universal_name(left) || !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?.into_owned();
+        if !integer_literal_fits_type(&literal, &ScalarType::U64) { return Err(ProjectCheck::Unsupported); }
+        let shift = if *operator == BinaryOperator::Subtract { -literal } else { literal };
+        // Translation is monotone. Checking both endpoints establishes
+        // exact checked u64 arithmetic throughout the quantified domain.
+        if domain.extremes().is_some_and(|(min, max)|
+            !integer_literal_fits_type(&(min + &shift), &ScalarType::U64)
+                || !integer_literal_fits_type(&(max + &shift), &ScalarType::U64))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+        (Cow::Owned(domain.affine_unit(false, &shift, false)), Some(shift))
+    };
+    let cost = image.interval_count().checked_add(target.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+    charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
+    if !image.is_subset_of(target) { return Err(ProjectCheck::Unsupported); }
+    Ok((image, shift))
 }
 
 type ArrayCoverage = ProofCoverage<Option<AggregateProofDiagnostic>>;
