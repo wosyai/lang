@@ -6564,7 +6564,7 @@ impl OccurrenceStructure {
     fn new(span: ByteSpan) -> Self {
         Self {
             root: BlockOrdinal(0),
-            blocks: vec![BlockRegion::new(span, Vec::new())],
+            blocks: vec![BlockRegion::new(span, Vec::new(), false)],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -6806,11 +6806,22 @@ struct ContextualCallPlace {
 impl FunctionCallSites {
     #[cfg(feature = "internal-checker")]
     fn checker_closed_calling_frame(&self) -> bool {
+        self.checker_closed_frame_allowing_snapshots() && self.structure.checker_selected_snapshots.is_empty()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn checker_closed_frame_allowing_snapshots(&self) -> bool {
         self.assignments.is_empty() && self.allocation_length_calls.is_empty()
             && self.arms.is_empty()
             && !self.structure.has_ordinary_contextual_places()
             && !self.structure.checker_has_bool_contextual_declaration
-            && self.structure.checker_selected_snapshots.is_empty()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_fixed_index_analysis_frame(&self) -> bool {
+        // Fixed-array proof uses prepared immutable snapshots as value
+        // representations, not as assumptions or memory authority.
+        self.checker_closed_frame_allowing_snapshots() && self.structure.checker_directives.is_empty()
     }
 
     #[cfg(feature = "internal-checker")]
@@ -9239,7 +9250,7 @@ impl StructuralWalker<'_, '_> {
             .push(self.reserve_legacy(parent, edge));
         self.structure
             .blocks
-            .push(BlockRegion::new(block.span, Vec::new()));
+            .push(BlockRegion::new(block.span, Vec::new(), block.unsafe_context));
         assert!(self
             .structure
             .edges

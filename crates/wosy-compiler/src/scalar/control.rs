@@ -540,14 +540,21 @@ pub(super) struct BlockItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BlockRegion {
     pub(super) span: ByteSpan,
+    #[cfg(feature = "internal-checker")]
+    pub(super) unsafe_context: bool,
     pub(super) items: Vec<BlockItem>,
     projected_outputs: Vec<FinalOutputSlot>,
 }
 
 impl BlockRegion {
-    pub(super) fn new(span: ByteSpan, items: Vec<BlockItem>) -> Self {
+    pub(super) fn new(
+        span: ByteSpan, items: Vec<BlockItem>,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] unsafe_context: bool,
+    ) -> Self {
         Self {
             span,
+            #[cfg(feature = "internal-checker")]
+            unsafe_context,
             items,
             projected_outputs: Vec::new(),
         }

@@ -175,6 +175,14 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const OBSERVE_FIXED_ARRAY: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    const OBSERVE_RUNTIME_FIXED_INDEX: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_runtime_fixed_index(
+        self, _: &'a super::reference::CheckerOrdinaryScalarLocal, _: usize,
+    ) -> Option<()> { None }
+
+    #[cfg(feature = "internal-checker")]
     const OBSERVE_RESULT_PAIR: bool = false;
 
     #[cfg(feature = "internal-checker")]
@@ -3243,6 +3251,94 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
         )
     }?;
     Some((active, failures))
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct RuntimeFixedIndexObserver<'a, 'proof> {
+    conditions: OrderedRootConditions<'a, true, true>,
+    discovered: &'proof std::cell::RefCell<HashMap<OccurrenceOrdinal, (&'a super::reference::CheckerOrdinaryScalarLocal, usize)>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for RuntimeFixedIndexObserver<'a, '_> {
+    const ENABLED: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
+    const OBSERVE_RUNTIME_FIXED_INDEX: bool = true;
+
+    fn allows_extended_scalar_locals(self) -> bool { true }
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> { None }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        self.conditions.split_unprepared(calls, slot, roots, path)
+    }
+
+    fn prefer_legacy_root_compound(
+        self, calls: &FunctionCallSites, block: BlockOrdinal, condition: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    ) -> bool {
+        self.conditions.prefer_legacy_root_compound(calls, block, condition, roots)
+    }
+
+    fn observe_runtime_fixed_index(
+        self, origin: &'a super::reference::CheckerOrdinaryScalarLocal, extent: usize,
+    ) -> Option<()> {
+        if let Some((previous, length)) = self.discovered.borrow_mut().insert(origin.source, (origin, extent)) {
+            if !std::ptr::eq(previous, origin) || length != extent { return None; }
+        }
+        Some(())
+    }
+}
+
+/// In-run coverage for the exact immutable prepared function and access.
+/// This cannot be serialized or rejoined by span. It is not a borrow result
+/// or emission instruction. Until Build shares these prepared identities its
+/// normal checked-access edge is retained.
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+pub(super) struct RuntimeFixedIndexEvidence<'a> {
+    body: &'a FunctionCallSites,
+    accesses: HashMap<OccurrenceOrdinal, (&'a super::reference::CheckerOrdinaryScalarLocal, usize)>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+impl RuntimeFixedIndexEvidence<'_> {
+    pub(super) fn authorizes(
+        &self, calls: &FunctionCallSites, access: &super::reference::CheckerOrdinaryScalarLocal, extent: usize,
+    ) -> bool {
+        std::ptr::eq(calls, self.body) && self.accesses.get(&access.source).is_some_and(|&(seen, length)|
+            std::ptr::eq(seen, access) && length == extent)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn observe_runtime_fixed_indices<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
+) -> Option<RuntimeFixedIndexEvidence<'a>> {
+    if body.unsafe_context || !calls.checker_fixed_index_analysis_frame() || !calls.call_occurrences.is_empty()
+        || !calls.structure.checker_direct_targets.is_empty() || !calls.callable_escapes.is_empty()
+        || !calls.structure.module_storage_uses.is_empty() || calls.contextual_formal().is_some()
+        || !calls.checker_returns_unit()
+    {
+        return None;
+    }
+    let discovered = std::cell::RefCell::new(HashMap::new());
+    let observer = RuntimeFixedIndexObserver { conditions: OrderedRootConditions(body, true), discovered: &discovered };
+    // Unrestricted typed arguments, no proof entry filter, no imported
+    // summaries, erased requirements, captured state or effects.
+    let mut failed = false;
+    let (active, continuation) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut |_| failed = true, observer,
+    )?;
+    if failed || active || !matches!(continuation, IntegerRequirementContinuation::Feasible) { return None; }
+    let accesses = discovered.into_inner();
+    (!accesses.is_empty()).then_some(RuntimeFixedIndexEvidence { body: calls, accesses })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6702,7 +6798,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
             }
         }
-        let items = &structure.blocks.get(block.0)?.items;
+        let region = structure.blocks.get(block.0)?;
+        #[cfg(feature = "internal-checker")]
+        if Authored::OBSERVE_RUNTIME_FIXED_INDEX && region.unsafe_context { return None; }
+        let items = &region.items;
         #[cfg(feature = "internal-checker")]
         let guard_pending = guard.is_some();
         #[cfg(not(feature = "internal-checker"))]
@@ -7653,7 +7752,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 #[cfg(feature = "internal-checker")]
                 if structure.checker_selected_snapshots.contains(&(block, item.position))
-                    || (Authored::OBSERVE_FIXED_ARRAY && (structure.checker_snapshot_locals.contains_key(&(block, item.position))
+                    || ((Authored::OBSERVE_FIXED_ARRAY || Authored::OBSERVE_RUNTIME_FIXED_INDEX)
+                        && (structure.checker_snapshot_locals.contains_key(&(block, item.position))
                         || structure.checker_snapshot_copies.contains_key(&(block, item.position))))
                 {
                     // Legacy early-failure checks do not materialize authored state.
@@ -7743,6 +7843,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                         };
                                         path = path.bounded_snapshot_path(&shape.root, &steps, field_axis,
                                             roots.ordinary_local_work.get_or_insert(0))?;
+                                        if Authored::OBSERVE_RUNTIME_FIXED_INDEX && !path.is_unreachable() {
+                                            if let [step] = prepared.as_ref() {
+                                                if matches!(step.offset, CheckerSnapshotArrayOffset::Lexical(_)) {
+                                                    charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1)?;
+                                                    authored_return.observe_runtime_fixed_index(origin, step.length)?;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

@@ -3970,6 +3970,17 @@ mod prepared {
         pub(super) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
             (&self.project, &self.calls)
         }
+
+        #[cfg(feature = "internal-checker")]
+        #[allow(dead_code)] // The backend cannot consume this until it shares this prepared graph.
+        pub(super) fn observe_runtime_fixed_indices(
+            &self, module: usize, item: usize,
+        ) -> Option<super::super::checker_flow::RuntimeFixedIndexEvidence<'_>> {
+            let ScalarItem::Function(function) = self.project.modules.get(module)?.items.get(item)? else { return None; };
+            if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
+            let calls = self.calls.function_body(module, item, None)?;
+            super::super::checker_flow::observe_runtime_fixed_indices(calls, &function.body)
+        }
     }
 
     pub(super) fn prepare_checker_project(
@@ -14790,6 +14801,67 @@ mod tests {
         let inner_outside = text.replace("index <= 1", "index <= 2")
             .replace("copied[index][index]", "copied[0][index]");
         assert!(matches!(run(&inner_outside, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn runtime_fixed_index_evidence_requires_the_ordinary_guard_and_exact_preparation() {
+        use super::super::reference::{CheckerOrdinaryScalarLocalKind, CheckerSnapshotReadIndex, CheckerSnapshotArrayOffset};
+        let src = source("src/main.w", "runtime-fixed-index-evidence");
+        let text = r#"%%start
+            unit(u64) inspect = fn(index) {
+                i8[2] payload = [3, 9];
+                if (index < 2) {
+                    i8 checked = payload[index];
+                    i8 second = payload[0];
+                    if (checked == 3) {};
+                    if (second == 3) {};
+                };
+            };
+        %%end"#;
+        let prepare = |text: &str, target_layout| {
+            let parsed = crate::parse_source(src.clone(), text.to_owned(), &[]);
+            prepare_checker_project(
+                vec![(crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap()
+        };
+        fn access(calls: &FunctionCallSites, lexical: bool) -> &super::super::reference::CheckerOrdinaryScalarLocal {
+            calls.structure.checker_ordinary_scalar_locals.values().find(|origin| {
+                match &origin.kind {
+                    CheckerOrdinaryScalarLocalKind::SnapshotRead { index: CheckerSnapshotReadIndex::ArrayPath(steps), .. } =>
+                        lexical && matches!(steps.as_ref(), [step] if matches!(step.offset, CheckerSnapshotArrayOffset::Lexical(_))),
+                    CheckerOrdinaryScalarLocalKind::SnapshotRead { index: CheckerSnapshotReadIndex::Leaf(_), .. } => !lexical,
+                    _ => false,
+                }
+            }).unwrap()
+        }
+        let native = ScalarTargetLayout::NATIVE64;
+        let wasi = ScalarTargetLayout::WASM32;
+        for target in [native, wasi] {
+            let prepared = prepare(text, target);
+            let result = prepared.observe_runtime_fixed_indices(0, 0).unwrap();
+            let calls = prepared.parts().1.function_body(0, 0, None).unwrap();
+            let dynamic = access(calls, true);
+            assert!(result.authorizes(calls, dynamic, 2));
+            assert!(!result.authorizes(calls, dynamic, 3));
+            let similar = prepare(text, target);
+            let similar_calls = similar.parts().1.function_body(0, 0, None).unwrap();
+            assert!(!result.authorizes(similar_calls, access(similar_calls, true), 2));
+            let other_target = prepare(text, if target == native { wasi } else { native });
+            assert!(!result.authorizes(other_target.parts().1.function_body(0, 0, None).unwrap(), dynamic, 2));
+            assert!(!result.authorizes(calls, access(calls, false), 2));
+            let dead = text.replace("index < 2", "false");
+            assert!(prepare(&dead, target).observe_runtime_fixed_indices(0, 0).is_none());
+            let erased = text.replace("if (index < 2) {", r#"
+                core.narrow(index < 2, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                if (true) {
+            "#);
+            assert!(prepare(&erased, target).observe_runtime_fixed_indices(0, 0).is_none());
+            let nested_unsafe = text.replace("if (index < 2) {", "unsafe { if (index < 2) {")
+                .replace("if (second == 3) {};", "if (second == 3) {}; };");
+            assert!(prepare(&nested_unsafe, target).observe_runtime_fixed_indices(0, 0).is_none());
+        }
     }
 
     #[cfg(feature = "internal-checker")]
