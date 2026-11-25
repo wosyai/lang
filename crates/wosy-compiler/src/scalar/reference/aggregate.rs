@@ -1235,6 +1235,53 @@ impl SealedMixedOwner {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct GuardedBinaryExpression {
+    pub(super) expression: OccurrenceOrdinal,
+    pub(super) calls: Vec<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) operations: Vec<GuardedBinaryNode>,
+}
+
+#[derive(Debug)]
+pub(super) enum GuardedBinaryNode {
+    Atom(u64),
+    Call(OccurrenceOrdinal),
+    Add,
+    And,
+    OrXor,
+}
+
+impl GuardedBinaryExpression {
+    fn proves_ordinary_arithmetic(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> bool {
+        // A materialized U64 result in this graph is a checked extent of
+        // a nonzero-sized scalar array, including across sealed relays.
+        let mut bounds = Vec::<u64>::new();
+        for node in &self.operations {
+            let bound = match *node {
+                GuardedBinaryNode::Atom(bound) => bound,
+                GuardedBinaryNode::Call(site) => if allocated(site) { u64::from(u32::MAX) } else { u64::MAX },
+                GuardedBinaryNode::Add | GuardedBinaryNode::And | GuardedBinaryNode::OrXor => {
+                    let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return false; };
+                    match node {
+                        GuardedBinaryNode::Add => {
+                            let Some(sum) = left.checked_add(right) else { return false; };
+                            sum
+                        }
+                        GuardedBinaryNode::And => left.min(right),
+                        GuardedBinaryNode::OrXor => {
+                            // Most-significant possible set bit bounds both.
+                            u64::MAX.checked_shr((left | right).leading_zeros()).unwrap_or(0)
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            };
+            bounds.push(bound);
+        }
+        bounds.len() == 1
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     selected_mixed: Option<LocalReceiptChoice>,
@@ -1274,7 +1321,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
-    pub(super) fallible_call_operations: Vec<(OccurrenceOrdinal, (CfgPointId, OccurrenceOrdinal, bool))>,
+    pub(super) fallible_call_operations: Vec<GuardedBinaryExpression>,
     pub(super) fallible_call_choices: Vec<(OccurrenceOrdinal, [(CfgPointId, OccurrenceOrdinal); 2])>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
@@ -6602,6 +6649,7 @@ fn closed_aggregates<'a>(
     let mut array_descriptor_identities = BTreeMap::new();
     let mut borrowed_extent_observers = BTreeMap::new();
     let mut fallible_call_requests = Vec::new();
+    let mut fallible_operations = Vec::new();
     let mut ordinary_fallible_candidates = BTreeSet::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
@@ -6617,17 +6665,19 @@ fn closed_aggregates<'a>(
         declarations.insert((input.source, function.name_span), (module, item));
         if let Some(facts) = facts {
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
-                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None, false)));
+                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
             if is_monomorphic && arm.is_none() {
                 ordinary_fallible_candidates.extend(facts.ordinary_fallible_call_candidates.iter()
                     .map(|ordinal| (key, ordinal.0)));
             }
             for &(choice, arms) in &facts.fallible_call_choices {
                 fallible_call_requests.extend(arms.into_iter()
-                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice), false)));
+                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice))));
             }
-            for &(operation, (call, ordinal, requires_extent)) in &facts.fallible_call_operations {
-                fallible_call_requests.push((key, input.source, cfg, call, ordinal, Some(operation), requires_extent));
+            for operation in &facts.fallible_call_operations {
+                fallible_call_requests.extend(operation.calls.iter().map(|&(call, ordinal)|
+                    (key, input.source, cfg, call, ordinal, Some(operation.expression))));
+                fallible_operations.push((key, operation));
             }
 
         }
@@ -7025,15 +7075,12 @@ fn closed_aggregates<'a>(
         };
         let mut memo = HashMap::new();
         let mut complete_suffixes = BTreeSet::new();
-        for (caller, source, cfg, call, ordinal, choice, requires_extent) in fallible_call_requests {
+        let mut allocated_sites = BTreeSet::new();
+        for (caller, source, cfg, call, ordinal, choice) in fallible_call_requests {
             let target = target_body(&declarations, cfg, call)
                 .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
-            if allocation_free_integer_graph(target, &mut memo, dependencies) {
-                if requires_extent {
-                    return Err("checked fallible addition requires a proven materialized extent".into());
-                }
-                continue;
-            }
+            if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
+            allocated_sites.insert((caller, ordinal.0));
             if let Some(choice) = choice {
                 fallible_choices.insert((caller, choice.0));
             }
@@ -7047,9 +7094,6 @@ fn closed_aggregates<'a>(
                 // Reusing a proven suffix still records its new incoming use.
                 // Every downstream edge has already been recorded once.
                 let check_payload = |actual: &ScalarType| {
-                    if requires_extent && *actual != ScalarType::U64 {
-                        return Err("checked fallible addition requires an unsigned materialized extent".to_owned());
-                    }
                     if payload.as_ref().is_some_and(|expected| expected != actual) {
                         Err("sealed fallible allocation relay changes the result payload type".to_owned())
                     } else { Ok(()) }
@@ -7084,6 +7128,11 @@ fn closed_aggregates<'a>(
             // leaf (directly or through a previously completed suffix).
             // The all-use check below still applies globally to every node.
             complete_suffixes.extend(visited);
+        }
+        for (caller, proof) in fallible_operations {
+            if !proof.proves_ordinary_arithmetic(|occurrence| allocated_sites.contains(&(caller, occurrence.0))) {
+                return Err("fallible checked addition has no proved in-range result".into());
+            }
         }
     }
     ordinary.census(reservations, &module_at, &declarations);

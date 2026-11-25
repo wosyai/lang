@@ -13389,3 +13389,91 @@ if (plus(7) != 0 || plus(7) != 9 || plus(0) != 0
         }
     }
 }
+
+#[test]
+fn guarded_fallible_expression_walk_stops_before_the_next_allocating_operand() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _first = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _second = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) right = fn(left, count) {
+    u64 result =? left ^ _second(count);
+    if (&result == null) { 99 } else { result }
+};
+u64(u64, u64) both = fn(first, second) {
+    u64 result =? (_first(first) ^ 1) + _second(second);
+    if (&result == null) { 99 } else { result }
+};
+if (right(10, 9) != 99 || right(10, 9) != 3 || both(7, 9) != 99 || both(7, 9) != 99
+    || both(7, 9) != 99 || both(7, 9) != 15 || both(1, 0) != 0) { core.system_panic(); };
+%%end";
+    let unbounded = text.replace("left ^ _second(count)", "left + _second(count)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let checked = prepare_initializer_test(&unbounded, layout);
+        let checked = analyze_scalar_build(&checked);
+        for output in [emit_scalar_build_single_module_llvm(&checked), emit_scalar_build_project_llvm(&checked)] {
+            assert!(matches!(output, Err(error) if error.contains("fallible checked addition has no proved in-range result")));
+        }
+
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible expression walk");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let first = authored("_first");
+            let second = authored("_second");
+            for (name, has_first) in [("right", false), ("both", true)] {
+                let caller = authored(name);
+                assert_eq!(caller.get_type().get_return_type(), Some(context.i64_type().into()));
+                let blocks = caller.get_basic_blocks();
+                let calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let [second_call] = calls(second)[..] else { panic!("{llvm}") };
+                let [destination] = calls(alloc)[..] else { panic!("{llvm}") };
+                assert_eq!(destination.get_parent().unwrap().get_name().to_bytes(), b"fallible.destination");
+                let merge = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.binary_merge").unwrap();
+                let phi = merge.get_first_instruction().unwrap();
+                assert_eq!(phi.get_opcode(), InstructionOpcode::Phi);
+                assert_eq!(inkwell::values::PhiValue::try_from(phi).unwrap().count_incoming(), if has_first { 3 } else { 2 });
+                let branch_after = |call: InstructionValue<'_>| {
+                    let status = call.get_next_instruction().unwrap();
+                    assert_eq!(status.get_indices(), vec![0]);
+                    let branch = status.get_next_instruction().unwrap();
+                    assert_eq!(known_field_operand(branch, 0).unwrap().as_instruction_value(), Some(status));
+                    assert!(branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(merge)));
+                };
+                branch_after(second_call);
+                if has_first {
+                    let [first_call] = calls(first)[..] else { panic!("{llvm}") };
+                    branch_after(first_call);
+                    let second_block = second_call.get_parent().unwrap();
+                    assert!(first_call.get_parent().unwrap().get_terminator().unwrap().get_operands()
+                        .any(|operand| operand.and_then(|operand| operand.block()) == Some(second_block)));
+                    assert!(std::iter::successors(second_block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+                        .take_while(|instruction| *instruction != second_call)
+                        .any(|instruction| instruction.get_opcode() == InstructionOpcode::Xor));
+                } else {
+                    assert!(calls(first).is_empty());
+                }
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_EXPRESSION_WALK_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

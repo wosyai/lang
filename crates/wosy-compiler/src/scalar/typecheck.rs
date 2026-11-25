@@ -6646,26 +6646,27 @@ fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char) || is_integer_type(ty) || is_float_type(ty)
 }
 
-pub(super) fn guarded_binary_rhs<'a>(
-    ty: &ScalarType, expression: &'a ScalarExpression,
-) -> Option<(&'a ScalarExpression, &'a ScalarExpression)> {
-    if !matches!(ty, ScalarType::U64 | ScalarType::I32) { return None; }
-    let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
-    // This corridor's abstract extent proof supports addition only when
-    // every successfully materialized default backing bounds its count and
-    // therefore proves the checked addition without a new runtime guard.
-    let safe_rhs = match operator {
-        BinaryOperator::Add if *ty == ScalarType::U64 => matches!(right.as_ref(),
-            ScalarExpression::Integer { value, .. }
-                if u64::try_from(value.clone()).is_ok_and(|delta| delta <= u64::MAX - u32::MAX as u64)),
-        BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor =>
-            matches!(right.as_ref(), ScalarExpression::Integer { .. } | ScalarExpression::Name { .. }),
-        _ => false,
-    };
-    if !safe_rhs || !matches!(left.as_ref(), ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty()) {
-        return None;
+fn guarded_binary_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
+    if !matches!(ty, ScalarType::U64 | ScalarType::I32)
+        || !matches!(expression, ScalarExpression::Binary { .. })
+    { return false; }
+    let mut stack = vec![expression];
+    let mut calls = false;
+    while let Some(node) = stack.pop() {
+        match node {
+            ScalarExpression::Integer { .. } | ScalarExpression::Name { .. } => {}
+            ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty() => calls = true,
+            ScalarExpression::Binary { operator, left, right, .. }
+                if matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor)
+                    || *ty == ScalarType::U64 && *operator == BinaryOperator::Add =>
+            {
+                stack.push(right);
+                stack.push(left);
+            }
+            _ => return false,
+        }
     }
-    Some((left.as_ref(), right.as_ref()))
+    calls
 }
 
 fn pending_fallible_operator(
@@ -6687,7 +6688,7 @@ fn pending_fallible_operator(
                     !branch.unsafe_context && matches!(branch.items.as_slice(),
                         [ScalarBlockItem::Expression(ScalarExpression::Call { type_arguments, .. })]
                             if type_arguments.is_empty())) => None,
-        (ty, expression @ ScalarExpression::Binary { .. }) if guarded_binary_rhs(ty, expression).is_some() => None,
+        (ty, expression @ ScalarExpression::Binary { .. }) if guarded_binary_rhs(ty, expression) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
                 && fields.iter().all(|field| match &field.value {

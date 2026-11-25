@@ -3859,30 +3859,63 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
     fn guarded_call_binary(
         &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
-    ) -> Option<(CfgPointId, OccurrenceOrdinal, bool)> {
-        let (left, right) = super::typecheck::guarded_binary_rhs(payload, value)?;
-        let ScalarExpression::Call { arguments, .. } = left else { return None; };
-        let sites = self.call_sites;
-        let child = |edge| match sites.structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
-            Some(OccurrenceNode::Expression(child)) => Some(*child),
-            _ => None,
+    ) -> Option<aggregate::GuardedBinaryExpression> {
+        if !matches!(payload, ScalarType::U64 | ScalarType::I32) { return None; }
+        let mut proof = aggregate::GuardedBinaryExpression {
+            expression: ordinal, calls: Vec::new(), operations: Vec::new(),
         };
-        let call = child(OccurrenceEdge::BinaryLeft)?;
-        let operand = child(OccurrenceEdge::BinaryRight)?;
-        let signature = sites.checked_call_signatures.get(&call)?;
-        let point = *self.cfg.primary_call_points.get(&call)?;
-        if !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
-                || aggregate::pure_widened_element(argument))
-            || sites.declared_unsafe_calls.contains(&call.0)
-            || sites.structure.checked_types.expressions.get(&operand) != Some(payload)
-            || matches!(right, ScalarExpression::Name { .. })
-                && !matches!(sites.prepared_plain_name(operand), Some(PlainNameIdentity::Lexical(_)))
-            || !signature.parameters.iter().all(aggregate::ordinary_value)
-            || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
-            || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
-                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
-        { return None; }
-        Some((point, call, matches!(value, ScalarExpression::Binary { operator: BinaryOperator::Add, .. })))
+        use aggregate::GuardedBinaryNode as Node;
+        let sites = self.call_sites;
+        let mut stack = vec![(value, ordinal, false)];
+        while let Some((value, occurrence, children_proved)) = stack.pop() {
+            if sites.structure.checked_types.expressions.get(&occurrence) != Some(payload) {
+                return None;
+            }
+            match value {
+                ScalarExpression::Integer { value, .. } =>
+                    proof.operations.push(Node::Atom(u64::try_from(value.clone()).unwrap_or(u64::MAX))),
+                ScalarExpression::Name { .. } => {
+                    if !matches!(sites.prepared_plain_name(occurrence), Some(PlainNameIdentity::Lexical(_))) {
+                        return None;
+                    }
+                    proof.operations.push(Node::Atom(u64::MAX));
+                }
+                ScalarExpression::Call { arguments, type_arguments, .. } => {
+                    let signature = sites.checked_call_signatures.get(&occurrence)?;
+                    let point = *self.cfg.primary_call_points.get(&occurrence)?;
+                    if !type_arguments.is_empty() || !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
+                            || aggregate::pure_widened_element(argument))
+                        || sites.declared_unsafe_calls.contains(&occurrence.0)
+                        || !signature.parameters.iter().all(aggregate::ordinary_value)
+                        || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
+                        || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
+                            target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
+                    { return None; }
+                    proof.calls.push((point, occurrence));
+                    proof.operations.push(Node::Call(occurrence));
+                }
+                ScalarExpression::Binary { operator, left, right, .. } => {
+                    if children_proved {
+                        proof.operations.push(match operator {
+                            BinaryOperator::Add if *payload == ScalarType::U64 => Node::Add,
+                            BinaryOperator::BitAnd => Node::And,
+                            BinaryOperator::BitOr | BinaryOperator::BitXor => Node::OrXor,
+                            _ => return None,
+                        });
+                    } else {
+                        let child = |edge| match sites.structure.edges.get(&(OccurrenceParent::Expression(occurrence), edge)) {
+                            Some(OccurrenceNode::Expression(child)) => Some(*child),
+                            _ => None,
+                        };
+                        stack.push((value, occurrence, true));
+                        stack.push((right, child(OccurrenceEdge::BinaryRight)?, false));
+                        stack.push((left, child(OccurrenceEdge::BinaryLeft)?, false));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        (!proof.calls.is_empty()).then_some(proof)
     }
 
     fn widened_join_inputs(
@@ -5046,7 +5079,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return Err(self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
                         };
-                        self.aggregate_result.fallible_call_operations.push((primary_ordinal, operation));
+                        self.aggregate_result.fallible_call_operations.push(operation);
                     }
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression
