@@ -2945,7 +2945,7 @@ pub(crate) struct ClosedWidenedRebind {
 pub(crate) struct ClosedBody {
     pub(crate) fallible_allocation_leaf: bool,
     pub(crate) fallible_allocation_relay: bool,
-    pub(crate) fallible_relay_allocation: Option<ByteSpan>,
+    pub(crate) fallible_relay_allocations: Vec<ByteSpan>,
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
@@ -6799,7 +6799,7 @@ fn closed_aggregates<'a>(
             }
             has_output.then_some(callees)
         };
-        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Option<ByteSpan>)> {
+        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Vec<ByteSpan>)> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
             let input = module_at(key.0)?;
             let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
@@ -6807,27 +6807,20 @@ fn closed_aggregates<'a>(
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                 || function.body.unsafe_context
             { return None; }
-            let allocation = match function.body.items.as_slice() {
-                [ScalarBlockItem::Expression(ScalarExpression::Call { .. })] => None,
-                [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(ScalarExpression::Call { .. }),
-                    ScalarBlockItem::Expression(ScalarExpression::Call { .. })] => Some(allocation),
-                _ => return None,
-            };
+            let (last, prefix) = function.body.items.split_last()?;
+            if !matches!(last, ScalarBlockItem::Expression(ScalarExpression::Call { .. }))
+                || !matches!(prefix.len(), 0 | 2 | 4)
+            { return None; }
             let sites = input.calls.function_body(key.1, None)?;
             let [formal] = sites.boundary.parameters.as_slice() else { return None; };
             let root = sites.structure.blocks.get(sites.structure.root.0)?;
             let mut outputs = root.final_outputs();
             let output = outputs.next()?;
             if output.output != 0 || outputs.next().is_some() { return None; }
-            let (occurrence, observer) = match (allocation, sites.call_occurrences.as_slice()) {
-                (None, [tail]) if tail.ordinal == output.expression => (tail, None),
-                (Some(_), [observer, tail]) if tail.ordinal == output.expression
-                    && matches!(&root.items.get(1)?.kind, BlockItemKind::Evaluation { expression }
-                        if *expression == observer.ordinal)
-                    && sites.sites.get(observer.site)?.target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen) =>
-                    (tail, Some(observer)),
-                _ => return None,
-            };
+            let (occurrence, observers) = sites.call_occurrences.split_last()?;
+            if occurrence.ordinal != output.expression || observers.len() != prefix.len() / 2 {
+                return None;
+            }
             let signature = sites.checked_call_signatures.get(&occurrence.ordinal)?;
             if formal.ty != ScalarType::U64
                 || !matches!(sites.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
@@ -6838,29 +6831,37 @@ fn closed_aggregates<'a>(
             let (_, cfg) = result_at(key, function)?;
             if !cfg.guarded_scalar_allocations().is_empty() { return None; }
             let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
-            let owner = match (allocation, cfg.allocations.len(), cfg.allocations.first()) {
-                (None, 0, None) => None,
-                (Some(allocation), 1, Some(owner)) => {
-                    let [receiver] = allocation.receivers.as_slice() else { return None; };
-                    if !allocation.is_allocation || allocation.fallible_assignment.is_some()
-                        || !matches!(&allocation.value, ScalarExpression::Integer { value, span }
-                            if *value == 0.into() && *span == allocation.span)
-                        || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
-                        || owner.declaration_span != receiver.name_span
-                        || cfg.observed_runtime_allocations.as_deref()? != [(receiver.name_span.start, receiver.name_span.end)]
-                    { return None; }
-                    let BlockItemKind::Binding(region) = &root.items.first()?.kind else { return None; };
-                    let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
-                    let [length] = lengths.as_slice() else { return None; };
-                    if length.position != 0
-                        || sites.structure.checked_types.expressions.get(&length.expression) != Some(&ScalarType::U64)
-                        || !matches!(sites.prepared_plain_name(length.expression)?,
-                            PlainNameIdentity::Lexical(binding) if binding == &formal)
-                    { return None; }
-                    Some(owner)
-                }
-                _ => return None,
-            };
+            if cfg.allocations.len() != observers.len() { return None; }
+            let mut owners = Vec::new();
+            let mut allocations = Vec::new();
+            for (index, (items, observer)) in prefix.chunks_exact(2).zip(observers).enumerate() {
+                let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(ScalarExpression::Call { .. })] = items else { return None; };
+                let [receiver] = allocation.receivers.as_slice() else { return None; };
+                if !allocation.is_allocation || allocation.fallible_assignment.is_some()
+                    || !matches!(&allocation.value, ScalarExpression::Integer { value, span }
+                        if *value == 0.into() && *span == allocation.span)
+                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+                    || !matches!(&root.items.get(index * 2 + 1)?.kind, BlockItemKind::Evaluation { expression }
+                        if *expression == observer.ordinal)
+                    || sites.sites.get(observer.site)?.target != ResolvedCallTarget::Core(CoreOperationId::ArrayLen)
+                { return None; }
+                let owner = cfg.allocations.iter().find(|owner| owner.declaration_span == receiver.name_span)?;
+                if owners.contains(&owner) { return None; }
+                let BlockItemKind::Binding(region) = &root.items.get(index * 2)?.kind else { return None; };
+                let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
+                let [length] = lengths.as_slice() else { return None; };
+                if length.position != 0
+                    || sites.structure.checked_types.expressions.get(&length.expression) != Some(&ScalarType::U64)
+                    || !matches!(sites.prepared_plain_name(length.expression)?,
+                        PlainNameIdentity::Lexical(binding) if binding == &formal)
+                { return None; }
+                owners.push(owner);
+                allocations.push(allocation);
+            }
+            let spans = owners.iter().map(|owner| owner.declaration_span).collect::<Vec<_>>();
+            if !spans.is_empty() && !cfg.observed_runtime_allocations.as_deref().is_some_and(|observed|
+                observed.iter().copied().eq(spans.iter().map(|span| (span.start, span.end))))
+            { return None; }
             let points = &cfg.initial_points;
             let point = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call {
                 target: ResolvedCallTarget::ModuleCallable { .. }, ..
@@ -6872,52 +6873,49 @@ fn closed_aggregates<'a>(
             let ([read], [output]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
             let read = points.get(read.0)?;
             let output = points.get(output.0)?;
-            let observer_points = match (owner, observer) {
-                (None, None) => None,
-                (Some(owner), Some(_)) => {
-                    let mut observers = points.iter().filter(|point| matches!(point.kind, CfgPointKind::Call {
-                        target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), ..
-                    }));
-                    let observed = observers.next()?;
-                    if observers.next().is_some() || observed.successors.as_slice() != [read.id] { return None; }
-                    let CfgPointKind::Call { output: 0, argument_points, .. } = &observed.kind else { return None; };
-                    let [borrow] = argument_points.as_slice() else { return None; };
-                    let borrow = points.get(borrow.0)?;
-                    if borrow.successors.as_slice() != [observed.id]
-                        || !matches!(&borrow.kind, CfgPointKind::Borrow { place, loan }
-                            if &place.binding == owner && place.projections.is_empty()
-                                && loan.mode == ScalarReferenceMutability::Shared)
-                    { return None; }
-                    Some((borrow.id, observed.id))
+            let mut permitted = BTreeSet::new();
+            // Every earlier observing loan is confined to its own adjacent call.
+            // Each prefix segment must run on the same fallthrough path.
+            let mut next = read.id;
+            for (&owner, allocation) in owners.iter().zip(allocations).rev() {
+                let observed = points.iter().find(|candidate| candidate.successors.as_slice() == [next]
+                    && matches!(candidate.kind, CfgPointKind::Call {
+                        target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), output: 0, ..
+                    }))?;
+                let CfgPointKind::Call { argument_points, .. } = &observed.kind else { return None; };
+                let [borrow] = argument_points.as_slice() else { return None; };
+                let borrow = points.get(borrow.0)?;
+                if borrow.successors.as_slice() != [observed.id]
+                    || !matches!(&borrow.kind, CfgPointKind::Borrow { place, loan }
+                        if &place.binding == owner && place.projections.is_empty()
+                            && loan.mode == ScalarReferenceMutability::Shared)
+                { return None; }
+                let bind = points.iter().find(|candidate| candidate.successors.as_slice() == [borrow.id]
+                    && matches!(&candidate.kind, CfgPointKind::Bind { binding } if binding == owner))?;
+                let zero = points.iter().find(|candidate| candidate.successors.as_slice() == [bind.id]
+                    && matches!(&candidate.kind, CfgPointKind::Evaluate(value) if value == &allocation.value))?;
+                permitted.extend([zero.id, bind.id, borrow.id, observed.id]);
+                next = zero.id;
+                // Some prepared routes record the allocation's exact length
+                // read as a separate point immediately before its placeholder.
+                if let Some(length) = points.iter().find(|candidate| candidate.successors.as_slice() == [next]
+                    && matches!(&candidate.kind, CfgPointKind::Read { binding } if binding == &formal))
+                {
+                    permitted.insert(length.id);
+                    next = length.id;
                 }
-                _ => return None,
-            };
-            let mut saw_owner = false;
-            let mut placeholder = false;
+            }
             if !matches!(&read.kind, CfgPointKind::Read { binding } if binding == &formal)
                 || read.successors.as_slice() != [point.id]
                 || !matches!(output.kind, CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. } if value_point == point.id)
                 || !points.iter().all(|candidate| match &candidate.kind {
                     CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
                     CfgPointKind::Bind { binding } if binding == &formal => true,
-                    CfgPointKind::Bind { binding } if owner == Some(binding) && !saw_owner
-                        && observer_points.is_some_and(|(borrow, _)| candidate.successors.as_slice() == [borrow]) => {
-                        saw_owner = true;
-                        true
-                    }
-                    CfgPointKind::Read { binding } if binding == &formal =>
-                        candidate.id == read.id || owner.is_some() && candidate.id.0 < read.id.0,
-                    CfgPointKind::Evaluate(value) if !placeholder && candidate.id.0 < read.id.0
-                        && allocation.is_some_and(|allocation| value == &allocation.value) => {
-                        placeholder = true;
-                        true
-                    }
-                    _ => [point.id, output.id].contains(&candidate.id) || observer_points.is_some_and(|(borrow, observer)| [borrow, observer].contains(&candidate.id)),
+                    _ => [read.id, point.id, output.id].contains(&candidate.id) || permitted.contains(&candidate.id),
                 })
-                || owner.is_some() != (saw_owner && placeholder)
             { return None; }
             Some((target_body(&declarations, cfg, point.id)?, occurrence.ordinal,
-                owner.map(|owner| owner.declaration_span)))
+                spans))
         };
         let mut memo = HashMap::new();
         let mut complete_suffixes = BTreeSet::new();
@@ -7326,7 +7324,7 @@ fn closed_aggregates<'a>(
         for (&target, sites) in &fallible_allocating_targets {
             let body = result.bodies.entry(target).or_default();
             body.fallible_allocation_relay = fallible_allocation_relays.contains_key(&target);
-            body.fallible_relay_allocation = fallible_allocation_relays.get(&target).copied().flatten();
+            body.fallible_relay_allocations = fallible_allocation_relays.get(&target).cloned().unwrap_or_default();
             body.fallible_allocation_leaf = !body.fallible_allocation_relay;
             for &(caller, ordinal) in sites {
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);

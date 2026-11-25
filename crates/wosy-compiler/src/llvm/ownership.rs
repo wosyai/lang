@@ -1371,7 +1371,7 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
 ) -> Result<PointerValue<'ctx>, String> {
-    emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, false)
+    emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, None)
 }
 
 pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
@@ -1380,7 +1380,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     element: &ScalarType,
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
-    relay_allocation: bool,
+    relay_prefix: Option<&[PointerValue<'ctx>]>,
 ) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
@@ -1389,7 +1389,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
         .get_insert_block()
         .and_then(|block| block.get_parent())
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
-    let recover = relay_allocation || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
+    let recover = relay_prefix.is_some() || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
     let integer = context.i64_type();
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
@@ -1433,6 +1433,11 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     )?;
     if recover {
         state.builder.position_at_end(allocation_failure);
+        for pointer in relay_prefix.unwrap_or_default().iter().rev() {
+            consume_runtime_array_release(context, state, RuntimeArrayRelease {
+                pointer: (*pointer).into(), live: None,
+            })?;
+        }
         let absent = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
         state.builder.build_return(Some(&absent)).map_err(builder_error)?;
     }
