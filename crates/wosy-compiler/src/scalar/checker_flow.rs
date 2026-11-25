@@ -3431,20 +3431,12 @@ pub(super) fn check_symbolic_contextual_unit(
         // This profile retains only equality copies and independent cells;
         // refusing unmodeled relations avoids comparing loose marginals.
         if row.len() != width || row.affine.is_some() || row.entry.is_some() { return None; }
-        let Some(amount) = amount else {
-            // Nothing is projected independently: all three concrete
-            // coordinates come from exactly this solver-produced row.
-            let entry = row.get(1)?.singleton_value()?;
-            let explicit = row.get(3)?.singleton_value()?;
-            let exit = row.first()?.singleton_value()?;
-            let expected = if add { entry + explicit } else { entry - explicit };
-            if expected < type_min || expected > type_max { return None; }
-            if first_refutation.is_none() && &expected != exit {
-                first_refutation = Some(ContextualUnitRefutation {
-                    entry: entry.clone(), exit: exit.clone(), explicit: Some(explicit.clone()),
-                });
-            }
-            continue;
+        // A typed exact amount on this row is the same checked
+        // translation as a written literal. Keep the original contextual
+        // entry and exit relation rather than projecting either axis.
+        let amount = match amount {
+            Some(literal) => literal,
+            None => row.get(3)?.singleton_value()?,
         };
         let expected_at = |entry: &BigInt| if add { entry + amount } else { entry - amount };
         let (old_min, old_max) = row.get(1)?.extremes()?;
@@ -7716,8 +7708,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     for row in &mut path.0 {
                                         if row.affine.is_some() || row.entry.is_some() { return None; }
                                         charge_call_work(work, row.len().checked_add(row.equal_axes().len())?.checked_add(5)?)?;
-                                        let entry = row.get(axis)?.singleton_value()?;
                                         let amount = row.get(argument)?.singleton_value()?;
+                                        if amount.bits() == 0 {
+                                            // The prepared ordinary Add/Subtract by
+                                            // zero leaves the exact place unchanged.
+                                            continue;
+                                        }
+                                        let entry = row.get(axis)?.singleton_value()?;
                                         let exit = operation.apply(Cow::Borrowed(entry), Cow::Borrowed(amount), &min, &max)?;
                                         if exit < min || exit > max { return None; }
                                         row.overwrite(axis, Rc::new(IntegerSet::singleton(&exit)), false);

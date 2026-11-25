@@ -24807,6 +24807,53 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_entry_delta_proves_restored_symbolic_lexical_credit() {
+        let app = source("src/main.w", "dormant-entry-delta-restored-context");
+        let program = r#"%%start
+            unit() type_provider = fn {
+                u8 core.context.credit = 7;
+                if (core.context.credit == 7) {};
+            };
+            unit(u8) preserve = fn(cost) {
+                core.narrow(cost == 0, { .stdout = ""; .stderr = ""; .code = 153; .files = []; });
+                if (true) {
+                    u8 core.context.credit = 77;
+                    core.context.credit = core.context.credit + 1;
+                    core.require(core.context.credit == 78, { .stdout = ""; .stderr = ""; .code = 154; .files = []; });
+                };
+                core.context.credit = core.context.credit - cost;
+            };
+            proof contract for preserve(amount) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - amount) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let check = |text: &str, scope| {
+                let (_, proof) = crate::parse_configured_root_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(proof, Vec::new())],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let valid = check(program, package).unwrap();
+            assert!(valid.active && valid.directives.is_empty() && valid.contextual_diagnostic.is_none());
+            let wrote_outer = program.replace("core.context.credit = core.context.credit - cost;",
+                "if (cost == 0) { core.context.credit = 8; };");
+            let failed = check(&wrote_outer, package).unwrap();
+            let witness = failed.contextual_diagnostic.unwrap();
+            assert!(witness.symbolic && failed.directives.is_empty());
+            assert_eq!((witness.entry, witness.exit), (0.into(), 8.into()));
+            assert_eq!(witness.explicit_entry, Some(("amount".into(), 0.into())));
+            assert_eq!(witness.goal.source, app);
+            assert_eq!(&wrote_outer[witness.goal.range.start as usize..witness.goal.range.end as usize],
+                "core.context.credit == core.old(core.context.credit) - amount");
+            let main = check(&wrote_outer, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.directives.is_empty() && main.contextual_diagnostic.is_none());
+            let imprecise = program.replace("core.narrow(cost == 0", "core.narrow(cost <= 1");
+            assert!(matches!(check(&imprecise, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn reached_contextual_proof_uses_each_exact_explicit_integer_and_resumes_caller() {
         let app = source("src/main.w", "reached-context-explicit-root");
         let lib = source("src/credit.w", "reached-context-explicit-provider");
