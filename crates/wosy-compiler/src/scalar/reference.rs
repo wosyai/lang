@@ -2538,16 +2538,32 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ..
             } => {
                 let mut checked_comparison = None;
+                let mut guarded_short_circuit = None;
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
                     let region = &calls.short_circuits[&ordinal];
-                    self.expression(left, scope, region.left)?;
-                    // Operand evaluation is linear in this reference CFG, but the
-                    // right operand is conditional in LLVM. Do not use its path
-                    // as an exact ownership merge or dominating producer corridor.
-                    if let Some(left_end) = self.cursor {
+                    if let Some((owner, present_on_true)) = self.guarded_fallible_binding(left, region.left)? {
+                        self.local_borrow = None;
+                        let left_end = self.point(CfgPointKind::Evaluate(left.as_ref().clone()),
+                            expression_span(left), scope, BTreeSet::new());
                         self.aggregate_result.conditional_input_barriers.insert(left_end);
+                        let branch = self.point(CfgPointKind::Branch { condition: left.as_ref().clone() },
+                            expression_span(left), scope, BTreeSet::new());
+                        let incoming_checked = self.checked.clone();
+                        self.expression(right, scope, region.right)?;
+                        self.checked.extend(incoming_checked);
+                        // Both paths meet at Boolean evaluation; provisional origins
+                        // from the evaluated operand cannot stand for the bypass.
+                        self.origins.clear();
+                        guarded_short_circuit = Some((branch, region.left, owner, present_on_true));
+                    } else {
+                        self.expression(left, scope, region.left)?;
+                        // Keep other historical scalar short circuits out of the
+                        // exact aggregate branch/producer proof.
+                        if let Some(left_end) = self.cursor {
+                            self.aggregate_result.conditional_input_barriers.insert(left_end);
+                        }
+                        self.expression(right, scope, region.right)?;
                     }
-                    self.expression(right, scope, region.right)?;
                 } else {
                     let left_ordinal = self.expression_ordinal(parent, OccurrenceEdge::BinaryLeft);
                     let right_ordinal = self.expression_ordinal(parent, OccurrenceEdge::BinaryRight);
@@ -2596,6 +2612,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope,
                     BTreeSet::new(),
                 );
+                if let Some((branch, condition, binding, present_on_true)) = guarded_short_circuit {
+                    let edges = &mut self.cfg.points[branch.0].successors;
+                    let [rhs] = edges.as_slice() else {
+                        return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                    };
+                    let entries = if *operator == BinaryOperator::And { [*rhs, point] } else { [point, *rhs] };
+                    edges.clear();
+                    edges.extend(entries);
+                    self.proof_points.record_guarded_allocation(branch, condition, binding, entries, present_on_true);
+                }
                 if let Some(comparison) = checked_comparison {
                     self.aggregate_facts.passive_checked_comparisons.insert(point, comparison);
                 }

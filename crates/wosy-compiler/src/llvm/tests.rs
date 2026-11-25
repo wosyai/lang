@@ -16107,3 +16107,56 @@ grouped(7);
         }
     }
 }
+
+#[test]
+fn guarded_fallible_presence_refines_only_the_evaluated_short_circuit_edge() {
+    let text = "%%start
+bool(u64) _probe = fn(value) {
+    u8[value] marker;
+    core.array_len(&marker) == 7
+};
+bool(u64) observed_and = fn(index) {
+    u64[] held =? [7, 9];
+    &held != null && _probe(held[index])
+};
+bool(u64) observed_or = fn(index) {
+    u64[] held =? [7, 9];
+    &held == null || _probe(held[index])
+};
+if (observed_and(0) || !observed_and(0) || observed_and(1)
+    || !observed_or(0) || !observed_or(0) || observed_or(1)) {
+    core.system_panic();
+};
+%%end";
+    let absent_rhs = text.replace("&held != null &&", "&held == null &&");
+    let after_merge = text.replace("    &held != null && _probe(held[index])",
+        "    bool predicate = &held != null && _probe(held[index]);
+    _probe(held[index]) || predicate");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for invalid in [&absent_rhs, &after_merge] {
+            let prepared = prepare_initializer_test(invalid, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().iter().any(|d|
+                d.code == "B0003" && d.message.contains("fallible allocation is not known to be available")),
+                "{:?}", checked.diagnostics());
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, artifact) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&checked)),
+            ("project", emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = artifact.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "authored guarded short-circuit");
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_PRESENCE_SHORT_CIRCUIT_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
