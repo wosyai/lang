@@ -420,6 +420,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
+    short_circuit_presence: Option<(OccurrenceOrdinal, ReferenceBindingId, bool)>,
     has_projected_child: bool,
     deferred_reborrow_roots: Vec<(ReferenceBindingId, super::control::DeferredReborrowRoot, CfgPointId, ReferenceOriginId)>,
     deferred_local_reborrow: bool,
@@ -575,6 +576,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             independent_checked_query: aggregate::checked_scalar_output(&call_sites.boundary.root_outputs),
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
+            short_circuit_presence: None,
             proof_points: CallablePointFacts {
                 has_grouped_assignment_capture: Some(false),
                 scope_exit_bindings: matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
@@ -1291,7 +1293,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         region: &ConditionalRegion,
         projected_origins: bool,
         observe_fallible: bool,
-    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>, CfgPointId, Option<(ReferenceBindingId, bool)>), ReferenceAnalysisError> {
+    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>, CfgPointId, Option<(ReferenceBindingId, bool, bool)>), ReferenceAnalysisError> {
         let (condition_ordinal, then_block, else_block) = match region {
             ConditionalRegion::Value {
                 condition,
@@ -1316,6 +1318,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } else {
             self.expression(condition, scope, condition_ordinal)?;
         }
+        let guarded = guarded.map(|(owner, on_true)| (owner, on_true, true)).or_else(|| {
+            if !observe_fallible { return None; }
+            self.short_circuit_presence.take().filter(|(root, ..)| *root == condition_ordinal)
+                .map(|(_, owner, on_true)| (owner, on_true, false))
+        });
         let condition_point = self.cursor;
         let branch = self.point(
             CfgPointKind::Branch {
@@ -1472,12 +1479,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
         self.connect_reference_conditional(&edges, region);
         self.record_conditional_inputs(&edges, expression);
-        if let Some((binding, present_on_then)) = guarded {
+        if let Some((binding, present_on_then, direct)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
                 let condition = match region {
                     ConditionalRegion::Value { condition, .. } | ConditionalRegion::Unit { condition, .. } => *condition,
                 };
-                self.proof_points.record_guarded_allocation(branch, condition, binding, [*then, *otherwise], present_on_then);
+                if direct {
+                    self.proof_points.record_guarded_allocation(branch, condition, binding, [*then, *otherwise], present_on_then);
+                } else {
+                    self.proof_points.record_implied_allocation_presence(branch, condition, binding,
+                        if present_on_then { *then } else { *otherwise });
+                }
             }
         }
         if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
@@ -2620,6 +2632,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let entries = if *operator == BinaryOperator::And { [*rhs, point] } else { [point, *rhs] };
                     edges.clear();
                     edges.extend(entries);
+                    let rhs_on_true = *operator == BinaryOperator::And;
+                    if present_on_true == rhs_on_true {
+                        // && can be true only after true-left; || can be false
+                        // only after false-left. Neither converse is true.
+                        self.short_circuit_presence = Some((ordinal, binding.clone(), rhs_on_true));
+                    }
                     self.proof_points.record_guarded_allocation(branch, condition, binding, entries, present_on_true);
                 }
                 if let Some(comparison) = checked_comparison {
@@ -6948,7 +6966,7 @@ impl ReferenceEdgeState {
         successor: CfgPointId,
         enrolled_move_owner: bool,
     ) {
-        if successor == edge.absent {
+        if Some(successor) == edge.absent {
             self.uninitialized.insert(edge.binding.clone());
         } else if successor == edge.present
             && !self.released.contains(&edge.binding)
@@ -7086,8 +7104,8 @@ fn guarded_allocation_facts_seal_distinct_polarities_in_branch_order() {
     let [(first, first_edges), (second, second_edges)] = facts.guarded_allocation_edges.iter().collect::<Vec<_>>()[..] else {
         panic!("expected two distinct branch facts");
     };
-    assert_eq!((*first, first_edges.present, first_edges.absent), (outer, CfgPointId(2), CfgPointId(8)));
-    assert_eq!((*second, second_edges.present, second_edges.absent), (inner, CfgPointId(6), CfgPointId(4)));
+    assert_eq!((*first, first_edges.present, first_edges.absent), (outer, CfgPointId(2), Some(CfgPointId(8))));
+    assert_eq!((*second, second_edges.present, second_edges.absent), (inner, CfgPointId(6), Some(CfgPointId(4))));
     assert_eq!((&first_edges.binding, &second_edges.binding), (&binding, &binding));
 }
 
@@ -7104,12 +7122,12 @@ fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
     let unrelated = binding(20);
     let edge = super::control::GuardedAllocationEdge {
         condition: OccurrenceOrdinal(0),
-        binding: target.clone(), present: CfgPointId(3), absent: CfgPointId(2),
+        binding: target.clone(), present: CfgPointId(3), absent: Some(CfgPointId(2)),
     };
     let mut entry = ReferenceEdgeState::default();
     entry.uninitialized.insert(unrelated.clone());
     let mut failure = entry.clone();
-    failure.refine_allocation_edge(&edge, edge.absent, false);
+    failure.refine_allocation_edge(&edge, CfgPointId(2), false);
     assert_eq!(failure.uninitialized, HashSet::from([target.clone(), unrelated.clone()]));
     let mut other = failure.clone();
     other.refine_allocation_edge(&edge, CfgPointId(4), false);
@@ -10598,10 +10616,9 @@ fn transfer_reference_facts(
         let guarded_allocation_edge = cfg.guarded_allocation_edges
             .and_then(|edges| edges.get(&id))
             .filter(|edge| matches!(original_points[id.0].kind, CfgPointKind::Branch { .. })
-                    && edge.present != edge.absent
-                    && matches!(original_points[id.0].successors.as_slice(), [first, second]
-                        if (*first, *second) == (edge.present, edge.absent)
-                            || (*first, *second) == (edge.absent, edge.present)));
+                    && matches!(original_points[id.0].successors.as_slice(), [first, second] if first != second
+                        && ((*first == edge.present && edge.absent.is_none_or(|absent| *second == absent))
+                            || (*second == edge.present && edge.absent.is_none_or(|absent| *first == absent)))));
         let enrolled_move_owner = guarded_allocation_edge.is_some_and(|edge| guarded_move_owners.contains(&edge.binding));
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
@@ -12413,12 +12430,11 @@ fn transfer_reference_facts(
             {
                 flow.expire_before(cutoff, last_use);
             }
-            if let Some(edge) = guarded_allocation_edge.filter(|edge| state.released.contains(&edge.binding)) {
+            if let Some(edge) = guarded_allocation_edge.filter(|edge| edge.absent.is_some() && state.released.contains(&edge.binding)) {
                 errors.push(ReferenceAnalysisError::MissingOrigin { source_span: point.source_span.clone(),
                     binding_id: edge.binding.clone(), reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation });
             }
-            if enrolled_move_owner {
-                let edge = guarded_allocation_edge.expect("enrolled guarded owner");
+            if let Some(edge) = guarded_allocation_edge.filter(|edge| enrolled_move_owner && edge.absent.is_some()) {
                 if let Some(origin) = state.guarded_whole_moves.get(&edge.binding) {
                     errors.push(ReferenceAnalysisError::ConflictingPlace {
                         source_span: point.source_span.clone(), origins: vec![origin.clone()],
@@ -17427,11 +17443,14 @@ fn seal_guarded_scalar_allocations(
     let mut owners: Vec<(&ReferenceBindingId, Vec<GuardedScalarBranch>, Vec<usize>)> = Vec::new();
     let mut owner_indices = HashMap::with_capacity(bindings.len());
     for (branch, edge) in &points.guarded_allocation_edges {
+        // Only an authored null comparison is a lowering receipt. The
+        // containing conditional's implication is for reference flow only.
+        let Some(absent) = edge.absent else { continue; };
         let point = cfg.points.get(branch.0)?;
         let [then, otherwise] = point.successors.as_slice() else { return None };
         if !matches!(point.kind, CfgPointKind::Branch { .. })
-            || !((*then == edge.present && *otherwise == edge.absent)
-                || (*then == edge.absent && *otherwise == edge.present))
+            || !((*then == edge.present && *otherwise == absent)
+                || (*then == absent && *otherwise == edge.present))
         {
             return None;
         }

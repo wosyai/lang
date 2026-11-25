@@ -16160,3 +16160,69 @@ if (observed_and(0) || !observed_and(0) || observed_and(1)
         }
     }
 }
+
+#[test]
+fn guarded_fallible_short_circuit_has_one_sided_outer_branch_presence() {
+    let text = "%%start
+bool(u64) _probe = fn(value) {
+    u8[value] marker;
+    core.array_len(&marker) == 7
+};
+u64(u64) observed_and = fn(index) {
+    u64[] held =? [7, 9];
+    if (&held != null && _probe(held[index])) { held[0] } else { 99 }
+};
+u64(u64) observed_or = fn(index) {
+    u64[] held =? [7, 9];
+    if (&held == null || _probe(held[index])) { 99 } else { held[0] }
+};
+if (observed_and(0) != 99 || observed_and(0) != 7 || observed_and(1) != 99
+    || observed_or(0) != 99 || observed_or(0) != 99 || observed_or(1) != 7) {
+    core.system_panic();
+};
+%%end";
+    let wrong_and = text.replacen("{ held[0] } else { 99 }", "{ held[0] } else { held[1] }", 1);
+    let wrong_or = text.replacen("{ 99 } else { held[0] }", "{ held[1] } else { held[0] }", 1);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for invalid in [&wrong_and, &wrong_or] {
+            let prepared = prepare_initializer_test(invalid, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().iter().any(|d|
+                d.code == "B0003" && d.message.contains("fallible allocation is not known to be available")),
+                "{:?}", checked.diagnostics());
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let module = &prepared.project().modules[0];
+        let source = &module.source;
+        for (ordinal, item) in module.items.iter().enumerate() {
+            if let ScalarItem::Function(function) = item {
+                if function.name.starts_with("observed_") {
+                    let proof = checked.reference_cfg(0, ordinal, None)
+                        .and_then(|cfg| cfg.guarded_scalar_allocation()).expect("one observed owner");
+                    assert_eq!(proof.guards().len(), 1, "outer implication is not a lowering receipt");
+                }
+            }
+        }
+        for (route, project, artifact) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = artifact.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "outer guarded short-circuit implication");
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            for name in ["observed_and", "observed_or"] {
+                let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, name));
+                assert_eq!(body.matches("icmp ne ptr").count(), 1, "{body}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_PRESENCE_IMPLICATION_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

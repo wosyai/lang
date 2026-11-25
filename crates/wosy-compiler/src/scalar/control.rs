@@ -27,7 +27,7 @@ pub(super) struct GuardedAllocationEdge {
     pub(super) condition: OccurrenceOrdinal,
     pub(super) binding: super::ReferenceBindingId,
     pub(super) present: super::CfgPointId,
-    pub(super) absent: super::CfgPointId,
+    pub(super) absent: Option<super::CfgPointId>,
 }
 
 #[derive(Clone, Copy)]
@@ -119,7 +119,19 @@ impl CallablePointFacts {
             condition,
             binding,
             present,
-            absent,
+            absent: Some(absent),
+        });
+    }
+
+    pub(super) fn record_implied_allocation_presence(
+        &mut self,
+        branch: super::CfgPointId,
+        condition: OccurrenceOrdinal,
+        binding: super::ReferenceBindingId,
+        present: super::CfgPointId,
+    ) {
+        self.guarded_allocation_edges.entry(branch).or_insert(GuardedAllocationEdge {
+            condition, binding, present, absent: None,
         });
     }
 }

@@ -432,7 +432,7 @@ fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
         let region = calls.functions[&0].conditionals.values().next().expect("resolved condition");
         let ConditionalRegion::Value { condition, .. } = region else { panic!("value condition"); };
         assert_eq!(carrier.condition(), condition.0);
-        assert_eq!((edge.present, edge.absent), if present_on_then { (*then, *otherwise) } else { (*otherwise, *then) });
+        assert_eq!((edge.present, edge.absent), if present_on_then { (*then, Some(*otherwise)) } else { (*otherwise, Some(*then)) });
         assert!(result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding == &edge.binding)));
         assert!(!result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == edge.binding)));
     }
