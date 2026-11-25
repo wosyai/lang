@@ -554,6 +554,15 @@ impl IntegerSet {
         self.0.get(next).is_some_and(|range| &range.first <= lower && upper <= &range.last)
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn first_uncovered_in_interval(&self, lower: &BigInt, upper: &BigInt) -> Option<BigInt> {
+        let next = self.0.partition_point(|range| &range.last < lower);
+        let Some(interval) = self.0.get(next).filter(|range| &range.first <= lower) else {
+            return Some(lower.clone());
+        };
+        (&interval.last < upper).then(|| &interval.last + 1u8)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

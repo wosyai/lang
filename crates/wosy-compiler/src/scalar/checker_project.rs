@@ -5035,6 +5035,7 @@ pub struct MainFlowProofDiagnostic {
     pub proof: wosy_syntax::SourceSpan,
     pub goal: wosy_syntax::SourceSpan,
     pub failed_step: Option<wosy_syntax::SourceSpan>,
+    pub entry_dependent_witness: bool,
     pub invocation: Rc<MainFlowProofInvocation>,
 }
 
@@ -6317,7 +6318,8 @@ impl SelectedSymbolicProof<'_, '_> {
             ).ok_or(ProjectCheck::Unsupported)?;
             if active || !directives.is_empty() { return Err(ProjectCheck::Unsupported); }
             if let Some(failure) = rejected {
-                self.record(first, function, source, effects.records.len(), failure, failed_step)?;
+                let step = failed_step.filter(|_| !goal.uses_entry() || failure.witness_outside_domain);
+                self.record(first, function, source, effects.records.len(), failure, step)?;
             }
             return Ok(Some(returned));
         }
@@ -6970,11 +6972,16 @@ impl<'a> MainFlowProofCase<'a> {
             TypedProofGoal::Existential { relation, witness, witness_in_domain } => Some((
                 Quantified::Comparison(None, *relation, witness), Some(!*witness_in_domain),
             )),
-            TypedProofGoal::ConjunctiveExistential(goal) => {
-                let ConjunctiveWitness::Literal(candidate, _) = &goal.witness else { return Err(ProjectCheck::Unsupported); };
-                Some((Quantified::Comparison(Some(&goal.output), goal.relation, candidate),
-                    Some(goal.domain.first_intersection_point(candidate, candidate).is_none())))
-            }
+            TypedProofGoal::EntryWitness { slot: 0, relation, domain } if body.boundary.parameters.len() == 1 =>
+                Some((Quantified::EntryWitness { relation: *relation, domain, bounds: None }, Some(false))),
+            TypedProofGoal::ConjunctiveExistential(goal) => match &goal.witness {
+                ConjunctiveWitness::Literal(candidate, _) =>
+                    Some((Quantified::Comparison(Some(&goal.output), goal.relation, candidate),
+                        Some(goal.domain.first_intersection_point(candidate, candidate).is_none()))),
+                ConjunctiveWitness::Formal(0) if body.boundary.parameters.len() == 1 =>
+                    Some((Quantified::EntryWitness { relation: goal.relation, domain: &goal.domain, bounds: Some(&goal.output) }, Some(false))),
+                ConjunctiveWitness::Formal(_) => return Err(ProjectCheck::Unsupported),
+            },
             TypedProofGoal::DependentWitness(goal) => Some((match goal {
                 DependentWitness::Unavailable | DependentWitness::OutsideDomain => Quantified::Impossible,
                 DependentWitness::Comparison(relation, bound) => Quantified::Comparison(None, *relation, bound),
@@ -6999,7 +7006,7 @@ impl<'a> MainFlowProofCase<'a> {
                 let [ScalarBlockItem::Expression(step)] = plan.steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
                 let exists = child(&ensures, SyntaxKind::ProofExists)?;
                 let goal = child(&exists, SyntaxKind::Expression)?;
-                let failed_step = witness_outside.then(|| super::typecheck::expression_span(step));
+                let failed_step = (witness_outside || goal_claim.uses_entry()).then(|| super::typecheck::expression_span(step));
                 (if witness_outside { Quantified::Impossible } else { goal_claim }, goal, failed_step)
             } else {
                 if !plan.has_no_authored_steps() { return Err(ProjectCheck::Unsupported); }
@@ -7702,6 +7709,7 @@ fn make_main_flow_proof_failure(
         proof: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.proof },
         goal: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.goal },
         failed_step: failed_step.map(|range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range }),
+        entry_dependent_witness: matches!(proof.bound, MainFlowProofBound::Quantified { claim, .. } if claim.uses_entry()),
         invocation,
     }
 }
@@ -7814,13 +7822,16 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                     }
                     self.active = true;
                     if let MainFlowProofBound::Quantified { claim, failed_step } = proof.bound {
-                        let Some(failure) = claim.rejected_point(value, value, &mut self.named_exact_work) else {
+                        let Some(failure) = claim.rejected_at_call(value, arguments, &mut self.named_exact_work) else {
                             self.incomplete = true;
                             return;
                         };
-                        if failure.is_some() && !emit(proof, failed_step) {
-                            self.incomplete = true;
-                            return;
+                        if let Some(witness_outside) = failure {
+                            let step = failed_step.filter(|_| !claim.uses_entry() || witness_outside);
+                            if !emit(proof, step) {
+                                self.incomplete = true;
+                                return;
+                            }
                         }
                         continue;
                     }
@@ -11439,36 +11450,42 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
         if names.contains_key(existential.as_str()) {
             return Err(ProjectCheck::InvalidProof);
         }
-        let ScalarExpression::Name { name, .. } = authored_witness_argument(steps)? else {
-            return Err(ProjectCheck::Unsupported);
+        let argument = authored_witness_argument(steps)?;
+        let (witness_source, translated) = match argument {
+            ScalarExpression::Name { .. } => (argument, None),
+            ScalarExpression::Binary { operator: BinaryOperator::Add | BinaryOperator::Subtract, left, .. } =>
+                (left.as_ref(), Some(argument)),
+            _ => return Err(ProjectCheck::Unsupported),
         };
+        let ScalarExpression::Name { name, .. } = witness_source else { return Err(ProjectCheck::Unsupported); };
         let chosen = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
-        Some((exists, existential, chosen))
+        Some((exists, existential, chosen, translated))
     } else {
         None
     };
     let mut saw_existential = false;
+    let mut translated_relation: Option<IntegerRelation> = None;
     let mut relations = vec![None::<IntegerRelation>; declarations.len()];
     let mut output_bounds = IntegerShowConstraints::default();
     let mut has_output_bounds = false;
     visit_output_conjuncts(ensures, |atom| {
         if let ScalarExpression::Binary { operator, left, right, .. } = atom {
             if let ScalarExpression::Name { name, .. } = right.as_ref() {
-                let slot = if let Some((_, binder, chosen)) = &witness {
-                    if name == binder {
-                        saw_existential = true;
-                        *chosen
-                    } else {
-                        *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?
-                    }
-                } else {
-                    *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?
-                };
                 if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
-                relations[slot] = Some(relations[slot].map_or(relation, |known| known.intersection(relation)));
+                let row = if let Some((_, binder, chosen, translation)) = &witness {
+                    if name == binder {
+                        saw_existential = true;
+                        if translation.is_some() { &mut translated_relation } else { &mut relations[*chosen] }
+                    } else {
+                        &mut relations[*names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?]
+                    }
+                } else {
+                    &mut relations[*names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?]
+                };
+                *row = Some(row.map_or(relation, |known| known.intersection(relation)));
                 return Ok(());
             }
         }
@@ -11480,41 +11497,76 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
     if DEPENDENT && !saw_existential {
         return Err(ProjectCheck::Unsupported);
     }
-    let admission = witness.map(|(exists, binder, chosen)| {
+    let admission = witness.map(|(exists, binder, chosen, translation)| {
         let domain = typed_quantifier_domain(exists, &binder, inputs, ty)?;
-        Ok::<_, ProjectCheck>((chosen, domain))
+        Ok::<_, ProjectCheck>((chosen, domain, translation))
     }).transpose()?;
     let mut unavailable = false;
     let mut impossible = false;
     let mut outside_domain = false;
     let mut forbidden = OwnedIntegerUnion::default();
-    for (slot, ((forall, binder), relation)) in declarations.into_iter().zip(relations).enumerate() {
-        let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
-        let (Some((minimum, maximum)), Some(relation)) = (domain.extremes(), relation) else {
-            unavailable = true;
-            continue;
-        };
-        if let Some((chosen, existential)) = &admission {
-            if slot == *chosen && !domain.is_subset_of(existential) {
-                outside_domain = true;
-            }
-        }
-        if unavailable || impossible || outside_domain { continue; }
+    let charge_translated_union = admission.as_ref().is_some_and(|(_, _, translation)| translation.is_some());
+    let mut exclusion_intervals = 0usize;
+    let mut exclusion_charge = 0usize;
+    let mut work = 0;
+    let mut apply_relation = |domain: IntegerSet, relation: IntegerRelation, work: &mut usize| -> Result<bool, ProjectCheck> {
+        let (minimum, maximum) = domain.extremes().ok_or(ProjectCheck::Unsupported)?;
         let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
             (true, false, _) => Some(true),
             (false, true, _) => Some(false),
             (false, false, true) if minimum == maximum => Some(true),
-            (false, false, _) => { impossible = true; continue; }
+            (false, false, _) => return Ok(false),
             (true, true, false) => None,
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let Some(lower) = lower else {
+        if let Some(lower) = lower {
+            let bound = domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
+            output_bounds.add(relation, Cow::Owned(bound));
+            has_output_bounds = true;
+        } else {
+            if charge_translated_union {
+                // Preflight each append and the eventual normalization,
+                // charging only the increase from the previous union size.
+                exclusion_intervals = exclusion_intervals.checked_add(domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+                let factor = (usize::BITS - exclusion_intervals.leading_zeros()) as usize + 1;
+                let total = exclusion_intervals.checked_mul(factor).ok_or(ProjectCheck::Unsupported)?;
+                let increase = total.checked_sub(exclusion_charge).ok_or(ProjectCheck::Unsupported)?;
+                super::checker_flow::charge_call_work(work, increase).ok_or(ProjectCheck::Unsupported)?;
+                exclusion_charge = total;
+            }
             forbidden.push(domain);
+        }
+        Ok(true)
+    };
+    for (slot, ((forall, binder), relation)) in declarations.into_iter().zip(relations).enumerate() {
+        let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
+        let admission = admission.as_ref().filter(|(chosen, _, _)| slot == *chosen);
+        let translation = admission.and_then(|(_, _, translation)| *translation);
+        if domain.is_empty() || (relation.is_none() && translation.is_none()) {
+            unavailable = true;
             continue;
-        };
-        let bound = domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
-        output_bounds.add(relation, Cow::Owned(bound));
-        has_output_bounds = true;
+        }
+        let image = if let Some(argument) = translation {
+            let (image, shift) = checked_quantified_witness_translation(argument, &binder, &domain, ty, &mut work)?;
+            let (Cow::Owned(image), Some(_)) = (image, shift) else { return Err(ProjectCheck::Unsupported); };
+            let (_, existential, _) = admission.ok_or(ProjectCheck::Unsupported)?;
+            let cost = image.interval_count().checked_add(existential.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
+            Some(image)
+        } else { None };
+        if let Some((_, existential, _)) = admission {
+            outside_domain |= !image.as_ref().unwrap_or(&domain).is_subset_of(existential);
+        }
+        if unavailable || impossible || outside_domain { continue; }
+        // The same original assignment supplies x and x±k, but universal
+        // conjunction distributes over these distinct pointwise predicates.
+        // Their rows must not be intersected as if the coordinates were equal.
+        if let Some(relation) = relation {
+            impossible |= !apply_relation(domain, relation, &mut work)?;
+        }
+        if let Some(image) = image {
+            impossible |= !apply_relation(image, translated_relation.ok_or(ProjectCheck::Unsupported)?, &mut work)?;
+        }
     }
     if unavailable {
         return Err(ProjectCheck::Unsupported);
@@ -21405,6 +21457,95 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_formal_existential_witness_uses_one_typed_entry_and_result() {
+        let source = r#"%%start
+            u8(u8) alias = fn(value) { value };
+            i8(i8) fixed = fn(value) { if (value <= 0) { -1 } else { -1 } };
+            proof same for alias(entry) -> (out) where (entry >= 4 && entry <= 6)
+                ensures (exists (u8 candidate where candidate >= 4 && candidate <= 6) { out == candidate && out <= 6 })
+                { core.witness(entry); }
+            proof signed for fixed(entry) -> (out) where (entry >= -2 && entry <= 0)
+                ensures (exists (i8 candidate where candidate >= -2 && candidate <= 0) { out != candidate })
+                { core.witness(entry); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let alias_source = source.replace("out != candidate", "out >= candidate").replace("entry <= 0", "entry <= -1");
+        let good = check_array_proof_cohort(&alias_source, package).unwrap();
+        assert!(good.active && good.symbolic_diagnostic.is_none());
+        let actual = |text: &str| text.replace("%%end", "u8 first = alias(5); u8 second = alias(5); i8 third = fixed(-1); %%end");
+        let good = check_array_proof_cohort(&actual(&alias_source), main).unwrap();
+        assert!(good.active && good.diagnostics.is_empty());
+        let hole = alias_source.replace("candidate >= 4 && candidate <= 6", "candidate == 4 || candidate == 6");
+        let symbolic = check_array_proof_cohort(&hole, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.returned, BigInt::from(5));
+        let step = symbolic.failed_step.unwrap().range;
+        assert_eq!(&hole[step.start as usize..step.end as usize], "core.witness(entry)");
+        let actual_hole = actual(&hole);
+        let bad = check_array_proof_cohort(&actual_hole, main).unwrap();
+        let [first, second] = bad.diagnostics.as_slice() else { panic!("one report per real call"); };
+        assert_ne!(first.invocation.call, second.invocation.call);
+        for failure in [first, second] {
+            assert_eq!(failure.invocation.returned, BigInt::from(5));
+            assert!(failure.failed_step.is_some());
+        }
+        let symbolic = check_array_proof_cohort(&source, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.returned, BigInt::from(-1));
+        assert!(symbolic.failed_step.is_none());
+        let observed = check_array_proof_cohort(&actual(&source), main).unwrap();
+        let [failure] = observed.diagnostics.as_slice() else { panic!("one actual signed predicate"); };
+        assert_eq!(failure.invocation.returned, BigInt::from(-1));
+        assert!(failure.failed_step.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_scalar_repeated_quantifiers_keep_original_and_translated_rows_distinct() {
+        let source = r#"%%start
+            u8(u8) checked = fn(value) { value };
+            proof distinct for checked(entry) -> (out) where (entry == 4)
+                forall (u8 seed where seed == 1 || seed == 3)
+                forall (u8 unrelated where unrelated == 0 || unrelated == 7)
+                ensures (exists (u8 candidate where candidate == 2 || candidate == 4) {
+                    out != seed && out >= candidate && out != unrelated
+                })
+                { core.witness(seed + 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 reached = checked(4); %%end");
+        let good = check_array_proof_cohort(source, package).unwrap();
+        assert!(good.active && good.symbolic_diagnostic.is_none());
+        let good = check_array_proof_cohort(&actual(source), main).unwrap();
+        assert!(good.active && good.diagnostics.is_empty());
+        let failures = [
+            (source.replace("candidate == 2 || candidate == 4", "candidate == 2"), true),
+            (source.replace("out >= candidate", "out != candidate"), false),
+            (source.replace("out != seed &&", "out <= seed &&"), false),
+            (source.replace("unrelated == 0", "unrelated == 4"), false),
+        ];
+        for (text, shift_domain) in failures {
+            let dormant = check_array_proof_cohort(&text, main).unwrap();
+            assert!(!dormant.active && dormant.diagnostics.is_empty());
+            let symbolic = check_array_proof_cohort(&text, package).unwrap().symbolic_diagnostic.unwrap();
+            assert_eq!(symbolic.returned, BigInt::from(4));
+            let reached = actual(&text);
+            let observed = check_array_proof_cohort(&reached, main).unwrap();
+            let [failure] = observed.diagnostics.as_slice() else { panic!("one distinct typed output refutation"); };
+            assert_eq!(failure.invocation.returned, BigInt::from(4));
+            for (span, text) in [(symbolic.failed_step.as_ref(), text.as_str()), (failure.failed_step.as_ref(), reached.as_str())] {
+                assert_eq!(span.is_some(), shift_domain);
+                if let Some(span) = span {
+                    assert_eq!(&text[span.range.start as usize..span.range.end as usize], "core.witness(seed + 1)");
+                }
+            }
+        }
+        let overflow = source.replace("seed == 3", "seed == 255");
+        assert!(matches!(check_array_proof_cohort(&overflow, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

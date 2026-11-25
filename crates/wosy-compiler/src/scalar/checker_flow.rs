@@ -360,6 +360,7 @@ impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthored
 pub(super) struct SymbolicLiteralFailure<'a> {
     pub(super) output: super::ByteSpan,
     pub(super) returned: BigInt,
+    pub(super) witness_outside_domain: bool,
     pub(super) state: IntegerInputs,
     pub(super) axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
 }
@@ -389,7 +390,7 @@ impl<'a> SymbolicLiteralFailure<'a> {
         if let Some(axis) = axis {
             state[axis] = Rc::new(IntegerSet::singleton(returned.as_ref()));
         }
-        Self { output: slot.span, returned: returned.into_owned(), state: IntegerInputs::from_cells(vec![state]),
+        Self { output: slot.span, returned: returned.into_owned(), witness_outside_domain: false, state: IntegerInputs::from_cells(vec![state]),
             axes: roots.axes[..roots.parameters].to_vec() }
     }
 }
@@ -617,14 +618,33 @@ pub(super) enum QuantifiedIntegerReturn<'a> {
     Output(&'a IntegerShowConstraints<'static>),
     Comparison(Option<&'a IntegerShowConstraints<'static>>, IntegerRelation, &'a BigInt),
     Avoiding(Option<&'a IntegerShowConstraints<'static>>, &'a IntegerSet),
+    EntryWitness { relation: IntegerRelation, domain: &'a IntegerSet, bounds: Option<&'a IntegerShowConstraints<'static>> },
 }
 
 #[cfg(feature = "internal-checker")]
 impl QuantifiedIntegerReturn<'_> {
+    pub(super) fn uses_entry(self) -> bool { matches!(self, Self::EntryWitness { .. }) }
+
+    pub(super) fn rejected_at_call(self, returned: &BigInt, arguments: &[&BigInt], work: &mut usize)
+        -> Option<Option<bool>>
+    {
+        if let Self::EntryWitness { relation, domain, bounds } = self {
+            let [entry] = arguments else { return None; };
+            let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
+            charge_call_work(work, depth.checked_add(1)?)?;
+            if !domain.covers_closed(entry, entry) { return Some(Some(true)); }
+            charge_call_work(work, 1usize.checked_add(bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?)?;
+            return Some((!relation.accepts(returned.cmp(entry))
+                || bounds.is_some_and(|bounds| !bounds.holds_value(returned))).then_some(false));
+        }
+        Some(self.rejected_point(returned, returned, work)?.map(|_| false))
+    }
+
     pub(super) fn rejected_point<'a>(self, low: &'a BigInt, high: &'a BigInt, work: &mut usize) -> Option<Option<&'a BigInt>>
     where Self: 'a,
     {
         let failure = match self {
+            Self::EntryWitness { .. } => return None,
             Self::Vacuous => { charge_call_work(work, 1)?; None }
             Self::Impossible => { charge_call_work(work, 1)?; Some(low) }
             Self::Output(bounds) => {
@@ -737,6 +757,47 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             let work = &mut *self.imported_relation_work?.borrow_mut();
             for row in &path.0 {
                 observed.0 = true;
+                if let QuantifiedIntegerReturn::EntryWitness { relation, domain, bounds } = claim {
+                    if roots.parameters != 1 || axis.is_some_and(|axis| axis != 0) { return None; }
+                    if matches!(value, IntegerReturn::Alias(_)) && !row.entry_alias(0, 0) { return None; }
+                    let entry = row.entry_domain(0);
+                    let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
+                    for (low, high) in entry.intervals() {
+                        charge_call_work(work, depth.checked_add(1)?)?;
+                        let outside = domain.first_uncovered_in_interval(low, high);
+                        let point = if let Some(point) = &outside {
+                            Some(point)
+                        } else {
+                            charge_call_work(work, 3usize.checked_add(bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?)?;
+                            match value {
+                                IntegerReturn::Const(returned) => {
+                                    if bounds.is_some_and(|bounds| !bounds.holds_value(returned)) {
+                                        Some(low)
+                                    } else {
+                                        let rejected = relation.complement();
+                                        [low, high].into_iter().find(|point| rejected.accepts(returned.cmp(*point)))
+                                            .or_else(|| (low < returned && returned < high
+                                                && rejected.accepts(std::cmp::Ordering::Equal)).then_some(returned))
+                                    }
+                                }
+                                IntegerReturn::Alias(_) => {
+                                    if !relation.accepts(std::cmp::Ordering::Equal) { Some(low) }
+                                    else { bounds.and_then(|bounds| bounds.first_violation_in_interval(low, high)) }
+                                }
+                            }
+                        };
+                        if let Some(point) = point {
+                            charge_call_work(work, roots.parameters.checked_add(1)?)?;
+                            let returned = match value { IntegerReturn::Const(returned) => returned, IntegerReturn::Alias(_) => point };
+                            let mut failure = SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(returned), Some((0, point)));
+                            failure.witness_outside_domain = outside.is_some();
+                            observed.1 = Some(failure);
+                            break;
+                        }
+                    }
+                    if observed.1.is_some() { break; }
+                    continue;
+                }
                 let witness = match (value, axis) {
                     (IntegerReturn::Const(value), None) => claim.rejected_point(value, value, work)?,
                     (IntegerReturn::Alias(_), Some(axis)) => {
@@ -4061,7 +4122,7 @@ pub(super) fn verify_named_pair_return<'a>(
             }
         };
         return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
-            output: piece.span, returned,
+            output: piece.span, returned, witness_outside_domain: false,
             state: IntegerInputs::from_cells(vec![Vec::from(cells)]),
             axes: vec![(first, &left.ty), (second, &right.ty)],
         }) });
@@ -4232,7 +4293,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
                 violating_inputs
             };
             return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
-                output: piece.span, returned: value.into_owned(), state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
+                output: piece.span, returned: value.into_owned(), witness_outside_domain: false, state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
                 axes: vec![(binding, &parameter.ty)],
             }) });
         }
