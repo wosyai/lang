@@ -100,6 +100,7 @@ pub(crate) fn parse_canonical_ordinary_source(
     text: String,
     comment_categories: &[String],
     build_typing: bool,
+    #[cfg(feature = "internal-checker")] check_typing: bool,
     persist_in: Option<(&std::path::Path, PersistCst)>,
 ) -> Result<(String, wosy_compiler::ScalarSourceDeclarations), CanonicalLoadFailure> {
     let (fresh, diagnostics) = parse_source_with_snapshot(source, text, comment_categories);
@@ -115,6 +116,11 @@ pub(crate) fn parse_canonical_ordinary_source(
     let declarations = if build_typing {
         wosy_compiler::derive_scalar_build_declarations_from_cst(result.canonical_cst())
     } else {
+        #[cfg(feature = "internal-checker")]
+        if check_typing {
+            let declarations = wosy_compiler::derive_scalar_check_declarations_from_cst(result.canonical_cst());
+            return Ok((result.text, declarations));
+        }
         derive_scalar_declarations_from_cst(result.canonical_cst())
     };
     Ok((result.text, declarations))
@@ -353,6 +359,8 @@ pub(crate) fn load_canonical_project_inputs(
                 let (text, declarations) = parse_canonical_ordinary_source(
                     source, text, &project.comment_categories,
                     matches!(&purpose, CanonicalLoadPurpose::Build(_)),
+                    #[cfg(feature = "internal-checker")]
+                    matches!(&purpose, CanonicalLoadPurpose::Check | CanonicalLoadPurpose::PackageProofs(_) | CanonicalLoadPurpose::LocalProofs),
                     match &purpose {
                         CanonicalLoadPurpose::Build(persist) => persist.map(|persist| (root, persist)),
                         #[cfg(feature = "internal-checker")]

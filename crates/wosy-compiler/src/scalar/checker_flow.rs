@@ -7672,6 +7672,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     }
                                 }
                             }
+                            super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch(transfer) => {
+                                if !roots.allow_extended_scalar_locals { return None; }
+                                bind_exact_enum_match_value(roots, &mut path, transfer, &receiver.ty)?;
+                            }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
                                 if !roots.allow_extended_scalar_locals { return None; }
                                 path = bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?;
@@ -9250,6 +9254,39 @@ fn ordinary_scalar_conditional_lanes(
     path.charge_projected_integer_directive(roots, predicate)?;
     let (passing, failing, _) = path.split(roots, predicate)?;
     Some([(passing, *then_block), (failing, *else_block)])
+}
+
+#[cfg(feature = "internal-checker")]
+fn bind_exact_enum_match_value(
+    roots: &mut IntegerRoots<'_>, path: &mut IntegerInputs,
+    transfer: &super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, ty: &ScalarType,
+) -> Option<()> {
+    use super::runtime_enum_match::{MatchTransfer, MatchValue};
+    let [row] = path.0.as_slice() else { return None; };
+    if row.affine.is_some() || row.entry.is_some() || !is_integer_type(ty) { return None; }
+    charge_call_work(roots.ordinary_local_work.get_or_insert(0), row.len().checked_add(3)?)?;
+    let output = match transfer {
+        MatchTransfer::Value(value) => value,
+        MatchTransfer::Select { condition, yes, no } => {
+            let (axis, condition_ty) = roots.lookup(condition)?;
+            if condition_ty != &ScalarType::Bool { return None; }
+            let flag = row.get(axis)?.singleton_value()?;
+            if flag == &BigInt::from(1) { yes }
+            else if flag == &BigInt::from(0) { no }
+            else { return None; }
+        }
+    };
+    match output {
+        MatchValue::Literal(value) => {
+            path.append_local(IntegerSet::singleton(value));
+        }
+        MatchValue::Copy(binding) => {
+            let (axis, source_ty) = roots.lookup(binding)?;
+            if source_ty != ty || row.get(axis)?.singleton_value().is_none() { return None; }
+            path.append_ordinary_copy(axis, roots)?;
+        }
+    }
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]

@@ -6,6 +6,9 @@ use wosy_syntax::{
 };
 
 mod scalar;
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub use scalar::derive_scalar_check_declarations_from_cst;
 pub use llvm::{
     emit_scalar_build_project_artifact_llvm, emit_scalar_build_project_llvm,
     emit_scalar_build_project_llvm_text, emit_scalar_build_single_module_artifact_llvm,

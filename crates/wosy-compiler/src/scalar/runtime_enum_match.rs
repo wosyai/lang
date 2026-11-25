@@ -16,6 +16,8 @@ pub(crate) struct Plan {
     inputs: Vec<(ByteSpan, ScalarType)>,
     initializer: bool,
     input_names: Vec<String>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) check_transfer: Option<MatchTransfer<ByteSpan>>,
     pub(crate) prefix: Vec<PrefixInput>,
     pub(crate) outputs: Vec<ScalarType>,
     pub(crate) selector: TypedSelector,
@@ -28,6 +30,36 @@ pub(crate) struct PrefixInput {
     pub(crate) name: String,
     pub(crate) declaration: ByteSpan,
     pub(crate) ty: ScalarType,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchTransfer<T> {
+    Value(MatchValue<T>),
+    Select { condition: T, yes: MatchValue<T>, no: MatchValue<T> },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchValue<T> {
+    Literal(BigInt),
+    Copy(T),
+}
+
+#[cfg(feature = "internal-checker")]
+impl MatchTransfer<ByteSpan> {
+    pub(super) fn bind<T>(&self, resolve: impl Fn(ByteSpan, bool) -> Option<T>) -> Option<MatchTransfer<T>> {
+        let value = |value: &MatchValue<ByteSpan>| Some(match value {
+            MatchValue::Literal(value) => MatchValue::Literal(value.clone()),
+            MatchValue::Copy(span) => MatchValue::Copy(resolve(*span, false)?),
+        });
+        Some(match self {
+            Self::Value(output) => MatchTransfer::Value(value(output)?),
+            Self::Select { condition, yes, no } => MatchTransfer::Select {
+                condition: resolve(*condition, true)?, yes: value(yes)?, no: value(no)?,
+            },
+        })
+    }
 }
 
 /// Opaque source-prepared value occurrence; raw/serialized IR has no constructor.
@@ -314,7 +346,10 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     let name_span = direct_token(&owner, SyntaxKind::Identifier).as_ref().map(token_span)
         .ok_or_else(|| error("missing runtime enum match callable name"))?;
     Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows, initializer, input_names, prefix,
-        enumeration: resolved.enumeration.id.clone(), outputs: output_types, selector, local: local_binding, arms })
+        enumeration: resolved.enumeration.id.clone(), outputs: output_types, selector, local: local_binding, arms,
+        #[cfg(feature = "internal-checker")]
+        check_transfer: None,
+    })
 }
 
 impl Plan {
@@ -345,6 +380,52 @@ impl Plan {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn prepare_check_transfer(&mut self, work: &mut usize) -> Option<()> {
+        if !self.initializer || !self.prefix.is_empty() || self.outputs.len() != 1 { return None; }
+        // This is projection of already-typed leaves, not evaluation. Check
+        // never silently omits effects or unsupported computations in a case.
+        analysis_budget::charge_call_work(work, self.arms.len().checked_add(1)?)?;
+        if self.arms.iter().any(|arm| !matches!(&arm.results[..], [ArmResult::Literal { .. } | ArmResult::Payload { .. }])) {
+            return None;
+        }
+        let value = |selector: &TypedSelector, work: &mut usize| {
+            let TypedSelector::Constructor { tag, payload, .. } = selector else { return None; };
+            analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?)?;
+            if payload.iter().any(|(_, operand)| matches!(operand, Operand::Expression(_))) { return None; }
+            let [result] = self.arms.iter().find(|arm| arm.tag == *tag)?.results.as_slice() else { return None; };
+            match result {
+                ArmResult::Literal { value, .. } => Some(MatchValue::Literal(value.clone())),
+                ArmResult::Payload { slot, .. } => Some(match &payload.get(*slot)?.1 {
+                    Operand::Literal(value) => MatchValue::Literal(value.clone()),
+                    Operand::Formal(span) => MatchValue::Copy(*span),
+                    Operand::Expression(_) => return None,
+                }),
+                ArmResult::Expression(_) => None,
+            }
+        };
+        self.check_transfer = Some(match &self.selector {
+            TypedSelector::Constructor { .. } => MatchTransfer::Value(value(&self.selector, work)?),
+            TypedSelector::If { predicate, yes, no } => {
+                let yes = value(yes, work)?;
+                let no = value(no, work)?;
+                match predicate {
+                    Predicate::Constant(flag) => MatchTransfer::Value(if *flag { yes } else { no }),
+                    Predicate::Formal { declaration, .. } => MatchTransfer::Select { condition: *declaration, yes, no },
+                    Predicate::Compare { .. } => return None,
+                }
+            }
+        });
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checked_input(&self, span: ByteSpan) -> Option<(&str, &ScalarType)> {
+        let index = self.inputs.binary_search_by_key(&span.start, |(span, _)| span.start).ok()?;
+        let (declared, ty) = &self.inputs[index];
+        (*declared == span).then_some((self.input_names.get(index)?.as_str(), ty))
     }
 
     pub(super) fn is_initializer(&self) -> bool { self.initializer }

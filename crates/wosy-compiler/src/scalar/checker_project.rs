@@ -4449,7 +4449,8 @@ pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCst
     let contextual = contextual_proof.is_some();
     #[cfg(not(feature = "internal-checker"))]
     let contextual = false;
-    let declarations = super::derive_scalar_declarations(canonical, contextual, contextual, false, Some(&mut definitions));
+    let declarations = super::derive_scalar_declarations(canonical, contextual, contextual, false, Some(&mut definitions),
+        #[cfg(feature = "internal-checker")] true);
     ScalarProofDeclarations { declarations, definitions,
         #[cfg(feature = "internal-checker")]
         contextual_proof,
@@ -24263,6 +24264,49 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ScalarModuleProofOutcome::Refuted,
             ScalarModuleProofOutcome::Refuted,
         ]);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn observed_ordinary_enum_match_result_reaches_later_requirement() {
+        let text = format!(r#"%%start
+            enum copy Region {{ left(u8, u16); right(u16, u8); }}
+            unit(bool, u16) inspect = fn(flag, entry) {{
+                u16 actual = match (if (flag) {{ Region.left(3, entry) }} else {{ Region.right(513, 7) }}) {{
+                    right(wide, narrow) {{ wide }}
+                    left(narrow, wide) {{ wide }}
+                }};
+                core.require(actual == 256, {OUTPUT});
+            }};
+            inspect(true, 256);
+            inspect(false, 256);
+        %%end"#);
+        let app = source("src/main.w", "observed-runtime-enum-match");
+        let run = |text: &str, scope| {
+            let parsed = parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations, Vec::new())], Vec::new(), vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let both = run(&text, scope).unwrap();
+            let [failed] = both.directives.as_slice() else { panic!("only the actually selected right arm refutes"); };
+            assert_eq!(failed.code(), &BigInt::from(1));
+            assert_eq!(&text[failed.condition.start as usize..failed.condition.end as usize], "actual == 256");
+            let right = BigInt::from(513);
+            assert!(failed.witness.intervals_at(0, 2).unwrap().eq([(&right, &right)]));
+            let true_only = text.replace("inspect(false, 256);", "");
+            let passed = run(&true_only, scope).unwrap();
+            assert!(passed.active && passed.directives.is_empty());
+        }
+        let dormant = text.replace("inspect(true, 256);", "").replace("inspect(false, 256);", "");
+        let idle = run(&dormant, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.directives.is_empty());
+        assert!(matches!(run(&dormant, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let unsupported = text.replace("left(narrow, wide) { wide }", "left(narrow, wide) { wide ^ 1 }");
+        assert!(matches!(run(&unsupported, ScalarCheckerScope::MainFlowOnly), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
     }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {

@@ -594,7 +594,7 @@ fn prepare_explicit_dormant_sources(
     sources.into_iter().map(|DormantSourceInput { identity, text }| {
         let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
         let (text, declarations) = parse_canonical_ordinary_source(
-            source, text, &project.comment_categories, false, None,
+            source, text, &project.comment_categories, false, true, None,
         )?;
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);

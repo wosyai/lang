@@ -6266,6 +6266,7 @@ pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
     SnapshotRead { shape: std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, index: CheckerSnapshotReadIndex },
     Conditional,
+    EnumMatch(super::runtime_enum_match::MatchTransfer<ReferenceBindingId>),
     BoolLiteral(bool),
     BoolCall(OccurrenceOrdinal),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
@@ -9578,6 +9579,22 @@ impl StructuralWalker<'_, '_> {
                 let resolver = callable.target_resolver;
                 self.ordinary_integer_local(outputs.primary, expression, &receiver.ty, names)
                     .or_else(|| {
+                        let ScalarExpression::RuntimeMatch(site) = expression else { return None; };
+                        let plan = &site.0;
+                        if plan.source != *resolver.source || plan.owner != resolver.function_span
+                            || position.block != self.structure.root || position.item != 0
+                            || site.ty() != &receiver.ty
+                        { return None; }
+                        let transfer = plan.check_transfer.as_ref()?.bind(|span, boolean| {
+                            let (name, declared) = plan.checked_input(span)?;
+                            let ty = if boolean { &ScalarType::Bool } else { &receiver.ty };
+                            if declared != ty || scope.types.get(name)? != ty { return None; }
+                            let PlainNameIdentity::Lexical(identity) = resolver.plain_name(name, &scope.names)? else { return None; };
+                            (identity.declaration_span == span).then_some(identity)
+                        })?;
+                        Some(CheckerOrdinaryScalarLocalKind::EnumMatch(transfer))
+                    })
+                    .or_else(|| {
                         let MemberFacts::Prepared(members) = &self.members else { return None; };
                         let PreparedMemberIdentity::Lexical { binding, field } = members.get(&outputs.primary)?
                             else { return None; };
@@ -9703,7 +9720,8 @@ impl StructuralWalker<'_, '_> {
                     });
                     self.structure.checker_has_finite_scalar_local |= finite;
                     self.structure.checker_has_extended_scalar_local |= finite || matches!(kind,
-                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. });
+                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
+                            | CheckerOrdinaryScalarLocalKind::EnumMatch(_));
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
                         CheckerOrdinaryScalarLocal { binding, source, kind });
                 }

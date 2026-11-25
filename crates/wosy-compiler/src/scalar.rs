@@ -2402,6 +2402,8 @@ pub fn derive_scalar_declarations_from_cst(
         false,
         #[cfg(any(test, feature = "internal-checker"))]
         None,
+        #[cfg(feature = "internal-checker")]
+        false,
     )
 }
 
@@ -2409,7 +2411,14 @@ pub fn derive_scalar_declarations_from_cst(
 #[doc(hidden)]
 pub fn derive_scalar_build_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
     derive_scalar_declarations(canonical, false, false, true,
-        #[cfg(any(test, feature = "internal-checker"))] None)
+        #[cfg(any(test, feature = "internal-checker"))] None,
+        #[cfg(feature = "internal-checker")] false)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn derive_scalar_check_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(canonical, false, false, false, None, true)
 }
 
 fn derive_scalar_declarations(
@@ -2418,6 +2427,7 @@ fn derive_scalar_declarations(
     contextual_proof_runtime: bool,
     retain_build_proofs: bool,
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
+    #[cfg(feature = "internal-checker")] check_typed_runtime_matches: bool,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let mut build_proofs = Vec::new();
@@ -2475,7 +2485,15 @@ fn derive_scalar_declarations(
         for node in pending_runtime_matches {
             match runtime_enum_match::prepare(&canonical.source, &enums, &node, &mut runtime_match_work) {
                 Ok(plan) => {
-                    if !retain_build_proofs {
+                    #[cfg(feature = "internal-checker")]
+                    let (plan, checked) = {
+                        let mut plan = plan;
+                        let checked = check_typed_runtime_matches && plan.prepare_check_transfer(&mut runtime_match_work).is_some();
+                        (plan, checked)
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let checked = false;
+                    if !retain_build_proofs && !checked {
                         diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span,
                             "typed runtime enum match is not yet eligible for this preparation route"));
                     }
