@@ -8053,8 +8053,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             {
                 matches!(self.initialization_call_targets.get(&call),
                     Some(ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration })
-                        if &declaration.source == *source
-                            && declarations.checker_proof_targets.contains(&(*source, declaration.range)))
+                        if declaration.source.project == source.project && declaration.source.package == source.package
+                            && declarations.checker_proof_targets.contains(&(&declaration.source, declaration.range)))
                     && self.checked_call_signatures.get(&call).is_some_and(|signature|
                         (3..=super::checker_project::MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len())
                             && slot < signature.parameters.len()

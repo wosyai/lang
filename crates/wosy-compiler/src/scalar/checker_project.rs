@@ -1520,7 +1520,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     #[cfg(feature = "internal-checker")]
                     let wide = if COLLECT && is_integer_type(ty) && receiver.contextual_storage.is_none()
                         && matches!(expression, ScalarExpression::Call { .. }) {
-                        actual.wide_ranked_startup_initializer(topology, source, outputs.primary, ty, &storage)?
+                        let qualified = matches!(expression, ScalarExpression::Call { receiver: Some(_), .. });
+                        actual.wide_ranked_startup_initializer(topology, source, outputs.primary, ty, &storage, qualified, visits)?
                     } else { None };
                     #[cfg(not(feature = "internal-checker"))]
                     let wide = None;
@@ -2288,7 +2289,7 @@ trait ActualIntegerObserver {
 
     #[cfg(feature = "internal-checker")]
     fn proved_wide_initializer_return(
-        &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &[&BigInt], _: &ScalarType,
+        &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &[&BigInt], _: &ScalarType, _: bool,
     ) -> Option<BigInt> { None }
 
     #[cfg(feature = "internal-checker")]
@@ -2664,19 +2665,22 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     fn wide_ranked_startup_initializer(
         &mut self, topology: &ModuleInitializationTopology, source: &SourceIdentity, call: OccurrenceOrdinal,
         expected: &ScalarType, storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+        qualified: bool, visits: &[InitializationVisit],
     ) -> Result<Option<BigInt>, ProjectCheck> {
         let Some(signature) = topology.checked_call_signatures.get(&call) else { return Ok(None); };
         if !(3..=MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len()) { return Ok(None); }
         let Some(ModuleInitializationCallTarget::Direct {
             declaration, concrete: ConcreteCallSelection::Declaration,
         }) = topology.call_targets.get(&call) else { return Err(ProjectCheck::Unsupported); };
-        if !ACTUAL_STARTUP || !Observer::ENABLED || &declaration.source != source
+        let cross_source = &declaration.source != source;
+        if !ACTUAL_STARTUP || !Observer::ENABLED || (cross_source && !qualified)
             || !matches!(signature.outputs.outputs.as_slice(), [result] if &result.ty == expected)
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let (target, _, _, body) = self.validated_direct_body(&topology.structure, call, source, declaration.range)?;
-        if self.active.contains(&target) || body.contextual_formal().is_some()
+        let (target, _, _, body) = self.validated_direct_body(&topology.structure, call, &declaration.source, declaration.range)?;
+        if (cross_source && !completed_namespace_owner(source, &declaration.source, target.0, Some(visits)))
+            || self.active.contains(&target) || body.contextual_formal().is_some()
             || body.boundary.parameters.len() != signature.parameters.len()
             || !matches!(body.boundary.results.as_slice(), [result] if &result.ty == expected)
         {
@@ -2694,7 +2698,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         // The ordinary ordered proof token supplies this value. This does
         // not execute the recursive body or widen the scalar evaluator.
-        let result = self.observer.proved_wide_initializer_return(target, body, &arguments, expected)
+        let result = self.observer.proved_wide_initializer_return(target, body, &arguments, expected, cross_source)
             .ok_or(ProjectCheck::Unsupported)?;
         self.reached.insert(target);
         Ok(Some(result))
@@ -7603,6 +7607,7 @@ struct RankedOrderedEvidence<'a, 'proof> {
     rank: TypedInductionRank<'a>,
     allow_reached: bool,
     allow_wide_initializer: bool,
+    allow_qualified_wide_initializer: bool,
     allow_symbolic_summary: bool,
     reached_return: Option<Option<VerifiedInductionExactReturn<'proof>>>,
 }
@@ -7615,9 +7620,10 @@ impl ActualIntegerObserver for RankedOrderedEvidence<'_, '_> {
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
 
     fn proved_wide_initializer_return(
-        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType, cross_source: bool,
     ) -> Option<BigInt> {
-        if !self.allow_wide_initializer || target != self.plan.target || !std::ptr::eq(body, self.plan.typed.body)
+        let allowed = if cross_source { self.allow_qualified_wide_initializer } else { self.allow_wide_initializer };
+        if !allowed || target != self.plan.target || !std::ptr::eq(body, self.plan.typed.body)
             || !matches!(&self.plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
         {
             return None;
@@ -7803,9 +7809,9 @@ impl ActualIntegerObserver for MixedOrderedEvidence<'_, '_> {
     }
 
     fn proved_wide_initializer_return(
-        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType, cross_source: bool,
     ) -> Option<BigInt> {
-        self.ranked.get_mut(&target)?.proved_wide_initializer_return(target, body, arguments, expected)
+        self.ranked.get_mut(&target)?.proved_wide_initializer_return(target, body, arguments, expected, cross_source)
     }
 
     fn proved_recursive_return(
@@ -7918,6 +7924,9 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
         allow_reached: existing_transfer_arity
             && (plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count)),
         allow_wide_initializer: !existing_transfer_arity && plan.proof_source == root_source,
+        allow_qualified_wide_initializer: !existing_transfer_arity && LOCAL_CATALOGS && plan.target.0 < startup_count
+            && plan.proof_source != root_source && plan.proof_source.project == root_source.project
+            && plan.proof_source.package == root_source.package,
         allow_symbolic_summary: plan.proof_source == root_source,
         reached_return: None,
     })
@@ -18410,6 +18419,93 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let effectful = library.replace("worker(value);", &format!("core.require(false, {OUTPUT}); worker(value);"));
             assert!(matches!(run(main, &effectful, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_qualified_wide_ranked_initializers_require_completed_proof_owner() {
+        let app = source("src/main.w", "wide-qualified-rank-app");
+        let owner = source("src/lib.w", "wide-qualified-rank-lib");
+        let main = r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8 first = lib.descend(2, 3, 1, 4);
+            core.require(first == 7, { .stdout = "wrong first"; .stderr = ""; .code = 20; .files = []; });
+            u8 last = 4;
+            u8 second = lib.descend(0, 1, 3, last);
+            core.require(second == 7, { .stdout = "wrong second"; .stderr = ""; .code = 21; .files = []; });
+            core.require(first == 8, { .stdout = "first"; .stderr = ""; .code = 22; .files = []; });
+            core.require(second == 8, { .stdout = "second"; .stderr = ""; .code = 23; .files = []; });
+        %%end"#;
+        let library = r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {
+                if (left == 0) { 7 } else { descend(page, slot, left - 1, quota) }
+            };
+            proof rank for descend(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && quota == 4)
+                ensures (out == 7) decreases (left) {
+                if (left == 0) { core.show(out == 7); }
+                else { core.use(rank(page, slot, left - 1, quota)); }
+            }
+            core.require(false, { .stdout = "provider once"; .stderr = ""; .code = 17; .files = []; });
+        %%end"#;
+        let portal = |owner: &SourceIdentity| ScalarNamespaceBinding {
+            binding: "lib".into(), target: owner.clone(), span: ByteSpan::new(0, 0),
+        };
+        let run = |main: &str, library: &str, owner: &SourceIdentity, scope| {
+            let (_, catalog) = crate::parse_proof_source(owner.clone(), library.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, main), vec![portal(owner)])], [(catalog, Vec::new())],
+                vec![app.clone(), owner.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(main, library, &owner, scope).unwrap();
+            assert!(receipt.active && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [provider, first, second] = receipt.directives.as_slice() else { panic!("provider first, then both calls"); };
+            assert_eq!((&provider.source, provider.stdout()), (&owner, b"provider once".as_slice()));
+            assert_eq!((&first.source, first.stdout()), (&app, b"first".as_slice()));
+            assert_eq!((&second.source, second.stdout()), (&app, b"second".as_slice()));
+            assert_ne!(first.condition, second.condition);
+            let no_rank = library.split("            proof rank").next().unwrap().to_owned() + "%%end";
+            assert!(matches!(run(main, &no_rank, &owner, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(run(&main.replace("3, last)", "3, 5)"), library, &owner, scope),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let foreign = SourceIdentity { project: "other-project".into(), ..owner.clone() };
+            assert!(matches!(run(main, library, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+
+        // Exercise the real prepared call edge with different visit receipts
+        // rather than manufacturing an impossible source order.
+        let (_, catalog) = crate::parse_proof_source(owner.clone(), library.to_owned(), &[]).ok().unwrap();
+        let prepared = prepare_loaded_proof_project(vec![(declarations(&app, main), vec![portal(&owner)])],
+            vec![(catalog, Vec::new())], vec![app.clone(), owner.clone()], inputs(), Vec::new(), true).unwrap();
+        let plan = prepared.plan_module_proof_in_scope::<true, false, false>(&owner, "rank").unwrap();
+        let (project, calls) = prepared.prepared.parts();
+        let caller = project.modules.iter().position(|module| module.source == app).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization_region(caller).unwrap().detail
+            else { panic!("expected checked startup occurrences"); };
+        let call = topology.call_targets.iter().filter_map(|(&call, target)| match target {
+            ModuleInitializationCallTarget::Direct { declaration, .. } if declaration.source == owner => Some(call),
+            _ => None,
+        }).min_by_key(|call| call.0).unwrap();
+        let rank = plan.typed.measure.unwrap();
+        let observer = closed_ranked_evidence::<true>(&app, project.modules.len(), &plan, rank).unwrap();
+        let mut actual = CheckedCalls::<_, true> {
+            project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            had_obligations: false, observer, symbolic_module: 0,
+        };
+        let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
+        for status in [InitializationVisit::Unseen, InitializationVisit::Started] {
+            visits[plan.target.0] = status;
+            assert!(matches!(actual.wide_ranked_startup_initializer(topology, &app, call, &ScalarType::U8,
+                &HashMap::new(), true, &visits), Err(ProjectCheck::Unsupported)));
+            assert!(actual.observer.reached_return.is_none() && actual.reached.is_empty());
+        }
+        visits[plan.target.0] = InitializationVisit::Completed;
+        assert!(matches!(actual.wide_ranked_startup_initializer(topology, &app, call, &ScalarType::U8,
+            &HashMap::new(), false, &visits), Err(ProjectCheck::Unsupported)));
+        assert_eq!(actual.wide_ranked_startup_initializer(topology, &app, call, &ScalarType::U8,
+            &HashMap::new(), true, &visits).unwrap(), Some(BigInt::from(7)));
     }
 
     #[cfg(feature = "internal-checker")]
