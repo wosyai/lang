@@ -14378,3 +14378,59 @@ unit(*(u8[]), *u8[], *(u8[])[], u8[][]) shapes = fn(view, refs, views, nested) {
     assert!(matches!(parameters.as_slice(), [ty] if is_view(ty)), "{parameters:?}");
     assert!(matches!(outputs.outputs.as_slice(), [output] if is_view(&output.ty)), "{outputs:?}");
 }
+
+#[test]
+fn lexical_allocator_qualification_seals_instance_identity_and_rejects_dispatch() {
+    use super::control::BlockItemKind;
+    let source = source();
+    let text = "%%start
+struct Heap {
+    *?u8(u64, u64) alloc;
+    unit(*?u8) free;
+}
+u64(Heap, Heap, u64) observe = fn(first, second, count) {
+    $first u8[count] left;
+    $second u8[count] right;
+    core.array_len(&left) + core.array_len(&right)
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let module = &prepared.project().modules[0];
+        let ScalarItem::Function(function) = &module.items[0] else { panic!("allocator witness function") };
+        let calls = prepared.function_calls(0, 0);
+        let block = &calls.structure.blocks[calls.structure.root.0];
+        let mut owners = Vec::new();
+        for item in &block.items[..2] {
+            let BlockItemKind::Binding(binding) = &item.kind else { panic!("qualified local binding") };
+            owners.push(binding.allocator.as_ref().expect("prepared allocator qualifier"));
+        }
+        for (position, owner) in owners.iter().enumerate() {
+            assert_eq!(owner.instance.declaration_span, function.parameter_spans[position]);
+            assert_eq!(owner.alloc, module.structs[0].fields[0].id);
+            assert_eq!(owner.free, module.structs[0].fields[1].id);
+        }
+        assert_ne!(owners[0].instance, owners[1].instance);
+        let checked = crate::analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().iter().any(|diagnostic|
+            diagnostic.message.contains("qualified allocator callback dispatch is not supported")));
+        assert!(crate::emit_scalar_build_single_module_llvm(&checked).is_err());
+        assert!(crate::emit_scalar_build_project_llvm(&checked).is_err());
+        for (malformed, expected) in [
+            (text.replace("$second u8[count] right;", "$missing u8[count] missing; core.array_len(&missing); $second u8[count] right;"), "in-scope lexical allocator instance"),
+            (text.replace("unit(*?u8) free;", "unit(u64) free;"), "exact allocator protocol"),
+        ] {
+            let malformed = prepare(&malformed).err().expect("invalid allocator qualifier rejects");
+            assert!(malformed.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(expected)),
+                "{:?}", malformed.diagnostics);
+        }
+    }
+}

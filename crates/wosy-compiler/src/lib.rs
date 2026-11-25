@@ -19,7 +19,7 @@ pub use scalar::{
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
     prepare_scalar_project, prepare_scalar_project_with_access, validate_scalar_project, BinaryOperator, PreparedScalarProject,
     ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
-    ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
+    ScalarAllocatorQualifier, ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,
     ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction, ScalarInitializationNode,
     ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding, ScalarOutput,

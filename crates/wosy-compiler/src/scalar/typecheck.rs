@@ -7502,6 +7502,9 @@ impl<'tree> StaticUseAnalyzer<'tree> {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 if binding.is_allocation {
+                    if let Some(qualifier) = &binding.allocator_qualifier {
+                        self.use_name(&qualifier.name);
+                    }
                     for receiver in &binding.receivers {
                         if let Some(length) = &receiver.allocation_length {
                             self.expression(length);

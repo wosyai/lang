@@ -53,11 +53,13 @@ conditional_unterminated = { !";" ~ !"}" }
 block_item = { local_binding | unsafe_block_item ~ !";" | expression ~ ";" }
 unsafe_block_item = { unsafe_expr }
 final_output_list = { output_list }
-local_binding = { allocation_binding | fallible_receiver_list ~ fallible_assignment_operator ~ single_output_list ~ ";" | receiver_list ~ "=" ~ output_list ~ ";" }
+local_binding = { qualified_allocation_binding | allocation_binding | fallible_receiver_list ~ fallible_assignment_operator ~ single_output_list ~ ";" | receiver_list ~ "=" ~ output_list ~ ";" }
 fallible_receiver_list = { receiver }
 fallible_assignment_operator = @{ "=?" }
 single_output_list = { expression }
 allocation_binding = { runtime_receiver ~ ";" }
+qualified_allocation_binding = { allocator_qualifier ~ runtime_receiver ~ ";" }
+allocator_qualifier = { "$" ~ identifier }
 runtime_receiver = { type_name ~ "[" ~ expression ~ "]" ~ identifier }
 expression = { conditional_expr | unsafe_expr | assignment | logical_or }
 conditional_expr = ${ conditional_head ~ conditional_else? }

@@ -728,6 +728,9 @@ pub enum ReferenceAnalysisErrorReason {
     UnprovedArrayLength,
     UnprovedWidenedArrayTransfer,
     UnprovedFallibleCallInitializer,
+    MissingLexicalAllocator,
+    UnsupportedLexicalAllocatorProtocol,
+    UnsupportedLexicalAllocatorDispatch,
     UnprovedReturnedArraySelector,
     MissingRequiredDereferenceOrigin,
     UnprovedCheckedArrayIndex,
@@ -751,6 +754,9 @@ impl ReferenceAnalysisErrorReason {
             Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
             Self::UnprovedReturnedArraySelector => "returned array index requires an exact bounded selector",
             Self::UnprovedArrayLength => "core.array_len requires an exact local array extent",
+            Self::MissingLexicalAllocator => "allocator qualifier requires an in-scope lexical allocator instance",
+            Self::UnsupportedLexicalAllocatorDispatch => "qualified allocator callback dispatch is not supported; no default allocator fallback",
+            Self::UnsupportedLexicalAllocatorProtocol => "allocator qualifier requires a struct with alloc and individual free fields of the exact allocator protocol",
             Self::UnprovedFallibleCallInitializer => "fallible call initializer requires a checked allocation-free scalar callable",
             Self::UnprovedWidenedArrayTransfer => "widened array backing must remain in its original local binding",
             Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
@@ -2100,6 +2106,12 @@ pub struct ScalarAssignmentTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarAllocatorQualifier {
+    pub name: String,
+    pub span: ByteSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarBinding {
     pub name: String,
     pub name_span: ByteSpan,
@@ -2110,6 +2122,8 @@ pub struct ScalarBinding {
     pub output_values: Vec<ScalarOutputValue>,
     pub output_origin: ScalarBindingOutputOrigin,
     pub is_allocation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocator_qualifier: Option<ScalarAllocatorQualifier>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallible_assignment: Option<ByteSpan>,
     pub span: ByteSpan,
@@ -3399,6 +3413,11 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_values,
         output_origin,
         is_allocation: outputs.is_empty(),
+        allocator_qualifier: receiver_list.children().find(|child| child.kind() == SyntaxKind::AllocatorQualifier)
+            .map(|qualifier| {
+                let name = direct_token(&qualifier, SyntaxKind::Identifier).expect("allocator qualifier name");
+                ScalarAllocatorQualifier { name: name.text().to_owned(), span: wosy_syntax::byte_span(&qualifier) }
+            }),
         fallible_assignment: direct_token(node, SyntaxKind::FallibleAssignmentOperator)
             .as_ref().map(token_span),
         span: wosy_syntax::byte_span(node),
