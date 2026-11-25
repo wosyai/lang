@@ -2400,6 +2400,7 @@ pub fn derive_scalar_declarations_from_cst(
         false,
         false,
         false,
+        None,
         #[cfg(any(test, feature = "internal-checker"))]
         None,
         #[cfg(feature = "internal-checker")]
@@ -2410,7 +2411,7 @@ pub fn derive_scalar_declarations_from_cst(
 /// Retains proof declarations solely for the canonical Build static typing pass.
 #[doc(hidden)]
 pub fn derive_scalar_build_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
-    derive_scalar_declarations(canonical, false, false, true,
+    derive_scalar_declarations(canonical, false, false, true, None,
         #[cfg(any(test, feature = "internal-checker"))] None,
         #[cfg(feature = "internal-checker")] false)
 }
@@ -2418,7 +2419,7 @@ pub fn derive_scalar_build_declarations_from_cst(canonical: &CanonicalCstRoot) -
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
 pub fn derive_scalar_check_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
-    derive_scalar_declarations(canonical, false, false, false, None, true)
+    derive_scalar_declarations(canonical, false, false, false, None, None, true)
 }
 
 fn derive_scalar_declarations(
@@ -2426,6 +2427,7 @@ fn derive_scalar_declarations(
     dormant_context: bool,
     contextual_proof_runtime: bool,
     retain_build_proofs: bool,
+    deferred_contextual_boundary: Option<&mut Option<Diagnostic>>,
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
     #[cfg(feature = "internal-checker")] check_typed_runtime_matches: bool,
 ) -> ScalarSourceDeclarations {
@@ -2522,10 +2524,15 @@ fn derive_scalar_declarations(
         contextual::ContextualPlaces::default()
     };
     if contextual && has_named_proofs && include_proof_diagnostics {
-        diagnostics.push(contextual::reported_error(
+        let boundary = contextual::reported_error(
             SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&source_root)),
             "contextual storage with named proofs is not supported by this checker boundary",
-        ));
+        );
+        if let Some(deferred) = deferred_contextual_boundary {
+            *deferred = Some(boundary);
+        } else {
+            diagnostics.push(boundary);
+        }
     }
     let mut executable_matches = HashMap::new();
     for plan in runtime_enum_matches {
@@ -4216,7 +4223,7 @@ pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_sc
 #[cfg(feature = "internal-checker")]
 pub(crate) use checker_project::derive_scalar_proof_declarations_from_cst;
 #[cfg(feature = "internal-checker")]
-pub(crate) use checker_project::derive_configured_scalar_proof_declarations_from_cst;
+pub(crate) use checker_project::{derive_configured_scalar_proof_declarations_from_cst, derive_configured_root_scalar_proof_declarations_from_cst};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{

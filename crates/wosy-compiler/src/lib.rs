@@ -415,6 +415,14 @@ pub fn parse_configured_proof_source(
 }
 
 #[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_configured_root_proof_source(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_configured_root_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
 fn parse_proof_source_for(
     source: SourceIdentity, text: String, configured_comments: &[String],
     derive: impl FnOnce(&wosy_syntax::CanonicalCstRoot) -> ScalarProofDeclarations,

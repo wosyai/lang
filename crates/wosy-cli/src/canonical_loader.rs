@@ -351,10 +351,12 @@ pub(crate) fn load_canonical_project_inputs(
         let (text, declarations) = match &purpose {
             #[cfg(feature = "internal-checker")]
             _ if parse_proofs => {
-                let parse = if matches!(&purpose, CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_))
-                    && root_node.is_some()
-                {
-                    wosy_compiler::parse_configured_proof_source
+                let parse = if matches!(&purpose, CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_)) {
+                    if root_node.is_some() {
+                        wosy_compiler::parse_configured_proof_source
+                    } else {
+                        wosy_compiler::parse_configured_root_proof_source
+                    }
                 } else {
                     wosy_compiler::parse_proof_source
                 };

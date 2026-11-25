@@ -345,7 +345,7 @@ pub(super) fn prepare_dormant_context(
 pub(super) fn prepare_contextual_transport(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool, contextual_proof: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
-    let source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, false, None, #[cfg(feature = "internal-checker")] false);
+    let source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, false, None, None, #[cfg(feature = "internal-checker")] false);
     prepare_contextual_transport_from_source(source, inputs, checker_directives)
 }
 
@@ -371,7 +371,7 @@ pub(super) fn prepare_contextual_transport_graph_with_proof_root(
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
     checker_directives: bool, allow_empty_startup: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
-    prepare_contextual_transport_graph_with_targets(sources, initialization_order, inputs, checker_directives, allow_empty_startup, &[], false)
+    prepare_contextual_transport_graph_with_targets(sources, initialization_order, inputs, checker_directives, allow_empty_startup, &[], false, false)
 }
 
 #[cfg(any(test, feature = "internal-checker"))]
@@ -380,6 +380,7 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
     checker_directives: bool, allow_empty_startup: bool, queries: &[super::reference::CheckerTargetQuery<'_>],
     mixed_scalar_bindings: bool,
+    configured_root_scalar: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{BindingInitialization, BlockItemKind, ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -450,7 +451,7 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
             } = &resolved.target else { return Err(Unsupported); };
             let owner = project.modules.get(resolved.declaration.0).ok_or(Unsupported)?;
             let Some(ScalarItem::Function(function)) = owner.items.get(resolved.declaration.1) else { return Err(Unsupported); };
-            if query.receiver.is_some() || query.source != source || source == root
+            if query.receiver.is_some() || query.source != source || (source == root) != configured_root_scalar
                 || source != &owner.source || *declaration_span != function.name_span
             {
                 return Err(Unsupported);
@@ -494,13 +495,14 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
                     let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
                         = topology.call_targets.get(&outputs.primary).ok_or(Unsupported)? else { return Err(Unsupported); };
                     let signature = topology.checked_call_signatures.get(&outputs.primary).ok_or(Unsupported)?;
-                    if !matches!(&binding.value, ScalarExpression::Call { receiver: Some(_), .. })
+                    if !matches!(&binding.value, ScalarExpression::Call { receiver, .. }
+                        if receiver.is_none() == configured_root_scalar)
                         || binding.is_allocation || receiver.contextual_storage.is_some() || !outputs.secondary.is_empty()
                         || !typecheck::is_integer_type(&receiver.ty)
                         || !matches!(signature.parameters.as_slice(), [parameter] if typecheck::is_integer_type(parameter))
                         || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty)
                         || topology.structure.checked_types.expressions.get(&outputs.primary) != Some(&receiver.ty)
-                        || declaration.source == *root
+                        || (declaration.source == *root) != configured_root_scalar
                         || !topology.structure.checker_direct_targets.get(&outputs.primary).is_some_and(|target| watched.contains(target))
                         || !scalar_initializers.insert(outputs.primary)
                     {
