@@ -83,10 +83,33 @@ impl BaseDeclarationsView {
     }
 }
 
-fn query_key(executable: NodeId) -> [u8; 33] {
+pub(super) fn query_key(executable: NodeId) -> [u8; 33] {
     let mut hasher = blake3::Hasher::new_derive_key(BASE_DECLARATION_ABI);
     hasher.update(wosy_syntax::base_cst_schema()).update(&executable.0);
     key(BASE_DECLARATION_QUERIES, NodeId(*hasher.finalize().as_bytes()))
+}
+
+enum Payload<'a> {
+    Inline(&'a [u8]),
+    Blob(blake3::Hash),
+}
+
+fn decode_payload(data: &[u8]) -> Result<Payload<'_>> {
+    let Some((tag, body)) = data.split_first() else {
+        return Err("missing canonical declaration payload".into());
+    };
+    match *tag {
+        INLINE => Ok(Payload::Inline(body)),
+        BLOB => Ok(Payload::Blob(blake3::Hash::from_bytes(body.try_into()?))),
+        _ => Err("invalid canonical declaration payload kind".into()),
+    }
+}
+
+pub(super) fn cas_digest(data: &[u8]) -> Result<Option<NodeId>> {
+    Ok(match decode_payload(data)? {
+        Payload::Inline(_) => None,
+        Payload::Blob(digest) => Some(NodeId(*digest.as_bytes())),
+    })
 }
 
 fn detached_identity(executable: NodeId) -> SourceIdentity {
@@ -219,14 +242,10 @@ impl SourceStore {
         if node.kind != Kind::BaseDeclarations || node.children != [executable] {
             return Err("invalid canonical declaration query result".into());
         }
-        let Some((tag, body)) = node.data.split_first() else {
-            return Err("missing canonical declaration payload".into());
-        };
         let blob;
-        let data = match *tag {
-            INLINE => body,
-            BLOB => {
-                let digest = blake3::Hash::from_bytes(body.try_into()?);
+        let data = match decode_payload(&node.data)? {
+            Payload::Inline(body) => body,
+            Payload::Blob(digest) => {
                 match fs::read(self.blobs.join(digest.to_hex().as_str())) {
                     Ok(bytes) if blake3::hash(&bytes) == digest => blob = bytes,
                     Ok(_) => return Ok(None),
@@ -235,7 +254,6 @@ impl SourceStore {
                 }
                 blob.as_slice()
             }
-            _ => return Err("invalid canonical declaration payload kind".into()),
         };
         let mut parser = serde_json::Deserializer::from_slice(data);
         parser.disable_recursion_limit();

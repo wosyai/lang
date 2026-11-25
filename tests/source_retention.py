@@ -124,3 +124,67 @@ with tempfile.TemporaryDirectory() as work:
            "publish_and_ack_peak_kib": publish_rss, "median_pin_ack_ms": round(median(pins), 3),
            "median_unpin_ack_ms": round(median(unpins), 3), "kv_bytes_delta": after-before,
            "cas_created": False}, flush=True)
+
+
+with tempfile.TemporaryDirectory() as work:
+    root, foreign, store = (Path(work) / part for part in ("nominated", "other-owner", "store"))
+    old_text = (
+        "%%start\n# WHY: original\nu32 value = 17;\n"
+        + "".join(f"u32 body{i} = {i};\n" for i in range(180)) + "%%end\n"
+    )
+    leaf = project(root, old_text)
+    old = run(root, store)[0]["snapshot"]["source_root"]
+    run(root, store, old, "--project-declarations")
+
+    changed_text = old_text.replace("value = 17;", "value = 19;")
+    leaf.write_text(changed_text)
+    latest = run(root, store, old)[0]["snapshot"]["source_root"]
+    run(root, store, latest, "--project-declarations")
+
+    def plan(*selection):
+        return run(root, store, latest, "--source-plan", "20000", *selection)
+
+    before, before_wall, before_rss = plan(old)
+    assert (before["nominated_roots"], before["protected_roots"], before["candidate_roots"]) == (1, 1, 1)
+    assert before["candidate_only_nodes"] > 0 and before["shared_nodes"] > 0
+    assert before["candidate_only_cas_references"] == 1
+    assert before["candidate_only_node_bytes"] > 0
+    same, _, _ = plan(old)
+    assert same["protection_epoch"] == before["protection_epoch"]
+
+    held, _, _ = plan(old, "--keep", old)
+    assert held["candidate_roots"] == held["candidate_only_nodes"] == 0
+    assert held["protection_epoch"] != before["protection_epoch"]
+    run(root, store, old, "--source-pin", "inspection")
+    pinned, _, _ = plan(old)
+    assert pinned["candidate_roots"] == pinned["candidate_only_nodes"] == 0
+    assert pinned["protection_epoch"] != before["protection_epoch"]
+    run(root, store, latest, "--source-unpin", "inspection")
+    restored, _, _ = plan(old)
+    assert restored["protection_epoch"] == before["protection_epoch"]
+    assert restored["candidate_only_nodes"] == before["candidate_only_nodes"]
+
+    # Even without its own pin, a root not explicitly nominated is protected.
+    # Its shared executable body removes the old CAS payload from the estimate.
+    project(foreign, old_text)
+    other_root = run(foreign, store)[0]["snapshot"]["source_root"]
+    assert listed(foreign, store, other_root) == []
+    protected, _, _ = plan(old)
+    assert protected["candidate_roots"] == 1 and protected["protected_roots"] == 2
+    assert protected["candidate_only_cas_references"] == 0
+    assert protected["protection_epoch"] != before["protection_epoch"]
+    assert protected["candidate_only_nodes"] < before["candidate_only_nodes"]
+
+    # Planning made no changes to roots or available derived bodies.
+    assert run(root, store, old, "std", "src/values.w")[0]["text"] == old_text
+    assert run(root, store, latest, "std", "src/values.w")[0]["text"] == changed_text
+    assert run(foreign, store, other_root, "std", "src/values.w")[0]["text"] == old_text
+    assert run(root, store, old, "--project-declarations")[0]["bodies_derived"] == 0
+    assert len(list((store / "cas").iterdir())) == 2
+    print("atomic read-only retention census, pinned/held override, conservative cross-workspace sharing:",
+          {"old_exclusive_nodes": before["candidate_only_nodes"],
+           "old_shared_nodes": before["shared_nodes"], "old_encoded_bytes": before["candidate_only_node_bytes"],
+           "old_cas_refs": before["candidate_only_cas_references"],
+           "after_other_owner_cas_refs": protected["candidate_only_cas_references"],
+           "elapsed_ms": before["query_ms"], "process_wall_ms": before_wall,
+           "peak_child_kib": before_rss}, flush=True)

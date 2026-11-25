@@ -3,12 +3,24 @@ use super::{key, published_source, read_node, source_top, Result, SourceStore, S
 use surrealkv::{Durability, LSMIterator, Mode, Transaction};
 use wosy_protocol::{NodeId, SourceConfig};
 
-const PINS: u8 = 10;
+pub(super) const PINS: u8 = 10;
 const OWNER_PREFIX_BYTES: usize = 34;
 
 pub struct SourcePin {
     pub name: String,
     pub root: NodeId,
+}
+
+pub(super) fn workspace_of_config(tx: &Transaction, id: NodeId) -> Result<String> {
+    let mut config: SourceConfig = serde_json::from_slice(&read_node(tx, id)?.data)?;
+    // Publication matched the entry's authored project to this namespace.
+    Ok(config.namespaces.remove(&config.entry.package)
+        .ok_or("pin scope is missing its entry namespace")?.project)
+}
+
+pub(super) fn decode_pin_value(bytes: &[u8]) -> Result<(NodeId, &[u8])> {
+    let (root, owner) = bytes.split_first_chunk::<32>().ok_or("incomplete source pin")?;
+    Ok((NodeId(*root), owner))
 }
 
 struct Owner {
@@ -31,11 +43,7 @@ impl Owner {
     }
 
     fn from_config(tx: &Transaction, id: NodeId) -> Result<Self> {
-        let mut config: SourceConfig = serde_json::from_slice(&read_node(tx, id)?.data)?;
-        // Publication already matched the entry's authored project to this
-        // namespace. It is independent of revision, annotations, and target.
-        let path = config.namespaces.remove(&config.entry.package)
-            .ok_or("pin scope is missing its entry namespace")?.project;
+        let path = workspace_of_config(tx, id)?;
         let id = NodeId(blake3::derive_key("wosy source pin workspace v1", path.as_bytes()));
         let mut prefix = [0; OWNER_PREFIX_BYTES];
         prefix[..33].copy_from_slice(&key(PINS, id));
@@ -64,11 +72,11 @@ impl Owner {
     }
 
     fn pinned_root(&self, bytes: &[u8]) -> Result<NodeId> {
-        let (root, owner) = bytes.split_first_chunk::<32>().ok_or("incomplete source pin")?;
+        let (root, owner) = decode_pin_value(bytes)?;
         if owner != self.path.as_bytes() {
             return Err("source pin has the wrong workspace owner".into());
         }
-        Ok(NodeId(*root))
+        Ok(root)
     }
 }
 

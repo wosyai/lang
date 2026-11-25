@@ -59,8 +59,12 @@ pub struct Node {
 }
 
 impl Node {
+    pub fn encoded_len(&self) -> usize {
+        9 + self.data.len() + 32 * self.children.len()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(9 + self.data.len() + 32 * self.children.len());
+        let mut bytes = Vec::with_capacity(self.encoded_len());
         bytes.push(self.kind as u8);
         bytes.extend_from_slice(&(self.data.len() as u64).to_be_bytes());
         bytes.extend_from_slice(&self.data);

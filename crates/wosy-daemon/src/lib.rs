@@ -44,12 +44,14 @@ mod base_declarations;
 mod pins;
 mod project_declarations;
 mod prepared_project;
+mod retention_plan;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
 pub use prepared_project::{ProjectPreparationReport, RootedPreparedProject};
+pub use retention_plan::SourceRetentionPlan;
 
 pub struct SourceStore {
     tree: Tree,

@@ -116,7 +116,7 @@ impl RootedOrder {
     }
 }
 
-fn projection_key(module: NodeId) -> [u8; 33] {
+pub(super) fn projection_key(module: NodeId) -> [u8; 33] {
     let mut hasher = blake3::Hasher::new_derive_key(MODULE_DECLARATION_ABI);
     hasher.update(BASE_DECLARATION_ABI.as_bytes())
         .update(wosy_syntax::base_cst_schema()).update(&module.0);
