@@ -1245,7 +1245,7 @@ pub(super) struct GuardedNumericExpression {
 #[derive(Debug)]
 pub(super) enum GuardedNumericNode {
     Atom(u64),
-    Call(OccurrenceOrdinal),
+    Call(OccurrenceOrdinal, usize),
     Add,
     And,
     OrXor,
@@ -1260,7 +1260,11 @@ impl GuardedNumericExpression {
         for node in &self.operations {
             let bound = match *node {
                 GuardedNumericNode::Atom(bound) => bound,
-                GuardedNumericNode::Call(site) => if allocated(site) { u64::from(u32::MAX) } else { u64::MAX },
+                GuardedNumericNode::Call(site, staged_arguments) => {
+                    let Some(keep) = bounds.len().checked_sub(staged_arguments) else { return false; };
+                    bounds.truncate(keep);
+                    if allocated(site) { u64::from(u32::MAX) } else { u64::MAX }
+                }
                 GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Select => {
                     let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return false; };
                     match node {

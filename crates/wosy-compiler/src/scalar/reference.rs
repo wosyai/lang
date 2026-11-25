@@ -3865,18 +3865,46 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     proof.operations.push(Node::Atom(u64::MAX));
                 }
                 ScalarExpression::Call { arguments, type_arguments, .. } => {
+                    let nested = arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }));
+                    if children_proved {
+                        proof.operations.push(Node::Call(occurrence, arguments.len()));
+                        continue;
+                    }
                     let signature = sites.checked_call_signatures.get(&occurrence)?;
                     let point = *self.cfg.primary_call_points.get(&occurrence)?;
-                    if !type_arguments.is_empty() || !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
-                            || aggregate::pure_widened_element(argument))
-                        || sites.declared_unsafe_calls.contains(&occurrence.0)
+                    let CfgPointKind::Call { output: 0, argument_points,
+                        target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. } =
+                        &self.cfg.points.get(point.0)?.kind else { return None; };
+                    if !type_arguments.is_empty() || sites.declared_unsafe_calls.contains(&occurrence.0)
                         || !signature.parameters.iter().all(aggregate::ordinary_value)
                         || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
-                        || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
-                            target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
                     { return None; }
                     proof.calls.push((point, occurrence));
-                    proof.operations.push(Node::Call(occurrence));
+                    if nested {
+                        if *payload != ScalarType::U64 || signature.parameters.len() != arguments.len()
+                            || !signature.parameters.iter().all(|ty| *ty == ScalarType::U64)
+                            || argument_points.len() != arguments.len()
+                        { return None; }
+                        stack.push((value, occurrence, true));
+                        for (position, argument) in arguments.iter().enumerate().rev() {
+                            let OccurrenceNode::Expression(child) = sites.structure.edges.get(&(
+                                OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(position),
+                            ))? else { return None; };
+                            match argument {
+                                ScalarExpression::Call { .. }
+                                    if sites.structure.checked_types.expressions.get(child) == Some(&ScalarType::U64)
+                                        && self.cfg.primary_call_points.get(child) == Some(&argument_points[position]) => {}
+                                ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } => {}
+                                _ => return None,
+                            }
+                            stack.push((argument, *child, false));
+                        }
+                    } else {
+                        if !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
+                            || aggregate::pure_widened_element(argument))
+                        { return None; }
+                        proof.operations.push(Node::Call(occurrence, 0));
+                    }
                 }
                 ScalarExpression::Binary { operator, left, right, .. } => {
                     if children_proved {
@@ -5031,6 +5059,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         Some((source.declaration_span, count))
                     })();
                     let before = self.cursor;
+                    let walk_fallible_expression = binding.fallible_assignment.is_some()
+                        && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                            || matches!(primary, ScalarExpression::Call { arguments, .. }
+                                if arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
                     let value = if let Some((owner, count)) = fixed_copy_receiver {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
                     } else if let Some(owner) = widened_receiver_source {
@@ -5054,9 +5086,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             primary_ordinal,
                             ExpressionReadMode::GuardedStructInitializer,
                         )?
-                    } else if binding.fallible_assignment.is_some()
-                        && matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
-                    {
+                    } else if walk_fallible_expression {
                         let previous = self.capture_call_points;
                         self.capture_call_points = true;
                         let result = self.expression(primary, scope, primary_ordinal);
@@ -5065,9 +5095,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         self.expression(primary, scope, primary_ordinal)?
                     };
-                    if binding.fallible_assignment.is_some()
-                        && matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
-                    {
+                    if walk_fallible_expression {
                         let Some(expression) = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
                             self.generic_parameters.is_empty() && binding_region.receivers().len() == 1
                             && outputs.secondary.is_empty())
@@ -5111,7 +5139,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             self.aggregate_result.ordinary_fallible_call_candidates.push(primary_ordinal);
                         }
                     }
-                    if let (Some(_), ScalarExpression::Call { arguments, .. }) = (binding.fallible_assignment, primary)
+                    if let (Some(_), ScalarExpression::Call { arguments, .. }, false) =
+                        (binding.fallible_assignment, primary, walk_fallible_expression)
                     {
                         // Allocation-free callee evidence does not cover its
                         // caller-side argument evaluation.

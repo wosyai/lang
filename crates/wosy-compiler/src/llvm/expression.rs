@@ -342,6 +342,11 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(expression, ScalarExpression::Call { .. })
+        && aggregate_transfer::fallible_allocation_expression_at(state, expression)
+    {
+        return emit_contextual_numeric(context, state, expression, expected, ExpressionPath::Project { module, modules });
+    }
     match expression {
         ScalarExpression::Utf8 { value, .. } => emit_utf8_literal(context, state, value, expected),
         ScalarExpression::Unary {
@@ -814,26 +819,7 @@ fn emit_prepared_call<'ctx, 'module>(
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
     let ordinary_fallible = aggregate_transfer::ordinary_fallible_allocation_call_at(state, expression);
     if ordinary_fallible || aggregate_transfer::fallible_allocation_call_at(state, expression) {
-        let [EmitValue::Basic(BasicValueEnum::IntValue(count))] = values.as_slice() else {
-            return Err("invalid sealed fallible allocation call argument".into());
-        };
-        let callee = state.functions.get(target).ok_or("missing sealed fallible allocation callable")?;
-        let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(target) else {
-            return Err("missing sealed fallible allocation callable signature".into());
-        };
-        let [output] = outputs.outputs.as_slice() else {
-            return Err("invalid sealed fallible allocation output signature".into());
-        };
-        let pair = aggregate_transfer::fallible_allocation_result_type(context, &output.ty)?;
-        if callee.get_linkage() != Linkage::Internal
-            || callee.get_type() != pair.fn_type(&[context.i64_type().into()], false)
-        {
-            return Err("invalid sealed fallible allocation callable ABI".into());
-        }
-        let call = state.builder.build_call(*callee, &[(*count).into()], "fallible.rhs").map_err(builder_error)?;
-        let Some(BasicValueEnum::StructValue(result)) = call.try_as_basic_value().basic() else {
-            return Err("missing sealed fallible allocation result".into());
-        };
+        let result = emit_sealed_allocation_call_values(context, state, target, &values)?;
         if !ordinary_fallible {
             return Ok(EmitValue::Basic(result.into()));
         }
@@ -858,6 +844,32 @@ fn emit_prepared_call<'ctx, 'module>(
     reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
     aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;
     emit_call_values(context, state, target, values)
+}
+
+fn emit_sealed_allocation_call_values<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>, target: &str, values: &[EmitValue<'ctx>],
+) -> Result<inkwell::values::StructValue<'ctx>, String> {
+    let [EmitValue::Basic(BasicValueEnum::IntValue(count))] = values else {
+        return Err("invalid sealed fallible allocation call argument".into());
+    };
+    let callee = state.functions.get(target).ok_or("missing sealed fallible allocation callable")?;
+    let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(target) else {
+        return Err("missing sealed fallible allocation callable signature".into());
+    };
+    let [output] = outputs.outputs.as_slice() else {
+        return Err("invalid sealed fallible allocation output signature".into());
+    };
+    let pair = aggregate_transfer::fallible_allocation_result_type(context, &output.ty)?;
+    if callee.get_linkage() != Linkage::Internal
+        || callee.get_type() != pair.fn_type(&[context.i64_type().into()], false)
+    {
+        return Err("invalid sealed fallible allocation callable ABI".into());
+    }
+    let call = state.builder.build_call(*callee, &[(*count).into()], "fallible.rhs").map_err(builder_error)?;
+    let Some(BasicValueEnum::StructValue(result)) = call.try_as_basic_value().basic() else {
+        return Err("missing sealed fallible allocation result".into());
+    };
+    Ok(result)
 }
 
 fn reject_unpaired_fixed_copy_argument(
@@ -2547,6 +2559,7 @@ fn emit_fallible_numeric<'ctx>(
     enum Step<'ctx, 'ast> {
         Emit(&'ast ScalarExpression),
         Binary(&'ast BinaryOperator),
+        Call(&'ast ScalarExpression, usize),
         BeginElse { value: &'ast ScalarExpression, block: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
         EndElse { then_value: BasicValueEnum<'ctx>, then_end: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
     }
@@ -2555,6 +2568,20 @@ fn emit_fallible_numeric<'ctx>(
         .ok_or("missing fallible expression function")?;
     let merge = context.append_basic_block(function, "fallible.binary_merge");
     let mut absent = Vec::new();
+    let take_present = |state: &mut EmitState<'ctx, '_>, tagged: inkwell::values::StructValue<'ctx>,
+        absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
+        if tagged.get_type() != pair { return Err("invalid sealed fallible numeric payload".into()); }
+        let test = state.builder.get_insert_block().ok_or("missing fallible operand test block")?;
+        let present = context.append_basic_block(function, "fallible.binary_present");
+        let succeeded = state.builder.build_extract_value(tagged, 0, "fallible.operand_succeeded")
+            .map_err(builder_error)?.into_int_value();
+        state.builder.build_conditional_branch(succeeded, present, merge).map_err(builder_error)?;
+        absent.push(test);
+        state.builder.position_at_end(present);
+        let value = state.builder.build_extract_value(tagged, 1, "fallible.operand_payload")
+            .map_err(builder_error)?;
+        Ok(EmitValue::Basic(value))
+    };
     let mut values = Vec::new();
     let mut stack = vec![Step::Emit(expression)];
     while let Some(step) = stack.pop() {
@@ -2564,6 +2591,30 @@ fn emit_fallible_numeric<'ctx>(
                 let right = values.pop().ok_or("missing fallible binary right operand")?;
                 let left = values.pop().ok_or("missing fallible binary left operand")?;
                 values.push(emit_binary_values(state, operator, left, right, *payload == ScalarType::U64)?);
+                continue;
+            }
+            Step::Call(call, arity) => {
+                let keep = values.len().checked_sub(arity).ok_or("missing sealed staged call arguments")?;
+                let arguments = values.split_off(keep);
+                let Some(PreparedCall::Symbol(target)) = state.prepared_call(call)? else {
+                    return Err("missing sealed direct staged call target".into());
+                };
+                if *payload != ScalarType::U64 || !arguments.iter().all(|argument|
+                    matches!(argument, EmitValue::Basic(BasicValueEnum::IntValue(value))
+                        if value.get_type() == context.i64_type()))
+                { return Err("invalid sealed staged call arguments".into()); }
+                let value = if aggregate_transfer::fallible_allocation_call_at(state, call) {
+                    let tagged = emit_sealed_allocation_call_values(context, state, &target, &arguments)?;
+                    take_present(state, tagged, &mut absent)?
+                } else {
+                    let callee = state.functions.get(target.as_ref()).ok_or("missing exact ordinary staged call")?;
+                    let types = vec![context.i64_type().into(); arity];
+                    if callee.get_type() != context.i64_type().fn_type(&types, false) {
+                        return Err("invalid sealed ordinary staged call ABI".into());
+                    }
+                    emit_call_values(context, state, &target, arguments)?
+                };
+                values.push(value);
                 continue;
             }
             Step::BeginElse { value, block, join } => {
@@ -2610,21 +2661,16 @@ fn emit_fallible_numeric<'ctx>(
                 stack.push(Step::BeginElse { value: else_value, block: else_block, join });
                 stack.push(Step::Emit(then_value));
             }
+            ScalarExpression::Call { arguments, .. } if arguments.iter()
+                .any(|argument| matches!(argument, ScalarExpression::Call { .. })) => {
+                    stack.push(Step::Call(node, arguments.len()));
+                    for argument in arguments.iter().rev() { stack.push(Step::Emit(argument)); }
+                }
             ScalarExpression::Call { .. } if aggregate_transfer::fallible_allocation_call_at(state, node) => {
                 let BasicValueEnum::StructValue(result) = take_basic(path.emit(context, state, node)?)? else {
                     return Err("missing sealed fallible operand result".into());
                 };
-                if result.get_type() != pair { return Err("invalid sealed fallible numeric payload".into()); }
-                let test = state.builder.get_insert_block().ok_or("missing fallible operand test block")?;
-                let present = context.append_basic_block(function, "fallible.binary_present");
-                let succeeded = state.builder.build_extract_value(result, 0, "fallible.operand_succeeded")
-                    .map_err(builder_error)?.into_int_value();
-                state.builder.build_conditional_branch(succeeded, present, merge).map_err(builder_error)?;
-                absent.push(test);
-                state.builder.position_at_end(present);
-                let value = state.builder.build_extract_value(result, 1, "fallible.operand_payload")
-                    .map_err(builder_error)?;
-                values.push(EmitValue::Basic(value));
+                values.push(take_present(state, result, &mut absent)?);
             }
             ScalarExpression::Integer { .. } | ScalarExpression::Name { .. } | ScalarExpression::Call { .. } =>
                 values.push(emit_contextual_numeric(context, state, node, payload, path)?),
