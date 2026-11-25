@@ -440,6 +440,9 @@ trait OrderedRunEvidence: ActualIntegerObserver {
     type SymbolicReport: Default;
     const HAS_NAMED_ROOT: bool = false;
 
+    fn consume_mixed_startup(&mut self, _: MixedStartupTap) -> Result<Vec<usize>, ProjectCheck> {
+        Err(ProjectCheck::Unsupported)
+    }
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck>;
     fn symbolic(&self) -> Self::Symbolic<'_>;
     fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run;
@@ -498,6 +501,7 @@ struct PreparedOrderedRun<E: OrderedRunEvidence> {
     symbolic: E::SymbolicReport,
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
     contextual_proofs: ContextualProofCohort,
+    mixed_context_after_actual: Option<Vec<usize>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -517,7 +521,7 @@ fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
 }
 
 #[cfg(feature = "internal-checker")]
-fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const DEFER_NAMED_TO_SYMBOLIC: bool>(
+fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXED_STARTUP: bool>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
     policy: OrderedReachPolicy, evidence: E, mut effects: OrderedFailures,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
@@ -529,14 +533,14 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const DEFER_NAMED_
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
         if !potential_obligations && !E::CONTEXTUAL && !E::HAS_NAMED_ROOT && effects.contextual_proofs.entries.is_empty() {
             return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None,
-                contextual_proofs: effects.contextual_proofs });
+                contextual_proofs: effects.contextual_proofs, mixed_context_after_actual: None });
         }
         authored_roots
     };
-    let (initialization, evidence) = if DEFER_NAMED_TO_SYMBOLIC {
+    let (initialization, mut evidence) = if PASSIVE_MIXED_STARTUP {
         if !matches!(policy, OrderedReachPolicy::Closed) { return Err(ProjectCheck::Unsupported); }
-        // Keep the actual contextual cursor profile intact. The named
-        // observer may consume only genuinely dormant symbolic roots.
+        // Evaluate using precisely the ordinary contextual startup profile.
+        // The tap records facts only after a canonical returning call.
         let (initialization, _) = check_package_initialization_observing_with_policy::<_, true, true>(
             prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
         )?;
@@ -551,8 +555,9 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const DEFER_NAMED_
     }? };
     for contextual in effects.contextual_proofs.entries.values_mut() {
         contextual.reached_at_startup = initialization.reached.contains(&contextual.target);
-        if DEFER_NAMED_TO_SYMBOLIC && !contextual.reached_at_startup { return Err(ProjectCheck::Unsupported); }
+        if PASSIVE_MIXED_STARTUP && !contextual.reached_at_startup { return Err(ProjectCheck::Unsupported); }
     }
+    let mixed_context_after_actual = effects.mixed_startup.take().map(|tap| evidence.consume_mixed_startup(tap)).transpose()?;
     let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations;
     let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
         let mut proof = evidence.symbolic();
@@ -587,7 +592,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const DEFER_NAMED_
     }
     Ok(PreparedOrderedRun {
         active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
-        contextual_proofs: effects.contextual_proofs,
+        contextual_proofs: effects.contextual_proofs, mixed_context_after_actual,
     })
 }
 
@@ -634,6 +639,22 @@ impl VerifiedContextualOutcome {
     fn matches_call(&self, source: &SourceIdentity, occurrence: OccurrenceOrdinal, span: ByteSpan) -> bool {
         &self.caller_source == source && self.occurrence == occurrence && self.leaf_call == span
     }
+}
+
+#[cfg(feature = "internal-checker")]
+struct MixedStartupTap {
+    captured: HashMap<PreparedCallable, usize>,
+    events: Vec<MixedStartupEvent>,
+    work: usize,
+}
+
+#[cfg(feature = "internal-checker")]
+enum MixedStartupEvent {
+    Scalar {
+        target: PreparedCallable, source: SourceIdentity, call: ByteSpan, directive_position: usize,
+        ty: ScalarType, argument: BigInt, returned: BigInt,
+    },
+    Contextual,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1334,6 +1355,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let collection = OrderedCallCollection::new(&sink, completed_visits);
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
                 had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false, named_mixed_pair: false, named_pair_work: 0 }, symbolic_module: ordinal,
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
@@ -1377,6 +1399,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         } else {
             let mut symbolic = CheckedCalls::<(), false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
                 had_obligations: false, observer: (), symbolic_module: ordinal,
             };
             if COLLECT {
@@ -1474,9 +1497,20 @@ fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntege
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
     let mut actual = CheckedCalls {
         project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
         had_obligations: false, observer, symbolic_module: 0,
     };
+    #[cfg(feature = "internal-checker")]
+    if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
+        actual.mixed_reached = Some(tap.captured.clone());
+    }
     walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures)?;
+    #[cfg(feature = "internal-checker")]
+    if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
+        if actual.mixed_reached.as_ref() != Some(&tap.captured) {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
     Ok((CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }, actual.observer))
 }
 
@@ -1528,7 +1562,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     || first.contextual_storage.is_some() || second.contextual_storage.is_some()
                 { return Err(ProjectCheck::Unsupported); }
                 let ActualCallResult::ResultPair(pair) = run_scalar_initializer_call(
-                    topology, actual, source, outputs.primary, &first.ty, Some(checked.receivers()), &storage, failures, visits,
+                    topology, actual, source, outputs.primary, &first.ty, Some(checked.receivers()), &storage, failures, visits, false,
                 )? else { return Err(ProjectCheck::Unsupported); };
                 for (receiver, value) in [first, second].into_iter().zip(pair) {
                     let typed = initialized_proof_atom(&receiver.ty, value).ok_or(ProjectCheck::Unsupported)?;
@@ -1575,7 +1609,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     if COLLECT && actual.can_initialize_fixed_arrays() =>
                 {
                     let ActualCallResult::FixedArray(cells) = run_scalar_initializer_call(
-                        topology, actual, source, outputs.primary, ty, None, &storage, failures, visits,
+                        topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, false,
                     )? else { return Err(ProjectCheck::Unsupported); };
                     InitializerValue::FixedArray { ty, cells }
                 }
@@ -1605,7 +1639,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
                         match run_scalar_initializer_call(
-                            topology, actual, source, outputs.primary, ty, None, &storage, failures, visits,
+                            topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, receiver.contextual_storage.is_none(),
                         )? {
                             ActualCallResult::Integer(value) => Cow::Owned(value),
                             #[cfg(feature = "internal-checker")]
@@ -1786,7 +1820,7 @@ fn reached_startup_condition(
         && topology.call_targets.contains_key(&condition)
     {
         return match run_scalar_initializer_call(
-            topology, actual, source, condition, &ScalarType::Bool, None, storage, failures, visits,
+            topology, actual, source, condition, &ScalarType::Bool, None, storage, failures, visits, false,
         )? {
             ActualCallResult::Integer(value) => super::checker_flow::bool_result_lane(&value)
                 .map(|lane| Some(lane == 1)).ok_or(ProjectCheck::Unsupported),
@@ -1858,7 +1892,7 @@ fn selected_startup_scalar<'a>(
         }
         ScalarExpression::Call { .. } => {
             let value = match run_scalar_initializer_call(
-                topology, actual, source, occurrence, expected, None, storage, failures, visits,
+                topology, actual, source, occurrence, expected, None, storage, failures, visits, false,
             )? {
                 ActualCallResult::Integer(value) => value,
                 ActualCallResult::EmptyScalar => return Ok(None),
@@ -1892,13 +1926,17 @@ fn run_scalar_initializer_call(
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] failures: &mut Option<&mut OrderedFailures>,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] visits: &[InitializationVisit],
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] passive_binding: bool,
 ) -> Result<ActualCallResult, ProjectCheck> {
     #[cfg(feature = "internal-checker")]
     let proof_site = actual.initializer_proof_site(topology, source, occurrence, failures.as_deref());
     #[cfg(feature = "internal-checker")]
     let sink = failures.as_deref_mut().map(RefCell::new);
     #[cfg(feature = "internal-checker")]
-    let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection::new(failures, Some(visits))));
+    let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
+        scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
+        ..OrderedCallCollection::new(failures, Some(visits))
+    }));
     #[cfg(not(feature = "internal-checker"))]
     let collection = None;
     run_initializer_call(
@@ -2153,6 +2191,8 @@ struct OrderedCallCollection<'a, 'visits> {
     #[cfg(feature = "internal-checker")]
     outer: Option<OrderedInitializerCall<'a>>,
     #[cfg(feature = "internal-checker")]
+    scalar_initializer: Option<OrderedInitializerCall<'a>>,
+    #[cfg(feature = "internal-checker")]
     meter_named_legacy_unit: bool,
 }
 
@@ -2162,6 +2202,8 @@ impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
             failures, visits,
             #[cfg(feature = "internal-checker")]
             outer: None,
+            #[cfg(feature = "internal-checker")]
+            scalar_initializer: None,
             #[cfg(feature = "internal-checker")]
             meter_named_legacy_unit: false,
         }
@@ -2250,6 +2292,8 @@ struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
     active: HashSet<(usize, usize)>,
     active_depth: usize,
     reached: HashSet<(usize, usize)>,
+    #[cfg(feature = "internal-checker")]
+    mixed_reached: Option<HashMap<PreparedCallable, usize>>,
     had_obligations: bool,
     observer: Observer,
     symbolic_module: usize,
@@ -2264,6 +2308,7 @@ struct InitializerProofSite<'a> {
 #[cfg(feature = "internal-checker")]
 enum InitializerProofOrigin<'a> {
     Direct { topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal, directive_position: usize },
+    CapturedDirect { call: ByteSpan, directive_position: usize },
     Nested { outer: OrderedInitializerCall<'a>, caller: &'a FunctionCallSites, inner: OccurrenceOrdinal, directive_position: usize },
     Stacked { outer: wosy_syntax::SourceSpan, intermediate: Vec<wosy_syntax::SourceSpan>, inner: ByteSpan, directive_position: usize, nested_scalar: bool },
 }
@@ -2396,6 +2441,15 @@ impl ActualIntegerObserver for () {
 }
 
 impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'project, Observer, ACTUAL_STARTUP> {
+    #[inline]
+    fn note_reached(&mut self, target: (usize, usize)) {
+        self.reached.insert(target);
+        #[cfg(feature = "internal-checker")]
+        if let Some(count) = self.mixed_reached.as_mut().and_then(|watched| watched.get_mut(&target)) {
+            *count = count.saturating_add(1);
+        }
+    }
+
     #[cfg(feature = "internal-checker")]
     fn initializer_proof_site<'a>(
         &self, topology: &'a ModuleInitializationTopology, source: &'a SourceIdentity,
@@ -2586,7 +2640,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         // result, to the existing enclosing local-binding continuation.
         let value = self.observer.proved_qualified_nested_return(target, body, &arguments, expected)
             .ok_or(ProjectCheck::Unsupported)?;
-        self.reached.insert(target);
+        self.note_reached(target);
         self.had_obligations = true;
         Ok(ActualCallResult::Integer(value))
     }
@@ -2865,7 +2919,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         // not execute the recursive body or widen the scalar evaluator.
         let result = self.observer.proved_wide_initializer_return(target, body, &arguments, expected, cross_source)
             .ok_or(ProjectCheck::Unsupported)?;
-        self.reached.insert(target);
+        self.note_reached(target);
         Ok(Some(result))
     }
 
@@ -3029,7 +3083,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     &frame.cursor,
                                 )? {
                                     frame.cursor.resume_exact_local_updates(update.into_iter()).ok_or(ProjectCheck::Unsupported)?;
-                                    self.reached.insert(target);
+                                    self.note_reached(target);
                                     self.had_obligations = true;
                                     continue;
                                 }
@@ -3074,7 +3128,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         parent.body.structure.checker_ordinary_directive_calls.contains_key(&effect.occurrence()));
                     #[cfg(not(feature = "internal-checker"))]
                     let hypothetical = false;
-                    if !hypothetical { self.reached.insert(target); }
+                    if !hypothetical { self.note_reached(target); }
                     self.active_depth -= 1;
                     if first_activation { self.active.remove(&target); }
                     #[cfg(feature = "internal-checker")]
@@ -3131,6 +3185,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     (parent.source, effect.occurrence(), span), &entry, &exit, reused)?;
                                 if !previously_refuted && proof.refutation.is_some() {
                                     effects.contextual_proofs.refutations.push(target);
+                                    if let Some(tap) = &mut effects.mixed_startup {
+                                        super::checker_flow::charge_call_work(&mut tap.work, 1).ok_or(ProjectCheck::Unsupported)?;
+                                        tap.events.push(MixedStartupEvent::Contextual);
+                                    }
                                 }
                             }
                         }
@@ -3680,6 +3738,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             if &output.ty == expected || (fixed_array && super::scalar_type_equal(&output.ty, expected))) {
             return Err(ProjectCheck::Unsupported);
         }
+        #[cfg(feature = "internal-checker")]
+        let passive_caller = collection.map(|(source, _)| source);
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
                 && (matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
@@ -3811,7 +3871,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let result = self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None);
                 self.active_depth -= 1;
                 self.active.remove(&target);
-                if result.is_ok() { self.reached.insert(target); }
+                if result.is_ok() { self.note_reached(target); }
                 return result;
             }
             if let Some(collection) = collection {
@@ -3905,8 +3965,36 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 self.observer.observe_initializer(target, scalar_site, &signature.parameters, exact, value);
             }
         }
+        #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP {
+            if let (Ok(ActualCallResult::Integer(returned)), Some(source), Some(ordered)) = (&result, passive_caller, collection) {
+                if let Some(site) = ordered.scalar_initializer.filter(|site| site.occurrence == call
+                    && std::ptr::eq(&site.topology.structure, structure))
+                {
+                    let mut effects = ordered.failures.borrow_mut();
+                    let directive_position = effects.records.len();
+                    if let Some(tap) = &mut effects.mixed_startup {
+                        if let Some(count) = tap.captured.get_mut(&target) {
+                            let ([ty], [argument]) = (signature.parameters.as_slice(), exact) else {
+                                return Err(ProjectCheck::Unsupported);
+                            };
+                            if source == &owner.source || !is_integer_type(ty) || !is_integer_type(expected) {
+                                return Err(ProjectCheck::Unsupported);
+                            }
+                            super::checker_flow::charge_call_work(&mut tap.work, MAX_CONTEXTUAL_PROOFS).ok_or(ProjectCheck::Unsupported)?;
+                            let call = site.topology.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span;
+                            *count = count.checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+                            tap.events.push(MixedStartupEvent::Scalar {
+                                target, source: source.clone(), call, directive_position,
+                                ty: ty.clone(), argument: (*argument).clone(), returned: returned.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         if ACTUAL_STARTUP && result.is_ok() {
-            self.reached.insert(target);
+            self.note_reached(target);
         }
         result
     }
@@ -4128,6 +4216,8 @@ struct OrderedFailures {
     contextual_call_work: usize,
     #[cfg(feature = "internal-checker")]
     contextual_proofs: ContextualProofCohort,
+    #[cfg(feature = "internal-checker")]
+    mixed_startup: Option<MixedStartupTap>,
     #[cfg(feature = "internal-checker")]
     snapshot_records: Vec<usize>,
     #[cfg(feature = "internal-checker")]
@@ -4803,7 +4893,7 @@ impl PreparedProofModule {
         #[cfg(feature = "internal-checker")]
         let (prepared, context) = if CONTEXTUAL {
             let (project, context) = super::contextual::prepare_contextual_transport_graph_with_targets(
-                declarations, initialization_order, inputs, true, false, &queries,
+                declarations, initialization_order, inputs, true, false, &queries, true,
             ).map_err(|_| ProjectCheck::Unsupported)?;
             (PreparedCheckerProject::from_contextual_transport(project), Some(context))
         } else {
@@ -5030,9 +5120,9 @@ fn prepare_loaded_proof_project(
 #[doc(hidden)]
 pub struct MainFlowProofReceipt {
     pub active: bool,
-    // In mixed mode all contextual theorem failures are real startup
-    // events, while the enrolled scalar theorem failures are dormant.
-    pub contextual_before_symbolic: bool,
+    /// In mixed mode, number of earlier actual scalar failures for each
+    /// contextual startup failure. Symbolic failures always follow startup.
+    pub mixed_context_after_actual: Option<Vec<usize>>,
     pub directives: Vec<ScalarOrderedCheckerFailure>,
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
@@ -5503,7 +5593,8 @@ fn run_named_partition_cursor<'a, const ORDINARY_LOCALS: bool>(
 ) -> Result<(ActualCallResult, bool, HashSet<PreparedCallable>), ProjectCheck> {
     let mut evaluator = CheckedCalls::<ProofFreeSymbolic<ORDINARY_LOCALS, true>, false> {
         project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
-        active_depth: 1, reached: HashSet::new(), had_obligations: false,
+        active_depth: 1, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None, had_obligations: false,
         observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair, named_pair_work: 0 }, symbolic_module: target.0,
     };
     if named_pair {
@@ -7783,6 +7874,7 @@ fn proof_invocation(
             let node = topology.occurrences.get(occurrence.0)?;
             (None, &[][..], node.span, *directive_position)
         }
+        InitializerProofOrigin::CapturedDirect { call, directive_position } => (None, &[][..], *call, *directive_position),
         InitializerProofOrigin::Nested { outer, caller, inner, directive_position } => {
             let outer = outer.topology.occurrences.get(outer.occurrence.0)?;
             let inner = caller.occurrences.get(inner.0)?;
@@ -8006,7 +8098,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         // The exact stack paid the authored observation charge
                         // before supplying this occurrence receipt.
                         InitializerProofOrigin::Stacked { .. } => {}
-                        InitializerProofOrigin::Nested { .. } => { self.incomplete = true; return; }
+                        InitializerProofOrigin::Nested { .. } | InitializerProofOrigin::CapturedDirect { .. } => { self.incomplete = true; return; }
                     }
                     match topology.resolve(cases, arguments, value, &mut self.named_exact_work) {
                         Ok(states) => Some(states),
@@ -8254,6 +8346,22 @@ impl ActualIntegerObserver for NamedOrderedEvidence<'_> {
 impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
     type Symbolic<'run> = SelectedSymbolicProof<'a, 'run> where Self: 'run;
     type SymbolicReport = (Option<SymbolicProofDiagnostic>, Vec<SymbolicProofDiagnostic>);
+
+    fn consume_mixed_startup(&mut self, tap: MixedStartupTap) -> Result<Vec<usize>, ProjectCheck> {
+        let mut order = Vec::new();
+        self.observed.named_exact_work = tap.work;
+        for event in tap.events {
+            match event {
+                MixedStartupEvent::Scalar { target, source, call, directive_position, ty, argument, returned } => {
+                    self.observed.observe_initializer(target, Some(InitializerProofSite {
+                        source: &source, call: InitializerProofOrigin::CapturedDirect { call, directive_position },
+                    }), &[ty], &[&argument], &returned);
+                }
+                MixedStartupEvent::Contextual => order.push(self.observed.diagnostics.len()),
+            }
+        }
+        Ok(order)
+    }
 
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
         if !self.observed.complete(reached) {
@@ -8750,7 +8858,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
-        contextual_before_symbolic: false,
+        mixed_context_after_actual: None,
         active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
@@ -8826,7 +8934,7 @@ fn ordered_contextual_diagnostics(mut contextual: ContextualProofCohort) -> Resu
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_mixed_dormant_symbolic_contextual(
+fn check_mixed_scalar_contextual(
     sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>, ordinary: Vec<ModuleProofCatalog>,
     initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
     inputs: ScalarPreparationInputs, scope: ScalarCheckerScope,
@@ -8876,17 +8984,19 @@ fn check_mixed_dormant_symbolic_contextual(
     }
     observed.finish_plans(&prepared.prepared, scope)?;
     let context = prepared.context.as_ref().ok_or(ProjectCheck::Unsupported)?;
-    let effects = prepare_contextual_effects(&prepared.prepared, context, headers, 3, false)?;
+    let mut effects = prepare_contextual_effects(&prepared.prepared, context, headers, 3, false)?;
+    effects.mixed_startup = Some(MixedStartupTap {
+        captured: plans.iter().map(|plan| (plan.target, 0)).collect(),
+        events: Vec::new(), work: 0,
+    });
     let mut report = run_prepared_ordered_check_profiles::<_, true>(
         &prepared.prepared, scope, 3, OrderedReachPolicy::Closed, NamedOrderedEvidence { observed }, effects,
     )?;
     complete_contextual_effects(&mut report, scope, false)?;
     let mut contextual = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = report.symbolic;
-    // No actual scalar witness is consumed by this profile; a reached
-    // named scalar target is rejected by complete_startup instead.
     Ok(MainFlowProofReceipt {
-        contextual_before_symbolic: true, active: report.active, directives: report.directives,
+        mixed_context_after_actual: report.mixed_context_after_actual, active: report.active, directives: report.directives,
         diagnostics: report.actual.observed.diagnostics, contextual_diagnostic: contextual.next(),
         additional_contextual_diagnostics: contextual.collect(), pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: report.entry_evidence,
@@ -8930,7 +9040,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             sources.push((proof.declarations, namespaces));
         }
         if !ordinary.is_empty() {
-            return check_mixed_dormant_symbolic_contextual(sources, ordinary, initialization_order, headers, inputs, scope);
+            return check_mixed_scalar_contextual(sources, ordinary, initialization_order, headers, inputs, scope);
         }
         if startup_count > 2 { return Err(ProjectCheck::Unsupported); }
         let mut report = check_prepared_contextual_proofs(sources, initialization_order, headers, inputs, scope, false)?;
@@ -8941,7 +9051,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             report.directives.clear();
         }
         return Ok(MainFlowProofReceipt {
-            contextual_before_symbolic: false,
+            mixed_context_after_actual: None,
             active: report.active, directives: report.directives, diagnostics: Vec::new(), contextual_diagnostic,
             additional_contextual_diagnostics: rest.collect(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
@@ -15188,6 +15298,7 @@ mod tests {
             (directive.operation == CheckerOperation::Narrow).then_some(*site)).unwrap();
         let mut actual = CheckedCalls {
             project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
             had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
         };
         let mut effects = OrderedFailures::default();
@@ -20548,6 +20659,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let observer = closed_ranked_evidence::<true>(&app, project.modules.len(), &plan, rank).unwrap();
         let mut actual = CheckedCalls::<_, true> {
             project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
             had_obligations: false, observer, symbolic_module: 0,
         };
         let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
@@ -23445,6 +23557,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             visits[target] = not_ready;
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
                 had_obligations: false, observer: (), symbolic_module: 0,
             };
             let mut output = OrderedFailures::default();
@@ -23579,7 +23692,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(pass.active && pass.directives.is_empty() && pass.diagnostics.is_empty()
                     && pass.contextual_diagnostic.is_none() && pass.symbolic_diagnostic.is_none());
                 let fail = run(root, &false_context, &false_scalar, scope).unwrap();
-                assert!(fail.contextual_before_symbolic && fail.diagnostics.is_empty() && fail.directives.is_empty());
+                assert!(fail.mixed_context_after_actual.as_deref() == Some(&[0][..]) && fail.diagnostics.is_empty() && fail.directives.is_empty());
                 let contextual = fail.contextual_diagnostic.unwrap();
                 assert!(!contextual.symbolic && contextual.call.source == library && contextual.supplying_call.source == app);
                 let call = contextual.call.range;
@@ -23598,6 +23711,31 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 let reached = root.replace("accounting.spend();",
                     r#"accounting.spend(); u8 score = facts.score(4); core.require(score == 4, { .stdout = ""; .stderr = ""; .code = 78; .files = []; });"#);
                 assert!(matches!(run(&reached, context, theorem, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                let direct = r#"u8 observed = facts.score(4);
+                    core.require(observed == 4, { .stdout = ""; .stderr = "wrong score"; .code = 79; .files = []; });"#;
+                let second = direct.replace("observed", "again");
+                for (program, contextual_after) in [
+                    (format!("{direct} entry(); {second}"), 1),
+                    (format!("entry(); {direct} {second}"), 0),
+                    (format!("{direct} {second} entry();"), 2),
+                ] {
+                    let direct_root = root.replace("entry();", &program);
+                    let pass = run(&direct_root, context, theorem, scope).unwrap();
+                    assert!(pass.active && pass.directives.is_empty() && pass.diagnostics.is_empty());
+                    let report = run(&direct_root, &false_context, &false_scalar, scope).unwrap();
+                    assert_eq!(report.mixed_context_after_actual.as_deref(), Some(&[contextual_after][..]));
+                    assert!(report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+                    let [first, second] = report.diagnostics.as_slice() else { panic!("one failure at each real scalar call"); };
+                    assert!(first.invocation.call.range != second.invocation.call.range);
+                    for failure in [first, second] {
+                        let span = failure.invocation.call.range;
+                        assert_eq!(failure.invocation.call.source, app);
+                        assert_eq!(&direct_root[span.start as usize..span.end as usize], "facts.score(4)");
+                        assert_eq!(failure.invocation.returned, BigInt::from(4));
+                        assert_eq!(failure.invocation.arguments, vec![(ScalarType::U8, BigInt::from(4))]);
+                    }
+                }
+
             }
         }
     }
@@ -24240,6 +24378,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             visits[target] = visit;
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
                 had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
             };
             let mut failures = OrderedFailures::default();
@@ -24322,6 +24461,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             visits[target] = visit;
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
                 had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
             };
             let mut failures = OrderedFailures::default();

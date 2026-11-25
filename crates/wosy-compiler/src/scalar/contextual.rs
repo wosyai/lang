@@ -371,7 +371,7 @@ pub(super) fn prepare_contextual_transport_graph_with_proof_root(
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
     checker_directives: bool, allow_empty_startup: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
-    prepare_contextual_transport_graph_with_targets(sources, initialization_order, inputs, checker_directives, allow_empty_startup, &[])
+    prepare_contextual_transport_graph_with_targets(sources, initialization_order, inputs, checker_directives, allow_empty_startup, &[], false)
 }
 
 #[cfg(any(test, feature = "internal-checker"))]
@@ -379,9 +379,10 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
     mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
     checker_directives: bool, allow_empty_startup: bool, queries: &[super::reference::CheckerTargetQuery<'_>],
+    mixed_scalar_bindings: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
-    use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
+    use super::control::{BindingInitialization, BlockItemKind, ModuleInitializationCallTarget, ModuleInitializationDetail};
     const MAX_WORK: usize = 4096;
     let mut work = 0usize;
     let mut charge = |amount| {
@@ -434,6 +435,33 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
     }
     let (project, mut calls) = prepare_project_contextual_types_with_targets(sources, initialization_order, inputs, checker_directives, queries)
         .map_err(|_| Unsupported)?;
+    let root = &project.modules.get(root_module).ok_or(Unsupported)?.source;
+    let init = calls.initialization_region(root_module).ok_or(Unsupported)?;
+    let ModuleInitializationDetail::Occurrences(topology) = &init.detail else { return Err(Unsupported); };
+    let watched = if mixed_scalar_bindings {
+        if !checker_directives || allow_empty_startup || queries.is_empty() || queries.len() != calls.checker_targets.len() {
+            return Err(Unsupported);
+        }
+        charge(queries.len())?;
+        queries.iter().zip(&calls.checker_targets).map(|(query, resolved)| {
+            let resolved = resolved.as_ref().ok_or(Unsupported)?;
+            let ResolvedCallTarget::ModuleCallable {
+                source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+            } = &resolved.target else { return Err(Unsupported); };
+            let owner = project.modules.get(resolved.declaration.0).ok_or(Unsupported)?;
+            let Some(ScalarItem::Function(function)) = owner.items.get(resolved.declaration.1) else { return Err(Unsupported); };
+            if query.receiver.is_some() || query.source != source || source == root
+                || source != &owner.source || *declaration_span != function.name_span
+            {
+                return Err(Unsupported);
+            }
+            Ok(resolved.declaration)
+        }).collect::<Result<HashSet<_>, _>>()?
+    } else {
+        HashSet::new()
+    };
+    let mut root_checked = topology.structure.blocks.get(topology.structure.root.0).ok_or(Unsupported)?.items.iter();
+    let mut scalar_initializers = HashSet::new();
     let mut by_target = HashMap::new();
     let mut callables = Vec::new();
     let mut pending = Vec::new();
@@ -451,7 +479,34 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
                     needs.push(false);
                 }
                 ScalarItem::Namespace(_) => {}
-                ScalarItem::Executable(_) if module_index == root_module => {}
+                ScalarItem::Executable(_) if module_index == root_module => {
+                    if mixed_scalar_bindings && root_checked.next().is_none_or(|checked|
+                        checked.position != item || !matches!(&checked.kind, BlockItemKind::Evaluation { .. }))
+                    {
+                        return Err(Unsupported);
+                    }
+                }
+                ScalarItem::Binding(binding) if mixed_scalar_bindings && module_index == root_module => {
+                    let checked = root_checked.next().filter(|checked| checked.position == item).ok_or(Unsupported)?;
+                    let BlockItemKind::Binding(checked) = &checked.kind else { return Err(Unsupported); };
+                    let [receiver] = checked.receivers() else { return Err(Unsupported); };
+                    let BindingInitialization::Outputs(outputs) = &checked.initialization else { return Err(Unsupported); };
+                    let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
+                        = topology.call_targets.get(&outputs.primary).ok_or(Unsupported)? else { return Err(Unsupported); };
+                    let signature = topology.checked_call_signatures.get(&outputs.primary).ok_or(Unsupported)?;
+                    if !matches!(&binding.value, ScalarExpression::Call { receiver: Some(_), .. })
+                        || binding.is_allocation || receiver.contextual_storage.is_some() || !outputs.secondary.is_empty()
+                        || !typecheck::is_integer_type(&receiver.ty)
+                        || !matches!(signature.parameters.as_slice(), [parameter] if typecheck::is_integer_type(parameter))
+                        || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty)
+                        || topology.structure.checked_types.expressions.get(&outputs.primary) != Some(&receiver.ty)
+                        || declaration.source == *root
+                        || !topology.structure.checker_direct_targets.get(&outputs.primary).is_some_and(|target| watched.contains(target))
+                        || !scalar_initializers.insert(outputs.primary)
+                    {
+                        return Err(Unsupported);
+                    }
+                }
                 _ => return Err(Unsupported),
             }
         }
@@ -556,10 +611,34 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
             if !topology.calls.is_empty() || !topology.callable_escapes.is_empty() { return Err(Unsupported); }
         }
     }
-    let init = calls.initialization_region(root_module).ok_or(Unsupported)?;
-    let ModuleInitializationDetail::Occurrences(topology) = &init.detail else { return Err(Unsupported); };
     if !topology.callable_escapes.is_empty() { return Err(Unsupported); }
-    match topology.calls.as_slice() {
+    let startup;
+    let ordered_calls = if mixed_scalar_bindings {
+        if root_checked.next().is_some() { return Err(Unsupported); }
+        charge(topology.calls.len())?;
+        let mut root_call = None;
+        for &occurrence in &topology.calls {
+            if scalar_initializers.remove(&occurrence) {
+                let ModuleInitializationCallTarget::Direct { declaration, .. }
+                    = topology.call_targets.get(&occurrence).ok_or(Unsupported)? else { return Err(Unsupported); };
+                let &callee = by_target.get(&(&declaration.source, declaration.range)).ok_or(Unsupported)?;
+                let (module, item, _) = callables[callee];
+                if needs[callee] || !watched.contains(&(module, item))
+                    || topology.structure.checker_direct_targets.get(&occurrence) != Some(&(module, item))
+                {
+                    return Err(Unsupported);
+                }
+            } else if root_call.replace(occurrence).is_some() {
+                return Err(Unsupported);
+            }
+        }
+        if !scalar_initializers.is_empty() { return Err(Unsupported); }
+        startup = [root_call.ok_or(Unsupported)?];
+        startup.as_slice()
+    } else {
+        topology.calls.as_slice()
+    };
+    match ordered_calls {
         [] if checker_directives && allow_empty_startup => {}
         [root] => {
             let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }

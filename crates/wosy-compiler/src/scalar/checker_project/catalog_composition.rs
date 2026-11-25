@@ -180,7 +180,7 @@ pub(super) fn run<Scalar: ScalarCatalogEvidence>(
         (run.active, run.directives, run.actual.into_diagnostics(run.symbolic), Vec::new(), run.entry_evidence)
     };
     Ok(MainFlowProofReceipt {
-        contextual_before_symbolic: false,
+        mixed_context_after_actual: None,
         active, directives, diagnostics: scalar.actual, contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
         aggregate_diagnostics, symbolic_diagnostic: scalar.symbolic,
         additional_symbolic_diagnostics: scalar.additional, entry_evidence,
