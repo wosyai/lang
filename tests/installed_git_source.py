@@ -1,4 +1,5 @@
 """Exercise a legitimate installed dependency via the ordinary, file-only Git route."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,10 +35,36 @@ def snapshot(root, store, *args):
         return json.load(output), elapsed, usage.ru_maxrss
 
 
+def consumer(root):
+    (root / "wosy.toml").write_text(manifest)
+    (root / "src").mkdir()
+    (root / "src/main.w").write_text(
+        '%%start\npayload = namespace remote_lib "packet.w";\n'
+        'constants = namespace remote_lib "constants.w";\n'
+        'payload.Packet packet = { .count = 19; };\nu32 marker = constants.value;\n%%end\n'
+    )
+    capture(compiler, "dep", "add", "../upstream", "--path", "packages/remote_lib", cwd=root)
+    capture(compiler, "dep", "sync", cwd=root)
+    capture(compiler, "parse", "app", cwd=root)
+    assert (root / ".wosy/cst/current.json").is_file()
+    return root / "deps/remote_lib/src/packet.w"
+
+
+def workspace_evidence(root):
+    paths = [
+        root / name for name in ("wosy.toml", "wosy.lock", "src/main.w",
+                                 "deps/.wosy-pins/remote_lib", "deps/remote_lib/wosy.toml",
+                                 "deps/remote_lib/src/packet.w", "deps/remote_lib/src/constants.w")
+    ]
+    paths.extend((root / "patches/remote_lib").glob("*.patch"))
+    paths.extend((root / ".wosy/cst").glob("*.json"))
+    return {path.relative_to(root): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
 with tempfile.TemporaryDirectory() as directory:
     work = Path(directory)
-    origin, app, store, bin_dir = (work / key for key in ("upstream", "app", "store", "bin"))
-    for path in (origin, app, bin_dir):
+    origin, app, peer, store, bin_dir = (work / key for key in ("upstream", "app", "peer", "store", "bin"))
+    for path in (origin, app, peer, bin_dir):
         path.mkdir()
     # Dev5 sets its own general protocol list for Git children. Narrow it
     # again through the fixture's PATH; also ignore host Git configurations.
@@ -60,18 +87,11 @@ with tempfile.TemporaryDirectory() as directory:
     capture("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
             "commit", "--quiet", "--no-verify", "--no-gpg-sign", "-m", "package", cwd=origin)
 
-    (app / "wosy.toml").write_text(manifest)
-    (app / "src").mkdir()
-    (app / "src/main.w").write_text(
-        '%%start\npayload = namespace remote_lib "packet.w";\n'
-        'constants = namespace remote_lib "constants.w";\n'
-        'payload.Packet packet = { .count = 19; };\nu32 marker = constants.value;\n%%end\n'
-    )
-    capture(compiler, "dep", "add", "../upstream", "--path", "packages/remote_lib", cwd=app)
-    capture(compiler, "dep", "sync", cwd=app)
+    installed, peer_source = consumer(app), consumer(peer)
     lock = (app / "wosy.lock").read_bytes()
-    installed = app / "deps/remote_lib/src/packet.w"
-    assert installed.read_bytes() == pristine.encode()
+    assert (peer / "wosy.lock").read_bytes() == lock
+    assert installed.read_bytes() == peer_source.read_bytes() == pristine.encode()
+    initial_workspace, peer_workspace = workspace_evidence(app), workspace_evidence(peer)
 
     first, cold_wall, cold_rss = snapshot(app, store)
     first = first["snapshot"]
@@ -85,18 +105,32 @@ with tempfile.TemporaryDirectory() as directory:
     warm = warm["snapshot"]
     assert warm["source_root"] == initial and warm["written"] == warm["parsed"] == 0
     assert warm["reused"] == 3
+    peer_first = snapshot(peer, store)[0]["snapshot"]
+    peer_root = peer_first["source_root"]
+    assert peer_root != initial and peer_first["executable"] == first["executable"]
+    assert snapshot(peer, store, peer_root, "--installed-git")[0]["remote_lib"] == selection
+    peer_typed = snapshot(peer, store, peer_root, "--typed-project", "dev", "--oracle")[0]
+    assert peer_typed["ready"] and peer_typed["project_ast"] == old_typed["project_ast"]
+    assert peer_typed["prepared_identity"] != old_typed["prepared_identity"]
+    assert peer_typed["modules"][1]["owner"]["project"] != old_typed["modules"][1]["owner"]["project"]
+    assert peer_typed["modules"][1]["structs"][0]["layout"]["size"] == 4
+    assert workspace_evidence(app) == initial_workspace
+    assert workspace_evidence(peer) == peer_workspace
 
     installed.write_text(edited)
+    dirty_workspace = workspace_evidence(app)
     dirty, dirty_wall, dirty_rss = snapshot(app, store, initial)
     dirty = dirty["snapshot"]
     authored = dirty["source_root"]
     assert initial != authored and (dirty["parsed"], dirty["reused"]) == (1, 2)
     assert snapshot(app, store, authored, "--installed-git")[0]["remote_lib"] == selection
     assert snapshot(app, store, authored, "--typed-project", "dev", "--oracle")[0]["modules"][1]["structs"][0]["layout"]["size"] == 8
+    assert workspace_evidence(app) == dirty_workspace
 
     capture(compiler, "dep", "snapshot", cwd=app)
     assert (app / "wosy.lock").read_bytes() == lock and installed.read_bytes() == edited.encode()
     assert len(list((app / "patches/remote_lib").glob("*.patch"))) == 1
+    overlay_workspace = workspace_evidence(app)
     overlay, patch_wall, patch_rss = snapshot(app, store, authored)
     overlay = overlay["snapshot"]
     patched = overlay["source_root"]
@@ -113,18 +147,38 @@ with tempfile.TemporaryDirectory() as directory:
     assert old_modules[1]["body"] != new_modules[1]["body"]
     assert old_modules[2]["body"] == new_modules[2]["body"]
     assert new_typed["ready"] and new_typed["modules"][1]["structs"][0]["layout"]["size"] == 8
+
+    # The already-cached importer text is equal in both consumers; neither
+    # source view, selected stack nor resolved owner is interchangeable.
+    peer_warm, peer_wall, peer_rss = snapshot(peer, store, peer_root)
+    peer_warm = peer_warm["snapshot"]
+    assert (peer_warm["source_root"], peer_warm["parsed"], peer_warm["written"]) == (peer_root, 0, 0)
+    assert snapshot(peer, store, peer_root, "--installed-git")[0]["remote_lib"] == selection
+    peer_after = snapshot(peer, store, peer_root, "--typed-project", "dev", "--oracle")[0]
+    assert peer_after["prepared_identity"] == peer_typed["prepared_identity"]
+    assert peer_after["modules"][1]["structs"][0]["layout"]["size"] == 4
+    back = snapshot(app, store, patched)[0]["snapshot"]
+    assert (back["source_root"], back["parsed"], back["written"]) == (patched, 0, 0)
+    assert snapshot(app, store, patched, "--installed-git")[0]["remote_lib"] == patch
+    patched_again = snapshot(app, store, patched, "--typed-project", "dev", "--oracle")[0]
+    assert patched_again["prepared_identity"] == new_typed["prepared_identity"]
+    assert patched_again["modules"][1]["structs"][0]["layout"]["size"] == 8
+    assert new_modules[0]["body"] == old_modules[0]["body"]  # importer AST
+
     old = snapshot(app, store, initial, "remote_lib", "src/packet.w")[0]
     old_again = snapshot(app, store, initial, "--typed-project", "dev")[0]
     assert old["text"] == pristine and old_again["prepared_identity"] == old_typed["prepared_identity"]
     assert old_again["modules"][1]["structs"][0]["layout"]["size"] == 4
     assert (package / "src/packet.w").read_text() == pristine
-    capture(compiler, "parse", "app", cwd=app)
-    assert (app / ".wosy/cst/current.json").is_file()
+    assert workspace_evidence(app) == overlay_workspace
+    assert workspace_evidence(peer) == peer_workspace
 
-    print("installed pinned subpackage, edited live bytes, captured overlay, old rooted compiler parity", {
+    print("shared store, one Git pin, two patch stacks, A→B→A, authored history, read-only consumers", {
         "cold_wall_ms": round(cold_wall, 3), "warm_wall_ms": round(warm_wall, 3),
         "one_edited_file_wall_ms": round(dirty_wall, 3), "new_stack_same_sources_ms": round(patch_wall, 3),
         "observe_ms": [round(state["observe_ms"], 3) for state in (first, warm, dirty, overlay)],
         "publish_writes": [state["written"] for state in (first, warm, dirty, overlay)],
         "peak_child_kib": [cold_rss, warm_rss, dirty_rss, patch_rss], "observed_files": 3,
+        "peer_warm_ms": round(peer_wall, 3), "peer_warm_peak_kib": peer_rss,
+        "sizes_A_B_A_historical": [8, 4, 8, 4],
     }, flush=True)
