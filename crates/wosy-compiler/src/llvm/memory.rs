@@ -687,6 +687,9 @@ pub(super) fn emit_array_len<'ctx>(
     let crate::ScalarPlace::Name { name, .. } = place else {
         return Err("core.array_len lacks a prepared named array address".into());
     };
+    if let Some(length) = super::local_callable::generated_fixed_extent(state, place) {
+        return Ok(EmitValue::Basic(context.i64_type().const_int(length, false).into()));
+    }
     let Some((storage, ty)) = state.storage.get(name) else {
         return Err("core.array_len has no prepared local array".into());
     };
@@ -1401,6 +1404,17 @@ pub(super) fn emit_generated_scalar_elements<'ctx, 'module>(
     count: inkwell::values::IntValue<'ctx>, element: &ScalarType,
     mut element_slot: impl FnMut(&mut EmitState<'ctx, 'module>, inkwell::values::IntValue<'ctx>) -> Result<PointerValue<'ctx>, String>,
 ) -> Result<(), String> {
+    emit_generated_elements(context, state, callee, count, |state, index, result| {
+        let slot = element_slot(state, index)?;
+        store_value(context, state, slot, element, EmitValue::Basic(result))
+    })
+}
+
+pub(super) fn emit_generated_elements<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, callee: FunctionValue<'ctx>,
+    count: inkwell::values::IntValue<'ctx>,
+    mut install: impl FnMut(&mut EmitState<'ctx, 'module>, inkwell::values::IntValue<'ctx>, BasicValueEnum<'ctx>) -> Result<(), String>,
+) -> Result<(), String> {
     let entry = state.builder.get_insert_block().ok_or("missing generated array preheader")?;
     let parent = entry.get_parent().ok_or("missing generated array function")?;
     let body = context.append_basic_block(parent, "generated_array.body");
@@ -1417,9 +1431,8 @@ pub(super) fn emit_generated_scalar_elements<'ctx, 'module>(
     index.add_incoming(&[(&context.i64_type().const_zero(), entry)]);
     let current = index.as_basic_value().into_int_value();
     let result = state.builder.build_call(callee, &[current.into()], "generated_value").map_err(builder_error)?
-        .try_as_basic_value().basic().ok_or("generated scalar factory returned no value")?;
-    let slot = element_slot(state, current)?;
-    store_value(context, state, slot, element, EmitValue::Basic(result))?;
+        .try_as_basic_value().basic().ok_or("generated factory returned no value")?;
+    install(state, current, result)?;
     let next = state.builder.build_int_add(current, context.i64_type().const_int(1, false), "factory_next")
         .map_err(builder_error)?;
     let more = state.builder.build_int_compare(IntPredicate::ULT, next,

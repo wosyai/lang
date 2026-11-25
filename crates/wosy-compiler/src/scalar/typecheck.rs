@@ -1232,7 +1232,18 @@ pub(super) fn block_item_type_in_module(
             if !unsafe_context {
                 inference.nominate_inline_elements(binding);
             }
-            let actual = if let ScalarExpression::GeneratedArray { factory, count, span } = &binding.value {
+            let actual = if let Some(candidate) = super::anonymous_callable::candidate_fixed_generated_callable(binding)
+                .filter(|_| !unsafe_context && inference.nominate_generated_callable())
+            {
+                inference.record_expression_type(candidate.factory, &candidate.factory_signature(), true);
+                let count_type = expression_type_in_module_expected(
+                    candidate.count, Some(&ScalarType::U64), scope, visible_names, folded_names,
+                    module, modules, diagnostics, unsafe_context, overloads, inference,
+                );
+                expect_module_type(module, &ScalarType::U64, &count_type, expression_span(candidate.count), diagnostics);
+                inference.record_expression_type(&binding.value, &binding.declared_type, true);
+                binding.declared_type.clone()
+            } else if let ScalarExpression::GeneratedArray { factory, count, span } = &binding.value {
                 let supported = !unsafe_context && binding.receivers.len() == 1
                     && binding.fallible_assignment.is_none() && matches!(factory.as_ref(), ScalarExpression::Name { .. });
                 let expected = match (&binding.declared_type, count.as_ref()) {

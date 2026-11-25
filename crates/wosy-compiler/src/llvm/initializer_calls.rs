@@ -15,6 +15,7 @@ pub(super) struct InitializerSymbols<'input> {
     externs: HashMap<SourceSpan, String>,
     callable_bindings: std::collections::HashSet<SourceSpan>,
     pub(super) inline_array_arms: HashMap<*const ScalarExpression, String>,
+    pub(super) generated_array_factories: HashMap<*const ScalarExpression, (String, bool)>,
 }
 
 impl<'input> InitializerSymbols<'input> {

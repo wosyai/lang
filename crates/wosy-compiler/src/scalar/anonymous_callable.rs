@@ -61,6 +61,57 @@ pub(super) fn candidate_fixed_elements(binding: &ScalarBinding) -> Option<&[Scal
     Some(elements)
 }
 
+/// Exact authored parent/child corridor for private fixed generation. A
+/// regular named factory is a different case; this must be the actual complete
+/// initializer, with a single authored return of the nested callable.
+pub(super) struct FixedGeneratedCallable<'a> {
+    pub(super) factory: &'a ScalarExpression,
+    pub(super) count: &'a ScalarExpression,
+    pub(super) child: &'a ScalarExpression,
+    pub(super) element: &'a ScalarType,
+    pub(super) invocation_index: Option<&'a (String, ByteSpan)>,
+}
+
+impl FixedGeneratedCallable<'_> {
+    pub(super) fn factory_signature(&self) -> ScalarType {
+        let span = expression_span(self.child);
+        ScalarType::Callable {
+            parameters: vec![ScalarType::U64],
+            outputs: ScalarOutputSequence {
+                outputs: vec![ScalarOutput { ty: self.element.clone(), span }],
+                span,
+            },
+        }
+    }
+}
+
+pub(super) fn candidate_fixed_generated_callable(binding: &ScalarBinding) -> Option<FixedGeneratedCallable<'_>> {
+    if binding.receivers.len() != 1 || binding.fallible_assignment.is_some() || binding.is_allocation {
+        return None;
+    }
+    let ScalarType::Array { element, length, .. } = &binding.declared_type else { return None; };
+    if !closed_scalar_signature(element) { return None; }
+    let ScalarExpression::GeneratedArray { factory, count, .. } = &binding.value else { return None; };
+    let ScalarExpression::Integer { value, .. } = count.as_ref() else { return None; };
+    if u64::try_from(value).ok() != Some(*length) { return None; }
+    let ScalarExpression::AnonymousCallable { parameters, body, .. } = factory.as_ref() else { return None; };
+    let [index] = parameters.as_slice() else { return None; };
+    if body.unsafe_context || body.items.len() != 1 || body.final_output_values.len() != 1 {
+        return None;
+    }
+    let (child, _) = body.final_expressions().next()?;
+    let ScalarExpression::AnonymousCallable { parameters, body, .. } = child else { return None; };
+    let ScalarType::Callable { parameters: inputs, .. } = element.as_ref() else { return None; };
+    if parameters.len() != inputs.len() || body.unsafe_context { return None; }
+    let invocation_index = (index.0 != "_").then_some(index);
+    if invocation_index.is_some_and(|index| parameters.iter().any(|child| child.0 == index.0)) {
+        // Do not let the internal transport parameter erase authored lexical
+        // shadowing. An unneeded non-underscore formal is not in this family.
+        return None;
+    }
+    Some(FixedGeneratedCallable { factory, count, child, element, invocation_index })
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PreparedInlineOwner {
     pub(crate) module: usize,
@@ -133,6 +184,64 @@ pub(crate) fn actual_inline_element<'a>(
         return Err("inline callable no longer belongs to its exact prepared owner".into());
     }
     Ok(value)
+}
+
+pub(crate) struct PreparedGeneratedCallable {
+    pub(crate) child: PreparedAnonymousCallable,
+    pub(crate) captures_index: bool,
+}
+
+pub(crate) fn actual_generated_callable<'a>(
+    outer: &'a PreparedScalarProject,
+    owner: PreparedInlineOwner,
+    nodes: &control::CallableBodyCallNodes<'a>,
+) -> Result<&'a ScalarExpression, String> {
+    let ScalarItem::Function(fun) = &outer.project().modules[owner.module].items[owner.item]
+        else { return Err("generated owner changed its function".into()); };
+    let Some(ScalarBlockItem::LocalBinding(binding)) = fun.body.items.get(owner.binding)
+        else { return Err("generated callable lost its binding".into()); };
+    let candidate = candidate_fixed_generated_callable(binding)
+        .ok_or("generated callable changed its authored initializer")?;
+    if nodes.binding_position(binding) != Some((owner.block, owner.binding))
+        || nodes.expression_ordinal(candidate.factory) != Some(owner.ordinal) || owner.rank != 0
+    { return Err("generated callable changed its exact prepared owner".into()); }
+    Ok(&binding.value)
+}
+
+pub(super) fn collect_prepared_generated_callables(
+    outer: &PreparedScalarProject,
+) -> Result<BTreeMap<PreparedInlineOwner, PreparedGeneratedCallable>, Vec<Diagnostic>> {
+    let mut arms = BTreeMap::new();
+    for (module, actual) in outer.project().modules.iter().enumerate() {
+        for (item, value) in actual.items.iter().enumerate() {
+            let ScalarItem::Function(fun) = value else { continue; };
+            if !fun.generic_parameters.is_empty() || !fun.overload_arms.is_empty() { continue; }
+            let mut nodes = None;
+            for value in &fun.body.items {
+                let ScalarBlockItem::LocalBinding(binding) = value else { continue; };
+                let Some(candidate) = candidate_fixed_generated_callable(binding) else { continue; };
+                if nodes.is_none() {
+                    nodes = Some(outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
+                        .map_err(|_| vec![arm_diagnostic(&actual.source, fun.span, "missing prepared generated callable owner")])?);
+                }
+                let nodes = nodes.as_ref().expect("bound generated callable owner");
+                let invalid = || vec![arm_diagnostic(&actual.source, binding.span, "missing exact generated callable binding or count")];
+                let (block, position) = nodes.binding_position(binding).ok_or_else(invalid)?;
+                let ordinal = nodes.expression_ordinal(candidate.factory).ok_or_else(invalid)?;
+                if nodes.checked_expression_type(&binding.value) != Some(&binding.declared_type)
+                    || nodes.checked_expression_type(candidate.factory) != Some(&candidate.factory_signature())
+                    || nodes.checked_expression_type(candidate.count) != Some(&ScalarType::U64)
+                { return Err(invalid()); }
+                let key = PreparedInlineOwner { module, item, block, binding: position, ordinal, rank: 0 };
+                let child = check_isolated_arm_with_capture(&actual.source, candidate.child.clone(),
+                    candidate.element.clone(), actual.target_layout, candidate.invocation_index)?;
+                if arms.insert(key, PreparedGeneratedCallable { child, captures_index: candidate.invocation_index.is_some() }).is_some() {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    Ok(arms)
 }
 
 pub(super) fn collect_prepared_inline_arms(
@@ -246,11 +355,24 @@ fn check_isolated_arm(
     source: &SourceIdentity, expression: ScalarExpression, signature: ScalarType,
     target: ScalarTargetLayout,
 ) -> Result<PreparedAnonymousCallable, Vec<Diagnostic>> {
-    let ScalarType::Callable { parameters: inputs, outputs } = &signature else { unreachable!("sealed scalar signature") };
-    let ScalarExpression::AnonymousCallable { parameters: authored, body, span } = expression
+    check_isolated_arm_with_capture(source, expression, signature, target, None)
+}
+
+fn check_isolated_arm_with_capture(
+    source: &SourceIdentity, expression: ScalarExpression, mut signature: ScalarType,
+    target: ScalarTargetLayout, capture: Option<&(String, ByteSpan)>,
+) -> Result<PreparedAnonymousCallable, Vec<Diagnostic>> {
+    let ScalarType::Callable { parameters: inputs, outputs } = &mut signature else { unreachable!("sealed scalar signature") };
+    let ScalarExpression::AnonymousCallable { parameters: mut authored, body, span } = expression
         else { unreachable!("authored anonymous callable") };
     if authored.len() != inputs.len() {
         return Err(vec![arm_diagnostic(source, span, "inline callable parameter count differs from its array element signature")]);
+    }
+    if let Some(capture) = capture {
+        // Only the authenticated authored factory formal is in this scope.
+        // Its value is a private ABI input, not an added source argument.
+        inputs.insert(0, ScalarType::U64);
+        authored.insert(0, capture.clone());
     }
     let (parameters, parameter_spans) = authored.into_iter().unzip();
     let mut body = *body;

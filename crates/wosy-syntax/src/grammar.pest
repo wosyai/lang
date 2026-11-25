@@ -89,7 +89,14 @@ parenthesized_index_suffix = !{ &ANY ~ index_suffix+ }
 parenthesized = !{ "(" ~ expression ~ ")" }
 struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
-generated_array = { "[" ~ (callable_literal | expression) ~ ";" ~ expression ~ "]" }
+generated_array = { "[" ~ (generated_callable_factory | callable_literal | expression) ~ ";" ~ expression ~ "]" }
+// This is not a general callable-valued expression: accept only the direct
+// returned callable in a generated factory, as a canonical final output.
+generated_callable_factory = { "fn" ~ parameters? ~ generated_callable_body }
+generated_callable_body = { "{" ~ generated_callable_final_output ~ "}" }
+generated_callable_final_output = { generated_callable_output_list }
+generated_callable_output_list = { generated_callable_output }
+generated_callable_output = { callable_literal }
 array_literal = { "[" ~ (array_element ~ ("," ~ array_element)*)? ~ "]" }
 array_element = _{ callable_literal | expression }
 callable_literal = { "fn" ~ parameters? ~ block }

@@ -3,6 +3,7 @@ use crate::ScalarBinding;
 
 pub(super) struct LocalCallableSlot<'ctx> {
     storage: PointerValue<'ctx>,
+    generated: Option<bool>,
     pub(super) parameters: Vec<ScalarType>,
     pub(super) outputs: crate::ScalarOutputSequence,
 }
@@ -10,9 +11,35 @@ pub(super) struct LocalCallableSlot<'ctx> {
 /// A private array of the same capture-free pointers as lexical callable slots.
 pub(super) struct LocalCallableArray<'ctx> {
     storage: PointerValue<'ctx>,
+    generated: Option<bool>,
     llvm_type: inkwell::types::ArrayType<'ctx>,
     length: u64,
     element: ScalarType,
+}
+
+pub(super) fn generated_entry_type(context: &Context) -> inkwell::types::StructType<'_> {
+    context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false)
+}
+
+pub(super) fn emit_generated_factory<'ctx>(
+    context: &'ctx Context, factory: FunctionValue<'ctx>, child: FunctionValue<'ctx>, captures: bool,
+) -> Result<(), String> {
+    let builder = context.create_builder();
+    builder.position_at_end(context.append_basic_block(factory, "entry"));
+    let entry = generated_entry_type(context).get_undef();
+    let entry = builder.build_insert_value(entry, child.as_global_value().as_pointer_value(), 0, "generated_code")
+        .map_err(builder_error)?.into_struct_value();
+    let env = if captures { factory.get_first_param().ok_or("generated factory missing index")?.into_int_value() }
+        else { context.i64_type().const_zero() };
+    let entry = builder.build_insert_value(entry, env, 1, "generated_capture")
+        .map_err(builder_error)?.into_struct_value();
+    builder.build_return(Some(&entry)).map_err(builder_error)?;
+    Ok(())
+}
+
+fn generated_factory<'a>(state: &'a EmitState<'_, '_>, binding: &ScalarBinding) -> Option<(&'a str, bool)> {
+    let (name, captures) = state.initializer_symbols?.generated_array_factories.get(&std::ptr::from_ref(&binding.value))?;
+    Some((name, *captures))
 }
 
 fn array_element(ty: &ScalarType) -> Option<(&ScalarType, u64)> {
@@ -46,7 +73,9 @@ fn array_binding<'a>(
     {
         return Err("fixed callable array requires a prepared lexical scalar-only declaration".into());
     }
-    let bytes = length.checked_mul(state.target_layout.pointer_size).ok_or("fixed callable array size overflows")?;
+    // {ptr, i64} is naturally aligned to 8 and occupies 16 bytes on both supported targets.
+    let stride = if generated_factory(state, binding).is_some() { 16 } else { state.target_layout.pointer_size };
+    let bytes = length.checked_mul(stride).ok_or("fixed callable array size overflows")?;
     memory::check_fixed_address_domain(state.target_layout, bytes)?;
     Ok((receiver, element, u32::try_from(length).map_err(|_| "fixed callable array exceeds LLVM array count")?))
 }
@@ -60,6 +89,16 @@ fn selected_array<'a, 'ctx>(
         other => other,
     };
     state.local_callable_arrays.get(&nodes.lexical_place_declaration(root)?)
+}
+
+pub(super) fn generated_fixed_extent(state: &EmitState<'_, '_>, place: &crate::ScalarPlace) -> Option<u64> {
+    let array = selected_array(state, place)?;
+    let nodes = state.body_call_nodes?;
+    if array.generated.is_none() || !matches!(place, crate::ScalarPlace::Name { .. })
+        || !nodes.checked_place_type(place).and_then(array_element)
+            .is_some_and(|(element, length)| same_scalar_signature(element, &array.element) && length == array.length)
+    { return None; }
+    Some(array.length)
 }
 
 fn selected_pointer<'ctx, 'module>(
@@ -166,6 +205,22 @@ pub(super) fn binding_value<'ctx, 'module>(
 ) -> Result<Option<EmitValue<'ctx>>, String> {
     if array_element(&binding.declared_type).is_some() {
         let (_, element, length) = array_binding(state, binding)?;
+        if let Some((name, _)) = generated_factory(state, binding) {
+            let callee = *state.functions.get(name).ok_or("missing private generated factory")?;
+            let entry = generated_entry_type(context);
+            let array = entry.array_type(length);
+            let storage = entry_alloca(state, array.into(), "generated_callable_array")?;
+            if length != 0 {
+                let count = context.i64_type().const_int(length.into(), false);
+                memory::emit_generated_elements(context, state, callee, count, |state, index, result| {
+                    if result.get_type() != entry.into() { return Err("generated factory changed entry type".into()); }
+                    let slot = memory::fixed_array_storage_element_pointer(context, state, array.into(), storage, index)?;
+                    state.builder.build_store(slot, result).map_err(builder_error)?;
+                    Ok(())
+                })?;
+            }
+            return Ok(Some(EmitValue::Basic(storage.into())));
+        }
         let ScalarExpression::ArrayLiteral { elements, .. } = &binding.value else {
             return Err("fixed callable array requires complete literal construction".into());
         };
@@ -200,8 +255,11 @@ pub(super) fn binding_value<'ctx, 'module>(
         {
             return Err("indexed callable requires one exact typed lexical receiver".into());
         }
+        let generated = selected_array(state, place).and_then(|array| array.generated);
         let pointer = selected_pointer(context, state, place, project)?;
-        let value = state.builder.build_load(context.ptr_type(AddressSpace::default()), pointer, "selected_callable")
+        let ty: BasicTypeEnum<'ctx> = if generated.is_some() { generated_entry_type(context).into() }
+            else { context.ptr_type(AddressSpace::default()).into() };
+        let value = state.builder.build_load(ty, pointer, "selected_callable")
             .map_err(builder_error)?;
         return Ok(Some(EmitValue::Basic(value)));
     }
@@ -214,15 +272,24 @@ pub(super) fn store_binding<'ctx>(
 ) -> Result<bool, String> {
     if array_element(&binding.declared_type).is_some() {
         let (receiver, element, length) = array_binding(state, binding)?;
-        let EmitValue::Basic(BasicValueEnum::ArrayValue(array)) = value else {
-            return Err("fixed callable array lacks fully initialized storage".into());
+        let generated = generated_factory(state, binding).map(|(_, captures)| captures);
+        let (storage, llvm_type) = if generated.is_some() {
+            let EmitValue::Basic(BasicValueEnum::PointerValue(storage)) = value else {
+                return Err("generated callable array lacks fully initialized storage".into());
+            };
+            (*storage, generated_entry_type(context).array_type(length))
+        } else {
+            let EmitValue::Basic(BasicValueEnum::ArrayValue(array)) = value else {
+                return Err("fixed callable array lacks fully initialized storage".into());
+            };
+            let ty = context.ptr_type(AddressSpace::default()).array_type(length);
+            if array.get_type() != ty { return Err("fixed callable array changed its physical extent".into()); }
+            let storage = entry_alloca(state, ty.into(), "local_callable_array")?;
+            state.builder.build_store(storage, *array).map_err(builder_error)?;
+            (storage, ty)
         };
-        let llvm_type = context.ptr_type(AddressSpace::default()).array_type(length);
-        if array.get_type() != llvm_type { return Err("fixed callable array changed its physical extent".into()); }
-        let storage = entry_alloca(state, llvm_type.into(), "local_callable_array")?;
-        state.builder.build_store(storage, *array).map_err(builder_error)?;
         if state.local_callable_arrays.insert(receiver.name_span, LocalCallableArray {
-            storage, llvm_type, length: length.into(), element: element.clone(),
+            storage, generated, llvm_type, length: length.into(), element: element.clone(),
         }).is_some() { return Err("duplicate fixed callable array declaration".into()); }
         return Ok(true);
     }
@@ -236,14 +303,19 @@ pub(super) fn store_binding<'ctx>(
     };
     let (parameters, outputs) = signature(&receiver.ty)
         .ok_or_else(|| "unsupported local callable slot signature".to_owned())?;
-    let EmitValue::Basic(BasicValueEnum::PointerValue(required)) = value else {
-        return Err("missing proved local callable initializer".into());
+    let generated = match &binding.value {
+        ScalarExpression::IndexedRead { place, .. } => selected_array(state, place).and_then(|array| array.generated),
+        _ => None,
     };
-    let storage = entry_alloca(state, context.ptr_type(AddressSpace::default()).into(), "local_callable")?;
+    let EmitValue::Basic(required) = value else { return Err("missing proved local callable initializer".into()); };
+    let ty: BasicTypeEnum<'ctx> = if generated.is_some() { generated_entry_type(context).into() }
+        else { context.ptr_type(AddressSpace::default()).into() };
+    if required.get_type() != ty { return Err("local callable initializer changes its private layout".into()); }
+    let storage = entry_alloca(state, ty, "local_callable")?;
     state.builder.build_store(storage, *required).map_err(builder_error)?;
     let key = (receiver.name_span.start, receiver.name_span.end);
     if state.local_callable_slots.insert(key, LocalCallableSlot {
-        storage, parameters: parameters.to_vec(), outputs: outputs.clone(),
+        storage, generated, parameters: parameters.to_vec(), outputs: outputs.clone(),
     }).is_some() {
         return Err("duplicate local callable slot".into());
     }
@@ -274,6 +346,7 @@ pub(super) fn replace<'ctx, 'module>(
                 return Err("fixed callable array update requires an ordinary lexical statement without a previous result".into());
             }
             let array = selected_array(state, &destination.place).expect("authenticated callable array");
+            if array.generated.is_some() { return Err("generated callable array is not an updateable slot".into()); }
             let (parameters, outputs) = scalar_only_signature(&array.element).ok_or("invalid fixed callable array signature")?;
             let value = target(state, expression, parameters, outputs, false)?;
             let pointer = selected_pointer(context, state, &destination.place, project)?;
@@ -289,6 +362,7 @@ pub(super) fn replace<'ctx, 'module>(
         state.local_callable_slots.get(&(span.start, span.end))
     });
     let Some(slot) = selected else { return Ok(None) };
+    if slot.generated.is_some() { return Err("generated callable snapshot is not an updateable slot".into()); }
     let [expression] = assignment.values.as_slice() else {
         return Err("local callable replacement requires one direct value".into());
     };
@@ -305,17 +379,32 @@ pub(super) fn invoke<'ctx, 'module>(
     arguments: &[ScalarExpression], project: Option<ProjectCallScope<'_>>,
 ) -> Result<EmitValue<'ctx>, String> {
     let slot = state.local_callable_slots.get(&key).ok_or_else(|| "missing local callable slot".to_owned())?;
-    let (storage, parameters, outputs) = (slot.storage, slot.parameters.clone(), slot.outputs.clone());
+    let (storage, parameters, outputs, generated) =
+        (slot.storage, slot.parameters.clone(), slot.outputs.clone(), slot.generated);
     if arguments.len() != parameters.len() {
         return Err("local callable slot argument count differs from its signature".into());
     }
-    let types = parameters.iter().map(|ty| basic_type(context, ty, state.target_layout).map(Into::into))
+    let mut types = parameters.iter().map(|ty| basic_type(context, ty, state.target_layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
+    let (pointer, capture) = if let Some(captures) = generated {
+        let entry = state.builder.build_load(generated_entry_type(context), storage, "generated_callable_snapshot")
+            .map_err(builder_error)?.into_struct_value();
+        let pointer = state.builder.build_extract_value(entry, 0, "generated_callable_code")
+            .map_err(builder_error)?.into_pointer_value();
+        let capture = if captures {
+            types.insert(0, context.i64_type().into());
+            Some(state.builder.build_extract_value(entry, 1, "generated_callable_environment")
+                .map_err(builder_error)?)
+        } else { None };
+        (pointer, capture)
+    } else {
+        (state.builder.build_load(context.ptr_type(AddressSpace::default()), storage, "local_callable_target")
+            .map_err(builder_error)?.into_pointer_value(), None)
+    };
     let ty = basic_type(context, &outputs.outputs[0].ty, state.target_layout)?.fn_type(&types, false);
-    let pointer = state.builder.build_load(context.ptr_type(AddressSpace::default()), storage, "local_callable_target")
-        .map_err(builder_error)?.into_pointer_value();
-    let values = super::expression::emit_contextual_arguments(context, state, arguments, &parameters, project)?
+    let mut values = super::expression::emit_contextual_arguments(context, state, arguments, &parameters, project)?
         .into_iter().map(|value| take_basic(value).map(Into::into)).collect::<Result<Vec<_>, _>>()?;
+    if let Some(capture) = capture { values.insert(0, capture.into()); }
     let call = state.builder.build_indirect_call(ty, pointer, &values, "local_callable_call").map_err(builder_error)?;
     state.call_owner_flags.clear();
     super::expression::ordinary_call_result(call.try_as_basic_value(), &outputs)

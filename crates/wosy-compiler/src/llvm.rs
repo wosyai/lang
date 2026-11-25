@@ -1664,6 +1664,44 @@ fn emit_project_llvm<'a>(
             anonymous_definitions.push((owner.module, name, arm));
         }
     }
+    if let Some(build) = project_build {
+        let prepared = build.prepared();
+        let mut bound_owner = None;
+        let mut reachable = None;
+        for (owner, arm) in prepared.generated_callables() {
+            if !reachable.get_or_insert_with(|| ordered_modules.iter().map(|&(module, _)| module)
+                .collect::<std::collections::HashSet<_>>()).contains(&owner.module) { continue; }
+            let key = (owner.module, owner.item);
+            if bound_owner.as_ref().is_none_or(|(found, _)| *found != key) {
+                let ScalarItem::Function(function) = &project.modules[owner.module].items[owner.item] else {
+                    return Err("private generated callable lost its function".into());
+                };
+                bound_owner = Some((key, prepared.bind_callable_body_call_nodes(
+                    owner.module, owner.item, None, &function.body,
+                )?));
+            }
+            let nodes = &bound_owner.as_ref().expect("bound generated owner").1;
+            let actual = crate::scalar::anonymous_callable::actual_generated_callable(prepared, owner, nodes)?;
+            let prefix = format!("__wosy_private_generated_{}_{}_{}_{}", owner.module, owner.item, owner.block, owner.binding);
+            let child_name = format!("{prefix}_child");
+            let factory_name = format!("{prefix}_factory");
+            if functions.contains_key(&child_name) || functions.contains_key(&factory_name)
+                || module.get_function(&child_name).is_some() || module.get_function(&factory_name).is_some()
+                || initializer_symbols.generated_array_factories.insert(std::ptr::from_ref(actual),
+                    (factory_name.clone(), arm.captures_index)).is_some()
+            { return Err("duplicate private generated callable".into()); }
+            let signature = &arm.child.function().signature;
+            let child = module.add_function(&child_name, function_type(&context, signature, target_layout)?, Some(Linkage::Private));
+            let factory = module.add_function(&factory_name,
+                local_callable::generated_entry_type(&context).fn_type(&[context.i64_type().into()], false),
+                Some(Linkage::Private));
+            local_callable::emit_generated_factory(&context, factory, child, arm.captures_index)?;
+            signatures.insert(child_name.clone(), signature.clone());
+            functions.insert(child_name.clone(), child);
+            functions.insert(factory_name, factory);
+            anonymous_definitions.push((owner.module, child_name, &arm.child));
+        }
+    }
     functions.insert(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
@@ -2963,11 +3001,11 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    if matches!(binding.value, ScalarExpression::GeneratedArray { .. }) {
-        return memory::emit_generated_fixed_scalar_array(context, state, binding);
-    }
     if let Some(value) = local_callable::binding_value(context, state, binding, Some(ProjectCallScope { module, modules }))? {
         return Ok(value);
+    }
+    if matches!(binding.value, ScalarExpression::GeneratedArray { .. }) {
+        return memory::emit_generated_fixed_scalar_array(context, state, binding);
     }
     if binding.output_sequence.outputs.len() == 1 {
         return emit_project_typed_expression(

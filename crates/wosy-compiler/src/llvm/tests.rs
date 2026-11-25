@@ -18864,3 +18864,69 @@ if (observe(3,2) != 12 || empty(0) != 0) { core.system_panic(); };
         }
     }
 }
+
+
+#[test]
+fn generated_fixed_callable_arrays_save_each_invocation_environment() {
+    let text = "%%start
+u64(u64,u64) ordered = fn(first,second) {
+    u64()[3] operations = [fn(index) { fn() { index } }; 3];
+    u64() saved_first = operations[first];
+    u64() saved_second = operations[second];
+    saved_first() * 10 + saved_second()
+};
+u8(u64) constant = fn(index) {
+    u8()[2] operations = [fn(_) { fn() { 7 } }; 2];
+    u8() saved = operations[index];
+    saved()
+};
+u64() empty = fn {
+    u8()[0] operations = [fn(_) { fn() { 9 } }; 0];
+    core.array_len(&operations)
+};
+if (ordered(2,0) != 20 || ordered(0,1) != 1 || constant(0) != 7 || constant(1) != 7 || empty() != 0) {
+    core.system_panic();
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/generated-callables.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = parse(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let generated = prepared.generated_callables().map(|(_, arm)| arm.captures_index).collect::<Vec<_>>();
+        assert_eq!(generated, vec![true, false, false]);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        for (name, output, count, selected) in [("ordered", "i64", 3, 2), ("constant", "i8", 2, 1), ("empty", "i64", 0, 0)] {
+            let body = self_tail_test_body(&ir, output, &project_function_name(&source, name));
+            assert_eq!(body.matches(&bounds).count(), selected, "{body}");
+            assert!(body.contains(&format!("[{count} x {{ ptr, i64 }}]")), "{body}");
+            assert_eq!(body.matches("call { ptr, i64 } @__wosy_private_generated_").count(), usize::from(count != 0), "{body}");
+            assert_eq!(body.matches("extractvalue { ptr, i64 }").count(), if name == "ordered" { 4 } else { selected }, "{body}");
+            if count != 0 {
+                assert!(body.contains("phi i64") && body.contains(&format!(", {count}")), "{body}");
+            } else {
+                assert!(!body.contains("generated_array.body") && body.contains("ret i64 0"), "{body}");
+            }
+        }
+        let capture = text.replace("fn() { index }", "fn() { first }");
+        let failures = parse(&capture).err().expect("outer captures are outside the private generated family").diagnostics.clone();
+        assert!(failures.iter().any(|error| error.code == "B0001"), "{failures:?}");
+        if let Some(out) = std::env::var_os("WOSY_DEV4_GENERATED_CALLABLE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-generated-callable.ll")), controlled).unwrap();
+        }
+    }
+}

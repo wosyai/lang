@@ -114,6 +114,7 @@ pub struct PreparedScalarProject {
     checked_access: Option<CheckedAccessDeclarations>,
 
     require_release_checked_access: bool,
+    generated_callables: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedGeneratedCallable>,
     inline_arms: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedAnonymousCallable>,
 }
 
@@ -310,6 +311,7 @@ impl PreparedScalarProject {
             validation.project.initialization_order.push(source);
             occurrence_typing.extend(typed);
         }
+        let generated_count = occurrence_typing.iter().map(PreparationOccurrenceTyping::generated_callable_count).sum::<usize>();
         let inline_count = occurrence_typing.iter().map(PreparationOccurrenceTyping::anonymous_element_count).sum::<usize>();
         let project = validation.project;
         let calls = reference::resolve_project_call_sites_with_occurrences_for(
@@ -330,7 +332,7 @@ impl PreparedScalarProject {
                 kind: ProjectPreparationRejectionKind::StaticLookup(calls),
             });
         }
-        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new() };
+        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new() };
         if inline_count != 0 {
             if isolated_anonymous_arm.is_some() {
                 return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
@@ -354,7 +356,29 @@ impl PreparedScalarProject {
             };
             prepared.inline_arms = arms;
         }
+        if generated_count != 0 {
+            let result = super::anonymous_callable::collect_prepared_generated_callables(&prepared);
+            prepared.generated_callables = match result {
+                Ok(arms) if isolated_anonymous_arm.is_none() && arms.len() == generated_count => arms,
+                result => {
+                    let diagnostics = result.err().unwrap_or_else(|| vec![Diagnostic {
+                        code: "B0003".into(), severity: crate::DiagnosticSeverity::Error,
+                        message: "generated callable is outside its admitted direct lexical fixed array owner".into(),
+                        labels: Vec::new(), notes: Vec::new(),
+                    }]);
+                    return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
+                        project: prepared.project, diagnostics,
+                    }));
+                }
+            };
+        }
         Ok(prepared)
+    }
+
+    pub(crate) fn generated_callables(&self) -> impl Iterator<Item = (
+        super::anonymous_callable::PreparedInlineOwner, &super::anonymous_callable::PreparedGeneratedCallable
+    )> {
+        self.generated_callables.iter().map(|(owner, arm)| (*owner, arm))
     }
 
     pub(crate) fn inline_arms(&self) -> impl Iterator<Item = (

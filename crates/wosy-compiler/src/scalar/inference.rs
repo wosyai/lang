@@ -89,6 +89,7 @@ pub(super) struct PreparationOccurrenceTyping {
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     needs_checked_access: bool,
     anonymous_element_count: usize,
+    generated_callable_count: usize,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
 }
@@ -106,6 +107,10 @@ pub(super) enum CheckedMember {
 }
 
 impl PreparationOccurrenceTyping {
+    pub(super) fn generated_callable_count(&self) -> usize {
+        self.generated_callable_count
+    }
+
     pub(super) fn anonymous_element_count(&self) -> usize {
         self.anonymous_element_count
     }
@@ -255,6 +260,12 @@ impl<'a> ScalarInferenceBuilder<'a> {
             },
             self.occurrences,
         )
+    }
+
+    pub(super) fn nominate_generated_callable(&mut self) -> bool {
+        if self.in_module_initialization || self.suppress_checked_occurrences { return false; }
+        self.occurrences.generated_callable_count += 1;
+        true
     }
 
     pub(super) fn nominate_inline_elements(&mut self, binding: &ScalarBinding) {
