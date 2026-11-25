@@ -31,7 +31,7 @@ impl<'a> CallerPointeeEffect<'a> {
 pub(super) fn checked<'a>(
     source: &SourceIdentity, declaration: ByteSpan, function: &ScalarFunction,
     body: &'a FunctionCallSites, cfg: &'a ScalarReferenceCfg, facts: &CallablePointFacts,
-    callees: &[EntryPointeeWrite<'a>], claimed: &[&BigInt], wanted: Option<OccurrenceOrdinal>,
+    callees: &[EntryPointeeWrite<'a>], claimed: &[&BigInt], wanted: Option<OccurrenceOrdinal>, guard: Option<bool>,
 ) -> Option<Vec<CallerPointeeEffect<'a>>> {
     if !(1..=2).contains(&callees.len()) || callees.len() != claimed.len()
         || !callees.iter().zip(claimed).all(|(effect, amount)| effect.offset() == *amount && &effect.formal().source == source)
@@ -43,6 +43,8 @@ pub(super) fn checked<'a>(
     {
         return None;
     }
+    if guard.is_some() && callees.len() != 1 { return None; }
+    let argument_count = callees.len().checked_add(usize::from(guard.is_some()))?;
     let structure = &body.structure;
     let root = structure.root;
     struct Cell<'a> {
@@ -131,12 +133,12 @@ pub(super) fn checked<'a>(
         let signature = body.checked_call_signatures.get(&call)?;
         if signature.overload.is_some() || signature.overload_origin.is_some()
             || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
-            || signature.parameters.len() != callees.len()
+            || signature.parameters.len() != argument_count
         {
             return None;
         }
         let ScalarExpression::Call { receiver: None, arguments, type_arguments, .. } = expression else { return None; };
-        if !type_arguments.is_empty() || arguments.len() != callees.len() || argument_points.len() != callees.len() { return None; }
+        if !type_arguments.is_empty() || arguments.len() != argument_count || argument_points.len() != argument_count { return None; }
         let mut receipts = Vec::with_capacity(callees.len());
         let mut call_cells = [false; 4];
         for (slot, ((callee, &amount), borrow)) in callees.iter().zip(claimed).zip(argument_points).enumerate() {
@@ -184,6 +186,25 @@ pub(super) fn checked<'a>(
             });
             cell.entry = exit;
             cell.observed = true;
+        }
+        if let Some(expected) = guard {
+            let slot = callees.len();
+            if signature.parameters.get(slot) != Some(&ScalarType::Bool) { return None; }
+            let actual @ ScalarExpression::Boolean { value, .. } = arguments.get(slot)? else { return None; };
+            if *value != expected { return None; }
+            let OccurrenceNode::Expression(argument) = structure.edges.get(&(
+                OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
+            ))? else { return None; };
+            let point = *argument_points.get(slot)?;
+            if facts.evaluations.get(argument) != Some(&point)
+                || structure.checked_types.expressions.get(argument) != Some(&ScalarType::Bool)
+                || cfg.points.get(point.0)?.source_span.range != body.occurrences.get(argument.0)?.span
+                || !matches!(&cfg.points.get(point.0)?.kind, CfgPointKind::Evaluate(expression) if expression == actual)
+                || !(previous.0 < point.0 && point.0 < call_point.id.0)
+            {
+                return None;
+            }
+            points.push(point);
         }
         points.push(call_point.id);
         previous = call_point.id;

@@ -25,6 +25,12 @@ pub(super) fn is_unit_target(selected: &SelectedModuleProof<'_>) -> bool {
         [result] if result.ty == ScalarType::Unit)
 }
 
+fn typed_guard_lane(positive: bool) -> Option<usize> {
+    let relation = IntegerRelation::from_operator(if positive { &BinaryOperator::Equal } else { &BinaryOperator::NotEqual })?;
+    let admitted = IntegerSet::ordinary_bool_domain().keep_relation(relation, &BigInt::from(1u8));
+    admitted.singleton_value().and_then(super::super::checker_flow::bool_result_lane)
+}
+
 impl Plan {
     pub(super) fn prepare(source: &SourceIdentity, selected: SelectedModuleProof<'_>) -> Result<Self, ProjectCheck> {
         let declaration = selected.node;
@@ -161,7 +167,6 @@ impl ActualIntegerObserver for &Plan {
         source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<Vec<LocalTransition>>, ProjectCheck> {
         if target != self.target { return Ok(None); }
-        if self.guard.is_some() { return Err(ProjectCheck::Unsupported); }
         if &self.proof.source != source
             || !matches!(runtime.visits, Some([InitializationVisit::Started]))
         {
@@ -176,8 +181,10 @@ impl ActualIntegerObserver for &Plan {
         let mut amounts = self.claims.iter().map(|claim| (claim.slot, &claim.amount)).collect::<Vec<_>>();
         amounts.sort_unstable_by_key(|(slot, _)| *slot);
         let amounts = amounts.into_iter().map(|(_, amount)| amount).collect::<Vec<_>>();
+        let guard = self.guard.map(|positive| typed_guard_lane(positive).map(|lane| lane == 1))
+            .map_or(Ok(None), |lane| lane.map(Some).ok_or(ProjectCheck::Unsupported))?;
         let receipts = references.pointer_caller_effects(
-            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &amounts, Some(occurrence),
+            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &amounts, Some(occurrence), guard,
         ).ok_or(ProjectCheck::Unsupported)?;
         let call = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
         // The receipt is immutable, but only the next real occurrence on
@@ -243,11 +250,7 @@ impl SymbolicRootProof for Root<'_> {
             // checker. Both authenticated arms exist before this restriction.
             let updates = validated.pointer_entry_bool_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
                 .ok_or(ProjectCheck::Unsupported)?;
-            let relation = IntegerRelation::from_operator(if guard { &BinaryOperator::Equal } else { &BinaryOperator::NotEqual })
-                .ok_or(ProjectCheck::Unsupported)?;
-            let admitted = IntegerSet::ordinary_bool_domain().keep_relation(relation, &BigInt::from(1u8));
-            let lane = admitted.singleton_value().and_then(super::super::checker_flow::bool_result_lane)
-                .ok_or(ProjectCheck::Unsupported)?;
+            let lane = typed_guard_lane(guard).ok_or(ProjectCheck::Unsupported)?;
             vec![updates.into_iter().nth(lane).ok_or(ProjectCheck::Unsupported)?]
         } else {
             validated.pointer_entry_wrapping_effects(&runtime.project.modules, runtime.calls, target.0, target.1)
@@ -420,12 +423,38 @@ mod tests {
                 assert_eq!(failure.write.range.start as usize, refuted.find(last).unwrap());
                 let dormant = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
                 assert!(!dormant.active && dormant.pointer_effect_diagnostic.is_none());
+
+                let exit = if lane { 0 } else { 2 };
+                let entrypoint = format!(r#"
+                    unit() start = fn {{
+                        u8 a = 253;
+                        update(&!a, {lane});
+                        core.require(a == {exit}, {{ .stdout = ""; .stderr = "guarded exit"; .code = 1; .files = []; }});
+                    }};
+                    start();
+                %%end"#);
+                let actual = program.replace("%%end", &entrypoint);
+                for scope in [ScalarCheckerScope::MainFlowOnly, package] {
+                    let pass = run(&actual, scope).unwrap();
+                    assert!(pass.active && pass.directives.is_empty() && pass.pointer_effect_diagnostic.is_none());
+                    let stale = actual.replace(&format!("a == {exit}"), "a == 253");
+                    let receipt = run(&stale, scope).unwrap();
+                    let [failed] = receipt.directives.as_slice() else { panic!("actual guarded write"); };
+                    assert_eq!(&stale[failed.condition.start as usize..failed.condition.end as usize], "a == 253");
+                    for denied in [
+                        actual.replace(&format!("update(&!a, {lane})"), &format!("update(&!a, {})", !lane)),
+                        refuted.replace("%%end", &entrypoint),
+                        actual.replace(&format!("update(&!a, {lane})"), &format!("bool configured = {lane}; update(&!a, configured)")),
+                        actual.replace("start();", "start(); start();"),
+                    ] {
+                        assert!(run(&denied, scope).is_err(), "{denied}");
+                    }
+                }
             }
             for refused in [
                 program.replace("where (gate)", "where (true)"),
                 program.replace("if (selected)", "if (!selected)"),
                 program.replace("*cell = *cell +@ 5", "*cell = *cell + 5"),
-                program.replace("%%end", "unit() start = fn { u8 a = 0; update(&!a, true); }; start(); %%end"),
             ] {
                 assert!(run(&refused, package).is_err(), "{refused}");
             }
