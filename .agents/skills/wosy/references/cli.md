@@ -42,7 +42,8 @@ Fails with `build rejected by syntax diagnostics`, `build rejected by CST deriva
 
 ## `wosy check`
 
-Analyze the selected target without building or running it.
+Use `wosy check [TARGET] [--profile PROFILE]` to analyze the selected target
+without building or running it.
 
 - **Default (`--declared-package`):** Check the main flow and symbolically check
   unused functions in the current package. Set `[package].source_root` to a
@@ -51,6 +52,23 @@ Analyze the selected target without building or running it.
   scan skips nested packages; unimported module initializers do not run.
 - **`--main-flow-only`:** Check only the reachable main flow. This scope does
   not require `source_root` and cannot be combined with `--declared-package`.
+- **`--dependencies`:** Also check every resolved dependency, including
+  transitive dependencies. Each uses its own primary target, default profile,
+  and declared-package scope, even when the root uses `--main-flow-only`.
+  Install locked Git dependencies with `wosy dep sync` first. Check does not
+  fetch or install dependencies.
+
+For a named proof, declare the function and its proof in a `.w` source:
+
+```wosy
+%%start
+u8(u8) echo = fn(input) { input };
+proof preserves_input for echo(x) -> (out) ensures (out == core.old(x)) {}
+%%end
+```
+
+Run the default package check to verify it even if `echo` is unused.
+Check verifies applicable proofs; a successful Build does not prove them.
 
 On completion, the first nonzero code from a failing `core.require` or
 `core.narrow` sets the exit status. With no such code, a refuted proof exits 1;
