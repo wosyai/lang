@@ -5205,30 +5205,49 @@ impl<'a> VerifiedSymbolicSummary<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-fn ranked_scalar_return_origin(calls: &FunctionCallSites)
-    -> Option<(PreparedCallable, usize, &CheckerIntegerCallOrigin, &super::reference::CallOccurrence)>
-{
+type RankedScalarOrigin<'a> = (PreparedCallable, usize, &'a CheckerIntegerCallOrigin, &'a super::reference::CallOccurrence);
+
+#[cfg(feature = "internal-checker")]
+fn ranked_scalar_return_origins(calls: &FunctionCallSites) -> Option<Vec<RankedScalarOrigin<'_>>> {
     if !calls.checker_pure_calling_frame() { return None; }
     let [result] = calls.boundary.results.as_slice() else { return None; };
-    if !is_integer_type(&result.ty) { return None; }
-    let [occurrence] = calls.call_occurrences.as_slice() else { return None; };
+    let occurrences = &calls.call_occurrences;
+    if !is_integer_type(&result.ty) || !(1..=4).contains(&occurrences.len()) { return None; }
     let structure = &calls.structure;
-    let Some(root) = structure.blocks.get(structure.root.0) else { return None; };
-    let [binding, output] = root.items.as_slice() else { return None; };
-    let (BlockItemKind::Binding(binding_region), BlockItemKind::FinalOutput(final_output)) = (&binding.kind, &output.kind)
-        else { return None; };
-    let [receiver] = binding_region.receivers() else { return None; };
-    let Some(origin) = structure.checker_integer_call_locals.get(&(structure.root, binding.position))
-        else { return None; };
-    if occurrence.ordinal != origin.call || receiver.contextual_storage.is_some() || receiver.ty != result.ty
-        || final_output.output != 0 || structure.checked_types.expressions.get(&final_output.expression) != Some(&result.ty)
-        || !matches!(calls.prepared_plain_name(final_output.expression),
-            Some(super::reference::PlainNameIdentity::Lexical(binding)) if binding == &origin.binding)
+    let root = structure.blocks.get(structure.root.0)?;
+    let (output, bindings) = root.items.split_last()?;
+    let BlockItemKind::FinalOutput(final_output) = &output.kind else { return None; };
+    if bindings.len() != occurrences.len() || final_output.output != 0
+        || structure.checked_types.expressions.get(&final_output.expression) != Some(&result.ty)
     {
         return None;
     }
-    let &callee = structure.checker_direct_targets.get(&origin.call)?;
-    Some((callee, binding.position, origin, occurrence))
+    let mut origins = Vec::with_capacity(bindings.len());
+    let mut seen = HashSet::new();
+    for binding in bindings {
+        let BlockItemKind::Binding(region) = &binding.kind else { return None; };
+        let [receiver] = region.receivers() else { return None; };
+        let origin = structure.checker_integer_call_locals.get(&(structure.root, binding.position))?;
+        let occurrence = occurrences.iter().find(|occurrence| occurrence.ordinal == origin.call)?;
+        if !seen.insert(origin.call) || receiver.contextual_storage.is_some() || !is_integer_type(&receiver.ty) {
+            return None;
+        }
+        let &callee = structure.checker_direct_targets.get(&origin.call)?;
+        origins.push((callee, binding.position, origin, occurrence));
+    }
+    let (_, _, last, _) = origins.last()?;
+    if !matches!(calls.prepared_plain_name(final_output.expression),
+        Some(super::reference::PlainNameIdentity::Lexical(binding)) if binding == &last.binding)
+    {
+        return None;
+    }
+    Some(origins)
+}
+
+#[cfg(feature = "internal-checker")]
+fn ranked_scalar_return_origin(calls: &FunctionCallSites) -> Option<RankedScalarOrigin<'_>> {
+    if calls.call_occurrences.len() != 1 { return None; }
+    ranked_scalar_return_origins(calls)?.pop()
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5332,11 +5351,11 @@ fn capture_closed_partitioned_returns<'a>(
 impl SelectedSymbolicProof<'_, '_> {
     fn check_ranked_scalar_import<'local>(
         &mut self, case: &MainFlowProofCase<'_>, calls: &'local FunctionCallSites, function: &'local ScalarFunction,
-        source: &SourceIdentity, effects: &mut OrderedFailures, import: ImportedLocal<'local>,
+        source: &SourceIdentity, effects: &mut OrderedFailures, imports: &mut [Option<ImportedLocal<'local>>],
     ) -> Result<Option<bool>, ProjectCheck> {
         let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
         let (active, directives, returned, failure) = super::checker_flow::collect_imported_root_literal_proof(
-            calls, &function.body, case.relation()?, bound, case.filter, import,
+            calls, &function.body, case.relation()?, bound, case.filter, imports,
         ).ok_or(ProjectCheck::Unsupported)?;
         for directive in directives { effects.push_callable(calls, source, directive); }
         if let Some(failure) = failure {
@@ -5357,35 +5376,45 @@ impl SelectedSymbolicProof<'_, '_> {
         if !rest.is_empty() || first.proof_source != source || first.owner != source || first.bound.literal().is_none() {
             return Ok(None);
         }
-        let Some((callee, position, origin, occurrence)) = ranked_scalar_return_origin(calls) else { return Ok(None); };
-        if callee.0 == target.0 || !matches!(origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)) {
+        let Some(origins) = ranked_scalar_return_origins(calls) else { return Ok(None); };
+        if origins.iter().any(|(callee, _, origin, _)| callee.0 == target.0
+            || !matches!(origin.arguments, super::reference::CheckerIntegerCallArguments::Wide(_)))
+        {
             return Ok(None);
         }
-        let provider = ranked.get_mut(&callee).ok_or(ProjectCheck::Unsupported)?;
-        let owner = runtime.project.modules.get(callee.0).ok_or(ProjectCheck::MissingRoot)?;
         let importing = runtime.project.modules.get(target.0).ok_or(ProjectCheck::MissingRoot)?;
-        if !provider.allow_qualified_demand || importing.source != *source
-            || !completed_namespace_owner(source, &owner.source, callee.0, runtime.visits)
-            || provider.plan.proof_source != &owner.source
-            || !std::ptr::eq(runtime.calls.function_body(callee.0, callee.1, None).ok_or(ProjectCheck::Unsupported)?,
-                provider.plan.typed.body)
-        {
-            return Err(ProjectCheck::Unsupported);
+        if importing.source != *source { return Err(ProjectCheck::Unsupported); }
+        for &(callee, _, _, occurrence) in &origins {
+            let provider = ranked.get_mut(&callee).ok_or(ProjectCheck::Unsupported)?;
+            let owner = runtime.project.modules.get(callee.0).ok_or(ProjectCheck::MissingRoot)?;
+            if !provider.allow_qualified_demand
+                || !completed_namespace_owner(source, &owner.source, callee.0, runtime.visits)
+                || provider.plan.proof_source != &owner.source
+                || !std::ptr::eq(runtime.calls.function_body(callee.0, callee.1, None).ok_or(ProjectCheck::Unsupported)?,
+                    provider.plan.typed.body)
+                || calls.sites.get(occurrence.site).map(|site| &site.target) != Some(provider.plan.canonical_target)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            provider.verify_qualified_demand()?;
+            if provider.demand_descriptor.is_none() {
+                provider.demand_descriptor = Some(ranked_symbolic_equality(provider.plan, &owner.source)
+                    .ok_or(ProjectCheck::Unsupported)?);
+            }
         }
-        if calls.sites.get(occurrence.site).map(|site| &site.target) != Some(provider.plan.canonical_target) {
-            return Err(ProjectCheck::Unsupported);
+        // Each provider remains private to this immutable analysis run.
+        // The existing ordered evaluator installs each bound only when its
+        // original lexical call and full guard are reached. Its output can
+        // feed the next prepared call, never the provider's verification.
+        let mut imports = Vec::with_capacity(origins.len());
+        for (callee, position, origin, occurrence) in origins {
+            let descriptor = ranked.get(&callee).and_then(|provider| provider.demand_descriptor.as_ref())
+                .ok_or(ProjectCheck::Unsupported)?;
+            let import = descriptor.import_local(target, calls, position, origin, occurrence, true, Some(importing.target_layout))?
+                .ok_or(ProjectCheck::Unsupported)?;
+            imports.push(Some(import));
         }
-        provider.verify_qualified_demand()?;
-        if provider.demand_descriptor.is_none() {
-            provider.demand_descriptor = Some(ranked_symbolic_equality(provider.plan, &owner.source)
-                .ok_or(ProjectCheck::Unsupported)?);
-        }
-        // This is a private guarded fact, never published to the shared
-        // same-source summary index or enrolled as a new proof dependency.
-        let descriptor = provider.demand_descriptor.as_ref().ok_or(ProjectCheck::Unsupported)?;
-        let import = descriptor.import_local(target, calls, position, origin, occurrence, true, Some(importing.target_layout))?
-            .ok_or(ProjectCheck::Unsupported)?;
-        self.check_ranked_scalar_import(first, calls, function, source, effects, import)
+        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut imports)
     }
 
     fn record(
@@ -6219,7 +6248,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                     let index = std::mem::take(&mut self.equalities);
                     let result = (|| {
                         let Some(import) = index.ranked_scalar_return_import(target, calls)? else { return Ok(None); };
-                        self.check_ranked_scalar_import(first, calls, function, source, effects, import)
+                        self.check_ranked_scalar_import(first, calls, function, source, effects, &mut [Some(import)])
                     })();
                     self.equalities = index;
                     if let Some(active) = result? { return Ok(Some(active)); }
@@ -19492,6 +19521,36 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!((&failure.output.source, &failure.goal.source), (&app, &app));
             &wrong[failure.output.range.start as usize..failure.output.range.end as usize]
         }).eq(["observed", "returned"]));
+        let layered = main.replace("                observed", "                u8 next = lib.finish(input, 2, input, observed); next")
+            .replace("ensures (out == 7) {}", "ensures (out == 9) {}")
+            .replace("                returned", "                u8 next = lib.finish(input, 1, input, returned); next");
+        let finish = r#"
+            u8(u8,u8,u8,u8) finish = fn(page, slot, left, quota) {
+                if (left == 0) { 9 } else { finish(page, slot, left - 1, quota) }
+            };
+            proof finishing for finish(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && quota == 7)
+                ensures (out == 9) decreases (left) {
+                if (left == 0) { core.show(out == 9); }
+                else { core.use(finishing(page, slot, left - 1, quota)); }
+            }
+        "#;
+        let both = library.replace("%%end", &format!("{finish} %%end"));
+        let paired = run(&layered, &both, &lib, package).unwrap();
+        assert!(paired.active && paired.directives.is_empty() && paired.symbolic_diagnostic.is_none());
+        let wrong_final = layered.replace("ensures (out == 9)", "ensures (out == 8)");
+        let failures = run(&wrong_final, &both, &lib, package).unwrap();
+        assert!(failures.symbolic_diagnostic.iter().chain(&failures.additional_symbolic_diagnostics).map(|failure| {
+            assert_eq!(failure.returned, BigInt::from(9));
+            &wrong_final[failure.output.range.start as usize..failure.output.range.end as usize]
+        }).eq(["next", "next"]));
+        for provider in [
+            both.replace("quota == 7", "quota == 8"),
+            both.replace("core.show(out == 9)", "core.show(out == 8)"),
+            both.split("            proof finishing").next().unwrap().to_owned() + "%%end",
+        ] {
+            assert!(matches!(run(&layered, &provider, &lib, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
         let idle = run(&wrong, library, &lib, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!idle.active && idle.directives.is_empty() && idle.symbolic_diagnostic.is_none());
         let no_rank = library.split("            proof rank").next().unwrap().to_owned() + "%%end";

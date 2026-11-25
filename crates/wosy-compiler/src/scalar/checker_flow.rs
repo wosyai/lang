@@ -3239,10 +3239,10 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_imported_root_literal_proof<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
-    entry_filter: &[CheckerPredicate], import: ImportedLocal<'a>,
+    entry_filter: &[CheckerPredicate], imports: &mut [Option<ImportedLocal<'a>>],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<true>(
-        calls, body, relation, bound, None, Some(entry_filter), &mut [Some(import)],
+        calls, body, relation, bound, None, Some(entry_filter), imports,
     )
 }
 
@@ -3278,11 +3278,13 @@ fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
     } else {
         None
     };
-    let imported_binding = match imports {
-        [] => None,
-        [Some(import)] => Some(&calls.structure.checker_integer_call_locals
-            .get(&(calls.structure.root, import.position))?.binding),
-        _ => return None,
+    let imported_binding = if imports.is_empty() {
+        None
+    } else {
+        if imports.len() > 4 || imports.iter().any(Option::is_none) { return None; }
+        let last = imports.last()?.as_ref()?;
+        Some(&calls.structure.checker_integer_call_locals
+            .get(&(calls.structure.root, last.position))?.binding)
     };
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
