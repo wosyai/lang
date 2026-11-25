@@ -1,5 +1,5 @@
 //! Guarded source preparation for the ordinary runtime enum match. This sealed body carries only checked, scope-limited scalar values.
-use super::{proof_match::{AuthoredMatch, Selector},
+use super::{proof_match::{AuthoredMatch, RuntimeSelector},
     typecheck::{concrete_integer_literal, integer_literal_fits_type},
     *};
 
@@ -274,13 +274,12 @@ impl Plan {
     }
 }
 
-fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: Selector<'_>,
+fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: RuntimeSelector<'_>,
     work: &mut usize,
 ) -> Result<TypedSelector, Diagnostic> {
     let names = |name: &str| formals.get(name).map(|(span, ty)| (ty.clone(), IntegerKind::Formal(*span)));
     match selector {
-        Selector::Variant { tag, runtime_arguments, span, .. } => {
-            let arguments = runtime_arguments.ok_or_else(|| diagnostic(source, span, "missing runtime enum selector arguments"))?;
+        RuntimeSelector::Variant { tag, payload: arguments, span } => {
             let payload = arguments.into_iter().map(|(argument, ty)| {
                 let typed = primitive::compile(source, argument, ty, &names, work, 0)?;
                 let span = typed.span;
@@ -293,7 +292,7 @@ fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: Selector
             }).collect::<Result<_, _>>()?;
             Ok(TypedSelector::Constructor { tag, span, payload })
         }
-        Selector::If { condition, then_branch, else_branch } => {
+        RuntimeSelector::If { condition, then_branch, else_branch } => {
             let predicate = match condition {
                 ScalarExpression::Boolean { value, .. } => Predicate::Constant(*value),
                 ScalarExpression::Name { name, span } if matches!(formals.get(name), Some((_, ScalarType::Bool))) => {
