@@ -3480,6 +3480,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         self.proof_points.runtime_field_borrows.insert(span, (borrow, id));
                     }
+                    if parent_id.is_none() && self.exact_local_runtime_copy_row(place, place_ordinal, ordinal, *mutability) {
+                        self.proof_points.runtime_field_borrows.insert(span, (borrow, id));
+                    }
                     if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
                         self.has_projected_child |= is_direct_checked_leaf(place);
                         self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
@@ -3747,6 +3750,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 Some(PlainNameIdentity::Lexical(expected)) if expected == binding),
             _ => false,
         }
+    }
+
+    fn exact_local_runtime_copy_row(
+        &mut self, place: &ScalarPlace, row: OccurrenceOrdinal, address: OccurrenceOrdinal,
+        mode: ScalarReferenceMutability,
+    ) -> bool {
+        let ScalarPlace::Index { base, .. } = place else { return false; };
+        let ScalarPlace::Name { span, .. } = base.as_ref() else { return false; };
+        let owner = self.place_ordinal(OccurrenceParent::Place(row), OccurrenceEdge::PlaceBase);
+        let selector = self.expression_ordinal(OccurrenceParent::Place(row), OccurrenceEdge::PlaceIndex);
+        let Ok(Some(PreparedPlaceRoot::Lexical(binding))) = self.prepared_place_root(owner, *span) else { return false; };
+        let types = &self.call_sites.structure.checked_types;
+        let Some(ScalarType::Struct(row_type)) = types.places.get(&row) else { return false; };
+        if !self.cfg.allocations.contains(binding)
+            || self.proof_points.guarded_runtime_receivers.contains(binding)
+            || self.proof_points.fallible_allocation_bindings.as_ref().is_some_and(|sites| sites.contains_key(binding))
+            || !matches!(types.places.get(&owner), Some(ScalarType::RuntimeArray { element, .. })
+                if matches!(element.as_ref(), ScalarType::Struct(id) if id == row_type))
+            || types.expressions.get(&selector) != Some(&ScalarType::U64)
+            || !matches!(types.expressions.get(&address), Some(ScalarType::CheckedReference { mutability, inner })
+                if *mutability == mode && matches!(inner.as_ref(), ScalarType::Struct(id) if id == row_type))
+        { return false; }
+        *self.copy_runtime_field_structs.get_or_insert_with(HashMap::new)
+            .entry(row_type.clone()).or_insert_with(|| self.structs.iter().find(|item| item.id == *row_type)
+                .is_some_and(|item| item.copy_policy == CopyPolicy::Copy))
     }
 
     fn record_runtime_array_field_site(
@@ -8213,11 +8241,12 @@ fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool
     false
 }
 
-fn exact_projected_field_of_mutable_parent(loan: &ReferenceLoanId) -> Option<(&ReferenceLoanId, &ScalarStructFieldId)> {
+fn exact_projected_field_of_mutable_parent(loan: &ReferenceLoanId, runtime_row: bool) -> Option<(&ReferenceLoanId, &ScalarStructFieldId)> {
     let parent = loan.parent.as_deref()?;
     if parent.mode != ScalarReferenceMutability::Mutable
-        || parent.parent.is_some() || !parent.origin_place.projections.is_empty()
-        || !matches!(parent.origin_place.place, ScalarPlace::Name { .. })
+        || parent.parent.is_some()
+        || (!runtime_row && (!parent.origin_place.projections.is_empty()
+            || !matches!(parent.origin_place.place, ScalarPlace::Name { .. })))
         || parent.origin_place.binding != loan.origin_place.binding
     {
         return None;
@@ -8243,6 +8272,7 @@ struct DisjointProjectedWrite<'a> {
     admission: ProjectedWriteAdmission<'a>,
     parent: &'a ReferenceLoanId,
     field: &'a ScalarStructFieldId,
+    runtime_row: bool,
 }
 
 impl DisjointProjectedWrite<'_> {
@@ -8265,7 +8295,7 @@ impl DisjointProjectedWrite<'_> {
                 index.is_none()
             },
         };
-        admitted && exact_projected_field_of_mutable_parent(loan).is_some_and(|(parent, field)|
+        admitted && exact_projected_field_of_mutable_parent(loan, self.runtime_row).is_some_and(|(parent, field)|
             parent == self.parent && field.structure == self.field.structure && field.index != self.field.index)
     }
 }
@@ -10187,6 +10217,7 @@ struct CheckedProjectedReborrowRead<'a> {
     span: ByteSpan,
     origin: ReferenceOriginId,
     runtime: bool,
+    runtime_row: bool,
 }
 
 fn checked_projected_reborrow_read<'a>(
@@ -10223,6 +10254,7 @@ fn checked_projected_reborrow_read<'a>(
         span: read.source_span.range,
         origin: authority.origin,
         runtime: authority.runtime_selector.is_some(),
+        runtime_row: false,
     })
 }
 
@@ -10237,6 +10269,33 @@ fn exact_projected_reborrow_parent_on_edge(
     points.get(authority.borrow.0)
         .and_then(|borrow| checked_projected_reborrow_read(points, borrow, authority))
         .is_some_and(|read| checked_projected_reborrow_parent_on_edge(state, facts, read, loan))
+}
+
+fn exact_runtime_row_parent(
+    cfg: &ReferenceTransferCfg<'_>, points: &[ReferenceFlowPoint],
+    authority: CheckedProjectedReborrowRead<'_>, child: &ReferenceLoanId,
+    child_point: &ReferenceFlowPoint,
+) -> bool {
+    if authority.runtime || direct_checked_field_base(&child.origin_place.place).is_none() { return false; }
+    let Some(ReferenceOrigin::Fresh { loan: parent, .. }) = cfg.facts.get(authority.origin.0) else { return false; };
+    let owner = &parent.origin_place;
+    let Some(&(birth, origin)) = cfg.runtime_field_borrows.and_then(|sites| sites.get(&parent.creation_span))
+        else { return false; };
+    let Some(point) = points.get(birth.0) else { return false; };
+    let [bind] = point.successors.as_slice() else { return false; };
+    let Some(bind) = points.get(bind.0) else { return false; };
+    let ScalarPlace::Index { base, index, .. } = &owner.place else { return false; };
+    matches!(base.as_ref(), ScalarPlace::Name { .. })
+        && matches!(owner.projections.as_slice(), [ReferencePlaceProjection::Index(actual)] if actual == index.as_ref())
+        && matches!(&point.kind, CfgPointKind::Borrow { place, loan } if place == owner && loan == parent)
+        && origin == authority.origin
+        && point.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&origin))
+        && matches!(&bind.kind, CfgPointKind::Bind { binding } if binding == authority.binding)
+        && cfg.checked_binding_initializers.binary_search_by_key(&bind.id, |&(bind, _)| bind)
+            .is_ok_and(|i| cfg.checked_binding_initializers[i].1 == birth)
+        && point.id < bind.id && bind.id < authority.pointer
+        && point.scope == bind.scope && (bind.scope == child_point.scope || bind.scope == ReferenceScopeId(0))
+        && cfg.allocations.contains(&owner.binding)
 }
 
 fn checked_projected_reborrow_parent_on_edge(
@@ -10270,8 +10329,9 @@ fn checked_projected_reborrow_parent_on_edge(
     let binding = authority.binding;
     let owner = &parent.origin_place;
     if &authority.span != span
-        || parent.parent.is_some() || !owner.projections.is_empty()
-        || !matches!(owner.place, ScalarPlace::Name { .. })
+        || parent.parent.is_some()
+        || (!authority.runtime_row && (!owner.projections.is_empty()
+            || !matches!(owner.place, ScalarPlace::Name { .. })))
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
         || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
         || (loan.mode == ScalarReferenceMutability::Mutable && parent.mode != ScalarReferenceMutability::Mutable)
@@ -10868,7 +10928,11 @@ fn transfer_reference_facts(
                     .binary_search_by_key(&point.id, |parent| parent.borrow)
                     .ok().map(|index| &cfg.named_reborrow_parents[index]);
                 if let (Some(authority), [next]) = (authority, point.successors.as_slice()) {
-                    let parent = checked_projected_reborrow_read(original_points, point, authority);
+                    let parent = checked_projected_reborrow_read(original_points, point, authority)
+                        .map(|mut parent| {
+                            parent.runtime_row = exact_runtime_row_parent(&cfg, original_points, parent, loan, point);
+                            parent
+                        });
                     let holder = original_points.get(next.0);
                     if let (Some(parent),
                         Some(ReferenceFlowPoint { kind: CfgPointKind::Bind { binding }, scope, .. }))
@@ -11979,13 +12043,22 @@ fn transfer_reference_facts(
                 {
                     let (ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. }) =
                         cfg.facts.get(candidate.origin.0)? else { return None };
-                    let (parent, field) = exact_projected_field_of_mutable_parent(loan)?;
+                    let runtime_row = loan.parent.as_deref().is_some_and(|parent|
+                        cfg.runtime_field_borrows.and_then(|sites| sites.get(&parent.creation_span))
+                            .is_some_and(|&(birth, origin)| {
+                                matches!(cfg.facts.get(origin.0), Some(ReferenceOrigin::Fresh { loan: issued, .. }) if issued == parent)
+                                    && matches!(&original_points[birth.0].kind, CfgPointKind::Borrow { loan: issued, .. } if issued == parent)
+                                    && matches!(parent.origin_place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])
+                            }));
+                    let (parent, field) = exact_projected_field_of_mutable_parent(loan, runtime_row)?;
                     let place = available_place(&candidate.place);
+                    let tail = if runtime_row {
+                        place.projections.strip_prefix(parent.origin_place.projections.as_slice())?
+                    } else { place.projections.as_slice() };
                     return (place.binding == parent.origin_place.binding
-                        && matches!(place.projections.as_slice(),
-                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == field))
+                        && matches!(tail, [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == field))
                         .then_some(DisjointProjectedWrite {
-                            admission: ProjectedWriteAdmission::Known(admitted), parent, field,
+                            admission: ProjectedWriteAdmission::Known(admitted), parent, field, runtime_row,
                         });
                 }
                 let (read, binding, field, index) = if let Some((read, binding, Some(field))) = exact_named_scalar_store_pointer(
@@ -12033,7 +12106,7 @@ fn transfer_reference_facts(
                     && exact_live_reborrow_holder(&state, binding, candidate.origin)
                     && !state.released.contains(&owner.binding) && !state.invalidated.contains(&owner.binding)
                     && !state.uninitialized.contains(&owner.binding) && !unavailable_place(&state, owner))
-                    .then_some(DisjointProjectedWrite { admission, parent, field })
+                    .then_some(DisjointProjectedWrite { admission, parent, field, runtime_row: false })
             })();
             let previous = match &point.kind {
                 CfgPointKind::Assign { target, .. } => Some(if grouped_installs.contains(&id) {
@@ -12054,7 +12127,10 @@ fn transfer_reference_facts(
                         let retirement_place = cfg.runtime_field_borrows.and_then(|receipts|
                             runtime_field_child_retirement_place(
                                 receipts, cfg.initial_points, cfg.facts, cfg.allocations, &state, point,
-                            ));
+                            )).or_else(|| match (projected_write, candidates.as_slice()) {
+                                (Some(proof), [candidate]) if proof.runtime_row => Some(available_place(&candidate.place)),
+                                _ => None,
+                            });
                         previous_candidate_origins(&state, &cfg.facts, candidates, projected_write, retirement_place.as_ref())
                     })
                 }

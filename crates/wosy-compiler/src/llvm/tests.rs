@@ -18439,3 +18439,100 @@ if (observe(2,1) != 202) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn runtime_whole_row_field_loans_preserve_checked_address_and_ancestry() {
+    let text = "%%start
+struct copy Cell { u8 tag; bool ready; u64 value; }
+u64(u64,u64) probe_shared = fn(count,index) {
+    Cell[count] cells;
+    cells[index].value = 101;
+    *Cell row = &cells[index];
+    *u64 leaf = &(*row).value;
+    *leaf
+};
+u64(u64,u64) probe_exclusive_shared = fn(count,index) {
+    Cell[count] cells;
+    cells[index].value = 102;
+    *!Cell row = &!cells[index];
+    *u64 leaf = &(*row).value;
+    u64 before = *leaf;
+    (*row).value + before
+};
+u64(u64,u64) probe_exclusive = fn(count,index) {
+    Cell[count] cells;
+    cells[index].value = 103;
+    *!Cell row = &!cells[index];
+    *!u64 leaf = &!(*row).value;
+    *leaf = 202;
+    (*row).value
+};
+u64(u64,u64) probe_siblings = fn(count,index) {
+    Cell[count] cells;
+    cells[index].tag = 7;
+    cells[index].value = 104;
+    *!Cell row = &!cells[index];
+    *!u8 tag = &!(*row).tag;
+    *!u64 value = &!(*row).value;
+    *tag = 8;
+    *value = 203;
+    u8 final_tag = *tag;
+    u64 final_value = *value;
+    if (final_tag == 8) { final_value } else { 0 }
+};
+if (probe_shared(2,1) != 101 || probe_exclusive_shared(2,1) != 204
+    || probe_exclusive(2,1) != 202 || probe_siblings(2,1) != 203) {
+    core.system_panic();
+};
+%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helpers = prepared.checked_access_source().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(helpers, "check_index_in_extent"));
+        let null = format!("call void @{}(", project_function_name(helpers, "check_non_null_address"));
+        let stride = "getelementptr inbounds [16 x i8], ptr ";
+        for (name, expected) in [("probe_shared", 2), ("probe_exclusive_shared", 2), ("probe_exclusive", 2), ("probe_siblings", 3)] {
+            let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, name));
+            let extent = loaded_runtime_extent_parameter(body, "count");
+            assert_eq!(body.matches(&bounds).count(), expected, "{body}");
+            assert_eq!(body.matches(stride).count(), expected, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+            let last = body.rfind(stride).unwrap();
+            let (before_row, after_row) = body.split_at(last);
+            let check = before_row.rsplit_once(&bounds).unwrap().1.lines().next().unwrap();
+            let (selector, full_count) = check.strip_prefix("i64 ").unwrap().split_once(", i64 ").unwrap();
+            assert_eq!(full_count, format!("{extent})"), "{body}");
+            assert!(after_row.lines().next().unwrap().ends_with(&format!("i64 {selector}")), "{body}");
+            assert!(after_row.contains(&null), "{body}");
+            assert!(after_row.contains("getelementptr inbounds i8, ptr "), "{body}");
+        }
+        let conflict = text.replace("    *leaf = 202;", "    (*row).value = 105;\n    *leaf = 202;");
+        let diagnostics = match prepare(&conflict) {
+            Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            Err(error) => error.diagnostics.clone(),
+        };
+        let creation = conflict.find("&!(*row).value").unwrap() as u32;
+        assert!(diagnostics.iter().any(|d| d.code == "B0003" && d.labels.iter().any(|label|
+            label.span.range == ByteSpan::new(creation, creation + 14)
+                && label.message == "origin of conflicting place or loan")), "{diagnostics:?}");
+        if let Some(out) = std::env::var_os("WOSY_DEV4_ROW_LOAN_IR_DIR") {
+            let target = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-row-field-loan.ll")), controlled).unwrap();
+        }
+    }
+}
