@@ -2713,7 +2713,10 @@ fn named_lexicographic_induction_checks_both_typed_axes_and_exact_recursive_argu
     assert_eq!(check("u8", "0", "offset >= 500 && entry > 0", "offset, entry", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("u8", "0", "true", "offset, entry", "prefix + 1", "offset"), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("u8", "0", "true", "offset, entry", "prefix", "offset + 1"), ScalarModuleProofOutcome::Unsupported);
-    assert_eq!(check("u8", "0", "true", "entry, offset", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
+    // The first authored rank can decrease even when it is the second parameter.
+    assert_eq!(check("u8", "0", "true", "entry, offset", "prefix", "offset"), ScalarModuleProofOutcome::Proved);
+    // A change to an unranked companion does not establish strict descent.
+    assert_eq!(check("u8", "0", "true", "offset", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
 }
 
 #[test]
