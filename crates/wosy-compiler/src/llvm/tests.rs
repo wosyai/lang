@@ -17415,6 +17415,92 @@ if (observe(3,5,1) != 117) { core.system_panic(); };
 }
 
 #[test]
+fn portable_private_runtime_pairs_keep_mixed_wasm_arrivals_and_signed_fallback() {
+    let common = "u16[length] cells;
+        u16[other_length] other;
+        _write(&!cells,0,9);
+        _write(&!cells,index,37);
+        _write(&!other,index,71);
+        u16 first = _relay(&cells,0);
+        u16 second = _relay(&other,index);
+        u16 replay = _relay(&cells,index);
+        if (first == 9 && second == 71 && replay == 37) { first + second + replay } else { 0 }";
+    let text = format!("%%start
+u64(u64) select = fn(index) {{ index }};
+u16(*(u16[]),u64) _read = fn(view,index) {{ (*view)[select(index)] }};
+u16(*(u16[]),u64) _relay = fn(view,index) {{ _read(view,index) }};
+u16(*(u16[]),u64) _signed_read = fn(view,index) {{ (*view)[select(index)] }};
+unit(*!(u16[]),u64,u16) _write = fn(view,index,value) {{ (*view)[select(index)] = value; }};
+u16(u64,u64,u64) portable = fn(length,other_length,index) {{ {common} }};
+u16(u64,u64,u64) signed_only = fn(length,other_length,index) {{ {} }};
+if (portable(3,5,1) != 117 || signed_only(3,5,1) != 117) {{ core.system_panic(); }};
+%%end", common.replace("u16 first = _relay", "select(index); u16 first = _read")
+           .replace("u16 replay = _relay(&cells,index);", "u16 replay = _signed_read(&cells,index);"));
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let wasm = layout == ScalarTargetLayout::WASM32;
+        let signed_cap = if wasm { (i32::MAX as u64) / 2 } else { (i64::MAX as u64) / 2 };
+        for (function, cap) in [
+            ("portable", if wasm { u64::MAX / 2 } else { signed_cap }),
+            ("signed_only", signed_cap),
+        ] {
+            let caller = self_tail_test_body(&ir, "i16", &project_function_name(&source, function));
+            let guard_lines: Vec<_> = caller.lines().filter(|line| line.contains("icmp ugt i64")).collect();
+            assert_eq!(guard_lines.len(), 2, "{caller}");
+            assert!(guard_lines.iter().all(|line| line.ends_with(&format!(", {cap}"))), "{caller}");
+            assert_eq!(caller.matches("call ptr @__wosy_core_alloc").count(), 2, "{caller}");
+            assert_eq!(caller.matches("call void @__wosy_core_free").count(), 2, "{caller}");
+            assert_eq!(caller.matches(&format!("call void @{}(", project_function_name(&source, "_write"))).count(), 3, "{caller}");
+            let direct = format!("call i16 @{}(", project_function_name(&source, "_read"));
+            let routed = format!("call i16 @{}(", project_function_name(&source, "_relay"));
+            let (direct_calls, relay_calls) = if function == "portable" { (0, 3) } else { (1, 1) };
+            assert_eq!(caller.matches(&direct).count(), direct_calls, "{caller}");
+            assert_eq!(caller.matches(&routed).count(), relay_calls, "{caller}");
+        }
+        let helper = prepared.checked_access_source().unwrap();
+        let validate_leaf = |name: &str, result: &str, unsigned: bool| {
+            let body = self_tail_test_body(&ir, result, &project_function_name(&source, name));
+            let non_null = format!("call void @{}(", project_function_name(helper, "check_non_null_address"));
+            let bounds = format!("call void @{}(", project_function_name(helper, "check_index_in_extent"));
+            let gep = if unsigned { "getelementptr i16" } else { "getelementptr inbounds i16" };
+            for needle in [&non_null, &bounds, gep] {
+                assert_eq!(body.matches(needle).count(), 1, "{body}");
+            }
+            assert!(body.find(&non_null).unwrap() < body.find(&bounds).unwrap()
+                && body.find(&bounds).unwrap() < body.find(gep).unwrap(), "{body}");
+            assert!(body.lines().any(|line| line.contains(&bounds) && line.contains("%borrowed_array_extent")), "{body}");
+            if wasm {
+                let narrow = body.find("trunc i64").unwrap();
+                assert!(body.find(&bounds).unwrap() < narrow && narrow < body.find(gep).unwrap(), "{body}");
+            }
+        };
+        validate_leaf("_read", "internal i16", wasm);
+        validate_leaf("_write", "internal void", wasm);
+        validate_leaf("_signed_read", "internal i16", false);
+        let relay = self_tail_test_body(&ir, "internal i16", &project_function_name(&source, "_relay"));
+        let formals = relay.split_once(')').unwrap().0;
+        assert!(relay.contains(&format!("call i16 @{}({formals})", project_function_name(&source, "_read"))), "{relay}");
+        assert!(!relay.contains("getelementptr") && !relay.contains("extractvalue"), "{relay}");
+        if let Some(out) = std::env::var_os("WOSY_PORTABLE_PRIVATE_RUNTIME_PAIRS_IR_DIR") {
+            let target = if wasm { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
+
+#[test]
 fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
     for (body, output) in [
         ("values[index]", "u8"),

@@ -397,6 +397,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     (aggregate.plan().private_runtime_reads.contains(&ordinal) || aggregate.plan().private_runtime_writes.contains(&ordinal))
                         .then_some((aggregate, nodes))
                 });
+            let portable_formal = formal_receipt.is_some_and(|(aggregate, _)|
+                aggregate.plan().private_runtime_portable_formal);
             let formal_pair = if let Some((aggregate, nodes)) = formal_receipt {
                 let (ScalarType::RuntimeArray { element, .. }, ScalarPlace::Dereference { pointer, .. }) =
                     (&base_type, base.as_ref())
@@ -526,7 +528,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             });
             let portable_local = matches!(local_extent, Some((_, LocalRuntimeExtent::PortableConstruction { .. }, true)));
             let portable_wasm_offset = state.target_layout == ScalarTargetLayout::WASM32
-                && (portable_local || runtime_offset.is_some_and(|receipt|
+                && (portable_local || portable_formal || runtime_offset.is_some_and(|receipt|
                     receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault));
             let index = emit_place_index(context, state, index, project)?;
             if signed_selector_maximum.zip(index.get_zero_extended_constant())
@@ -677,7 +679,7 @@ impl PortableRuntimeAddressDomain {
         (target == ScalarTargetLayout::WASM32).then_some(signed_runtime_scalar_element(element)?).map(Self)
     }
 
-    fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
+    pub(super) fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
         target == ScalarTargetLayout::WASM32 && Some(self.0) == signed_runtime_scalar_element(element)
     }
 }

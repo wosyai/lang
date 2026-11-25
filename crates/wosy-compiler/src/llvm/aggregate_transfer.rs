@@ -352,11 +352,17 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     symbol: &str, arguments: &[ScalarExpression], parameters: &[ScalarType],
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
-    let Some(calls) = state.aggregate.as_ref().map(|aggregate| &aggregate.plan.private_runtime_access_calls)
-        .filter(|calls| !calls.is_empty()) else { return Ok(None) };
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan)
+        .filter(|plan| !plan.private_runtime_access_calls.is_empty()) else { return Ok(None) };
     let nodes = state.body_call_nodes.ok_or("private runtime array call lacks prepared occurrences")?;
     let Some(occurrence) = nodes.expression_ordinal(expression) else { return Ok(None) };
-    let Some(&declaration) = calls.get(&occurrence) else { return Ok(None) };
+    let Some(site) = plan.private_runtime_access_calls.get(&occurrence) else { return Ok(None) };
+    let declaration = site.owner;
+    let portable = plan.private_runtime_portable_calls.contains(&occurrence);
+    if portable && (site.portable_birth.is_none() || !state.project_names.is_some_and(|names|
+        names.private_runtime_portable_symbols.contains(symbol))) {
+        return Err("portable private runtime array call lost its exact sink".into());
+    }
     let Some((ScalarExpression::CheckedAddress { mutability, place: place @ ScalarPlace::Name { .. }, .. },
         scalar_arguments)) = arguments.split_first()
         else { return Err("private runtime array call changed its exact arguments".into()); };
@@ -371,11 +377,17 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         return Err("private runtime array call changed its exact owner".into());
     }
     let pointer = memory::place_pointer(context, state, place, project)?;
-    let Some(&(owner, LocalRuntimeExtent::Construction { length, signed: Some(domain) }, true)) =
-        state.local_runtime_extents.get(&pointer)
-        else { return Err("private runtime array call lacks its original signed backing and extent".into()); };
-    if owner != declaration || !domain.matches_consumer(state.target_layout, element) {
-        return Err("private runtime array call changed its prepared extent domain".into());
+    let Some(&(owner, extent, true)) = state.local_runtime_extents.get(&pointer)
+        else { return Err("private runtime array call lacks its original checked backing and extent".into()); };
+    let length = match extent {
+        LocalRuntimeExtent::PortableConstruction { length, domain }
+            if portable && domain.matches_consumer(state.target_layout, element) => length,
+        LocalRuntimeExtent::Construction { length, signed: Some(domain) }
+            if !portable && domain.matches_consumer(state.target_layout, element) => length,
+        _ => return Err("private runtime array call changed its prepared extent domain".into()),
+    };
+    if owner != declaration {
+        return Err("private runtime array call changed its original backing".into());
     }
     let address = state.builder.build_ptr_to_int(pointer, memory::pointer_integer_type(context, state.target_layout),
         "private_runtime_address").map_err(builder_error)?;
@@ -1690,6 +1702,11 @@ pub(super) fn emit_array_descriptor_forward<'ctx>(
     };
     let parameter = definition.get_first_param().ok_or("missing checked array forwarding parameter")?;
     let private_index = matches!(transport, ArrayDescriptorForward::PrivateSharedIndex);
+    if private_index && state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.private_runtime_portable_formal)
+        && !state.project_names.is_some_and(|names| names.private_runtime_portable_symbols.contains(symbol))
+    {
+        return Err("portable private runtime relay lost its closed target".into());
+    }
     let target_type = target.get_type();
     let exact_parameters = if private_index {
         target_type.get_param_types().as_slice() == [argument.into(), context.i64_type().into()]

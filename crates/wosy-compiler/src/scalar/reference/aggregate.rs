@@ -3116,7 +3116,10 @@ pub(crate) struct ClosedBody {
     pub(crate) private_runtime_read_forward: Option<usize>,
     pub(crate) private_runtime_reads: HashSet<usize>,
     pub(crate) private_runtime_writes: HashSet<usize>,
-    pub(crate) private_runtime_access_calls: HashMap<usize, ByteSpan>,
+    pub(crate) private_runtime_access_calls: HashMap<usize, PrivateRuntimePairCall>,
+    pub(crate) private_runtime_access_relay_target: Option<BodyKey>,
+    pub(crate) private_runtime_portable_calls: HashSet<usize>,
+    pub(crate) private_runtime_portable_formal: bool,
     pub(crate) private_runtime_access_owners: HashSet<ByteSpan>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
@@ -3168,6 +3171,13 @@ impl ClosedBody {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrivateRuntimePairCall {
+    pub(crate) owner: ByteSpan,
+    pub(crate) target: BodyKey,
+    pub(crate) portable_birth: Option<(CfgPointId, CfgPointId)>, // exact (call, first borrow)
+}
+
 pub(crate) type BodyKey = (usize, usize, Option<usize>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3188,6 +3198,7 @@ pub(crate) struct ClosedInitializer {
 #[derive(Debug, Default)]
 pub(crate) struct ClosedAggregates {
     bodies: BTreeMap<BodyKey, ClosedBody>,
+    private_runtime_pair_members: Vec<BodyKey>,
     initializers: HashMap<SourceIdentity, ClosedInitializer>,
 }
 
@@ -9345,11 +9356,45 @@ struct PrivateRuntimeReadPlan {
     forward: Option<usize>,
     accesses: HashSet<usize>,
     writes: HashSet<usize>,
-    calls: HashMap<usize, ByteSpan>,
+    calls: HashMap<usize, PrivateRuntimePairCall>,
+    relay_target: Option<BodyKey>,
     owners: HashSet<ByteSpan>,
 }
 
 impl ClosedAggregates {
+    pub(crate) fn private_runtime_pair_members(&self) -> &[BodyKey] {
+        &self.private_runtime_pair_members
+    }
+
+    pub(crate) fn mark_private_runtime_portable(
+        &mut self, local: HashMap<BodyKey, HashSet<usize>>,
+    ) -> Result<(), String> {
+        let mut pending = Vec::new();
+        for (key, calls) in local {
+            let plan = self.bodies.get_mut(&key).ok_or("portable caller lost its closed body")?;
+            for call in &calls {
+                let site = plan.private_runtime_access_calls.get(call).ok_or("portable call lost its exact closed use")?;
+                if site.portable_birth.is_none() {
+                    return Err("portable call lost its standard construction proof".into());
+                }
+                pending.push(site.target);
+            }
+            plan.private_runtime_portable_calls = calls;
+        }
+        // OR across all incoming arrivals. A once-marked relay never needs
+        // another scan or a runtime domain tag.
+        while let Some(key) = pending.pop() {
+            let plan = self.bodies.get_mut(&key).ok_or("portable call lost its closed sink")?;
+            if plan.private_runtime_access_formal.is_none() {
+                return Err("portable call lost its exact formal pair".into());
+            }
+            if !std::mem::replace(&mut plan.private_runtime_portable_formal, true) {
+                pending.extend(plan.private_runtime_access_relay_target);
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::scalar) fn install_private_runtime_reads(
         &mut self, plans: &PrivateRuntimeReadPlans, reservations: &AggregateReservations,
     ) -> Result<(), String> {
@@ -9371,7 +9416,9 @@ impl ClosedAggregates {
             body.private_runtime_reads.clone_from(&plan.accesses);
             body.private_runtime_writes.clone_from(&plan.writes);
             body.private_runtime_access_calls.clone_from(&plan.calls);
+            body.private_runtime_access_relay_target = plan.relay_target;
             body.private_runtime_access_owners.clone_from(&plan.owners);
+            self.private_runtime_pair_members.push(key);
         }
         Ok(())
     }
@@ -9642,6 +9689,9 @@ impl ProjectReferenceResults {
         }
         let mut immutable_owners = HashMap::<BodyKey, HashSet<ReferenceBindingId>>::new();
         let mut raw_exposures = HashMap::<BodyKey, (bool, HashSet<ReferenceBindingId>)>::new();
+        // Indexed once, only after an actual closed-use candidate has been
+        // reached. No separate birth map for unrelated ordinary allocators.
+        let mut ordinary_births = HashMap::<BodyKey, HashSet<ReferenceBindingId>>::new();
         let mut local_sites = HashMap::new();
         for (&target, uses) in &census.transport_uses {
             let Some(uses) = uses.as_ref().filter(|uses| !uses.is_empty()) else { continue };
@@ -9726,18 +9776,37 @@ impl ProjectReferenceResults {
                     });
                     if *unknown || exposed.contains(&place.binding) { return None; }
                 }
-                immutable.contains(&place.binding).then_some(place.binding.declaration_span)
+                let portable_birth = (project.modules[caller.0].target_layout == ScalarTargetLayout::WASM32
+                    && ordinary_births.entry(caller).or_insert_with(|| {
+                        let Some(facts) = self.callable_point_facts(caller.0, caller.1, caller.2)
+                            else { return HashSet::new(); };
+                        facts.definitions.iter().filter_map(|(&(block, item, receiver), definition)| {
+                            let BindingDefinition::Allocation { bind } = definition else { return None; };
+                            let BlockItemKind::Binding(binding) = &sites.structure.blocks.get(block.0)?.items.get(item)?.kind
+                                else { return None; };
+                            let BindingInitialization::Allocation { lengths } = &binding.initialization else { return None; };
+                            let [declaration] = binding.receivers() else { return None; };
+                            let CfgPointKind::Bind { binding: owner } = &cfg.initial_points.get(bind.0)?.kind
+                                else { return None; };
+                            (receiver == 0 && lengths.len() == 1 && owner.declaration_span == declaration.span
+                                && matches!(&declaration.ty, ScalarType::RuntimeArray { element, .. } if ordinary_value(element)))
+                                .then(|| owner.clone())
+                        }).collect()
+                    }).contains(&place.binding)).then_some((call, borrow));
+                immutable.contains(&place.binding).then_some(PrivateRuntimePairCall {
+                    owner: place.binding.declaration_span, target, portable_birth,
+                })
             };
             for &(caller, occurrence) in uses {
-                if let Some(owner) = classify(caller, occurrence, &mut immutable_owners) {
-                    local_sites.insert((caller, occurrence), (target, owner));
+                if let Some(site) = classify(caller, occurrence, &mut immutable_owners) {
+                    local_sites.insert((caller, occurrence), site);
                 }
             }
         }
         let sealed = closed_descriptor_routes(&census, &routes, |_| true, |_, route| match *route {
             PrivateRuntimeAccessRoute::Read(_) | PrivateRuntimeAccessRoute::Write(_) => None,
             PrivateRuntimeAccessRoute::Forward { call, target, .. } => Some((call, target)),
-        }, |caller, call| local_sites.get(&(caller, call)).map(|(target, _)| *target));
+        }, |caller, call| local_sites.get(&(caller, call)).map(|site| site.target));
         for target in sealed {
             let plan = plans.bodies.entry(target).or_default();
             match routes[&target] {
@@ -9749,16 +9818,17 @@ impl ProjectReferenceResults {
                     plan.formal = Some(formal);
                     plan.writes.extend(pending_writes[&target].values().map(|access| access.0));
                 }
-                PrivateRuntimeAccessRoute::Forward { formal, call, .. } => {
+                PrivateRuntimeAccessRoute::Forward { formal, call, target } => {
                     plan.formal = Some(formal);
                     plan.forward = Some(call.0);
+                    plan.relay_target = target;
                 }
             }
             for &(caller, occurrence) in census.transport_uses[&target].as_ref().expect("complete private read census") {
-                if let Some(&(_, owner)) = local_sites.get(&(caller, occurrence)) {
+                if let Some(&site) = local_sites.get(&(caller, occurrence)) {
                     let caller = plans.bodies.entry(caller).or_default();
-                    caller.calls.insert(occurrence, owner);
-                    caller.owners.insert(owner);
+                    caller.calls.insert(occurrence, site);
+                    caller.owners.insert(site.owner);
                 }
             }
         }

@@ -115,6 +115,7 @@ struct ProjectNames<'ctx, 'module> {
     scopes: Vec<ModuleNames<'ctx, 'module>>,
     positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
     checked_access: Option<CheckedAccessSymbols>,
+    private_runtime_portable_symbols: std::collections::HashSet<String>,
 
     require_release_checked_access: bool,
 
@@ -297,18 +298,41 @@ fn portable_lexical_runtime_body(
                     || memory::ordinary_scalar_storage(&output.ty)))
 }
 
+type RuntimeAllocationAccess<'ctx> = (
+    BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>, BTreeSet<(u32, u32)>,
+);
+
+fn portable_runtime_plan_allows_plain_storage(plan: &crate::scalar::ClosedBody) -> bool {
+    !plan.fallible_allocation_leaf && !plan.guarded_array_descriptor_leaf
+        && plan.literal_array.is_none()
+}
+
 fn runtime_allocation_access<'ctx>(
     reference_cfg: &ScalarReferenceCfg,
     body_nodes: Option<&CallableBodyCallNodes<'_>>,
     plan: Option<&crate::scalar::ClosedBody>,
     checked_access: bool,
     mut portable_body: bool,
-) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>, BTreeSet<(u32, u32)>) {
+    allow_private_pair_transport: bool,
+) -> RuntimeAllocationAccess<'ctx> {
     let mut mutable = BTreeSet::new();
     let mut indexed = BTreeSet::new();
     let mut unproved_writes = BTreeSet::new();
     let mut not_portable = std::collections::HashSet::new();
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
+    let portable_private_sites = (portable_body && allow_private_pair_transport).then(|| {
+        let mut calls = HashMap::new();
+        let mut borrows = HashMap::new();
+        if let Some(plan) = plan {
+            for site in plan.private_runtime_access_calls.values() {
+                if let Some((call, borrow)) = site.portable_birth {
+                    calls.insert(call, (borrow, site.owner));
+                    borrows.insert(borrow, site.owner);
+                }
+            }
+        }
+        (calls, borrows)
+    });
     let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
         .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
     let widened_owning_install = plan.and_then(|plan| plan.widened_owning_roundtrip).map(|(_, install, _)| install);
@@ -350,9 +374,9 @@ fn runtime_allocation_access<'ctx>(
         }
     };
     for point in &reference_cfg.points {
-        // No portable authority is inherited by a formal, carried through a
-        // whole-value use, or lent to independently lowered address syntax.
-        // Refuse unmodelled effects within this same ordinary census.
+        // No portable authority is inferred from a type or given to an
+        // independently lowered address. Only already sealed private pair
+        // calls can transport it out of the exact standard owner.
         if portable_body {
             let mut exclude = |binding: &crate::scalar::ReferenceBindingId| {
                 if reference_cfg.allocations.contains(binding) {
@@ -384,8 +408,15 @@ fn runtime_allocation_access<'ctx>(
                                 output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
                                 argument_points, ..
                             }) if argument_points.as_slice() == [point.id]));
-                    if !exact_length { exclude(&place.binding); }
+                    let exact_private = portable_private_sites.as_ref().and_then(|(_, borrows)| borrows.get(&point.id))
+                        == Some(&place.binding.declaration_span)
+                        && loan.parent.is_none() && place.projections.is_empty()
+                        && matches!(place.place, crate::ScalarPlace::Name { .. });
+                    if !exact_length && !exact_private { exclude(&place.binding); }
                 }
+                CfgPointKind::Call { argument_points, .. }
+                    if portable_private_sites.as_ref().and_then(|(calls, _)| calls.get(&point.id))
+                        .is_some_and(|(borrow, _)| argument_points.first() == Some(borrow)) => {}
                 CfgPointKind::Call { target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), .. }
                 | CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
                 | CfgPointKind::Bind { .. } | CfgPointKind::Branch { .. } | CfgPointKind::Join
@@ -441,7 +472,11 @@ fn runtime_allocation_access<'ctx>(
         for &owner in &plan.private_runtime_access_owners {
             let id = key(owner);
             indexed.insert(id);
-            not_portable.insert(id);
+        }
+        for site in plan.private_runtime_access_calls.values() {
+            if !allow_private_pair_transport || site.portable_birth.is_none() {
+                not_portable.insert(key(site.owner));
+            }
         }
     }
     indexed.retain(|id| !unproved_writes.contains(id));
@@ -1405,25 +1440,58 @@ fn emit_project_llvm<'a>(
     if prepared_render && reservations.modules.len() > 1 {
         reservations.snapshot_struct = Some(&snapshot_struct);
     }
-    let aggregates = close_aggregates(&reservations)?;
+    let mut aggregates = close_aggregates(&reservations)?;
+    let mut planned_runtime_access = HashMap::new();
+    if target_layout == ScalarTargetLayout::WASM32 && reservations.checked_access
+        && !aggregates.private_runtime_pair_members().is_empty()
+    {
+        // Only exact member owners enter the pre-definition census. The
+        // result is consumed at body emission instead of walking those CFGs
+        // twice. Unrelated ordinary and managed bodies stay on their path.
+        let mut portable_calls = HashMap::new();
+        for &key @ (ordinal, item, arm) in aggregates.private_runtime_pair_members() {
+            let plan = aggregates.body(ordinal, item, arm).expect("indexed private runtime member");
+            if !plan.private_runtime_access_calls.values().any(|site| site.portable_birth.is_some())
+                || !portable_runtime_plan_allows_plain_storage(plan)
+                || !plan.fallible_relay_allocations.is_empty() || !plan.same_array_rebinds.is_empty()
+                || plan.replacement_index_observation.is_some()
+            {
+                continue;
+            }
+            let Some(ScalarItem::Function(function)) = project.modules[ordinal].items.get(item) else {
+                return Err("portable runtime owner body lost its prepared function".into());
+            };
+            let cfg = require_cfg(ordinal, item, arm, function)?;
+            if !portable_lexical_runtime_body(target_layout, true, function, cfg) {
+                continue;
+            }
+            // This exact class has no managed rebind requiring body nodes
+            // in runtime_allocation_access; every private Call/Borrow is
+            // authenticated against its sealed CFG points instead.
+            let mut access = runtime_allocation_access(cfg, None, Some(plan), true, true, true);
+            for owner in access.2.owners.keys() {
+                access.3.remove(&(owner.start, owner.end));
+            }
+            let admitted: std::collections::HashSet<_> = plan.private_runtime_access_calls.iter().filter_map(|(&call, site)|
+                access.3.contains(&(site.owner.start, site.owner.end)).then_some(call)).collect();
+            if !admitted.is_empty() { portable_calls.insert(key, admitted); }
+            planned_runtime_access.insert(key, access);
+        }
+        aggregates.mark_private_runtime_portable(portable_calls)?;
+    }
+    let mut private_runtime_portable_symbols = std::collections::HashSet::new();
     for declaration in declarations {
         match declaration {
             Declaration::Ordinary(index) => {
                 let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let plan = aggregates.body(module_ordinal, item_ordinal, None);
+                if plan.is_some_and(|plan| plan.private_runtime_portable_formal) {
+                    private_runtime_portable_symbols.insert(name.clone());
+                }
                 let value = module.add_function(
                     &name,
-                    aggregate_transfer::definition_type(
-                        &context,
-                        function,
-                        cfg,
-                        target_layout,
-                        aggregates.body(module_ordinal, item_ordinal, None),
-                    )?,
-                    aggregate_transfer::linkage(aggregates.body(
-                        module_ordinal,
-                        item_ordinal,
-                        None,
-                    )),
+                    aggregate_transfer::definition_type(&context, function, cfg, target_layout, plan)?,
+                    aggregate_transfer::linkage(plan),
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
                     if let Some(argument) = value.get_nth_param(index as u32) {
@@ -1556,6 +1624,7 @@ fn emit_project_llvm<'a>(
         scopes,
         positions: module_positions,
         require_release_checked_access: generic_input.requires_release_checked_access(),
+        private_runtime_portable_symbols,
         checked_access: project_build.and_then(|build| build.prepared().checked_access()).map(|access| {
             CheckedAccessSymbols {
                 non_null: project_function_name(&access.source, &access.non_null),
@@ -1616,6 +1685,7 @@ fn emit_project_llvm<'a>(
             &all_structs,
             &layouts,
             target_layout,
+            planned_runtime_access.remove(&(ordinal, item, arm)),
         )?;
     }
     emit_project_main(
@@ -2261,11 +2331,7 @@ fn store_runtime_allocation<'ctx, 'module>(
     let portable = (prepared && checked_extent && !widened && !mutable && relay_unwind.is_none()
         && !state.runtime_borrow_index.owners.contains_key(&receiver.name_span)
         && state.portable_runtime_allocations.contains(&declaration)
-        && state.aggregate.as_ref().is_none_or(|aggregate| {
-            let plan = aggregate.plan();
-            !plan.fallible_allocation_leaf && !plan.guarded_array_descriptor_leaf
-                && plan.literal_array.is_none()
-        })).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
+        && state.aggregate.as_ref().is_none_or(|aggregate| portable_runtime_plan_allows_plain_storage(aggregate.plan()))).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
     let allocation = ownership::emit_runtime_array_allocation_with_absence(
         context, state, element, length, checked_extent && portable.is_none(), relay_unwind,
     )?;
@@ -2774,7 +2840,7 @@ fn emit_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
         runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access,
-            portable_lexical_runtime_body(target_layout, require_release_checked_access, function, reference_cfg));
+            portable_lexical_runtime_body(target_layout, require_release_checked_access, function, reference_cfg), false);
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access,
@@ -3124,6 +3190,7 @@ fn emit_project_function<'ctx, 'module>(
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
     target_layout: ScalarTargetLayout,
+    planned_runtime_access: Option<RuntimeAllocationAccess<'ctx>>,
 ) -> Result<(), String> {
     let value = *functions
         .get(name)
@@ -3145,8 +3212,9 @@ fn emit_project_function<'ctx, 'module>(
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index, portable_runtime_allocations) =
-        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, project_names.require_release_checked_access,
-            portable_lexical_runtime_body(target_layout, project_names.require_release_checked_access, function, reference_cfg));
+        planned_runtime_access.unwrap_or_else(|| runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan,
+            project_names.require_release_checked_access,
+            portable_lexical_runtime_body(target_layout, project_names.require_release_checked_access, function, reference_cfg), false));
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access: project_names.require_release_checked_access,
