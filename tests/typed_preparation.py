@@ -92,6 +92,17 @@ with tempfile.TemporaryDirectory() as work:
     )
     main.write_text(source(body, "primeiro ☕"))
     first = snapshot(root, store)
+    # Exercise selection rejection before any valid query prepares this root.
+    # Later writes are measured by actual compiler data, not physical WAL size.
+    absent = subprocess.run(
+        [binary, root, store, first, "--typed-project", "not-a-profile"],
+        capture_output=True, text=True,
+    )
+    assert absent.returncode != 0 and "not present in the rooted source configuration" in absent.stderr
+    assert not (store / "cas").exists()
+    untouched, _, _ = run(root, store, first, "--project-declarations")
+    assert untouched["modules_derived"] == 3 and untouched["modules_reused"] == 0
+    assert untouched["bodies_derived"] == 2  # the two providers have identical executable bodies
     wasm, _, _ = prepare(root, store, first, "dev", "--oracle")
     native, _, _ = prepare(root, store, first, "native", "--oracle")
     assert wasm["ready"] and native["ready"]
@@ -140,15 +151,6 @@ with tempfile.TemporaryDirectory() as work:
     assert configs[0]["layout"] == configs[1]["layout"]
     assert configs[0]["prepared_identity"] != configs[1]["prepared_identity"]
     assert not any(result["reused_live"] for result in configs)
-
-    # Selection errors do not trigger new compiler projections or writes.
-    prior_size = sizes(store)
-    absent = subprocess.run(
-        [binary, root, store, changed_config, "--typed-project", "not-a-profile"],
-        capture_output=True, text=True,
-    )
-    assert absent.returncode != 0 and "not present in the rooted source configuration" in absent.stderr
-    assert sizes(store) == prior_size
 
     broken_body = imports + "i32 requested = one.unlisted;\n"
     main.write_text(source(broken_body, "detalhe ☕"))
@@ -208,3 +210,94 @@ with tempfile.TemporaryDirectory() as work:
     print("25 modules / 3,456 bindings with persisted AST median", {
         key: round(median(row[key] for row in samples), 3) for key in samples[0]
     }, flush=True)
+
+
+with tempfile.TemporaryDirectory() as work:
+    first, second, shared = (Path(work) / part for part in ("consumer-a", "consumer-b", "shared-store"))
+    first_main, first_provider = create(first)
+    second_main, second_provider = create(second)
+    importer = source(
+        'selected = namespace std "api.w";\nselected.Datum answer = selected.read();\n'
+    )
+    first_main.write_text(importer)
+    second_main.write_text(importer)
+
+    def provider(kind, number):
+        return source(
+            f"struct copy Datum {{ {kind} value; }}\n"
+            f"Datum() read = fn() {{ Datum result = {{ .value = {number}; }}; result }};\n"
+        )
+
+    narrow = provider("u32", 17)
+    wide = provider("u64", 23)
+    (first_provider / "api.w").write_text(narrow)
+    (second_provider / "api.w").write_text(wide)
+    alternate = first / "alternate" / "src"
+    alternate.mkdir(parents=True)
+    (alternate.parent / "wosy.toml").write_text((first_provider.parent / "wosy.toml").read_text())
+    (alternate / "api.w").write_text(wide)
+
+    def observe(workspace, previous=None):
+        return run(workspace, shared, *([previous] if previous else []))[0]["snapshot"]
+
+    def import_module(state):
+        return next(file for file in state["files"] if file["path"] == "src/main.w")
+
+    def importer_body(workspace, state):
+        return run(workspace, shared, state["source_root"], "app", "src/main.w", "--declarations")[0]
+
+    def verify_answer(workspace, state, provider_root, width, *, fresh=True):
+        result = {}
+        for profile, pointer_size in (("dev", 4), ("native", 8)):
+            args = ["--oracle"] if fresh else []
+            reply, _, _ = prepare(workspace, shared, state["source_root"], profile, *args)
+            consumer, exported = reply["modules"]
+            aggregate, = exported["structs"]
+            assert reply["ready"] and reply["layout"]["pointer_size"] == pointer_size
+            assert consumer["members"]["answer"] == exported["owner"] == aggregate["owner"]
+            assert exported["author"]["project"] == str(provider_root.resolve())
+            assert aggregate["layout"]["size"] == width and aggregate["copy_policy"] == "Copy"
+            result[profile] = reply
+        assert result["dev"]["project_ast"] == result["native"]["project_ast"]
+        assert result["dev"]["prepared_identity"] != result["native"]["prepared_identity"]
+        return result
+
+    a_source = observe(first)
+    a_body = importer_body(first, a_source)
+    assert a_body["disposition"] == "Derived"
+    a = verify_answer(first, a_source, first_provider.parent, 4)
+
+    b_source = observe(second)
+    b_body = importer_body(second, b_source)
+    assert b_body["disposition"] == "Reused" and b_body["declarations"] == a_body["declarations"]
+    assert import_module(a_source)["executable"] == import_module(b_source)["executable"]
+    assert import_module(a_source)["imports"] == import_module(b_source)["imports"]
+    assert (b_source["namespace_derived"], b_source["namespace_reused"]) == (1, 1)
+    b = verify_answer(second, b_source, second_provider.parent, 8)
+    assert a["dev"]["prepared_identity"] != b["dev"]["prepared_identity"]
+
+    reopened = observe(first, a_source["source_root"])
+    assert reopened["source_root"] == a_source["source_root"]
+    assert (reopened["parsed"], reopened["reused"], reopened["written"]) == (0, 2, 0)
+    assert verify_answer(first, reopened, first_provider.parent, 4)["dev"]["prepared_identity"] == a["dev"]["prepared_identity"]
+
+    # Change only A's manifest. Its new provider is byte-identical to B's,
+    # but still has a distinct workspace/source owner resolved in A's context.
+    (first / "wosy.toml").write_text(manifest.replace('path = "stdlib"', 'path = "alternate"'))
+    repointed = observe(first, a_source["source_root"])
+    assert (repointed["parsed"], repointed["reused"]) == (1, 1)
+    assert (repointed["namespace_derived"], repointed["namespace_reused"]) == (0, 1)
+    assert first_main.read_bytes() == second_main.read_bytes()
+    repointed_body = importer_body(first, repointed)
+    assert repointed_body["disposition"] == "Reused"
+    assert repointed_body["declarations"] == a_body["declarations"]
+    moved = verify_answer(first, repointed, alternate.parent, 8)
+    historical = verify_answer(first, a_source, first_provider.parent, 4, fresh=False)
+    for profile in ("dev", "native"):
+        assert moved[profile]["project_ast"] == b[profile]["project_ast"]
+        assert moved[profile]["prepared_identity"] != b[profile]["prepared_identity"]
+        assert moved[profile]["prepared_identity"] != a[profile]["prepared_identity"]
+        assert historical[profile]["prepared_identity"] == a[profile]["prepared_identity"]
+    print("shared store: identical importer AST; distinct local providers; A→B→A; manifest-only repoint:",
+          {"importer_reparsed": 0, "provider_reparsed": repointed["parsed"],
+           "sizes_A_B_A_repointed": [4, 8, 4, 8], "layouts": ["Wasm32", "Native64"]}, flush=True)
