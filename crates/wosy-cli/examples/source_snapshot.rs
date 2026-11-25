@@ -11,6 +11,8 @@ use wosy_protocol::{FileKey, NodeId};
 
 #[path = "source_snapshot/typed_preparation.rs"]
 mod typed_preparation;
+#[path = "source_snapshot/retention.rs"]
+mod retention;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -174,12 +176,25 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
-    let prior = args.next().map(|s| NodeId::parse_hex(&s)).transpose()?;
+    let selection = args.next();
+    let publish_pin = selection.as_deref() == Some("--publish-pin-exit");
+    let prior = if publish_pin { None } else {
+        selection.map(|s| NodeId::parse_hex(&s)).transpose()?
+    };
     let startup_ms = milliseconds(process);
     let start = Instant::now();
     let store = SourceStore::open(&dir, 8 << 20)?;
     let open_ms = milliseconds(start);
+    if publish_pin {
+        let name = args.next().ok_or("expected pin name")?;
+        return retention::publish_and_pin(&store, &project, &name).await;
+    }
     if let Some(package) = args.next() {
+        if matches!(package.as_str(), "--source-pin" | "--source-unpin" | "--source-pins") {
+            let scope = prior.ok_or("source pin operation needs a root")?;
+            retention::run(&store, scope, &package, &mut args).await?;
+            return store.close().await;
+        }
         if package == "--typed-project" {
             let root = prior.ok_or("typed project query needs a root")?;
             let profile = args.next().ok_or("typed project query needs a profile")?;

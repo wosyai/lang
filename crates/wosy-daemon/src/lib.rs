@@ -41,9 +41,11 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
+mod pins;
 mod project_declarations;
 mod prepared_project;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
+pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
@@ -105,13 +107,7 @@ impl SourceStore {
 
     pub fn snapshot(&self, root: NodeId) -> Result<Option<SourceView>> {
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() {
-            return Ok(None);
-        }
-        let top = read_node(&tx, root)?;
-        if !supported_top(&top) {
-            return Ok(None);
-        }
+        let Some(top) = published_source(&tx, root)? else { return Ok(None); };
         let index = read_index(&tx, top)?;
         Ok(Some(SourceView {
             tx,
@@ -124,6 +120,18 @@ impl SourceStore {
             files: index.files,
         }))
     }
+}
+
+fn published_source(tx: &Transaction, root: NodeId) -> Result<Option<Node>> {
+    if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() {
+        return Ok(None);
+    }
+    source_top(tx, root)
+}
+
+fn source_top(tx: &Transaction, root: NodeId) -> Result<Option<Node>> {
+    let top = read_node(tx, root)?;
+    Ok(supported_top(&top).then_some(top))
 }
 
 fn intern_closure(
