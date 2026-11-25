@@ -4313,12 +4313,20 @@ mod prepared {
         }
     }
 
-    // Opt-in checker-only result for the ordinary whole-package route. The
-    // cover stays private until this same preparation's terminal verdict.
+    #[cfg(feature = "internal-checker")]
+    type FixedIndexRequest = (usize, usize, super::super::reference::OccurrenceOrdinal);
+
+    #[cfg(feature = "internal-checker")]
+    const MAX_FIXED_INDEX_OBSERVATION_REQUESTS: usize = 16;
+
+    // Opt-in checker-only results for the ordinary whole-package route.
+    // Staged cover stays private until this preparation's terminal verdict.
     #[cfg(feature = "internal-checker")]
     #[allow(dead_code)] // No production caller or Build helper validator yet.
     pub(super) struct CompletedFixedIndexCheck<'a> {
-        read: super::super::static_calls::PreparedReadOccurrence<'a>,
+        reads: HashMap<FixedIndexRequest, super::super::static_calls::PreparedReadOccurrence<'a>>,
+        #[cfg(test)]
+        observed_bodies: usize,
     }
 
     #[cfg(feature = "internal-checker")]
@@ -4329,43 +4337,71 @@ mod prepared {
             read: super::super::reference::OccurrenceOrdinal, extent: usize,
         ) -> bool {
             use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
-            self.read.matches(prepared.occurrence_snapshot(), module, item, read, PreparedReadKind::FixedIndex)
-                && matches!(self.read.shape(), PreparedReadShape::FixedIndex(shape) if shape.extent == extent)
+            self.reads.get(&(module, item, read)).is_some_and(|seen|
+                seen.matches(prepared.occurrence_snapshot(), module, item, read, PreparedReadKind::FixedIndex)
+                    && matches!(seen.shape(), PreparedReadShape::FixedIndex(shape) if shape.extent == extent))
         }
+
+        #[cfg(test)]
+        pub(super) fn observed_bodies(&self) -> usize { self.observed_bodies }
+    }
+
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn check_ordinary_package_with_fixed_index_observation(
+        prepared: &PreparedCheckerProject, module: usize, item: usize, occurrence: super::super::reference::OccurrenceOrdinal,
+    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'_>>) {
+        check_ordinary_package_with_fixed_index_observations(prepared, &[(module, item, occurrence)])
     }
 
     #[cfg(feature = "internal-checker")]
     #[allow(dead_code)]
-    pub(super) fn check_ordinary_package_with_fixed_index_observation(
-        prepared: &PreparedCheckerProject, module: usize, item: usize,
-        occurrence: super::super::reference::OccurrenceOrdinal,
-    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'_>>) {
+    pub(super) fn check_ordinary_package_with_fixed_index_observations<'a>(
+        prepared: &'a PreparedCheckerProject, requests: &[FixedIndexRequest],
+    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'a>>) {
         use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
-        // This entry point checks every prepared module as an ordinary
-        // package; it cannot take a caller-supplied scope, startup count,
-        // verdict, or an independently prepared read.
         let snapshot = prepared.occurrence_snapshot();
-        let same_package = prepared.project.initialization_order.first()
-            .zip(prepared.project.modules.get(module))
-            .is_some_and(|(root, candidate)| root.project == candidate.source.project
-                && root.package == candidate.source.package);
-        let staged = same_package.then(|| snapshot.read(module, item, occurrence, PreparedReadKind::FixedIndex))
-            .flatten().filter(|read| {
-                let PreparedReadShape::FixedIndex(shape) = read.shape() else { return false };
-                prepared.observe_runtime_fixed_indices(module, item)
-                    .is_some_and(|evidence| evidence.covers_read(occurrence, shape.extent))
-            });
+        let root = prepared.project.initialization_order.first();
+        let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+        let mut seen = HashSet::new();
+        if requests.len() <= MAX_FIXED_INDEX_OBSERVATION_REQUESTS {
+            for &(module, item, occurrence) in requests {
+                if !seen.insert((module, item, occurrence)) { continue; }
+                let same_package = root.zip(prepared.project.modules.get(module))
+                    .is_some_and(|(root, candidate)| root.project == candidate.source.project
+                        && root.package == candidate.source.package);
+                if !same_package { continue; }
+                let Some(read) = snapshot.read(module, item, occurrence, PreparedReadKind::FixedIndex) else { continue; };
+                groups.entry((module, item)).or_default().push((occurrence, read));
+            }
+        }
+        let mut reads = HashMap::new();
+        #[cfg(test)]
+        let mut observed_bodies = 0;
+        for ((module, item), candidates) in groups {
+            #[cfg(test)]
+            { observed_bodies += 1; }
+            let Some(evidence) = prepared.observe_runtime_fixed_indices(module, item) else { continue; };
+            for (occurrence, read) in candidates {
+                let PreparedReadShape::FixedIndex(shape) = read.shape() else { continue; };
+                if evidence.covers_read(occurrence, shape.extent) {
+                    reads.insert((module, item, occurrence), read);
+                }
+            }
+        }
+        // No caller-supplied scope/startup count/verdict, and nothing
+        // publishes from partial initialization or a nonpassing Check.
         let run = run_prepared_ordered_check_profiles::<_, false, true>(
             prepared, ScalarCheckerScope::CurrentPackage, prepared.project.modules.len(),
             OrderedReachPolicy::Legacy, (), OrderedFailures::default(),
         );
         let finished = run.as_ref().is_ok_and(|run| run.finished_all_initialization);
         let outcome = terminal_ordered_outcome(run.map(|run| (run.active, run.directives)));
-        let completed = if finished && matches!(outcome, ScalarOrderedCheckerOutcome::Passed) {
-            staged.map(|read| CompletedFixedIndexCheck { read })
-        } else {
-            None
-        };
+        let completed = (finished && matches!(outcome, ScalarOrderedCheckerOutcome::Passed) && !reads.is_empty())
+            .then_some(CompletedFixedIndexCheck {
+                reads,
+                #[cfg(test)]
+                observed_bodies,
+            });
         (outcome, completed)
     }
 
@@ -16135,6 +16171,70 @@ mod tests {
             let nested_unsafe = text.replace("if (index < 2) {", "unsafe { if (index < 2) {")
                 .replace("if (second == 3) {};", "if (second == 3) {}; };");
             assert!(prepare(&nested_unsafe, target).observe_runtime_fixed_indices(0, 0).is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn terminal_fixed_index_batch_visits_each_selected_callable_once() {
+        let src = source("src/main.w", "terminal-fixed-index-batch");
+        let input = r#"%%start
+            unit(u64) inspect = fn(index) {
+                i8[2] pair = [3, 9];
+                i8[3] triple = [3, 8, 5];
+                if (index < 2) {
+                    i8 selected = pair[index];
+                    i8 other = triple[index];
+                    if (selected == 3) {};
+                    if (other == 3) {};
+                };
+            };
+            unit(u64) never = fn(index) {
+                i8[2] pair = [3, 9];
+                if (false) {
+                    i8 selected = pair[index];
+                    if (selected == 3) {};
+                };
+            };
+            unit(u8) verify = fn(value) { core.require(value >= 1, OUTPUT); };
+            verify(1);
+        %%end"#.replace("OUTPUT", OUTPUT);
+        let candidates = |prepared: &PreparedCheckerProject, item: usize| {
+            let (_, body) = prepared.occurrence_snapshot().monomorphic_body(0, item).unwrap();
+            let mut reads = body.structure.checker_ordinary_scalar_locals.values()
+                .filter_map(|local| Some((body.fixed_index_read_shape(local.source)?.extent, local.source)))
+                .collect::<Vec<_>>();
+            reads.sort_unstable_by_key(|(extent, _)| *extent);
+            reads
+        };
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |input: &str| prepare_checker_project(
+                vec![(declarations(&src, input), Vec::new())], vec![src.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap();
+            let project = prepare(&input);
+            let one = candidates(&project, 0);
+            let [(2, pair), (3, triple)] = one.as_slice() else { panic!("two distinct prepared reads"); };
+            let dead = candidates(&project, 1);
+            let [(2, dead)] = dead.as_slice() else { panic!("structural dead read is not evidence"); };
+            let requests = [(0, 0, *pair), (0, 0, *triple), (0, 0, *pair), (0, 1, *dead), (0, 2, *pair)];
+            let (outcome, observed) = prepared::check_ordinary_package_with_fixed_index_observations(&project, &requests);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed), "{outcome:?}");
+            let observed = observed.unwrap();
+            assert_eq!(observed.observed_bodies(), 2);
+            assert!(observed.describes(&project, 0, 0, *pair, 2));
+            assert!(observed.describes(&project, 0, 0, *triple, 3));
+            assert!(!observed.describes(&project, 0, 0, *triple, 2));
+            assert!(!observed.describes(&project, 0, 1, *dead, 2));
+            assert!(!observed.describes(&project, 0, 2, *pair, 2));
+            assert!(!observed.describes(&prepare(&input), 0, 0, *pair, 2));
+            let over = vec![(0, 0, *pair); 17];
+            let (outcome, observed) = prepared::check_ordinary_package_with_fixed_index_observations(&project, &over);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed));
+            assert!(observed.is_none());
+            let refuted = prepare(&input.replace("value >= 1", "value > 1"));
+            let (outcome, observed) = prepared::check_ordinary_package_with_fixed_index_observations(&refuted, &requests);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Failed(_)));
+            assert!(observed.is_none());
         }
     }
 
