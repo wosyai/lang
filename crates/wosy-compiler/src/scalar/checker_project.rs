@@ -631,6 +631,7 @@ struct ContextualProofOccurrence {
     symbolic: bool,
     entry: BigInt,
     exit: BigInt,
+    explicit: Option<(String, BigInt)>,
     reused: bool,
 }
 
@@ -692,6 +693,7 @@ struct ReachedContextualProof {
     amount: BigInt,
     observations: Vec<ContextualProofOccurrence>,
     retain_observations: bool,
+    explicit: Option<String>,
     saw_proved_occurrence: bool,
     reached_at_startup: bool,
     examined_symbolic_root: bool,
@@ -743,7 +745,7 @@ impl ReachedContextualProof {
         if self.refutation.is_none() {
             let occurrence = || ContextualProofOccurrence {
                 binding: binding.clone(), supplying_call, call, call_source: call_source.clone(), symbolic: false,
-                entry: entry.clone(), exit: exit.clone(), reused,
+                entry: entry.clone(), exit: exit.clone(), explicit: None, reused,
             };
             if proved {
                 self.saw_proved_occurrence = true;
@@ -781,6 +783,7 @@ impl From<ProjectCheck> for InternalContextualProofError {
 #[cfg(feature = "internal-checker")]
 struct ContextualProofHeader {
     name: CstToken,
+    explicit: Option<String>,
     place: CstToken,
     proof: ByteSpan,
     goal: ByteSpan,
@@ -792,7 +795,7 @@ struct ContextualProofHeader {
 const MAX_CONTEXTUAL_PROOFS: usize = 4;
 
 #[cfg(feature = "internal-checker")]
-fn contextual_proof_headers(canonical: &CanonicalCstRoot) -> Result<Vec<ContextualProofHeader>, ProjectCheck> {
+fn contextual_proof_headers(canonical: &CanonicalCstRoot, allow_explicit: bool) -> Result<Vec<ContextualProofHeader>, ProjectCheck> {
     let root = child(&canonical.root, SyntaxKind::Root)?;
     let mut headers = Vec::new();
     let mut names = HashSet::new();
@@ -800,13 +803,13 @@ fn contextual_proof_headers(canonical: &CanonicalCstRoot) -> Result<Vec<Contextu
         if headers.len() == MAX_CONTEXTUAL_PROOFS { return Err(ProjectCheck::Unsupported); }
         let proof_name = module_proof_name(&declaration).ok_or(ProjectCheck::InvalidProof)?;
         if !names.insert(proof_name.text().to_owned()) { return Err(ProjectCheck::InvalidProof); }
-        headers.push(contextual_proof_header(&declaration)?);
+        headers.push(contextual_proof_header(&declaration, allow_explicit)?);
     }
     Ok(headers)
 }
 
 #[cfg(feature = "internal-checker")]
-fn contextual_proof_header(declaration: &CstNode) -> Result<ContextualProofHeader, ProjectCheck> {
+fn contextual_proof_header(declaration: &CstNode, allow_explicit: bool) -> Result<ContextualProofHeader, ProjectCheck> {
     if declaration.children().any(|node| matches!(node.kind(), SyntaxKind::ProofWhere | SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
         || child(&declaration, SyntaxKind::Block)?.children().next().is_some()
     {
@@ -820,8 +823,18 @@ fn contextual_proof_header(declaration: &CstNode) -> Result<ContextualProofHeade
     // whereas a named parameter list owns a Parameters node.
     let mut target_parameters = target_node.children_with_tokens()
         .filter(|element| element.kind() == SyntaxKind::Parameters);
-    if !target_parameters.next().is_some_and(|parameters| parameters.into_token().is_some())
-        || target_parameters.next().is_some()
+    let explicit = match target_parameters.next() {
+        Some(parameters) if parameters.as_token().is_some() => None,
+        Some(parameters) if allow_explicit => {
+            let parameters = parameters.into_node().ok_or(ProjectCheck::Unsupported)?;
+            let mut names = identifiers(&parameters);
+            let name = names.next().ok_or(ProjectCheck::Unsupported)?;
+            if name == "null" || names.next().is_some() { return Err(ProjectCheck::Unsupported); }
+            Some(name)
+        }
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    if target_parameters.next().is_some()
         || output_names.next().is_none_or(|discard| !is_null_literal_name(&discard))
         || output_names.next().is_some()
     {
@@ -831,7 +844,7 @@ fn contextual_proof_header(declaration: &CstNode) -> Result<ContextualProofHeade
     if namespace.is_some() { return Err(ProjectCheck::Unsupported); }
     let goal = child(&child(&declaration, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
     let (place, add, amount) = super::contextual::contextual_proof_delta(&goal).ok_or(ProjectCheck::Unsupported)?;
-    Ok(ContextualProofHeader { name, place, proof: wosy_syntax::byte_span(&declaration),
+    Ok(ContextualProofHeader { name, explicit, place, proof: wosy_syntax::byte_span(&declaration),
         goal: wosy_syntax::byte_span(&goal), add, amount })
 }
 
@@ -886,7 +899,12 @@ fn prepare_contextual_effects(
         }).ok_or(ProjectCheck::InvalidProof)?;
         let body = calls.function_body(module_index, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let (formal, ty) = body.contextual_formal().ok_or(ProjectCheck::Unsupported)?;
-        if ty != &context.ty || !body.boundary.parameters.is_empty()
+        let explicit_parameter = match (header.explicit.as_ref(), body.boundary.parameters.as_slice()) {
+            (None, []) => true,
+            (Some(_), [slot]) => slot.ordinal == 0 && is_integer_type(&slot.ty),
+            _ => false,
+        };
+        if ty != &context.ty || !explicit_parameter
             || !matches!(body.boundary.results.as_slice(), [output] if output.ty == ScalarType::Unit)
             || formal.source != module.source || formal.function_span != function.span
         {
@@ -899,7 +917,7 @@ fn prepare_contextual_effects(
         if contextual_proofs.entries.insert(target, ReachedContextualProof {
             source: proof_source, proof: header.proof, target, formal: formal.clone(), ty: ty.clone(), goal: header.goal,
             add: header.add, amount: header.amount, observations: Vec::new(),
-            retain_observations, saw_proved_occurrence: false, reached_at_startup: false,
+            retain_observations, explicit: header.explicit, saw_proved_occurrence: false, reached_at_startup: false,
             examined_symbolic_root: false, refutation: None,
             reusable_body: (startup_count == 1 && super::checker_flow::exact_contextual_summary_leaf(body))
                 .then_some(std::ptr::from_ref(body)),
@@ -1321,11 +1339,16 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                             effects.push_callable(body, &module.source, failure);
                         },
                     ).ok_or(ProjectCheck::Unsupported)?;
-                    if let Some((entry, exit)) = refuted {
+                    if let Some(failure) = refuted {
+                        let explicit = match (context.explicit.as_ref(), failure.explicit) {
+                            (Some(name), Some(value)) => Some((name.clone(), value)),
+                            (None, None) => None,
+                            _ => return Err(ProjectCheck::Unsupported),
+                        };
                         context.refutation = Some(ContextualProofOccurrence {
                             binding: context.formal.clone(), supplying_call: function.name_span,
                             call: function.name_span, call_source: module.source.clone(),
-                            symbolic: true, entry, exit, reused: false,
+                            symbolic: true, entry: failure.entry, exit: failure.exit, explicit, reused: false,
                         });
                     }
                     context.examined_symbolic_root = true;
@@ -4784,7 +4807,7 @@ impl ScalarProofDeclarations {
 
 pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
     derive_scalar_proof_declarations_using_headers(canonical,
-        #[cfg(feature = "internal-checker")] contextual_proof_headers(canonical).unwrap_or_default())
+        #[cfg(feature = "internal-checker")] contextual_proof_headers(canonical, false).unwrap_or_default())
 }
 
 fn derive_scalar_proof_declarations_using_headers(
@@ -4822,7 +4845,7 @@ pub(crate) fn derive_configured_scalar_proof_declarations_from_cst(canonical: &C
         if let Some(name) = module_proof_name(&node) {
             if !names.insert(name.text().to_owned()) { duplicate = Some(wosy_syntax::byte_span(&node)); }
         }
-        match contextual_proof_header(&node) {
+        match contextual_proof_header(&node, true) {
             Ok(header) => contextual_proofs.push(header),
             Err(_) => ordinary_count += 1,
         }
@@ -4847,7 +4870,7 @@ pub(crate) fn derive_configured_scalar_proof_declarations_from_cst(canonical: &C
 
 #[cfg(feature = "internal-checker")]
 pub(crate) fn derive_configured_root_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
-    let contextual_proofs = contextual_proof_headers(canonical).unwrap_or_default();
+    let contextual_proofs = contextual_proof_headers(canonical, true).unwrap_or_default();
     if !contextual_proofs.is_empty() {
         return derive_scalar_proof_declarations_using_headers(canonical, contextual_proofs);
     }
@@ -5346,6 +5369,7 @@ pub struct ContextualProofDiagnostic {
     pub binding: wosy_syntax::SourceSpan,
     pub entry: BigInt,
     pub exit: BigInt,
+    pub explicit_symbolic_entry: Option<(String, BigInt)>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9103,7 +9127,7 @@ fn ordered_contextual_diagnostics(mut contextual: ContextualProofCohort) -> Resu
             supplying_call: wosy_syntax::SourceSpan::new(occurrence.binding.source.clone(), occurrence.supplying_call),
             call: wosy_syntax::SourceSpan::new(occurrence.call_source, occurrence.call),
             binding: wosy_syntax::SourceSpan::new(occurrence.binding.source, occurrence.binding.declaration_span),
-            entry: occurrence.entry, exit: occurrence.exit,
+            entry: occurrence.entry, exit: occurrence.exit, explicit_symbolic_entry: occurrence.explicit,
         });
     }
     Ok(ordered)
@@ -24410,6 +24434,49 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.symbolic && second.symbolic && diagnostics.directives.is_empty());
         assert_eq!((&first.entry, &first.exit), (&11.into(), &2.into()));
         assert_eq!((&second.entry, &second.exit), (&13.into(), &4.into()));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_contextual_proof_ranges_over_its_original_explicit_integer() {
+        let app = source("src/main.w", "dormant-context-and-explicit-input");
+        let program = r#"%%start
+            unit() type_provider = fn {
+                u8 core.context.credit = 3;
+                if (core.context.credit == 3) {};
+            };
+            unit(u8) examine = fn(selector) {
+                if (selector == 7) {
+                    if (core.context.credit == 11) { core.context.credit = 11; };
+                };
+            };
+            proof preserve for examine(choice) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) + 0) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let check = |text: &str, scope| {
+                let (_, proof) = crate::parse_configured_root_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(proof, Vec::new())],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            let green = check(program, ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(green.active && green.directives.is_empty() && green.contextual_diagnostic.is_none());
+            let bad = program.replace("credit = 11", "credit = 2");
+            let package = check(&bad, ScalarCheckerScope::CurrentPackage).unwrap();
+            let failure = package.contextual_diagnostic.unwrap();
+            assert!(failure.symbolic && package.directives.is_empty());
+            assert_eq!((&failure.entry, &failure.exit), (&11.into(), &2.into()));
+            assert_eq!(failure.explicit_symbolic_entry, Some(("choice".into(), 7.into())));
+            assert_eq!(failure.goal.source, app);
+            assert_eq!(&bad[failure.goal.range.start as usize..failure.goal.range.end as usize],
+                "core.context.credit == core.old(core.context.credit) + 0");
+            let main = check(&bad, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.contextual_diagnostic.is_none());
+            let reached = program.replace("if (core.context.credit == 3) {};", "examine(7);")
+                .replace("%%end", "type_provider(); %%end");
+            assert!(matches!(check(&reached, ScalarCheckerScope::CurrentPackage),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

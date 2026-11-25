@@ -3338,20 +3338,37 @@ impl IntegerReturningPath<'_> {
 
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) struct ContextualUnitRefutation {
+    pub(super) entry: BigInt,
+    pub(super) exit: BigInt,
+    pub(super) explicit: Option<BigInt>,
+}
+
 /// Checks one arbitrary typed contextual Unit root in the ordinary symbolic
-/// row evaluator. The hidden axis preserves the entry of this exact binding.
+/// row evaluator. Hidden copies preserve the original explicit argument
+/// and contextual entry even if the body subsequently changes either place.
 #[cfg(feature = "internal-checker")]
 pub(super) fn check_symbolic_contextual_unit(
     calls: &FunctionCallSites, amount: &BigInt, add: bool,
     sink: &mut dyn for<'row> FnMut(IntegerCheckFailure<'row>),
-) -> Option<(bool, Option<(BigInt, BigInt)>)> {
+) -> Option<(bool, Option<ContextualUnitRefutation>)> {
     let (formal, ty) = calls.contextual_formal()?;
-    if !calls.boundary.parameters.is_empty()
-        || !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
+    if !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
         || !calls.call_occurrences.is_empty() || !calls.allocation_length_calls.is_empty()
     {
         return None;
     }
+    let explicit = match calls.boundary.parameters.as_slice() {
+        [] => None,
+        [parameter] if parameter.ordinal == 0 && is_integer_type(&parameter.ty) => {
+            let [binding] = calls.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+            Some((binding, &parameter.ty, ReferenceBindingId {
+                kind: super::ReferenceBindingKind::CheckerSnapshotField(1), ..binding.clone()
+            }))
+        }
+        _ => return None,
+    };
     let snapshots = ReferenceBindingId {
         kind: super::ReferenceBindingKind::CheckerSnapshotField(0), ..formal.clone()
     };
@@ -3365,6 +3382,15 @@ pub(super) fn check_symbolic_contextual_unit(
     roots.add(formal, ty);
     rows.append_ordinary_copy(0, &mut roots)?;
     roots.add(&snapshots, ty);
+    if let Some((binding, ty, snapshot)) = &explicit {
+        let [row] = rows.0.as_mut_slice() else { return None; };
+        charge_call_work(roots.symbolic_context_work.as_mut()?, row.equal_axes().len().checked_add(4)?)?;
+        let domain = Rc::new(IntegerSet::from_type(ty)?);
+        row.push(Rc::clone(&domain));
+        roots.add(binding, ty);
+        row.append_alias(2, domain);
+        roots.add(snapshot, ty);
+    }
     let mut checked = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty,
         projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false,
@@ -3380,11 +3406,12 @@ pub(super) fn check_symbolic_contextual_unit(
     let (type_min, type_max) = super::typecheck::integer_bounds(ty)?;
     let expected_at = |entry: &BigInt| if add { entry + amount } else { entry - amount };
     let mut first_refutation = None;
+    let width = if explicit.is_some() { 4 } else { 2 };
     for row in rows.0 {
-        charge_call_work(work, 7)?;
+        charge_call_work(work, 3 + 2 * width)?;
         // This profile retains only equality copies and independent cells;
         // refusing unmodeled relations avoids comparing loose marginals.
-        if row.len() != 2 || row.affine.is_some() || row.entry.is_some() { return None; }
+        if row.len() != width || row.affine.is_some() || row.entry.is_some() { return None; }
         let (old_min, old_max) = row.get(1)?.extremes()?;
         // Translation is monotone, even for a disconnected row. Check both
         // extrema of every surviving entry domain before exposing a result.
@@ -3393,16 +3420,28 @@ pub(super) fn check_symbolic_contextual_unit(
         if expected_min < type_min || expected_max > type_max { return None; }
         if first_refutation.is_some() { continue; }
         let (new_min, new_max) = row.first()?.extremes()?;
+        let counterexample = |entry: &BigInt, exit: &BigInt| -> Option<ContextualUnitRefutation> {
+            let explicit = if explicit.is_some() {
+                // The witness must extend this same row and respect equal
+                // coordinates. Only independent extra axes choose their min.
+                let slot = row.canonical_axis(3);
+                let value = if slot == row.canonical_axis(1) { entry }
+                    else if slot == row.canonical_axis(0) { exit }
+                    else { row.get(3)?.extremes()?.0 };
+                Some(value.clone())
+            } else { None };
+            Some(ContextualUnitRefutation { entry: entry.clone(), exit: exit.clone(), explicit })
+        };
         if row.canonical_axis(0) == row.canonical_axis(1) {
             if &expected_min != old_min {
-                first_refutation = Some((old_min.clone(), old_min.clone()));
+                first_refutation = Some(counterexample(old_min, old_min)?);
             }
         } else {
             for (entry, exit, expected) in [
                 (old_min, new_min, &expected_min), (old_min, new_max, &expected_min), (old_max, new_min, &expected_max),
             ] {
                 if expected != exit {
-                    first_refutation = Some((entry.clone(), exit.clone()));
+                    first_refutation = Some(counterexample(entry, exit)?);
                     break;
                 }
             }

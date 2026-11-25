@@ -1253,10 +1253,13 @@ fn check_command(
                     message: "active contextual binding".to_owned() },
             ]);
         }
+        let mut notes = vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)];
+        if let Some((name, value)) = &failure.explicit_symbolic_entry {
+            notes.push(format!("explicit symbolic entry: {name} = {value}"));
+        }
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,
-            message: "proof obligation failed".to_owned(), labels,
-            notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
+            message: "proof obligation failed".to_owned(), labels, notes,
         }
     });
     let aggregate = report.aggregate_diagnostics.iter().map(|failure| {
