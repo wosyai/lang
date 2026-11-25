@@ -3855,6 +3855,14 @@ pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarT
         .then_some((element, elements, *span))
 }
 
+pub(crate) fn guarded_runtime_literal(binding: &ScalarBinding) -> Option<(&ScalarType, &[ScalarExpression], ByteSpan)> {
+    let ScalarType::RuntimeArray { element, .. } = &binding.declared_type else { return None; };
+    let ScalarExpression::ArrayLiteral { elements, span } = &binding.value else { return None; };
+    (!binding.is_allocation && binding.fallible_assignment.is_some() && binding.receivers.len() == 1
+        && matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32) && !elements.is_empty())
+        .then_some((element, elements, *span))
+}
+
 fn fixed_copy_owning_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
     reference::aggregate::neutral_array_signature(parameters, outputs)
 }

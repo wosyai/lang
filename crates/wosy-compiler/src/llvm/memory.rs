@@ -381,7 +381,6 @@ pub(super) fn place_pointer<'ctx, 'module>(
             resolved_field_pointer(context, state, base, field)
         }
         crate::ScalarPlace::Index { base, index, .. } => {
-            let base_pointer = place_pointer(context, state, base, project)?;
             let base_type = assignment_place_type(state, base)
                 .ok_or_else(|| "unknown LLVM indexed place type".to_owned())?;
             if !matches!(
@@ -390,7 +389,29 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let runtime_extent = if (state.require_release_checked_access || !state.local_runtime_extents.is_empty())
+            // A guarded lexical array stores its original backing directly,
+            // not an ordinary runtime-array pointer slot. Authenticate and
+            // retain that backing and extent before evaluating the selector.
+            let guarded = if let crate::ScalarPlace::Name { name, .. } = base.as_ref() {
+                if let Some((backing, _)) = state.storage.get(name) {
+                    ownership::guarded_array_extent(state, base, *backing, &base_type)?
+                        .map(|extent| (*backing, extent))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let (base_pointer, guarded_extent) = if let Some((backing, extent)) = guarded {
+                (backing, Some(extent))
+            } else {
+                (place_pointer(context, state, base, project)?, None)
+            };
+            let fallback = guarded_extent.map(|_| (
+                "guarded_index_out_of_bounds", "guarded_index_panic", "guarded_index_continue",
+            ));
+            let runtime_extent = if guarded_extent.is_none()
+                && (state.require_release_checked_access || !state.local_runtime_extents.is_empty())
                 && matches!(&base_type, ScalarType::RuntimeArray { .. })
             {
                 // Snapshot the extent paired with this base before a selector
@@ -401,6 +422,14 @@ pub(super) fn place_pointer<'ctx, 'module>(
             };
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
+                if let Some(length) = guarded_extent {
+                    let crate::ScalarPlace::Name { span, .. } = base.as_ref() else {
+                        return Err("guarded runtime array index lacks its exact lexical base".into());
+                    };
+                    let layout = ScalarType::Array { element, length, length_span: *span, span: *span };
+                    check_fixed_index(context, state, index, length, fallback)?;
+                    return fixed_array_element_pointer(context, state, &layout, base_pointer, index, true);
+                }
                 if let Some(extent) = runtime_extent {
                     check_release_index(state, index, extent)?;
                 } else if super::aggregate_transfer::requires_returned_array_index(state) {
@@ -418,12 +447,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 .map_err(builder_error);
             }
             let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
-            let guarded_extent = ownership::guarded_fixed_array_extent(state, base, base_pointer, &base_type)?;
             let checked = guarded_extent.is_some() || !fixed_index_has_raw_root(state, base);
             if checked {
-                let fallback = guarded_extent.map(|_| (
-                    "guarded_index_out_of_bounds", "guarded_index_panic", "guarded_index_continue",
-                ));
                 check_fixed_index(context, state, index, guarded_extent.unwrap_or(length), fallback)?;
             }
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
@@ -498,9 +523,12 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
     for_index: bool,
 ) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
     let crate::ScalarPlace::Name { name, .. } = base else { return Ok(None) };
-    let Some((storage, ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
+    let Some((storage, ty @ ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
         return Ok(None);
     };
+    if let Some(extent) = ownership::guarded_array_extent(state, base, address, ty)? {
+        return Ok(Some(context.i64_type().const_int(extent, false)));
+    }
     let Some((declaration, extent, checked_extent)) = state.local_runtime_extents.get(storage) else {
         // Incoming, forwarded and other unresolved extents use their existing path.
         return Ok(None);

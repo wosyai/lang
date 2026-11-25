@@ -342,6 +342,7 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 pub(crate) struct GuardedScalarAllocation {
     binding: ReferenceBindingId,
     ty: ScalarType,
+    runtime_literal_length: Option<u64>,
     guards: Box<[GuardedScalarBranch]>,
     alias_accesses: Box<[usize]>,
 }
@@ -356,6 +357,7 @@ pub(crate) struct GuardedScalarBranch {
 impl GuardedScalarAllocation {
     pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
     pub(crate) fn ty(&self) -> &ScalarType { &self.ty }
+    pub(crate) fn runtime_literal_length(&self) -> Option<u64> { self.runtime_literal_length }
     #[cfg(test)]
     pub(crate) fn condition(&self) -> usize { self.guards[0].condition }
     #[cfg(test)]
@@ -1159,7 +1161,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             // A projected alias never serves as a root presence test. The
             // Borrow CFG point below must already see the same owner present.
             ScalarPlace::Index { .. } if *mutability == ScalarReferenceMutability::Shared
-                && self.exact_guarded_index(place, occurrence, owner, &site.ty) == Some(inner.as_ref()) =>
+                && self.exact_guarded_index(place, occurrence, owner, &site.ty, None) == Some(inner.as_ref()) =>
                 Some(owner.clone()),
             _ => None,
         }
@@ -2019,6 +2021,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 borrowed_extent_formal = Some(place.binding.declaration_span);
                             }
                             Some(ScalarType::Array { .. }) if place.projections.is_empty() => {}
+                            Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
+                                && self.proof_points.fallible_allocation_bindings.as_ref()
+                                    .and_then(|sites| sites.get(&place.binding)).is_some_and(|site|
+                                        site.runtime_literal_length.is_some()) => {}
                             Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
                                 && self.cfg.allocations.contains(&place.binding) => {
                                 self.proof_points.array_length_owners.insert(place.binding.clone());
@@ -2921,10 +2927,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 mutability, place, ..
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
-                if !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer) {
+                let root = self.place_root(place, place_ordinal);
+                let guarded_length = matches!(read_mode, ExpressionReadMode::ArrayLengthArgument)
+                    && *mutability == ScalarReferenceMutability::Shared
+                    && matches!(place, ScalarPlace::Name { span, .. }
+                        if matches!(self.prepared_place_root(root.ordinal, *span)?,
+                            Some(PreparedPlaceRoot::Lexical(binding))
+                                if self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding))
+                                    .is_some_and(|site| site.runtime_literal_length.is_some())));
+                if !guarded_length && !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer) {
                     self.reject_fallible_address(place, place_ordinal, span)?;
                 }
-                let root = self.place_root(place, place_ordinal);
                 let proof_place = self.proof_place(place, place_ordinal);
                 if let ScalarPlace::Index { base, index, .. } = proof_place.as_ref() {
                     if direct_checked_field_base(base).is_some()
@@ -3541,10 +3554,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         if let Some(binding) = root_binding {
             let guarded_array = self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding))
-                .filter(|owner| matches!(owner.ty, ScalarType::Array { .. }));
+                .filter(|owner| matches!(owner.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }));
             if let Some(owner) = guarded_array {
                 let exact = match source {
-                    CheckedReadSource::Place(ordinal) => self.exact_guarded_index(place, ordinal, binding, &owner.ty).is_some(),
+                    CheckedReadSource::Place(ordinal) => self.exact_guarded_index(place, ordinal, binding, &owner.ty, owner.runtime_literal_length).is_some(),
                     _ => false,
                 };
                 if !exact {
@@ -4928,9 +4941,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
     }
 
     fn exact_guarded_index<'b>(
-        &self, place: &ScalarPlace, ordinal: OccurrenceOrdinal, owner: &ReferenceBindingId, ty: &'b ScalarType,
+        &self, place: &ScalarPlace, ordinal: OccurrenceOrdinal, owner: &ReferenceBindingId,
+        ty: &'b ScalarType, runtime_literal_length: Option<u64>,
     ) -> Option<&'b ScalarType> {
-        let ScalarType::Array { element, length, .. } = ty else { return None; };
+        let (element, length) = match ty {
+            ScalarType::Array { element, length, .. } => (element, *length),
+            ScalarType::RuntimeArray { element, .. } => (element, runtime_literal_length?),
+            _ => return None,
+        };
         let ScalarPlace::Index { base, index, .. } = place else { return None; };
         let ScalarPlace::Name { span, .. } = base.as_ref() else { return None; };
         let parent = OccurrenceParent::Place(ordinal);
@@ -4943,7 +4961,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && types.expressions.get(&selector) == Some(&ScalarType::U64)
             && match index.as_ref() {
                 ScalarExpression::Integer { value, .. } =>
-                    u64::try_from(value.clone()).ok().is_some_and(|index| index < *length),
+                    u64::try_from(value.clone()).ok().is_some_and(|index| index < length),
                 _ => true,
             }).then_some(element.as_ref())
     }
@@ -5207,7 +5225,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                         ReferenceValue::Other
                     } else if binding.fallible_assignment.is_some()
-                        && matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+                        && matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. })
                     {
                         self.expression_with_read_mode(
                             primary,
@@ -5393,8 +5411,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if binding.is_allocation || widened {
                         self.cfg.allocations.insert(id.clone());
                     }
+                    let runtime_literal_length = super::guarded_runtime_literal(binding).and_then(|(_, values, _)| {
+                        let (_, length) = super::fixed_copy_to_runtime(&receiver.ty,
+                            calls.structure.checked_types.expressions.get(&primary_ordinal)?)?;
+                        (length == values.len() as u64).then_some(length)
+                    });
                     if binding.fallible_assignment.is_some()
-                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
+                        && (runtime_literal_length.is_some() || is_integer_type(&receiver.ty)
+                            || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
                     {
                         declares_fallible = true;
                         let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
@@ -5402,7 +5426,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 Ok(CopyPolicy::Copy));
                         self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(
                             id.clone(), super::control::GuardedAllocationBinding {
-                                scope, ty: receiver.ty.clone(), whole_copy,
+                                scope, ty: receiver.ty.clone(), whole_copy, runtime_literal_length,
                             },
                         );
                         self.local_borrow = None;
@@ -6114,7 +6138,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     && self.proof_points.fallible_allocation_bindings.as_ref()
                                         .and_then(|sites| sites.get(&target.binding))
                                         .and_then(|owner| self.exact_guarded_index(
-                                            &assignment.targets[position].place, slot.destination, &target.binding, &owner.ty))
+                                            &assignment.targets[position].place, slot.destination, &target.binding, &owner.ty, None))
                                         == Some(&output_types[position])
                                 {
                                     self.proof_points.guarded_indexed_stores.insert(install);
@@ -9614,7 +9638,7 @@ fn require_available_fallible_read(
 ) {
     let unavailable = state.uninitialized.contains(binding);
     let Some(site) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
-    let reason = if whole && matches!(site.ty, ScalarType::Array { .. }) {
+    let reason = if whole && matches!(site.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }) {
         ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess
     } else if whole && matches!(site.ty, ScalarType::Struct(_)) && !site.whole_copy {
         ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead
@@ -10958,7 +10982,7 @@ fn transfer_reference_facts(
             }
             if let CfgPointKind::Borrow { place, .. } = &point.kind {
                 if let Some(bindings) = cfg.fallible_allocation_bindings {
-                    if bindings.get(&place.binding).is_some_and(|site| matches!(site.ty, ScalarType::Array { .. })) {
+                    if bindings.get(&place.binding).is_some_and(|site| matches!(site.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. })) {
                         require_available_fallible_read(bindings, &state, &place.binding, point, false, &mut errors);
                     }
                 }
@@ -10967,7 +10991,7 @@ fn transfer_reference_facts(
                 if let Some(bindings) = cfg.fallible_allocation_bindings {
                     if matches!(&point.kind, CfgPointKind::ReadPlace { pointer_point: None, .. })
                         && (is_lexical_field_path(&place.projections)
-                            || bindings.get(&place.binding).is_some_and(|owner| matches!(owner.ty, ScalarType::Array { .. })))
+                            || bindings.get(&place.binding).is_some_and(|owner| matches!(owner.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. })))
                     {
                         require_available_fallible_read(bindings, &state, &place.binding, point, false, &mut errors);
                     }
@@ -16794,7 +16818,7 @@ fn seal_guarded_scalar_allocations(
         accesses.sort_unstable();
         accesses.dedup();
         Some(GuardedScalarAllocation {
-            binding: binding.clone(), ty: bindings.get(binding)?.ty.clone(),
+            binding: binding.clone(), ty: declared.ty.clone(), runtime_literal_length: declared.runtime_literal_length,
             guards: guards.into_boxed_slice(), alias_accesses: accesses.into_boxed_slice(),
         })
     }).collect()

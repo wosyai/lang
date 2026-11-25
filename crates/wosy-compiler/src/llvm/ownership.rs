@@ -1160,6 +1160,7 @@ pub(super) fn emit_managed_allocation_branch<'ctx>(
 struct GuardedScalarSite {
     scope: ByteSpan,
     ty: ScalarType,
+    runtime_literal_length: Option<u64>,
 }
 
 pub(super) struct GuardedScalarSites<'ctx> {
@@ -1191,6 +1192,7 @@ impl<'ctx> GuardedScalarSites<'ctx> {
         Some(Box::new(Self {
             sites: proofs.iter().map(|proof| GuardedScalarSite {
                 scope: proof.binding().block_span, ty: proof.ty().clone(),
+                runtime_literal_length: proof.runtime_literal_length(),
             }).collect(),
             declarations, conditions, aliases,
             active: vec![None; proofs.len()], lexical: Vec::new(),
@@ -1229,6 +1231,18 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     {
         return Err("invalid guarded scalar allocation binding".into());
     }
+    let runtime_layout = match (&receiver.ty, sites.sites[index].runtime_literal_length) {
+        (ScalarType::RuntimeArray { element, .. }, Some(length)) => {
+            let (_, values, span) = crate::scalar::guarded_runtime_literal(binding)
+                .ok_or("missing guarded runtime literal")?;
+            if values.len() as u64 != length { return Err("guarded runtime literal lost its prepared extent".into()); }
+            Some(ScalarType::Array { element: element.clone(), length, length_span: span, span })
+        }
+        (ScalarType::RuntimeArray { .. }, None) | (_, Some(_)) =>
+            return Err("invalid guarded runtime extent receipt".into()),
+        _ => None,
+    };
+    let materialized_ty = runtime_layout.as_ref().unwrap_or(&receiver.ty);
     let rhs = if super::aggregate_transfer::fallible_allocation_call_at(state, &binding.value)
         || super::aggregate_transfer::fallible_allocation_expression_at(state, &binding.value)
     {
@@ -1259,7 +1273,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
             }
         }
     };
-    let aggregate = match (&receiver.ty, &binding.value, value) {
+    let aggregate = match (materialized_ty, &binding.value, value) {
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
             Some(GuardedAggregateInitializer::Struct(memory::prepare_struct_literal_with(state, id, fields, emit_member)?)),
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. }, None)
@@ -1273,7 +1287,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         _ => return Err("invalid guarded allocation initializer".into()),
     };
     declare_core_runtime(context, state.module);
-    let (size, align) = allocation_layout(&receiver.ty, state.layouts, state.target_layout)?;
+    let (size, align) = allocation_layout(materialized_ty, state.layouts, state.target_layout)?;
     let initialized = context.append_basic_block(parent, "fallible.initialize");
     let continuation = context.append_basic_block(parent, "fallible.continue");
     let skipped = if let Some(rhs) = rhs {
@@ -1302,7 +1316,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     if let Some(values) = aggregate {
         match values {
             GuardedAggregateInitializer::Struct(values) => memory::write_struct_literal(context, state, values, backing)?,
-            GuardedAggregateInitializer::Array(values) => memory::write_fixed_array_literal(context, state, &receiver.ty, values, backing)?,
+            GuardedAggregateInitializer::Array(values) => memory::write_fixed_array_literal(context, state, materialized_ty, values, backing)?,
         }
     } else {
         let value = if let Some(rhs) = rhs {
@@ -1330,7 +1344,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     Ok(())
 }
 
-pub(super) fn guarded_fixed_array_extent(
+pub(super) fn guarded_array_extent(
     state: &EmitState<'_, '_>,
     base: &crate::ScalarPlace,
     backing: PointerValue<'_>,
@@ -1340,13 +1354,16 @@ pub(super) fn guarded_fixed_array_extent(
     let Some(declaration) = state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base))
     else { return Ok(None); };
     let Some(&index) = sites.declarations.get(&(declaration.start, declaration.end)) else { return Ok(None); };
-    let ScalarType::Array { length, .. } = &sites.sites[index].ty else { return Ok(None); };
-    if &sites.sites[index].ty != ty
-        || !sites.active[index].is_some_and(|owner| owner.backing == backing)
-    {
-        return Err("guarded fixed-array read lost its exact prepared owner".into());
+    let site = &sites.sites[index];
+    let extent = match &site.ty {
+        ScalarType::Array { length, .. } => *length,
+        ScalarType::RuntimeArray { .. } => site.runtime_literal_length.ok_or("missing guarded runtime extent")?,
+        _ => return Ok(None),
+    };
+    if &site.ty != ty || !sites.active[index].is_some_and(|owner| owner.backing == backing) {
+        return Err("guarded array access lost its exact prepared owner".into());
     }
-    Ok(Some(*length))
+    Ok(Some(extent))
 }
 
 pub(super) fn guarded_alias_has_non_null_proof(

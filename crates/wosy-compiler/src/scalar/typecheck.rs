@@ -1538,7 +1538,7 @@ fn validate_assignment_target_distinctness_in_module(
 }
 
 fn widened_local_literal_type(binding: &ScalarBinding) -> Option<ScalarType> {
-    let (element, values, span) = super::widened_local_literal(binding)?;
+    let (element, values, span) = super::widened_local_literal(binding).or_else(|| super::guarded_runtime_literal(binding))?;
     Some(ScalarType::Array {
         element: Box::new(element.clone()), length: values.len() as u64,
         length_span: span, span,
@@ -6687,6 +6687,15 @@ fn pending_fallible_operator(
 ) -> Option<ByteSpan> {
     let operator = binding.fallible_assignment?;
     let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
+    let array_element = |element: &ScalarType, value: &ScalarExpression| match value {
+        ScalarExpression::Integer { .. } => true,
+        ScalarExpression::Name { name, .. } => scope.get(name) == Some(element),
+        ScalarExpression::Call { type_arguments, .. } => type_arguments.is_empty(),
+        _ => guarded_numeric_rhs(element, value),
+    };
+    if let Some((element, values, _)) = super::guarded_runtime_literal(binding) {
+        return (!values.iter().all(|value| array_element(element, value))).then_some(operator);
+    }
     match (&receiver.ty, &binding.value) {
         (ty, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
             if is_integer_type(ty) => None,
@@ -6697,12 +6706,7 @@ fn pending_fallible_operator(
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
             if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
                 && *length != 0 && *length == elements.len() as u64
-                && elements.iter().all(|value| match value {
-                    ScalarExpression::Integer { .. } => true,
-                    ScalarExpression::Name { name, .. } => scope.get(name) == Some(element.as_ref()),
-                    ScalarExpression::Call { type_arguments, .. } => type_arguments.is_empty(),
-                    _ => guarded_numeric_rhs(element, value),
-                }) => None,
+                && elements.iter().all(|value| array_element(element, value)) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
             let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return Some(operator); };
             if fields.is_empty() || structure.fields.is_empty()

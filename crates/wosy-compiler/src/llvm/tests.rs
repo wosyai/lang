@@ -14392,3 +14392,97 @@ if (observed(1) != 99 || observed(0) != 7 || observed(1) != 4
         }
     }
 }
+
+#[test]
+fn guarded_fallible_runtime_literal_preserves_exact_extent_and_one_owner() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _read_from_buffer = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _read_next = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64, u64) observed = fn(first, second, index) {
+    u64[] held =? [_read_from_buffer(first), _read_next(second) ^ 0, 7];
+    if (&held == null) { 99 } else { core.array_len(&held) ^ held[index] }
+};
+if (observed(7, 9, 0) != 99 || observed(7, 9, 0) != 99 || observed(7, 9, 0) != 99
+    || observed(0, 0, 0) != 3 || observed(7, 9, 1) != 10
+    || observed(7, 9, 4294967297) != 0) { core.system_panic(); };
+%%end";
+    let absent_read = text.replace("if (&held == null)", "held[index]; if (&held == null)");
+    let absent_extent = text.replace("if (&held == null)", "core.array_len(&held); if (&held == null)");
+    let unsupported_store = text.replace("else { core.array_len", "else { held[index] = 5; core.array_len");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (negative, reason) in [
+            (absent_read.as_str(), "fallible allocation is not known to be available"),
+            (absent_extent.as_str(), "fallible allocation is not known to be available"),
+            (unsupported_store.as_str(), "fallible allocation access is not a supported"),
+        ] {
+            let prepared = prepare_initializer_test(negative, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().iter().any(|diagnostic| diagnostic.message.contains(reason)),
+                "{reason}: {:?}", checked.diagnostics());
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, release_source, output) in [
+            ("standalone", false, None, emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", true, None, emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", true, release.checked_access_source(), emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded runtime array literal");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
+            let observed = authored("observed");
+            let blocks = observed.get_basic_blocks();
+            fn instructions<'ctx>(block: inkwell::basic_block::BasicBlock<'ctx>) -> impl Iterator<Item = InstructionValue<'ctx>> {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }
+            let calls_to = |callee| blocks.iter().copied().flat_map(instructions)
+                .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                    .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+            let [destination] = calls_to(module.get_function("__wosy_core_alloc").unwrap())[..] else { panic!("{llvm}") };
+            let [free] = calls_to(module.get_function("__wosy_core_free").unwrap())[..] else { panic!("{llvm}") };
+            let [first] = calls_to(authored("_read_from_buffer"))[..] else { panic!("{llvm}") };
+            let [second] = calls_to(authored("_read_next"))[..] else { panic!("{llvm}") };
+            let absent = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.field_absence").unwrap();
+            let branches = |instruction: InstructionValue<'_>, successor| instruction.get_parent()
+                .and_then(|block| block.get_terminator()).unwrap().get_operands()
+                .any(|operand| operand.and_then(|operand| operand.block()) == Some(successor));
+            assert!(branches(first, second.get_parent().unwrap()) && branches(first, absent));
+            assert!(branches(second, destination.get_parent().unwrap()) && branches(second, absent));
+            assert_eq!(known_field_operand(destination, 0).unwrap().into_int_value().get_zero_extended_constant(), Some(24));
+            let continuation = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.continue").unwrap();
+            assert_eq!(known_field_operand(free, 0).unwrap().as_instruction_value(), continuation.get_first_instruction());
+            if let Some(helper_source) = release_source {
+                let helper = module.get_function(&project_function_name(helper_source, "check_index_in_extent")).unwrap();
+                let [bounds] = calls_to(helper)[..] else { panic!("{llvm}") };
+                assert_eq!(known_field_operand(bounds, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(3));
+                assert!(std::iter::successors(bounds.get_next_instruction(), |instruction| instruction.get_next_instruction())
+                    .any(|instruction| instruction.get_opcode() == InstructionOpcode::GetElementPtr));
+            } else {
+                let check = blocks.iter().copied().flat_map(instructions).find(|i|
+                    i.get_name().is_some_and(|name| name.to_bytes() == b"guarded_index_out_of_bounds")).unwrap();
+                assert_eq!(check.get_icmp_predicate(), Some(inkwell::IntPredicate::UGE));
+                assert_eq!(known_field_operand(check, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(3));
+            }
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_RUNTIME_LITERAL_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

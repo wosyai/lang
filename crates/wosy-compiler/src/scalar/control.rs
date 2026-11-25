@@ -41,6 +41,7 @@ pub(super) struct GuardedAllocationBinding {
     pub(super) scope: super::ReferenceScopeId,
     pub(super) ty: ScalarType,
     pub(super) whole_copy: bool,
+    pub(super) runtime_literal_length: Option<u64>,
 }
 
 #[derive(Default)]
