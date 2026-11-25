@@ -3130,10 +3130,10 @@ fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
 // Leaves and obvious non-float shapes need no cache access. Check both
 // children shallowly before following a composite, so ordinary arithmetic
 // spines with a named or integer operand have no recursive shape walk.
-fn is_homogeneous_bitwise(operator: &BinaryOperator) -> bool {
+fn is_homogeneous_integer_operator(operator: &BinaryOperator) -> bool {
     matches!(
         operator,
-        BinaryOperator::BitAnd
+        BinaryOperator::WrappingAdd | BinaryOperator::BitAnd
             | BinaryOperator::BitOr
             | BinaryOperator::BitXor
             | BinaryOperator::ShiftLeft
@@ -3153,7 +3153,7 @@ fn is_integer_literal_operand(expression: &ScalarExpression) -> bool {
     }
 }
 
-fn infer_bitwise_operands(
+fn infer_homogeneous_integer_operands(
     left: &ScalarExpression,
     right: &ScalarExpression,
     mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
@@ -3752,7 +3752,7 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
-            if is_homogeneous_bitwise(operator) {
+            if is_homogeneous_integer_operator(operator) {
                 return check_expression_type_in_module_expected(
                     expression, None, scope, visible_names, folded_names, module, modules,
                     diagnostics, unsafe_context, overloads, inference,
@@ -3856,14 +3856,7 @@ fn check_expression_type_in_module(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             if boolean {
                 expect_module_type(module, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_module_type(module, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -3871,7 +3864,7 @@ fn check_expression_type_in_module(
             } else if comparison {
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
-            } else if bitwise {
+            } else if integer_operator {
                 expect_module_integer(module, &left_type, *span, diagnostics);
                 expect_module_integer(module, &right_type, *span, diagnostics);
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
@@ -4975,14 +4968,7 @@ fn check_expression_type_in_module_expected(
                 | BinaryOperator::GreaterEqual
         );
         let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-        let bitwise = matches!(
-            operator,
-            BinaryOperator::BitAnd
-                | BinaryOperator::BitOr
-                | BinaryOperator::BitXor
-                | BinaryOperator::ShiftLeft
-                | BinaryOperator::ShiftRight
-        );
+        let integer_operator = is_homogeneous_integer_operator(operator);
         let arithmetic_context = expected.filter(|ty| {
             matches!(
                 ty,
@@ -5009,8 +4995,8 @@ fn check_expression_type_in_module_expected(
             );
         }
         let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if bitwise && arithmetic_context.is_none() {
-            infer_bitwise_operands(left, right, |operand, expected| {
+        let (left_type, right_type) = if integer_operator && arithmetic_context.is_none() {
+            infer_homogeneous_integer_operands(left, right, |operand, expected| {
                 expression_type_in_module_expected(
                     operand, expected, scope, visible_names, folded_names, module, modules,
                     diagnostics, unsafe_context, overloads, inference,
@@ -5149,7 +5135,7 @@ fn check_expression_type_in_module_expected(
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
             return ScalarType::Bool;
         }
-        if bitwise {
+        if integer_operator {
             expect_module_integer(module, &left_type, *span, diagnostics);
             expect_module_integer(module, &right_type, *span, diagnostics);
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
@@ -7027,6 +7013,7 @@ fn validate_unit_if_position_in_place(
 pub(super) fn operator(value: &str) -> BinaryOperator {
     match value {
         "+" => BinaryOperator::Add,
+        "+@" => BinaryOperator::WrappingAdd,
         "-" => BinaryOperator::Subtract,
         "*" => BinaryOperator::Multiply,
         "/" => BinaryOperator::Divide,
@@ -8473,8 +8460,8 @@ fn check_expression_type(
                     inference,
                 );
             }
-            let (left_type, right_type) = if is_homogeneous_bitwise(operator) {
-                infer_bitwise_operands(left, right, |operand, expected| {
+            let (left_type, right_type) = if is_homogeneous_integer_operator(operator) {
+                infer_homogeneous_integer_operands(left, right, |operand, expected| {
                     if let Some(expected) = expected {
                         expression_type_expected(
                             operand, expected, scope, visible_names, folded_names, program,
@@ -8540,14 +8527,7 @@ fn check_expression_type(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             if boolean {
                 expect_type(program, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_type(program, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -8555,7 +8535,7 @@ fn check_expression_type(
             } else if comparison {
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
-            } else if bitwise {
+            } else if integer_operator {
                 expect_integer(program, &left_type, *span, diagnostics);
                 expect_integer(program, &right_type, *span, diagnostics);
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
@@ -9504,14 +9484,7 @@ fn check_expression_type_expected(
                     | ScalarType::F32
                     | ScalarType::F64
             );
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             let bool_context = ScalarType::Bool;
             let (left_type, right_type) = if comparison && is_null_expression(left) {
                 let right_type = expression_type(
@@ -9660,7 +9633,7 @@ fn check_expression_type_expected(
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 return ScalarType::Bool;
             }
-            if bitwise {
+            if integer_operator {
                 expect_integer(program, &left_type, *span, diagnostics);
                 expect_integer(program, &right_type, *span, diagnostics);
                 expect_type(program, &left_type, &right_type, *span, diagnostics);

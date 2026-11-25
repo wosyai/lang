@@ -925,10 +925,10 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 path.singleton_at(formal_axis(ordinal)?).map(Cow::Borrowed)
             };
             let (left, right) = match (left.as_ref(), right.as_ref(), operator) {
-                (ScalarExpression::Name { .. }, ScalarExpression::Name { .. }, BinaryOperator::Add | BinaryOperator::Subtract) => {
+                (ScalarExpression::Name { .. }, ScalarExpression::Name { .. }, BinaryOperator::Add | BinaryOperator::WrappingAdd | BinaryOperator::Subtract) => {
                     let left_axis = formal_axis(left_ordinal)?;
                     let right_axis = formal_axis(right_ordinal)?;
-                    if left_axis == right_axis {
+                    if left_axis == right_axis && !matches!(operator, BinaryOperator::WrappingAdd) {
                         if !matches!(operator, BinaryOperator::Subtract) {
                             return None;
                         }
@@ -939,9 +939,9 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                     let (left, right) = path.singleton_pair_at(left_axis, right_axis)?;
                     (Cow::Borrowed(left), Cow::Borrowed(right))
                 }
-                (ScalarExpression::Name { .. }, literal, BinaryOperator::Add | BinaryOperator::Subtract) =>
+                (ScalarExpression::Name { .. }, literal, BinaryOperator::Add | BinaryOperator::WrappingAdd | BinaryOperator::Subtract) =>
                     (exact_formal(left_ordinal, literal)?, concrete_integer_literal(literal)?),
-                (literal, ScalarExpression::Name { .. }, BinaryOperator::Add) => {
+                (literal, ScalarExpression::Name { .. }, BinaryOperator::Add | BinaryOperator::WrappingAdd) => {
                     let value = exact_formal(right_ordinal, literal)?;
                     (concrete_integer_literal(literal)?, value)
                 }
@@ -954,7 +954,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             }
             #[cfg(all(test, feature = "internal-checker"))]
             AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-            let value = operation.apply(left, right, &min)?;
+            let value = operation.apply(left, right, &min, &max)?;
             fits(&value).then_some(value)
         }).as_ref()
     }
@@ -964,6 +964,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
 #[derive(Clone, Copy)]
 enum AuthoredIntegerOperation {
     Add,
+    WrappingAdd,
     Subtract,
     Multiply,
     Divide,
@@ -975,6 +976,7 @@ impl AuthoredIntegerOperation {
     fn checked(operator: &BinaryOperator) -> Option<Self> {
         Some(match operator {
             BinaryOperator::Add => Self::Add,
+            BinaryOperator::WrappingAdd => Self::WrappingAdd,
             BinaryOperator::Subtract => Self::Subtract,
             BinaryOperator::Multiply => Self::Multiply,
             BinaryOperator::Divide => Self::Divide,
@@ -983,12 +985,22 @@ impl AuthoredIntegerOperation {
         })
     }
 
-    fn apply(self, left: Cow<'_, BigInt>, right: Cow<'_, BigInt>, min: &BigInt) -> Option<BigInt> {
+    fn apply(self, left: Cow<'_, BigInt>, right: Cow<'_, BigInt>, min: &BigInt, max: &BigInt) -> Option<BigInt> {
         Some(match (self, left, right) {
             (Self::Add, Cow::Owned(left), Cow::Owned(right)) => left + right,
             (Self::Add, Cow::Owned(left), right) => left + right.as_ref(),
             (Self::Add, left, Cow::Owned(right)) => right + left.as_ref(),
             (Self::Add, left, right) => left.as_ref() + right.as_ref(),
+            (Self::WrappingAdd, left, right) => {
+                let (left, right) = (left.as_ref(), right.as_ref());
+                if left < min || left > max || right < min || right > max { return None; }
+                let sum = left + right;
+                // The sum of two in-type operands is at most one modulus
+                // outside the type's inclusive numerical range.
+                if &sum < min { sum + (max - min + 1u8) }
+                else if &sum > max { sum - (max - min + 1u8) }
+                else { sum }
+            }
             (Self::Subtract, Cow::Owned(left), Cow::Owned(right)) => left - right,
             (Self::Subtract, Cow::Owned(left), right) => left - right.as_ref(),
             (Self::Subtract, left, Cow::Owned(right)) => left.as_ref() - right,
@@ -1070,7 +1082,7 @@ fn nested_authored_integer_return<'a>(
                     break;
                 }
                 Some(Frame::Right { left, operation }) => {
-                    let computed = operation.apply(left, value, min)?;
+                    let computed = operation.apply(left, value, min, max)?;
                     if !fits(&computed) {
                         return None;
                     }
@@ -8893,7 +8905,7 @@ fn compute_row_integer_operation(
     let right_exact = singleton_calculation_operand(row, right);
     let (axis, reflected, offset) = match (left_exact, right_exact, operation) {
         (Some(left), Some(right), operation) if fits(left) && fits(right) => {
-            let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), min)?;
+            let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), min, max)?;
             return fits(&value).then(|| ComputedRowInteger::Singleton(value));
         }
         (None, Some(value), AuthoredIntegerOperation::Add) if fits(value) => (left.1?, false, value.clone()),
@@ -8946,7 +8958,7 @@ impl IntegerInputs {
                 let mut input = first.clone();
                 for index in 0..count {
                     let (left, right) = if lexical_on_left { (&input, literal) } else { (literal, &input) };
-                    let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), &min)?;
+                    let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), &min, &max)?;
                     if value < min || value > max { return None; }
                     let mut piece = row.clone();
                     // Refining the old source preserves all of its aliases;

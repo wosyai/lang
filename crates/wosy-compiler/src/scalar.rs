@@ -1781,6 +1781,7 @@ pub enum BinaryOperator {
     BitXor,
     ShiftLeft,
     ShiftRight,
+    WrappingAdd,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

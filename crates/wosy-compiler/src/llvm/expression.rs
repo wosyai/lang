@@ -2535,7 +2535,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         ScalarExpression::Binary { operator, left, right, .. }
             if (float || integer) && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
                 | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)
-                || integer && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr
+                || integer && matches!(operator, BinaryOperator::WrappingAdd | BinaryOperator::BitAnd | BinaryOperator::BitOr
                     | BinaryOperator::BitXor | BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight) =>
         {
             let left = emit_contextual_numeric(context, state, left, expected, path)?;
@@ -2755,6 +2755,7 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 .map(|value| EmitValue::Basic(value.into())),
             BinaryOperator::And
             | BinaryOperator::Or
+            | BinaryOperator::WrappingAdd
             | BinaryOperator::BitAnd
             | BinaryOperator::BitOr
             | BinaryOperator::BitXor
@@ -2768,7 +2769,9 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
     let left = left.into_int_value();
     let right = right.into_int_value();
     let value = match operator {
-        BinaryOperator::Add => state
+        // LLVM integer add without no-wrap flags is arithmetic modulo
+        // the bit width. Leave the ordinary addition lowering unchanged.
+        BinaryOperator::Add | BinaryOperator::WrappingAdd => state
             .builder
             .build_int_add(left, right, "add")
             .map_err(builder_error)?

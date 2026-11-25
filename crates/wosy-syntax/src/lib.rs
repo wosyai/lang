@@ -2931,6 +2931,22 @@ mod proof_fragment_tests {
     }
 
     #[test]
+    fn wrapping_addition_remains_one_canonical_additive_token_in_a_pointer_proof() {
+        let text = "proof increment_effect for increment(p) -> () ensures (*p == core.old(*p) +@ 1) {}";
+        let parsed = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let result = parsed.as_result();
+        let declaration = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        let operators: Vec<_> = declaration.descendants_with_tokens().filter_map(|item| item.into_token())
+            .filter(|token| token.kind() == SyntaxKind::Operator)
+            .map(|token| token.text().to_owned()).collect();
+        assert!(operators.iter().any(|op| op == "+@"), "{operators:?}");
+        for invalid in [text.replace("+@", "+ @"), text.replace("+@", "+@=")] {
+            assert!(!parse_proof_fragment(source(), invalid, &[]).as_result().is_valid());
+        }
+    }
+
+    #[test]
     fn proof_fragment_reuses_canonical_binders_expressions_and_block() {
         let text = r#"proof bounded for clamp_bounded(x) -> (out)
     where (x <= 10)

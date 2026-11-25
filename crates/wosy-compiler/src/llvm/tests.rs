@@ -5347,6 +5347,44 @@ fn emits_float_conversions_for_single_file_and_project() {
 }
 
 #[test]
+fn lowers_wrapping_addition_at_each_integer_width_without_no_wrap_flags() {
+    let mut text = String::from("%%start\nunit(*!u32) increment = fn(p) { *p = *p +@ 1; };\n");
+    for ty in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128"] {
+        text += &format!("{ty}({ty}, {ty}) wrap_{ty} = fn(a, b) {{ a +@ b }}; wrap_{ty}(1, 2);\n");
+    }
+    text += "%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(&text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let standalone = derive_scalar_program_with_layout(&parse_source(source, text.clone(), &[]).result, layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        for partition in [
+            emit_scalar_llvm(&standalone),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            for width in [8, 16, 32, 64, 128] {
+                assert!(ir.contains(&format!("add i{width} ")), "{layout:?}: {ir}");
+            }
+            assert!(!ir.contains("add nsw") && !ir.contains("add nuw"), "{layout:?}: {ir}");
+        }
+    }
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    for invalid in [
+        "f32(f32, f32) bad = fn(a, b) { a +@ b };",
+        "bool(bool, bool) bad = fn(a, b) { a +@ b };",
+        "u16(u16, u8) bad = fn(a, b) { a +@ b };",
+    ] {
+        let text = format!("%%start {invalid} %%end");
+        let standalone = derive_scalar_program_with_layout(&parse_source(source.clone(), text, &[]).result, ScalarTargetLayout::NATIVE64);
+        assert!(!standalone.diagnostics.is_empty(), "{invalid}");
+    }
+}
+
+#[test]
 fn lowers_runtime_float_negation_as_ieee_fneg() {
     let text = r#"%%start
 f32(f32) narrow = fn(value) { -value };

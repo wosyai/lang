@@ -135,7 +135,7 @@ bit_and_operator = @{ "&" ~ !"&" }
 shift_operator = { "<<" | ">>" }
 unary_operator = { "!" | "~" | "-" }
 comparison_operator = { "==" | "!=" | "<=" | ">=" | "<" | ">" }
-add_operator = { "+" | "-" }
+add_operator = { "+@" | "+" | "-" }
 multiply_operator = { "*" | "/" | "%" }
 operator = { or_operator | and_operator | comparison_operator | add_operator | multiply_operator }
 boolean = { "true" | "false" }

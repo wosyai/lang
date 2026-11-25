@@ -22295,6 +22295,38 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn authored_wrapping_addition_keeps_the_declared_width_and_checked_addition_contract() {
+        use ScalarModuleProofOutcome::{Proved, Refuted, Unsupported};
+        let source = source("src/main.w", "typed-authored-wrapping-add");
+        let run = |ty: &str, body: &str, guard: &str, expected: &BigInt| {
+            let text = format!(r#"%%start
+                {ty}({ty}) number = fn(value) {{ if (value == 0) {{}}; {body} }};
+                proof leaf for number(arg) -> (out) where ({guard}) ensures (out == {expected}) {{
+                    core.show(out <= {expected});
+                }}
+            %%end"#);
+            check_scalar_module_proofs(source.clone(), &["leaf"],
+                vec![ScalarProofModuleInput { source: source.clone(), text, namespaces: Vec::new() }],
+                vec![source.clone()], inputs()).unwrap()
+        };
+        for (name, ty) in [
+            ("i8", ScalarType::I8), ("u8", ScalarType::U8), ("i16", ScalarType::I16), ("u16", ScalarType::U16),
+            ("i32", ScalarType::I32), ("u32", ScalarType::U32), ("i64", ScalarType::I64), ("u64", ScalarType::U64),
+            ("i128", ScalarType::I128), ("u128", ScalarType::U128),
+        ] {
+            let (min, max) = super::super::typecheck::integer_bounds(&ty).unwrap();
+            assert_eq!(run(name, &format!("{max} +@ 1"), "true", &min), [Proved]);
+            assert_eq!(run(name, "value +@ 1", &format!("arg == {max}"), &min), [Proved]);
+            assert_eq!(run(name, &format!("{max} +@ 1"), "true", &max), [Refuted]);
+            assert_eq!(run(name, &format!("{max} + 1"), "true", &min), [Unsupported]);
+            if name.starts_with('i') {
+                assert_eq!(run(name, &format!("{min} +@ -1"), "true", &max), [Proved]);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn authored_show_root_literal_arithmetic_is_exact_lazy_and_proof_local() {
         use super::super::checker_flow::AUTHORED_RETURN_CALCULATIONS;
         use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};

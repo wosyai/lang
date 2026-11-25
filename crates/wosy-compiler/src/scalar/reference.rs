@@ -8368,7 +8368,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         allow_finite: bool, allow_contextual: bool,
     ) -> Option<(BinaryOperator, [(OccurrenceOrdinal, Option<std::borrow::Cow<'syntax, BigInt>>); 2])> {
         let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
-        if !(matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+        if !(matches!(operator, BinaryOperator::Add | BinaryOperator::WrappingAdd | BinaryOperator::Subtract)
             || allow_finite && matches!(operator, BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder))
         {
             return None;
