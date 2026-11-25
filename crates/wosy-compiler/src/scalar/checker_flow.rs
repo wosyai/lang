@@ -991,16 +991,8 @@ impl AuthoredIntegerOperation {
             (Self::Add, Cow::Owned(left), right) => left + right.as_ref(),
             (Self::Add, left, Cow::Owned(right)) => right + left.as_ref(),
             (Self::Add, left, right) => left.as_ref() + right.as_ref(),
-            (Self::WrappingAdd, left, right) => {
-                let (left, right) = (left.as_ref(), right.as_ref());
-                if left < min || left > max || right < min || right > max { return None; }
-                let sum = left + right;
-                // The sum of two in-type operands is at most one modulus
-                // outside the type's inclusive numerical range.
-                if &sum < min { sum + (max - min + 1u8) }
-                else if &sum > max { sum - (max - min + 1u8) }
-                else { sum }
-            }
+            (Self::WrappingAdd, left, right) =>
+                super::typecheck::wrapping_integer_sum(left.as_ref(), right.as_ref(), min, max)?,
             (Self::Subtract, Cow::Owned(left), Cow::Owned(right)) => left - right,
             (Self::Subtract, Cow::Owned(left), right) => left - right.as_ref(),
             (Self::Subtract, left, Cow::Owned(right)) => left.as_ref() - right,

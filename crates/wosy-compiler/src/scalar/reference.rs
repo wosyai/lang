@@ -21,6 +21,8 @@ pub(crate) mod aggregate;
 pub(super) mod self_tail;
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) mod pointer_entry;
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) mod pointer_call;
 
 #[cfg(test)]
 mod input_tests;
@@ -10753,6 +10755,22 @@ impl ProjectReferenceResults {
         let body = calls.function_body(module, item, None)?;
         let result = self.function_result(module, item, None)?;
         pointer_entry::checked(&source.source, function, body, &result.cfg, &result.proof_points)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(super) fn pointer_caller_effect<'a>(
+        &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
+        module: usize, caller: usize, callee: usize, claimed: &BigInt,
+    ) -> Option<pointer_call::CallerPointeeEffect<'a>> {
+        let update = self.pointer_entry_wrapping_write(modules, calls, module, callee)?;
+        let owner = modules.get(module)?;
+        let ScalarItem::Function(declaration) = owner.items.get(callee)? else { return None; };
+        let ScalarItem::Function(function) = owner.items.get(caller)? else { return None; };
+        let body = calls.function_body(module, caller, None)?;
+        let result = self.function_result(module, caller, None)?;
+        pointer_call::checked(&owner.source, declaration.name_span, function, body, &result.cfg,
+            &result.proof_points, update, claimed)
     }
 
     pub(super) fn callable_point_facts(

@@ -3328,6 +3328,19 @@ pub(super) fn integer_bounds(ty: &ScalarType) -> Option<(BigInt, BigInt)> {
     })
 }
 
+// Numeric bounds come only from the fixed-width checked integer type.
+// Two in-type operands can cross its full modulus at most once.
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn wrapping_integer_sum(
+    left: &BigInt, right: &BigInt, min: &BigInt, max: &BigInt,
+) -> Option<BigInt> {
+    if left < min || left > max || right < min || right > max { return None; }
+    let sum = left + right;
+    Some(if &sum < min { sum + (max - min + 1u8) }
+        else if &sum > max { sum - (max - min + 1u8) }
+        else { sum })
+}
+
 pub(super) fn expression_type_in_module(
     expression: &ScalarExpression,
     scope: &BTreeMap<String, ScalarType>,

@@ -377,6 +377,15 @@ pub struct ScalarBuildValidation<'a> {
 impl<'a> ScalarBuildValidation<'a> {
     #[cfg(any(test, feature = "internal-checker"))]
     #[allow(dead_code)]
+    pub(crate) fn pointer_caller_effect(
+        &self, module: usize, caller: usize, callee: usize, claimed: &BigInt,
+    ) -> Option<reference::pointer_call::CallerPointeeEffect<'_>> {
+        self.results.pointer_caller_effect(&self.prepared.project.modules, &self.prepared.calls,
+            module, caller, callee, claimed)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
     pub(crate) fn pointer_entry_wrapping_write(
         &self, module: usize, item: usize,
     ) -> Option<reference::pointer_entry::EntryPointeeWrite<'_>> {
