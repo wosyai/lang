@@ -2768,53 +2768,47 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
     }
     let left = left.into_int_value();
     let right = right.into_int_value();
+    Ok(EmitValue::Basic(emit_integer_binary(state.builder, operator, left, right, unsigned)?.into()))
+}
+
+pub(super) fn emit_integer_binary<'ctx>(
+    builder: &Builder<'ctx>, operator: &BinaryOperator,
+    left: inkwell::values::IntValue<'ctx>, right: inkwell::values::IntValue<'ctx>, unsigned: bool,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
     let value = match operator {
         // LLVM integer add without no-wrap flags is arithmetic modulo
         // the bit width. Leave the ordinary addition lowering unchanged.
-        BinaryOperator::Add | BinaryOperator::WrappingAdd => state
-            .builder
+        BinaryOperator::Add | BinaryOperator::WrappingAdd => builder
             .build_int_add(left, right, "add")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Subtract => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Subtract => builder
             .build_int_sub(left, right, "sub")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Multiply => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Multiply => builder
             .build_int_mul(left, right, "mul")
-            .map_err(builder_error)?
-            .into(),
+            .map_err(builder_error)?,
         BinaryOperator::Divide => if unsigned {
-            state.builder.build_int_unsigned_div(left, right, "div")
+            builder.build_int_unsigned_div(left, right, "div")
         } else {
-            state.builder.build_int_signed_div(left, right, "div")
+            builder.build_int_signed_div(left, right, "div")
         }
-        .map_err(builder_error)?
-        .into(),
+        .map_err(builder_error)?,
         BinaryOperator::Remainder => if unsigned {
-            state.builder.build_int_unsigned_rem(left, right, "rem")
+            builder.build_int_unsigned_rem(left, right, "rem")
         } else {
-            state.builder.build_int_signed_rem(left, right, "rem")
+            builder.build_int_signed_rem(left, right, "rem")
         }
-        .map_err(builder_error)?
-        .into(),
+        .map_err(builder_error)?,
         BinaryOperator::And | BinaryOperator::Or => {
             return Err("short-circuit operators require expression lowering".to_owned())
         }
-        BinaryOperator::Equal => state
-            .builder
+        BinaryOperator::Equal => builder
             .build_int_compare(IntPredicate::EQ, left, right, "eq")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::NotEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::NotEqual => builder
             .build_int_compare(IntPredicate::NE, left, right, "ne")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Less => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Less => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::ULT
@@ -2825,10 +2819,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "lt",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::LessEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::LessEqual => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::ULE
@@ -2839,10 +2831,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "le",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Greater => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Greater => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::UGT
@@ -2853,10 +2843,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "gt",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::GreaterEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::GreaterEqual => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::UGE
@@ -2867,35 +2855,24 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "ge",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitAnd => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitAnd => builder
             .build_and(left, right, "and")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitOr => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitOr => builder
             .build_or(left, right, "or")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitXor => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitXor => builder
             .build_xor(left, right, "xor")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::ShiftLeft => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::ShiftLeft => builder
             .build_left_shift(left, right, "shl")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::ShiftRight => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::ShiftRight => builder
             .build_right_shift(left, right, !unsigned, "shr")
-            .map_err(builder_error)?
-            .into(),
+            .map_err(builder_error)?,
     };
-    Ok(EmitValue::Basic(value))
+    Ok(value)
 }
 
 pub(super) fn emit_unary_value<'ctx, 'module>(

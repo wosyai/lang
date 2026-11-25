@@ -1,7 +1,10 @@
 //! Guarded source preparation for the ordinary runtime enum match. This sealed body carries only checked, scope-limited scalar values.
-use super::{proof_match::{AuthoredMatch, Payload, Selector},
+use super::{proof_match::{AuthoredMatch, Selector},
     typecheck::{concrete_integer_literal, integer_literal_fits_type},
     *};
+
+mod primitive;
+pub(crate) use primitive::{IntegerExpression, IntegerKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -32,10 +35,14 @@ pub(crate) enum TypedSelector {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Operand { Literal(BigInt), Formal(ByteSpan) }
+pub(crate) enum Operand { Literal(BigInt), Formal(ByteSpan), Expression(IntegerExpression) }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Predicate { Constant(bool), Formal { use_span: ByteSpan, declaration: ByteSpan } }
+pub(crate) enum Predicate {
+    Constant(bool),
+    Formal { use_span: ByteSpan, declaration: ByteSpan },
+    Compare { operator: BinaryOperator, operands: Box<[IntegerExpression; 2]> },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TypedArm {
@@ -56,6 +63,7 @@ pub(crate) struct CaseBinding {
 pub(crate) enum ArmResult {
     Literal { value: BigInt, span: ByteSpan },
     Payload { slot: usize, use_span: ByteSpan },
+    Expression(IntegerExpression),
 }
 
 pub(crate) fn diagnostic(source: &SourceIdentity, span: ByteSpan, message: &str) -> Diagnostic {
@@ -145,7 +153,7 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     };
     let matching = AuthoredMatch::prepare_with_initializer(&matching, local.as_ref().map(|(_, _, node)| node.clone()))
         .map_err(|error| diagnostic(source, error.span, error.message))?;
-    let resolved = matching.resolve(source, enums, &|name, ty| formals.get(name).is_some_and(|(_, found)| ty == found), work)
+    let resolved = matching.resolve_runtime(source, enums, work)
         .map_err(|error| diagnostic(source, error.span, error.message))?;
     if resolved.enumeration.copy_modifier_span.is_none() || resolved.enumeration.has_tag_only_layout() {
         return Err(error("runtime enum payload match requires a payload-bearing enum copy declaration"));
@@ -164,7 +172,7 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
         Ok(LexicalEnumBinding { enumeration: resolved.enumeration.id.clone(), declaration: token_span(name),
             initializer: wosy_syntax::byte_span(initializer), read: use_span })
     }).transpose()?;
-    let selector = typed_selector(source, &formals, resolved.selector)?;
+    let selector = typed_selector(source, &formals, resolved.selector, work)?;
     let arms = resolved.arms.into_iter().map(|arm| {
         let scope = arm.body.span;
         let arm_error = |message| diagnostic(source, scope, message);
@@ -189,11 +197,16 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
                 return Err(diagnostic(source, *span, "runtime enum payload result type differs from the function output"));
             }
             ArmResult::Payload { slot, use_span: *span }
-        } else {
-            let literal = concrete_integer_literal(&returned.value)
-                .filter(|value| integer_literal_fits_type(value, &result.ty))
-                .ok_or_else(|| diagnostic(source, returned.span, "runtime enum arm literal does not fit the function output"))?;
+        } else if let Some(literal) = concrete_integer_literal(&returned.value) {
+            if !integer_literal_fits_type(&literal, &result.ty) {
+                return Err(diagnostic(source, returned.span, "runtime enum arm literal does not fit the function output"));
+            }
             ArmResult::Literal { value: literal.into_owned(), span: returned.span }
+        } else {
+            let slots = arm.binders.iter().enumerate().map(|(slot, (name, _))| (*name, slot))
+                .collect::<HashMap<_, _>>();
+            let names = |name: &str| slots.get(name).map(|&slot| (bindings[slot].ty.clone(), IntegerKind::Payload(slot)));
+            ArmResult::Expression(primitive::compile(source, &returned.value, &result.ty, &names, work, 0)?)
         };
         Ok(TypedArm { tag: arm.tag, scope, bindings, result })
     }).collect::<Result<_, _>>()?;
@@ -210,11 +223,22 @@ impl Plan {
             match selector {
                 TypedSelector::Constructor { payload, .. } => {
                     for (use_span, operand) in payload {
-                        if let Operand::Formal(declaration) = operand { visit(*use_span, *declaration); }
+                        match operand {
+                            Operand::Formal(declaration) => visit(*use_span, *declaration),
+                            Operand::Expression(expression) => expression.for_each_formal(&mut visit),
+                            Operand::Literal(_) => {}
+                        }
                     }
                 }
                 TypedSelector::If { predicate, yes, no } => {
-                    if let Predicate::Formal { use_span, declaration } = predicate { visit(*use_span, *declaration); }
+                    match predicate {
+                        Predicate::Formal { use_span, declaration } => visit(*use_span, *declaration),
+                        Predicate::Compare { operands, .. } => {
+                            operands[0].for_each_formal(&mut visit);
+                            operands[1].for_each_formal(&mut visit);
+                        }
+                        Predicate::Constant(_) => {}
+                    }
                     pending.push(no);
                     pending.push(yes);
                 }
@@ -239,16 +263,22 @@ impl Plan {
     }
 }
 
-fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: Selector<'_>) -> Result<TypedSelector, Diagnostic> {
+fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: Selector<'_>,
+    work: &mut usize,
+) -> Result<TypedSelector, Diagnostic> {
+    let names = |name: &str| formals.get(name).map(|(span, ty)| (ty.clone(), IntegerKind::Formal(*span)));
     match selector {
-        Selector::Variant { tag, payload, operands, span } => {
-            let payload = operands.into_iter().zip(payload).map(|(use_span, value)| {
-                let value = match value {
-                    Payload::Literal(value) => Operand::Literal(value),
-                    Payload::Entry(name) => Operand::Formal(formals.get(&name)
-                        .ok_or_else(|| diagnostic(source, use_span, "missing verified enum payload formal"))?.0),
+        Selector::Variant { tag, runtime_arguments, span, .. } => {
+            let arguments = runtime_arguments.ok_or_else(|| diagnostic(source, span, "missing runtime enum selector arguments"))?;
+            let payload = arguments.into_iter().map(|(argument, ty)| {
+                let typed = primitive::compile(source, argument, ty, &names, work, 0)?;
+                let span = typed.span;
+                let operand = match typed.kind {
+                    IntegerKind::Literal(value) => Operand::Literal(value),
+                    IntegerKind::Formal(declaration) => Operand::Formal(declaration),
+                    _ => Operand::Expression(typed),
                 };
-                Ok((use_span, value))
+                Ok((span, operand))
             }).collect::<Result<_, _>>()?;
             Ok(TypedSelector::Constructor { tag, span, payload })
         }
@@ -258,11 +288,20 @@ fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: Selector
                 ScalarExpression::Name { name, span } if matches!(formals.get(name), Some((_, ScalarType::Bool))) => {
                     Predicate::Formal { use_span: *span, declaration: formals[name].0 }
                 }
+                ScalarExpression::Binary { operator, left, right, span }
+                    if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
+                        | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual) => {
+                    let ty = primitive::comparison_type(left, right, formals, work).ok_or_else(||
+                        diagnostic(source, *span, "runtime enum comparison needs a typed integer formal"))?;
+                    let left = primitive::compile(source, left, &ty, &names, work, 0)?;
+                    let right = primitive::compile(source, right, &ty, &names, work, 0)?;
+                    Predicate::Compare { operator: operator.clone(), operands: Box::new([left, right]) }
+                }
                 _ => return Err(diagnostic(source, typecheck::expression_span(condition),
-                    "runtime enum selector requires a Boolean literal or immutable Boolean formal")),
+                    "runtime enum selector requires a Boolean literal, immutable Boolean formal, or typed integer comparison")),
             };
-            Ok(TypedSelector::If { predicate, yes: Box::new(typed_selector(source, formals, *then_branch)?),
-                no: Box::new(typed_selector(source, formals, *else_branch)?) })
+            Ok(TypedSelector::If { predicate, yes: Box::new(typed_selector(source, formals, *then_branch, work)?),
+                no: Box::new(typed_selector(source, formals, *else_branch, work)?) })
         }
     }
 }
@@ -466,5 +505,53 @@ fn prepared_runtime_enum_lexical_binding_is_the_sole_match_input() {
     ] {
         let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime enum binding");
         assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_typed_primitive_regions_share_ordinary_integer_lowering() {
+    let text = r#"%%start
+        enum copy Region { negative(i8, i8); positive(i8); }
+        i8(i8) choose = fn(input) {
+            Region chosen = if (input < 0) { Region.negative(input +@ -1, 3) } else { Region.positive(input | 2) };
+            match (chosen) {
+                negative(value, delta) { value +@ delta }
+                positive(value) { value ^ 1 }
+            }
+        };
+        i8 negative = choose(-128);
+        i8 positive = choose(0);
+        i8 expected_negative = -126;
+        if (negative != expected_negative || positive != 3) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("icmp slt i8"));
+            assert!(ir.contains("add i8") && ir.contains("or i8") && ir.contains("xor i8"));
+            assert!(ir.contains("switch i32") && ir.contains("enum.local.storage"));
+        }
+    }
+    for invalid in [
+        text.replace("input +@ -1", "input + -1"),
+        text.replace("value +@ delta", "value +@ input"),
+        text.replace("input | 2", "input / 2"),
+        text.replace("input | 2", "input | 128"),
+        text.replace("negative(i8, i8)", "negative(i8, u8)"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime primitive expression");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{:?}", rejected.diagnostics);
     }
 }

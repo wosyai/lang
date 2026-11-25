@@ -36,7 +36,7 @@ pub(super) enum Selector<'a> {
         tag: u32,
         #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
         payload: Vec<Payload>,
-        operands: Vec<ByteSpan>,
+        runtime_arguments: Option<Vec<(&'a ScalarExpression, &'a ScalarType)>>,
         span: ByteSpan,
     },
     If { condition: &'a ScalarExpression, then_branch: Box<Selector<'a>>, else_branch: Box<Selector<'a>> },
@@ -120,7 +120,19 @@ impl AuthoredMatch {
     pub(super) fn resolve<'a>(&'a self, source: &SourceIdentity, enums: &'a [ScalarEnum],
         inputs: &impl Fn(&str, &ScalarType) -> bool, work: &mut usize,
     ) -> Result<ResolvedMatch<'a>, MatchError> {
-        let mut resolver = Resolver { enums, source, enumeration: None, variants: HashMap::new(), work };
+        self.resolve_with_mode(source, enums, inputs, work, false)
+    }
+
+    pub(super) fn resolve_runtime<'a>(&'a self, source: &SourceIdentity, enums: &'a [ScalarEnum],
+        work: &mut usize,
+    ) -> Result<ResolvedMatch<'a>, MatchError> {
+        self.resolve_with_mode(source, enums, &|_, _| false, work, true)
+    }
+
+    fn resolve_with_mode<'a>(&'a self, source: &SourceIdentity, enums: &'a [ScalarEnum],
+        inputs: &impl Fn(&str, &ScalarType) -> bool, work: &mut usize, runtime: bool,
+    ) -> Result<ResolvedMatch<'a>, MatchError> {
+        let mut resolver = Resolver { enums, source, enumeration: None, variants: HashMap::new(), work, runtime };
         let selector = resolver.resolve(&self.selector, inputs, 0)?;
         let enumeration = resolver.enumeration.ok_or_else(|| MatchError::unsupported(self.span,
             "authored match requires a resolved enum selector"))?;
@@ -158,6 +170,7 @@ struct Resolver<'a, 'w> {
     enumeration: Option<&'a ScalarEnum>,
     variants: HashMap<&'a str, &'a ScalarEnumVariant>,
     work: &'w mut usize,
+    runtime: bool,
 }
 
 impl<'a> Resolver<'a, '_> {
@@ -199,6 +212,12 @@ impl<'a> Resolver<'a, '_> {
             if selected.payload.len() != arguments.len() {
                 return Err(MatchError::invalid(span, "enum constructor does not match the payload arity"));
             }
+            if self.runtime {
+                let runtime_arguments = arguments.iter().zip(&selected.payload)
+                    .map(|(argument, slot)| (argument, &slot.ty)).collect();
+                return Ok(Selector::Variant { tag: selected.tag, payload: Vec::new(),
+                    runtime_arguments: Some(runtime_arguments), span });
+            }
             let payload = selected.payload.iter().zip(arguments).map(|(slot, value)| {
                 let value_span = expression_span(value);
                 if !is_integer_type(&slot.ty) {
@@ -218,7 +237,7 @@ impl<'a> Resolver<'a, '_> {
                     Ok(Payload::Literal(literal.into_owned()))
                 }
             }).collect::<Result<_, _>>()?;
-            return Ok(Selector::Variant { tag: selected.tag, payload, operands: arguments.iter().map(expression_span).collect(), span });
+            return Ok(Selector::Variant { tag: selected.tag, payload, runtime_arguments: None, span });
         }
         match expression {
             ScalarExpression::If { condition, then_branch, else_branch, .. } => {

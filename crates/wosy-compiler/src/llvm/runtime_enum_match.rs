@@ -1,6 +1,6 @@
 use inkwell::values::BasicValue;
-use super::{memory::{builder_error, integer_constant, integer_type}, *};
-use crate::scalar::runtime_enum_match::{ArmResult, Operand, Plan, Predicate, TypedSelector};
+use super::{expression::emit_integer_binary, memory::{builder_error, integer_constant, integer_type}, *};
+use crate::scalar::runtime_enum_match::{ArmResult, IntegerExpression, IntegerKind, Operand, Plan, Predicate, TypedSelector};
 use crate::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout};
 use wosy_syntax::ByteSpan;
 
@@ -54,6 +54,8 @@ pub(super) fn emit<'ctx>(
         }
         let result = match &arm.result {
             ArmResult::Literal { value, .. } => literal(context, &plan.output, value)?,
+            ArmResult::Expression(expression) if expression.ty == plan.output => lowering.integer(expression, Some(&variant.slots))?,
+            ArmResult::Expression(_) => return Err("invalid prepared runtime arm result type".into()),
             ArmResult::Payload { slot, .. } => {
                 let selected = variant.slots.get(*slot).filter(|slot| slot.source_type.ty == plan.output)
                     .ok_or("missing prepared runtime enum projection")?;
@@ -111,6 +113,34 @@ impl<'ctx> Lowering<'_, 'ctx> {
             &[self.context.i64_type().const_int(offset, false)], "enum.match.slot") }.map_err(builder_error)
     }
 
+    fn integer(&self, expression: &IntegerExpression, slots: Option<&[ScalarEnumPayloadSlotLayout]>)
+        -> Result<inkwell::values::IntValue<'ctx>, String>
+    {
+        match &expression.kind {
+            IntegerKind::Literal(value) => literal(self.context, &expression.ty, value),
+            IntegerKind::Formal(declaration) => self.actual(*declaration, integer_type(self.context, &expression.ty)?),
+            IntegerKind::Payload(index) => {
+                let slot = slots.and_then(|slots| slots.get(*index))
+                    .filter(|slot| slot.source_type.ty == expression.ty)
+                    .ok_or("missing prepared enum arm payload")?;
+                self.builder.build_load(integer_type(self.context, &expression.ty)?, self.address(slot)?, "enum.match.payload")
+                    .map_err(builder_error).map(|value| value.into_int_value())
+            }
+            IntegerKind::Binary { operator, operands } => self.primitive_binary(operator, operands, slots),
+        }
+    }
+
+    fn primitive_binary(&self, operator: &BinaryOperator, operands: &[IntegerExpression; 2],
+        slots: Option<&[ScalarEnumPayloadSlotLayout]>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let [left, right] = operands;
+        if left.ty != right.ty { return Err("mismatched prepared runtime enum operator types".into()); }
+        let unsigned = matches!(left.ty, ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128);
+        let left = self.integer(left, slots)?;
+        let right = self.integer(right, slots)?;
+        emit_integer_binary(self.builder, operator, left, right, unsigned)
+    }
+
     fn selector(&self, selector: &TypedSelector, join: inkwell::basic_block::BasicBlock<'ctx>) -> Result<(), String> {
         match selector {
             TypedSelector::Constructor { tag, payload, .. } => {
@@ -122,6 +152,8 @@ impl<'ctx> Lowering<'_, 'ctx> {
                     let value = match operand {
                         Operand::Literal(value) => literal(self.context, ty, value)?,
                         Operand::Formal(span) => self.actual(*span, integer_type(self.context, ty)?)?,
+                        Operand::Expression(expression) if &expression.ty == ty => self.integer(expression, None)?,
+                        Operand::Expression(_) => return Err("mismatched prepared runtime enum constructor operand".into()),
                     };
                     self.builder.build_store(self.address(slot)?, value).map_err(builder_error)?;
                 }
@@ -133,6 +165,8 @@ impl<'ctx> Lowering<'_, 'ctx> {
                 let condition = match predicate {
                     Predicate::Constant(value) => self.context.bool_type().const_int(u64::from(*value), false),
                     Predicate::Formal { declaration, .. } => self.actual(*declaration, self.context.bool_type())?,
+                    Predicate::Compare { operator, operands } => self.primitive_binary(operator, operands, None)?,
+
                 };
                 let then_block = self.context.append_basic_block(self.function, "enum.match.select.yes");
                 let else_block = self.context.append_basic_block(self.function, "enum.match.select.no");
