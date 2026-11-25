@@ -108,6 +108,7 @@ pub enum SyntaxKind {
     ProofMatchBlock = 95,
     ProofMatch = 96,
     ProofMatchArm = 97,
+    EnumVariantPayload = 98,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -215,6 +216,7 @@ impl Language for WosyLanguage {
             95 => SyntaxKind::ProofMatchBlock,
             96 => SyntaxKind::ProofMatch,
             97 => SyntaxKind::ProofMatchArm,
+            98 => SyntaxKind::EnumVariantPayload,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -1001,6 +1003,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::enum_decl => SyntaxKind::EnumDecl,
         Rule::copy_modifier => SyntaxKind::CopyModifier,
         Rule::enum_variant => SyntaxKind::EnumVariant,
+        Rule::enum_variant_payload => SyntaxKind::EnumVariantPayload,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
         Rule::receiver_list => SyntaxKind::ReceiverList,

@@ -15921,6 +15921,66 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_authored_enum_payload_is_typed_and_arm_local() {
+        let app = source("src/main.w", "ordered-authored-enum-payload");
+        let program = r#"%%start
+            enum Region { fixed(u8); identity(u8); reserved; }
+            u8(u8) classify = fn(value) { if (value < 10) { 2 } else { value } };
+            proof partitioned for classify(x) -> (out) ensures (out >= 2) {
+                match (if (x < 10) { Region.fixed(2) } else { Region.identity(x) }) {
+                    identity(same) { core.show(out == same); }
+                    fixed(value) { core.show(value == out); }
+                    reserved {}
+                }
+            }
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, scope| {
+                let (_, parsed) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+                check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                    Vec::new(), vec![(parsed, Vec::new())], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let main = ScalarCheckerScope::MainFlowOnly;
+            let proven = run(program, package).unwrap();
+            assert!(proven.active && proven.symbolic_diagnostic.is_none());
+            assert!(!run(program, main).unwrap().active);
+            let wrong = program.replace("Region.fixed(2)", "Region.fixed(3)");
+            let failed = run(&wrong, package).unwrap().symbolic_diagnostic.unwrap();
+            let step = failed.failed_step.unwrap().range;
+            assert_eq!(&wrong[step.start as usize..step.end as usize], "core.show(value == out)");
+            assert_eq!(failed.returned, BigInt::from(2));
+            let reach = |text: &str| text.replace("%%end", "u8 first = classify(5); u8 second = classify(14); %%end");
+            for scope in [main, package] {
+                let verified = run(&reach(program), scope).unwrap();
+                assert!(verified.active && verified.diagnostics.is_empty());
+                let reached = reach(&wrong);
+                let failure = run(&reached, scope).unwrap();
+                let [failure] = failure.diagnostics.as_slice() else { panic!("only the fixed payload arm refutes"); };
+                let span = failure.invocation.call.range;
+                assert_eq!(&reached[span.start as usize..span.end as usize], "classify(5)");
+                assert_eq!(failure.invocation.returned, BigInt::from(2));
+            }
+            for invalid in [
+                program.replace("Region.fixed(2)", "Region.fixed(256)"),
+                program.replace("Region.identity(x)", "Region.identity"),
+                program.replace("identity(u8)", "identity(u16)"),
+                program.replace("fixed(value)", "fixed(x)"),
+                program.replace("fixed(value)", "fixed"),
+            ] {
+                assert!(matches!(run(&invalid, package), Err(ProjectCheck::InvalidProof)), "{invalid}");
+            }
+            let leaked = program.replace("out == same", "out == value");
+            assert!(matches!(run(&leaked, package), Err(ProjectCheck::Unsupported)));
+            let conflicted = program.replace("Region.identity(x)", "Region.fixed(x)");
+            assert!(matches!(run(&conflicted, package), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_pure_affine_proof_observes_typed_conditional_joins_and_returns() {
         let app = source("src/main.w", "ordinary-branching-pure-proof");
         let text = r#"%%start

@@ -4828,9 +4828,9 @@ fn derives_zero_payload_enum_tags_and_equality() {
             "%%start\nenum Status { first; second; third; }\nStatus value = Status::second;\nbool equal = value == Status::second;\n%%end",
         );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-    assert_eq!(result.program.enums[0].variants[0].tag, 0);
-    assert_eq!(result.program.enums[0].variants[1].tag, 1);
-    assert_eq!(result.program.enums[0].variants[2].tag, 2);
+    assert_eq!(result.program.enums[0].variants()[0].tag, 0);
+    assert_eq!(result.program.enums[0].variants()[1].tag, 1);
+    assert_eq!(result.program.enums[0].variants()[2].tag, 2);
 }
 
 #[test]
@@ -8096,6 +8096,61 @@ fn build_types_authored_match_arms_without_proving_or_lowering_them() {
             if let Some(expected) = expected {
                 assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.message.contains(expected)), "{diagnostics:?}");
             }
+        }
+    }
+}
+
+#[test]
+fn enum_layout_gate_is_recomputed_from_serialized_variant_slots() {
+    let parsed = parse_source(source(), "%%start enum TagOnly { active; } enum HasPayload { none; some(u8); } %%end".to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let [plain, payload] = declarations.enums.as_slice() else { panic!("two canonical enums"); };
+    assert!(plain.has_tag_only_layout());
+    assert!(!payload.has_tag_only_layout());
+    for (enumeration, tag_only) in [(plain, true), (payload, false)] {
+        let mut json = serde_json::to_value(enumeration).unwrap();
+        assert!(json["variants"].is_array());
+        assert!(json.get("has_payload").is_none());
+        assert!(json["variants"][0].get("payload").is_none());
+        // The cache is never wire authority, including for old tag-only rows.
+        json["has_payload"] = serde_json::Value::Bool(tag_only);
+        let restored: ScalarEnum = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, *enumeration);
+        assert_eq!(restored.has_tag_only_layout(), tag_only);
+    }
+}
+
+#[test]
+fn build_scopes_authored_payload_bindings_without_runtime_materialization() {
+    let valid = r#"%%start
+        enum Result { got(u8); absent; }
+        u8(u8) identity = fn(n) { n };
+        proof p for identity(n) -> (out) ensures (out == 0) {
+            match (if (n == 0) { Result.absent } else { Result.got(n) }) {
+                got(value) { core.show(out == value); }
+                absent { core.show(out == 0); }
+            }
+        }
+        u8 used = identity(5);
+    %%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout })
+        };
+        assert!(prepare(valid).is_ok());
+        for invalid in [
+            valid.replace("absent { core.show(out == 0); }", "absent { core.show(out == value); }"),
+            valid.replace("Result.got(n)", "Result.got(256)"),
+            valid.replace("got(value)", "got(out)"),
+            valid.replace("%%end", "Result runtime = Result.got(1); %%end"),
+            valid.replace("%%end", "Result runtime = Result.absent; %%end"),
+        ] {
+            let Err(rejected) = prepare(&invalid) else { panic!("unsupported payload context accepted"); };
+            assert!(!rejected.into_ordered_diagnostics().is_empty());
         }
     }
 }

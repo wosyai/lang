@@ -80,18 +80,7 @@ impl<'a> IntegerComparison<'a> {
     }
 }
 
-pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<Cow<'_, BigInt>> {
-    match expression {
-        ScalarExpression::Integer { value, .. } => Some(Cow::Borrowed(value)),
-        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
-            let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
-                return None;
-            };
-            Some(Cow::Owned(-value))
-        }
-        _ => None,
-    }
-}
+pub(super) use super::typecheck::concrete_integer_literal;
 
 pub(super) struct ImportedLocal<'a> {
     pub(super) position: usize,

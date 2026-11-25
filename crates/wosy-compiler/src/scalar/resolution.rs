@@ -28,7 +28,7 @@ pub(super) fn resolve_program_types(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(program.enums.iter().map(|enumeration| {
+        .chain(program.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -306,7 +306,7 @@ pub(super) fn resolve_program_places(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(program.enums.iter().map(|enumeration| {
+        .chain(program.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -691,10 +691,10 @@ fn resolve_expression_places(
             *enum_tag = program
                 .enums
                 .iter()
-                .find(|enumeration| enumeration.name == *receiver)
+                .find(|enumeration| enumeration.name == *receiver && enumeration.has_tag_only_layout())
                 .and_then(|enumeration| {
                     enumeration
-                        .variants
+                        .variants()
                         .iter()
                         .find(|variant| variant.name == *name)
                 })
@@ -1154,7 +1154,7 @@ pub(super) fn resolve_module_places(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(module.enums.iter().map(|enumeration| {
+        .chain(module.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -1650,7 +1650,7 @@ pub(super) fn enum_member_in_module(
     let enumeration = module
         .enums
         .iter()
-        .find(|enumeration| enumeration.name == receiver)
+        .find(|enumeration| enumeration.name == receiver && enumeration.has_tag_only_layout())
         .or_else(|| {
             receiver.split_once('.').and_then(|(namespace, enum_name)| {
                 module
@@ -1665,13 +1665,14 @@ pub(super) fn enum_member_in_module(
                     .and_then(|target| {
                         target.enums.iter().find(|enumeration| {
                             enumeration.name == enum_name
+                                && enumeration.has_tag_only_layout()
                                 && !is_module_private_name(&enumeration.name)
                         })
                     })
             })
         })?;
     enumeration
-        .variants
+        .variants()
         .iter()
         .find(|variant| variant.name == name)
         .map(|variant| (enumeration.id.clone(), variant.tag))

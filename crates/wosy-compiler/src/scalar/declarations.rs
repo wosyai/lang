@@ -89,7 +89,7 @@ impl ScalarModuleDeclarations {
                     .or_insert_with(|| copy_struct_id(&structure.id));
             }
         }
-        for enumeration in &module.enums {
+        for enumeration in module.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()) {
             local_types.insert(
                 copy_name(&enumeration.name),
                 ScalarType::Enum(copy_enum_id(&enumeration.id)),

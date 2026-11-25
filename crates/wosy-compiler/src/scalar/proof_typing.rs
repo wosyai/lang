@@ -3,7 +3,7 @@
 use super::{
     declarations::ScalarDeclarationEnvironment, overload::ScalarOverloadEnvironment,
     proof_match::{AuthoredMatch, Selector},
-    typecheck::{expression_span, expression_type_in_module_expected, expect_module_type, is_integer_type,
+    typecheck::{expression_span, expression_type_in_module_expected, expect_module_type, is_integer_type, is_null_literal_name,
         module_diagnostic, validate_module_type, ScalarModuleTyping},
     *,
 };
@@ -200,14 +200,24 @@ impl ProofTyping<'_, '_> {
         let enums = self.module.enums;
         let checked = AuthoredMatch::prepare(&matching);
         let checked = checked.as_ref().map_err(|error| (error.span, error.message)).and_then(|matching| {
-            matching.resolve(source, enums, &mut 0).map_err(|error| (error.span, error.message))
+            matching.resolve(source, enums, &|name, ty| self.entry_scope.get(name) == Some(ty), &mut 0).map_err(|error| (error.span, error.message))
         });
         match checked {
             Ok(matching) => {
                 let inputs = self.entry_scope.clone();
                 self.check_match_selector(&matching.selector, &inputs);
-                for (_, arm) in matching.arms {
-                    self.steps(arm, scope, witness);
+                for arm in matching.arms {
+                    if let Some((binder, ty)) = arm.binder {
+                        if is_null_literal_name(binder) || scope.contains_key(binder) {
+                            self.diagnostics.push(module_diagnostic(self.module, "B0003", "payload binder must be a fresh proof-local name", arm.body.span));
+                            continue;
+                        }
+                        let mut local = scope.clone();
+                        local.insert(binder.to_owned(), ty.clone());
+                        self.steps(arm.body, &local, witness);
+                    } else {
+                        self.steps(arm.body, scope, witness);
+                    }
                 }
             }
             Err((span, message)) => self.diagnostics.push(module_diagnostic(self.module, "B0003", message, span)),

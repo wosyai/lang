@@ -1,4 +1,4 @@
-use super::super::proof_match::{AuthoredMatch, MatchError, Selector};
+use super::super::proof_match::{AuthoredMatch, MatchError, Payload, Selector};
 use super::*;
 use super::super::checker_flow::{charge_call_work, verify_partitioned_call_return, PartitionedProofGoal, SymbolicLiteralFailure};
 
@@ -89,7 +89,7 @@ impl<'a> CaseShows<'a> {
         let steps = if let Some(matching) = plan.variant_match {
             vec![matching.compile(plan, entry, catalog, goal, &mut work)?]
         } else {
-            compile(&plan.steps, plan, entry, catalog, goal, None, 0, &mut work)?
+            compile(&plan.steps, plan, entry, catalog, goal, None, None, 0, &mut work)?
         };
         Ok(Self { steps, work: work.observation, has_citations: work.has_citations })
     }
@@ -182,16 +182,26 @@ impl AuthoredMatch {
         if &owner.source != plan.proof_source { return Err(ProjectCheck::Unsupported); }
         let [parameter] = plan.typed.body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let universe = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
-        let matching = self.resolve(plan.proof_source, &owner.enums, &mut work.preparation).map_err(match_error)?;
+        let [input] = plan.typed.input_names.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let matching = self.resolve(plan.proof_source, &owner.enums,
+            &|name, ty| name == input && ty == &parameter.ty, &mut work.preparation).map_err(match_error)?;
         let mut selector = SelectorCompiler { plan, entry, domains: HashMap::new(), work };
         selector.visit(&matching.selector, universe, 0)?;
         let mut domains = selector.domains;
         let mut arms = Vec::with_capacity(matching.arms.len());
-        for (tag, arm) in matching.arms {
-            let domain = domains.remove(&tag).unwrap_or_default();
+        for arm in matching.arms {
+            let (domain, payload) = domains.remove(&arm.tag).unwrap_or_default();
+            let binding = if let Some((name, ty)) = arm.binder {
+                if is_null_literal_name(name) || name == input || name == plan.typed.output {
+                    return Err(ProjectCheck::InvalidProof);
+                }
+                Some(ArmPayload { name, ty, value: payload.as_ref() })
+            } else {
+                None
+            };
             charge_call_work(&mut work.observation, domain.interval_count().checked_add(1)
                 .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
-            arms.push((domain, compile(arm, plan, entry, catalog, goal.clone(), None, 1, work)?));
+            arms.push((domain, compile(arm.body, plan, entry, catalog, goal.clone(), None, binding, 1, work)?));
         }
         if !domains.is_empty() { return Err(ProjectCheck::InvalidProof); }
         Ok(Step::Match(arms))
@@ -204,7 +214,7 @@ impl AuthoredMatch {
 struct SelectorCompiler<'a, 'w> {
     plan: &'a PlannedModuleProof<'a>,
     entry: &'a ReferenceBindingId,
-    domains: HashMap<u32, IntegerSet>,
+    domains: HashMap<u32, (IntegerSet, Option<Payload>)>,
     work: &'w mut CompileWork,
 }
 
@@ -213,8 +223,10 @@ impl SelectorCompiler<'_, '_> {
         if depth == MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
         charge_call_work(&mut self.work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
         match selector {
-            Selector::Variant(tag) => {
-                let previous = self.domains.entry(*tag).or_default();
+            Selector::Variant { tag, payload } => {
+                let (previous, prior_payload) = self.domains.entry(*tag)
+                    .or_insert_with(|| (IntegerSet::default(), payload.clone()));
+                if prior_payload != payload { return Err(ProjectCheck::Unsupported); }
                 let cost = previous.interval_count().checked_add(domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
                 charge_call_work(&mut self.work.preparation, cost).ok_or(ProjectCheck::Unsupported)?;
                 *previous = std::mem::take(previous).join(domain);
@@ -317,10 +329,42 @@ fn compile_partition(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ArmPayload<'a> {
+    name: &'a str,
+    ty: &'a ScalarType,
+    value: Option<&'a Payload>,
+}
+
+fn arm_payload_claim(payload: ArmPayload<'_>, expression: &ScalarExpression, output: &str,
+    result_type: &ScalarType, body: &FunctionCallSites,
+) -> Result<Option<Claim<'static>>, ProjectCheck> {
+    let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = expression else {
+        return Ok(None);
+    };
+    let (ScalarExpression::Name { name: lhs, .. }, ScalarExpression::Name { name: rhs, .. }) =
+        (left.as_ref(), right.as_ref()) else { return Ok(None); };
+    if !((lhs == output && rhs == payload.name) || (rhs == output && lhs == payload.name)) {
+        return Ok(None);
+    }
+    if result_type != payload.ty { return Err(ProjectCheck::InvalidProof); }
+    let claim = match payload.value.ok_or(ProjectCheck::Unsupported)? {
+        Payload::Literal(value) => Claim::Literal(IntegerRelation::from_operator(&BinaryOperator::Equal)
+            .ok_or(ProjectCheck::Unsupported)?, Cow::Owned(value.clone())),
+        Payload::Entry(_) => {
+            if !matches!(body.boundary.parameters.as_slice(), [parameter] if &parameter.ty == result_type) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            Claim::Entry
+        }
+    };
+    Ok(Some(claim))
+}
+
 fn compile<'a>(
     block: &'a ScalarBlock, plan: &'a PlannedModuleProof<'a>, entry: &ReferenceBindingId,
     catalog: Option<&PublicProofCatalog<'a>>, mut current: rewrite::Goal<'a>,
-    outer: Option<&VisibleShows<'_, 'a>>, depth: usize, work: &mut CompileWork,
+    outer: Option<&VisibleShows<'_, 'a>>, payload: Option<ArmPayload<'_>>, depth: usize, work: &mut CompileWork,
 ) -> Result<Vec<Step<'a>>, ProjectCheck> {
     let typed = &plan.typed;
     if depth == MAX_ACTUAL_CALL_DEPTH || block.terminated_items.len() != block.items.len() {
@@ -347,11 +391,11 @@ fn compile<'a>(
         let step = match item {
             ScalarBlockItem::Expression(ScalarExpression::If { condition: predicate, then_branch, else_branch, .. }) =>
                 Step::Split(compile_condition(predicate, plan, entry, work)?,
-                    compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?,
-                    compile(else_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?),
+                    compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), payload, depth + 1, work)?,
+                    compile(else_branch, plan, entry, catalog, current.clone(), Some(&visible), payload, depth + 1, work)?),
             ScalarBlockItem::Expression(ScalarExpression::UnitIf { condition: predicate, then_branch, .. }) =>
                 Step::Split(compile_condition(predicate, plan, entry, work)?,
-                    compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?, Vec::new()),
+                    compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), payload, depth + 1, work)?, Vec::new()),
             _ if cited.is_some() => {
                 let name = cited.ok_or(ProjectCheck::Unsupported)?;
                 let peer = catalog.and_then(|catalog| catalog.resolve(plan.proof_source, name))
@@ -368,7 +412,11 @@ fn compile<'a>(
             ScalarBlockItem::Expression(expression) => {
                 let claim = proof_show_expression(item, terminated)?;
                 let (output, names, ty) = (&typed.output, &typed.input_names, typed.result_type);
-                let claim = if let Some(comparison) = IntegerComparison::from_expression(claim) {
+                let payload_claim = payload.map(|payload| arm_payload_claim(payload, claim, output, ty, typed.body))
+                    .transpose()?.flatten();
+                let claim = if let Some(claim) = payload_claim {
+                    claim
+                } else if let Some(comparison) = IntegerComparison::from_expression(claim) {
                     let (_, relation, bound) = checked_literal_output_goal_borrowed(comparison, output, names, ty)?;
                     Claim::Literal(relation, bound)
                 } else if let Some(old) = checked_old_output_relation(claim, output, names, typed.body, ty) {

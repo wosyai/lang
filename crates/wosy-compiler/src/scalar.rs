@@ -1318,6 +1318,8 @@ pub struct ScalarEnumVariant {
     pub name: String,
     pub name_span: ByteSpan,
     pub tag: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<ScalarTypeArgument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1325,10 +1327,49 @@ pub struct ScalarEnum {
     pub id: ScalarEnumId,
     pub name: String,
     pub name_span: ByteSpan,
-    pub variants: Vec<ScalarEnumVariant>,
+    variants: ScalarEnumVariants,
     pub copy_policy: CopyPolicy,
     pub copy_modifier_span: Option<ByteSpan>,
     pub span: ByteSpan,
+}
+
+// Compute the gate once while collecting the canonical declaration. The
+// immutable collection prevents the gate becoming stale. The serialized
+// form stays a plain variant sequence; never trust a serialized layout gate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct ScalarEnumVariants {
+    entries: Vec<ScalarEnumVariant>,
+    #[serde(skip)]
+    has_payload: bool,
+}
+
+impl FromIterator<ScalarEnumVariant> for ScalarEnumVariants {
+    fn from_iter<T: IntoIterator<Item = ScalarEnumVariant>>(variants: T) -> Self {
+        let mut has_payload = false;
+        let entries = variants.into_iter().inspect(|variant| {
+            has_payload |= !variant.payload.is_empty();
+        }).collect();
+        Self { entries, has_payload }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScalarEnumVariants {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<ScalarEnumVariant>::deserialize(deserializer).map(|variants| variants.into_iter().collect())
+    }
+}
+
+impl ScalarEnum {
+    pub fn variants(&self) -> &[ScalarEnumVariant] {
+        &self.variants.entries
+    }
+
+    // Until the ordinary tagged-union layout exists, the legacy i32 path
+    // must never materialize any variant of a payload-bearing enum.
+    pub(super) fn has_tag_only_layout(&self) -> bool {
+        !self.variants.has_payload
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3680,6 +3721,11 @@ fn derive_enum(node: CstNode, id: ScalarEnumId) -> ScalarEnum {
                 name: name.text().to_owned(),
                 name_span: token_span(&name),
                 tag: u32::try_from(tag).expect("enum variant tag fits u32"),
+                payload: variant.children().find(|child| child.kind() == SyntaxKind::EnumVariantPayload)
+                    .into_iter().flat_map(|payload| payload.children())
+                    .filter(|child| child.kind() == SyntaxKind::TypeSpec)
+                    .map(|ty| ScalarTypeArgument { ty: derive_type(&ty), span: wosy_syntax::byte_span(&ty) })
+                    .collect(),
             }
         })
         .collect();

@@ -38,7 +38,8 @@ top_level_item = { (assignment | expression) ~ ";" }
 struct_decl = { "struct" ~ copy_modifier? ~ identifier ~ "{" ~ struct_field* ~ "}" }
 enum_decl = { "enum" ~ copy_modifier? ~ identifier ~ "{" ~ enum_variant* ~ "}" }
 copy_modifier = @{ "copy" ~ !(ASCII_ALPHANUMERIC | "_") }
-enum_variant = { identifier ~ ";" }
+enum_variant = { identifier ~ enum_variant_payload? ~ ";" }
+enum_variant_payload = { "(" ~ type_spec ~ ("," ~ type_spec)* ~ ")" }
 struct_field = { type_spec ~ identifier ~ ";" }
 namespace_decl = { identifier ~ "=" ~ "namespace" ~ identifier ~ string ~ ";" }
 extern_decl = { identifier ~ "=" ~ "extern" ~ identifier ~ string ~ "{" ~ extern_function+ ~ "}" ~ ";" }

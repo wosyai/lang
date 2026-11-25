@@ -3308,6 +3308,19 @@ fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
     }
 }
 
+pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<std::borrow::Cow<'_, BigInt>> {
+    match expression {
+        ScalarExpression::Integer { value, .. } => Some(std::borrow::Cow::Borrowed(value)),
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
+            let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
+                return None;
+            };
+            Some(std::borrow::Cow::Owned(-value))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
     integer_bounds(ty).is_some_and(|(minimum, maximum)| value >= &minimum && value <= &maximum)
 }
@@ -8308,7 +8321,7 @@ fn check_expression_type(
         } => match program
             .enums
             .iter()
-            .find(|enumeration| enumeration.name == *receiver)
+            .find(|enumeration| enumeration.name == *receiver && enumeration.has_tag_only_layout())
         {
             Some(enumeration) => {
                 if let Some(tag) = *enum_tag {
