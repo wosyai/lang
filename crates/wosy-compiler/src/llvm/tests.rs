@@ -18536,3 +18536,116 @@ if (probe_shared(2,1) != 101 || probe_exclusive_shared(2,1) != 204
         }
     }
 }
+
+#[test]
+fn retained_fixed_read_observes_prepared_helper_without_changing_build() {
+    use crate::ScalarPlace;
+    let text = "%%start
+u8(u64) observe = fn(index) {
+    u8[3] bytes = [11, 22, 33];
+    bytes[index]
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/retained_index.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+
+        let (module, authored) = prepared.project().modules.iter().enumerate()
+            .find(|(_, module)| module.source == source).unwrap();
+        let (item, fun) = authored.items.iter().enumerate()
+            .find_map(|(item, value)| match value {
+                crate::scalar::ScalarItem::Function(fun) if fun.name == "observe" => Some((item, fun)),
+                _ => None,
+            }).unwrap();
+        let nodes = prepared.bind_callable_body_call_nodes(module, item, None, &fun.body).unwrap();
+        let [ScalarBlockItem::LocalBinding(local), ScalarBlockItem::Expression(read)] =
+            fun.body.items.as_slice() else { panic!("unexpected authored read body") };
+        let ScalarExpression::IndexedRead { place, .. } = read else { panic!("expected checked read expression") };
+        let ScalarPlace::Index { base, index, .. } = place else { panic!("expected indexed place") };
+        assert!(matches!(base.as_ref(), ScalarPlace::Name { .. }));
+        assert!(matches!(index.as_ref(), ScalarExpression::Name { .. }));
+        assert_eq!(nodes.lexical_place_declaration(base), Some(local.name_span));
+        assert_eq!(nodes.checked_place_type(base), Some(&local.declared_type));
+        assert!(matches!(local.declared_type, ScalarType::Array { ref element, length: 3, .. }
+            if element.as_ref() == &ScalarType::U8));
+        assert!(nodes.place_ordinal(place).is_some());
+        assert_ne!(nodes.place_ordinal(place), nodes.place_ordinal(base));
+        assert!(nodes.expression_ordinal(index).is_some());
+        assert_eq!(nodes.lexical_expression_declaration(index), Some(fun.parameter_spans[0]));
+        assert_eq!(nodes.checked_expression_type(index), Some(&ScalarType::U64));
+        assert_eq!(nodes.checked_expression_type(read), Some(&ScalarType::U8));
+
+        let access = prepared.checked_access().expect("sealed ordinary helper");
+        let helper_symbol = project_function_name(&access.source, &access.in_extent);
+        let helper = self_tail_test_body(&ir, "void", &helper_symbol);
+        assert!(helper.starts_with("i64 %index, i64 %count)"), "{helper}");
+        let helper_index = loaded_runtime_extent_parameter(helper, "index");
+        let helper_count = loaded_runtime_extent_parameter(helper, "count");
+        let comparison = format!(" = icmp uge i64 {helper_index}, {helper_count}");
+        let cmp = helper.lines().find_map(|line| line.trim().strip_suffix(&comparison)).unwrap();
+        let branch = helper.lines().find_map(|line| line.trim().strip_prefix(&format!("br i1 {cmp}, label %"))).unwrap();
+        let (fail, success) = branch.split_once(", label %").unwrap();
+        let block = |label: &str| helper.split_once(&format!("\n{label}:")).unwrap().1.split("\n\n").next().unwrap();
+        // The authored unit-if retains its CFG join. Termination is the
+        // runtime contract of SystemPanic, not an LLVM terminator here.
+        let panic = "call void @__wosy_core_system_panic()";
+        assert_eq!(helper.matches(panic).count(), 1, "{helper}");
+        let failure = block(fail);
+        assert!(failure.contains(&format!("{panic}\n  br label %{success}")), "{helper}");
+        assert!(block(success).contains("ret void") && !block(success).contains(panic), "{helper}");
+
+        let body = self_tail_test_body(&ir, "i8", &project_function_name(&source, "observe"));
+        let index = loaded_runtime_extent_parameter(body, "index");
+        let guard = format!("call void @{helper_symbol}(i64 {index}, i64 3)");
+        let [before, after] = body.split(&guard).collect::<Vec<_>>()[..] else { panic!("{body}") };
+        let allocations = before.lines().filter_map(|line|
+            line.trim().split_once(" = alloca [3 x i8]").map(|(slot, _)| slot)).collect::<Vec<_>>();
+        let initializes_literal = |slot: &str| [11, 22, 33].into_iter().enumerate().all(|(offset, byte)| {
+            let gep = format!(" = getelementptr inbounds [3 x i8], ptr {slot}, i32 0, i32 {offset}");
+            let Some(address) = before.lines().find_map(|line| line.trim().strip_suffix(&gep)) else { return false; };
+            before.contains(&format!("store i8 {byte}, ptr {address},"))
+        });
+        let [literal] = allocations.iter().copied().filter(|slot| initializes_literal(slot))
+            .collect::<Vec<_>>()[..] else { panic!("exact authored initializer: {body}") };
+        let moves = before.lines().filter(|line| line.contains("call void @llvm.memmove"))
+            .filter_map(|line| {
+                let (_, args) = line.split_once('(')?;
+                let mut args = args.split(", ");
+                let destination = args.next()?.split_whitespace().last()?;
+                let source = args.next()?.split_whitespace().last()?;
+                let extent = args.next()?.split_whitespace().last()?;
+                (source == literal && extent == "3" && allocations.contains(&destination)).then_some(destination)
+            }).collect::<Vec<_>>();
+        let backing = match moves.as_slice() {
+            [] => literal,
+            [destination] => *destination,
+            _ => panic!("ambiguous prepared array backing: {body}"),
+        };
+        let address_index = if target == ScalarTargetLayout::WASM32 {
+            let trunc = format!(" = trunc i64 {index} to i32");
+            assert!(!before.contains(&trunc), "{body}");
+            let narrowed = after.lines().find_map(|line| line.trim().strip_suffix(&trunc)).unwrap();
+            assert!(after.find(&trunc).unwrap() < after.find("getelementptr inbounds [3 x i8]").unwrap(), "{body}");
+            format!("i32 {narrowed}")
+        } else {
+            format!("i64 {index}")
+        };
+        let gep = format!(" = getelementptr inbounds [3 x i8], ptr {backing}, i32 0, {address_index}");
+        let addr = after.lines().find_map(|line| line.trim().strip_suffix(&gep)).unwrap();
+        let load = format!(" = load i8, ptr {addr},");
+        let value = after.lines().find_map(|line| line.trim().split_once(&load).map(|(value, _)| value)).unwrap();
+        assert!(after.find(&gep).unwrap() < after.find(&load).unwrap(), "{body}");
+        assert!(after.find(&load).unwrap() < after.find(&format!("ret i8 {value}")).unwrap(), "{body}");
+        assert!(!body.contains("@__wosy_core_system_panic"), "{body}");
+        assert_eq!(emit_scalar_build_project_llvm(&checked).unwrap().to_text(), ir);
+    }
+}
