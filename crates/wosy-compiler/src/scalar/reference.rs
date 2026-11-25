@@ -2605,9 +2605,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
                     let before = self.cursor;
-                    self.expression(&field.value, scope, ordinal)?;
-                    if matches!(read_mode, ExpressionReadMode::GuardedStructInitializer)
-                        && matches!(&field.value, ScalarExpression::Name { .. })
+                    let guarded = matches!(read_mode, ExpressionReadMode::GuardedStructInitializer);
+                    let requires_field_proof = guarded && matches!(&field.value,
+                        ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. });
+                    let previous = self.capture_call_points;
+                    self.capture_call_points |= requires_field_proof;
+                    let result = self.expression(&field.value, scope, ordinal);
+                    self.capture_call_points = previous;
+                    result?;
+                    if requires_field_proof {
+                        let proof = calls.structure.literal_fields.get(&ordinal)
+                            .filter(|member| Some(&member.structure) == structure_id)
+                            .and_then(|_| calls.structure.checked_types.expressions.get(&ordinal))
+                            .filter(|_| self.generic_parameters.is_empty())
+                            .and_then(|ty| self.guarded_numeric_expression(&field.value, ordinal, ty));
+                        let Some(proof) = proof else {
+                            return Err(self.missing_context(expression_span(&field.value),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+                        };
+                        self.aggregate_result.fallible_call_expressions.push(proof);
+                    }
+                    if guarded && matches!(&field.value, ScalarExpression::Name { .. })
                         && !self.cursor.is_some_and(|point| {
                             Some(point) != before && matches!(self.cfg.points[point.0].kind, CfgPointKind::Read { .. })
                         })

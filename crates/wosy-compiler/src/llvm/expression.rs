@@ -2552,10 +2552,11 @@ fn checked_float_type<'a>(
         })
 }
 
-fn emit_fallible_numeric<'ctx>(
+pub(super) fn emit_fallible_numeric_to<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
-    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>, ordinary: bool,
-) -> Result<EmitValue<'ctx>, String> {
+    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>,
+    failure: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, Vec<inkwell::basic_block::BasicBlock<'ctx>>), String> {
     use inkwell::basic_block::BasicBlock;
     enum Step<'ctx, 'ast> {
         Emit(&'ast ScalarExpression),
@@ -2567,7 +2568,6 @@ fn emit_fallible_numeric<'ctx>(
     let pair = aggregate_transfer::fallible_allocation_result_type(context, payload)?;
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing fallible expression function")?;
-    let merge = context.append_basic_block(function, if ordinary { "ordinary.allocation_absent" } else { "fallible.binary_merge" });
     let mut absent = Vec::new();
     let take_present = |state: &mut EmitState<'ctx, '_>, tagged: inkwell::values::StructValue<'ctx>,
         absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
@@ -2576,7 +2576,7 @@ fn emit_fallible_numeric<'ctx>(
         let present = context.append_basic_block(function, "fallible.binary_present");
         let succeeded = state.builder.build_extract_value(tagged, 0, "fallible.operand_succeeded")
             .map_err(builder_error)?.into_int_value();
-        state.builder.build_conditional_branch(succeeded, present, merge).map_err(builder_error)?;
+        state.builder.build_conditional_branch(succeeded, present, failure).map_err(builder_error)?;
         absent.push(test);
         state.builder.position_at_end(present);
         let value = state.builder.build_extract_value(tagged, 1, "fallible.operand_payload")
@@ -2679,7 +2679,18 @@ fn emit_fallible_numeric<'ctx>(
         }
     }
     if values.len() != 1 || absent.is_empty() { return Err("invalid sealed fallible expression result".into()); }
-    let value = take_basic(values.pop().expect("one sealed fallible expression output"))?;
+    Ok((take_basic(values.pop().expect("one sealed fallible expression output"))?, absent))
+}
+
+fn emit_fallible_numeric<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>, ordinary: bool,
+) -> Result<EmitValue<'ctx>, String> {
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing fallible expression function")?;
+    let merge = context.append_basic_block(function,
+        if ordinary { "ordinary.allocation_absent" } else { "fallible.binary_merge" });
+    let (value, absent) = emit_fallible_numeric_to(context, state, expression, payload, path, merge)?;
     if ordinary {
         let success = state.builder.get_insert_block().ok_or("missing ordinary expression success block")?;
         state.builder.position_at_end(merge);
@@ -2692,8 +2703,8 @@ fn emit_fallible_numeric<'ctx>(
     let computed_end = state.builder.get_insert_block().ok_or("missing fallible expression present block")?;
     state.builder.build_unconditional_branch(merge).map_err(builder_error)?;
     state.builder.position_at_end(merge);
-    let phi = state.builder.build_phi(pair, "fallible.binary_result").map_err(builder_error)?;
-    let zero = pair.const_zero();
+    let phi = state.builder.build_phi(computed.get_type(), "fallible.binary_result").map_err(builder_error)?;
+    let zero = computed.get_type().const_zero();
     for test in absent { phi.add_incoming(&[(&zero, test)]); }
     phi.add_incoming(&[(&computed, computed_end)]);
     Ok(EmitValue::Basic(phi.as_basic_value()))

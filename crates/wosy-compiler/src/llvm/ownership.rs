@@ -1209,6 +1209,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     binding: &crate::ScalarBinding,
     value: Option<BasicValueEnum<'ctx>>,
+    path: super::expression::ExpressionPath<'_>,
 ) -> Result<(), String> {
     let [receiver] = binding.receivers.as_slice() else {
         return Err("fallible scalar allocation requires a single receiver".into());
@@ -1234,9 +1235,27 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         }
         Some(pair)
     } else { None };
+    let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or_else(|| "missing guarded scalar allocation function".to_owned())?;
+    let mut field_failure = None;
     let aggregate = match (&receiver.ty, &binding.value, value) {
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
-            Some(memory::prepare_struct_literal(context, state, id, fields)?),
+            Some(memory::prepare_struct_literal_with(state, id, fields, |state, field, ty| {
+                use super::expression::{ExpressionPath, emit_fallible_numeric_to};
+                if super::aggregate_transfer::fallible_allocation_expression_at(state, field) {
+                    let failure = *field_failure.get_or_insert_with(||
+                        context.append_basic_block(parent, "fallible.field_absence"));
+                    let (value, _) = emit_fallible_numeric_to(context, state, field, ty, path, failure)?;
+                    Ok(EmitValue::Basic(value))
+                } else {
+                    match (path, field) {
+                        (ExpressionPath::Project { module, modules },
+                            ScalarExpression::Call { .. } | ScalarExpression::Binary { .. } | ScalarExpression::If { .. }) =>
+                            super::expression::emit_project_typed_expression(context, state, field, ty, module, modules),
+                        _ => memory::emit_typed_expression(context, state, field, ty),
+                    }
+                }
+            })?),
         (_, _, Some(BasicValueEnum::StructValue(_))) if rhs.is_some() => None,
         (ty, _, Some(BasicValueEnum::IntValue(value)))
             if memory::integer_width(ty) == Some(value.get_type().get_bit_width()) => None,
@@ -1244,8 +1263,6 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     };
     declare_core_runtime(context, state.module);
     let (size, align) = allocation_layout(&receiver.ty, state.layouts, state.target_layout)?;
-    let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
-        .ok_or_else(|| "missing guarded scalar allocation function".to_owned())?;
     let initialized = context.append_basic_block(parent, "fallible.initialize");
     let continuation = context.append_basic_block(parent, "fallible.continue");
     let skipped = if let Some(rhs) = rhs {
@@ -1255,7 +1272,13 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         let allocate = context.append_basic_block(parent, "fallible.destination");
         state.builder.build_conditional_branch(succeeded, allocate, continuation).map_err(builder_error)?;
         state.builder.position_at_end(allocate);
-        Some((rhs, here))
+        Some(here)
+    } else if let Some(failure) = field_failure {
+        let success = state.builder.get_insert_block().ok_or("missing successful struct fields block")?;
+        state.builder.position_at_end(failure);
+        state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
+        state.builder.position_at_end(success);
+        Some(failure)
     } else { None };
     let allocation_end = state.builder.get_insert_block().ok_or("missing fallible allocation block")?;
     let backing = emit_standard_allocation_call(
@@ -1268,7 +1291,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     if let Some(values) = aggregate {
         memory::write_struct_literal(context, state, values, backing)?;
     } else {
-        let value = if let Some((rhs, _)) = skipped {
+        let value = if let Some(rhs) = rhs {
             state.builder.build_extract_value(rhs, 1, "fallible.rhs_payload").map_err(builder_error)?
         } else {
             value.expect("checked integer initializer")
@@ -1277,7 +1300,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     }
     state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
-    let (backing, present) = if let Some((_, skipped)) = skipped {
+    let (backing, present) = if let Some(skipped) = skipped {
         let address = state.builder.build_phi(backing.get_type(), "fallible.backing").map_err(builder_error)?;
         address.add_incoming(&[(&backing, allocation_end), (&backing, initialized),
             (&backing.get_type().const_null(), skipped)]);

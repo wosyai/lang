@@ -5399,7 +5399,7 @@ fn emit_block_item<'ctx, 'module>(
                 } else {
                     Some(take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?)
                 };
-                ownership::bind_guarded_scalar(context, state, binding, value)?;
+                ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Single)?;
                 return Ok(EmitValue::Unit);
             }
             if store_widened_local_array(context, state, binding, None)? {
@@ -5431,7 +5431,7 @@ fn emit_project_block_item<'ctx, 'module>(
                         context, state, &binding.value, &binding.declared_type, module, modules,
                     )?)?)
                 };
-                ownership::bind_guarded_scalar(context, state, binding, value)?;
+                ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Project { module, modules })?;
                 return Ok(EmitValue::Unit);
             }
             if store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
@@ -5539,6 +5539,7 @@ fn emit_project_block_item<'ctx, 'module>(
 mod expression;
 mod self_tail;
 use expression::{
+    ExpressionPath,
     emit_expression, emit_if_value, emit_project_expression, emit_project_typed_expression,
 };
 mod return_memory;

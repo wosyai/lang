@@ -6693,21 +6693,27 @@ fn pending_fallible_operator(
             if is_integer_type(ty) && type_arguments.is_empty() => None,
         (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
             if guarded_numeric_rhs(ty, expression) => None,
-        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
-            if !fields.is_empty()
-                && fields.iter().all(|field| match &field.value {
-                    ScalarExpression::Integer { .. }
-                    | ScalarExpression::Boolean { .. }
-                    | ScalarExpression::Char { .. }
-                    | ScalarExpression::Float { .. } => true,
-                    ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
-                        matches!(operand.as_ref(), ScalarExpression::Float { .. }),
-                    ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_guarded_struct_field_type),
-                    _ => false,
-                })
-                && structs.iter().any(|structure| &structure.id == id
-                    && !structure.fields.is_empty()
-                    && structure.fields.iter().all(|field| is_guarded_struct_field_type(&field.ty))) => None,
+        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {
+            let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return Some(operator); };
+            if fields.is_empty() || structure.fields.is_empty()
+                || !structure.fields.iter().all(|field| is_guarded_struct_field_type(&field.ty))
+            { return Some(operator); }
+            let member_types = structure.fields.iter().map(|member| (member.name.as_str(), &member.ty))
+                .collect::<BTreeMap<_, _>>();
+            if fields.iter().all(|field| match &field.value {
+                ScalarExpression::Integer { .. }
+                | ScalarExpression::Boolean { .. }
+                | ScalarExpression::Char { .. }
+                | ScalarExpression::Float { .. } => true,
+                ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+                    matches!(operand.as_ref(), ScalarExpression::Float { .. }),
+                ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_guarded_struct_field_type),
+                expression => member_types.get(field.name.as_str()).is_some_and(|ty|
+                    matches!(ty, ScalarType::U64 | ScalarType::I32)
+                    && (matches!(expression, ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty())
+                        || guarded_numeric_rhs(ty, expression))),
+            }) { None } else { Some(operator) }
+        }
         _ => Some(operator),
     }
 }

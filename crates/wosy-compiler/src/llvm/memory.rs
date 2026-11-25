@@ -856,6 +856,16 @@ pub(super) fn prepare_struct_literal<'ctx, 'module>(
     id: &crate::ScalarStructId,
     fields: &[crate::ScalarStructLiteralField],
 ) -> Result<PreparedStructLiteral<'ctx, 'module>, String> {
+    prepare_struct_literal_with(state, id, fields, |state, value, ty|
+        emit_typed_expression(context, state, value, ty))
+}
+
+pub(super) fn prepare_struct_literal_with<'ctx, 'module>(
+    state: &mut EmitState<'ctx, 'module>,
+    id: &crate::ScalarStructId,
+    fields: &[crate::ScalarStructLiteralField],
+    mut emit_field: impl FnMut(&mut EmitState<'ctx, 'module>, &ScalarExpression, &ScalarType) -> Result<EmitValue<'ctx>, String>,
+) -> Result<PreparedStructLiteral<'ctx, 'module>, String> {
     let structure = structure(state.structs, id.clone())?;
     let mut values = BTreeMap::new();
     for field in &structure.fields {
@@ -865,7 +875,7 @@ pub(super) fn prepare_struct_literal<'ctx, 'module>(
         let (ty, value) = values
             .get_mut(field.name.as_str())
             .expect("validated struct field");
-        *value = Some(emit_typed_expression(context, state, &field.value, ty)?);
+        *value = Some(emit_field(state, &field.value, ty)?);
     }
     Ok(PreparedStructLiteral { structure, values })
 }
