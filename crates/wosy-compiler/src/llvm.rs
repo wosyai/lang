@@ -2121,8 +2121,8 @@ fn store_runtime_allocation<'ctx, 'module>(
     }
     let private_literal = aggregate_transfer::has_literal_array_plan(state);
     let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
-    let checked_extent = widened || (prepared && state.require_release_checked_access
-        && state.indexed_runtime_allocations.contains(&declaration));
+    let checked_extent = widened || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+        || (prepared && state.require_release_checked_access && state.indexed_runtime_allocations.contains(&declaration));
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
         .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
     aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
@@ -5394,7 +5394,7 @@ fn emit_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = if matches!(binding.declared_type, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }) {
+                let value = if matches!(&binding.value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }) {
                     None
                 } else {
                     Some(take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?)
@@ -5424,7 +5424,7 @@ fn emit_project_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = if matches!(binding.declared_type, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }) {
+                let value = if matches!(&binding.value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. }) {
                     None
                 } else {
                     Some(take_basic(emit_project_typed_expression(

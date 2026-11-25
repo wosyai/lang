@@ -1333,6 +1333,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
+    pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) ordinary_fallible_expressions: Vec<Vec<GuardedNumericExpression>>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
@@ -1570,7 +1571,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.fallible_call_initializers.is_empty() || !self.fallible_call_expressions.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.fallible_call_initializers.is_empty() || !self.fallible_call_expressions.is_empty() || !self.guarded_array_returns.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -3050,6 +3051,7 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) guarded_array_descriptor_leaf: bool,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -6661,6 +6663,7 @@ fn closed_aggregates<'a>(
     let mut array_descriptor_identities = BTreeMap::new();
     let mut borrowed_extent_observers = BTreeMap::new();
     let mut fallible_call_requests = Vec::new();
+    let mut guarded_array_requests = Vec::new();
     let mut fallible_expressions = Vec::new();
     let mut ordinary_expressions = Vec::new();
     let mut ordinary_fallible_candidates = BTreeSet::new();
@@ -6677,6 +6680,11 @@ fn closed_aggregates<'a>(
             .ok_or_else(|| format!("missing emitted aggregate result {key:?}"))?;
         declarations.insert((input.source, function.name_span), (module, item));
         if let Some(facts) = facts {
+            if !facts.guarded_array_returns.is_empty() && (!is_monomorphic || arm.is_some()) {
+                return Err("guarded owned array call requires an exact monomorphic caller".into());
+            }
+            guarded_array_requests.extend(facts.guarded_array_returns.iter()
+                .map(|&(point, ordinal)| (key, cfg, point, ordinal)));
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
             if is_monomorphic && arm.is_none() {
@@ -7198,7 +7206,36 @@ fn closed_aggregates<'a>(
             }
         }
     }
+    let mut guarded_array_cohorts = BTreeMap::<BodyKey, (ClosedLiteralArray, BTreeSet<(BodyKey, usize)>)>::new();
+    for (caller, cfg, point, ordinal) in guarded_array_requests {
+        let invalid = || "guarded owned array call requires an exact private fresh dynamic producer".to_owned();
+        let target = target_body(&declarations, cfg, point).ok_or_else(invalid)?;
+        let body = bodies.get(&target).filter(|body| body.is_monomorphic && target.2.is_none()).ok_or_else(invalid)?;
+        let input = module_at(target.0).ok_or_else(invalid)?;
+        let Some(ScalarItem::Function(function)) = input.items.get(target.1) else { return Err(invalid()); };
+        if !crate::scalar::typecheck::is_module_private_name(&function.name) || function.body.unsafe_context
+            || !body.sites.declared_unsafe_calls.is_empty()
+            || !matches!(body.sites.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
+        { return Err(invalid()); }
+        let Some(LiteralArrayRoute::FreshLeaf { allocation, output }) =
+            body.facts.and_then(AggregateFlowResult::proved_literal_array_route)
+        else { return Err(invalid()); };
+        if allocation.extent != FreshArrayExtent::Formal { return Err(invalid()); }
+        let plan = ClosedLiteralArray::FreshLeaf {
+            receipt: OriginalArrayReceipt { origin: allocation.bind, allocation: (allocation.position.block.0, allocation.position.item) },
+            length_occurrence: allocation.length_occurrence.0, extent: allocation.extent, output: output.0,
+        };
+        ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
+        guarded_array_cohorts.entry(target).or_insert_with(|| (plan, BTreeSet::new())).1.insert((caller, ordinal.0));
+    }
     ordinary.census(reservations, &module_at, &declarations);
+    for (target, (_, sites)) in &guarded_array_cohorts {
+        let observed = ordinary.transport_uses.get(target).and_then(Option::as_ref)
+            .ok_or("guarded owned array cohort has an unknown use")?;
+        if observed.iter().copied().collect::<BTreeSet<_>>() != *sites {
+            return Err("guarded owned array cohort has a non-guarded use".into());
+        }
+    }
     let mut ordinary_fallible_calls = BTreeSet::new();
     for (target, calls) in &fallible_allocating_targets {
         let unsupported = || "fallible allocating callable requires exclusively checked fallible initializer uses or sealed ordinary scalar bindings".to_owned();
@@ -7590,6 +7627,18 @@ fn closed_aggregates<'a>(
             result.bodies.entry(body).or_default().ordinary_fallible_allocating_expressions.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
+        for (&target, (route, callers)) in &guarded_array_cohorts {
+            let target = result.bodies.entry(target).or_default();
+            if target.literal_array.is_some_and(|existing| existing != *route) || target.array_descriptor_identity {
+                return Err("conflicting guarded owned array producer plan".into());
+            }
+            target.literal_array = Some(*route);
+            target.array_descriptor_return = true;
+            target.guarded_array_descriptor_leaf = true;
+            for &(body, call) in callers {
+                result.bodies.entry(body).or_default().array_descriptor_calls.insert(call);
+            }
+        }
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
             return Err("returned array index requires the authenticated checked-access helper".into());
         }

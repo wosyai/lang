@@ -394,7 +394,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             // retain that backing and extent before evaluating the selector.
             let guarded = if let crate::ScalarPlace::Name { name, .. } = base.as_ref() {
                 if let Some((backing, _)) = state.storage.get(name) {
-                    ownership::guarded_array_extent(state, base, *backing, &base_type)?
+                    ownership::guarded_array_extent(context, state, base, *backing, &base_type)?
                         .map(|extent| (*backing, extent))
                 } else {
                     None
@@ -422,13 +422,15 @@ pub(super) fn place_pointer<'ctx, 'module>(
             };
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
-                if let Some(length) = guarded_extent {
-                    let crate::ScalarPlace::Name { span, .. } = base.as_ref() else {
-                        return Err("guarded runtime array index lacks its exact lexical base".into());
-                    };
-                    let layout = ScalarType::Array { element, length, length_span: *span, span: *span };
-                    check_fixed_index(context, state, index, length, fallback)?;
-                    return fixed_array_element_pointer(context, state, &layout, base_pointer, index, true);
+                if let Some(extent) = guarded_extent {
+                    check_array_extent(context, state, index, extent, fallback)?;
+                    if let Some(length) = extent.get_zero_extended_constant() {
+                        let crate::ScalarPlace::Name { span, .. } = base.as_ref() else {
+                            return Err("guarded runtime array index lacks its exact lexical base".into());
+                        };
+                        let layout = ScalarType::Array { element, length, length_span: *span, span: *span };
+                        return fixed_array_element_pointer(context, state, &layout, base_pointer, index, true);
+                    }
                 }
                 if let Some(extent) = runtime_extent {
                     check_release_index(state, index, extent)?;
@@ -436,6 +438,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     return Err("sealed returned array index lost its paired extent".into());
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
+                let index = if guarded_extent.is_some() { array_address_index(context, state, index)? } else { index };
                 return unsafe {
                     state.builder.build_in_bounds_gep(
                         element,
@@ -449,7 +452,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
             let checked = guarded_extent.is_some() || !fixed_index_has_raw_root(state, base);
             if checked {
-                check_fixed_index(context, state, index, guarded_extent.unwrap_or(length), fallback)?;
+                check_fixed_index(context, state, index, length, fallback)?;
             }
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
@@ -526,8 +529,8 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
     let Some((storage, ty @ ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
         return Ok(None);
     };
-    if let Some(extent) = ownership::guarded_array_extent(state, base, address, ty)? {
-        return Ok(Some(context.i64_type().const_int(extent, false)));
+    if let Some(extent) = ownership::guarded_array_extent(context, state, base, address, ty)? {
+        return Ok(Some(extent));
     }
     let Some((declaration, extent, checked_extent)) = state.local_runtime_extents.get(storage) else {
         // Incoming, forwarded and other unresolved extents use their existing path.
@@ -626,7 +629,20 @@ fn fixed_array_element_pointer<'ctx>(
     let array = storage_type(context, ty, state.layouts, state.target_layout)?;
     // The release helper and domain checks consume the full language-level
     // selector; target-width conversion belongs only at address construction.
-    let index = if state.target_layout == ScalarTargetLayout::WASM32
+    let index = array_address_index(context, state, index)?;
+    unsafe {
+        state.builder.build_in_bounds_gep(
+            array, base, &[context.i32_type().const_zero(), index], "array_element",
+        )
+    }
+    .map_err(builder_error)
+}
+
+fn array_address_index<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>,
+    index: inkwell::values::IntValue<'ctx>,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
+    if state.target_layout == ScalarTargetLayout::WASM32
         && index.get_type().get_bit_width() > 32
     {
         state
@@ -636,16 +652,10 @@ fn fixed_array_element_pointer<'ctx>(
                 pointer_integer_type(context, state.target_layout),
                 "array_address_index",
             )
-            .map_err(builder_error)?
+            .map_err(builder_error)
     } else {
-        index
-    };
-    unsafe {
-        state.builder.build_in_bounds_gep(
-            array, base, &[context.i32_type().const_zero(), index], "array_element",
-        )
+        Ok(index)
     }
-    .map_err(builder_error)
 }
 
 pub(super) fn checked_fixed_assignment_element_pointer<'ctx>(
@@ -692,10 +702,17 @@ fn check_fixed_index<'ctx>(
     length: u64,
     legacy_guard_labels: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
-    if index.get_zero_extended_constant().is_some_and(|index| index < length) {
-        return Ok(());
-    }
-    let count = context.i64_type().const_int(length, false);
+    check_array_extent(context, state, index, context.i64_type().const_int(length, false), legacy_guard_labels)
+}
+
+fn check_array_extent<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    index: inkwell::values::IntValue<'ctx>, count: inkwell::values::IntValue<'ctx>,
+    legacy_guard_labels: Option<(&str, &str, &str)>,
+) -> Result<(), String> {
+    if index.get_zero_extended_constant().zip(count.get_zero_extended_constant())
+        .is_some_and(|(index, count)| index < count)
+    { return Ok(()); }
     if state.project_names.and_then(|names| names.checked_access.as_ref()).is_some() {
         return check_release_index(state, index, count);
     }

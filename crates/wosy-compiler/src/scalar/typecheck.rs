@@ -6703,6 +6703,9 @@ fn pending_fallible_operator(
             if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
         (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
             if guarded_numeric_rhs(ty, expression) => None,
+        (ScalarType::RuntimeArray { element, .. }, ScalarExpression::Call { arguments, type_arguments, .. })
+            if super::reference::aggregate::ordinary_value(element) && type_arguments.is_empty()
+                && matches!(arguments.as_slice(), [ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }]) => None,
         (ScalarType::Array { element, length, .. }, ScalarExpression::ArrayLiteral { elements, .. })
             if matches!(element.as_ref(), ScalarType::U64 | ScalarType::I32)
                 && *length != 0 && *length == elements.len() as u64

@@ -1161,6 +1161,7 @@ struct GuardedScalarSite {
     scope: ByteSpan,
     ty: ScalarType,
     runtime_literal_length: Option<u64>,
+    runtime_returned: bool,
 }
 
 pub(super) struct GuardedScalarSites<'ctx> {
@@ -1193,6 +1194,7 @@ impl<'ctx> GuardedScalarSites<'ctx> {
             sites: proofs.iter().map(|proof| GuardedScalarSite {
                 scope: proof.binding().block_span, ty: proof.ty().clone(),
                 runtime_literal_length: proof.runtime_literal_length(),
+                runtime_returned: proof.runtime_returned(),
             }).collect(),
             declarations, conditions, aliases,
             active: vec![None; proofs.len()], lexical: Vec::new(),
@@ -1204,6 +1206,7 @@ impl<'ctx> GuardedScalarSites<'ctx> {
 struct GuardedScalarOwner<'ctx> {
     backing: PointerValue<'ctx>,
     present: inkwell::values::IntValue<'ctx>,
+    runtime_extent: Option<inkwell::values::IntValue<'ctx>>,
 }
 
 enum GuardedAggregateInitializer<'ctx, 'module> {
@@ -1230,6 +1233,24 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         || sites.active[index].is_some()
     {
         return Err("invalid guarded scalar allocation binding".into());
+    }
+    if sites.sites[index].runtime_returned {
+        let Some(BasicValueEnum::StructValue(result)) = value else { return Err("missing guarded owned array descriptor".into()); };
+        if result.get_type() != super::aggregate_transfer::array_descriptor_type(context)
+            || !state.aggregate.as_ref().is_some_and(|aggregate| state.body_call_nodes
+                .and_then(|nodes| nodes.expression_ordinal(&binding.value))
+                .is_some_and(|ordinal| aggregate.plan().array_descriptor_calls.contains(&ordinal)))
+        { return Err("invalid guarded owned array descriptor".into()); }
+        let backing = state.builder.build_extract_value(result, 0, "guarded_array_backing")
+            .map_err(builder_error)?.into_pointer_value();
+        let extent = state.builder.build_extract_value(result, 1, "guarded_array_extent")
+            .map_err(builder_error)?.into_int_value();
+        let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
+        state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+        let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
+        sites.active[index] = Some(GuardedScalarOwner { backing, present, runtime_extent: Some(extent) });
+        sites.lexical.push(index);
+        return Ok(());
     }
     let runtime_layout = match (&receiver.ty, sites.sites[index].runtime_literal_length) {
         (ScalarType::RuntimeArray { element, .. }, Some(length)) => {
@@ -1339,30 +1360,34 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     } else { (backing, present) };
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
     let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
-    sites.active[index] = Some(GuardedScalarOwner { backing, present });
+    sites.active[index] = Some(GuardedScalarOwner { backing, present, runtime_extent: None });
     sites.lexical.push(index);
     Ok(())
 }
 
-pub(super) fn guarded_array_extent(
-    state: &EmitState<'_, '_>,
+pub(super) fn guarded_array_extent<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
     base: &crate::ScalarPlace,
-    backing: PointerValue<'_>,
+    backing: PointerValue<'ctx>,
     ty: &ScalarType,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
     let Some(sites) = &state.guarded_scalar else { return Ok(None); };
     let Some(declaration) = state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base))
     else { return Ok(None); };
     let Some(&index) = sites.declarations.get(&(declaration.start, declaration.end)) else { return Ok(None); };
     let site = &sites.sites[index];
+    if !matches!(site.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }) { return Ok(None); }
+    let owner = sites.active[index].filter(|owner| owner.backing == backing && &site.ty == ty)
+        .ok_or("guarded array access lost its exact prepared owner")?;
     let extent = match &site.ty {
-        ScalarType::Array { length, .. } => *length,
-        ScalarType::RuntimeArray { .. } => site.runtime_literal_length.ok_or("missing guarded runtime extent")?,
-        _ => return Ok(None),
+        ScalarType::Array { length, .. } => context.i64_type().const_int(*length, false),
+        ScalarType::RuntimeArray { .. } if site.runtime_returned =>
+            owner.runtime_extent.ok_or("missing guarded returned array extent")?,
+        ScalarType::RuntimeArray { .. } => context.i64_type()
+            .const_int(site.runtime_literal_length.ok_or("missing guarded runtime literal extent")?, false),
+        _ => unreachable!("checked guarded array type"),
     };
-    if &site.ty != ty || !sites.active[index].is_some_and(|owner| owner.backing == backing) {
-        return Err("guarded array access lost its exact prepared owner".into());
-    }
     Ok(Some(extent))
 }
 
@@ -1464,8 +1489,9 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
         .get_insert_block()
         .and_then(|block| block.get_parent())
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
+    let guarded_array = state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf);
     let recover = relay_unwind.is_none()
-        && state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
+        && (guarded_array || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf));
     let integer = context.i64_type();
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
@@ -1511,7 +1537,8 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     )?;
     if recover {
         state.builder.position_at_end(allocation_failure);
-        let absent = sealed_absence_value(context, state)?;
+        let absent = if guarded_array { super::aggregate_transfer::array_descriptor_type(context).const_zero() }
+            else { sealed_absence_value(context, state)? };
         state.builder.build_return(Some(&absent)).map_err(builder_error)?;
     }
     if let Some(panic_block) = panic_block {

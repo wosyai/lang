@@ -42,9 +42,12 @@ pub(super) struct GuardedAllocationBinding {
     pub(super) ty: ScalarType,
     pub(super) whole_copy: bool,
     pub(super) runtime_literal_length: Option<u64>,
+    pub(super) runtime_returned: bool,
 }
 
 impl GuardedAllocationBinding {
+    pub(super) fn has_indexed_extent(&self) -> bool { self.runtime_returned || self.indexed_extent().is_some() }
+    pub(super) fn has_runtime_extent(&self) -> bool { self.runtime_returned || self.runtime_literal_length.is_some() }
     pub(super) fn indexed_extent(&self) -> Option<u64> {
         match &self.ty {
             ScalarType::Array { length, .. } => Some(*length),
