@@ -10,7 +10,7 @@ pub(super) struct Plan {
     goal: SourceSpan,
     amount: BigInt,
     references: std::cell::OnceCell<super::super::reference::ProjectReferenceResults>,
-    applied: std::cell::Cell<bool>,
+    applied: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 pub(super) struct LocalTransition {
@@ -71,7 +71,7 @@ impl Plan {
         if !integer_literal_fits_type(amount, inner) { return Err(ProjectCheck::InvalidProof); }
         let at = |node| SourceSpan::new(source.clone(), wosy_syntax::byte_span(node));
         Ok(Self { target: (selected.function.0, selected.function.1), proof: at(declaration), goal: at(&goal), amount: amount.clone(),
-            references: std::cell::OnceCell::new(), applied: std::cell::Cell::new(false) })
+            references: std::cell::OnceCell::new(), applied: std::cell::Cell::new(None) })
     }
 
     fn references(
@@ -123,7 +123,7 @@ impl ActualIntegerObserver for &Plan {
         source: &SourceIdentity, runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<LocalTransition>, ProjectCheck> {
         if target != self.target { return Ok(None); }
-        if self.applied.get() || &self.proof.source != source
+        if &self.proof.source != source
             || !matches!(runtime.visits, Some([InitializationVisit::Started]))
         {
             return Err(ProjectCheck::Unsupported);
@@ -135,11 +135,20 @@ impl ActualIntegerObserver for &Plan {
             std::ptr::eq(body, runtime.calls.function_body(target.0, item, None)?).then_some(item)
         }).ok_or(ProjectCheck::Unsupported)?;
         let receipt = references.pointer_caller_effect(
-            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &self.amount,
+            &runtime.project.modules, runtime.calls, target.0, caller, target.1, &self.amount, Some(occurrence),
         ).ok_or(ProjectCheck::Unsupported)?;
         let call = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
         if &receipt.call().source != source || receipt.call().range != call { return Err(ProjectCheck::Unsupported); }
-        self.applied.set(true);
+        // The receipt is immutable, but only the next real occurrence on
+        // this exact caller frame may consume it. A second activation starts
+        // with position zero and cannot borrow the previous epoch.
+        let expected = match self.applied.get() {
+            None => 0,
+            Some((owner, next)) if owner == caller => next,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        if receipt.position() != expected { return Err(ProjectCheck::Unsupported); }
+        self.applied.set(Some((caller, expected.checked_add(1).ok_or(ProjectCheck::Unsupported)?)));
         Ok(Some(LocalTransition {
             binding: receipt.place().binding.clone(), ty: receipt.width().clone(),
             entry: receipt.entry().clone(), exit: receipt.exit().clone(),
@@ -153,8 +162,8 @@ impl OrderedRunEvidence for &Plan {
     const HAS_NAMED_ROOT: bool = true;
 
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
-        if reached.contains(&self.target) != self.applied.get() { return Err(ProjectCheck::Unsupported); }
-        Ok(self.applied.get())
+        if reached.contains(&self.target) != self.applied.get().is_some() { return Err(ProjectCheck::Unsupported); }
+        Ok(self.applied.get().is_some())
     }
     fn symbolic(&self) -> Root<'_> { Root { plan: self, diagnostic: None } }
     fn finish_symbolic<'run>(root: Root<'run>) -> Self::SymbolicReport where Self: 'run { root.diagnostic }
@@ -243,6 +252,22 @@ mod tests {
                 assert_eq!(&stale[failed.condition.start as usize..failed.condition.end as usize], "local == 0");
                 let two = BigInt::from(2);
                 assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&two, &two)]));
+
+                let repeated = ordered.replace("increment(&!local);", "increment(&!local); increment(&!local);")
+                    .replace("local == 2", "local == 5");
+                let approved = run(&repeated, scope).unwrap();
+                assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+                let first_exit = repeated.replace("local == 5", "local == 2");
+                let refuted = run(&first_exit, scope).unwrap();
+                let [failed] = refuted.directives.as_slice() else { panic!("second exact call exit"); };
+                let five = BigInt::from(5);
+                assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&five, &five)]));
+                for excluded in [
+                    repeated.replace("increment(&!local); increment", "increment(&!local); local = 9; increment"),
+                    repeated.replace("            start();", "            start(); start();"),
+                ] {
+                    assert!(run(&excluded, scope).is_err(), "{excluded}");
+                }
 
                 let old = program.replace("core.require(local == 0", "core.require(local == 4294967295");
                 let witnessed = run(&old, scope).unwrap();

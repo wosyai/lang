@@ -382,7 +382,7 @@ impl<'a> ScalarBuildValidation<'a> {
         &self, module: usize, caller: usize, callee: usize, claimed: &BigInt,
     ) -> Option<reference::pointer_call::CallerPointeeEffect<'_>> {
         self.results.pointer_caller_effect(&self.prepared.project.modules, &self.prepared.calls,
-            module, caller, callee, claimed)
+            module, caller, callee, claimed, None)
     }
 
     #[cfg(any(test, feature = "internal-checker"))]

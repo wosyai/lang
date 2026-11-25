@@ -10791,7 +10791,7 @@ impl ProjectReferenceResults {
     #[allow(dead_code)]
     pub(super) fn pointer_caller_effect<'a>(
         &'a self, modules: &'a [ScalarModule], calls: &'a ProjectCallSiteResults,
-        module: usize, caller: usize, callee: usize, claimed: &BigInt,
+        module: usize, caller: usize, callee: usize, claimed: &BigInt, wanted: Option<OccurrenceOrdinal>,
     ) -> Option<pointer_call::CallerPointeeEffect<'a>> {
         let update = self.pointer_entry_wrapping_write(modules, calls, module, callee)?;
         let owner = modules.get(module)?;
@@ -10800,7 +10800,7 @@ impl ProjectReferenceResults {
         let body = calls.function_body(module, caller, None)?;
         let result = self.function_result(module, caller, None)?;
         pointer_call::checked(&owner.source, declaration.name_span, function, body, &result.cfg,
-            &result.proof_points, update, claimed)
+            &result.proof_points, update, claimed, wanted)
     }
 
     pub(super) fn callable_point_facts(
