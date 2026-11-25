@@ -5005,13 +5005,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
     }
 
     fn returned_array_index_selector_syntax(index: &ScalarExpression) -> bool {
-        match index {
-            ScalarExpression::Integer { .. } => true,
-            ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } =>
-                matches!(left.as_ref(), ScalarExpression::Integer { .. })
-                    || matches!(right.as_ref(), ScalarExpression::Integer { .. }),
-            _ => false,
-        }
+        matches!(index,
+            ScalarExpression::Integer { .. } | ScalarExpression::Name { .. } |
+            ScalarExpression::Binary { operator: BinaryOperator::Add | BinaryOperator::Subtract
+                | BinaryOperator::Multiply | BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor, .. })
     }
 
     fn names_literal_array_owner_at_index(&self, read: CfgPointId) -> bool {
@@ -5039,6 +5036,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let CfgPointKind::ReadPlace { candidates, .. } = &self.cfg.points.get(read.0)?.kind else { return None; };
         let [owner] = candidates.as_slice() else { return None; };
         let (first, upper_bound) = match index.as_ref() {
+            ScalarExpression::Name { .. } => {
+                let formal = self.literal_array_formal_binding(selector, &ScalarType::U64)?;
+                let first = CfgPointId(read.0.checked_sub(1)?);
+                if !matches!(&self.cfg.points.get(first.0)?.kind,
+                    CfgPointKind::Read { binding } if binding == formal)
+                {
+                    return None;
+                }
+                (first, None)
+            }
             ScalarExpression::Integer { value, .. } => {
                 let first = CfgPointId(read.0.checked_sub(1)?);
                 if !matches!(&self.cfg.points.get(first.0)?.kind,
@@ -5046,20 +5053,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 {
                     return None;
                 }
-                (first, u64::try_from(value.clone()).ok()?)
+                (first, Some(u64::try_from(value.clone()).ok()?))
             }
-            ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } => {
+            ScalarExpression::Binary { operator, left, right, .. } => {
                 use OccurrenceEdge::*;
-                let mask = match (left.as_ref(), right.as_ref()) {
-                    (ScalarExpression::Integer { value, .. }, _)
-                    | (_, ScalarExpression::Integer { value, .. }) => u64::try_from(value.clone()).ok()?,
-                    _ => return None,
-                };
-                // The final mask bounds the computed selector for offset
-                // representability, not for the actual installed array extent.
+                let mask = if *operator == BinaryOperator::BitAnd {
+                    match (left.as_ref(), right.as_ref()) {
+                        (ScalarExpression::Integer { value, .. }, _)
+                        | (_, ScalarExpression::Integer { value, .. }) =>
+                            Some(u64::try_from(value.clone()).ok()?),
+                        _ => None,
+                    }
+                } else { None };
                 // Pair every operand with its already-checked CFG event in
-                // reverse evaluation order. No calls or storage projections
-                // are admitted here.
+                // reverse evaluation order. Only the final literal mask
+                // supplies a signed upper bound; no calls or storage
+                // projections are admitted here.
                 let mut next = read.0;
                 let mut pending = vec![(selector, index.as_ref())];
                 while let Some((ordinal, operand)) = pending.pop() {

@@ -485,7 +485,13 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     return Err("signed element offset differs from its checked selector or current owner pair".into());
                 }
             }
-            let signed_selector_maximum = runtime_offset.map(|receipt| receipt.upper_bound);
+            let signed_selector_maximum = runtime_offset.and_then(|receipt| match receipt.address {
+                crate::scalar::ReturnedArrayAddress::Signed(maximum) => Some(maximum),
+                crate::scalar::ReturnedArrayAddress::PortableDefault => None,
+            });
+            let portable_wasm_offset = state.target_layout == ScalarTargetLayout::WASM32
+                && runtime_offset.is_some_and(|receipt|
+                    receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault);
             let index = emit_place_index(context, state, index, project)?;
             if signed_selector_maximum.zip(index.get_zero_extended_constant())
                 .is_some_and(|(maximum, index)| index > maximum)
@@ -513,9 +519,18 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     }
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
-                let index = if guarded_extent.is_some() || checked_lexical_descriptor || borrowed_extent.is_some() {
+                let index = if guarded_extent.is_some() || checked_lexical_descriptor
+                    || borrowed_extent.is_some() || portable_wasm_offset
+                {
                     array_address_index(context, state, index)?
                 } else { index };
+                if portable_wasm_offset {
+                    // The paired standard allocation and checked index give
+                    // a valid unsigned byte range. The typed GEP keeps pointer
+                    // derivation but makes no signed wasm32 offset promise.
+                    return unsafe { state.builder.build_gep(element, base_pointer, &[index], "array_element") }
+                        .map_err(builder_error);
+                }
                 return unsafe {
                     state.builder.build_in_bounds_gep(
                         element,

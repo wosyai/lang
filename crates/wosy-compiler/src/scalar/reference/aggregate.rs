@@ -684,17 +684,26 @@ pub(super) struct ReturnedArrayIndex {
     pub(super) place: OccurrenceOrdinal,
     pub(super) selector: OccurrenceOrdinal,
     pub(super) owner: ByteSpan,
-    pub(super) upper_bound: u64,
+    pub(super) upper_bound: Option<u64>,
 }
 
 #[derive(Debug)]
-pub(crate) struct SignedElementOffset {
+pub(crate) struct ClosedReturnedArrayIndex {
     pub(crate) place: usize,
     pub(crate) selector: usize,
     pub(crate) owner: ByteSpan,
-    pub(crate) upper_bound: u64,
+    pub(crate) address: ReturnedArrayAddress,
     pub(crate) target: ScalarTargetLayout,
     pub(crate) element: ScalarType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReturnedArrayAddress {
+    Signed(u64),
+    // The sealed default allocator result covers count * stride bytes.
+    // The independently retained full-width bounds check authorizes the
+    // access; Wasm's address formation must not promise signed arithmetic.
+    PortableDefault,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -3107,7 +3116,7 @@ pub(crate) struct ClosedBody {
     pub(crate) widened_owning_receives: BTreeMap<usize, (ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(crate) widened_owning_roundtrip: Option<(usize, CfgPointId, ByteSpan)>,
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
-    pub(crate) replacement_index_observation: Option<SignedElementOffset>,
+    pub(crate) replacement_index_observation: Option<ClosedReturnedArrayIndex>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     pub(crate) ordinary_array_descriptor_receivers: BTreeMap<usize, ByteSpan>,
     pub(crate) ordinary_array_descriptor_replacements: BTreeSet<usize>,
@@ -8021,9 +8030,17 @@ fn closed_aggregates<'a>(
             let receipt = (|| {
                 let element = body.sites.structure.checked_types.expressions.get(&index.output)?;
                 let target = reservations.target_layout?;
-                returned_array_index_fits_offset(index.upper_bound, element, target).then(|| SignedElementOffset {
+                let address = match index.upper_bound {
+                    Some(maximum) if returned_array_index_fits_offset(maximum, element, target) =>
+                        ReturnedArrayAddress::Signed(maximum),
+                    None if ordinary_value(element)
+                        && matches!(target, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) =>
+                        ReturnedArrayAddress::PortableDefault,
+                    _ => return None,
+                };
+                Some(ClosedReturnedArrayIndex {
                     place: index.place.0, selector: index.selector.0, owner: index.owner,
-                    upper_bound: index.upper_bound, target, element: element.clone(),
+                    address, target, element: element.clone(),
                 })
             })().ok_or_else(|| format!("returned array index byte offset is not representable in {source:?}"))?;
             let Some(plan) = result.bodies.get_mut(&key).filter(|plan|

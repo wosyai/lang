@@ -3893,7 +3893,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent};
+pub(crate) use reference::aggregate::{mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,

@@ -11383,7 +11383,8 @@ if (replace(7)");
             let replace = prepared.project().modules[0].items.iter().position(|item|
                 matches!(item, ScalarItem::Function(function) if function.name == "replace")).unwrap();
             let receipt = plans.body(0, replace, None).unwrap().replacement_index_observation.as_ref().unwrap();
-            assert_eq!((receipt.target, &receipt.element, receipt.upper_bound), (layout, &ScalarType::U8, 3));
+            assert_eq!((receipt.target, &receipt.element, receipt.address),
+                (layout, &ScalarType::U8, crate::scalar::ReturnedArrayAddress::Signed(3)));
             assert_eq!(receipt.owner.start as usize, text.find("u8[2] bytes").unwrap() + "u8[2] ".len());
             let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, "replace"));
             let extent = body.find("%runtime_extent = load i64, ptr %bytes_length").expect("paired extent");
@@ -17063,6 +17064,67 @@ if (update(42) != 51 || read(19) != 19) { core.system_panic(); };
             assert!(diagnostics.iter().any(|diagnostic| diagnostic.message == reason
                 && (test != &overlap || diagnostic.labels.iter().any(|label|
                     label.message == "origin of conflicting place or loan"))), "{diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn portable_returned_array_index_uses_checked_count_and_unsigned_wasm_address() {
+    let text = "%%start
+u16[](u64) fabricate = fn(count) { u16[count] fresh; fresh };
+u16(u64) replace = fn(count) {
+    u16[2] cells;
+    cells = fabricate(count);
+    cells[count ^ 1]
+};
+if (replace(7) != 37) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, "replace"));
+        let extent = body.find("%runtime_extent = load i64, ptr %cells_length").unwrap();
+        let backing = body.lines().find(|line| line.contains(" = load ptr, ptr %cells_backing,")).unwrap();
+        let base = backing.trim().split_once(" = ").unwrap().0;
+        let installed = body.find("store i64 %array_descriptor_extent, ptr %cells_length").unwrap();
+        let selector = body.lines().find(|line| line.contains(" = xor i64 ") && line.ends_with(", 1")).unwrap();
+        let full_index = selector.trim().split_once(" = ").unwrap().0;
+        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+        let check = format!("call void @{helper}(i64 {full_index}, i64 %runtime_extent)");
+        assert_eq!(body.matches(&check).count(), 1, "{body}");
+        assert!(installed < extent && extent < body.find(selector).unwrap() && body.find(selector).unwrap() < body.find(&check).unwrap(), "{body}");
+        let address = if layout == ScalarTargetLayout::WASM32 {
+            let narrow = format!("trunc i64 {full_index} to i32");
+            let truncate = body.lines().find(|line| line.contains(&narrow)).unwrap();
+            let index = truncate.trim().split_once(" = ").unwrap().0;
+            let address = format!("getelementptr i16, ptr {base}, i32 {index}");
+            assert!(!body.contains("getelementptr inbounds i16") && body.find(&check).unwrap() < body.find(&narrow).unwrap(), "{body}");
+            assert!(body.find(&narrow).unwrap() < body.find(&address).unwrap(), "{body}");
+            address
+        } else {
+            format!("getelementptr inbounds i16, ptr {base}, i64 {full_index}")
+        };
+        assert!(body.find(&check).unwrap() < body.find(&address).unwrap(), "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 2, "{body}");
+        let factory_symbol = project_function_name(&source, "fabricate");
+        let factory = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{factory_symbol}(")).unwrap().1
+            .split_once("\n}").unwrap().0;
+        assert!(factory.lines().any(|line| line.contains("icmp ugt i64") && line.ends_with(", 9223372036854775807")), "{factory}");
+        assert!(!factory.contains(", 1073741823"), "{factory}");
+        if let Some(out) = std::env::var_os("WOSY_PORTABLE_RETURNED_ARRAY_INDEX_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
         }
     }
 }
