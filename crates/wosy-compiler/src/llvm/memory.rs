@@ -406,9 +406,14 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     else { return Err("private runtime index lost its exact dereferenced formal".into()); };
                 if !state.require_release_checked_access
                     || nodes.lexical_expression_declaration(pointer) != aggregate.plan().private_runtime_access_formal
-                    || signed_runtime_scalar_element(element).is_none()
-                {
-                    return Err("private runtime index changed its prepared formal or scalar element".into());
+                { return Err("private runtime index changed its prepared formal".into()); }
+                if let ScalarType::Struct(id) = element.as_ref() {
+                    if portable_formal || aggregate.plan().private_runtime_copy_fields.is_empty() {
+                        return Err("private runtime Copy index lacks its signed field plan".into());
+                    }
+                    private_runtime_copy_row(state, id)?;
+                } else if signed_runtime_scalar_element(element).is_none() {
+                    return Err("private runtime index changed its prepared scalar element".into());
                 }
                 Some(aggregate.private_runtime_access_pair.ok_or("missing authenticated private runtime array formal")?)
             } else { None };
@@ -628,8 +633,23 @@ fn require_runtime_field_extent(
 ) -> Result<(), String> {
     if !state.require_release_checked_access { return Ok(()); }
     let ScalarPlace::Index { base: owner, index, .. } = base else { return Ok(()); };
-    let ScalarPlace::Name { name, .. } = owner.as_ref() else { return Ok(()); };
     let nodes = state.body_call_nodes;
+    if let ScalarPlace::Dereference { .. } = owner.as_ref() {
+        let Some(ScalarType::RuntimeArray { element, .. }) = nodes.and_then(|nodes| nodes.checked_place_type(owner))
+            else { return Ok(()); };
+        let ScalarType::Struct(id) = element.as_ref() else { return Ok(()); };
+        let nodes = nodes.ok_or("private runtime Copy field lacks prepared places")?;
+        let (leaf, prefix) = nodes.place_ordinal(leaf).zip(nodes.place_ordinal(base)).ok_or("private runtime Copy field lacks exact projection")?;
+        let plan = state.aggregate.as_ref().ok_or("runtime Copy field lacks its private formal plan")?.plan();
+        if plan.private_runtime_copy_fields.get(&leaf) != Some(&(prefix, field.clone()))
+            || &field.structure != id || !plan.private_runtime_reads.contains(&prefix)
+            || nodes.checked_expression_type(index) != Some(&ScalarType::U64)
+            || !matches!(nodes.checked_place_type(base), Some(ScalarType::Struct(actual)) if actual == id)
+        { return Err("runtime Copy field changed its private formal projection".into()); }
+        private_runtime_copy_row(state, id)?;
+        return require_runtime_copy_field_geometry(state, field);
+    }
+    let ScalarPlace::Name { name, .. } = owner.as_ref() else { return Ok(()); };
     let storage = state.storage.get(name);
     let runtime_struct = |ty: &ScalarType| matches!(ty, ScalarType::RuntimeArray { element, .. }
         if matches!(element.as_ref(), ScalarType::Struct(_)));
@@ -654,8 +674,20 @@ fn require_runtime_field_extent(
     if *owner != site.owner.declaration_span || state.runtime_array_allocations.get(name) != Some(&true)
         || !domain.matches_consumer(state.target_layout, element)
     { return Err("runtime field changed its original construction domain".into()); }
+    require_runtime_copy_field_geometry(state, field)
+}
+
+pub(super) fn private_runtime_copy_row(state: &EmitState<'_, '_>, id: &crate::ScalarStructId) -> Result<(), String> {
+    let row = state.layouts.aggregate(id).ok_or("private runtime Copy array lacks its registered row")?;
+    if row.target != state.target_layout
+        || row.layout.as_ref().is_none_or(|layout| layout.size == 0 || u32::try_from(layout.size).is_err())
+    { return Err("private runtime Copy array lost its exact signed row geometry".into()); }
+    Ok(())
+}
+
+fn require_runtime_copy_field_geometry(state: &EmitState<'_, '_>, field: &crate::ScalarStructFieldId) -> Result<(), String> {
     // Allocation and index GEP already use this same indexed target layout.
-    let layout = state.layouts.aggregate(id).ok_or("runtime field lost its registered layout")?;
+    let layout = state.layouts.aggregate(&field.structure).ok_or("runtime field lost its registered layout")?;
     let row = layout.layout.as_ref().ok_or("runtime field has no registered stride")?;
     let field_layout = layout.fields.get(field.index).ok_or("runtime field has no registered member layout")?;
     let (Some(offset), Some(member)) = (field_layout.offset, field_layout.layout.as_ref())

@@ -2564,7 +2564,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } if signature.is_some_and(|signature|
                         match argument_points.as_slice() {
                             [borrow, _] => self.borrowed_extent_argument(*borrow, 0).is_some()
-                                && aggregate::private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs),
+                                && (aggregate::private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
+                                    || aggregate::private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)),
                             [borrow, _, _] => self.exact_runtime_exclusive_argument(*borrow)
                                 && aggregate::private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs),
                             _ => false,
@@ -3896,6 +3897,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ScalarType::CheckedReference { .. }
             ),
         };
+        let projected = match place {
+            ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. }
+                if matches!(base.as_ref(), ScalarPlace::Index { .. }) => Some((base.as_ref(), field)),
+            _ => None,
+        };
+        // Cache only actual resolved field candidates before taking the
+        // immutable pointer-type view needed by the existing read solver.
+        let projected_copy = projected.filter(|_| matches!(root, ScalarPlace::Dereference { .. }))
+            .is_some_and(|(_, field)| *self.copy_runtime_field_structs.get_or_insert_with(HashMap::new)
+                .entry(field.structure.clone()).or_insert_with(|| self.structs.iter().any(|item|
+                    item.id == field.structure && item.copy_policy == CopyPolicy::Copy)));
         let pointer_type = if let ScalarPlace::Dereference { pointer, .. } = root {
             if prepared {
                 self.prepared_read_pointer_type(canonical_root.as_ref().unwrap(), pointer)?
@@ -3910,30 +3922,53 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let mut runtime_read = None;
         let mut runtime_exclusive_read = None;
         if let (ScalarPlace::Index { base, .. }, Some(ScalarType::CheckedReference { inner, mutability })) =
-            (place, pointer_type)
+            (projected.map_or(place, |(prefix, _)| prefix), pointer_type)
         {
             if let ScalarType::RuntimeArray { element, .. } = inner.as_ref() {
                 let eligible = (|| {
                     let CheckedReadSource::Place(access) = source else { return None };
                     if *mutability == ScalarReferenceMutability::Mutable {
-                        if prepared && aggregate::ordinary_value(element)
+                        if projected.is_none() && prepared && aggregate::ordinary_value(element)
                             && self.local_runtime_exclusive_place(place, access).is_some()
                         {
                             runtime_exclusive_read = Some(access);
-                            return Some((access, None));
+                            return Some((access, None, None));
                         }
                         return None;
                     }
-                    if !prepared || *mutability != ScalarReferenceMutability::Shared
-                        || !aggregate::ordinary_value(element)
-                    { return None; }
+                    if !prepared || *mutability != ScalarReferenceMutability::Shared { return None; }
                     let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
-                    if super::immediate_shared_array_place(base).is_some() { return Some((access, None)); }
+                    let field = if let Some((_, field)) = projected {
+                        let ScalarType::Struct(id) = element.as_ref() else { return None; };
+                        if id != &field.structure { return None; }
+                        let prefix = self.place_ordinal(OccurrenceParent::Place(access), OccurrenceEdge::PlaceBase);
+                        let selector = self.expression_ordinal(OccurrenceParent::Place(prefix), OccurrenceEdge::PlaceIndex);
+                        let types = &self.call_sites.structure.checked_types;
+                        if !matches!(self.call_sites.boundary.parameters.as_slice(), [_, selector] if selector.ty == ScalarType::U64)
+                            || !matches!(self.call_sites.boundary.results.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
+                            || !matches!(types.places.get(&prefix), Some(ScalarType::Struct(actual)) if actual == id)
+                            || !types.places.get(&access).is_some_and(aggregate::ordinary_value)
+                            || types.expressions.get(&selector) != Some(&ScalarType::U64)
+                        { return None; }
+                        if !projected_copy { return None; }
+                        Some((prefix, field.clone()))
+                    } else {
+                        if !aggregate::ordinary_value(element) { return None; }
+                        if super::immediate_shared_array_place(base).is_some() { return Some((access, None, None)); }
+                        None
+                    };
                     let ScalarExpression::Name { .. } = pointer.as_ref() else { return None; };
                     let pointer = self.expression_ordinal(OccurrenceParent::Place(canonical_root.as_ref()?.ordinal),
                         OccurrenceEdge::DereferencePointer);
                     match self.call_sites.prepared_plain_name(pointer)? {
-                        PlainNameIdentity::Lexical(handle) => Some((access, Some(handle.declaration_span))),
+                        PlainNameIdentity::Lexical(handle) => {
+                            if field.is_some() && self.call_sites.boundary.parameters.first()
+                                .is_none_or(|slot| slot.span != handle.declaration_span)
+                            { None }
+                            else if let Some((prefix, field)) = field {
+                                Some((prefix, Some(handle.declaration_span), Some((access.0, field))))
+                            } else { Some((access, Some(handle.declaration_span), None)) }
+                        },
                         _ => None,
                     }
                 })();
@@ -4022,9 +4057,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent))?;
             self.cfg.runtime_array_exclusive_sites.insert(point, site);
         }
-        if let Some((access, handle)) = runtime_read {
+        if let Some((access, handle, field)) = runtime_read {
             self.cfg.runtime_array_read_sites.insert(point, RuntimeArrayReadSite {
-                occurrence: access.0, handle, origin: RuntimeArrayReadOrigin::Unseen,
+                occurrence: access.0, handle, field, origin: RuntimeArrayReadOrigin::Unseen,
             });
         }
 

@@ -6255,6 +6255,15 @@ pub(super) fn place_type_in_module(
     ty
 }
 
+pub(super) fn indexed_read_prefix_type_in_module(
+    place: &ScalarPlace, scope: &BTreeMap<String, ScalarType>, module: &ScalarModuleTyping<'_>,
+    modules: &[ScalarModuleTyping<'_>], unsafe_context: bool,
+    overloads: &ScalarTypingView<'_>, inference: &mut ScalarInferenceBuilder<'_>,
+) -> ScalarType {
+    check_place_type_in_module(place, scope, module, modules, &mut Vec::new(), overloads, inference,
+        PlaceTypeMode::IndexedRead { unsafe_context })
+}
+
 fn check_place_type_in_module(
     place: &ScalarPlace,
     scope: &BTreeMap<String, ScalarType>,

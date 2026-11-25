@@ -376,6 +376,13 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     if nodes.lexical_place_declaration(place) != Some(declaration) {
         return Err("private runtime array call changed its exact owner".into());
     }
+    let copy_field = matches!(element.as_ref(), ScalarType::Struct(_));
+    if copy_field && (portable || *mutability != crate::scalar::ScalarReferenceMutability::Shared
+        || !matches!(nodes.checked_place_type(place), Some(ScalarType::RuntimeArray { element: actual, .. }) if actual == element))
+    { return Err("private runtime Copy field lost its signed original layout".into()); }
+    if let ScalarType::Struct(id) = element.as_ref() {
+        memory::private_runtime_copy_row(state, id)?;
+    }
     let pointer = memory::place_pointer(context, state, place, project)?;
     let Some(&(owner, extent, true)) = state.local_runtime_extents.get(&pointer)
         else { return Err("private runtime array call lacks its original checked backing and extent".into()); };
@@ -407,7 +414,8 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
             function_type.get_param_types().as_slice()
                 == [descriptor.into(), context.i64_type().into(), basic_type(context, element, state.target_layout)?.into()]
                 && function_type.get_return_type().is_none()
-        } else if !mutable && crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs) {
+        } else if !mutable && (crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs)
+            || crate::scalar::private_runtime_copy_read_signature(parameters, &outputs.outputs)) {
             function_type.get_param_types().as_slice() == [descriptor.into(), context.i64_type().into()]
                 && function_type.get_return_type() == Some(basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
         } else { false };
@@ -803,9 +811,11 @@ pub(super) fn definition_type<'ctx>(
             return Ok(context.void_type().fn_type(&[borrowed_extent_type(context, layout).into(),
                 context.i64_type().into(), basic_type(context, &parameters[2], layout)?.into()], false));
         }
-        if !crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs) {
-            return Err("private runtime array accessor changed its prepared signature".into());
-        }
+        if !(crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs)
+            || (crate::scalar::private_runtime_copy_read_signature(parameters, &outputs.outputs)
+                && plan.is_some_and(|body| !body.private_runtime_copy_fields.is_empty() && body.private_runtime_writes.is_empty()
+                    && body.private_runtime_read_forward.is_none() && !body.private_runtime_portable_formal)))
+        { return Err("private runtime array accessor changed its prepared signature".into()); }
         return Ok(basic_type(context, &outputs.outputs[0].ty, layout)?
             .fn_type(&[borrowed_extent_type(context, layout).into(), context.i64_type().into()], false));
     }

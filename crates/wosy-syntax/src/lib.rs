@@ -954,7 +954,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
         Rule::parenthesized_dereference_place => SyntaxKind::ParenthesizedDereferencePlace,
-        Rule::indexed_place | Rule::indexed_value_place | Rule::indexed_dereference_place | Rule::checked_indexed_field_place => SyntaxKind::IndexedPlace,
+        Rule::indexed_place | Rule::indexed_value_place | Rule::indexed_dereference_place | Rule::checked_indexed_field_place
+        | Rule::indexed_dereferenced_field_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
         Rule::index_field_suffix => SyntaxKind::IndexFieldSuffix,
         Rule::direct_field_chain_tail => SyntaxKind::DirectFieldChainTail,

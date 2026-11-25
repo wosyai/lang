@@ -1734,6 +1734,12 @@ fn resolve_module_place(
                         _ => ScalarType::Error,
                     }
                 }
+                ScalarPlace::Index { base: owner, .. } if matches!(owner.as_ref(), ScalarPlace::Dereference { .. }) => {
+                    let mut scratch = ScalarInferenceBuilder::new(owners);
+                    super::typecheck::indexed_read_prefix_type_in_module(
+                        base, scope, module, modules, unsafe_context, overloads, &mut scratch,
+                    )
+                }
                 ScalarPlace::Name { .. }
                 | ScalarPlace::Field { .. }
                 | ScalarPlace::Index { .. } => {

@@ -3115,6 +3115,7 @@ pub(crate) struct ClosedBody {
     pub(crate) private_runtime_access_formal: Option<ByteSpan>,
     pub(crate) private_runtime_read_forward: Option<usize>,
     pub(crate) private_runtime_reads: HashSet<usize>,
+    pub(crate) private_runtime_copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     pub(crate) private_runtime_writes: HashSet<usize>,
     pub(crate) private_runtime_access_calls: HashMap<usize, PrivateRuntimePairCall>,
     pub(crate) private_runtime_access_relay_target: Option<BodyKey>,
@@ -9355,6 +9356,7 @@ struct PrivateRuntimeReadPlan {
     formal: Option<ByteSpan>,
     forward: Option<usize>,
     accesses: HashSet<usize>,
+    copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     writes: HashSet<usize>,
     calls: HashMap<usize, PrivateRuntimePairCall>,
     relay_target: Option<BodyKey>,
@@ -9414,6 +9416,7 @@ impl ClosedAggregates {
             body.private_runtime_access_formal = plan.formal;
             body.private_runtime_read_forward = plan.forward;
             body.private_runtime_reads.clone_from(&plan.accesses);
+            body.private_runtime_copy_fields.clone_from(&plan.copy_fields);
             body.private_runtime_writes.clone_from(&plan.writes);
             body.private_runtime_access_calls.clone_from(&plan.calls);
             body.private_runtime_access_relay_target = plan.relay_target;
@@ -9429,6 +9432,16 @@ pub(crate) fn private_runtime_read_signature(parameters: &[ScalarType], outputs:
         mutability: ScalarReferenceMutability::Shared, inner,
     }, ScalarType::U64] if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
         if ordinary_value(element)))
+        && matches!(outputs, [output] if ordinary_value(&output.ty))
+}
+
+/// Shape only. Authorization requires the distinct exact field and Copy
+/// layout receipts plus a closed, original-owner caller cohort.
+pub(crate) fn private_runtime_copy_read_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
+    matches!(parameters, [ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Shared, inner,
+    }, ScalarType::U64] if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+        if matches!(element.as_ref(), ScalarType::Struct(_))))
         && matches!(outputs, [output] if ordinary_value(&output.ty))
 }
 
@@ -9474,7 +9487,8 @@ pub(super) fn private_runtime_read_declaration(function: &ScalarFunction) -> boo
     function.generic_parameters.is_empty() && function.overload_arms.is_empty()
         && crate::scalar::typecheck::is_module_private_name(&function.name)
         && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
-            if private_runtime_read_signature(parameters, &outputs.outputs))
+            if private_runtime_read_signature(parameters, &outputs.outputs)
+                || (!function.body.unsafe_context && private_runtime_copy_read_signature(parameters, &outputs.outputs)))
 }
 
 #[derive(Clone, Copy)]
@@ -9704,9 +9718,19 @@ impl ProjectReferenceResults {
                 let ordinal = OccurrenceOrdinal(occurrence);
                 let signature = sites.checked_call_signatures.get(&ordinal)?;
                 let mutable = matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
+                let copy_fields = private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs);
+                // The callee's exact field receipt already authenticated Copy.
+                // The declaration, actual and formal must share the same
+                // authored module and exact type identity below.
+                if copy_fields && caller.0 != target.0 { return None; }
                 let mode = if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared };
-                let matches_signature = if mutable { private_runtime_write_signature } else { private_runtime_read_signature };
-                if !matches_signature(&signature.parameters, &signature.outputs.outputs)
+                let exact_signature = if mutable {
+                    private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs)
+                } else {
+                    private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
+                        || private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)
+                };
+                if !exact_signature
                     || !signature.parameters.iter().map(scalar_type_identity).eq(target_parameters.iter().map(scalar_type_identity))
                     || !signature.outputs.outputs.iter().map(|output| &output.ty).eq(target_outputs.outputs.iter().map(|output| &output.ty))
                 { return None; }
@@ -9764,7 +9788,7 @@ impl ProjectReferenceResults {
                     }
                     remaining
                 });
-                if mutable {
+                if mutable || copy_fields {
                     let facts = self.callable_point_facts(caller.0, caller.1, caller.2)?;
                     let (unknown, exposed) = raw_exposures.entry(caller).or_insert_with(|| {
                         let mut unknown = false;
@@ -9812,7 +9836,13 @@ impl ProjectReferenceResults {
             match routes[&target] {
                 PrivateRuntimeAccessRoute::Read(formal) => {
                     plan.formal = Some(formal);
-                    plan.accesses.extend(pending[&target].iter().map(|(_, access, _, _)| *access));
+                    let cfg = self.reference_cfg(target.0, target.1, target.2).expect("closed private runtime body");
+                    for (point, access, _, _) in &pending[&target] {
+                        plan.accesses.insert(*access);
+                        if let Some((leaf, field)) = cfg.runtime_array_read_sites[point].field.as_ref() {
+                            plan.copy_fields.insert(*leaf, (*access, field.clone()));
+                        }
+                    }
                 }
                 PrivateRuntimeAccessRoute::Write(formal) => {
                     plan.formal = Some(formal);
