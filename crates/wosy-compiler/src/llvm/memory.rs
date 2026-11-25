@@ -437,8 +437,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
                             if signed_runtime_scalar_element(element).is_some()
                                 && domain.matches_consumer(state.target_layout, element) => (Some(*length), false),
                         LocalRuntimeExtent::PortableConstruction { length, domain }
-                            if state.runtime_borrow_index.portable_children.contains(&nodes.place_ordinal(place)
-                                .ok_or("missing portable child place ordinal")?)
+                            if state.runtime_borrow_index.portable_places.contains(&nodes.place_ordinal(place)
+                                .ok_or("missing portable checked place ordinal")?)
                                 && domain.matches_consumer(state.target_layout, element) => (Some(*length), true),
                         _ => return Err("indexed borrow changed its prepared index domain".into()),
                     }

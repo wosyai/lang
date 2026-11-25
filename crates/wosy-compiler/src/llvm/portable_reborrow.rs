@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use crate::scalar::{
     CfgPointId, CfgPointKind, ReferenceBindingId, ReferenceFlowPoint, ReferenceOrigin,
     ReferenceLoanId, ReferenceOriginId, ReferencePlaceId, ReferencePlaceProjection,
-    ReleaseTarget, RuntimeArrayChildSite, ScalarReferenceCfg, ScalarReferenceMutability,
+    ReleaseTarget, RuntimeArrayChildSite, RuntimeArrayExclusiveSite, ScalarReferenceCfg, ScalarReferenceMutability,
 };
-use crate::ScalarPlace;
+use crate::{ScalarExpression, ScalarPlace};
 
 type Owner = (u32, u32);
 
@@ -19,6 +19,7 @@ struct Holder {
 
 pub(super) struct Census<'a> {
     exact: HashMap<CfgPointId, Holder>,
+    direct: HashMap<CfgPointId, Holder>,
     holders: HashMap<&'a ReferenceBindingId, Holder>,
     origins: HashMap<usize, Holder>,
     scalar_returns: HashMap<CfgPointId, Holder>,
@@ -26,8 +27,8 @@ pub(super) struct Census<'a> {
 
 impl<'a> Census<'a> {
     pub(super) fn new(cfg: &'a ScalarReferenceCfg) -> Option<Self> {
-        if cfg.runtime_array_child_sites.is_empty() { return None; }
-        let mut census = Self { exact: HashMap::new(), holders: HashMap::new(), origins: HashMap::new(), scalar_returns: HashMap::new() };
+        if cfg.runtime_array_child_sites.is_empty() && cfg.runtime_array_exclusive_sites.is_empty() { return None; }
+        let mut census = Self { exact: HashMap::new(), direct: HashMap::new(), holders: HashMap::new(), origins: HashMap::new(), scalar_returns: HashMap::new() };
         for site in &cfg.runtime_array_child_sites {
             let Some((install, parent_origin, child_origin, owner)) = cfg.runtime_array_portable_child(site) else { continue; };
             let owner = (owner.declaration_span.start, owner.declaration_span.end);
@@ -47,7 +48,26 @@ impl<'a> Census<'a> {
                 { return None; }
             }
         }
+        for (&point, site) in &cfg.runtime_array_exclusive_sites {
+            let Some(owner) = cfg.runtime_array_exclusive_origin(point, site) else { continue; };
+            let Some((birth, bind)) = site.portable_install else { continue; };
+            if !direct_selector_interval(cfg, point, site) { continue; }
+            let owner = (owner.declaration_span.start, owner.declaration_span.end);
+            let holder = Holder { owner, origin: site.origin, child: false };
+            let CfgPointKind::Bind { binding } = &cfg.points[bind.0].kind else { continue; };
+            if census.holders.insert(binding, holder).is_some_and(|old| old != holder)
+                || census.origins.insert(holder.origin.0, holder).is_some_and(|old| old != holder)
+                || census.direct.insert(point, holder).is_some()
+            { return None; }
+            for point in [birth, bind, site.pointer] {
+                if census.exact.insert(point, holder).is_some_and(|old| old != holder) { return None; }
+            }
+        }
         (!census.exact.is_empty()).then_some(census)
+    }
+
+    pub(super) fn contains_direct(&self, point: CfgPointId) -> bool {
+        self.direct.contains_key(&point)
     }
 
     pub(super) fn contains(&self, cfg: &ScalarReferenceCfg, site: &RuntimeArrayChildSite) -> bool {
@@ -101,7 +121,7 @@ impl<'a> Census<'a> {
                 if !matches!(value.kind, CfgPointKind::ReadPlace { reads_origin: false, .. })
                     || value.scope != point.scope || value.successors.as_slice() != [point.id]
                 { return None; }
-                let holder = self.child_use(cfg, value, None)?;
+                let holder = self.child_use(cfg, value, None).or_else(|| self.direct.get(value_point).copied())?;
                 let [exit] = point.successors.as_slice() else { return None; };
                 let exit = cfg.points.get(exit.0)?;
                 let [terminal] = exit.successors.as_slice() else { return None; };
@@ -125,6 +145,9 @@ impl<'a> Census<'a> {
     ) -> bool {
         let planned = self.exact.get(&point.id).copied();
         let allowed = planned.filter(|holder| singleton(point, holder.origin))
+            // Direct writes are enrolled from exact solved pointer facts, not
+            // the AssignThrough point's right-hand value provenance.
+            .or_else(|| self.direct.get(&point.id).copied())
             .or_else(|| self.child_use(cfg, point, None))
             .or_else(|| {
                 let CfgPointKind::Read { .. } = point.kind else { return None; };
@@ -166,6 +189,35 @@ impl<'a> Census<'a> {
             }
         }
         allowed.is_some()
+    }
+}
+
+// V3 has already proved the actual indexed canonical place, exact pointer
+// loan, and a typed independent U64 selector. Bind the path on the solved
+// CFG too: no additional evaluation between pointer capture and consumer.
+fn direct_selector_interval(
+    cfg: &ScalarReferenceCfg, consumer: CfgPointId, site: &RuntimeArrayExclusiveSite,
+) -> bool {
+    let Some(pointer) = cfg.points.get(site.pointer.0) else { return false; };
+    let Some(access) = cfg.points.get(consumer.0) else { return false; };
+    let place = match &access.kind {
+        CfgPointKind::ReadPlace { place, .. } => place,
+        CfgPointKind::AssignThrough { place, rhs_point, .. } if *rhs_point < site.pointer => place,
+        _ => return false,
+    };
+    let ScalarPlace::Index { index, .. } = place else { return false; };
+    let [selector] = pointer.successors.as_slice() else { return false; };
+    let Some(selector) = cfg.points.get(selector.0) else { return false; };
+    if !(site.pointer < selector.id && selector.id < consumer)
+        || pointer.scope != selector.scope || selector.scope != access.scope
+        || selector.successors.as_slice() != [consumer]
+        || selector.possible_origins.as_ref().is_some_and(|values| !values.is_empty())
+    { return false; }
+    match (index.as_ref(), &selector.kind) {
+        (ScalarExpression::Name { span, .. }, CfgPointKind::Read { .. }) =>
+            *span == selector.source_span.range,
+        (expected @ ScalarExpression::Integer { .. }, CfgPointKind::Evaluate(actual)) => expected == actual,
+        _ => false,
     }
 }
 
@@ -225,7 +277,7 @@ mod tests {
             successors: Vec::new(),
         };
         let cfg = ScalarReferenceCfg::unsealed_for_test(Vec::new(), Vec::new());
-        let mut census = Census { exact: HashMap::new(), holders: HashMap::new(), origins: HashMap::new(), scalar_returns: HashMap::new() };
+        let mut census = Census { exact: HashMap::new(), direct: HashMap::new(), holders: HashMap::new(), origins: HashMap::new(), scalar_returns: HashMap::new() };
         let mut excluded = HashSet::new();
         assert!(!census.observe(&cfg, &point, &mut excluded));
         assert!(excluded.is_empty());

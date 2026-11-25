@@ -5026,7 +5026,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         { return None; }
         Some(RuntimeArrayExclusiveSite {
             occurrence: occurrence.0, pointer, handle: binding.declaration_span, origin,
-            reached: false, refused: false,
+            reached: false, refused: false, portable_install: None,
         })
     }
 
@@ -10613,7 +10613,11 @@ fn transfer_reference_facts(
             .flatten().map(|binding| (binding.clone(), false)).collect::<HashMap<_, _>>()
     });
     if let Some(sites) = cfg.runtime_array_exclusive.as_deref_mut() {
-        for site in sites.values_mut() { site.reached = false; site.refused = !cfg.raw_address_exposures.is_empty(); }
+        for site in sites.values_mut() {
+            site.reached = false;
+            site.refused = !cfg.raw_address_exposures.is_empty();
+            site.portable_install = None;
+        }
     }
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
@@ -10920,7 +10924,7 @@ fn transfer_reference_facts(
     }
     // Sparse exact initializer receipts: reuse the existing checked install
     // walk; don't scan unrelated definitions or infer a Bind from proximity.
-    let mut runtime_child_installs = runtime_child_changes.as_ref().filter(|_| !cfg.runtime_array_children.is_empty()).map(|changes| {
+    let mut runtime_child_installs = runtime_child_changes.as_ref().map(|changes| {
         let children = cfg.runtime_array_children.iter().map(|site| (site.borrow, None))
             .collect::<HashMap<_, _>>();
         let parents = changes.keys().cloned().map(|binding| (binding, None))
@@ -12982,6 +12986,23 @@ fn transfer_reference_facts(
             for site in sites.values_mut() {
                 site.refused |= runtime_exclusive_protected_bindings(site, original_points, cfg.facts)
                     .is_none_or(|bindings| bindings.into_iter().any(|binding| changes.get(binding) != Some(&false)));
+                site.portable_install = (|| {
+                    if !site.reached || site.refused { return None; }
+                    let (_, parents) = runtime_child_installs.as_ref()?;
+                    let [holder, _] = runtime_exclusive_protected_bindings(site, original_points, cfg.facts)?;
+                    let (borrow, bind) = parents.get(holder).copied().flatten()?;
+                    let birth = cfg.points.get(borrow.0)?;
+                    let install = cfg.points.get(bind.0)?;
+                    let read = cfg.points.get(site.pointer.0)?;
+                    if !(borrow < bind && bind < site.pointer) || birth.successors.as_slice() != [bind]
+                        || birth.scope != install.scope || install.scope != read.scope
+                        || !matches!(&birth.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none())
+                        || !matches!(&install.kind, CfgPointKind::Bind { binding } if *binding == *holder)
+                        || !birth.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.origin))
+                        || install.possible_origins != birth.possible_origins
+                    { return None; }
+                    Some((borrow, bind))
+                })();
             }
         }
         for site in cfg.runtime_array_children {

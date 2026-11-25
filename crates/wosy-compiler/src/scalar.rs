@@ -677,6 +677,7 @@ pub(crate) struct RuntimeArrayExclusiveSite {
     pub(crate) origin: ReferenceOriginId,
     pub(super) reached: bool,
     pub(super) refused: bool,
+    pub(crate) portable_install: Option<(CfgPointId, CfgPointId)>,
 }
 
 #[cfg_attr(not(test), derive(Clone))]

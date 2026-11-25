@@ -17665,6 +17665,10 @@ u16(u64,u64,u64,u16) update = fn(count,index,other,value) {
 };
 if (update(3,1,2,37) != 108) { core.system_panic(); };
 %%end";
+    let portable_mixed = text.replace("produce(value);", "value;")
+        .replace("    (*writer)[other] = 71;",
+            "    *u16 snapshot = &(*writer)[index];\n    u16 saved = *snapshot;\n    (*writer)[other] = 71;")
+        .replace("    first + second", "    if (first == saved) { first + second } else { 0 }");
     let conflict = text.replace("    (*writer)[other] = 71;",
         "    *u16 child = &(*writer)[other];\n    (*writer)[other] = 71;\n    u16 saved = *child;")
         .replace("    first + second", "    first + second + saved");
@@ -17753,10 +17757,59 @@ if (update(3,1,2,37) != 108) { core.system_panic(); };
                 || diagnostic.labels.iter().any(|label| label.message == "origin of conflicting place or loan"))),
                 "{diagnostics:?}");
         }
+        let portable = prepare(&portable_mixed).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let portable_checked = analyze_scalar_build(&portable);
+        assert!(portable_checked.diagnostics().is_empty(), "{:?}", portable_checked.diagnostics());
+        let portable_ir = emit_scalar_build_project_llvm(&portable_checked).unwrap().to_text();
+        let mixed = self_tail_test_body(&portable_ir, "i16", &project_function_name(&source, "update"));
+        let extent = loaded_runtime_extent_parameter(mixed, "count");
+        let expected_cap = if wasm { u64::MAX / 2 } else { cap };
+        assert!(mixed.lines().any(|line| line.ends_with(&format!("icmp ugt i64 {extent}, {expected_cap}"))), "{mixed}");
+        let element_gep = if wasm { "getelementptr i16, ptr %deref" } else { "getelementptr inbounds i16, ptr %deref" };
+        assert_eq!(mixed.matches(element_gep).count(), 5, "{mixed}");
+        assert_eq!(mixed.matches(&bounds).count(), 5, "{mixed}");
+        assert_eq!(mixed.matches("call ptr @__wosy_core_alloc").count(), 1, "{mixed}");
+        assert_eq!(mixed.matches("call void @__wosy_core_free").count(), 1, "{mixed}");
+        let mut prior = 0;
+        for ((at, _), action) in mixed.match_indices(element_gep).zip(["store", "take", "store", "load", "load"]) {
+            let region = &mixed[prior..at];
+            let bounds_at = region.find(&bounds).unwrap();
+            assert_eq!(region.matches(&bounds).count(), 1, "{region}");
+            let before_guard = &region[..bounds_at];
+            let guard = region[bounds_at..].lines().next().unwrap();
+            let selector = guard.strip_prefix(&format!("{bounds}i64 ")).unwrap()
+                .strip_suffix(&format!(", i64 {extent})")).unwrap();
+            let (address_bits, checked_base) = before_guard.lines().rev().find_map(|line| {
+                let call = line.trim_start().strip_prefix(&null)?.strip_suffix(')')?;
+                call.split_once(' ')
+            }).unwrap();
+            let base = before_guard.lines().find_map(|line| {
+                let (name, op) = line.trim_start().split_once(" = ")?;
+                (op == format!("inttoptr {address_bits} {checked_base} to ptr")).then_some(name)
+            }).unwrap();
+            let narrowed = if wasm {
+                region[bounds_at..].lines().find_map(|line| {
+                    let (name, op) = line.trim_start().split_once(" = ")?;
+                    (op == format!("trunc i64 {selector} to i32")).then_some(name)
+                }).unwrap()
+            } else { selector };
+            let gep = mixed[at..].lines().next().unwrap();
+            assert_eq!(gep, format!("{} i16, ptr {base}, {address_bits} {narrowed}",
+                if wasm { "getelementptr" } else { "getelementptr inbounds" }));
+            let element = mixed[..at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap();
+            let next = mixed[at + gep.len()..].trim_start().lines().next().unwrap();
+            match action {
+                "store" => assert!(next.starts_with("store i16 ") && next.contains(&format!(", ptr {element},")), "{next}"),
+                "take" => assert!(next.contains(&format!("ptrtoint ptr {element} to {address_bits}")), "{next}"),
+                "load" => assert!(next.contains(&format!("load i16, ptr {element},")), "{next}"),
+                _ => unreachable!(),
+            }
+            prior = at + gep.len();
+        }
         if let Some(out) = std::env::var_os("WOSY_LOCAL_EXCLUSIVE_RUNTIME_ARRAY_IR_DIR") {
             let name = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
-            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
-            assert_ne!(controlled, ir);
+            let controlled = portable_ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, portable_ir);
             std::fs::write(std::path::PathBuf::from(out).join(format!("{name}-release-project-control.ll")), controlled).unwrap();
         }
     }

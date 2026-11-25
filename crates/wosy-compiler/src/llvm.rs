@@ -152,7 +152,7 @@ enum LocalRuntimeExtent<'ctx> {
 #[derive(Default)]
 struct RuntimeBorrowIndex<'ctx> {
     sites: HashMap<usize, (wosy_syntax::ByteSpan, Option<wosy_syntax::ByteSpan>)>,
-    portable_children: std::collections::HashSet<usize>,
+    portable_places: std::collections::HashSet<usize>,
     owners: HashMap<wosy_syntax::ByteSpan, Option<PointerValue<'ctx>>>,
 }
 
@@ -503,7 +503,11 @@ fn runtime_allocation_access<'ctx>(
             let declaration = owner.declaration_span;
             if mutable.contains(&key(declaration)) { continue; }
             indexed.insert(key(declaration));
-            not_portable.insert(key(declaration));
+            if reborrows.as_ref().is_some_and(|census| census.contains_direct(point)) {
+                borrowed.portable_places.insert(site.occurrence);
+            } else {
+                not_portable.insert(key(declaration));
+            }
             borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
             borrowed.owners.entry(declaration).or_insert(None);
         }
@@ -515,7 +519,7 @@ fn runtime_allocation_access<'ctx>(
             if !reborrows.as_ref().is_some_and(|census| census.contains(reference_cfg, site)) {
                 not_portable.insert(key(declaration));
             } else {
-                borrowed.portable_children.insert(site.occurrence);
+                borrowed.portable_places.insert(site.occurrence);
             }
             borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
             borrowed.owners.entry(declaration).or_insert(None);
