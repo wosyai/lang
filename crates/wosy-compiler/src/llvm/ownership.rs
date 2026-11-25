@@ -1387,7 +1387,11 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         let signed = (|| {
             let Some((target, producer_element)) = state.aggregate.as_ref().and_then(|aggregate|
                 state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(&binding.value))
-                    .and_then(|ordinal| aggregate.plan().signed_array_descriptor_calls.get(&ordinal)))
+                    .and_then(|ordinal| {
+                        let plan = aggregate.plan();
+                        plan.signed_array_descriptor_calls.get(&ordinal)
+                            .or_else(|| plan.signed_array_descriptor_choices.get(&ordinal))
+                    }))
             else { return Ok(None); };
             let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
                 return Err("signed private descriptor receiver is not a runtime array");

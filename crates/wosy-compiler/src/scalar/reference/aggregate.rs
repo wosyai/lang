@@ -1345,11 +1345,10 @@ pub(super) struct AggregateFlowResult {
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
     pub(super) owning_scalar_tail_entry: Option<CfgPointId>,
-    pub(super) guarded_array_returns: Vec<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) guarded_array_returns: Vec<(OccurrenceOrdinal, Vec<(CfgPointId, OccurrenceOrdinal)>)>,
     pub(super) ordinary_array_receivers: Vec<OrdinaryArrayReceiver>,
     pub(super) ordinary_array_extent_demands: HashSet<OccurrenceOrdinal>,
     pub(super) ordinary_array_incompatible_uses: HashSet<OccurrenceOrdinal>,
-    pub(super) guarded_array_choices: BTreeSet<usize>,
     pub(super) guarded_array_producer_choice: Option<(OccurrenceOrdinal, Vec<(CfgPointId, OccurrenceOrdinal)>)>,
     pub(super) ordinary_fallible_expressions: Vec<(Option<OccurrenceOrdinal>, Vec<GuardedNumericExpression>)>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
@@ -3075,6 +3074,7 @@ pub(crate) struct ClosedBody {
     pub(crate) guarded_array_descriptor_choices: BTreeSet<usize>,
     pub(crate) signed_array_descriptor_result: Option<(ScalarTargetLayout, ScalarType)>,
     pub(crate) signed_array_descriptor_calls: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
+    pub(crate) signed_array_descriptor_choices: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -6696,7 +6696,7 @@ fn closed_aggregates<'a>(
     let mut fallible_call_requests = Vec::new();
     let mut guarded_array_requests = Vec::new();
     let mut ordinary_array_requests = Vec::new();
-    let mut guarded_array_choices = BTreeMap::new();
+    let mut guarded_array_choices = Vec::new();
     let mut fallible_expressions = Vec::new();
     let mut ordinary_expressions = Vec::new();
     let mut ordinary_fallible_candidates = BTreeSet::new();
@@ -6716,10 +6716,11 @@ fn closed_aggregates<'a>(
             if !facts.guarded_array_returns.is_empty() && (!is_monomorphic || arm.is_some()) {
                 return Err("guarded owned array call requires an exact monomorphic caller".into());
             }
-            guarded_array_requests.extend(facts.guarded_array_returns.iter()
-                .map(|&(point, ordinal)| (key, cfg, point, ordinal)));
-            if !facts.guarded_array_choices.is_empty() {
-                guarded_array_choices.insert(key, &facts.guarded_array_choices);
+            for (root, paths) in &facts.guarded_array_returns {
+                guarded_array_requests.extend(paths.iter().map(|&(point, ordinal)| (key, cfg, point, ordinal)));
+                if matches!(paths.as_slice(), [_, _, ..]) {
+                    guarded_array_choices.push((key, *root, paths.as_slice()));
+                }
             }
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
@@ -7976,8 +7977,15 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        for (&key, &choices) in &guarded_array_choices {
-            result.bodies.entry(key).or_default().guarded_array_descriptor_choices.extend(choices);
+        for &(key, root, paths) in &guarded_array_choices {
+            let plan = result.bodies.entry(key).or_default();
+            plan.guarded_array_descriptor_choices.insert(root.0);
+            let mut receipts = paths.iter().map(|(_, call)| plan.signed_array_descriptor_calls.get(&call.0));
+            if let Some(Some(first)) = receipts.next() {
+                if receipts.all(|receipt| receipt == Some(first)) {
+                    plan.signed_array_descriptor_choices.insert(root.0, first.clone());
+                }
+            }
         }
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
             return Err("returned array index requires the authenticated checked-access helper".into());

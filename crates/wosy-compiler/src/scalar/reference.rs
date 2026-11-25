@@ -5643,10 +5643,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty)).flatten()
                             .ok_or_else(|| self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer))?;
-                        if matches!(primary, ScalarExpression::If { .. }) {
-                            self.aggregate_result.guarded_array_choices.insert(primary_ordinal.0);
-                        }
-                        self.aggregate_result.guarded_array_returns.extend(paths);
+                        self.aggregate_result.guarded_array_returns.push((primary_ordinal, paths));
                     }
                     if let (Some(_), ScalarExpression::Call { arguments, .. }, false) =
                         (binding.fallible_assignment, primary, walk_fallible_expression || runtime_returned)
