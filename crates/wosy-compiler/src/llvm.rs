@@ -152,6 +152,7 @@ enum LocalRuntimeExtent<'ctx> {
 #[derive(Default)]
 struct RuntimeBorrowIndex<'ctx> {
     sites: HashMap<usize, (wosy_syntax::ByteSpan, Option<wosy_syntax::ByteSpan>)>,
+    portable_children: std::collections::HashSet<usize>,
     owners: HashMap<wosy_syntax::ByteSpan, Option<PointerValue<'ctx>>>,
 }
 
@@ -320,6 +321,7 @@ fn runtime_allocation_access<'ctx>(
     let mut unproved_writes = BTreeSet::new();
     let mut not_portable = std::collections::HashSet::new();
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
+    let mut reborrows = portable_body.then(|| portable_reborrow::Census::new(reference_cfg)).flatten();
     let portable_private_sites = (portable_body && allow_private_pair_transport).then(|| {
         let mut calls = HashMap::new();
         let mut borrows = HashMap::new();
@@ -378,6 +380,8 @@ fn runtime_allocation_access<'ctx>(
         // independently lowered address. Only already sealed private pair
         // calls can transport it out of the exact standard owner.
         if portable_body {
+            let exact_reborrow = reborrows.as_mut().is_some_and(|census|
+                census.observe(reference_cfg, point, &mut not_portable));
             let mut exclude = |binding: &crate::scalar::ReferenceBindingId| {
                 if reference_cfg.allocations.contains(binding) {
                     not_portable.insert(key(binding.declaration_span));
@@ -389,6 +393,7 @@ fn runtime_allocation_access<'ctx>(
                         if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
             };
             match &point.kind {
+                _ if exact_reborrow => {}
                 CfgPointKind::Read { binding } => exclude(binding),
                 CfgPointKind::Assign { target, .. } => {
                     if !direct_index(target) { exclude(&target.binding); }
@@ -489,6 +494,7 @@ fn runtime_allocation_access<'ctx>(
             if mutable.contains(&key(declaration)) { continue; }
             indexed.insert(key(declaration));
             borrowed.sites.insert(site.occurrence, (declaration, site.handle));
+            not_portable.insert(key(declaration));
             borrowed.owners.entry(declaration).or_insert(None);
         }
         for site in &reference_cfg.runtime_array_child_sites {
@@ -496,7 +502,11 @@ fn runtime_allocation_access<'ctx>(
             let declaration = owner.declaration_span;
             if mutable.contains(&key(declaration)) { continue; }
             indexed.insert(key(declaration));
-            not_portable.insert(key(declaration));
+            if !reborrows.as_ref().is_some_and(|census| census.contains(reference_cfg, site)) {
+                not_portable.insert(key(declaration));
+            } else {
+                borrowed.portable_children.insert(site.occurrence);
+            }
             borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
             borrowed.owners.entry(declaration).or_insert(None);
         }
@@ -2076,6 +2086,7 @@ fn definition_function_type<'ctx>(
 
 mod aggregate_transfer;
 mod local_callable;
+mod portable_reborrow;
 mod memory;
 use memory::{
     aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
@@ -2338,7 +2349,6 @@ fn store_runtime_allocation<'ctx, 'module>(
         Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
     };
     let portable = (prepared && checked_extent && !widened && !mutable && relay_unwind.is_none()
-        && !state.runtime_borrow_index.owners.contains_key(&receiver.name_span)
         && state.portable_runtime_allocations.contains(&declaration)
         && state.aggregate.as_ref().is_none_or(|aggregate| portable_runtime_plan_allows_plain_storage(aggregate.plan()))).then(|| memory::PortableRuntimeAddressDomain::for_construction(state.target_layout, element)).flatten();
     let allocation = ownership::emit_runtime_array_allocation_with_absence(

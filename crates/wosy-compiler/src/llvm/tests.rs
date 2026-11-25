@@ -17547,6 +17547,14 @@ if (read_shared(3,1) != 11 || read_exclusive(4,1) != 70 || update(5,1,2) != 108)
             "    u16[count] other;\n    *(u16[]) reader = if (index == 0) { &cells } else { &other };");
     let escape = text.replace("u16(u64,u64) read_shared", "*u16(u64,u64) read_shared")
         .replace("    *cell\n", "    cell\n").replace("read_shared(3,1) != 11 || ", "");
+    let child_rebind = text.replace("    *cell\n",
+        "    u16 previous = *cell;\n    u16 standalone = 0;\n    cell = &standalone;\n    previous\n");
+    let signed_fallback = text.replace("%%start
+", "%%start
+u64(u64) keep_signed = fn(value) { value };
+")
+        .replace("    *(u16[]) reader = &cells;", "    keep_signed(index);
+    *(u16[]) reader = &cells;");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
         let prepare = |authored: &str| {
@@ -17564,10 +17572,35 @@ if (read_shared(3,1) != 11 || read_exclusive(4,1) != 70 || update(5,1,2) != 108)
         let helpers = prepared.checked_access_source().unwrap();
         let null = format!("call void @{}(", project_function_name(helpers, "check_non_null_address"));
         let bounds = format!("call void @{}(", project_function_name(helpers, "check_index_in_extent"));
+        let wasm = layout == ScalarTargetLayout::WASM32;
+        let signed_cap = if wasm { i32::MAX as u64 / 2 } else { i64::MAX as u64 / 2 };
+        let ordinary = prepare(&signed_fallback).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let ordinary_checked = analyze_scalar_build(&ordinary);
+        assert!(ordinary_checked.diagnostics().is_empty(), "{:?}", ordinary_checked.diagnostics());
+        let ordinary_ir = emit_scalar_build_project_llvm(&ordinary_checked).unwrap().to_text();
+        let signed = self_tail_test_body(&ordinary_ir, "i16", &project_function_name(&source, "read_shared"));
+        assert!(signed.contains("getelementptr inbounds i16, ptr %deref"), "{signed}");
+        assert!(signed.lines().any(|line| line.contains("icmp ugt i64") && line.ends_with(&format!(", {signed_cap}"))), "{signed}");
+        let rebind = prepare(&child_rebind).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let rejected = analyze_scalar_build(&rebind);
+        let reborrow_text = "&(*reader)[index]";
+        let reborrow_start = child_rebind.find(reborrow_text).unwrap() as u32;
+        let reborrow_span = ByteSpan::new(reborrow_start, reborrow_start + reborrow_text.len() as u32);
+        assert!(rejected.diagnostics().iter().any(|diagnostic|
+            diagnostic.code == "B0003"
+                && diagnostic.message == "checked runtime array indexing requires the extent of the dereferenced backing"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range == reborrow_span)),
+            "{:?}", rejected.diagnostics());
         for (name, expected) in [("read_shared", 1), ("read_exclusive", 2), ("update", 2)] {
             let body = self_tail_test_body(&ir, "i16", &project_function_name(&source, name));
             let mut count = 0;
-            for (position, _) in body.match_indices("getelementptr inbounds i16, ptr %deref") {
+            let (gep, cap) = if wasm {
+                ("getelementptr i16, ptr %deref", u64::MAX / 2)
+            } else {
+                ("getelementptr inbounds i16, ptr %deref", signed_cap)
+            };
+            assert!(body.lines().any(|line| line.contains("icmp ugt i64") && line.ends_with(&format!(", {cap}"))), "{body}");
+            for (position, _) in body.match_indices(gep) {
                 count += 1;
                 let before = &body[..position];
                 let null_at = before.rfind(&null).unwrap();

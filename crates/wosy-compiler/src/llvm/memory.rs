@@ -411,7 +411,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 }
                 Some(aggregate.private_runtime_access_pair.ok_or("missing authenticated private runtime array formal")?)
             } else { None };
-            let borrowed_extent = if let Some((_, count)) = formal_pair { Some(count) } else { match (&base_type, base.as_ref()) {
+            let (borrowed_extent, portable_reborrow) = if let Some((_, count)) = formal_pair { (Some(count), false) } else { match (&base_type, base.as_ref()) {
                 (ScalarType::RuntimeArray { element, .. }, crate::ScalarPlace::Dereference { pointer, .. })
                     if !index_has_raw_root(state, base) =>
                 {
@@ -427,18 +427,23 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     };
                     let backing = state.runtime_borrow_index.owners.get(&owner).copied().flatten()
                         .ok_or("indexed borrow has no direct source backing")?;
-                    let Some((declaration, LocalRuntimeExtent::Construction { length, signed: Some(domain) }, true)) =
-                        state.local_runtime_extents.get(&backing)
+                    let Some((declaration, extent, true)) = state.local_runtime_extents.get(&backing)
                     else { return Err("indexed borrow has no original checked extent".into()); };
-                    if !exact_source || *declaration != owner
-                        || signed_runtime_scalar_element(element).is_none()
-                        || !domain.matches_consumer(state.target_layout, element)
-                    {
-                        return Err("indexed borrow changed its prepared source or index domain".into());
+                    if !exact_source || *declaration != owner {
+                        return Err("indexed borrow changed its prepared source".into());
                     }
-                    Some(*length)
+                    match extent {
+                        LocalRuntimeExtent::Construction { length, signed: Some(domain) }
+                            if signed_runtime_scalar_element(element).is_some()
+                                && domain.matches_consumer(state.target_layout, element) => (Some(*length), false),
+                        LocalRuntimeExtent::PortableConstruction { length, domain }
+                            if state.runtime_borrow_index.portable_children.contains(&nodes.place_ordinal(place)
+                                .ok_or("missing portable child place ordinal")?)
+                                && domain.matches_consumer(state.target_layout, element) => (Some(*length), true),
+                        _ => return Err("indexed borrow changed its prepared index domain".into()),
+                    }
                 }
-                _ => None,
+                _ => (None, false),
             }};
             // A guarded lexical array stores its original backing directly,
             // not an ordinary runtime-array pointer slot. Authenticate and
@@ -528,7 +533,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             });
             let portable_local = matches!(local_extent, Some((_, LocalRuntimeExtent::PortableConstruction { .. }, true)));
             let portable_wasm_offset = state.target_layout == ScalarTargetLayout::WASM32
-                && (portable_local || portable_formal || runtime_offset.is_some_and(|receipt|
+                && (portable_local || portable_formal || portable_reborrow || runtime_offset.is_some_and(|receipt|
                     receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault));
             let index = emit_place_index(context, state, index, project)?;
             if signed_selector_maximum.zip(index.get_zero_extended_constant())

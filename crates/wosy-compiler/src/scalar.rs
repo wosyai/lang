@@ -657,6 +657,16 @@ pub(crate) struct RuntimeArrayChildSite {
     pub(super) pointer: CfgPointId,
     pub(super) parent: ReferenceOriginId,
     pub(super) mutable_representation: bool,
+    pub(super) lexical_install: Option<RuntimeArrayChildInstall>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeArrayChildInstall {
+    pub(crate) parent_borrow: CfgPointId,
+    pub(crate) parent_bind: CfgPointId,
+    pub(crate) parent_read: CfgPointId,
+    pub(crate) child_borrow: CfgPointId,
+    pub(crate) child_bind: CfgPointId,
 }
 
 #[cfg_attr(not(test), derive(Clone))]
@@ -746,6 +756,15 @@ impl ScalarReferenceCfg {
         (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
             && loan.origin_place.projections.is_empty() && self.allocations.contains(&loan.origin_place.binding))
             .then_some(&loan.origin_place.binding)
+    }
+
+    pub(crate) fn runtime_array_portable_child(
+        &self, site: &RuntimeArrayChildSite,
+    ) -> Option<(RuntimeArrayChildInstall, ReferenceOriginId, ReferenceOriginId, &ReferenceBindingId)> {
+        let owner = self.runtime_array_child_origin(site)?;
+        let install = site.lexical_install?;
+        let child = *self.points.get(install.child_borrow.0)?.possible_origins.as_ref()?.first()?;
+        Some((install, site.parent, child, owner))
     }
 
     pub(crate) fn runtime_array_child_origin(&self, site: &RuntimeArrayChildSite) -> Option<&ReferenceBindingId> {

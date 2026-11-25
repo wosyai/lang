@@ -3472,7 +3472,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         if let Some(handle) = runtime_child {
                             self.cfg.runtime_array_child_sites.push(RuntimeArrayChildSite {
                                 borrow, occurrence: place_ordinal.0, handle, pointer, parent: origin,
-                                mutable_representation: false,
+                                mutable_representation: false, lexical_install: None,
                             });
                         }
                     }
@@ -10838,8 +10838,23 @@ fn transfer_reference_facts(
     for &(wrapper, value) in cfg.checked_block_values {
         last_use[value.0] = last_use[value.0].max(wrapper.0);
     }
+    // Sparse exact initializer receipts: reuse the existing checked install
+    // walk; don't scan unrelated definitions or infer a Bind from proximity.
+    let mut runtime_child_installs = runtime_child_changes.as_ref().map(|changes| {
+        let children = cfg.runtime_array_children.iter().map(|site| (site.borrow, None))
+            .collect::<HashMap<_, _>>();
+        let parents = changes.keys().cloned().map(|binding| (binding, None))
+            .collect::<HashMap<_, _>>();
+        (children, parents)
+    });
     for &(bind, value) in cfg.checked_binding_initializers {
         last_use[value.0] = last_use[value.0].max(bind.0);
+        if let Some((children, parents)) = &mut runtime_child_installs {
+            if let Some(child) = children.get_mut(&value) { *child = Some(bind); }
+            if let CfgPointKind::Bind { binding } = &original_points[bind.0].kind {
+                if let Some(parent) = parents.get_mut(binding) { *parent = Some((value, bind)); }
+            }
+        }
     }
     for parent in cfg.named_reborrow_parents {
         last_use[parent.pointer.0] = last_use[parent.pointer.0].max(parent.borrow.0);
@@ -12874,6 +12889,29 @@ fn transfer_reference_facts(
         for site in cfg.runtime_array_children {
             site.mutable_representation |= runtime_child_protected_bindings(site, original_points, cfg.facts)
                 .is_none_or(|bindings| bindings.into_iter().any(|binding| changes.get(binding) != Some(&false)));
+            site.lexical_install = (|| {
+                if site.mutable_representation { return None; }
+                let (children, parents) = runtime_child_installs.as_ref()?;
+                let [holder, _] = runtime_child_protected_bindings(site, original_points, cfg.facts)?;
+                let (parent_borrow, parent_bind) = parents.get(holder).copied().flatten()?;
+                let child_bind = children.get(&site.borrow).copied().flatten()?;
+                let parent = cfg.points.get(parent_borrow.0)?;
+                let child = cfg.points.get(site.borrow.0)?;
+                let exact_successor = |point: &ReferenceFlowPoint, bind: CfgPointId|
+                    point.successors.as_slice() == [bind]
+                        && cfg.points.get(bind.0).is_some_and(|binding|
+                            binding.scope == point.scope && binding.possible_origins == point.possible_origins);
+                if !matches!(&parent.kind, CfgPointKind::Borrow { loan, .. } if loan.parent.is_none())
+                    || !parent.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&site.parent))
+                    || !exact_successor(parent, parent_bind) || !exact_successor(child, child_bind)
+                    || !(parent_borrow < parent_bind && parent_bind < site.pointer
+                        && site.pointer < site.borrow && site.borrow < child_bind)
+                { return None; }
+                Some(RuntimeArrayChildInstall {
+                    parent_borrow, parent_bind, parent_read: site.pointer,
+                    child_borrow: site.borrow, child_bind,
+                })
+            })();
         }
     }
     let mut unique = Vec::new();
