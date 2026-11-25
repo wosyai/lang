@@ -2126,8 +2126,13 @@ fn store_runtime_allocation<'ctx, 'module>(
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
         .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
     aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
-    let slot = ownership::emit_runtime_array_allocation_with_domain(
-        context, state, element, length, checked_extent,
+    let relay_allocation = state.aggregate.as_ref().is_some_and(|aggregate|
+        aggregate.plan().fallible_relay_allocation == Some(receiver.name_span));
+    if relay_allocation && (!prepared || mutable || widened) {
+        return Err("invalid sealed fallible allocation relay backing".into());
+    }
+    let slot = ownership::emit_runtime_array_allocation_with_absence(
+        context, state, element, length, checked_extent, relay_allocation,
     )?;
     initialize(state, slot)?;
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;

@@ -12892,13 +12892,13 @@ fn guarded_fallible_allocating_call_skips_outer_materialization_on_absence() {
     use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
     let text = "%%start
 u64(u64) _measure = fn(count) { u8[count] scratch; core.array_len(&scratch) };
-u64(u64) _middle = fn(count) { _measure(count) };
+u64(u64) _middle = fn(count) { u8[count] local; core.array_len(&local); _measure(count) };
 u64(u64) _entry = fn(count) { _middle(count) };
 u64(u64) observed = fn(count) {
     u64 result =? _entry(count);
-    if (&result == null) { 0 } else { result }
+    if (&result == null) { 0 } else { result + 1 }
 };
-if (observed(7) != 0 || observed(7) != 0 || observed(7) != 7) { core.system_panic(); };
+if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
 %%end";
     let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count); ordinary; u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -12944,15 +12944,28 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 7) { core.system_pani
                     let relay = module.get_function(&self_tail_test_symbol(source, in_project, name)).unwrap();
                     assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
                     assert_eq!(relay.get_type(), previous.get_type());
-                    assert!(calls_to(relay, alloc).is_empty() && calls_to(relay, free).is_empty());
                     let [forwarded] = calls_to(relay, previous)[..] else { panic!("{llvm}") };
-                    assert!(relay.get_basic_blocks().into_iter().all(|block|
-                        block.get_terminator().is_none_or(|term| term.get_opcode() != InstructionOpcode::Br
-                            || term.get_num_operands() == 1)));
-                    let returned = relay.get_basic_blocks().into_iter()
+                    let returned_forward = relay.get_basic_blocks().into_iter()
                         .filter_map(|block| block.get_terminator())
-                        .find(|instruction| instruction.get_opcode() == InstructionOpcode::Return).unwrap();
-                    assert_eq!(known_field_operand(returned, 0).unwrap().as_instruction_value(), Some(forwarded));
+                        .find(|instruction| instruction.get_opcode() == InstructionOpcode::Return
+                            && known_field_operand(*instruction, 0).and_then(|operand| operand.as_instruction_value()) == Some(forwarded))
+                        .unwrap();
+                    if name == "_middle" {
+                        let [allocation] = calls_to(relay, alloc)[..] else { panic!("{llvm}") };
+                        let [release] = calls_to(relay, free)[..] else { panic!("{llvm}") };
+                        assert_eq!(known_field_operand(release, 0).unwrap().as_instruction_value(), Some(allocation));
+                        assert_eq!(forwarded.get_next_instruction(), Some(release));
+                        assert_eq!(release.get_next_instruction(), Some(returned_forward));
+                        let absent = relay.get_basic_blocks().into_iter()
+                            .find(|block| block.get_name().to_bytes() == b"allocation_absent").unwrap();
+                        assert!(absent.get_first_instruction().is_some_and(|instruction|
+                            instruction == absent.get_terminator().unwrap() && instruction.get_opcode() == InstructionOpcode::Return));
+                    } else {
+                        assert!(calls_to(relay, alloc).is_empty() && calls_to(relay, free).is_empty());
+                        assert!(relay.get_basic_blocks().into_iter().all(|block|
+                            block.get_terminator().is_none_or(|term| term.get_opcode() != InstructionOpcode::Br
+                                || term.get_num_operands() == 1)));
+                    }
                     previous = relay;
                 }
                 let [rhs] = calls_to(caller, previous)[..] else { panic!("{llvm}") };
@@ -12965,7 +12978,7 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 7) { core.system_pani
                 let branch = flag.get_next_instruction().unwrap();
                 assert_eq!(branch.get_opcode(), InstructionOpcode::Br);
                 assert_eq!(known_field_operand(branch, 0).unwrap().as_instruction_value(), Some(flag));
-                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_ALLOCATING_IR_DIR") {
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_OWNING_RELAY_IR_DIR") {
                     let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                     let route = if in_project { "project" } else { "standalone" };
                     let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);

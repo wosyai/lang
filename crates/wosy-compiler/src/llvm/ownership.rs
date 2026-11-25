@@ -1371,6 +1371,17 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
 ) -> Result<PointerValue<'ctx>, String> {
+    emit_runtime_array_allocation_with_absence(context, state, element, length, checked_extent, false)
+}
+
+pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    element: &ScalarType,
+    length: inkwell::values::IntValue<'ctx>,
+    checked_extent: bool,
+    relay_allocation: bool,
+) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
     let function = state
@@ -1378,7 +1389,7 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
         .get_insert_block()
         .and_then(|block| block.get_parent())
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
-    let recover = state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
+    let recover = relay_allocation || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
     let integer = context.i64_type();
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
