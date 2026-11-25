@@ -812,7 +812,8 @@ fn emit_prepared_call<'ctx, 'module>(
         return Ok(value);
     }
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
-    if aggregate_transfer::fallible_allocation_call_at(state, expression) {
+    let ordinary_fallible = aggregate_transfer::ordinary_fallible_allocation_call_at(state, expression);
+    if ordinary_fallible || aggregate_transfer::fallible_allocation_call_at(state, expression) {
         let [EmitValue::Basic(BasicValueEnum::IntValue(count))] = values.as_slice() else {
             return Err("invalid sealed fallible allocation call argument".into());
         };
@@ -824,8 +825,26 @@ fn emit_prepared_call<'ctx, 'module>(
             return Err("invalid sealed fallible allocation callable ABI".into());
         }
         let call = state.builder.build_call(*callee, &[(*count).into()], "fallible.rhs").map_err(builder_error)?;
-        return call.try_as_basic_value().basic().map(EmitValue::Basic)
-            .ok_or_else(|| "missing sealed fallible allocation result".into());
+        let Some(BasicValueEnum::StructValue(result)) = call.try_as_basic_value().basic() else {
+            return Err("missing sealed fallible allocation result".into());
+        };
+        if !ordinary_fallible {
+            return Ok(EmitValue::Basic(result.into()));
+        }
+        let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+            .ok_or("missing sealed ordinary allocation caller")?;
+        let present = context.append_basic_block(parent, "ordinary.allocation_present");
+        let absent = context.append_basic_block(parent, "ordinary.allocation_absent");
+        let succeeded = state.builder.build_extract_value(result, 0, "ordinary.allocation_succeeded")
+            .map_err(builder_error)?.into_int_value();
+        state.builder.build_conditional_branch(succeeded, present, absent).map_err(builder_error)?;
+        state.builder.position_at_end(absent);
+        emit_core_system_panic(context, state, &[])?;
+        state.builder.build_unreachable().map_err(builder_error)?;
+        state.builder.position_at_end(present);
+        let payload = state.builder.build_extract_value(result, 1, "ordinary.allocation_payload")
+            .map_err(builder_error)?;
+        return Ok(EmitValue::Basic(payload));
     }
     if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
         return Ok(value);

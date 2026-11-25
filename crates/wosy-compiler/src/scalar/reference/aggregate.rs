@@ -1272,6 +1272,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
+    pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) fallible_call_choices: Vec<(OccurrenceOrdinal, [(CfgPointId, OccurrenceOrdinal); 2])>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
@@ -2947,6 +2948,7 @@ pub(crate) struct ClosedBody {
     pub(crate) fallible_allocation_leaf: bool,
     pub(crate) fallible_allocation_relay: bool,
     pub(crate) fallible_relay_allocations: Vec<ByteSpan>,
+    pub(crate) ordinary_fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) fallible_allocating_choices: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
@@ -6598,6 +6600,7 @@ fn closed_aggregates<'a>(
     let mut array_descriptor_identities = BTreeMap::new();
     let mut borrowed_extent_observers = BTreeMap::new();
     let mut fallible_call_requests = Vec::new();
+    let mut ordinary_fallible_candidates = BTreeSet::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
         let Some(ScalarItem::Function(function)) = input.items.get(item) else {
@@ -6613,6 +6616,10 @@ fn closed_aggregates<'a>(
         if let Some(facts) = facts {
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
                 .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal, None)));
+            if is_monomorphic && arm.is_none() {
+                ordinary_fallible_candidates.extend(facts.ordinary_fallible_call_candidates.iter()
+                    .map(|ordinal| (key, ordinal.0)));
+            }
             for &(choice, arms) in &facts.fallible_call_choices {
                 fallible_call_requests.extend(arms.into_iter()
                     .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice))));
@@ -6977,11 +6984,15 @@ fn closed_aggregates<'a>(
         }
     }
     ordinary.census(reservations, &module_at, &declarations);
+    let mut ordinary_fallible_calls = BTreeSet::new();
     for (target, calls) in &fallible_allocating_targets {
-        if !ordinary.transport_uses.get(target).and_then(Option::as_ref).is_some_and(|observed|
-            observed.len() == calls.len() && observed.iter().all(|site| calls.contains(site)))
-        {
-            return Err("fallible allocating callable requires exclusively checked fallible initializer uses".into());
+        let unsupported = || "fallible allocating callable requires exclusively checked fallible initializer uses or sealed ordinary scalar bindings".to_owned();
+        let observed = ordinary.transport_uses.get(target).and_then(Option::as_ref)
+            .ok_or_else(unsupported)?.iter().copied().collect::<BTreeSet<_>>();
+        if !calls.is_subset(&observed) { return Err(unsupported()); }
+        for site in observed.difference(calls) {
+            if !ordinary_fallible_candidates.contains(site) { return Err(unsupported()); }
+            ordinary_fallible_calls.insert(*site);
         }
     }
     let mut outgoing = BTreeSet::new();
@@ -7352,6 +7363,9 @@ fn closed_aggregates<'a>(
             for &(caller, ordinal) in sites {
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
             }
+        }
+        for &(body, ordinal) in &ordinary_fallible_calls {
+            result.bodies.entry(body).or_default().ordinary_fallible_allocating_calls.insert(ordinal);
         }
         for &(body, ordinal) in &fallible_choices {
             result.bodies.entry(body).or_default().fallible_allocating_choices.insert(ordinal);

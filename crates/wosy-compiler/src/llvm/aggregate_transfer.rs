@@ -576,6 +576,14 @@ pub(super) fn fallible_allocation_call_at(state: &EmitState<'_, '_>, expression:
     })
 }
 
+pub(super) fn ordinary_fallible_allocation_call_at(state: &EmitState<'_, '_>, expression: &ScalarExpression) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate| {
+        let calls = &aggregate.plan().ordinary_fallible_allocating_calls;
+        !calls.is_empty() && state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
+            .is_some_and(|ordinal| calls.contains(&ordinal))
+    })
+}
+
 pub(super) fn fallible_allocation_choice_at(state: &EmitState<'_, '_>, expression: &ScalarExpression) -> bool {
     state.aggregate.as_ref().is_some_and(|aggregate| {
         let choices = &aggregate.plan().fallible_allocating_choices;

@@ -5016,6 +5016,32 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
+                    if let (None, ScalarExpression::Call { arguments, type_arguments, .. }, Some(point)) =
+                        (binding.fallible_assignment, primary, call_producer)
+                    {
+                        if scope == ReferenceScopeId(0) && position.block == calls.structure.root
+                            && position.item == 0
+                            && calls.structure.edges.get(&(
+                                OccurrenceParent::Block(calls.structure.root),
+                                OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+                            )) == Some(&OccurrenceNode::Expression(primary_ordinal))
+                            && !block.unsafe_context && !binding.is_allocation
+                            && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
+                            && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
+                            && self.generic_parameters.is_empty() && receiver.ty == ScalarType::U64
+                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                            && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                            && matches!(arguments.as_slice(), [argument]
+                                if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
+                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                                signature.parameters.as_slice() == [ScalarType::U64]
+                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64))
+                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
+                        {
+                            self.aggregate_result.ordinary_fallible_call_candidates.push(primary_ordinal);
+                        }
+                    }
                     if let (Some(_), ScalarExpression::Call { arguments, .. }) = (binding.fallible_assignment, primary)
                     {
                         // Allocation-free callee evidence does not cover its
@@ -16408,7 +16434,7 @@ impl FunctionReferenceResult {
         }
         function.reference_cfg = self.cfg;
         if let Some(facts) = facts {
-            if self.aggregate.has_observations() {
+            if self.aggregate.has_observations() || !self.aggregate.ordinary_fallible_call_candidates.is_empty() {
                 facts.insert((item, arm), self.aggregate);
             }
         }

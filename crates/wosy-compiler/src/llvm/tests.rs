@@ -12900,7 +12900,7 @@ u64(u64) observed = fn(count) {
 };
 if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
 %%end";
-    let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count); ordinary; u64 result =?");
+    let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count) + 1; ordinary; u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (closed, text) in [(true, text), (false, mixed.as_str())] {
             let prepared = prepare_initializer_test(text, layout);
@@ -13084,6 +13084,84 @@ if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
                     assert_ne!(controlled, llvm);
                     std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_fallible_and_ordinary_binding_share_one_private_body() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _leaf = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _relay = fn(count) { u8[count] local; core.array_len(&local); _leaf(count) };
+u64(u64) ordinary = fn(count) { u64 result = _relay(count); result };
+u64(u64) guarded = fn(count) {
+    u64 result =? _relay(count);
+    if (&result == null) { 0 } else { result + 1 }
+};
+if (ordinary(7) != 7 || ordinary(0) != 0 || guarded(9) != 0 || guarded(0) != 1) { core.system_panic(); };
+ordinary(13);
+%%end";
+    let preceding_owner = text.replace("u64 result = _relay(count);",
+        "u8[count] prior; core.array_len(&prior); u64 result = _relay(count);");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let refused = prepare_initializer_test(&preceding_owner, layout);
+        let refused = analyze_scalar_build(&refused);
+        assert!(refused.diagnostics().is_empty(), "{:?}", refused.diagnostics());
+        for output in [emit_scalar_build_single_module_llvm(&refused), emit_scalar_build_project_llvm(&refused)] {
+            assert!(matches!(output, Err(error) if error.contains("requires exclusively checked fallible initializer uses")));
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "sealed dual-use fallible callable");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let ordinary = authored("ordinary");
+            let guarded = authored("guarded");
+            let relay = authored("_relay");
+            let panic = module.get_function("__wosy_core_system_panic").unwrap();
+            assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
+            fn calls_to<'ctx>(caller: inkwell::values::FunctionValue<'ctx>,
+                callee: inkwell::values::FunctionValue<'ctx>) -> Vec<InstructionValue<'ctx>> {
+                caller.get_basic_blocks().into_iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect()
+            }
+            for caller in [ordinary, guarded] {
+                assert_eq!(caller.get_type().get_return_type(), Some(context.i64_type().into()));
+                assert_eq!(calls_to(caller, relay).len(), 1);
+            }
+            assert!(calls_to(guarded, panic).is_empty());
+            let [ordinary_panic] = calls_to(ordinary, panic)[..] else { panic!("{llvm}") };
+            let absent = ordinary_panic.get_parent().unwrap();
+            assert_eq!(absent.get_name().to_bytes(), b"ordinary.allocation_absent");
+            assert_eq!(absent.get_first_instruction(), Some(ordinary_panic));
+            assert_eq!(ordinary_panic.get_next_instruction().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+            let [ordinary_call] = calls_to(ordinary, relay)[..] else { panic!("{llvm}") };
+            let status = ordinary_call.get_next_instruction().unwrap();
+            assert_eq!(status.get_opcode(), InstructionOpcode::ExtractValue);
+            assert_eq!(status.get_indices(), vec![0]);
+            let branch = status.get_next_instruction().unwrap();
+            assert_eq!(known_field_operand(branch, 0).unwrap().as_instruction_value(), Some(status));
+            assert!(branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(absent)));
+            assert!(calls_to(ordinary, module.get_function("__wosy_core_alloc").unwrap()).is_empty());
+            assert!(calls_to(ordinary, module.get_function("__wosy_core_free").unwrap()).is_empty());
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_DUAL_USE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
             }
         }
     }
