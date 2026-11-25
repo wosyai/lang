@@ -1226,7 +1226,7 @@ fn check_command(
             notes,
         }
     });
-    let contextual = report.contextual_diagnostic.iter().map(|failure| {
+    let contextual = report.contextual_diagnostic.iter().chain(&report.additional_contextual_diagnostics).map(|failure| {
         let mut labels = vec![
             DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
                 message: if failure.symbolic { "not satisfied by this symbolic contextual call" }

@@ -147,7 +147,7 @@ impl Plan {
     ) -> Result<MainFlowProofReceipt, ProjectCheck> {
         let run = run_prepared_ordered_check(prepared, scope, 1, OrderedReachPolicy::Closed, self)?;
         Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None,
+            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(),
             aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None,
             additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
             pointer_effect_diagnostic: run.symbolic,
