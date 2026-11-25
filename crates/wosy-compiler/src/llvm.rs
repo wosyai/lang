@@ -367,13 +367,13 @@ fn runtime_allocation_access<'ctx>(
     indexed.retain(|id| !unproved_writes.contains(id));
     let mut borrowed = RuntimeBorrowIndex::default();
     if checked_access {
-        for &(access, point, handle) in &reference_cfg.runtime_array_read_sites {
+        for (&point, site) in &reference_cfg.runtime_array_read_sites {
             let Some(owner) = reference_cfg.runtime_array_read_origin(point) else { continue; };
             let declaration = owner.declaration_span;
             // A general mutable pointer slot is not an extent receipt.
             if mutable.contains(&key(declaration)) { continue; }
             indexed.insert(key(declaration));
-            borrowed.sites.insert(access, (declaration, handle));
+            borrowed.sites.insert(site.occurrence, (declaration, site.handle));
             borrowed.owners.entry(declaration).or_insert(None);
         }
     }

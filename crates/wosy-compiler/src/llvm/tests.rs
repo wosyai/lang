@@ -16832,3 +16832,76 @@ if (observe(3, 4, 1) != 40) { core.system_panic(); };
             "{ambiguous:?}");
     }
 }
+
+#[test]
+fn runtime_checked_index_joins_null_and_same_backing_without_erasing_checks() {
+    let text = "%%start
+u64(u64) select = fn(index) { index };
+u16(u64, u64, bool) nullable = fn(length, index, present) {
+    u16[length] values;
+    *(u16[]) view = null;
+    if (present) { view = &values; };
+    (*view)[select(index)]
+};
+u16(u64, u64, bool) common = fn(length, index, choose) {
+    u16[length] values;
+    *(u16[]) view = &values;
+    if (choose) { view = &values; };
+    (*view)[select(index)]
+};
+if (nullable(3, 1, true) != 37 || common(4, 0, true) != 2 || common(4, 3, false) != 7) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helper_source = prepared.checked_access_source().unwrap();
+        let null_symbol = project_function_name(helper_source, "check_non_null_address");
+        let non_null = format!("call void @{null_symbol}(");
+        let bounds = format!("call void @{}(", project_function_name(helper_source, "check_index_in_extent"));
+        let select = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let helper = self_tail_test_body(&llvm, "void", &null_symbol);
+        assert!(helper.contains("br i1") && helper.contains("call void @__wosy_core_system_panic"), "{helper}");
+        for name in ["nullable", "common"] {
+            let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, name));
+            let length = length_loaded_for_runtime_array(body);
+            let required = [&non_null[..], "inttoptr", &select, &bounds, "getelementptr inbounds i16", "load i16, ptr"];
+            let order = required.map(|needle| {
+                assert_eq!(body.matches(needle).count(), 1, "{body}");
+                body.find(needle).unwrap()
+            });
+            assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{body}");
+            assert!(body[order[3]..].lines().next().unwrap().ends_with(&format!(", i64 {length})")), "{body}");
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+            if name == "nullable" {
+                let width = if layout == ScalarTargetLayout::WASM32 { 32 } else { 64 };
+                let slot = body[..order[0]].lines().find_map(|line| {
+                    line.trim_start().strip_prefix(&format!("store i{width} 0, ptr "))
+                        .and_then(|tail| tail.split(',').next())
+                }).expect("nullable declaration initializes its reference slot to zero");
+                let helper_call = body[order[0]..].lines().next().unwrap();
+                let checked = helper_call.strip_prefix(&non_null).unwrap()
+                    .strip_prefix(&format!("i{width} ")).unwrap().strip_suffix(')').unwrap();
+                let load = format!("{checked} = load i{width}, ptr {slot},");
+                assert_eq!(body[..order[0]].matches(&load).count(), 1, "{body}");
+                let conversion = format!("inttoptr i{width} {checked} to ptr");
+                assert!(body[order[1]..].starts_with(&conversion), "{body}");
+            }
+        }
+        if let Some(out) = std::env::var_os("WOSY_JOINED_RUNTIME_INDEX_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

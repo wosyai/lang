@@ -41,7 +41,7 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
-            runtime_array_read_sites: Vec::new(),
+            runtime_array_read_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
@@ -219,7 +219,7 @@ fn check_detached_tail_conditional(text: &str, check: impl Fn(&ScalarReferenceCf
             overload_arms: Vec::new(),
             reference_cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
-                runtime_array_read_sites: Vec::new(),
+                runtime_array_read_sites: HashMap::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),

@@ -632,6 +632,22 @@ pub enum CfgPointKind {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RuntimeArrayReadOrigin {
+    Unseen,
+    Null,
+    Local(ReferenceOriginId),
+    Refused,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeArrayReadSite {
+    pub(crate) occurrence: usize,
+    pub(crate) handle: Option<ByteSpan>,
+    // One backing shared by every reachable non-null origin.
+    pub(super) origin: RuntimeArrayReadOrigin,
+}
+
 #[cfg_attr(not(test), derive(Clone))]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
@@ -648,7 +664,7 @@ pub struct ScalarReferenceCfg {
     #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
     #[serde(skip)]
-    pub(crate) runtime_array_read_sites: Vec<(usize, CfgPointId, Option<ByteSpan>)>,
+    pub(crate) runtime_array_read_sites: HashMap<CfgPointId, RuntimeArrayReadSite>,
 }
 
 impl PartialEq for ScalarReferenceCfg {
@@ -684,23 +700,21 @@ impl ScalarReferenceCfg {
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             primary_call_points: HashMap::new(),
-            runtime_array_read_sites: Vec::new(),
+            runtime_array_read_sites: HashMap::new(),
         }
     }
 
     pub(crate) fn runtime_array_read_origin(&self, id: CfgPointId) -> Option<&ReferenceBindingId> {
         let read = self.points.get(id.0)?;
-        let CfgPointKind::ReadPlace { pointer_point: Some(_), candidates, reads_origin: false, .. } = &read.kind
+        let CfgPointKind::ReadPlace { pointer_point: Some(_), reads_origin: false, .. } = &read.kind
         else { return None; };
-        let mut origins = read.possible_origins.as_ref()?.iter();
-        let origin = origins.next()?;
-        if origins.next().is_some() { return None; }
-        let [candidate] = candidates.as_slice() else { return None; };
+        let RuntimeArrayReadOrigin::Local(origin) = self.runtime_array_read_sites.get(&id)?.origin
+        else { return None; };
+        if !read.possible_origins.as_ref()?.contains(&origin) { return None; }
         let ReferenceOrigin::Fresh { loan, .. } = self.facts.get(origin.0)? else { return None; };
         (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
-            && loan.origin_place.projections.is_empty() && loan.origin_place.binding == candidate.binding
-            && self.allocations.contains(&candidate.binding))
-            .then_some(&candidate.binding)
+            && loan.origin_place.projections.is_empty() && self.allocations.contains(&loan.origin_place.binding))
+            .then_some(&loan.origin_place.binding)
     }
 
     pub(crate) fn primary_call_point(
@@ -3726,7 +3740,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
-            runtime_array_read_sites: Vec::new(),
+            runtime_array_read_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
@@ -3831,7 +3845,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
                     primary_call_points: HashMap::new(),
-                    runtime_array_read_sites: Vec::new(),
+                    runtime_array_read_sites: HashMap::new(),
                     observed_runtime_allocations: None,
                     guarded_scalar_allocation: None,
                     facts: Vec::new(),
@@ -3863,7 +3877,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
-            runtime_array_read_sites: Vec::new(),
+            runtime_array_read_sites: HashMap::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),

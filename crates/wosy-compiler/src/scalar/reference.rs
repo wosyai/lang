@@ -610,7 +610,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             origin_index: ReferenceOriginIndex::default(),
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
-                runtime_array_read_sites: Vec::new(),
+                runtime_array_read_sites: HashMap::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
@@ -3819,7 +3819,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             self.proof_points.checked_pointee_reads.push(point);
         }
         if let Some((access, handle)) = runtime_read {
-            self.cfg.runtime_array_read_sites.push((access.0, point, handle));
+            self.cfg.runtime_array_read_sites.insert(point, RuntimeArrayReadSite {
+                occurrence: access.0, handle, origin: RuntimeArrayReadOrigin::Unseen,
+            });
         }
 
         if uncomputed {
@@ -9098,6 +9100,7 @@ struct ReferenceTransferCfg<'a> {
     facts: &'a mut Vec<ReferenceOrigin>,
     provisional_origin_index: Option<&'a mut ReferenceOriginIndex>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
+    runtime_array_read_sites: Option<&'a mut HashMap<CfgPointId, RuntimeArrayReadSite>>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
@@ -9139,6 +9142,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             facts: &mut cfg.facts,
             provisional_origin_index: None,
             allocations: &cfg.allocations,
+            runtime_array_read_sites: (!cfg.runtime_array_read_sites.is_empty()).then_some(&mut cfg.runtime_array_read_sites),
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             pending_returned_extent: proof.and_then(|proof| proof.pending_returned_extent),
@@ -10296,6 +10300,11 @@ fn transfer_reference_facts(
     if !deferred_policies.is_empty() || !contracts.is_empty() || cfg.pending_named_reborrow.is_some() {
         cfg.local_borrow = None;
     }
+    if let Some(sites) = cfg.runtime_array_read_sites.as_deref_mut() {
+        for site in sites.values_mut() {
+            site.origin = RuntimeArrayReadOrigin::Unseen;
+        }
+    }
     let original_points = cfg.initial_points;
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
@@ -11109,14 +11118,37 @@ fn transfer_reference_facts(
                 ..
             } = &mut point.kind
             {
+                let site = cfg.runtime_array_read_sites.as_deref_mut().and_then(|sites| sites.get_mut(&id));
+                let mut common = None::<(ReferenceOriginId, &ReferenceBindingId)>;
+                let mut compatible = site.is_some() && !*reads_origin;
+                let mut reached = false;
                 if let Some(origins) = place_read_pointer {
                     if let Some(origins) = origins.filter(|origins| !origins.is_empty()) {
                         if !*reads_origin {
                             point.possible_origins = Some(origins.clone());
                         }
                         let checked_pointee = cfg.checked_pointee_reads.binary_search(&id).is_ok();
+                        reached = true;
                         for origin in origins {
-                            match &cfg.facts[origin.0] {
+                            let fact = &cfg.facts[origin.0];
+                            if compatible {
+                                match fact {
+                                    ReferenceOrigin::Null { .. } => {}
+                                    ReferenceOrigin::Fresh { loan, .. }
+                                        if loan.mode == ScalarReferenceMutability::Shared
+                                            && loan.parent.is_none()
+                                            && loan.origin_place.projections.is_empty() =>
+                                    {
+                                        let owner = &loan.origin_place.binding;
+                                        match common {
+                                            Some((_, expected)) => compatible = owner == expected,
+                                            None => common = Some((origin, owner)),
+                                        }
+                                    }
+                                    _ => compatible = false,
+                                }
+                            }
+                            match fact {
                                 ReferenceOrigin::Fresh { loan, .. }
                                 | ReferenceOrigin::BorrowedFrom { loan, .. } => {
                                     let mut resolved = loan.origin_place.clone();
@@ -11159,6 +11191,30 @@ fn transfer_reference_facts(
                             reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                         });
                     }
+                }
+                if let Some(site) = site {
+                    use RuntimeArrayReadOrigin::*;
+                    let next = match common {
+                        _ if !reached || !compatible => Refused,
+                        None => Null,
+                        Some((origin, owner)) if cfg.allocations.contains(owner) => Local(origin),
+                        _ => Refused,
+                    };
+                    // The existing transfer can visit a point for several
+                    // incomparable incoming states. Never prefer the last
+                    // state or infer the allocation from a null alternative.
+                    site.origin = match (site.origin, next) {
+                        (Refused, _) | (_, Refused) => Refused,
+                        (Unseen | Null, next) => next,
+                        (earlier, Unseen | Null) => earlier,
+                        (earlier @ Local(id), Local(later)) => {
+                            match (&cfg.facts[id.0], &cfg.facts[later.0]) {
+                                (ReferenceOrigin::Fresh { loan: lhs, .. }, ReferenceOrigin::Fresh { loan: rhs, .. })
+                                    if lhs.origin_place.binding == rhs.origin_place.binding => earlier,
+                                _ => Refused,
+                            }
+                        }
+                    };
                 }
             }
             if let Some(origins) = assignment_pointer {
@@ -17196,6 +17252,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     facts: &mut facts,
                     provisional_origin_index: None,
                     allocations: &template_cfg.allocations,
+                    runtime_array_read_sites: None,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     pending_returned_extent: template_result.proof_points.pending_returned_extent,
@@ -17976,13 +18033,14 @@ fn build_function_reference_cfg(
         drop(provisional_origin_index);
         // The ordinary reference transfer has now resolved the actual reaching
         // loan. A type or a reference name is not an extent authority.
-        for &(_, point, _) in &builder.cfg.runtime_array_read_sites {
-            if builder.cfg.runtime_array_read_origin(point).is_none() {
-                errors.push(ReferenceAnalysisError::MissingContext {
-                    source_span: builder.cfg.points[point.0].source_span.clone(),
-                    reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
-                });
-            }
+        let mut rejected_runtime_reads: Vec<_> = builder.cfg.runtime_array_read_sites.keys().copied()
+            .filter(|&point| builder.cfg.runtime_array_read_origin(point).is_none()).collect();
+        rejected_runtime_reads.sort_unstable();
+        for point in rejected_runtime_reads {
+            errors.push(ReferenceAnalysisError::MissingContext {
+                source_span: builder.cfg.points[point.0].source_span.clone(),
+                reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
+            });
         }
         builder.proof_points.forward_initial_graph = forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {
