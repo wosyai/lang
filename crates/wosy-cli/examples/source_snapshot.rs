@@ -188,6 +188,13 @@ async fn main() -> Result<()> {
         return std::thread::spawn(move || storage_worker::run(&dir, scope, old))
             .join().map_err(|_| "storage worker fixture panicked")?;
     }
+    if selection.as_deref() == Some("--retained-source-budget") {
+        let key = FileKey {
+            package: args.next().ok_or("expected a selected source package")?,
+            path: PackageRelativePath::new(args.next().ok_or("expected a selected source path")?.into())?,
+        };
+        return recovery::run_budget(&project, &dir, &key).await;
+    }
     if selection.as_deref() == Some("--reconcile-source") {
         let replacement = args.next().ok_or("expected a replacement fixture store")?;
         let key = FileKey {

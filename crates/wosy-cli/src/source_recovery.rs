@@ -2,38 +2,132 @@
 //! persistence, derived compiler cache, or transport is owned here.
 use crate::source_preparation::{prepare_with_files, Files, PreparedSources};
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
 use wosy_protocol::{Delta, Node, NodeId};
+
+/// Bounds one selected generation's canonical payload, not the parser, file
+/// index, candidate staging, allocator overhead, or total process RSS.
+#[derive(Clone, Copy)]
+pub struct ClientSourceLimits {
+    pub nodes: usize,
+    pub encoded_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientSourceUsage {
+    pub nodes: usize,
+    pub encoded_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceLimit {
+    Nodes,
+    EncodedBytes,
+}
+
+#[derive(Debug)]
+pub enum ClientSourceError {
+    Observe(String),
+    InvalidGeneration(&'static str),
+    LimitExceeded { field: SourceLimit, limit: usize },
+}
+
+impl fmt::Display for ClientSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observe(message) => f.write_str(message),
+            Self::InvalidGeneration(message) => f.write_str(message),
+            Self::LimitExceeded { field, limit } => {
+                write!(f, "retained source exceeds {field:?} limit {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClientSourceError {}
 
 pub struct RetainedSources {
     current: PreparedSources,
     files: Files,
+    usage: ClientSourceUsage,
+    limits: ClientSourceLimits,
+}
+
+/// A staged selection is private until committed. Dropping it releases the
+/// candidate without changing the client's selected root, bytes or file index.
+pub struct StagedSourceRefresh<'a> {
+    owner: &'a mut RetainedSources,
+    data: NextSelection,
+}
+
+enum NextSelection {
+    Same { parsed: usize, reused: usize },
+    Replace { source: PreparedSources, files: Files, closure: Closure },
+}
+
+impl StagedSourceRefresh<'_> {
+    pub fn root(&self) -> NodeId {
+        match &self.data {
+            NextSelection::Same { .. } => self.owner.current.root,
+            NextSelection::Replace { source, .. } => source.root,
+        }
+    }
+
+    pub fn usage(&self) -> ClientSourceUsage {
+        match &self.data {
+            NextSelection::Same { .. } => self.owner.usage,
+            NextSelection::Replace { closure, .. } => closure.usage(),
+        }
+    }
+
+    pub fn commit(self) {
+        let Self { owner, data } = self;
+        match data {
+            NextSelection::Same { parsed, reused } => {
+                owner.current.parsed = parsed;
+                owner.current.reused = reused;
+            }
+            NextSelection::Replace { mut source, files, closure } => {
+                owner.current.delta.nodes.retain(|id, _| {
+                    closure.nodes.contains(id) && !source.delta.nodes.contains_key(id)
+                });
+                source.delta.nodes.retain(|id, _| closure.nodes.contains(id));
+                source.delta.nodes.append(&mut owner.current.delta.nodes);
+                owner.current = source;
+                owner.files = files;
+                owner.usage = closure.usage();
+            }
+        }
+    }
 }
 
 impl RetainedSources {
-    pub fn observe(project: &Path, target: Option<&str>) -> Result<Self, String> {
-        let (mut current, files) = prepare_with_files(project, target, None)?;
-        let closure = reachable(current.root, &current.delta, None)?;
-        current.delta.nodes.retain(|id, _| closure.contains(id));
-        Ok(Self { current, files })
+    pub fn observe(
+        project: &Path, target: Option<&str>, limits: ClientSourceLimits,
+    ) -> Result<Self, ClientSourceError> {
+        let (mut current, files) = prepare_with_files(project, target, None).map_err(ClientSourceError::Observe)?;
+        let closure = reachable(current.root, &current.delta, None, limits)?;
+        current.delta.nodes.retain(|id, _| closure.nodes.contains(id));
+        Ok(Self { current, files, usage: closure.usage(), limits })
     }
 
-    pub fn refresh(&mut self, project: &Path, target: Option<&str>) -> Result<(), String> {
-        let (mut next, files) = prepare_with_files(project, target, Some(&self.files))?;
-        if self.current.root == next.root {
-            self.current.parsed = next.parsed;
-            self.current.reused = next.reused;
-            return Ok(());
-        }
-        let closure = reachable(next.root, &next.delta, Some(&self.current.delta))?;
-        // Do not invalidate the selected root until the new closure is known.
-        // Move retained byte buffers; prior generations do not accumulate.
-        self.current.delta.nodes.retain(|id, _| closure.contains(id) && !next.delta.nodes.contains_key(id));
-        next.delta.nodes.retain(|id, _| closure.contains(id));
-        next.delta.nodes.append(&mut self.current.delta.nodes);
-        self.current = next;
-        self.files = files;
+    pub fn refresh(&mut self, project: &Path, target: Option<&str>) -> Result<(), ClientSourceError> {
+        self.stage_refresh(project, target)?.commit();
         Ok(())
+    }
+
+    pub fn stage_refresh(
+        &mut self, project: &Path, target: Option<&str>,
+    ) -> Result<StagedSourceRefresh<'_>, ClientSourceError> {
+        let (source, files) = prepare_with_files(project, target, Some(&self.files)).map_err(ClientSourceError::Observe)?;
+        let data = if self.current.root == source.root {
+            NextSelection::Same { parsed: source.parsed, reused: source.reused }
+        } else {
+            let closure = reachable(source.root, &source.delta, Some(&self.current.delta), self.limits)?;
+            NextSelection::Replace { source, files, closure }
+        };
+        Ok(StagedSourceRefresh { owner: self, data })
     }
 
     /// A complete source submission, including unchanged input nodes. The
@@ -42,16 +136,43 @@ impl RetainedSources {
     pub fn selected(&self) -> &PreparedSources {
         &self.current
     }
+
+    pub fn usage(&self) -> ClientSourceUsage {
+        self.usage
+    }
 }
 
-fn reachable(root: NodeId, delta: &Delta, base: Option<&Delta>) -> Result<HashSet<NodeId>, String> {
-    let mut closure = HashSet::new();
+struct Closure {
+    nodes: HashSet<NodeId>,
+    encoded_bytes: usize,
+}
+
+impl Closure {
+    fn usage(&self) -> ClientSourceUsage {
+        ClientSourceUsage { nodes: self.nodes.len(), encoded_bytes: self.encoded_bytes }
+    }
+}
+
+fn reachable(
+    root: NodeId, delta: &Delta, base: Option<&Delta>, limits: ClientSourceLimits,
+) -> Result<Closure, ClientSourceError> {
+    use ClientSourceError::{InvalidGeneration, LimitExceeded};
+    let nodes_over = || LimitExceeded { field: SourceLimit::Nodes, limit: limits.nodes };
+    let bytes_over = || LimitExceeded { field: SourceLimit::EncodedBytes, limit: limits.encoded_bytes };
+    if limits.nodes == 0 { return Err(nodes_over()); }
+    let mut closure = Closure { nodes: HashSet::from([root]), encoded_bytes: 0 };
     let mut pending = vec![root];
     while let Some(id) = pending.pop() {
-        if !closure.insert(id) { continue; }
         let bytes = delta.nodes.get(&id).or_else(|| base.and_then(|base| base.nodes.get(&id)))
-            .ok_or("client source generation is not closed")?;
-        pending.extend(Node::child_ids(bytes).ok_or("invalid client source generation node")?);
+            .ok_or(InvalidGeneration("client source generation is not closed"))?;
+        closure.encoded_bytes = closure.encoded_bytes.checked_add(bytes.len())
+            .filter(|&total| total <= limits.encoded_bytes).ok_or_else(bytes_over)?;
+        for child in Node::child_ids(bytes).ok_or(InvalidGeneration("invalid client source generation node"))? {
+            if closure.nodes.insert(child) {
+                if closure.nodes.len() > limits.nodes { return Err(nodes_over()); }
+                pending.push(child);
+            }
+        }
     }
     Ok(closure)
 }

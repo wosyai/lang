@@ -96,3 +96,63 @@ with tempfile.TemporaryDirectory() as temp:
         "recovered_open_ms": round(phase3["replacement_open_ms"], 3),
         "process_wall_ms": round(wall, 3), "process_peak_kib": usage.ru_maxrss,
     }, flush=True)
+
+
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp) / "app"
+    (root / "src").mkdir(parents=True)
+    (root / "stdlib/src").mkdir(parents=True)
+    (root / "wosy.toml").write_text(manifest)
+    (root / "stdlib/wosy.toml").write_text('[package]\nname = "std"\nsource_root = "src"\n')
+    (root / "src/main.w").write_text(source(
+        'payload = namespace std "packet.w";\npayload.Packet packet = { .count = 19; };\n', "application"
+    ))
+    original = source("struct copy Packet { u32 count; }\n", "original ☕")
+    over_budget = source("struct copy Packet { u32 count; }\n", "excede " + "ç" * 4096)
+    edited = source("struct copy Packet { u64 count; }\n", "editado 🚀")
+    path = root / "stdlib/src/packet.w"
+    path.write_text(original)
+    start = time.perf_counter()
+    with subprocess.Popen(
+        [example, root, Path(temp) / "store", "--retained-source-budget", "std", "src/packet.w"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    ) as child:
+        phase1 = json.loads(child.stdout.readline())
+        path.write_text(over_budget)
+        child.stdin.write("\n")
+        child.stdin.flush()
+        phase2 = json.loads(child.stdout.readline())
+        path.write_text(edited)
+        child.stdin.write("\n")
+        child.stdin.flush()
+        phase3 = json.loads(child.stdout.readline())
+        assert child.stdout.read() == ""
+        _, status, usage = os.wait4(child.pid, 0)
+        child.returncode = os.waitstatus_to_exitcode(status)
+        assert child.returncode == 0
+    wall = (time.perf_counter() - start) * 1000
+
+    initial = phase1["initial"]
+    assert phase1["exact_limits"] and phase1["both_one_less_rejected"]
+    assert phase2["after_rejection"] == phase3["after_cancel"] == initial
+    assert phase2["original_publish"]["written"] > 0
+    assert phase2["original_state"]["authored"] == original
+    assert phase2["original_state"]["modules"][1]["structs"][0]["layout"]["size"] == 4
+    assert phase3["cancelled_repeat"]["written"] == 0
+    committed = phase3["committed"]
+    assert committed["root"] == phase3["candidate"] != initial["root"]
+    assert (committed["parsed"], committed["reused"]) == (1, 1)
+    assert committed["retained_node_bytes"] <= phase1["refresh_byte_limit"]
+    assert phase3["new_publish"]["written"] > 0
+    assert phase3["new_state"]["authored"] == edited
+    assert "editado" in phase3["new_state"]["comments"][0]["raw_payload"]
+    assert phase3["new_state"]["modules"][1]["structs"][0]["layout"]["size"] == 8
+    assert path.read_text() == edited and not (root / ".wosy").exists()
+    print("exact payload caps, over-limit recovery, cancelled staging, explicit commit", {
+        "selected_nodes": [initial["retained_nodes"], committed["retained_nodes"]],
+        "selected_encoded_bytes": [initial["retained_node_bytes"], committed["retained_node_bytes"]],
+        "refresh_byte_limit": phase1["refresh_byte_limit"],
+        "rejected_ms": round(phase2["rejected_ms"], 3),
+        "staged_ms": round(phase3["stage_ms"], 3), "commit_ms": round(phase3["commit_ms"], 3),
+        "process_wall_ms": round(wall, 3), "process_peak_kib": usage.ru_maxrss,
+    }, flush=True)
