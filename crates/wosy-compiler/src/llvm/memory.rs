@@ -391,7 +391,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             }
             let borrowed_extent = match (&base_type, base.as_ref()) {
                 (ScalarType::RuntimeArray { element, .. }, crate::ScalarPlace::Dereference { pointer, .. })
-                    if !fixed_index_has_raw_root(state, base) =>
+                    if !index_has_raw_root(state, base) =>
                 {
                     let nodes = state.body_call_nodes.ok_or("indexed borrow has no prepared nodes")?;
                     let (owner, handle) = nodes.place_ordinal(place)
@@ -451,6 +451,16 @@ pub(super) fn place_pointer<'ctx, 'module>(
             } else {
                 None
             };
+            // All typed runtime indexed actions use this address path. In
+            // release mode only an exact reachable extent, or the explicitly
+            // unsafe raw-pointer corridor, can permit address formation.
+            if state.require_release_checked_access
+                && matches!(base_type, ScalarType::RuntimeArray { .. })
+                && guarded_extent.is_none() && runtime_extent.is_none()
+                && !index_has_raw_root(state, base)
+            {
+                return Err("runtime array indexing requires its authenticated backing extent".into());
+            }
             let checked_lexical_descriptor = runtime_extent.is_some()
                 && state.local_runtime_extents.get(&base_pointer)
                     .is_some_and(|(_, extent, _)| matches!(extent,
@@ -542,7 +552,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 .map_err(builder_error);
             }
             let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
-            let checked = guarded_extent.is_some() || !fixed_index_has_raw_root(state, base);
+            let checked = guarded_extent.is_some() || !index_has_raw_root(state, base);
             if checked {
                 check_fixed_index(context, state, index, length, fallback)?;
             }
@@ -748,7 +758,7 @@ fn check_release_index<'ctx>(
     emit_checked_access_call(state, &access.in_extent, &[index.into(), count.into()])
 }
 
-fn fixed_index_has_raw_root(state: &EmitState<'_, '_>, mut place: &crate::ScalarPlace) -> bool {
+fn index_has_raw_root(state: &EmitState<'_, '_>, mut place: &crate::ScalarPlace) -> bool {
     loop {
         match place {
             crate::ScalarPlace::Field { base, .. } | crate::ScalarPlace::Index { base, .. } => place = base,

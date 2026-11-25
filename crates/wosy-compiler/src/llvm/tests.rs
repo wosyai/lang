@@ -17128,3 +17128,30 @@ if (replace(7) != 37) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
+    for (body, output) in [
+        ("values[index]", "u8"),
+        ("values[index] = 37;", "unit"),
+        ("*u8 view = &values[index]; *view", "u8"),
+    ] {
+        let text = format!("%%start\n{output}(u8[],u64) indexed = fn(values,index) {{ {body} }};\n%%end");
+        for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+            let parsed = parse_source(source.clone(), text.clone(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            match emit_scalar_build_project_llvm(&checked) {
+                Err(error) => assert!(error.contains("runtime array indexing requires its authenticated backing extent"), "{error}"),
+                Ok(_) => panic!("checked {output} path must not form an address without its paired extent"),
+            }
+        }
+    }
+}
