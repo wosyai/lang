@@ -129,6 +129,7 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
 #[derive(Clone, Copy)]
 enum LocalRuntimeExtent<'ctx> {
     Construction(inkwell::values::IntValue<'ctx>),
+    OrdinaryDescriptor(inkwell::values::IntValue<'ctx>),
     WidenedLiteral(inkwell::values::IntValue<'ctx>),
     OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),
@@ -1958,7 +1959,8 @@ fn store_binding_outputs<'ctx, 'module>(
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
-    if aggregate_transfer::install_widened_owning_receiver(context, state, binding, &value)? {
+    if aggregate_transfer::install_ordinary_array_descriptor(context, state, binding, &value)?
+        || aggregate_transfer::install_widened_owning_receiver(context, state, binding, &value)? {
         return Ok(());
     }
     if store_widened_join(context, state, binding, &value)? {

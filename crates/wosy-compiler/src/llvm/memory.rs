@@ -420,6 +420,9 @@ pub(super) fn place_pointer<'ctx, 'module>(
             } else {
                 None
             };
+            let ordinary_descriptor = runtime_extent.is_some()
+                && state.local_runtime_extents.get(&base_pointer)
+                    .is_some_and(|(_, extent, _)| matches!(extent, LocalRuntimeExtent::OrdinaryDescriptor(_)));
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = guarded_extent {
@@ -433,12 +436,20 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     }
                 }
                 if let Some(extent) = runtime_extent {
-                    check_release_index(state, index, extent)?;
+                    if ordinary_descriptor {
+                        check_array_extent(context, state, index, extent, Some((
+                            "ordinary_array_index_out_of_bounds", "ordinary_array_index_panic", "ordinary_array_index_continue",
+                        )))?;
+                    } else {
+                        check_release_index(state, index, extent)?;
+                    }
                 } else if super::aggregate_transfer::requires_returned_array_index(state) {
                     return Err("sealed returned array index lost its paired extent".into());
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
-                let index = if guarded_extent.is_some() { array_address_index(context, state, index)? } else { index };
+                let index = if guarded_extent.is_some() || ordinary_descriptor {
+                    array_address_index(context, state, index)?
+                } else { index };
                 return unsafe {
                     state.builder.build_in_bounds_gep(
                         element,
@@ -544,7 +555,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
     }
     match extent {
         LocalRuntimeExtent::Construction(length) | LocalRuntimeExtent::WidenedLiteral(length)
-            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+        | LocalRuntimeExtent::OrdinaryDescriptor(length) if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
                 Ok(Some(*length)),
         LocalRuntimeExtent::OwningFormal(length)
             if !for_index && *storage == address && state.runtime_array_allocations.get(name) == Some(&false) =>

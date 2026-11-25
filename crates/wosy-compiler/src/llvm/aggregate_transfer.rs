@@ -482,6 +482,38 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
     Ok(Some(EmitValue::Basic(value)))
 }
 
+pub(super) fn install_ordinary_array_descriptor<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    binding: &ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    let Some(receivers) = state.aggregate.as_ref().map(|aggregate| &aggregate.plan.ordinary_array_descriptor_receivers)
+        .filter(|receivers| !receivers.is_empty()) else { return Ok(false); };
+    let nodes = state.body_call_nodes.ok_or("missing ordinary returned array receipt")?;
+    let Some(&span) = nodes.expression_ordinal(&binding.value).and_then(|call| receivers.get(&call))
+        else { return Ok(false); };
+    let [receiver] = binding.receivers.as_slice() else { return Err("missing ordinary array receiver".into()); };
+    if receiver.name_span != span || nodes.binding_position(binding).is_none()
+        || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+        || binding.fallible_assignment.is_some() || binding.is_allocation
+    { return Err("ordinary array receiver changed its prepared assignment boundary".into()); }
+    let (backing, extent) = unpack_widened_owning_descriptor(context, state, value)?;
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing ordinary array receiver block")?;
+    let present = context.append_basic_block(function, "ordinary.array_present");
+    let absent = context.append_basic_block(function, "ordinary.array_absent");
+    let available = state.builder.build_is_not_null(backing, "ordinary.array_available").map_err(builder_error)?;
+    state.builder.build_conditional_branch(available, present, absent).map_err(builder_error)?;
+    state.builder.position_at_end(absent);
+    super::expression::emit_terminal_system_panic(context, state)?;
+    state.builder.position_at_end(present);
+    install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.local_runtime_extents.insert(backing, (span, LocalRuntimeExtent::OrdinaryDescriptor(extent), true));
+    Ok(true)
+}
+
 pub(super) fn install_widened_owning_receiver<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,

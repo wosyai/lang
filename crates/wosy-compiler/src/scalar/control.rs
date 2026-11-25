@@ -76,6 +76,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) pending_returned_extent: Option<super::CfgPointId>,
     pub(super) widened_rebind_points: Option<HashSet<super::CfgPointId>>,
     pub(super) array_length_owners: HashSet<super::ReferenceBindingId>,
+    pub(super) ordinary_array_receivers: HashMap<super::ReferenceBindingId, OccurrenceOrdinal>,
     pub(super) fallible_aliases: HashMap<super::ReferenceBindingId, super::ReferenceBindingId>,
     pub(super) fallible_alias_accesses: Vec<(OccurrenceOrdinal, super::ReferenceBindingId)>,
     pub(super) guarded_indexed_stores: HashSet<super::CfgPointId>,

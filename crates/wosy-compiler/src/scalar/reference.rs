@@ -2042,6 +2042,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     .and_then(|sites| sites.get(&place.binding)).is_some_and(|site|
                                         site.has_runtime_extent()) => {}
                             Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
+                                && self.proof_points.ordinary_array_receivers.contains_key(&place.binding) => {
+                                self.aggregate_result.ordinary_array_extent_demands.insert(
+                                    self.proof_points.ordinary_array_receivers[&place.binding]);
+                                self.proof_points.array_length_owners.insert(place.binding.clone());
+                            }
+                            Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
                                 && self.cfg.allocations.contains(&place.binding) => {
                                 self.proof_points.array_length_owners.insert(place.binding.clone());
                             }
@@ -2788,6 +2794,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     }
                     _ => None,
                 };
+                if let Some(call) = exposed.as_ref().and_then(|owner| self.proof_points.ordinary_array_receivers.get(owner)) {
+                    self.aggregate_result.ordinary_array_incompatible_uses.insert(*call);
+                }
                 self.proof_points.raw_address_exposures.push((value, exposed));
                 if let Some(&pointer) = self.dereference_points.get(&root.ordinal) {
                     self.aggregate_facts.receipt_loan_sinks.insert(value, vec![pointer]);
@@ -2919,6 +2928,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     None => self.binding(name, span)?,
                     _ => unreachable!("null and module name reads handled above"),
                 };
+                // Whole reads, including values passed, captured, moved,
+                // discarded or returned, are outside direct-backing enrollment.
+                if let Some(call) = self.proof_points.ordinary_array_receivers.get(&binding) {
+                    self.aggregate_result.ordinary_array_incompatible_uses.insert(*call);
+                }
                 if self.proof_points.guarded_runtime_receivers.contains(&binding) {
                     return Err(self.missing_origin(span, binding, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
                 }
@@ -2947,6 +2961,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 let root = self.place_root(place, place_ordinal);
+                let extent_only = matches!(read_mode, ExpressionReadMode::ArrayLengthArgument)
+                    && *mutability == ScalarReferenceMutability::Shared && matches!(place, ScalarPlace::Name { .. });
+                if !extent_only {
+                    if let ScalarPlace::Name { span, .. } = root.place {
+                        if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(root.ordinal, *span)? {
+                            if let Some(call) = self.proof_points.ordinary_array_receivers.get(binding) {
+                                self.aggregate_result.ordinary_array_incompatible_uses.insert(*call);
+                            }
+                        }
+                    }
+                }
                 let guarded_length = matches!(read_mode, ExpressionReadMode::ArrayLengthArgument)
                     && *mutability == ScalarReferenceMutability::Shared
                     && matches!(place, ScalarPlace::Name { span, .. }
@@ -5082,6 +5107,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         ordinal: OccurrenceOrdinal,
     ) -> Result<ReferenceAssignmentDestination<'a>, ReferenceAnalysisError> {
         if let ScalarPlace::Name { span, .. } = &target.place {
+            if let Some(DirectDestinationIdentity::Existing(binding)) = self.call_sites.prepared_direct_destination(ordinal) {
+                if let Some(call) = self.proof_points.ordinary_array_receivers.get(binding) {
+                    self.aggregate_result.ordinary_array_incompatible_uses.insert(*call);
+                }
+            }
             return match &self.call_sites.direct_destinations {
                 DirectDestinationFacts::Raw => Ok(ReferenceAssignmentDestination::RawName),
                 DirectDestinationFacts::Prepared(rows) => rows
@@ -5466,6 +5496,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
                         aggregate::same_runtime_array_type(&site.ty, &receiver.ty).then(|| source.clone())
                     })();
+                    let ordinary_array_receive = call_producer.filter(|&point|
+                        !block.unsafe_context && self.generic_parameters.is_empty()
+                            && !binding.is_allocation && binding.fallible_assignment.is_none()
+                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                            && matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+                            && super::typecheck::guarded_runtime_rhs(primary)
+                            && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                                signature.parameters.as_slice() == [ScalarType::U64]
+                                    && matches!(signature.outputs.outputs.as_slice(), [output]
+                                        if aggregate::same_runtime_array_type(&output.ty, &receiver.ty)))
+                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
                     let widened_move = outputs.secondary.is_empty()
                         && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
                     self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
@@ -5477,6 +5520,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         kind: ReferenceBindingKind::Declared,
                     };
                     self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
+                    if let Some(point) = ordinary_array_receive {
+                        self.proof_points.ordinary_array_receivers.insert(id.clone(), primary_ordinal);
+                        self.aggregate_result.ordinary_array_receivers.push((point, primary_ordinal, receiver.span));
+                    }
                     if let Some(source) = guarded_move {
                         declares_guarded_owner = true;
                         let read = initializer.ok_or_else(|| self.missing_context(expression_span(primary),
@@ -16998,6 +17045,7 @@ impl FunctionReferenceResult {
                 || !self.aggregate.ordinary_fallible_call_candidates.is_empty()
                 || !self.aggregate.ordinary_fallible_expressions.is_empty()
                 || self.aggregate.guarded_array_producer_choice.is_some()
+                || !self.aggregate.ordinary_array_receivers.is_empty()
             {
                 facts.insert((item, arm), self.aggregate);
             }
