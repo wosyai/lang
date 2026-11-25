@@ -196,6 +196,9 @@ pub(super) fn emit_return<'ctx, 'module>(
         return Ok(());
     }
     if let Some(aggregate) = state.aggregate.as_ref().filter(|aggregate| aggregate.plan().fallible_allocation_leaf) {
+        if aggregate.fallible_relay_next != aggregate.plan().fallible_relay_allocations.len() {
+            return Err("incomplete sealed terminal fallible allocation backing".into());
+        }
         let payload = aggregate.plan().fallible_allocation_payload.as_ref()
             .ok_or("missing sealed fallible leaf payload type")?;
         let value = super::aggregate_transfer::present_fallible_allocation_result(

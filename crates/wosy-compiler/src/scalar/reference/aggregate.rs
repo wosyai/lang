@@ -6717,10 +6717,11 @@ fn closed_aggregates<'a>(
     let mut recommit_returns = BTreeSet::new();
     let mut fallible_choices = BTreeSet::<(BodyKey, usize)>::new();
     let mut fallible_payloads = BTreeMap::new();
-    let mut fallible_allocation_relays = BTreeMap::new();
+    let mut fallible_allocation_relays = BTreeSet::new();
+    let mut fallible_prefixes = BTreeMap::new();
     let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
-        let allocation_leaf = |key: BodyKey| -> Option<ScalarType> {
+        let allocation_leaf = |key: BodyKey| -> Option<(ScalarType, Vec<ByteSpan>)> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
             let input = module_at(key.0)?;
             let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
@@ -6734,30 +6735,49 @@ fn closed_aggregates<'a>(
                 || !matches!(sites.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::U64)
                 || !matches!(output.ty, ScalarType::U64 | ScalarType::I32)
             { return None; }
-            let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(result)] =
-                function.body.items.as_slice() else { return None; };
-            let [receiver] = allocation.receivers.as_slice() else { return None; };
-            if !allocation.is_allocation || allocation.fallible_assignment.is_some()
-                || !matches!(allocation.value, ScalarExpression::Integer { ref value, span }
-                    if *value == 0.into() && span == allocation.span)
-                || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
-            { return None; }
+            let ([ScalarBlockItem::LocalBinding(last_allocation), ScalarBlockItem::Expression(result)], prefix) =
+                function.body.items.split_at_checked(function.body.items.len().checked_sub(2)?)
+                    .map(|(prefix, suffix)| (suffix, prefix))? else { return None; };
+            if prefix.len() % 2 != 0 { return None; }
             let (_, cfg) = result_at(key, function)?;
-            if cfg.allocations.len() != 1 || !cfg.guarded_scalar_allocations().is_empty() { return None; }
-            let owner = cfg.allocations.first()?;
-            if owner.declaration_span != receiver.name_span
-                || cfg.observed_runtime_allocations.as_deref()? != [(receiver.name_span.start, receiver.name_span.end)]
-            { return None; }
-            let root = &sites.structure.blocks[sites.structure.root.0];
+            if cfg.allocations.len() != prefix.len() / 2 + 1 || !cfg.guarded_scalar_allocations().is_empty() {
+                return None;
+            }
+            let root = sites.structure.blocks.get(sites.structure.root.0)?;
             let formal = parameter_binding_identity(input.source, function.span,
                 root.span, &sites.boundary.parameters[0]);
-            let BlockItemKind::Binding(region) = &root.items.first()?.kind else { return None; };
-            let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
-            let [length] = lengths.as_slice() else { return None; };
-            if length.position != 0
-                || sites.structure.checked_types.expressions.get(&length.expression) != Some(&ScalarType::U64)
-                || !matches!(sites.prepared_plain_name(length.expression)?,
-                    PlainNameIdentity::Lexical(binding) if binding == &formal)
+            let mut by_span = cfg.allocations.iter().map(|owner| (owner.declaration_span, owner))
+                .collect::<HashMap<_, _>>();
+            if by_span.len() != cfg.allocations.len() { return None; }
+            let mut allocations = Vec::new();
+            for (index, pair) in prefix.chunks_exact(2).enumerate() {
+                let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(observer @ ScalarExpression::Call { .. })] =
+                    pair else { return None; };
+                let BlockItemKind::Evaluation { .. } = &root.items.get(index * 2 + 1)?.kind else { return None; };
+                allocations.push((allocation, Some(observer)));
+            }
+            allocations.push((last_allocation, None));
+            let mut owners = Vec::new();
+            for (index, &(allocation, _)) in allocations.iter().enumerate() {
+                let [receiver] = allocation.receivers.as_slice() else { return None; };
+                if !allocation.is_allocation || allocation.fallible_assignment.is_some()
+                    || !matches!(allocation.value, ScalarExpression::Integer { ref value, span }
+                        if *value == 0.into() && span == allocation.span)
+                    || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+                { return None; }
+                owners.push(by_span.remove(&receiver.name_span)?);
+                let BlockItemKind::Binding(region) = &root.items.get(index * 2)?.kind else { return None; };
+                let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
+                let [length] = lengths.as_slice() else { return None; };
+                if length.position != 0
+                    || sites.structure.checked_types.expressions.get(&length.expression) != Some(&ScalarType::U64)
+                    || !matches!(sites.prepared_plain_name(length.expression)?,
+                        PlainNameIdentity::Lexical(binding) if binding == &formal)
+                { return None; }
+            }
+            let spans = owners.iter().map(|owner| owner.declaration_span).collect::<Vec<_>>();
+            if !cfg.observed_runtime_allocations.as_deref().is_some_and(|observed|
+                observed.iter().copied().eq(spans.iter().map(|span| (span.start, span.end))))
             { return None; }
             // The signed corridor is ordinary subtraction of an authored
             // contextual integer and an exact truncation of the observed
@@ -6770,8 +6790,7 @@ fn closed_aggregates<'a>(
                 let ScalarExpression::Call { arguments, .. } = right.as_ref() else { return None; };
                 let [argument] = arguments.as_slice() else { return None; };
                 if !matches!(argument, ScalarExpression::Call { .. }) { return None; }
-                let [_, BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }] = root.items.as_slice()
-                    else { return None; };
+                let BlockItemKind::FinalOutput(slot) = &root.items.last()?.kind else { return None; };
                 let OccurrenceNode::Expression(truncate) = sites.structure.edges.get(&(
                     OccurrenceParent::Expression(slot.expression), OccurrenceEdge::BinaryRight,
                 ))? else { return None; };
@@ -6785,22 +6804,38 @@ fn closed_aggregates<'a>(
             let mut truncate = None;
             let mut signed_result = None;
             let mut returned = false;
+            let mut index = 0;
             let mut placeholder = false;
+            let mut bound = false;
+            let mut borrowed = None;
             for point in &cfg.initial_points {
+                if point.successors.len() > 1 { return None; }
                 match &point.kind {
                     CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
                     | CfgPointKind::Return => {}
-                    CfgPointKind::Read { binding } if binding == &formal => {}
+                    CfgPointKind::Read { binding } | CfgPointKind::Bind { binding } if binding == &formal => {}
                     // The canonical CFG evaluates derive_binding's synthetic
-                    // zero for an uninitialized runtime-allocation declaration.
-                    CfgPointKind::Evaluate(value) if !placeholder && value == &allocation.value => placeholder = true,
-                    CfgPointKind::Bind { binding } if binding == &formal || binding == owner => {}
-                    CfgPointKind::Borrow { place, loan } if place.binding == *owner
-                        && place.projections.is_empty() && loan.mode == ScalarReferenceMutability::Shared => {}
+                    // zero for each uninitialized runtime allocation.
+                    CfgPointKind::Evaluate(value) if !placeholder
+                        && allocations.get(index).is_some_and(|(allocation, _)| value == &allocation.value) =>
+                        placeholder = true,
+                    CfgPointKind::Bind { binding } if placeholder && !bound && owners.get(index) == Some(&binding) =>
+                        bound = true,
+                    CfgPointKind::Borrow { place, loan } if bound && borrowed.is_none()
+                        && owners.get(index) == Some(&&place.binding)
+                        && place.projections.is_empty() && loan.mode == ScalarReferenceMutability::Shared =>
+                        borrowed = Some(point.id),
                     CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
-                        argument_points, .. } if extent.is_none() && matches!(argument_points.as_slice(), [borrow]
-                            if matches!(&cfg.initial_points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
-                                if place.binding == *owner)) => extent = Some(point.id),
+                        argument_points, expression } if borrowed.is_some()
+                            && matches!(argument_points.as_slice(), [id] if Some(*id) == borrowed)
+                            && allocations.get(index).is_some_and(|(_, observer)|
+                                observer.is_none_or(|observer| observer == expression)) => {
+                        index += 1;
+                        if index == allocations.len() { extent = Some(point.id); }
+                        placeholder = false;
+                        bound = false;
+                        borrowed = None;
+                    }
                     CfgPointKind::Evaluate(value) if !literal && signed.is_some_and(|(left, _)| value == left) =>
                         literal = true,
                     CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::IntTrunc),
@@ -6816,7 +6851,8 @@ fn closed_aggregates<'a>(
                     _ => return None,
                 }
             }
-            (returned && placeholder && (signed.is_none() || literal)).then(|| output.ty.clone())
+            (returned && index == allocations.len() && (signed.is_none() || literal))
+                .then(|| (output.ty.clone(), spans))
         };
         let dependencies = |key: BodyKey| -> Option<Vec<BodyKey>> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
@@ -7012,9 +7048,12 @@ fn closed_aggregates<'a>(
                 if !visited.insert(current) {
                     return Err("fallible allocating callable relay cycle requires an allocation leaf".into());
                 }
-                if let Some(actual) = allocation_leaf(current) {
+                if let Some((actual, allocations)) = allocation_leaf(current) {
                     check_payload(&actual)?;
                     fallible_payloads.insert(current, actual);
+                    // A sole terminal allocation still uses the original
+                    // branch. Multi-allocation terminals take shared unwind.
+                    if allocations.len() > 1 { fallible_prefixes.insert(current, allocations); }
                     break;
                 }
                 let Some((next, ordinal, allocation, actual)) = relay(current) else {
@@ -7023,7 +7062,8 @@ fn closed_aggregates<'a>(
                 check_payload(&actual)?;
                 payload = Some(actual.clone());
                 fallible_payloads.insert(current, actual);
-                fallible_allocation_relays.insert(current, allocation);
+                fallible_allocation_relays.insert(current);
+                fallible_prefixes.insert(current, allocation);
                 incoming = (current, ordinal.0);
                 current = next;
             }
@@ -7407,8 +7447,8 @@ fn closed_aggregates<'a>(
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         for (&target, sites) in &fallible_allocating_targets {
             let body = result.bodies.entry(target).or_default();
-            body.fallible_allocation_relay = fallible_allocation_relays.contains_key(&target);
-            body.fallible_relay_allocations = fallible_allocation_relays.get(&target).cloned().unwrap_or_default();
+            body.fallible_allocation_relay = fallible_allocation_relays.contains(&target);
+            body.fallible_relay_allocations = fallible_prefixes.get(&target).cloned().unwrap_or_default();
             body.fallible_allocation_leaf = !body.fallible_allocation_relay;
             body.fallible_allocation_payload = fallible_payloads.get(&target).cloned();
             for &(caller, ordinal) in sites {

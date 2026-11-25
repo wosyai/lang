@@ -13242,3 +13242,76 @@ ordinary(13);
         }
     }
 }
+
+#[test]
+fn guarded_fallible_terminal_prefix_unwinds_only_installed_owners() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+i32(u64) _terminal = fn(count) {
+    u8[count] first; core.array_len(&first);
+    u8[count] second; core.array_len(&second);
+    u8[count] third; 7 - core.int_trunc<i32>(core.array_len(&third))
+};
+i32(u64) observed = fn(count) {
+    i32 result =? _terminal(count);
+    if (&result == null) { -99 } else { result }
+};
+if (observed(7) != -99 || observed(7) != -99 || observed(7) != -99 || observed(7) != -99
+    || observed(9) != -2 || observed(7) != 0 || observed(0) != 7) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible terminal prefix");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let terminal = module.get_function(&self_tail_test_symbol(source, project, "_terminal")).unwrap();
+            let observed = module.get_function(&self_tail_test_symbol(source, project, "observed")).unwrap();
+            let allocate = module.get_function("__wosy_core_alloc").unwrap();
+            let release = module.get_function("__wosy_core_free").unwrap();
+            assert_eq!(terminal.get_linkage(), inkwell::module::Linkage::Internal);
+            assert_eq!(terminal.get_type().get_return_type(), Some(
+                context.struct_type(&[context.bool_type().into(), context.i32_type().into()], false).into()));
+            assert_eq!(observed.get_type().get_return_type(), Some(context.i32_type().into()));
+            let blocks = terminal.get_basic_blocks();
+            let calls = |callee| blocks.iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                    .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+            let [first, second, third] = calls(allocate)[..] else { panic!("{llvm}") };
+            let releases = calls(release);
+            assert_eq!(releases.len(), 5);
+            let absent = *blocks.iter().find(|block| block.get_name().to_bytes() == b"allocation_absent").unwrap();
+            assert_eq!(absent.get_first_instruction(), absent.get_terminator());
+            assert_eq!(absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Return);
+            let mut prior = absent;
+            for (owner, next) in [(first, second), (second, third)] {
+                let released = *releases.iter().find(|release| release.get_parent().unwrap().get_name().to_bytes()
+                    .starts_with(b"allocation_unwind")
+                    && known_field_operand(**release, 0).unwrap().as_instruction_value() == Some(owner)).unwrap();
+                let cold = released.get_parent().unwrap();
+                assert_eq!(cold.get_first_instruction(), Some(released));
+                let jump = released.get_next_instruction().unwrap();
+                assert_eq!(jump.get_num_operands(), 1);
+                assert!(jump.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(prior)));
+                let null_branch = next.get_parent().unwrap().get_terminator().unwrap();
+                assert!(null_branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(cold)));
+                prior = cold;
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_TERMINAL_PREFIX_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
