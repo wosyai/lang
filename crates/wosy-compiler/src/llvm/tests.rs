@@ -14982,3 +14982,82 @@ if (guarded(2) != 99 || guarded(2) != 2 || ordinary(3, 2) != 3
         }
     }
 }
+
+#[test]
+fn guarded_fallible_runtime_array_explicit_release_consumes_one_present_owner() {
+    let text = "%%start
+u64[](u64) _make = fn(count) { u64[count] fresh; fresh };
+u64(bool, u64) observed = fn(explicit, count) {
+    u64[] held =? _make(count);
+    if (&held == null) { 99 } else {
+        u64 extent = core.array_len(&held);
+        held[0] = 7;
+        if (explicit) {
+            *u64 cell = &held[0];
+            *cell;
+            unsafe { core.free(&held); };
+            u8[extent] marker;
+            core.array_len(&marker);
+        };
+        extent
+    }
+};
+if (observed(true, 2) != 99 || observed(true, 2) != 2
+    || observed(false, 2) != 2) { core.system_panic(); };
+%%end";
+    let unproved = text.replace("    if (&held == null)", "    unsafe { core.free(&held); };\n    if (&held == null)");
+    let live = text.replace(
+        "            *cell;\n            unsafe { core.free(&held); };",
+        "            unsafe { core.free(&held); };\n            *cell;",
+    );
+    let repeated = text.replace("            unsafe { core.free(&held); };",
+        "            unsafe { core.free(&held); core.free(&held); };");
+    let post_release_store = text.replace("            unsafe { core.free(&held); };",
+        "            unsafe { core.free(&held); };\n            held[0] = 9;");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (case, expected) in [
+            (&unproved, "fallible allocation is not known to be available"),
+            (&live, "read or move of unavailable place"),
+            (&repeated, "fallible allocation is not known to be available"),
+            (&post_release_store, "fallible allocation is not known to be available"),
+        ] {
+            let candidate = prepare_initializer_test(case, layout);
+            let checked = analyze_scalar_build(&candidate);
+            let diagnostic = checked.diagnostics().iter().find(|diagnostic| diagnostic.message.contains(expected))
+                .unwrap_or_else(|| panic!("{expected}: {:?}", checked.diagnostics()));
+            if case == &live {
+                let origin = live.find("&held[0]").unwrap() as u32;
+                assert!(diagnostic.labels.iter().any(|label| label.kind == crate::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == origin));
+            }
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, output) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "explicit guarded release");
+            context.create_module_from_ir(bytes).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_RUNTIME_RELEASE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

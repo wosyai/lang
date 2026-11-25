@@ -82,6 +82,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) guarded_indexed_stores: HashSet<super::CfgPointId>,
     pub(super) guarded_runtime_receivers: HashSet<super::ReferenceBindingId>,
     pub(super) guarded_runtime_moves: BTreeMap<super::CfgPointId, super::reference::GuardedRuntimeMove>,
+    pub(super) guarded_releases: BTreeMap<super::CfgPointId, super::ReferenceBindingId>,
     pub(super) guarded_allocation_scopes: HashMap<usize, GuardedAllocationScope>,
     pub(super) guarded_allocation_edges: BTreeMap<super::CfgPointId, GuardedAllocationEdge>,
     pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,

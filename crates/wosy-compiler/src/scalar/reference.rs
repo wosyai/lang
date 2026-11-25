@@ -358,6 +358,7 @@ pub(crate) struct GuardedScalarAllocation {
     guards: Box<[GuardedScalarBranch]>,
     alias_accesses: Box<[usize]>,
     runtime_moves: Box<[GuardedRuntimeMove]>,
+    releases: Box<[ByteSpan]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +372,7 @@ impl GuardedScalarAllocation {
     pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
     pub(crate) fn ty(&self) -> &ScalarType { &self.ty }
     pub(crate) fn runtime_moves(&self) -> &[GuardedRuntimeMove] { &self.runtime_moves }
+    pub(crate) fn releases(&self) -> &[ByteSpan] { &self.releases }
     pub(crate) fn runtime_returned(&self) -> bool { self.runtime_returned }
     pub(crate) fn runtime_literal_length(&self) -> Option<u64> { self.runtime_literal_length }
     #[cfg(test)]
@@ -392,6 +394,7 @@ enum ExpressionReadMode {
     FallibleAliasInitializer,
     DereferenceOperand,
     ArrayLengthArgument,
+    GuardedWholeReleaseArgument,
     WidenedBorrowAddress(ByteSpan),
     WidenedOwningRoundtrip(ByteSpan),
     FixedCopyOwningArgument(ByteSpan, u64),
@@ -1978,6 +1981,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && self.binding_types.get(binding).is_some_and(|ty| aggregate::same_runtime_array_type(ty, inner)))
                         .then_some(binding.declaration_span)
                 })();
+                let guarded_release = (|| {
+                    if target != ResolvedCallTarget::Core(CoreOperationId::Free) { return None; }
+                    let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
+                        place: ScalarPlace::Name { span, .. }, .. }] = arguments.as_slice() else { return None; };
+                    let argument = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(0));
+                    let place = self.place_ordinal(OccurrenceParent::Expression(argument), OccurrenceEdge::ExpressionPlace);
+                    let PreparedPlaceRoot::Lexical(binding) = self.prepared_place_root(place, *span).ok().flatten()? else { return None; };
+                    self.proof_points.fallible_allocation_bindings.as_ref()?.get(binding)?
+                        .has_runtime_extent().then(|| binding.clone())
+                })();
                 let mut borrowed_extent_formal = None;
                 let mut aggregate_arguments = BTreeMap::new();
                 let mut array_argument = None;
@@ -1988,6 +2001,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let array_length = target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen);
                     if array_length {
                         self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::ArrayLengthArgument)?;
+                    } else if guarded_release.is_some() {
+                        self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::GuardedWholeReleaseArgument)?;
                     } else if let Some(owner) = widened_borrow {
                         self.expression_with_read_mode(
                             argument, scope, ordinal, ExpressionReadMode::WidenedBorrowAddress(owner),
@@ -2194,6 +2209,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             scope,
                             BTreeSet::new(),
                         );
+                        if let Some(owner) = guarded_release {
+                            self.proof_points.guarded_releases.insert(release, owner);
+                        }
                         if self.joined_local_reborrow {
                             self.proof_points.joined_checked_releases.push(release);
                         }
@@ -2980,7 +2998,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 if self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding))
                                     .is_some_and(|site| site.has_runtime_extent())
                                     || self.proof_points.guarded_runtime_receivers.contains(binding)));
-                if !guarded_length && !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer) {
+                if !guarded_length && !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer
+                    | ExpressionReadMode::GuardedWholeReleaseArgument) {
                     self.reject_fallible_address(place, place_ordinal, span)?;
                 }
                 let proof_place = self.proof_place(place, place_ordinal);
@@ -8791,6 +8810,7 @@ struct ReferenceTransferCfg<'a> {
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
     guarded_indexed_stores: Option<&'a HashSet<CfgPointId>>,
     guarded_runtime_moves: Option<&'a BTreeMap<CfgPointId, GuardedRuntimeMove>>,
+    guarded_releases: Option<&'a BTreeMap<CfgPointId, ReferenceBindingId>>,
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -8831,6 +8851,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             guarded_allocation_edges: proof.map(|proof| &proof.guarded_allocation_edges),
             guarded_indexed_stores: proof.map(|proof| &proof.guarded_indexed_stores),
             guarded_runtime_moves: proof.map(|proof| &proof.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
+            guarded_releases: proof.map(|proof| &proof.guarded_releases).filter(|releases| !releases.is_empty()),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -9925,7 +9946,8 @@ fn require_available_fallible_read(
     whole: bool,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) {
-    let unavailable = state.uninitialized.contains(binding);
+    let unavailable = state.uninitialized.contains(binding) || state.released.contains(binding)
+        || state.invalidated.contains(binding);
     let Some(site) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
     let reason = if whole && site.has_indexed_extent() {
         ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess
@@ -11034,7 +11056,14 @@ fn transfer_reference_facts(
                 let owners: BTreeMap<_, _> = candidates.iter().map(|candidate|
                     (&candidate.place.binding, &candidate.place)).collect();
                 for (&binding, &selection) in &owners {
-                    if !cfg.allocations.contains(binding) {
+                    let guarded = cfg.guarded_releases.and_then(|releases| releases.get(&id)) == Some(binding)
+                        && owners.len() == 1 && selection.projections.is_empty();
+                    if guarded {
+                        if let Some(bindings) = cfg.fallible_allocation_bindings {
+                            require_available_fallible_read(bindings, &state, binding, point, false, &mut errors);
+                        }
+                    }
+                    if !guarded && !cfg.allocations.contains(binding) {
                         errors.push(ReferenceAnalysisError::MissingContext {
                             source_span: address_span.clone(),
                             reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
@@ -11652,7 +11681,8 @@ fn transfer_reference_facts(
                 CfgPointKind::Assign { target, .. }
                     if let Some(site) = cfg.fallible_allocation_bindings.and_then(|bindings| bindings.get(&target.binding)) =>
                 {
-                    let unavailable = state.uninitialized.contains(&target.binding);
+                    let unavailable = state.uninitialized.contains(&target.binding) || state.released.contains(&target.binding)
+                        || state.invalidated.contains(&target.binding);
                     let checked_indexed_store = site.has_indexed_extent()
                         && cfg.guarded_indexed_stores.is_some_and(|stores| stores.contains(&id));
                     let error = if checked_indexed_store {
@@ -12141,6 +12171,10 @@ fn transfer_reference_facts(
                 (common_aggregate_cutoff, &aggregate_deadlines, &mut state.aggregate)
             {
                 flow.expire_before(cutoff, last_use);
+            }
+            if let Some(edge) = guarded_allocation_edge.filter(|edge| state.released.contains(&edge.binding)) {
+                errors.push(ReferenceAnalysisError::MissingOrigin { source_span: point.source_span.clone(),
+                    binding_id: edge.binding.clone(), reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation });
             }
             if enrolled_move_owner {
                 let edge = guarded_allocation_edge.expect("enrolled guarded owner");
@@ -16814,6 +16848,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     guarded_allocation_edges: Some(&template_result.proof_points.guarded_allocation_edges),
                     guarded_indexed_stores: Some(&template_result.proof_points.guarded_indexed_stores),
                     guarded_runtime_moves: Some(&template_result.proof_points.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
+                    guarded_releases: Some(&template_result.proof_points.guarded_releases).filter(|releases| !releases.is_empty()),
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
@@ -17137,6 +17172,16 @@ fn seal_guarded_scalar_allocations(
         { return None; }
         moves_by_owner.entry(&receipt.source).or_default().push(receipt.clone());
     }
+    let mut releases_by_owner = HashMap::<&ReferenceBindingId, Vec<ByteSpan>>::new();
+    for (point, binding) in &points.guarded_releases {
+        let release = cfg.points.get(point.0)?;
+        let CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } } = &release.kind else { return None; };
+        let [candidate] = candidates.as_slice() else { return None; };
+        if &candidate.place.binding != binding || !candidate.place.projections.is_empty()
+            || !bindings.get(binding)?.has_runtime_extent()
+        { return None; }
+        releases_by_owner.entry(binding).or_default().push(release.source_span.range);
+    }
     owners.into_iter().map(|(binding, mut guards, mut accesses)| {
         let declared = bindings.get(binding)?;
         let scope = points.guarded_allocation_scopes.get(&declared.scope.0)?;
@@ -17159,6 +17204,7 @@ fn seal_guarded_scalar_allocations(
             runtime_returned: declared.runtime_returned,
             guards: guards.into_boxed_slice(), alias_accesses: accesses.into_boxed_slice(),
             runtime_moves: moves_by_owner.remove(binding).unwrap_or_default().into_boxed_slice(),
+            releases: releases_by_owner.remove(binding).unwrap_or_default().into_boxed_slice(),
         })
     }).collect()
 }

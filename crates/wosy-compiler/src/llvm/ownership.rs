@@ -1172,6 +1172,7 @@ pub(super) struct GuardedScalarSites<'ctx> {
     aliases: HashMap<usize, usize>,
     runtime_moves: HashMap<(u32, u32), (usize, usize, usize)>,
     runtime_replacements: HashMap<usize, (usize, usize, usize)>,
+    releases: HashMap<(u32, u32), usize>,
     active: Vec<Option<GuardedScalarOwner<'ctx>>>,
     lexical: Vec<usize>,
 }
@@ -1183,7 +1184,11 @@ impl<'ctx> GuardedScalarSites<'ctx> {
         let mut declarations = HashMap::with_capacity(proofs.len());
         let mut conditions = HashMap::new();
         let mut aliases = HashMap::new();
+        let mut releases = HashMap::new();
         for (index, proof) in proofs.iter().enumerate() {
+            for span in proof.releases() {
+                if releases.insert((span.start, span.end), index).is_some() { return None; }
+            }
             let declaration = proof.binding().declaration_span;
             if declarations.insert((declaration.start, declaration.end), index).is_some() { return None; }
             for guard in proof.guards() {
@@ -1196,7 +1201,7 @@ impl<'ctx> GuardedScalarSites<'ctx> {
         let mut sites = proofs.iter().map(|proof| GuardedScalarSite {
             scope: proof.binding().block_span, ty: proof.ty().clone(),
             runtime_literal_length: proof.runtime_literal_length(),
-            runtime_returned: proof.runtime_returned(), movable: !proof.runtime_moves().is_empty(),
+            runtime_returned: proof.runtime_returned(), movable: !proof.runtime_moves().is_empty() || !proof.releases().is_empty(),
         }).collect::<Vec<_>>();
         let mut runtime_moves = HashMap::new();
         for (source, proof) in proofs.iter().enumerate() {
@@ -1226,7 +1231,7 @@ impl<'ctx> GuardedScalarSites<'ctx> {
         }
         let active = vec![None; sites.len()];
         Some(Box::new(Self {
-            sites: sites.into_boxed_slice(), declarations, conditions, aliases, runtime_moves, runtime_replacements,
+            sites: sites.into_boxed_slice(), declarations, conditions, aliases, runtime_moves, runtime_replacements, releases,
             active, lexical: Vec::new(),
         }))
     }
@@ -1547,6 +1552,35 @@ pub(super) fn guarded_scalar_condition<'ctx>(
         state.builder.build_not(owner.present, "fallible.absent").map_err(builder_error)?
     };
     Ok(Some(EmitValue::Basic(condition.into())))
+}
+
+pub(super) fn release_guarded_runtime_at<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    span: ByteSpan,
+    arguments: &[ScalarExpression],
+    candidates: &[crate::scalar::InvalidationCandidate],
+) -> Result<bool, String> {
+    let Some(sites) = state.guarded_scalar.as_ref().filter(|sites| !sites.releases.is_empty()) else { return Ok(false); };
+    let Some(&index) = sites.releases.get(&(span.start, span.end)) else { return Ok(false); };
+    let [ScalarExpression::CheckedAddress { place: place @ crate::ScalarPlace::Name { name, .. }, .. }] = arguments
+        else { return Err("guarded release lost its exact lexical address".into()); };
+    let [candidate] = candidates else { return Err("guarded release has no singular owner".into()); };
+    let declaration = state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(place))
+        .ok_or("guarded release has no prepared lexical root")?;
+    let owner = sites.active[index].ok_or("guarded release has no active owner")?;
+    if candidate.place.binding.declaration_span != declaration || !candidate.place.projections.is_empty()
+        || sites.declarations.get(&(declaration.start, declaration.end)) != Some(&index)
+        || !matches!(state.storage.get(name), Some((backing, ty))
+            if *backing == owner.backing && *ty == sites.sites[index].ty)
+    { return Err("guarded release differs from its checked backing".into()); }
+    let live = owner.live_slot.ok_or("guarded release lacks its lifetime slot")?;
+    // Presence and all conflicting loans were resolved on this exact edge.
+    // The explicit release consumes the original owner, without a second check.
+    state.builder.build_store(live, context.bool_type().const_zero()).map_err(builder_error)?;
+    consume_runtime_array_release(context, state,
+        RuntimeArrayRelease { pointer: owner.backing.into(), live: None })?;
+    Ok(true)
 }
 
 pub(super) fn release_guarded_scalar<'ctx>(

@@ -1018,6 +1018,11 @@ fn emit_core_invalidation<'ctx, 'module>(
         .get(&(span.start, span.end))
         .cloned()
         .ok_or_else(|| "core invalidation lacks a typed CFG event".to_owned())?;
+    if operation == CoreOperationId::Free
+        && ownership::release_guarded_runtime_at(context, state, span, arguments, &candidates)?
+    {
+        return Ok(EmitValue::Unit);
+    }
     let address = take_basic(match project {
         Some(scope) => {
             emit_project_expression(context, state, &arguments[0], scope.module, scope.modules)?
