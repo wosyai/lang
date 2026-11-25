@@ -3052,6 +3052,7 @@ pub(crate) struct ClosedBody {
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
     pub(crate) guarded_array_descriptor_leaf: bool,
+    pub(crate) guarded_array_descriptor_forward: Option<usize>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -7206,30 +7207,108 @@ fn closed_aggregates<'a>(
             }
         }
     }
-    let mut guarded_array_cohorts = BTreeMap::<BodyKey, (ClosedLiteralArray, BTreeSet<(BodyKey, usize)>)>::new();
-    for (caller, cfg, point, ordinal) in guarded_array_requests {
-        let invalid = || "guarded owned array call requires an exact private fresh dynamic producer".to_owned();
-        let target = target_body(&declarations, cfg, point).ok_or_else(invalid)?;
-        let body = bodies.get(&target).filter(|body| body.is_monomorphic && target.2.is_none()).ok_or_else(invalid)?;
-        let input = module_at(target.0).ok_or_else(invalid)?;
-        let Some(ScalarItem::Function(function)) = input.items.get(target.1) else { return Err(invalid()); };
+    #[derive(Clone, Copy)]
+    enum GuardedArrayRoute {
+        Fresh(ClosedLiteralArray),
+        Forward(OccurrenceOrdinal),
+    }
+    let guarded_array_cohort = |target: BodyKey| {
+        // Pure forwards need not be present in the observation-only body map.
+        // Read the same exact reserved prepared CFG used for scalar relays.
+        if target.2.is_some() || reservations.bodies.get(&target) != Some(&true) { return None; }
+        let input = module_at(target.0)?;
+        let ScalarItem::Function(function) = input.items.get(target.1)? else { return None; };
+        let sites = input.calls.function_body(target.1, None)?;
+        let (facts, cfg) = result_at(target, function)?;
         if !crate::scalar::typecheck::is_module_private_name(&function.name) || function.body.unsafe_context
-            || !body.sites.declared_unsafe_calls.is_empty()
-            || !matches!(body.sites.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
-        { return Err(invalid()); }
-        let Some(LiteralArrayRoute::FreshLeaf { allocation, output }) =
-            body.facts.and_then(AggregateFlowResult::proved_literal_array_route)
-        else { return Err(invalid()); };
-        if allocation.extent != FreshArrayExtent::Formal { return Err(invalid()); }
-        let plan = ClosedLiteralArray::FreshLeaf {
-            receipt: OriginalArrayReceipt { origin: allocation.bind, allocation: (allocation.position.block.0, allocation.position.item) },
-            length_occurrence: allocation.length_occurrence.0, extent: allocation.extent, output: output.0,
-        };
-        ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
-        guarded_array_cohorts.entry(target).or_insert_with(|| (plan, BTreeSet::new())).1.insert((caller, ordinal.0));
+            || !sites.declared_unsafe_calls.is_empty()
+        { return None; }
+        let ([formal], [output]) = (sites.boundary.parameters.as_slice(), sites.boundary.root_outputs.as_slice())
+        else { return None; };
+        if formal.ty != ScalarType::U64 || !matches!(output.ty, ScalarType::RuntimeArray { .. }) { return None; }
+        if let Some(LiteralArrayRoute::FreshLeaf { allocation, output: occurrence }) =
+            facts.and_then(AggregateFlowResult::proved_literal_array_route)
+        {
+            let route = ClosedLiteralArray::FreshLeaf {
+                receipt: OriginalArrayReceipt { origin: allocation.bind, allocation: (allocation.position.block.0, allocation.position.item) },
+                length_occurrence: allocation.length_occurrence.0, extent: allocation.extent, output: occurrence.0,
+            };
+            return (allocation.extent == FreshArrayExtent::Formal).then_some((GuardedArrayRoute::Fresh(route), None, &output.ty));
+        }
+        let root = sites.structure.blocks.get(sites.structure.root.0)?;
+        let [item] = root.items.as_slice() else { return None; };
+        let BlockItemKind::FinalOutput(final_value) = &item.kind else { return None; };
+        let [call] = sites.call_occurrences.as_slice() else { return None; };
+        if final_value.output != 0 || final_value.expression != call.ordinal
+            || !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
+        { return None; }
+        let signature = sites.checked_call_signatures.get(&call.ordinal)?;
+        if signature.parameters.as_slice() != [ScalarType::U64]
+            || !matches!(signature.outputs.outputs.as_slice(), [actual] if same_runtime_array_type(&actual.ty, &output.ty))
+        { return None; }
+        let points = &cfg.initial_points;
+        let site = &sites.sites.get(call.site)?.target;
+        let point = points.iter().find(|point| matches!(&point.kind, CfgPointKind::Call {
+            target, output: 0, ..
+        } if target == site))?;
+        let CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
+            concrete: ConcreteCallSelection::Declaration, ..
+        }, argument_points, .. } = &point.kind else { return None; };
+        let ([read], [returned]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
+        let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
+        if !matches!(&points.get(read.0)?.kind, CfgPointKind::Read { binding } if binding == &formal)
+            || points.get(read.0)?.successors.as_slice() != [point.id]
+            || !matches!(points.get(returned.0)?.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false, .. }
+                if value_point == point.id)
+            || !points.iter().enumerate().all(|(index, candidate)| {
+                candidate.id.0 == index
+                    && points.get(index + 1).map_or(candidate.successors.is_empty(), |next| candidate.successors.as_slice() == [next.id])
+                    && match &candidate.kind {
+                        CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+                        CfgPointKind::Bind { binding } if binding == &formal => true,
+                        _ => [*read, point.id, *returned].contains(&candidate.id),
+                    }
+            })
+        { return None; }
+        Some((GuardedArrayRoute::Forward(call.ordinal), Some(target_body(&declarations, cfg, point.id)?), &output.ty))
+    };
+    let mut guarded_array_cohorts = BTreeMap::<BodyKey, (GuardedArrayRoute, &ScalarType, BTreeSet<(BodyKey, usize)>)>::new();
+    for (caller, cfg, point, ordinal) in guarded_array_requests {
+        let invalid = || "guarded owned array call requires an exact private fresh dynamic producer or sealed forwarding path".to_owned();
+        let mut current = target_body(&declarations, cfg, point).ok_or_else(invalid)?;
+        let mut incoming = (caller, ordinal.0);
+        let mut previous_type = None;
+        let mut visited = BTreeSet::new();
+        let mut pending = Vec::new();
+        loop {
+            if let Some((_, ty, sites)) = guarded_array_cohorts.get_mut(&current) {
+                if previous_type.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
+                sites.insert(incoming);
+                break;
+            }
+            if !visited.insert(current) { return Err(invalid()); }
+            let (route, next, ty) = guarded_array_cohort(current).ok_or_else(invalid)?;
+            if previous_type.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
+            pending.push((current, route, ty, incoming));
+            match (route, next) {
+                (GuardedArrayRoute::Fresh(_), None) => break,
+                (GuardedArrayRoute::Forward(call), Some(next)) => {
+                    incoming = (current, call.0);
+                    current = next;
+                    previous_type = Some(ty);
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        // Cache only fully grounded suffixes. Their incoming uses remain
+        // subject to the global closed-use check, including relay call sites.
+        for (body, route, ty, incoming) in pending {
+            ordinary.transport_uses.entry(body).or_insert_with(|| Some(Vec::new()));
+            guarded_array_cohorts.insert(body, (route, ty, BTreeSet::from([incoming])));
+        }
     }
     ordinary.census(reservations, &module_at, &declarations);
-    for (target, (_, sites)) in &guarded_array_cohorts {
+    for (target, (_, _, sites)) in &guarded_array_cohorts {
         let observed = ordinary.transport_uses.get(target).and_then(Option::as_ref)
             .ok_or("guarded owned array cohort has an unknown use")?;
         if observed.iter().copied().collect::<BTreeSet<_>>() != *sites {
@@ -7627,14 +7706,25 @@ fn closed_aggregates<'a>(
             result.bodies.entry(body).or_default().ordinary_fallible_allocating_expressions.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
-        for (&target, (route, callers)) in &guarded_array_cohorts {
+        for (&target, (route, _, callers)) in &guarded_array_cohorts {
             let target = result.bodies.entry(target).or_default();
-            if target.literal_array.is_some_and(|existing| existing != *route) || target.array_descriptor_identity {
+            if target.array_descriptor_identity {
                 return Err("conflicting guarded owned array producer plan".into());
             }
-            target.literal_array = Some(*route);
+            match *route {
+                GuardedArrayRoute::Fresh(route) => {
+                    if target.literal_array.is_some_and(|existing| existing != route) {
+                        return Err("conflicting guarded owned array producer plan".into());
+                    }
+                    target.literal_array = Some(route);
+                    target.guarded_array_descriptor_leaf = true;
+                }
+                GuardedArrayRoute::Forward(call) => {
+                    if target.literal_array.is_some() { return Err("conflicting guarded owned array relay plan".into()); }
+                    target.guarded_array_descriptor_forward = Some(call.0);
+                }
+            }
             target.array_descriptor_return = true;
-            target.guarded_array_descriptor_leaf = true;
             for &(body, call) in callers {
                 result.bodies.entry(body).or_default().array_descriptor_calls.insert(call);
             }

@@ -685,7 +685,9 @@ pub(super) fn definition_type<'ctx>(
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("invalid array descriptor declaration".into());
         };
-        if !matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. }))
+        let forward = plan.guarded_array_descriptor_forward.is_some();
+        if (forward && (parameters.as_slice() != [ScalarType::U64] || plan.literal_array.is_some()))
+            || (!forward && !matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. })))
             || !matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty: ScalarType::RuntimeArray { .. }, .. }])
             || !dynamic_return_outputs(function.span, cfg).is_empty()
         {
@@ -1489,13 +1491,20 @@ pub(super) fn extract_observing_array_formal<'ctx>(
     Ok((backing, extent.into_int_value()))
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ArrayDescriptorForward {
+    Owned,
+    Borrowed,
+    GuardedProducer,
+}
+
 pub(super) fn emit_array_descriptor_forward<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
     definition: FunctionValue<'ctx>,
     function: &ScalarFunction,
     call: usize,
-    borrowed: bool,
+    transport: ArrayDescriptorForward,
 ) -> Result<(), String> {
     let Some((expression, _)) = function.body.final_expressions().next() else {
         return Err("missing checked array forwarding expression".into());
@@ -1506,17 +1515,20 @@ pub(super) fn emit_array_descriptor_forward<'ctx>(
     let selected = state.prepared_call(expression)?.ok_or("missing qualified array forwarding target")?;
     let symbol = selected.symbol().ok_or("checked array forwarding lost its declaration")?;
     let target = *state.functions.get(symbol).ok_or("missing checked array forwarding target")?;
-    let descriptor = if borrowed {
-        borrowed_extent_type(context, state.target_layout)
-    } else {
-        array_descriptor_type(context)
+    let owned = array_descriptor_type(context);
+    let (argument, result): (BasicTypeEnum<'ctx>, BasicTypeEnum<'ctx>) = match transport {
+        ArrayDescriptorForward::Owned => (owned.into(), owned.into()),
+        ArrayDescriptorForward::Borrowed => (borrowed_extent_type(context, state.target_layout).into(), context.i64_type().into()),
+        ArrayDescriptorForward::GuardedProducer => {
+            if !state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.array_descriptor_calls.contains(&call)) {
+                return Err("guarded producer forwarding lost its descriptor call receipt".into());
+            }
+            (context.i64_type().into(), owned.into())
+        }
     };
-    let result: BasicTypeEnum<'ctx> = if borrowed { context.i64_type().into() } else { descriptor.into() };
-    let Some(BasicValueEnum::StructValue(parameter)) = definition.get_first_param() else {
-        return Err("missing checked array forwarding parameter".into());
-    };
-    if parameter.get_type() != descriptor || target.get_linkage() != Linkage::Internal
-        || target.get_type().get_param_types().as_slice() != [descriptor.into()]
+    let parameter = definition.get_first_param().ok_or("missing checked array forwarding parameter")?;
+    if parameter.get_type() != argument || target.get_linkage() != Linkage::Internal
+        || target.get_type().get_param_types().as_slice() != [argument.into()]
         || target.get_type().get_return_type() != Some(result)
     {
         return Err("checked array forwarding types differ from the paired plan".into());

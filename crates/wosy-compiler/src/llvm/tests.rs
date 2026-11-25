@@ -14503,8 +14503,10 @@ fn guarded_fallible_returned_runtime_array_keeps_one_backing_and_dynamic_extent(
     use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
     let text = "%%start
 u64[](u64) _make = fn(count) { u64[count] fresh; fresh };
+u64[](u64) _middle = fn(count) { _make(count) };
+u64[](u64) _forward = fn(count) { _middle(count) };
 u64(u64, u64) observed = fn(count, index) {
-    u64[] held =? _make(count);
+    u64[] held =? _forward(count);
     if (&held == null) { 99 } else {
         u64 extent = core.array_len(&held);
         if (extent == 0) { 0 } else { held[index] = 7; extent }
@@ -14549,6 +14551,8 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
             let authored = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
             let make = authored("_make");
             let observed = authored("observed");
+            let middle = authored("_middle");
+            let forward = authored("_forward");
             let descriptor = context.struct_type(&[context.ptr_type(inkwell::AddressSpace::default()).into(), context.i64_type().into()], false);
             assert_eq!(make.get_linkage(), inkwell::module::Linkage::Internal);
             assert_eq!(make.get_type().get_return_type(), Some(descriptor.into()));
@@ -14564,7 +14568,15 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
             let free = module.get_function("__wosy_core_free").unwrap();
             assert_eq!(calls_to(make, alloc).len(), 1);
             assert!(calls_to(make, free).is_empty() && calls_to(observed, alloc).is_empty());
-            let [returned] = calls_to(observed, make)[..] else { panic!("{llvm}") };
+            for (relay, target) in [(forward, middle), (middle, make)] {
+                assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
+                assert_eq!(relay.get_type().get_return_type(), Some(descriptor.into()));
+                let [call, returned] = instructions(relay).collect::<Vec<_>>()[..] else { panic!("{llvm}") };
+                assert_eq!(calls_to(relay, target), [call]);
+                assert_eq!(known_field_operand(call, 0), relay.get_first_param());
+                assert_eq!(known_field_operand(returned, 0).unwrap().as_instruction_value(), Some(call));
+            }
+            let [returned] = calls_to(observed, forward)[..] else { panic!("{llvm}") };
             let [release] = calls_to(observed, free)[..] else { panic!("{llvm}") };
             let backing = returned.get_next_instruction().unwrap();
             let extent = backing.get_next_instruction().unwrap();
