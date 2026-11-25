@@ -2550,9 +2550,29 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
             emit_binary_values(state, operator, left, right, unsigned)
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+            let choice = aggregate_transfer::fallible_allocation_choice_at(state, expression);
+            if choice && *expected != ScalarType::U64 {
+                return Err("invalid sealed fallible conditional payload type".into());
+            }
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
             emit_if_value(context, state, condition, then_branch, else_branch, expression, |state, block| {
-                path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
+                let value = path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))?;
+                if !choice { return Ok(value); }
+                let [ScalarBlockItem::Expression(call @ ScalarExpression::Call { .. })] = block.items.as_slice()
+                    else { return Err("missing sealed fallible conditional arm".into()); };
+                let value = take_basic(value)?;
+                if aggregate_transfer::fallible_allocation_call_at(state, call) {
+                    let BasicValueEnum::StructValue(pair) = value else {
+                        return Err("missing sealed fallible conditional arm result".into());
+                    };
+                    if pair.get_type() != aggregate_transfer::fallible_allocation_result_type(context) {
+                        return Err("invalid sealed fallible conditional arm result".into());
+                    }
+                    Ok(EmitValue::Basic(pair.into()))
+                } else {
+                    let pair = aggregate_transfer::present_fallible_allocation_result(context, state, value)?;
+                    Ok(EmitValue::Basic(pair.into()))
+                }
             })
         }
         ScalarExpression::Block(block) => {

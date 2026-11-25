@@ -6707,7 +6707,7 @@ fn closed_aggregates<'a>(
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
-    let mut fallible_choices = BTreeMap::<(BodyKey, usize), usize>::new();
+    let mut fallible_choices = BTreeSet::<(BodyKey, usize)>::new();
     let mut fallible_allocation_relays = BTreeMap::new();
     let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
@@ -6944,7 +6944,7 @@ fn closed_aggregates<'a>(
                 .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
             if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
             if let Some(choice) = choice {
-                *fallible_choices.entry((caller, choice.0)).or_default() += 1;
+                fallible_choices.insert((caller, choice.0));
             }
             let mut visited = BTreeSet::new();
             let mut current = target;
@@ -6975,9 +6975,6 @@ fn closed_aggregates<'a>(
             // The all-use check below still applies globally to every node.
             complete_suffixes.extend(visited);
         }
-    }
-    if fallible_choices.values().any(|&arms| arms != 2) {
-        return Err("fallible conditional requires the same sealed outcome in both arms".into());
     }
     ordinary.census(reservations, &module_at, &declarations);
     for (target, calls) in &fallible_allocating_targets {
@@ -7356,7 +7353,7 @@ fn closed_aggregates<'a>(
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
             }
         }
-        for &(body, ordinal) in fallible_choices.keys() {
+        for &(body, ordinal) in &fallible_choices {
             result.bodies.entry(body).or_default().fallible_allocating_choices.insert(ordinal);
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);

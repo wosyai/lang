@@ -588,6 +588,22 @@ pub(super) fn fallible_allocation_result_type(context: &Context) -> inkwell::typ
     context.struct_type(&[context.bool_type().into(), context.i64_type().into()], false)
 }
 
+pub(super) fn present_fallible_allocation_result<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    payload: BasicValueEnum<'ctx>,
+) -> Result<inkwell::values::StructValue<'ctx>, String> {
+    if !matches!(payload, BasicValueEnum::IntValue(integer) if integer.get_type() == context.i64_type()) {
+        return Err("invalid sealed fallible allocation result payload".into());
+    }
+    let pair = fallible_allocation_result_type(context);
+    let tagged = pair.const_named_struct(&[
+        context.bool_type().const_all_ones().into(), context.i64_type().const_zero().into()
+    ]);
+    state.builder.build_insert_value(tagged, payload, 1, "fallible.payload")
+        .map_err(builder_error).map(|value| value.into_struct_value())
+}
+
 pub(super) fn definition_type<'ctx>(
     context: &'ctx Context,
     function: &ScalarFunction,

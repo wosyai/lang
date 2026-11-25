@@ -13030,9 +13030,10 @@ if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
     || observed(false, 9) != 10 || observed(true, 0) != 1) { core.system_panic(); };
 %%end";
     let mixed = text.replace("u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };",
-        "u64(u64) _right = fn(count) { count };");
+        "u64(u64) _right = fn(count) { count };")
+        .replace("observed(false, 9) != 10", "observed(false, 0) != 1");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        for (sealed, text) in [(true, text), (false, mixed.as_str())] {
+        for (mixed, text) in [(false, text), (true, mixed.as_str())] {
             let prepared = prepare_initializer_test(text, layout);
             let checked = analyze_scalar_build(&prepared);
             assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
@@ -13040,10 +13041,6 @@ if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
             for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
                 (true, emit_scalar_build_project_llvm(&checked))]
             {
-                if !sealed {
-                    assert!(matches!(output, Err(error) if error.contains("requires the same sealed outcome in both arms")));
-                    continue;
-                }
                 let llvm = output.unwrap().to_text();
                 let context = Context::create();
                 let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "sealed conditional initializer");
@@ -13060,7 +13057,12 @@ if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
                     .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
                         .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
                 for (leaf, arm) in [(left, b"if.then".as_slice()), (right, b"if.else".as_slice())] {
-                    assert_eq!(leaf.get_linkage(), inkwell::module::Linkage::Internal);
+                    if leaf == right && mixed {
+                        assert_eq!(leaf.get_type().get_return_type(), Some(context.i64_type().into()));
+                    } else {
+                        assert_eq!(leaf.get_linkage(), inkwell::module::Linkage::Internal);
+                        assert!(leaf.get_type().get_return_type().unwrap().is_struct_type());
+                    }
                     let [call] = named_calls(leaf)[..] else { panic!("{llvm}") };
                     assert_eq!(call.get_parent().unwrap().get_name().to_bytes(), arm);
                 }
@@ -13073,7 +13075,9 @@ if (observed(true, 7) != 0 || observed(false, 9) != 0 || observed(true, 7) != 0
                 assert_eq!(present.get_opcode(), InstructionOpcode::ExtractValue);
                 assert_eq!(present.get_indices(), vec![0]);
                 assert_eq!(known_field_operand(present, 0).unwrap().as_instruction_value(), Some(phi));
-                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_CONDITIONAL_IR_DIR") {
+                let out_var = if mixed { "WOSY_FALLIBLE_MIXED_CONDITIONAL_IR_DIR" }
+                    else { "WOSY_FALLIBLE_CONDITIONAL_IR_DIR" };
+                if let Some(out) = std::env::var_os(out_var) {
                     let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                     let route = if project { "project" } else { "standalone" };
                     let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
