@@ -11594,7 +11594,9 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
         return Err(ProjectCheck::Unsupported);
     }
     let admission = witness.map(|(exists, binder, chosen, translation)| {
-        let domain = typed_quantifier_domain(exists, &binder, inputs, ty)?;
+        let original = &declarations.get(chosen).ok_or(ProjectCheck::Unsupported)?.1;
+        let relative = origin.is_some().then(|| (original.as_str(), quantified_offset_order(translation.as_ref())));
+        let domain = typed_quantifier_domain_with_relative(exists, &binder, inputs, ty, relative)?;
         Ok::<_, ProjectCheck>((chosen, domain, translation))
     }).transpose()?;
     let mut unavailable = false;
@@ -11750,6 +11752,13 @@ fn typed_quantifier_binder(
 fn typed_quantifier_domain(
     quantifier: &CstNode, binder: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<IntegerSet, ProjectCheck> {
+    typed_quantifier_domain_with_relative(quantifier, binder, inputs, ty, None)
+}
+
+fn typed_quantifier_domain_with_relative(
+    quantifier: &CstNode, binder: &str, inputs: &[String], ty: &ScalarType,
+    relative: Option<(&str, std::cmp::Ordering)>,
+) -> Result<IntegerSet, ProjectCheck> {
     use super::{checker_flow::charge_call_work, symbolic_integer::IntegerIntersection};
 
     let universe = IntegerSet::from_type(ty).ok_or(ProjectCheck::Unsupported)?;
@@ -11790,6 +11799,24 @@ fn typed_quantifier_domain(
             Task::Visit(ScalarExpression::Boolean { value, .. }, negated) =>
                 domains.push(if *value != negated { universe.clone() } else { IntegerSet::default() }),
             Task::Visit(expression, negated) => {
+                if let Some((original, order)) = relative {
+                    if let ScalarExpression::Binary { operator, left, right, .. } = expression {
+                        if let (ScalarExpression::Name { name: first, .. }, ScalarExpression::Name { name: second, .. }) =
+                            (left.as_ref(), right.as_ref())
+                        {
+                            // Both names were bound by the typed quantifier
+                            // plan. For an exact checked candidate=x+shift
+                            // the comparison with x has one constant order.
+                            let order = if first == binder && second == original { order }
+                                else if first == original && second == binder { order.reverse() }
+                                else { return Err(ProjectCheck::Unsupported); };
+                            let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+                            charge_call_work(&mut work, 1).ok_or(ProjectCheck::Unsupported)?;
+                            domains.push(if relation.accepts(order) != negated { universe.clone() } else { IntegerSet::default() });
+                            continue;
+                        }
+                    }
+                }
                 let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
                 let (operator, _, bound) = checked_literal_output_goal(comparison, binder, inputs, ty)?;
                 let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
@@ -11955,6 +11982,16 @@ fn checked_quantified_witness_offset(
 }
 
 #[cfg(feature = "internal-checker")]
+fn quantified_offset_order(offset: Option<&BigInt>) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match offset.map(BigInt::sign) {
+        Some(num_bigint::Sign::Minus) => Less,
+        Some(num_bigint::Sign::Plus) => Greater,
+        Some(num_bigint::Sign::NoSign) | None => Equal,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn checked_quantified_witness_image(
     domain: &IntegerSet, shift: &BigInt, ty: &ScalarType, work: &mut usize,
 ) -> Result<Option<IntegerSet>, ProjectCheck> {
@@ -11991,12 +12028,18 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::InvalidProof);
     }
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
+    let configured_relative = origin.is_some();
     let witness_domain = || -> Result<Result<(IntegerSet, Option<BigInt>), (String, BigInt)>, ProjectCheck> {
         let argument = authored_witness_argument(steps)?;
         let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
-        let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
+        let shift = checked_quantified_witness_offset(argument, &universal, ty)?;
+        let relative = configured_relative.then(|| (universal.as_str(), quantified_offset_order(shift.as_ref())));
+        let existential_domain = typed_quantifier_domain_with_relative(exists, &existential, inputs, ty, relative)?;
         let mut work = 0;
-        let (image, shift) = checked_quantified_witness_translation(argument, &universal, &universal_domain, ty, &mut work)?;
+        let image = if let Some(offset) = &shift {
+            Cow::Owned(checked_quantified_witness_image(&universal_domain, offset, ty, &mut work)?
+                .ok_or(ProjectCheck::Unsupported)?)
+        } else { Cow::Borrowed(&universal_domain) };
         if shift.is_some() {
             let cost = image.interval_count().checked_add(existential_domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
             super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
@@ -21713,6 +21756,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_dependent_existential_checks_relative_where_on_the_typed_axis() {
+        let source = r#"%%start
+            u8(u8) upward = fn(value) { value };
+            i8(i8) downward = fn(value) { value };
+            proof forward for upward(entry) -> (out) where (entry == 5)
+                forall (u8 seed where seed == 1 || seed == 3)
+                forall (u8 other where other == 0 || other == 7)
+                ensures (exists (u8 chosen where seed < chosen && chosen <= 4) {
+                    out > chosen && out != other
+                })
+                { core.witness(seed + 1); }
+            proof reverse for downward(entry) -> (out) where (entry == 0)
+                forall (i8 seed where seed == -1)
+                ensures (exists (i8 chosen where !(chosen >= seed) && chosen >= -2) { out > chosen })
+                { core.witness(seed - 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 a = upward(5); i8 b = downward(0); %%end");
+        let pass = check_array_proof_cohort(source, package).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none());
+        let pass = check_array_proof_cohort(&actual(source), main).unwrap();
+        assert!(pass.active && pass.diagnostics.is_empty());
+        let failure = source.replace("seed < chosen && chosen <= 4", "chosen == seed || chosen == 2");
+        let dormant = check_array_proof_cohort(&failure, main).unwrap();
+        assert!(!dormant.active && dormant.diagnostics.is_empty());
+        let checked = check_array_proof_cohort(&failure, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(checked.quantified_witness, Some(("seed".into(), BigInt::from(3))));
+        assert!(checked.failed_step.is_some());
+        let reached = check_array_proof_cohort(&actual(&failure), main).unwrap();
+        let [checked] = reached.diagnostics.as_slice() else { panic!("one reached relative guard admission"); };
+        assert_eq!(checked.quantified_witness, Some(("seed".into(), BigInt::from(3))));
+        assert!(checked.failed_step.is_some());
+        let opposite = source.replace("!(chosen >= seed)", "chosen >= seed");
+        let checked = check_array_proof_cohort(&opposite, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(checked.quantified_witness, Some(("seed".into(), BigInt::from(-1))));
+        assert!(checked.failed_step.is_some());
+        for rejected in [
+            source.replace("seed < chosen", "other < chosen"),
+            source.replace("seed < chosen", "entry < chosen"),
+            source.replace("seed == 1 || seed == 3", "seed == 255"),
+            source.replace("seed == -1", "seed == -128"),
+        ] {
+            assert!(matches!(check_array_proof_cohort(&rejected, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
