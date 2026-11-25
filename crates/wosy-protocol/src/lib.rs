@@ -76,15 +76,26 @@ impl Node {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let (kind, data, children) = Self::parts(bytes)?;
+        Some(Self {
+            kind,
+            data: data.to_vec(),
+            children: children.iter().copied().map(NodeId).collect(),
+        })
+    }
+
+    /// Walk the same binary record's links without copying its payload.
+    pub fn child_ids(bytes: &[u8]) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let (_, _, children) = Self::parts(bytes)?;
+        Some(children.iter().copied().map(NodeId))
+    }
+
+    fn parts(bytes: &[u8]) -> Option<(Kind, &[u8], &[[u8; 32]])> {
         let kind = Kind::from_byte(*bytes.first()?)?;
         let len = usize::try_from(u64::from_be_bytes(bytes.get(1..9)?.try_into().ok()?)).ok()?;
         let (data, links) = bytes.get(9..)?.split_at_checked(len)?;
-        let (chunks, tail) = links.as_chunks::<32>();
-        tail.is_empty().then(|| Self {
-            kind,
-            data: data.to_vec(),
-            children: chunks.iter().copied().map(NodeId).collect(),
-        })
+        let (children, tail) = links.as_chunks::<32>();
+        tail.is_empty().then_some((kind, data, children))
     }
 
     pub fn id(bytes: &[u8]) -> NodeId {

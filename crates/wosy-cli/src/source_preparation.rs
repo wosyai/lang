@@ -111,6 +111,12 @@ fn module_roots(graph: &SourceGraph, leaves: &[NodeId], delta: &mut Delta) -> Ve
 }
 
 pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Result<PreparedSources, String> {
+    Ok(prepare_with_files(root, target, base)?.0)
+}
+
+pub(crate) fn prepare_with_files(
+    root: &Path, target: Option<&str>, base: Option<&Files>,
+) -> Result<(PreparedSources, Files), String> {
     let project = root.canonicalize().map_err(|e| e.to_string())?;
     let (cfg, manifest) = ProjectConfiguration::load_with_manifest(&project)?;
     let target = cfg.resolve_target(target)?;
@@ -197,5 +203,5 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
     let root = delta.add(Kind::SourcePreparation, schema.to_vec(), roots);
-    Ok(PreparedSources { root, delta, parsed, reused })
+    Ok((PreparedSources { root, delta, parsed, reused }, files))
 }

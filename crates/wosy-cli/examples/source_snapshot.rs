@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 mod typed_preparation;
 #[path = "source_snapshot/retention.rs"]
 mod retention;
+#[path = "source_snapshot/recovery.rs"]
+mod recovery;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -178,6 +180,14 @@ async fn main() -> Result<()> {
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
+    if selection.as_deref() == Some("--reconcile-source") {
+        let replacement = args.next().ok_or("expected a replacement fixture store")?;
+        let key = FileKey {
+            package: args.next().ok_or("expected a selected source package")?,
+            path: PackageRelativePath::new(args.next().ok_or("expected a selected source path")?.into())?,
+        };
+        return recovery::run(&project, &dir, Path::new(&replacement), &key).await;
+    }
     let publish_pin = selection.as_deref() == Some("--publish-pin-exit");
     let prior = if publish_pin { None } else {
         selection.map(|s| NodeId::parse_hex(&s)).transpose()?
