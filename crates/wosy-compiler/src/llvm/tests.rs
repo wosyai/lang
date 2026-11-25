@@ -19088,15 +19088,19 @@ if (fixed(0,3) != 14 || fixed(1,3) != 24 || captured(2) != 2 || generated(3,2,1)
 fn checked_root_runtime_arrays_publish_original_count_to_private_accessors() {
     let text = "%%start
 u64(u64) count = fn(n) { n };
-u8(u64) _read_first = fn(i) { _first[i] };
+u8(bool,u64,u64) _read_first = fn(right,i,j) { if (right) { _first[i] } else { _first[j] } };
 unit(u64,u8) _write_first = fn(i,v) { _first[i] = v; };
 u8(u64) _read_second = fn(i) { _second[i] };
-unit(u64,u8) _write_second = fn(i,v) { _second[i] = v; };
+unit(bool,bool,u64,u64,u8) _write_second = fn(left,right,i,j,v) {
+    if (left) { _second[i] = v; };
+    if (right) { _second[j] = v; };
+};
 u8[count(3)] _first;
 u8[count(5)] _second;
 _write_first(2,17);
-_write_second(4,23);
-if (_read_first(2) != 17 || _read_second(4) != 23) { core.system_panic(); };
+_write_second(true,false,0,4,23);
+_write_second(false,true,0,4,23);
+if (_read_first(true,2,1) != 17 || _read_first(false,1,2) != 17 || _read_second(0) != 23 || _read_second(4) != 23) { core.system_panic(); };
 %%end";
     for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source = SourceIdentity::new("project".into(), "package".into(), "src/root-runtime-extent.w".into(), "r1".into());
@@ -19137,13 +19141,21 @@ if (_read_first(2) != 17 || _read_second(4) != 23) { core.system_panic(); };
                 let output = if rank == 0 { "i8" } else { "void" };
                 assert!(ir.contains(&format!("define private {output} @{symbol}(")), "{ir}");
                 let body = self_tail_test_body(&ir, &format!("private {output}"), &symbol);
-                let (backing_line, _) = body.lines().find_map(|line| line.trim().split_once(&format!(" = load ptr, ptr @{backing_name}"))).unwrap();
-                let (count, _) = body.lines().find_map(|line| line.trim().split_once(&format!(" = load i64, ptr {count_global}"))).unwrap();
-                assert_eq!(body.matches(&bounds).count(), 1, "{body}");
-                let guard = body.lines().find(|line| line.contains(&bounds)).unwrap();
-                assert!(guard.ends_with(&format!(", i64 {count})")), "{body}");
-                let gep = format!("getelementptr inbounds i8, ptr {backing_line},");
-                assert!(body.find(&bounds).unwrap() < body.find(&gep).unwrap(), "{body}");
+                let backing_load = format!(" = load ptr, ptr @{backing_name}");
+                let count_load = format!(" = load i64, ptr {count_global}");
+                let sites = if matches!(name, "_read_first" | "_write_second") { 2 } else { 1 };
+                let guards: Vec<_> = body.match_indices(&bounds).collect();
+                assert_eq!(guards.len(), sites, "{body}");
+                let backings: Vec<_> = body.lines().filter_map(|line| line.trim().split_once(&backing_load).map(|(value, _)| value)).collect();
+                let counts: Vec<_> = body.lines().filter_map(|line| line.trim().split_once(&count_load).map(|(value, _)| value)).collect();
+                assert_eq!(backings.len(), sites, "{body}");
+                assert_eq!(counts.len(), sites, "{body}");
+                for ((guard, backing), count) in guards.into_iter().zip(backings).zip(counts) {
+                    let (position, _) = guard;
+                    assert!(body[position..].lines().next().unwrap().ends_with(&format!(", i64 {count})")), "{body}");
+                    let gep = format!("getelementptr inbounds i8, ptr {backing},");
+                    assert!(position < body.find(&gep).unwrap(), "{body}");
+                }
             }
         }
         let early = text.replace("u8[count(3)] _first;", "_write_first(2,17);

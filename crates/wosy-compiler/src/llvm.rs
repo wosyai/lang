@@ -122,7 +122,7 @@ struct ProjectNames<'ctx, 'module> {
     positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
     checked_access: Option<CheckedAccessSymbols>,
     root_array_storage: HashMap<wosy_syntax::SourceSpan, RootRuntimeArrayStorage<'ctx>>,
-    root_array_accessors: HashMap<String, (wosy_syntax::SourceSpan, wosy_syntax::ByteSpan)>,
+    root_array_accessors: HashMap<String, (wosy_syntax::SourceSpan, std::collections::HashSet<(usize, usize)>)>,
     private_runtime_portable_symbols: std::collections::HashSet<String>,
 
     require_release_checked_access: bool,
@@ -1401,11 +1401,11 @@ fn emit_project_llvm<'a>(
             if let ScalarItem::Function(function) = item {
                 let name = project_function_name(&source_module.source, &function.name);
                 if root_source == Some(&source_module.source) {
-                    if let Some(&(owner, site)) = root_array_uses.and_then(|uses| uses.accessor_sites.get(&function.name_span)) {
+                    if let Some((owner, sites)) = root_array_uses.and_then(|uses| uses.accessor_sites.get(&function.name_span)) {
                         if exports.iter().any(|export| export.symbol == name) {
                             return Err("root-owned runtime array accessors cannot be exported".into());
                         }
-                        root_array_accessors.insert(name.clone(), (wosy_syntax::SourceSpan::new(source_module.source.clone(), owner), site));
+                        root_array_accessors.insert(name.clone(), (wosy_syntax::SourceSpan::new(source_module.source.clone(), *owner), sites.clone()));
                     }
                 }
                 initializer_symbols.function(&source_module.source, function, name.clone());

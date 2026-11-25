@@ -11,7 +11,7 @@ void *__wosy_core_alloc(u64 size, u64 alignment) {
 
 void __wosy_core_free(void *pointer) {
     unsigned bit = pointer == first ? 1 : pointer == second ? 2 : 0;
-    if (issued != 2 || !bit || (released & bit) || first[2] != 17 || second[4] != 23)
+    if (issued != 2 || !bit || (released & bit) || first[2] != 17 || second[0] != 23 || second[4] != 23)
         __builtin_trap();
     released |= bit;
 }

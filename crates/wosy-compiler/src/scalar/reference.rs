@@ -14282,7 +14282,7 @@ impl ProjectCallSiteResults {
 #[derive(Default)]
 pub(crate) struct ClosedRootArrayUses {
     pub(crate) owners: HashMap<ByteSpan, String>,
-    pub(crate) accessor_sites: HashMap<ByteSpan, (ByteSpan, ByteSpan)>,
+    pub(crate) accessor_sites: HashMap<ByteSpan, (ByteSpan, HashSet<(usize, usize)>)>,
 }
 
 pub(super) fn close_root_array_uses(
@@ -14382,24 +14382,22 @@ pub(super) fn close_root_array_uses(
                 }
             }
             let NamedPlaceRootFacts::Prepared(roots) = &sites.named_place_roots else { return ClosedRootArrayUses::default(); };
-            let mut uses = roots.iter().filter_map(|(&point, identity)| match identity {
-                NamedPlaceRootIdentity::ModuleValue(identity) => Some((point, owner(identity)?)),
+            let candidate_roots: HashMap<_, _> = roots.iter().filter_map(|(&point, identity)| match identity {
+                NamedPlaceRootIdentity::ModuleValue(identity) => Some((point.0, owner(identity)?)),
                 _ => None,
-            });
-            let Some((point, allocation)) = uses.next() else { continue; };
+            }).collect();
+            let Some(&allocation) = candidate_roots.values().next() else { continue; };
             let (_, element) = candidates[&allocation];
             let eligible = std::ptr::eq(sites, body)
                 && function.name.starts_with('_') && function.overload_arms.is_empty()
                 && function.generic_parameters.is_empty() && !function.body.unsafe_context
-                && uses.next().is_none()
-                && root_array_accessor(prepared, module, item, function, point, allocation, element);
-            if !eligible {
-                invalid.insert(allocation);
-                invalid.extend(roots.values().filter_map(|identity| match identity {
-                    NamedPlaceRootIdentity::ModuleValue(identity) => owner(identity), _ => None,
-                }));
+                && candidate_roots.values().all(|actual| *actual == allocation);
+            if let Some(certified) = eligible.then(|| root_array_accessor(
+                prepared, module, item, function, &candidate_roots, allocation, element,
+            )).flatten() {
+                accessors.insert(function.name_span, (allocation, certified));
             } else {
-                accessors.insert(function.name_span, (allocation, sites.occurrences[point.0].span));
+                invalid.extend(candidate_roots.into_values());
             }
         }
     }
@@ -14413,7 +14411,7 @@ pub(super) fn close_root_array_uses(
             _ => continue,
         };
         if &identity.source != source { continue; }
-        let Some(&(allocation, _)) = accessors.get(&identity.range) else { continue; };
+        let Some(&(allocation, ref _sites)) = accessors.get(&identity.range) else { continue; };
         let span = initializer.occurrences[point.0].span;
         let position = initialization_steps.partition_point(|step| step.end <= span.start);
         let dominated = allocation_steps.get(&allocation).is_some_and(|&install| install < position)
@@ -14424,7 +14422,7 @@ pub(super) fn close_root_array_uses(
             reached.insert(identity.range);
         }
     }
-    for (function, &(allocation, _)) in &accessors {
+    for (function, &(allocation, ref _sites)) in &accessors {
         if outside_calls.contains(function) || !reached.contains(function) { invalid.insert(allocation); }
     }
     accessors.retain(|_, (allocation, _)| !invalid.contains(allocation));
@@ -14434,34 +14432,73 @@ pub(super) fn close_root_array_uses(
 
 fn root_array_accessor(
     prepared: &super::PreparedScalarProject, module: usize, item: usize, function: &ScalarFunction,
-    root_ordinal: OccurrenceOrdinal, allocation: ByteSpan, element: &ScalarType,
-) -> bool {
-    let Some(node) = function.body.items.first() else { return false; };
-    if function.body.items.len() != 1 { return false; }
-    let ScalarType::Callable { parameters, outputs } = &function.signature else { return false; };
-    let (place, assigned) = match node {
-        ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })
-            if function.body.final_output_values.len() == 1 && parameters.as_slice() == [ScalarType::U64]
-                && matches!(outputs.outputs.as_slice(), [output] if &output.ty == element) => (place, None),
-        ScalarBlockItem::Assignment(assignment) if function.body.final_output_values.is_empty()
-            && matches!(parameters.as_slice(), [ScalarType::U64, value] if value == element)
-            && matches!(outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit) => {
-            let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice()) else { return false; };
-            (&target.place, Some(value))
-        }
-        _ => return false,
+    roots: &HashMap<usize, ByteSpan>, allocation: ByteSpan, element: &ScalarType,
+) -> Option<HashSet<(usize, usize)>> {
+    let ScalarType::Callable { parameters, outputs } = &function.signature else { return None; };
+    let [output] = outputs.outputs.as_slice() else { return None; };
+    let writer = output.ty == ScalarType::Unit;
+    if !(writer || &output.ty == element)
+        || !parameters.iter().all(aggregate::ordinary_value)
+    { return None; }
+    let nodes = prepared.bind_callable_body_call_nodes(module, item, None, &function.body).ok()?;
+    let formals: HashSet<_> = function.parameter_spans.iter().copied().collect();
+    let parameter = |expr: &ScalarExpression, ty: &ScalarType| {
+        nodes.checked_expression_type(expr) == Some(ty)
+            && nodes.lexical_expression_declaration(expr)
+                .is_some_and(|span| formals.contains(&span))
     };
-    let ScalarPlace::Index { base, index, .. } = place else { return false; };
-    let Ok(nodes) = prepared.bind_callable_body_call_nodes(module, item, None, &function.body) else { return false; };
-    matches!(base.as_ref(), ScalarPlace::Name { .. })
-        && nodes.place_ordinal(base) == Some(root_ordinal.0)
-        && matches!(nodes.named_place_root(base), Some(NamedPlaceRootIdentity::ModuleValue(owner))
-            if owner.range == allocation)
-        && nodes.checked_place_type(place) == Some(element)
-        && nodes.checked_expression_type(index) == Some(&ScalarType::U64)
-        && nodes.lexical_expression_declaration(index) == function.parameter_spans.first().copied()
-        && assigned.is_none_or(|value| nodes.checked_expression_type(value) == Some(element)
-            && nodes.lexical_expression_declaration(value) == function.parameter_spans.get(1).copied())
+    let condition = |expr: &ScalarExpression| matches!(expr, ScalarExpression::Boolean { .. })
+        || parameter(expr, &ScalarType::Bool);
+    let mut accepted = HashSet::with_capacity(roots.len());
+    let mut current = vec![&function.body];
+    while let Some(block) = current.pop() {
+        if block.unsafe_context || (!writer && (block.items.len() != 1 || block.final_output_values.len() != 1))
+            || (writer && !block.final_output_values.is_empty())
+        { return None; }
+        for node in &block.items {
+            let place = match node {
+                ScalarBlockItem::Expression(ScalarExpression::If { condition: value, then_branch, else_branch, .. })
+                    if !writer && condition(value) => {
+                    current.extend([then_branch, else_branch]);
+                    continue;
+                }
+                ScalarBlockItem::Expression(ScalarExpression::UnitIf { condition: value, then_branch, .. })
+                    if writer && condition(value) => {
+                    current.push(then_branch);
+                    continue;
+                }
+                ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. }) if !writer => place,
+                ScalarBlockItem::Assignment(assignment) if writer => {
+                    let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+                    let ScalarPlace::Index { base, index, .. } = &target.place else { return None; };
+                    let (ScalarPlace::Name { name: owner, span: root }, ScalarExpression::Name { name: selector, span: index }) =
+                        (base.as_ref(), index.as_ref()) else { return None; };
+                    // These legacy receiver/target fields mirror the two
+                    // identifier tokens even for an ordinary indexed store.
+                    // They may not redirect the canonical prepared place.
+                    if !parameter(value, element)
+                        || assignment.receiver.as_ref() != Some(owner) || target.receiver.as_ref() != Some(owner)
+                        || assignment.receiver_span != Some(*root) || target.receiver_span != Some(*root)
+                        || &assignment.target != selector || &target.target != selector
+                        || assignment.target_span != *index || target.target_span != *index
+                    { return None; }
+                    &target.place
+                }
+                _ => return None,
+            };
+            let ScalarPlace::Index { base, index, .. } = place else { return None; };
+            let (root, projection) = (nodes.place_ordinal(base)?, nodes.place_ordinal(place)?);
+            if !matches!(base.as_ref(), ScalarPlace::Name { .. })
+                || roots.get(&root) != Some(&allocation)
+                || !matches!(nodes.named_place_root(base), Some(NamedPlaceRootIdentity::ModuleValue(owner))
+                    if owner.range == allocation)
+                || nodes.checked_place_type(place) != Some(element)
+                || !parameter(index, &ScalarType::U64)
+                || !accepted.insert((root, projection))
+            { return None; }
+        }
+    }
+    (accepted.len() == roots.len()).then_some(accepted)
 }
 
 #[cfg(test)]
