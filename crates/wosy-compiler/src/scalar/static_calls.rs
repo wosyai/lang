@@ -17,6 +17,7 @@ impl PreparedProgram {
                 diagnostics: Vec::new(),
                 contextual_places: contextual::ContextualPlaces::default(),
                 build_proofs: Vec::new(),
+                runtime_enum_matches: Vec::new(),
             },
             program.target_layout,
         )

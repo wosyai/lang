@@ -11,7 +11,7 @@ pub(super) struct AuthoredMatch {
 struct Arm {
     variant: String,
     body: ScalarBlock,
-    binders: Vec<String>,
+    binders: Vec<(String, ByteSpan)>,
     span: ByteSpan,
 }
 
@@ -26,6 +26,7 @@ pub(super) struct MatchArm<'a> {
     pub(super) tag: u32,
     pub(super) body: &'a ScalarBlock,
     pub(super) binders: Vec<(&'a str, &'a ScalarType)>,
+    pub(super) binder_spans: Vec<ByteSpan>,
 }
 
 pub(super) enum Selector<'a> {
@@ -34,11 +35,14 @@ pub(super) enum Selector<'a> {
         tag: u32,
         #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
         payload: Vec<Payload>,
+        operands: Vec<ByteSpan>,
+        span: ByteSpan,
     },
     If { condition: &'a ScalarExpression, then_branch: Box<Selector<'a>>, else_branch: Box<Selector<'a>> },
 }
 
 pub(super) struct ResolvedMatch<'a> {
+    pub(super) enumeration: &'a ScalarEnum,
     pub(super) selector: Selector<'a>,
     pub(super) arms: Vec<MatchArm<'a>>,
 }
@@ -83,8 +87,8 @@ impl AuthoredMatch {
                 .into_iter().flat_map(|parameters| parameters.children_with_tokens())
                 .filter_map(|element| element.into_token())
                 .filter(|token| token.kind() == SyntaxKind::Identifier)
-                .map(|token| token.text().to_owned()).collect::<Vec<_>>();
-            let unique = binders.iter().collect::<HashSet<_>>();
+                .map(|token| (token.text().to_owned(), super::token_span(&token))).collect::<Vec<_>>();
+            let unique = binders.iter().map(|(name, _)| name).collect::<HashSet<_>>();
             if unique.len() != binders.len() {
                 return Err(MatchError::invalid(span, "duplicate enum payload binder"));
             }
@@ -119,15 +123,15 @@ impl AuthoredMatch {
                 } else { MatchError::invalid(arm.span, "variant pattern does not match the payload arity") };
                 return Err(error);
             }
-            let binders = arm.binders.iter().zip(&variant.payload).map(|(name, slot)| {
+            let binders = arm.binders.iter().zip(&variant.payload).map(|((name, _), slot)| {
                 if !is_integer_type(&slot.ty) {
                     return Err(MatchError::unsupported(arm.span, "authored match supports integer payloads"));
                 }
                 Ok((name.as_str(), &slot.ty))
             }).collect::<Result<_, _>>()?;
-            arms.push(MatchArm { tag: variant.tag, body: &arm.body, binders });
+            arms.push(MatchArm { tag: variant.tag, body: &arm.body, binders, binder_spans: arm.binders.iter().map(|(_, span)| *span).collect() });
         }
-        Ok(ResolvedMatch { selector, arms })
+        Ok(ResolvedMatch { selector, arms, enumeration })
     }
 }
 
@@ -197,7 +201,7 @@ impl<'a> Resolver<'a, '_> {
                     Ok(Payload::Literal(literal.into_owned()))
                 }
             }).collect::<Result<_, _>>()?;
-            return Ok(Selector::Variant { tag: selected.tag, payload });
+            return Ok(Selector::Variant { tag: selected.tag, payload, operands: arguments.iter().map(expression_span).collect(), span });
         }
         match expression {
             ScalarExpression::If { condition, then_branch, else_branch, .. } => {

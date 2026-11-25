@@ -109,6 +109,7 @@ pub enum SyntaxKind {
     ProofMatch = 96,
     ProofMatchArm = 97,
     EnumVariantPayload = 98,
+    RuntimeMatchBody = 99,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -217,6 +218,7 @@ impl Language for WosyLanguage {
             96 => SyntaxKind::ProofMatch,
             97 => SyntaxKind::ProofMatchArm,
             98 => SyntaxKind::EnumVariantPayload,
+            99 => SyntaxKind::RuntimeMatchBody,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -953,6 +955,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
         Rule::proof_exists => SyntaxKind::ProofExists,
         Rule::proof_match_block => SyntaxKind::ProofMatchBlock,
+        Rule::runtime_match_body => SyntaxKind::RuntimeMatchBody,
         Rule::proof_match => SyntaxKind::ProofMatch,
         Rule::proof_match_arm => SyntaxKind::ProofMatchArm,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
@@ -3007,8 +3010,9 @@ mod proof_fragment_tests {
         assert_eq!(arms[1].text(), "right {}");
         let runtime = format!("%%start u8(u8) classify = fn(x) {{ {matching} }}; %%end");
         let ordinary = parse(source(), runtime, &[]);
-        assert!(!ordinary.is_valid());
-        assert!(!ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::ProofMatch));
+        assert!(ordinary.is_valid(), "{:?}", ordinary.errors);
+        assert!(ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::RuntimeMatchBody));
+        assert!(!ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::ProofMatchBlock));
     }
 
     #[test]

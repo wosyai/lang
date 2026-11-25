@@ -2345,6 +2345,9 @@ pub struct ScalarSourceDeclarations {
     #[allow(dead_code)]
     contextual_places: contextual::ContextualPlaces,
     build_proofs: Vec<CstNode>,
+    // Guarded plans, not executable declarations or lowering authority.
+    #[allow(dead_code)]
+    runtime_enum_matches: Vec<runtime_enum_match::Plan>,
 }
 
 impl ScalarSourceDeclarations {
@@ -2432,6 +2435,7 @@ fn derive_scalar_declarations(
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     let mut contextual = false;
+    let mut pending_runtime_matches = Vec::new();
     let (mut diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, diagnostic_roots, |node| {
         match node.kind() {
             SyntaxKind::StructDecl => {
@@ -2443,6 +2447,7 @@ fn derive_scalar_declarations(
                 enums.push(derive_enum(node, id));
             }
             SyntaxKind::ContextualPlace => contextual = true,
+            SyntaxKind::RuntimeMatchBody => pending_runtime_matches.push(node),
             _ => {}
         }
     });
@@ -2457,7 +2462,22 @@ fn derive_scalar_declarations(
             .flat_map(|node| node.descendants())
             .filter_map(|node| invalid_projection_diagnostic(&canonical.source, &node)));
     }
-    if invalid_projection || diagnostics.len() != proof_diagnostic_start {
+    let mut runtime_enum_matches = Vec::new();
+    let guarded_runtime = !pending_runtime_matches.is_empty();
+    if guarded_runtime && diagnostics.is_empty() {
+        let mut runtime_match_work = 0;
+        for node in pending_runtime_matches {
+            match runtime_enum_match::prepare(&canonical.source, &enums, &node, &mut runtime_match_work) {
+                Ok(plan) => {
+                    diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span,
+                        "typed runtime enum match is not yet eligible for lowering"));
+                    runtime_enum_matches.push(plan);
+                }
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+    }
+    if guarded_runtime || invalid_projection || diagnostics.len() != proof_diagnostic_start {
         return ScalarSourceDeclarations {
             source: canonical.source.clone(),
             items,
@@ -2466,6 +2486,7 @@ fn derive_scalar_declarations(
             diagnostics,
             contextual_places: contextual::ContextualPlaces::default(),
             build_proofs,
+            runtime_enum_matches,
         };
     }
     let contextual_places = if contextual {
@@ -2550,6 +2571,7 @@ fn derive_scalar_declarations(
         diagnostics,
         contextual_places,
         build_proofs,
+        runtime_enum_matches,
     }
 }
 
@@ -2626,6 +2648,7 @@ mod contextual;
 mod declarations;
 mod proof_typing;
 mod proof_match;
+mod runtime_enum_match;
 mod analysis_budget;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
@@ -2660,7 +2683,15 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
         .filter(|module| module.children().any(|node| node.kind() == SyntaxKind::ProofDecl))
         .map(|module| runtime_module_roots(&module));
     let roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&canonical.root));
-    collect_scalar_diagnostics(canonical, roots, |_| {}).0
+    let mut runtime = Vec::new();
+    let (mut diagnostics, _) = collect_scalar_diagnostics(canonical, roots, |node| {
+        if node.kind() == SyntaxKind::RuntimeMatchBody {
+            runtime.push(runtime_enum_match::diagnostic(&canonical.source, wosy_syntax::byte_span(&node),
+                "runtime enum match is not yet eligible for lowering"));
+        }
+    });
+    diagnostics.append(&mut runtime);
+    diagnostics
 }
 
 fn runtime_module_roots(module: &CstNode) -> Vec<CstNode> {
@@ -2730,7 +2761,7 @@ fn collect_scalar_diagnostics(
                 lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
             }
             NodeOrToken::Node(node)
-                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl | SyntaxKind::ContextualPlace) =>
+                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl | SyntaxKind::ContextualPlace | SyntaxKind::RuntimeMatchBody) =>
                 record_declaration(node),
             NodeOrToken::Node(node) => projections.extend(invalid_projection_diagnostic(&canonical.source, &node)),
         }

@@ -255,7 +255,7 @@ impl SelectorCompiler<'_, '_> {
         if depth == MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
         charge_call_work(&mut self.work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
         match selector {
-            Selector::Variant { tag, payload } => {
+            Selector::Variant { tag, payload, .. } => {
                 let (previous, facts) = self.domains.entry(*tag).or_default();
                 let cost = previous.interval_count().checked_add(domain.interval_count())
                     .and_then(|cost| cost.checked_add(payload.len())).ok_or(ProjectCheck::Unsupported)?;
