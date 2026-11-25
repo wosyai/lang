@@ -19,7 +19,10 @@ pub(super) fn emit<'ctx>(
     if size < 4 || alignment < 4 || plan.arms.len() != layout.variants.len() {
         return Err("invalid runtime enum storage or exhaustive arm count".into());
     }
-    let storage = builder.build_alloca(context.i8_type().array_type(size), "enum.match.storage").map_err(builder_error)?;
+    // A lexical constructor initializes this exact slot. The match only
+    // reads it: no reconstruction or second constructor path.
+    let storage_name = if plan.local.is_some() { "enum.local.storage" } else { "enum.match.storage" };
+    let storage = builder.build_alloca(context.i8_type().array_type(size), storage_name).map_err(builder_error)?;
     storage.as_instruction_value().ok_or("missing runtime enum storage instruction")?
         .set_alignment(alignment).map_err(|error| format!("{error:?}"))?;
     let arguments = callable.parameter_spans.iter().map(|span| (span.start, span.end)).zip(function.get_param_iter())

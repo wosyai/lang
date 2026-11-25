@@ -13,7 +13,16 @@ pub(crate) struct Plan {
     inputs: Vec<(ByteSpan, ScalarType)>,
     pub(crate) output: ScalarType,
     pub(crate) selector: TypedSelector,
+    pub(crate) local: Option<LexicalEnumBinding>,
     pub(crate) arms: Vec<TypedArm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LexicalEnumBinding {
+    enumeration: ScalarEnumId,
+    declaration: ByteSpan,
+    initializer: ByteSpan,
+    read: ByteSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,14 +96,74 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
             return Err(diagnostic(source, token_span(&name), "duplicate or reserved runtime match parameter"));
         }
     }
-    let matching = body.children().find(|node| node.kind() == SyntaxKind::ProofMatch)
-        .ok_or_else(|| error("missing runtime match selector and arms"))?;
-    let matching = AuthoredMatch::prepare(&matching).map_err(|error| diagnostic(source, error.span, error.message))?;
+    let (matching, local) = {
+        let mut parts = body.children();
+        let first = parts.next().ok_or_else(|| error("missing runtime match selector and arms"))?;
+        if first.kind() == SyntaxKind::ProofMatch && parts.next().is_none() {
+            (first, None)
+        } else if first.kind() == SyntaxKind::BlockItem {
+            let matching = parts.next().filter(|node| node.kind() == SyntaxKind::ProofMatch)
+                .ok_or_else(|| error("runtime enum match allows only one preceding immutable enum local"))?;
+            if parts.next().is_some() {
+                return Err(error("runtime enum match must be the final result"));
+            }
+            let declaration = first.children().find(|part| part.kind() == SyntaxKind::LocalBinding)
+                .ok_or_else(|| error("runtime enum match allows only a preceding immutable enum local"))?;
+            let receivers = declaration.children().find(|part| part.kind() == SyntaxKind::ReceiverList)
+                .ok_or_else(|| error("runtime enum match requires an initialized enum local"))?;
+            let mut receivers = receivers.children().filter(|part| part.kind() == SyntaxKind::Receiver);
+            let receiver = receivers.next().ok_or_else(|| error("missing runtime enum local receiver"))?;
+            if receivers.next().is_some() {
+                return Err(error("runtime enum match requires exactly one enum receiver"));
+            }
+            let ty = receiver.children().find(|part| part.kind() == SyntaxKind::TypeSpec)
+                .ok_or_else(|| error("missing runtime enum local type"))?;
+            let mut semantic = semantic_children(&ty);
+            let Some(ty_name) = semantic.next().and_then(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::TypeName) else {
+                return Err(diagnostic(source, wosy_syntax::byte_span(&ty), "runtime enum local needs a simple same-source enum type"));
+            };
+            if semantic.next().is_some() {
+                return Err(diagnostic(source, wosy_syntax::byte_span(&ty), "runtime enum local needs a simple same-source enum type"));
+            }
+            let name = direct_token(&receiver, SyntaxKind::Identifier)
+                .ok_or_else(|| error("missing runtime enum local name"))?;
+            if formals.contains_key(name.text()) || typecheck::is_null_literal_name(name.text()) {
+                return Err(diagnostic(source, token_span(&name), "runtime enum local must be fresh"));
+            }
+            let output = declaration.children().find(|part| part.kind() == SyntaxKind::OutputList)
+                .ok_or_else(|| error("missing runtime enum local initializer"))?;
+            let mut outputs = output.children().filter(|part| part.kind() == SyntaxKind::Expression);
+            let initializer = outputs.next().ok_or_else(|| error("missing runtime enum local initializer"))?;
+            if outputs.next().is_some() {
+                return Err(error("runtime enum match requires exactly one enum initializer"));
+            }
+            (matching, Some((name, ty_name, initializer)))
+        } else {
+            return Err(error("runtime enum match allows only one preceding immutable enum local"));
+        }
+    };
+    let matching = AuthoredMatch::prepare_with_initializer(&matching, local.as_ref().map(|(_, _, node)| node.clone()))
+        .map_err(|error| diagnostic(source, error.span, error.message))?;
     let resolved = matching.resolve(source, enums, &|name, ty| formals.get(name).is_some_and(|(_, found)| ty == found), work)
         .map_err(|error| diagnostic(source, error.span, error.message))?;
     if resolved.enumeration.copy_modifier_span.is_none() || resolved.enumeration.has_tag_only_layout() {
         return Err(error("runtime enum payload match requires a payload-bearing enum copy declaration"));
     }
+    let local_binding = local.as_ref().map(|(name, ty, initializer)| {
+        let type_span = token_span(ty);
+        if ty.text() != resolved.enumeration.name.as_str() {
+            return Err(diagnostic(source, type_span, "runtime enum local type does not match its initializer enum"));
+        }
+        let use_span = match matching.lexical_selector() {
+            Some(ScalarExpression::Name { name: used, span }) if used == name.text() => *span,
+            Some(selector) => return Err(diagnostic(source, typecheck::expression_span(selector),
+                "runtime match must read the preceding enum local")),
+            None => return Err(error("missing preceding runtime enum local read")),
+        };
+        Ok(LexicalEnumBinding { enumeration: resolved.enumeration.id.clone(), declaration: token_span(name),
+            initializer: wosy_syntax::byte_span(initializer), read: use_span })
+    }).transpose()?;
     let selector = typed_selector(source, &formals, resolved.selector)?;
     let arms = resolved.arms.into_iter().map(|arm| {
         let scope = arm.body.span;
@@ -106,7 +175,8 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
             return Err(arm_error("runtime enum arm must directly return its payload or an integer literal"));
         }
         let bindings = arm.binders.iter().zip(arm.binder_spans).enumerate().map(|(slot, ((name, ty), declaration))| {
-            if formals.contains_key(*name) || typecheck::is_null_literal_name(name) {
+            if formals.contains_key(*name) || typecheck::is_null_literal_name(name)
+                || local.as_ref().is_some_and(|(binding, ..)| binding.text() == *name) {
                 return Err(diagnostic(source, declaration, "runtime enum payload binder must be fresh"));
             }
             Ok(CaseBinding { slot, declaration, ty: (*ty).clone() })
@@ -130,7 +200,7 @@ pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstN
     let name_span = direct_token(&owner, SyntaxKind::Identifier).as_ref().map(token_span)
         .ok_or_else(|| error("missing runtime enum match callable name"))?;
     Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows,
-        enumeration: resolved.enumeration.id.clone(), output: result.ty.clone(), selector, arms })
+        enumeration: resolved.enumeration.id.clone(), output: result.ty.clone(), selector, local: local_binding, arms })
 }
 
 impl Plan {
@@ -158,6 +228,9 @@ impl Plan {
             && self.name_span == function.name_span && self.span == function.body.span
             && function.body.items.is_empty() && function.body.final_output_values.is_empty()
             && function.overload_arms.is_empty() && function.generic_parameters.is_empty()
+            && self.local.as_ref().is_none_or(|local| local.enumeration == self.enumeration
+                && self.span.start <= local.declaration.start && local.declaration.end <= local.initializer.start
+                && local.initializer.end <= local.read.start && local.read.end <= self.span.end)
             && self.inputs.len() == function.parameter_spans.len()
             && self.inputs.len() == parameters.len()
             && self.inputs.iter().zip(function.parameter_spans.iter().zip(parameters))
@@ -334,5 +407,64 @@ fn prepared_runtime_enum_match_uses_real_tagged_storage_on_native_and_wasi() {
         assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
         let llvm = crate::emit_scalar_build_project_llvm_text(&analyzed).unwrap();
         assert!(llvm.contains("enum.match.storage = alloca") && llvm.contains("switch i32"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_lexical_binding_is_the_sole_match_input() {
+    let text = r#"%%start
+        enum copy Region { left(u8); right(u8, u16); }
+        enum copy Other { left(u8); right(u8, u16); }
+        u8(bool, u8) choose = fn(flag, input) {
+            Region selected = if (flag) { Region.left(input) } else { Region.right(9, 256) };
+            match (selected) {
+                right(value, other) { value }
+                left(bound) { bound }
+            }
+        };
+        u8 x = choose(true, 17);
+        u8 y = choose(false, 29);
+        if (x != 17 || y != 9) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target_layout).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[0] else {
+            panic!("prepared lexical runtime match owner");
+        };
+        let plan = function.runtime_enum_match.as_deref().unwrap();
+        let local = plan.local.as_ref().unwrap();
+        let at = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(at(local.declaration), "selected");
+        assert_eq!(at(local.read), "selected");
+        assert_ne!(local.declaration, local.read);
+        assert_eq!(local.enumeration, plan.enumeration);
+        assert!(at(local.initializer).starts_with("if (flag)"));
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let llvm = emit(&analyzed).unwrap();
+            assert_eq!(llvm.matches("enum.local.storage = alloca").count(), 1);
+            assert!(llvm.contains("switch i32") && llvm.contains("store i16 256"));
+        }
+    }
+    for (invalid, reason) in [
+        (text.replace("Region selected = ", "Other selected = "), "does not match its initializer"),
+        (text.replace("Region selected = ", "Region[1] selected = "), "simple same-source enum type"),
+        (text.replace("match (selected)", "match (input)"), "must read the preceding"),
+        (text.replace("Region selected", "Region input").replace("match (selected)", "match (input)"), "must be fresh"),
+        (text.replace("left(bound) { bound }", "left(selected) { selected }"), "binder must be fresh"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime enum binding");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
     }
 }

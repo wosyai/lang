@@ -688,6 +688,12 @@ fn build_pair(
         } else {
             SyntaxKind::UnitIfExpr
         }
+    } else if pair.as_rule() == Rule::function_block {
+        if pair.clone().into_inner().any(|child| child.as_rule() == Rule::proof_match) {
+            SyntaxKind::RuntimeMatchBody
+        } else {
+            SyntaxKind::Block
+        }
     } else {
         kind(pair.as_rule())
     };
@@ -955,7 +961,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
         Rule::proof_exists => SyntaxKind::ProofExists,
         Rule::proof_match_block => SyntaxKind::ProofMatchBlock,
-        Rule::runtime_match_body => SyntaxKind::RuntimeMatchBody,
         Rule::proof_match => SyntaxKind::ProofMatch,
         Rule::proof_match_arm => SyntaxKind::ProofMatchArm,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
@@ -987,7 +992,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::unsafe_marker => SyntaxKind::Unsafe,
         Rule::identifier => SyntaxKind::Identifier,
         Rule::parameters => SyntaxKind::Parameters,
-        Rule::block => SyntaxKind::Block,
+        Rule::block | Rule::function_block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::unsafe_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
@@ -2991,6 +2996,36 @@ mod proof_fragment_tests {
         assert!(entry.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "x <= 10"));
         assert!(goal.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "out <= 10"));
         assert!(body.descendants().any(|node| node.kind() == SyntaxKind::Call && node.text() == "core.show(out == x)"));
+    }
+
+    #[test]
+    fn named_function_uses_one_ordinary_binding_prefix_before_choosing_its_tail() {
+        let ordinary = "%%start u8(u8) f = fn(x) { u8 local = if (x == 0) { 1 } else { x }; local }; %%end";
+        let lexical = "%%start u8(u8) f = fn(x) { Region local = if (x == 0) { Region.a(1) } else { Region.b(x) }; match (local) { a(a_value) { a_value } b(b_value) { b_value } } }; %%end";
+        for (text, tail, kind) in [
+            (ordinary, Rule::final_output_list, SyntaxKind::Block),
+            (lexical, Rule::proof_match, SyntaxKind::RuntimeMatchBody),
+        ] {
+            let body = WosyParser::parse(Rule::source, text).unwrap().flatten()
+                .find(|pair| pair.as_rule() == Rule::function_block).unwrap();
+            let parts = body.into_inner().collect::<Vec<_>>();
+            assert_eq!(parts.iter().map(|pair| pair.as_rule()).collect::<Vec<_>>(),
+                [Rule::block_item, tail]);
+            assert_eq!(parts[0].clone().into_inner().filter(|pair| pair.as_rule() == Rule::local_binding).count(), 1);
+            let parsed = parse(source(), text.to_owned(), &[]);
+            assert!(parsed.is_valid(), "{:?}", parsed.errors);
+            let named = parsed.root.descendants().find(|node| node.kind() == SyntaxKind::FunctionDecl).unwrap();
+            assert!(named.children().any(|node| node.kind() == kind));
+            assert_eq!(parsed.reconstruct(), text);
+        }
+        // Grammar topology (not timing): there is no special alternative
+        // that can retry the typed binding before selecting the body rule.
+        let grammar = include_str!("grammar.pest");
+        let callable = grammar.lines().find(|line| line.starts_with("function_decl =")).unwrap();
+        let body = grammar.lines().find(|line| line.starts_with("function_block =")).unwrap();
+        assert!(callable.contains("parameters? ~ function_block ~"));
+        assert_eq!(body.matches("block_prefix").count(), 1);
+        assert!(body.contains("block_prefix ~ (proof_match | final_output_list)?"));
     }
 
     #[test]

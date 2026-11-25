@@ -4,6 +4,7 @@ use super::{analysis_budget::{charge_call_work, MAX_ACTUAL_CALL_DEPTH}, typechec
 
 pub(super) struct AuthoredMatch {
     selector: ScalarExpression,
+    lexical_selector: Option<ScalarExpression>,
     arms: Vec<Arm>,
     span: ByteSpan,
 }
@@ -66,10 +67,18 @@ fn charge(work: &mut usize, cost: usize, span: ByteSpan) -> Result<(), MatchErro
 
 impl AuthoredMatch {
     pub(super) fn prepare(node: &CstNode) -> Result<Self, MatchError> {
+        Self::prepare_with_initializer(node, None)
+    }
+
+    pub(super) fn prepare_with_initializer(node: &CstNode, initializer: Option<CstNode>) -> Result<Self, MatchError> {
         let span = wosy_syntax::byte_span(node);
         let mut work = 0;
         charge(&mut work, u32::from(node.text_range().len()) as usize / 32 + 1, span)?;
         let mut pending = vec![(node.clone(), 1)];
+        if let Some(initializer) = &initializer {
+            charge(&mut work, u32::from(initializer.text_range().len()) as usize / 32 + 1, span)?;
+            pending.push((initializer.clone(), 1));
+        }
         while let Some((node, depth)) = pending.pop() {
             if depth > MAX_ACTUAL_CALL_DEPTH { return Err(MatchError::budget(span)); }
             for child in node.children() {
@@ -79,7 +88,11 @@ impl AuthoredMatch {
         }
         let child = |node: &CstNode, kind| node.children().find(|child| child.kind() == kind)
             .ok_or_else(|| MatchError::invalid(wosy_syntax::byte_span(node), "incomplete authored match"));
-        let selector = derive_expression(&child(node, SyntaxKind::Expression)?);
+        let authored_selector = derive_expression(&child(node, SyntaxKind::Expression)?);
+        let (selector, lexical_selector) = match initializer {
+            Some(initializer) => (derive_expression(&initializer), Some(authored_selector)),
+            None => (authored_selector, None),
+        };
         let mut arms = Vec::new();
         for node in node.children().filter(|node| node.kind() == SyntaxKind::ProofMatchArm) {
             let span = wosy_syntax::byte_span(&node);
@@ -97,7 +110,11 @@ impl AuthoredMatch {
             let body = derive_block(&child(&node, SyntaxKind::Block)?);
             arms.push(Arm { variant, body, binders, span });
         }
-        Ok(Self { selector, arms, span })
+        Ok(Self { selector, lexical_selector, arms, span })
+    }
+
+    pub(super) fn lexical_selector(&self) -> Option<&ScalarExpression> {
+        self.lexical_selector.as_ref()
     }
 
     pub(super) fn resolve<'a>(&'a self, source: &SourceIdentity, enums: &'a [ScalarEnum],
