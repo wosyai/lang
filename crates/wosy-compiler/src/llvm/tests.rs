@@ -15871,3 +15871,92 @@ ordinary(2);
         }
     }
 }
+
+#[test]
+fn guarded_fallible_known_layout_explicit_release_retires_original_backing() {
+    let text = "%%start
+struct Value { u8 tag; u64 count; }
+u64(bool) scalar = fn(explicit) {
+    u64 owned =? 7;
+    if (&owned == null) { 99 } else {
+        u64 n = owned;
+        if (explicit) {
+            unsafe { core.free(&owned); };
+            u8[n] marker;
+            core.array_len(&marker);
+        };
+        n
+    }
+};
+u64(bool) fixed = fn(explicit) {
+    u64[2] owned =? [8, 9];
+    if (&owned == null) { 99 } else {
+        u64 n = owned[0];
+        if (explicit) {
+            unsafe { core.free(&owned); };
+            u8[n] marker;
+            core.array_len(&marker);
+        };
+        n
+    }
+};
+u64(bool) structure = fn(explicit) {
+    Value owned =? { .tag = 3; .count = 11; };
+    if (&owned == null) { 99 } else {
+        u64 n = owned.count;
+        if (explicit) {
+            unsafe { core.free(&owned); };
+            u8[n] marker;
+            core.array_len(&marker);
+        };
+        n
+    }
+};
+if (scalar(true) != 99 || scalar(true) != 7 || scalar(false) != 7
+    || fixed(true) != 99 || fixed(true) != 8 || fixed(false) != 8
+    || structure(true) != 99 || structure(true) != 11 || structure(false) != 11) {
+    core.system_panic();
+};
+%%end";
+    let unproved = text.replacen("    if (&owned == null)", "    unsafe { core.free(&owned); };
+    if (&owned == null)", 1);
+    let repeated = text.replacen("core.free(&owned);", "core.free(&owned); core.free(&owned);", 1);
+    let live = text.replace("        u64 n = owned[0];", "        *u64 cell = &owned[0];\n        u64 n = *cell;")
+        .replace("        };\n        n\n    }\n};\nu64(bool) structure",
+            "        };\n        *cell\n    }\n};\nu64(bool) structure");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (case, expected) in [
+            (&unproved, "fallible allocation is not known to be available"),
+            (&repeated, "fallible allocation is not known to be available"),
+            (&live, "read or move of unavailable place"),
+        ] {
+            let prepared = prepare_initializer_test(case, layout);
+            let checked = analyze_scalar_build(&prepared);
+            let diagnostic = checked.diagnostics().iter().find(|diagnostic| diagnostic.message.contains(expected))
+                .unwrap_or_else(|| panic!("{expected}: {:?}", checked.diagnostics()));
+            if case == &live {
+                let origin = live.find("&owned[0]").unwrap() as u32;
+                assert!(diagnostic.labels.iter().any(|label| label.kind == crate::DiagnosticLabelKind::Secondary
+                    && label.span.range.start == origin));
+            }
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, output) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&checked)),
+            ("project", emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded explicit known-layout release");
+            context.create_module_from_ir(bytes).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_KNOWN_LAYOUT_RELEASE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

@@ -1998,8 +1998,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let argument = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(0));
                     let place = self.place_ordinal(OccurrenceParent::Expression(argument), OccurrenceEdge::ExpressionPlace);
                     let PreparedPlaceRoot::Lexical(binding) = self.prepared_place_root(place, *span).ok().flatten()? else { return None; };
-                    self.proof_points.fallible_allocation_bindings.as_ref()?.get(binding)?
-                        .has_runtime_extent().then(|| binding.clone())
+                    self.proof_points.fallible_allocation_bindings.as_ref()?.get(binding)?;
+                    Some(binding.clone())
                 })();
                 let mut borrowed_extent_formal = None;
                 let mut aggregate_arguments = BTreeMap::new();
@@ -17456,7 +17456,7 @@ fn seal_guarded_scalar_allocations(
         let CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } } = &release.kind else { return None; };
         let [candidate] = candidates.as_slice() else { return None; };
         if &candidate.place.binding != binding || !candidate.place.projections.is_empty()
-            || !bindings.get(binding)?.has_runtime_extent()
+            || !bindings.contains_key(binding)
         { return None; }
         releases_by_owner.entry(binding).or_default().push(release.source_span.range);
     }

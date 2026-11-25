@@ -1570,7 +1570,7 @@ pub(super) fn guarded_scalar_condition<'ctx>(
     Ok(Some(EmitValue::Basic(condition.into())))
 }
 
-pub(super) fn release_guarded_runtime_at<'ctx>(
+pub(super) fn release_guarded_owner_at<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     span: ByteSpan,
