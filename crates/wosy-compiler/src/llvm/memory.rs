@@ -564,9 +564,18 @@ impl SignedRuntimeAddressDomain {
         Ok(Self { pointer_bytes, max_bytes, scalar_element: signed_runtime_scalar_element(element) })
     }
 
+    // A known guarded literal uses an already-computed allocation size.
+    // Out-of-domain or non-scalar literals keep their old path and gain no proof.
+    pub(super) fn for_static_scalar(
+        target: ScalarTargetLayout, element: &ScalarType, allocation_bytes: u64,
+    ) -> Option<Self> {
+        let domain = Self::for_construction(target, element).ok()?;
+        (domain.scalar_element.is_some() && allocation_bytes <= domain.max_bytes).then_some(domain)
+    }
+
     pub(super) fn max_bytes(self) -> u64 { self.max_bytes }
 
-    fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
+    pub(super) fn matches_consumer(self, target: ScalarTargetLayout, element: &ScalarType) -> bool {
         // None on both ends leaves the established non-scalar constructor
         // and index path unchanged; it grants no reusable layout identity.
         self.pointer_bytes == target.pointer_size && self.scalar_element == signed_runtime_scalar_element(element)

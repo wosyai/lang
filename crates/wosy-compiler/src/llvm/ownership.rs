@@ -1242,6 +1242,7 @@ struct GuardedScalarOwner<'ctx> {
     backing: PointerValue<'ctx>,
     present: inkwell::values::IntValue<'ctx>,
     runtime_extent: Option<inkwell::values::IntValue<'ctx>>,
+    signed: Option<memory::SignedRuntimeAddressDomain>,
     live_slot: Option<PointerValue<'ctx>>,
 }
 
@@ -1334,7 +1335,8 @@ fn transfer_guarded_runtime_owner<'ctx>(
     state.builder.build_store(live_slot, context.bool_type().const_zero()).map_err(builder_error)?;
     state.storage.insert(name.into(), (owner.backing, receiver_ty));
     let transferred = GuardedScalarOwner { backing: owner.backing,
-        present: context.bool_type().const_all_ones(), runtime_extent: Some(extent), live_slot: None };
+        present: context.bool_type().const_all_ones(), runtime_extent: Some(extent),
+        signed: owner.signed, live_slot: None };
     if let Some(previous) = previous {
         state.guarded_scalar.as_mut().expect("prepared guarded sites").active[target] = Some(transferred);
         release_guarded_scalar_owner(context, state, previous)?;
@@ -1385,7 +1387,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
         state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
         return enroll_guarded_owner(context, state, index, GuardedScalarOwner {
-            backing, present, runtime_extent: Some(extent), live_slot: None,
+            backing, present, runtime_extent: Some(extent), signed: None, live_slot: None,
         });
     }
     let runtime_layout = match (&receiver.ty, sites.sites[index].runtime_literal_length) {
@@ -1456,6 +1458,11 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     };
     declare_core_runtime(context, state.module);
     let (size, align) = allocation_layout(materialized_ty, state.layouts, state.target_layout)?;
+    let signed = match (&receiver.ty, &runtime_layout) {
+        (ScalarType::RuntimeArray { element, .. }, Some(_)) =>
+            memory::SignedRuntimeAddressDomain::for_static_scalar(state.target_layout, element, size),
+        _ => None,
+    };
     let initialized = context.append_basic_block(parent, "fallible.initialize");
     let continuation = context.append_basic_block(parent, "fallible.continue");
     let skipped = if let Some(rhs) = rhs {
@@ -1511,7 +1518,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     } else { (backing, present) };
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
     enroll_guarded_owner(context, state, index, GuardedScalarOwner {
-        backing, present, runtime_extent: None, live_slot: None,
+        backing, present, runtime_extent: None, signed, live_slot: None,
     })
 }
 
@@ -1530,6 +1537,14 @@ pub(super) fn guarded_array_extent<'ctx>(
     if !matches!(site.ty, ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }) { return Ok(None); }
     let owner = sites.active[index].filter(|owner| owner.backing == backing && &site.ty == ty)
         .ok_or("guarded array access lost its exact prepared owner")?;
+    if let Some(signed) = owner.signed {
+        let ScalarType::RuntimeArray { element, .. } = ty else {
+            return Err("guarded signed address domain is not attached to runtime array storage".into());
+        };
+        if !signed.matches_consumer(state.target_layout, element) {
+            return Err("guarded runtime array changed its signed address domain".into());
+        }
+    }
     let extent = match &site.ty {
         ScalarType::Array { length, .. } => context.i64_type().const_int(*length, false),
         ScalarType::RuntimeArray { .. } if site.runtime_returned =>

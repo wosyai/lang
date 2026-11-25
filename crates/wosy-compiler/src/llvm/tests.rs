@@ -16274,3 +16274,60 @@ if (observed(3, 1) != 37) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn guarded_literal_signed_address_domain_survives_whole_move_and_replacement() {
+    let text = "%%start
+u64(u64) observed = fn(index) {
+    u64[] prior =? [10, 20];
+    if (&prior == null) { 90 } else {
+        u64[] donor =? [30, 40, 50];
+        if (&donor == null) {
+            prior[index] = 11;
+            core.array_len(&prior)
+        } else {
+            u64[] dest = prior;
+            dest[index] = 12;
+            dest = donor;
+            dest[index] = 7;
+            core.array_len(&dest)
+        }
+    }
+};
+if (observed(1) != 2 || observed(1) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, artifact) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", true, emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = artifact.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "signed guarded owner handoff");
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "observed"));
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 2, "{body}");
+            assert_eq!(body.matches("icmp ne ptr").count(), 2, "{body}");
+            assert!(!body.contains("allocation_size_overflow"), "{body}");
+            if let Some(out) = std::env::var_os("WOSY_SIGNED_GUARDED_OWNER_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
