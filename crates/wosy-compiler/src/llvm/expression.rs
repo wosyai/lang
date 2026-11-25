@@ -2720,8 +2720,8 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
                 stack.push(Step::BeginIf { left: then_value, right: else_value, ty });
                 stack.push(Step::Emit(condition, &ScalarType::Bool));
             }
-            ScalarExpression::Call { arguments, .. } if arguments.iter()
-                .any(|argument| matches!(argument, ScalarExpression::Call { .. })) => {
+            ScalarExpression::Call { arguments, .. } if state.body_call_nodes.is_some_and(|nodes|
+                nodes.prepared_call_has_callful_arguments(node)) => {
                     if *ty != ScalarType::U64 { return Err("invalid sealed staged call result type".into()); }
                     stack.push(Step::Call(node, arguments.len()));
                     for argument in arguments.iter().rev() { stack.push(Step::Emit(argument, &ScalarType::U64)); }

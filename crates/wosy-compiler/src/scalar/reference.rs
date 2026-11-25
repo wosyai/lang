@@ -4033,7 +4033,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     proof.operations.push(Node::Atom(u64::MAX));
                 }
                 ScalarExpression::Call { arguments, type_arguments, .. } => {
-                    let nested = arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }));
+                    let nested = sites.structure.callful_arguments.contains(&occurrence);
                     if children_proved {
                         proof.operations.push(Node::Call(occurrence, arguments.len()));
                         continue;
@@ -4058,13 +4058,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             let OccurrenceNode::Expression(child) = sites.structure.edges.get(&(
                                 OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(position),
                             ))? else { return None; };
-                            match argument {
-                                ScalarExpression::Call { .. }
-                                    if sites.structure.checked_types.expressions.get(child) == Some(&ScalarType::U64)
-                                        && cfg.primary_call_points.get(child) == Some(&argument_points[position]) => {}
-                                ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } => {}
-                                _ => return None,
-                            }
+                            let evaluation = argument_points[position];
+                            if evaluation.0 >= point.0
+                                || (matches!(argument, ScalarExpression::Call { .. })
+                                    && cfg.primary_call_points.get(child) != Some(&evaluation))
+                            { return None; }
+                            // The prepared CallArgument edge identifies each
+                            // exact typed subtree. The same walker proves all
+                            // descendants, rather than a second argument DSL.
                             stack.push((argument, *child, payload, false));
                         }
                     } else {
@@ -5447,8 +5448,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let walk_fallible_expression = !runtime_returned && !ordinary_runtime_receive
                         && (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (calls.candidate_fallible_composite(primary, primary_ordinal)
-                            || matches!(primary, ScalarExpression::Call { arguments, .. }
-                                if receiver.ty == ScalarType::Bool || arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
+                            || matches!(primary, ScalarExpression::Call { .. }
+                                if receiver.ty == ScalarType::Bool || calls.structure.callful_arguments.contains(&primary_ordinal)));
                     let value = if let Some((owner, count)) = fixed_copy_receiver {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
                     } else if let Some(owner) = widened_receiver_source {
@@ -13065,6 +13066,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     proven_index_values: HashMap<OccurrenceOrdinal, u64>,
     callful_total_unary: HashSet<OccurrenceOrdinal>,
+    pub(super) callful_arguments: HashSet<OccurrenceOrdinal>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
@@ -13087,6 +13089,7 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             proven_index_values: HashMap::new(),
             callful_total_unary: HashSet::new(),
+            callful_arguments: HashSet::new(),
             literal_fields: HashMap::new(),
             value_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
@@ -14021,17 +14024,27 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             WalkMode::CallableAllocationLength(_) => Some(walker.structural_calls.len()),
             _ => None,
         };
-        let before = if let ScalarExpression::Unary { operator, .. } = expression {
-            self.structure.checked_types.expressions.get(&ordinal)
+        let before = match expression {
+            ScalarExpression::Unary { operator, .. } => self.structure.checked_types.expressions.get(&ordinal)
                 .filter(|ty| super::fallible_total_unary_bound(ty, operator).is_some())
-                .and_then(|_| call_tally(self))
-        } else { None };
+                .and_then(|_| call_tally(self)).map(|count| (count, false)),
+            ScalarExpression::Call { arguments, type_arguments, .. }
+                if !arguments.is_empty() && type_arguments.is_empty()
+                    && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::U64) =>
+                call_tally(self).map(|count| (count, true)),
+            _ => None,
+        };
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
-        if let Some(before) = before {
-            // Typed ordinary unary nodes with no prepared call in their own
-            // subtree never request the separate scalar proof traversal.
-            if call_tally(self).is_some_and(|after| after > before) {
-                self.structure.callful_total_unary.insert(ordinal);
+        if let Some((before, root_is_call)) = before {
+            // The existing census is preorder; a Call contributes its own
+            // one row before any of its argument descendants. Store only
+            // argument subtrees that actually contain another prepared call.
+            if call_tally(self).is_some_and(|after| after - before > usize::from(root_is_call)) {
+                if root_is_call {
+                    self.structure.callful_arguments.insert(ordinal);
+                } else {
+                    self.structure.callful_total_unary.insert(ordinal);
+                }
             }
         }
         Ok(ordinal)

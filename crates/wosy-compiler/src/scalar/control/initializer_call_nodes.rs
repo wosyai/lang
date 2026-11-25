@@ -680,6 +680,12 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.blocks.get(&std::ptr::from_ref(block)).map(|ordinal| ordinal.0)
     }
 
+    pub(crate) fn prepared_call_has_callful_arguments(&self, expression: &ScalarExpression) -> bool {
+        let Some(calls) = self.proof_nodes.calls else { return false; };
+        self.expression_ordinal(expression).is_some_and(|ordinal|
+            calls.structure.callful_arguments.contains(&OccurrenceOrdinal(ordinal)))
+    }
+
     pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
         self.proof_nodes
             .expressions

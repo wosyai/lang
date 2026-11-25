@@ -15696,3 +15696,65 @@ if (numeric(11) != 99 || numeric(0) != 0 || numeric(7) != 7
         }
     }
 }
+
+#[test]
+fn fallible_computed_call_arguments_stage_checked_subtrees_in_source_order() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _left = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _material = fn(count) { u32[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) _combine = fn(left, right) { left ^ right };
+u64(bool, u64, u64) guarded = fn(select_right, first, second) {
+    u64 value =? _combine(_left(first) ^ 1, if (select_right) { _right(second) } else { 1 });
+    if (&value == null) { 99 } else { value }
+};
+u64(u64) nested = fn(count) {
+    u64 value =? _material(_left(count) ^ 1);
+    if (&value == null) { 99 } else { value }
+};
+if (guarded(true, 11, 9) != 99 || guarded(true, 7, 13) != 99
+    || guarded(false, 0, 13) != 0 || guarded(true, 7, 9) != 15
+    || nested(11) != 99 || nested(4) != 99 || nested(4) != 5) { core.system_panic(); };
+%%end";
+    let overflow = text.replace("_left(first) ^ 1", "_left(first) + 18446744073709551615");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let negative = prepare_initializer_test(&overflow, layout);
+        let rejected = analyze_scalar_build(&negative);
+        assert!(rejected.diagnostics().is_empty(), "{:?}", rejected.diagnostics());
+        assert!(matches!(emit_scalar_build_project_llvm(&rejected), Err(error)
+            if error.contains("fallible checked addition has no proved in-range result")));
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "computed fallible call argument subtrees");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let combine = authored("_combine");
+            assert_eq!(combine.get_type(), context.i64_type().fn_type(&[context.i64_type().into(); 2], false));
+            for (caller, outer) in [(authored("guarded"), combine), (authored("nested"), authored("_material"))] {
+                let calls = caller.get_basic_blocks().into_iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |i| i.get_next_instruction()))
+                    .filter(|&i| CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(outer)))
+                    .collect::<Vec<_>>();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].get_parent().unwrap().get_name().to_bytes(),
+                    if caller == authored("guarded") { b"if.merge".as_slice() } else { b"fallible.binary_present".as_slice() });
+            }
+            if let Some(out) = std::env::var_os("WOSY_COMPUTED_FALLIBLE_ARGUMENT_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
