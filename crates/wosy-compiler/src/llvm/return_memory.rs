@@ -198,6 +198,11 @@ pub(super) fn emit_return<'ctx, 'module>(
         }
         [output] if output.ty != ScalarType::Unit => {
             let value = take_basic(value)?;
+            if let Some(bytes) = inline_return_storage(state) {
+                if !matches!(value, BasicValueEnum::ArrayValue(v) if v.get_type() == bytes) {
+                    return Err("fixed copy return must be captured before scope cleanup".into());
+                }
+            }
             state
                 .builder
                 .build_return(Some(&value))
@@ -269,14 +274,55 @@ pub(super) fn finish_block_return<'ctx, 'module>(
     value: EmitValue<'ctx>,
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let value =
-        materialize_return_branch(context, state, block, value, emission.ordered_outputs())?;
+    let outputs = emission.ordered_outputs();
+    let value = materialize_return_branch(context, state, block, value, outputs)?;
+    let value = if let Some(outputs) = emission.return_outputs() {
+        capture_inline_return(context, state, value, outputs)?
+    } else { value };
     if let BlockEmission::Return(outputs) = emission {
         let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
         state.fresh_return_outputs.clear();
         return Ok(value);
     }
     Ok(value)
+}
+
+pub(super) fn inline_return_storage<'ctx>(
+    state: &EmitState<'ctx, '_>,
+) -> Option<inkwell::types::ArrayType<'ctx>> {
+    let function = state.builder.get_insert_block()?.get_parent()?;
+    match function.get_type().get_return_type()? {
+        BasicTypeEnum::ArrayType(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+fn capture_inline_return<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    value: EmitValue<'ctx>,
+    outputs: &crate::ScalarOutputSequence,
+) -> Result<EmitValue<'ctx>, String> {
+    let Some(bytes) = inline_return_storage(state) else {
+        return Ok(value);
+    };
+    let [output] = outputs.outputs.as_slice() else {
+        return Err("invalid fixed copy return arity".into());
+    };
+    let expected = storage_type(context, &output.ty, state.layouts, state.target_layout)?;
+    if !matches!(output.ty, ScalarType::Struct(_)) || expected != BasicTypeEnum::ArrayType(bytes) {
+        return Err("inline return value does not match its declared struct layout".into());
+    }
+    match take_basic(value)? {
+        value @ BasicValueEnum::ArrayValue(array) if array.get_type() == bytes =>
+            Ok(EmitValue::Basic(value)),
+        BasicValueEnum::PointerValue(address) => {
+            let value = state.builder.build_load(bytes, address, "inline_return_value")
+                .map_err(builder_error)?;
+            Ok(EmitValue::Basic(value))
+        }
+        _ => Err("fixed copy return has no value storage".into()),
+    }
 }
 
 fn materialize_return_branch<'ctx, 'module>(

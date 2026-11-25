@@ -37,6 +37,7 @@ use crate::{
 pub enum LlvmValueType {
     Void,
     Aggregate(Vec<LlvmValueType>),
+    InlineBytes(u32),
     I1,
     I16,
     I32,
@@ -386,6 +387,7 @@ fn emit_scalar_llvm_with_metadata(
         &program.items,
         prepared.initialization_region(),
         &program.structs,
+        &program.enums,
         &program.layouts,
         program.target_layout,
         GenericInitializerInput::RawStandalone(&prepared),
@@ -570,6 +572,7 @@ fn emit_scalar_build_single_module_with_metadata(
         &module.items,
         initialization_region,
         &module.structs,
+        &module.enums,
         &module.layouts,
         module.target_layout,
         GenericInitializerInput::PreparedRows(prepared),
@@ -613,6 +616,7 @@ fn emit_single_module_llvm<'a>(
     items: &'a [ScalarItem],
     initialization_region: &'a ModuleInitializationRegion,
     structs: &[ScalarStruct],
+    enums: &[crate::scalar::ScalarEnum],
     layouts: &ScalarTargetLayouts,
     target_layout: ScalarTargetLayout,
     generic_input: GenericInitializerInput<'a>,
@@ -642,6 +646,7 @@ fn emit_single_module_llvm<'a>(
     let builder = context.create_builder();
     let layouts = crate::scalar::layout::ScalarLayoutIndex::program(layouts);
     let structs = structs.iter().collect::<Vec<_>>();
+    let inline_results = InlineResultShapes::new(&structs, enums.iter());
     let mut globals = BTreeMap::new();
     for item in items {
         if let ScalarItem::Binding(binding) = item {
@@ -739,6 +744,8 @@ fn emit_single_module_llvm<'a>(
                 function,
                 cfg,
                 target_layout,
+                &inline_results,
+                &layouts,
                 aggregates.body(0, item_ordinal, None),
             )?,
             aggregate_transfer::linkage(aggregates.body(0, item_ordinal, None)),
@@ -765,7 +772,7 @@ fn emit_single_module_llvm<'a>(
         let cfg = require_cfg(*item_ordinal, *arm_index, template)?;
         let value = module.add_function(
             name,
-            aggregate_transfer::definition_type(&context, function, cfg, target_layout, aggregates.body(0, *item_ordinal, *arm_index))?,
+            aggregate_transfer::definition_type(&context, function, cfg, target_layout, &inline_results, &layouts, aggregates.body(0, *item_ordinal, *arm_index))?,
             aggregate_transfer::linkage(aggregates.body(0, *item_ordinal, *arm_index)),
         );
         for (index, parameter) in function.parameters.iter().enumerate() {
@@ -1069,6 +1076,7 @@ fn emit_project_llvm<'a>(
         .iter()
         .flat_map(|module| module.structs.iter())
         .collect::<Vec<_>>();
+    let inline_results = InlineResultShapes::new(&all_structs, modules.iter().flat_map(|module| &module.enums));
     let layouts = crate::scalar::layout::ScalarLayoutIndex::project(&project.modules);
     let module_name = modules
         .first()
@@ -1231,7 +1239,7 @@ fn emit_project_llvm<'a>(
                 let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
                 let aggregate = aggregates.body(module_ordinal, item_ordinal, None);
                 let mut definition_type = aggregate_transfer::definition_type(
-                    &context, function, cfg, target_layout, aggregate,
+                    &context, function, cfg, target_layout, &inline_results, &layouts, aggregate,
                 )?;
                 let contextual = generic_input.contextual_formal(module_ordinal, item_ordinal, None).is_some();
                 if contextual {
@@ -1288,7 +1296,7 @@ fn emit_project_llvm<'a>(
             let cfg = require_cfg(module_ordinal, item_ordinal, arm_index, template)?;
             let value = module.add_function(
                 &name,
-                definition_function_type(&context, &function, cfg, target_layout)?,
+                definition_function_type(&context, &function, cfg, target_layout, &inline_results, &layouts)?,
                 None,
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -1322,7 +1330,7 @@ fn emit_project_llvm<'a>(
             let cfg = require_cfg(module_ordinal, item_ordinal, arm_index, template)?;
             let value = module.add_function(
                 &name,
-                aggregate_transfer::definition_type(&context, &function, cfg, target_layout, aggregates.body(module_ordinal, item_ordinal, arm_index))?,
+                aggregate_transfer::definition_type(&context, &function, cfg, target_layout, &inline_results, &layouts, aggregates.body(module_ordinal, item_ordinal, arm_index))?,
                 aggregate_transfer::linkage(aggregates.body(module_ordinal, item_ordinal, arm_index)),
             );
             for (index, parameter) in function.parameters.iter().enumerate() {
@@ -1679,7 +1687,10 @@ fn finish_partition<'ctx>(
                     let ScalarType::Callable { outputs, parameters } = signatures.get(name)? else {
                         return None;
                     };
-                    (function_value_result(outputs).ok()?, parameters.as_slice())
+                    (match function.get_type().get_return_type() {
+                        Some(BasicTypeEnum::ArrayType(bytes)) => LlvmValueType::InlineBytes(bytes.len()),
+                        _ => function_value_result(outputs).ok()?,
+                    }, parameters.as_slice())
                 };
                 let parameters = parameters
                     .iter()
@@ -1798,7 +1809,86 @@ fn function_value_result(
     }
 }
 
+struct InlineResultShapes<'a> {
+    definitions: HashMap<&'a crate::scalar::ScalarStructId, &'a ScalarStruct>,
+    fixed: std::cell::RefCell<HashMap<&'a crate::scalar::ScalarStructId, bool>>,
+    tag_only_enums: std::collections::BTreeSet<&'a crate::scalar::ScalarEnumId>,
+}
+
+impl<'a> InlineResultShapes<'a> {
+    fn new(structs: &[&'a ScalarStruct], enums: impl Iterator<Item = &'a crate::scalar::ScalarEnum>) -> Self {
+        Self {
+            definitions: structs.iter().map(|&decl| (&decl.id, decl)).collect(),
+            fixed: Default::default(),
+            tag_only_enums: enums.filter(|decl| decl.has_tag_only_layout()).map(|decl| &decl.id).collect(),
+        }
+    }
+
+    fn fixed_inline(
+        &self,
+        ty: &ScalarType,
+        memo: &mut HashMap<&'a crate::scalar::ScalarStructId, bool>,
+    ) -> bool {
+        match ty {
+            ScalarType::Bool | ScalarType::Char | ScalarType::F32 | ScalarType::F64 => true,
+            // Dev3's scoped runtime payload enum route is not the i32 tag
+            // ABI used by ordinary storage. Require the exact declaration.
+            ScalarType::Enum(id) => self.tag_only_enums.contains(id),
+            ty if integer_width(ty).is_some() => true,
+            ScalarType::Array { element, .. } => self.fixed_inline(element, memo),
+            ScalarType::Struct(id) => {
+                let Some(&decl) = self.definitions.get(id) else { return false; };
+                if let Some(&fixed) = memo.get(&decl.id) { return fixed; }
+                memo.insert(&decl.id, false);
+                let fixed = decl.copy_policy == crate::scalar::CopyPolicy::Copy
+                    && decl.fields.iter().all(|field| self.fixed_inline(&field.ty, memo));
+                memo.insert(&decl.id, fixed);
+                fixed
+            }
+            _ => false,
+        }
+    }
+
+    fn result_type<'ctx>(
+        &self,
+        context: &'ctx Context,
+        signature: &ScalarType,
+        layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
+        target_layout: ScalarTargetLayout,
+    ) -> Result<Option<BasicTypeEnum<'ctx>>, String> {
+        let ScalarType::Callable { outputs, .. } = signature else { return Ok(None); };
+        let [output] = outputs.outputs.as_slice() else { return Ok(None); };
+        let ScalarType::Struct(id) = &output.ty else { return Ok(None); };
+        let decl = self.definitions.get(id).ok_or_else(|| format!("unknown LLVM struct {}", id.index))?;
+        if decl.copy_policy != crate::scalar::CopyPolicy::Copy { return Ok(None); }
+        if !self.fixed_inline(&output.ty, &mut self.fixed.borrow_mut()) {
+            return Err("copy struct result lacks a supported fixed inline data layout".into());
+        }
+        Ok(Some(storage_type(context, &output.ty, layouts, target_layout)?))
+    }
+}
+
 fn definition_function_type<'ctx>(
+    context: &'ctx Context,
+    function: &ScalarFunction,
+    reference_cfg: &ScalarReferenceCfg,
+    target_layout: ScalarTargetLayout,
+    inline_results: &InlineResultShapes<'_>,
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
+) -> Result<FunctionType<'ctx>, String> {
+    let inline = inline_results.result_type(context, &function.signature, layouts, target_layout)?;
+    if let Some(result) = inline {
+        if !dynamic_return_outputs(function.span, reference_cfg).is_empty() {
+            return Err("fixed copy callable result cannot have an ownership sidecar".into());
+        }
+        let original = function_type(context, &function.signature, target_layout)?;
+        let operands = original.get_param_types().into_iter().map(Into::into).collect::<Vec<_>>();
+        return Ok(result.fn_type(&operands, false));
+    }
+    legacy_definition_function_type(context, function, reference_cfg, target_layout)
+}
+
+fn legacy_definition_function_type<'ctx>(
     context: &'ctx Context,
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
@@ -2415,7 +2505,7 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && !value.get_type().get_return_type().is_some_and(|ty| ty.is_array_type()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let single_output = if function.body.items.len() == 1 {
@@ -2425,7 +2515,7 @@ fn emit_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && !value.get_type().get_return_type().is_some_and(|ty| ty.is_array_type()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs), false).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
@@ -2753,7 +2843,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && !value.get_type().get_return_type().is_some_and(|ty| ty.is_array_type()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2772,7 +2862,7 @@ fn emit_project_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && !value.get_type().get_return_type().is_some_and(|ty| ty.is_array_type()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs), false).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
@@ -3149,6 +3239,13 @@ impl<'a> BlockEmission<'a> {
         }
     }
 
+    fn return_outputs(self) -> Option<&'a crate::ScalarOutputSequence> {
+        match self {
+            Self::Return(outputs) | Self::TailArm(outputs) => Some(outputs),
+            _ => None,
+        }
+    }
+
     fn ordered_outputs(self) -> Option<&'a crate::ScalarOutputSequence> {
         match self {
             Self::Return(outputs) | Self::TailArm(outputs) if outputs.outputs.len() > 1 => {
@@ -3163,7 +3260,7 @@ impl<'a> BlockEmission<'a> {
         expression_count: usize,
     ) -> Result<Option<&'a crate::ScalarOutputSequence>, String> {
         let (outputs, site) = match self {
-            Self::TailArm(outputs) => (outputs, "conditional arm"),
+            Self::TailArm(outputs) if outputs.outputs.len() > 1 => (outputs, "conditional arm"),
             Self::Return(outputs) if expression_count > 1 && outputs.outputs.len() > 1 => {
                 (outputs, "callable return")
             }
@@ -3186,8 +3283,9 @@ struct CanonicalTailIf<'syntax, 'signature> {
 fn canonical_tail_if<'syntax, 'signature>(
     block: &'syntax ScalarBlock,
     emission: BlockEmission<'signature>,
+    inline: bool,
 ) -> Option<CanonicalTailIf<'syntax, 'signature>> {
-    let outputs = emission.ordered_outputs()?;
+    let outputs = if inline { emission.return_outputs()? } else { emission.ordered_outputs()? };
     if block.final_output_values.len() != 1 {
         return None;
     }
@@ -3376,7 +3474,8 @@ fn emit_final_outputs<'ctx, 'module>(
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    if let Some(tail) = canonical_tail_if(block, emission) {
+    let inline = emission.return_outputs().is_some() && return_memory::inline_return_storage(state).is_some();
+    if let Some(tail) = canonical_tail_if(block, emission, inline) {
         let condition =
             take_basic(emit_expression(context, state, tail.condition)?)?.into_int_value();
         return emit_if_value(
@@ -3389,6 +3488,11 @@ fn emit_final_outputs<'ctx, 'module>(
                 emit_block_at(context, state, branch, BlockEmission::TailArm(tail.outputs))
             },
         );
+    }
+    if inline && block.final_output_values.len() == 1 {
+        if let ScalarExpression::Block(nested) = final_output_expression(block, 0) {
+            return emit_block_at(context, state, nested, BlockEmission::TailArm(emission.return_outputs().unwrap()));
+        }
     }
     if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, None);
@@ -3408,7 +3512,14 @@ fn emit_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
-        let ty = emission.expected_numeric().unwrap_or(&output.ty);
+        let ty = if inline {
+            let [declared] = emission.return_outputs().expect("inline result declaration").outputs.as_slice() else {
+                return Err("invalid fixed copy return arity".into());
+            };
+            &declared.ty
+        } else {
+            emission.expected_numeric().unwrap_or(&output.ty)
+        };
         let snapshot = if matches!(expression, ScalarExpression::IndexedRead { .. }) {
             aggregate_transfer::emit_checked_ordinary_snapshot(context, state, expression, None)?
         } else {
@@ -3473,7 +3584,8 @@ fn emit_project_final_outputs<'ctx, 'module>(
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    if let Some(tail) = canonical_tail_if(block, emission) {
+    let inline = emission.return_outputs().is_some() && return_memory::inline_return_storage(state).is_some();
+    if let Some(tail) = canonical_tail_if(block, emission, inline) {
         let condition = take_basic(emit_project_expression(
             context,
             state,
@@ -3500,6 +3612,11 @@ fn emit_project_final_outputs<'ctx, 'module>(
             },
         );
     }
+    if inline && block.final_output_values.len() == 1 {
+        if let ScalarExpression::Block(nested) = final_output_expression(block, 0) {
+            return emit_project_block_at(context, state, nested, module, modules, BlockEmission::TailArm(emission.return_outputs().unwrap()));
+        }
+    }
     if let Some(outputs) = emission.explicit_ordered_outputs(block.final_output_values.len())? {
         return emit_ordered_final_outputs(context, state, block, outputs, Some((module, modules)));
     }
@@ -3518,7 +3635,14 @@ fn emit_project_final_outputs<'ctx, 'module>(
             }
             return Ok(value);
         }
-        let ty = emission.expected_numeric().unwrap_or(&output.ty);
+        let ty = if inline {
+            let [declared] = emission.return_outputs().expect("inline result declaration").outputs.as_slice() else {
+                return Err("invalid fixed copy return arity".into());
+            };
+            &declared.ty
+        } else {
+            emission.expected_numeric().unwrap_or(&output.ty)
+        };
         let value = match aggregate_transfer::emit_checked_ordinary_snapshot(
             context, state, expression, Some(ProjectCallScope { module, modules }),
         )? {
