@@ -606,6 +606,7 @@ fn fallible_allocation_integer_type<'ctx>(
     match payload {
         ScalarType::U64 => Ok(context.i64_type()),
         ScalarType::I32 => Ok(context.i32_type()),
+        ScalarType::Bool => Ok(context.bool_type()),
         _ => Err("invalid sealed fallible allocation payload type".into()),
     }
 }

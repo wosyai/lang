@@ -6647,31 +6647,32 @@ fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
 }
 
 fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
-    if !matches!(ty, ScalarType::U64 | ScalarType::I32)
+    if !matches!(ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
         || !matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
     { return false; }
-    let mut stack = vec![expression];
+    let mut stack = vec![(expression, ty)];
     let mut calls = false;
-    while let Some(node) = stack.pop() {
+    while let Some((node, ty)) = stack.pop() {
         match node {
-            ScalarExpression::Integer { .. } | ScalarExpression::Name { .. } => {}
+            ScalarExpression::Name { .. } => {}
+            ScalarExpression::Integer { .. } if *ty != ScalarType::Bool => {}
+            ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {}
             ScalarExpression::Call { type_arguments, .. } if type_arguments.is_empty() => calls = true,
             ScalarExpression::Binary { operator, left, right, .. }
-                if matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor)
+                if (*ty == ScalarType::Bool && matches!(operator, BinaryOperator::And | BinaryOperator::Or))
+                    || (*ty != ScalarType::Bool && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor))
                     || *ty == ScalarType::U64 && *operator == BinaryOperator::Add =>
             {
-                stack.push(right);
-                stack.push(left);
+                stack.push((right, ty));
+                stack.push((left, ty));
             }
             ScalarExpression::If { condition, then_branch, else_branch, .. } => {
-                if !matches!(condition.as_ref(), ScalarExpression::Name { .. } |
-                    ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. })
-                { return false; }
                 for arm in [else_branch, then_branch] {
                     let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };
                     if arm.unsafe_context { return false; }
-                    stack.push(value);
+                    stack.push((value, ty));
                 }
+                stack.push((condition, &ScalarType::Bool));
             }
             _ => return false,
         }
@@ -6690,7 +6691,7 @@ fn pending_fallible_operator(
         (ty, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
             if is_integer_type(ty) => None,
         (ty, ScalarExpression::Call { type_arguments, .. })
-            if is_integer_type(ty) && type_arguments.is_empty() => None,
+            if (is_integer_type(ty) || *ty == ScalarType::Bool) && type_arguments.is_empty() => None,
         (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
             if guarded_numeric_rhs(ty, expression) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }) => {

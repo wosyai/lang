@@ -948,9 +948,8 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
     expression: &ScalarExpression,
     expected: &ScalarType,
 ) -> Result<EmitValue<'ctx>, String> {
-    if matches!(expression, ScalarExpression::Call { .. })
-        && (super::aggregate_transfer::fallible_allocation_expression_at(state, expression)
-            || super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression))
+    if super::aggregate_transfer::fallible_allocation_expression_at(state, expression)
+        || super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression)
     {
         return emit_contextual_numeric(context, state, expression, expected, ExpressionPath::Single);
     }

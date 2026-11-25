@@ -3843,39 +3843,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
     fn guarded_numeric_expression(
         &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
     ) -> Option<aggregate::GuardedNumericExpression> {
-        if !matches!(payload, ScalarType::U64 | ScalarType::I32) { return None; }
+        if !matches!(payload, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool) { return None; }
         let mut proof = aggregate::GuardedNumericExpression {
             expression: ordinal, calls: Vec::new(), operations: Vec::new(),
         };
         use aggregate::GuardedNumericNode as Node;
         let sites = self.call_sites;
-        let ordinary_condition = |value: &ScalarExpression, occurrence: OccurrenceOrdinal| {
-            let mut pending = vec![(value, occurrence)];
-            while let Some((value, occurrence)) = pending.pop() {
-                if sites.structure.checked_types.expressions.get(&occurrence) != Some(&ScalarType::Bool) {
-                    return None;
-                }
-                match value {
-                    ScalarExpression::Name { .. } if matches!(sites.prepared_plain_name(occurrence),
-                        Some(PlainNameIdentity::Lexical(_))) => {}
-                    ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, left, right, .. } => {
-                        let region = sites.short_circuits.get(&occurrence)?;
-                        pending.push((right.as_ref(), region.right));
-                        pending.push((left.as_ref(), region.left));
-                    }
-                    _ => return None,
-                }
-            }
-            Some(())
-        };
-        let mut stack = vec![(value, ordinal, false)];
-        while let Some((value, occurrence, children_proved)) = stack.pop() {
+        let mut stack = vec![(value, ordinal, payload, false)];
+        while let Some((value, occurrence, payload, children_proved)) = stack.pop() {
             if sites.structure.checked_types.expressions.get(&occurrence) != Some(payload) {
                 return None;
             }
             match value {
                 ScalarExpression::Integer { value, .. } =>
                     proof.operations.push(Node::Atom(u64::try_from(value.clone()).unwrap_or(u64::MAX))),
+                ScalarExpression::Boolean { value, .. } if *payload == ScalarType::Bool =>
+                    proof.operations.push(Node::Atom(u64::from(*value))),
                 ScalarExpression::Name { .. } => {
                     if !matches!(sites.prepared_plain_name(occurrence), Some(PlainNameIdentity::Lexical(_))) {
                         return None;
@@ -3903,7 +3886,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || !signature.parameters.iter().all(|ty| *ty == ScalarType::U64)
                             || argument_points.len() != arguments.len()
                         { return None; }
-                        stack.push((value, occurrence, true));
+                        stack.push((value, occurrence, payload, true));
                         for (position, argument) in arguments.iter().enumerate().rev() {
                             let OccurrenceNode::Expression(child) = sites.structure.edges.get(&(
                                 OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(position),
@@ -3915,7 +3898,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } => {}
                                 _ => return None,
                             }
-                            stack.push((argument, *child, false));
+                            stack.push((argument, *child, payload, false));
                         }
                     } else {
                         if !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
@@ -3928,8 +3911,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if children_proved {
                         proof.operations.push(match operator {
                             BinaryOperator::Add if *payload == ScalarType::U64 => Node::Add,
-                            BinaryOperator::BitAnd => Node::And,
-                            BinaryOperator::BitOr | BinaryOperator::BitXor => Node::OrXor,
+                            BinaryOperator::BitAnd if *payload != ScalarType::Bool => Node::And,
+                            BinaryOperator::BitOr | BinaryOperator::BitXor if *payload != ScalarType::Bool => Node::OrXor,
+                            BinaryOperator::And | BinaryOperator::Or if *payload == ScalarType::Bool => Node::Logical,
                             _ => return None,
                         });
                     } else {
@@ -3937,9 +3921,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             Some(OccurrenceNode::Expression(child)) => Some(*child),
                             _ => None,
                         };
-                        stack.push((value, occurrence, true));
-                        stack.push((right, child(OccurrenceEdge::BinaryRight)?, false));
-                        stack.push((left, child(OccurrenceEdge::BinaryLeft)?, false));
+                        stack.push((value, occurrence, payload, true));
+                        let (left_site, right_site) = if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+                            let region = sites.short_circuits.get(&occurrence)?;
+                            (region.left, region.right)
+                        } else {
+                            (child(OccurrenceEdge::BinaryLeft)?, child(OccurrenceEdge::BinaryRight)?)
+                        };
+                        stack.push((right, right_site, payload, false));
+                        stack.push((left, left_site, payload, false));
                     }
                 }
                 ScalarExpression::If { condition, then_branch, else_branch, .. } => {
@@ -3948,7 +3938,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         let ConditionalRegion::Value { condition: predicate, then_block, else_block, .. } =
                             sites.conditionals.get(&occurrence)? else { return None; };
-                        ordinary_condition(condition, *predicate)?;
                         let arm = |block: &ScalarBlock, region: BlockOrdinal| {
                             let [ScalarBlockItem::Expression(_)] = block.items.as_slice() else { return None; };
                             let [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }] =
@@ -3957,9 +3946,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         };
                         let [ScalarBlockItem::Expression(left)] = then_branch.items.as_slice() else { return None; };
                         let [ScalarBlockItem::Expression(right)] = else_branch.items.as_slice() else { return None; };
-                        stack.push((value, occurrence, true));
-                        stack.push((right, arm(else_branch, *else_block)?, false));
-                        stack.push((left, arm(then_branch, *then_block)?, false));
+                        stack.push((value, occurrence, payload, true));
+                        stack.push((right, arm(else_branch, *else_block)?, payload, false));
+                        stack.push((left, arm(then_branch, *then_block)?, payload, false));
+                        stack.push((condition, *predicate, &ScalarType::Bool, false));
                     }
                 }
                 _ => return None,
@@ -5097,7 +5087,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_root_binding)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
-                                if arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
+                                if receiver.ty == ScalarType::Bool || arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
                     let value = if let Some((owner, count)) = fixed_copy_receiver {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
                     } else if let Some(owner) = widened_receiver_source {
@@ -5298,7 +5288,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.cfg.allocations.insert(id.clone());
                     }
                     if binding.fallible_assignment.is_some()
-                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_)))
+                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Bool))
                     {
                         declares_fallible = true;
                         let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))

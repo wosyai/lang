@@ -342,9 +342,8 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    if matches!(expression, ScalarExpression::Call { .. })
-        && (aggregate_transfer::fallible_allocation_expression_at(state, expression)
-            || aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression))
+    if aggregate_transfer::fallible_allocation_expression_at(state, expression)
+        || aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression)
     {
         return emit_contextual_numeric(context, state, expression, expected, ExpressionPath::Project { module, modules });
     }
@@ -2559,18 +2558,21 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
 ) -> Result<(BasicValueEnum<'ctx>, Vec<inkwell::basic_block::BasicBlock<'ctx>>), String> {
     use inkwell::basic_block::BasicBlock;
     enum Step<'ctx, 'ast> {
-        Emit(&'ast ScalarExpression),
-        Binary(&'ast BinaryOperator),
+        Emit(&'ast ScalarExpression, &'ast ScalarType),
+        Binary(&'ast BinaryOperator, &'ast ScalarType),
         Call(&'ast ScalarExpression, usize),
-        BeginElse { value: &'ast ScalarExpression, block: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
+        BeginShort { rhs: &'ast ScalarExpression, is_and: bool },
+        EndShort { skipped: BasicBlock<'ctx>, join: BasicBlock<'ctx>, is_and: bool },
+        BeginIf { left: &'ast ScalarExpression, right: &'ast ScalarExpression, ty: &'ast ScalarType },
+        BeginElse { value: &'ast ScalarExpression, ty: &'ast ScalarType, block: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
         EndElse { then_value: BasicValueEnum<'ctx>, then_end: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
     }
-    let pair = aggregate_transfer::fallible_allocation_result_type(context, payload)?;
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing fallible expression function")?;
     let mut absent = Vec::new();
     let take_present = |state: &mut EmitState<'ctx, '_>, tagged: inkwell::values::StructValue<'ctx>,
-        absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
+        ty: &ScalarType, absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
+        let pair = aggregate_transfer::fallible_allocation_result_type(context, ty)?;
         if tagged.get_type() != pair { return Err("invalid sealed fallible numeric payload".into()); }
         let test = state.builder.get_insert_block().ok_or("missing fallible operand test block")?;
         let present = context.append_basic_block(function, "fallible.binary_present");
@@ -2584,14 +2586,14 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
         Ok(EmitValue::Basic(value))
     };
     let mut values = Vec::new();
-    let mut stack = vec![Step::Emit(expression)];
+    let mut stack = vec![Step::Emit(expression, payload)];
     while let Some(step) = stack.pop() {
-        let node = match step {
-            Step::Emit(node) => node,
-            Step::Binary(operator) => {
+        let (node, ty) = match step {
+            Step::Emit(node, ty) => (node, ty),
+            Step::Binary(operator, ty) => {
                 let right = values.pop().ok_or("missing fallible binary right operand")?;
                 let left = values.pop().ok_or("missing fallible binary left operand")?;
-                values.push(emit_binary_values(state, operator, left, right, *payload == ScalarType::U64)?);
+                values.push(emit_binary_values(state, operator, left, right, *ty == ScalarType::U64)?);
                 continue;
             }
             Step::Call(call, arity) => {
@@ -2600,13 +2602,13 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
                 let Some(PreparedCall::Symbol(target)) = state.prepared_call(call)? else {
                     return Err("missing sealed direct staged call target".into());
                 };
-                if *payload != ScalarType::U64 || !arguments.iter().all(|argument|
+                if !arguments.iter().all(|argument|
                     matches!(argument, EmitValue::Basic(BasicValueEnum::IntValue(value))
                         if value.get_type() == context.i64_type()))
                 { return Err("invalid sealed staged call arguments".into()); }
                 let value = if aggregate_transfer::fallible_allocation_call_at(state, call) {
                     let tagged = emit_sealed_allocation_call_values(context, state, &target, &arguments)?;
-                    take_present(state, tagged, &mut absent)?
+                    take_present(state, tagged, &ScalarType::U64, &mut absent)?
                 } else {
                     let callee = state.functions.get(target.as_ref()).ok_or("missing exact ordinary staged call")?;
                     let types = vec![context.i64_type().into(); arity];
@@ -2618,13 +2620,47 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
                 values.push(value);
                 continue;
             }
-            Step::BeginElse { value, block, join } => {
+            Step::BeginShort { rhs, is_and } => {
+                let condition = take_basic(values.pop().ok_or("missing short-circuit left operand")?)?.into_int_value();
+                let skipped = state.builder.get_insert_block().ok_or("missing short-circuit left block")?;
+                let rhs_block = context.append_basic_block(function, "short_circuit.rhs");
+                let join = context.append_basic_block(function, "short_circuit.merge");
+                let (yes, no) = if is_and { (rhs_block, join) } else { (join, rhs_block) };
+                state.builder.build_conditional_branch(condition, yes, no).map_err(builder_error)?;
+                state.builder.position_at_end(rhs_block);
+                stack.push(Step::EndShort { skipped, join, is_and });
+                stack.push(Step::Emit(rhs, &ScalarType::Bool));
+                continue;
+            }
+            Step::EndShort { skipped, join, is_and } => {
+                let rhs = take_basic(values.pop().ok_or("missing short-circuit right operand")?)?.into_int_value();
+                let rhs_end = state.builder.get_insert_block().ok_or("missing short-circuit right block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(join);
+                let phi = state.builder.build_phi(context.bool_type(), "short_circuit.value").map_err(builder_error)?;
+                let skip_value = context.bool_type().const_int(u64::from(!is_and), false);
+                phi.add_incoming(&[(&skip_value, skipped), (&rhs, rhs_end)]);
+                values.push(EmitValue::Basic(phi.as_basic_value()));
+                continue;
+            }
+            Step::BeginIf { left, right, ty } => {
+                let condition = take_basic(values.pop().ok_or("missing fallible if predicate")?)?.into_int_value();
+                let then_block = context.append_basic_block(function, "if.then");
+                let else_block = context.append_basic_block(function, "if.else");
+                let join = context.append_basic_block(function, "if.merge");
+                state.builder.build_conditional_branch(condition, then_block, else_block).map_err(builder_error)?;
+                state.builder.position_at_end(then_block);
+                stack.push(Step::BeginElse { value: right, ty, block: else_block, join });
+                stack.push(Step::Emit(left, ty));
+                continue;
+            }
+            Step::BeginElse { value, ty, block, join } => {
                 let then_value = take_basic(values.pop().ok_or("missing fallible then value")?)?;
                 let then_end = state.builder.get_insert_block().ok_or("missing fallible then block")?;
                 state.builder.build_unconditional_branch(join).map_err(builder_error)?;
                 state.builder.position_at_end(block);
                 stack.push(Step::EndElse { then_value, then_end, join });
-                stack.push(Step::Emit(value));
+                stack.push(Step::Emit(value, ty));
                 continue;
             }
             Step::EndElse { then_value, then_end, join } => {
@@ -2643,38 +2679,37 @@ pub(super) fn emit_fallible_numeric_to<'ctx>(
             }
         };
         match node {
+            ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
+                stack.push(Step::BeginShort { rhs: right, is_and: *operator == BinaryOperator::And });
+                stack.push(Step::Emit(left, &ScalarType::Bool));
+            }
             ScalarExpression::Binary { operator, left, right, .. } => {
-                stack.push(Step::Binary(operator));
-                stack.push(Step::Emit(right));
-                stack.push(Step::Emit(left));
+                stack.push(Step::Binary(operator, ty));
+                stack.push(Step::Emit(right, ty));
+                stack.push(Step::Emit(left, ty));
             }
             ScalarExpression::If { condition, then_branch, else_branch, .. } => {
                 let [ScalarBlockItem::Expression(then_value)] = then_branch.items.as_slice()
                     else { return Err("missing sealed fallible then expression".into()); };
                 let [ScalarBlockItem::Expression(else_value)] = else_branch.items.as_slice()
                     else { return Err("missing sealed fallible else expression".into()); };
-                let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
-                let then_block = context.append_basic_block(function, "if.then");
-                let else_block = context.append_basic_block(function, "if.else");
-                let join = context.append_basic_block(function, "if.merge");
-                state.builder.build_conditional_branch(condition, then_block, else_block).map_err(builder_error)?;
-                state.builder.position_at_end(then_block);
-                stack.push(Step::BeginElse { value: else_value, block: else_block, join });
-                stack.push(Step::Emit(then_value));
+                stack.push(Step::BeginIf { left: then_value, right: else_value, ty });
+                stack.push(Step::Emit(condition, &ScalarType::Bool));
             }
             ScalarExpression::Call { arguments, .. } if arguments.iter()
                 .any(|argument| matches!(argument, ScalarExpression::Call { .. })) => {
+                    if *ty != ScalarType::U64 { return Err("invalid sealed staged call result type".into()); }
                     stack.push(Step::Call(node, arguments.len()));
-                    for argument in arguments.iter().rev() { stack.push(Step::Emit(argument)); }
+                    for argument in arguments.iter().rev() { stack.push(Step::Emit(argument, &ScalarType::U64)); }
                 }
             ScalarExpression::Call { .. } if aggregate_transfer::fallible_allocation_call_at(state, node) => {
                 let BasicValueEnum::StructValue(result) = take_basic(path.emit(context, state, node)?)? else {
                     return Err("missing sealed fallible operand result".into());
                 };
-                values.push(take_present(state, result, &mut absent)?);
+                values.push(take_present(state, result, ty, &mut absent)?);
             }
-            ScalarExpression::Integer { .. } | ScalarExpression::Name { .. } | ScalarExpression::Call { .. } =>
-                values.push(emit_contextual_numeric(context, state, node, payload, path)?),
+            ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } | ScalarExpression::Name { .. } | ScalarExpression::Call { .. } =>
+                values.push(emit_contextual_numeric(context, state, node, ty, path)?),
             _ => return Err("invalid sealed fallible expression node".into()),
         }
     }

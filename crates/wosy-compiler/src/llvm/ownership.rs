@@ -1258,7 +1258,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
             })?),
         (_, _, Some(BasicValueEnum::StructValue(_))) if rhs.is_some() => None,
         (ty, _, Some(BasicValueEnum::IntValue(value)))
-            if memory::integer_width(ty) == Some(value.get_type().get_bit_width()) => None,
+            if memory::integer_width(ty) == Some(value.get_type().get_bit_width())
+                || (*ty == ScalarType::Bool && value.get_type().get_bit_width() == 1) => None,
         _ => return Err("invalid guarded allocation initializer".into()),
     };
     declare_core_runtime(context, state.module);

@@ -1249,6 +1249,7 @@ pub(super) enum GuardedNumericNode {
     Add,
     And,
     OrXor,
+    Logical,
     Select,
 }
 
@@ -1265,7 +1266,7 @@ impl GuardedNumericExpression {
                     bounds.truncate(keep);
                     if allocated(site) { u64::from(u32::MAX) } else { u64::MAX }
                 }
-                GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Select => {
+                GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Logical | GuardedNumericNode::Select => {
                     let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return false; };
                     match node {
                         GuardedNumericNode::Add => {
@@ -1273,7 +1274,11 @@ impl GuardedNumericExpression {
                             sum
                         }
                         GuardedNumericNode::And => left.min(right),
-                        GuardedNumericNode::Select => left.max(right),
+                        GuardedNumericNode::Logical => 1,
+                        GuardedNumericNode::Select => {
+                            if bounds.pop().is_none() { return false; }
+                            left.max(right)
+                        },
                         GuardedNumericNode::OrXor => {
                             // Most-significant possible set bit bounds both.
                             u64::MAX.checked_shr((left | right).leading_zeros()).unwrap_or(0)
@@ -6794,7 +6799,7 @@ fn closed_aggregates<'a>(
             let [output] = sites.boundary.root_outputs.as_slice() else { return None; };
             if !sites.declared_unsafe_calls.is_empty()
                 || !matches!(sites.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::U64)
-                || !matches!(output.ty, ScalarType::U64 | ScalarType::I32)
+                || !matches!(output.ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)
             { return None; }
             let ([ScalarBlockItem::LocalBinding(last_allocation), ScalarBlockItem::Expression(result)], prefix) =
                 function.body.items.split_at_checked(function.body.items.len().checked_sub(2)?)
@@ -6860,10 +6865,26 @@ fn closed_aggregates<'a>(
                 }
                 Some((left.as_ref(), right.as_ref()))
             } else { None };
+            // Bool is exactly the comparison of the final authenticated
+            // extent with a contextual U64 zero, with no extra effects.
+            let bool_comparison = if output.ty == ScalarType::Bool {
+                let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = result else { return None; };
+                if !matches!(left.as_ref(), ScalarExpression::Call { .. })
+                    || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if *value == 0.into())
+                { return None; }
+                let BlockItemKind::FinalOutput(slot) = &root.items.last()?.kind else { return None; };
+                for edge in [OccurrenceEdge::BinaryLeft, OccurrenceEdge::BinaryRight] {
+                    let OccurrenceNode::Expression(operand) = sites.structure.edges.get(&(
+                        OccurrenceParent::Expression(slot.expression), edge,
+                    ))? else { return None; };
+                    if sites.structure.checked_types.expressions.get(operand) != Some(&ScalarType::U64) { return None; }
+                }
+                Some((left.as_ref(), right.as_ref()))
+            } else { None };
             let mut extent = None;
             let mut literal = false;
             let mut truncate = None;
-            let mut signed_result = None;
+            let mut compared_result = None;
             let mut returned = false;
             let mut index = 0;
             let mut placeholder = false;
@@ -6890,7 +6911,9 @@ fn closed_aggregates<'a>(
                         argument_points, expression } if borrowed.is_some()
                             && matches!(argument_points.as_slice(), [id] if Some(*id) == borrowed)
                             && allocations.get(index).is_some_and(|(_, observer)|
-                                observer.is_none_or(|observer| observer == expression)) => {
+                                observer.map_or_else(
+                                    || bool_comparison.is_none_or(|(call, _)| call == expression),
+                                    |observer| observer == expression)) => {
                         index += 1;
                         if index == allocations.len() { extent = Some(point.id); }
                         placeholder = false;
@@ -6904,15 +6927,19 @@ fn closed_aggregates<'a>(
                         if truncate.is_none() && signed.is_some_and(|(_, trunc)| expression == trunc)
                             && matches!(argument_points.as_slice(), [point] if Some(*point) == extent) =>
                         truncate = Some(point.id),
-                    CfgPointKind::Evaluate(value) if truncate.is_some() && signed_result.is_none() && value == result =>
-                        signed_result = Some(point.id),
+                    CfgPointKind::Evaluate(value) if !literal && extent.is_some()
+                        && bool_comparison.is_some_and(|(_, zero)| value == zero) =>
+                        literal = true,
+                    CfgPointKind::Evaluate(value) if compared_result.is_none() && value == result
+                        && (truncate.is_some() || bool_comparison.is_some() && literal) =>
+                        compared_result = Some(point.id),
                     CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. }
-                        if !returned && (if signed.is_some() { signed_result } else { extent }) == Some(*value_point) =>
+                        if !returned && (if signed.is_some() || bool_comparison.is_some() { compared_result } else { extent }) == Some(*value_point) =>
                         returned = true,
                     _ => return None,
                 }
             }
-            (returned && index == allocations.len() && (signed.is_none() || literal))
+            (returned && index == allocations.len() && ((signed.is_none() && bool_comparison.is_none()) || literal))
                 .then(|| (output.ty.clone(), spans))
         };
         let dependencies = |key: BodyKey| -> Option<Vec<BodyKey>> {
@@ -6924,7 +6951,7 @@ fn closed_aggregates<'a>(
             if !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
                 || !sites.declared_unsafe_calls.is_empty()
                 || !sites.boundary.parameters.iter().all(|formal| ordinary_value(&formal.ty))
-                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if is_integer_type(&output.ty))
+                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if is_integer_type(&output.ty) || output.ty == ScalarType::Bool)
             { return None; }
             let root = sites.structure.blocks[sites.structure.root.0].span;
             let formals = sites.boundary.parameters.iter().map(|formal|

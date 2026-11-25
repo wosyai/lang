@@ -13760,3 +13760,84 @@ if (observed(7, 9) != 99 || observed(7, 9) != 99 || observed(7, 9) != 99
         }
     }
 }
+
+#[test]
+fn guarded_fallible_bool_distinguishes_false_and_absence_in_selected_paths() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+bool(u64) _empty = fn(count) { u8[count] scratch; core.array_len(&scratch) == 0 };
+u64(u64) _then_value = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _else_value = fn(count) { u32[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) both_empty = fn(first, second) {
+    bool result =? _empty(first) && _empty(second);
+    if (&result == null) { 99 } else { if (result) { 1 } else { 0 } }
+};
+u64(u64, u64, u64) selected = fn(first, second, count) {
+    u64 result =? if (_empty(first) || _empty(second)) { _then_value(count) } else { _else_value(count) };
+    if (&result == null) { 99 } else { result }
+};
+if (both_empty(7, 9) != 0 || both_empty(0, 9) != 0 || both_empty(0, 0) != 1
+    || both_empty(11, 9) != 99 || both_empty(0, 13) != 99
+    || selected(0, 9, 7) != 7 || selected(7, 0, 7) != 7 || selected(7, 9, 7) != 7
+    || selected(11, 9, 7) != 99 || selected(7, 13, 7) != 99 || selected(0, 9, 15) != 99) {
+    core.system_panic();
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible Bool short circuit");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let empty = authored("_empty");
+            let pair = context.struct_type(&[context.bool_type().into(), context.bool_type().into()], false);
+            assert_eq!(empty.get_linkage(), inkwell::module::Linkage::Internal);
+            assert_eq!(empty.get_type(), pair.fn_type(&[context.i64_type().into()], false));
+            for (caller, arms) in [(authored("both_empty"), false), (authored("selected"), true)] {
+                assert_eq!(caller.get_type().get_return_type(), Some(context.i64_type().into()));
+                let blocks = caller.get_basic_blocks();
+                let calls_to = |callee| blocks.iter().flat_map(|block| std::iter::successors(
+                    block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let absence = *blocks.iter().find(|block| block.get_name().to_bytes() == b"fallible.binary_merge").unwrap();
+                let continuation = *blocks.iter().find(|block| block.get_name().to_bytes() == b"short_circuit.merge").unwrap();
+                let [first, second] = calls_to(empty)[..] else { panic!("{llvm}") };
+                assert_eq!(second.get_parent().unwrap().get_name().to_bytes(), b"short_circuit.rhs");
+                let phi = inkwell::values::PhiValue::try_from(continuation.get_first_instruction().unwrap()).unwrap();
+                assert_eq!(phi.count_incoming(), 2);
+                assert!((0..2).filter_map(|index| phi.get_incoming(index)).any(|(value, _)|
+                    value.into_int_value().get_zero_extended_constant() == Some(u64::from(arms))));
+                let reaches_absence = |instruction: InstructionValue<'_>| instruction.get_parent()
+                    .and_then(|block| block.get_terminator()).unwrap().get_operands()
+                    .any(|operand| operand.and_then(|operand| operand.block()) == Some(absence));
+                assert!(reaches_absence(first) && reaches_absence(second));
+                let [destination] = calls_to(module.get_function("__wosy_core_alloc").unwrap())[..] else { panic!("{llvm}") };
+                assert_eq!(destination.get_parent().unwrap().get_name().to_bytes(), b"fallible.destination");
+                assert_eq!(calls_to(module.get_function("__wosy_core_free").unwrap()).len(), 1);
+                if arms {
+                    for (name, arm) in [("_then_value", b"if.then".as_slice()), ("_else_value", b"if.else".as_slice())] {
+                        let [call] = calls_to(authored(name))[..] else { panic!("{llvm}") };
+                        assert_eq!(call.get_parent().unwrap().get_name().to_bytes(), arm);
+                        assert!(reaches_absence(call));
+                    }
+                }
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_BOOL_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
