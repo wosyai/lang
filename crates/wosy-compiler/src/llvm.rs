@@ -3686,7 +3686,8 @@ fn emit_project_block_at<'ctx, 'module>(
                 emit_project_block_item(context, state, item, module, modules)?;
             }
             ScalarBlockItem::LocalBinding(binding) => {
-                if store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                if ownership::move_guarded_runtime_owner(context, state, binding)?
+                    || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
                     continue;
                 }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
@@ -5410,6 +5411,9 @@ fn emit_block_item<'ctx, 'module>(
                 ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Single)?;
                 return Ok(EmitValue::Unit);
             }
+            if ownership::move_guarded_runtime_owner(context, state, binding)? {
+                return Ok(EmitValue::Unit);
+            }
             if store_widened_local_array(context, state, binding, None)? {
                 return Ok(EmitValue::Unit);
             }
@@ -5442,7 +5446,8 @@ fn emit_project_block_item<'ctx, 'module>(
                 ownership::bind_guarded_scalar(context, state, binding, value, ExpressionPath::Project { module, modules })?;
                 return Ok(EmitValue::Unit);
             }
-            if store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+            if ownership::move_guarded_runtime_owner(context, state, binding)?
+                || store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
                 return Ok(EmitValue::Unit);
             }
             if binding.is_allocation {

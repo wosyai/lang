@@ -339,6 +339,16 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedRuntimeMove {
+    pub(crate) source: ReferenceBindingId,
+    pub(crate) target: ReferenceBindingId,
+    pub(crate) target_ty: ScalarType,
+    pub(crate) rhs: usize,
+    moved: CfgPointId,
+    scope: ReferenceScopeId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuardedScalarAllocation {
     binding: ReferenceBindingId,
     ty: ScalarType,
@@ -346,6 +356,7 @@ pub(crate) struct GuardedScalarAllocation {
     runtime_returned: bool,
     guards: Box<[GuardedScalarBranch]>,
     alias_accesses: Box<[usize]>,
+    runtime_moves: Box<[GuardedRuntimeMove]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +369,7 @@ pub(crate) struct GuardedScalarBranch {
 impl GuardedScalarAllocation {
     pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
     pub(crate) fn ty(&self) -> &ScalarType { &self.ty }
+    pub(crate) fn runtime_moves(&self) -> &[GuardedRuntimeMove] { &self.runtime_moves }
     pub(crate) fn runtime_returned(&self) -> bool { self.runtime_returned }
     pub(crate) fn runtime_literal_length(&self) -> Option<u64> { self.runtime_literal_length }
     #[cfg(test)]
@@ -1191,7 +1203,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let ScalarPlace::Name { span, .. } = root.place else { return Ok(()) };
         if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(root.ordinal, *span)? {
-            if bindings.contains_key(binding) || self.proof_points.fallible_aliases.contains_key(binding) {
+            if bindings.contains_key(binding) || self.proof_points.fallible_aliases.contains_key(binding)
+                || self.proof_points.guarded_runtime_receivers.contains(binding) {
                 return Err(self.missing_origin(
                     source, binding.clone(), ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
                 ));
@@ -2905,6 +2918,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     None => self.binding(name, span)?,
                     _ => unreachable!("null and module name reads handled above"),
                 };
+                if self.proof_points.guarded_runtime_receivers.contains(&binding) {
+                    return Err(self.missing_origin(span, binding, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                }
                 if let Some(owner) = self.proof_points.fallible_aliases.get(&binding) {
                     if !matches!(read_mode, ExpressionReadMode::DereferenceOperand) {
                         return Err(self.missing_origin(span, binding, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
@@ -2936,7 +2952,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         if matches!(self.prepared_place_root(root.ordinal, *span)?,
                             Some(PreparedPlaceRoot::Lexical(binding))
                                 if self.proof_points.fallible_allocation_bindings.as_ref().and_then(|sites| sites.get(binding))
-                                    .is_some_and(|site| site.has_runtime_extent())));
+                                    .is_some_and(|site| site.has_runtime_extent())
+                                    || self.proof_points.guarded_runtime_receivers.contains(binding)));
                 if !guarded_length && !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer) {
                     self.reject_fallible_address(place, place_ordinal, span)?;
                 }
@@ -5163,7 +5180,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && !block.unsafe_context && self.generic_parameters.is_empty()
             && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
             && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
-        let mut declares_fallible = false;
+        let mut declares_guarded_owner = false;
         let mut declared = Vec::new();
         let mut result = ReferenceBlockResult::default();
         let mut next_item = 0;
@@ -5437,6 +5454,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .evaluations
                             .insert(primary_ordinal, initializer.expect("raw null evaluation"));
                     }
+                    let guarded_move = (|| {
+                        if binding.is_allocation || binding.fallible_assignment.is_some() || block.unsafe_context
+                            || !self.generic_parameters.is_empty() || binding_region.receivers().len() != 1
+                            || !outputs.secondary.is_empty()
+                        { return None; }
+                        let ScalarExpression::Name { span, .. } = primary else { return None; };
+                        let Some(PlainNameIdentity::Lexical(source)) = self.prepared_name_identity(primary_ordinal, *span).ok().flatten()
+                        else { return None; };
+                        let site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
+                        aggregate::same_runtime_array_type(&site.ty, &receiver.ty).then(|| source.clone())
+                    })();
                     let widened_move = outputs.secondary.is_empty()
                         && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
                     self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
@@ -5448,6 +5476,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         kind: ReferenceBindingKind::Declared,
                     };
                     self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
+                    if let Some(source) = guarded_move {
+                        declares_guarded_owner = true;
+                        let read = initializer.ok_or_else(|| self.missing_context(expression_span(primary),
+                            ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                        let moved = self.cursor.filter(|point| *point != read)
+                            .ok_or_else(|| self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                        self.cfg.allocations.insert(id.clone());
+                        self.proof_points.guarded_runtime_receivers.insert(id.clone());
+                        self.proof_points.guarded_runtime_moves.insert(read, GuardedRuntimeMove {
+                            source, target: id.clone(), target_ty: receiver.ty.clone(), rhs: primary_ordinal.0, moved, scope,
+                        });
+                    }
                     if let Some(owner) = alias_owner {
                         self.proof_points.fallible_aliases.insert(id.clone(), owner);
                     }
@@ -5504,7 +5545,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && (runtime_returned || runtime_literal_length.is_some() || is_integer_type(&receiver.ty)
                             || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
                     {
-                        declares_fallible = true;
+                        declares_guarded_owner = true;
                         let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
                             && matches!(copy_policy(&receiver.ty, self.structs, self.enums, &self.generic_parameters),
                                 Ok(CopyPolicy::Copy));
@@ -6112,6 +6153,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             {
                                 return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
                             }
+                            if self.proof_points.guarded_runtime_receivers.contains(&id)
+                                && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
+                            {
+                                return Err(self.missing_origin(*span, id, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                            }
                             let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
                             if let Some((destination, source, target)) = widened_rebind {
                                 self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
@@ -6441,7 +6487,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             self.root_return_points = first_return_point..self.cfg.points.len();
         }
         let scope_exit = self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
-        if declares_fallible {
+        if declares_guarded_owner {
             self.proof_points.guarded_allocation_scopes.insert(scope.0,
                 super::control::GuardedAllocationScope { scope, entry: scope_entry, exit: scope_exit });
         }
@@ -6510,6 +6556,7 @@ struct ReferenceEdgeState {
     point_values: ReferencePointValues,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
+    guarded_whole_moves: BTreeMap<ReferenceBindingId, SourceSpan>,
     moved_checked_handles: BTreeMap<ReferenceBindingId, Vec<(Vec<ReferencePlaceProjection>, SourceSpan)>>,
     assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
 }
@@ -6519,13 +6566,15 @@ impl ReferenceEdgeState {
         &mut self,
         edge: &super::control::GuardedAllocationEdge,
         successor: CfgPointId,
+        enrolled_move_owner: bool,
     ) {
         if successor == edge.absent {
             self.uninitialized.insert(edge.binding.clone());
         } else if successor == edge.present
             && !self.released.contains(&edge.binding)
             && !self.invalidated.contains(&edge.binding)
-            && !self.moved.iter().any(|(place, _)| place.binding == edge.binding)
+            && if enrolled_move_owner { !self.guarded_whole_moves.contains_key(&edge.binding) }
+                else { !self.moved.iter().any(|(place, _)| place.binding == edge.binding) }
         {
             self.uninitialized.remove(&edge.binding);
         }
@@ -6545,6 +6594,7 @@ impl ReferenceEdgeState {
             self.bindings.remove(binding);
             self.uninitialized.remove(binding);
             self.moved_checked_handles.remove(binding);
+            self.guarded_whole_moves.remove(binding);
             self.released.remove(binding);
             self.invalidated.remove(binding);
             self.replaced_array_extents.remove(binding);
@@ -6559,6 +6609,7 @@ impl ReferenceEdgeState {
         self.bindings.retain(|binding, _| live(binding));
         self.uninitialized.retain(&live);
         self.moved.retain(|(place, _)| live(&place.binding));
+        self.guarded_whole_moves.retain(|binding, _| live(binding));
         self.moved_checked_handles.retain(|binding, _| live(binding));
         self.released.retain(&live);
         self.invalidated.retain(&live);
@@ -6678,18 +6729,18 @@ fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
     let mut entry = ReferenceEdgeState::default();
     entry.uninitialized.insert(unrelated.clone());
     let mut failure = entry.clone();
-    failure.refine_allocation_edge(&edge, edge.absent);
+    failure.refine_allocation_edge(&edge, edge.absent, false);
     assert_eq!(failure.uninitialized, HashSet::from([target.clone(), unrelated.clone()]));
     let mut other = failure.clone();
-    other.refine_allocation_edge(&edge, CfgPointId(4));
+    other.refine_allocation_edge(&edge, CfgPointId(4), false);
     assert!(other == failure);
     let mut success = failure.clone();
-    success.refine_allocation_edge(&edge, edge.present);
+    success.refine_allocation_edge(&edge, edge.present, false);
     assert!(success == entry);
     assert!(failure.uninitialized.contains(&target));
     failure.released.insert(target.clone());
     let mut retired = failure.clone();
-    retired.refine_allocation_edge(&edge, edge.present);
+    retired.refine_allocation_edge(&edge, edge.present, false);
     assert!(retired == failure);
 
     failure.released.clear();
@@ -6704,8 +6755,18 @@ fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
     };
     failure.moved.push((moved, SourceSpan::new(source, span)));
     let mut moved_edge = failure.clone();
-    moved_edge.refine_allocation_edge(&edge, edge.present);
+    moved_edge.refine_allocation_edge(&edge, edge.present, false);
     assert!(moved_edge == failure);
+    let mut indexed = failure.clone();
+    indexed.guarded_whole_moves.insert(target.clone(), indexed.moved[0].1.clone());
+    let mut indexed_edge = indexed.clone();
+    indexed_edge.refine_allocation_edge(&edge, edge.present, true);
+    assert!(indexed_edge == indexed);
+    let mut other_owner = edge;
+    other_owner.binding = unrelated.clone();
+    indexed_edge.refine_allocation_edge(&other_owner, other_owner.present, true);
+    assert!(indexed_edge.uninitialized.contains(&target));
+    assert!(!indexed_edge.uninitialized.contains(&unrelated));
 }
 
 #[cfg(test)]
@@ -6754,6 +6815,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
         state.bindings.insert(binding.clone(), BTreeSet::new());
         state.uninitialized.insert(binding.clone());
         state.moved.push((place.clone(), SourceSpan::new(source.clone(), span)));
+        state.guarded_whole_moves.insert(binding.clone(), SourceSpan::new(source.clone(), span));
         state.moved_checked_handles.insert(binding.clone(), Vec::new());
         state.released.insert(binding.clone());
         state.invalidated.insert(binding.clone());
@@ -6766,6 +6828,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     let others = BTreeSet::from([inner.clone(), introduced.clone()]);
     assert!(single.bindings.keys().eq(others.iter()));
     assert!(single.moved_checked_handles.keys().eq(others.iter()));
+    assert!(single.guarded_whole_moves.keys().eq(others.iter()));
     assert_eq!(single.uninitialized, HashSet::from([inner.clone(), introduced.clone()]));
     assert_eq!(single.released, others);
     assert_eq!(single.invalidated, others);
@@ -6777,6 +6840,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     assert_eq!(state.uninitialized, HashSet::from([outer.clone()]));
     assert!(matches!(state.moved.as_slice(), [(place, _)] if place.binding == outer));
     assert_eq!(state.moved_checked_handles, BTreeMap::from([(outer.clone(), Vec::new())]));
+    assert!(state.guarded_whole_moves.keys().eq([&outer]));
     assert_eq!(state.released, BTreeSet::from([outer.clone()]));
     assert_eq!(state.invalidated, BTreeSet::from([outer.clone()]));
     assert!(matches!(state.projected.as_slice(), [known] if known.place.binding == outer));
@@ -8606,6 +8670,7 @@ struct ReferenceTransferCfg<'a> {
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
     guarded_indexed_stores: Option<&'a HashSet<CfgPointId>>,
+    guarded_runtime_moves: Option<&'a BTreeMap<CfgPointId, GuardedRuntimeMove>>,
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -8645,6 +8710,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
             guarded_allocation_edges: proof.map(|proof| &proof.guarded_allocation_edges),
             guarded_indexed_stores: proof.map(|proof| &proof.guarded_indexed_stores),
+            guarded_runtime_moves: proof.map(|proof| &proof.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -10128,6 +10194,12 @@ fn transfer_reference_facts(
     let ordinary_forward = strictly_forward && pending.is_none() && descriptor.is_none();
     let mut errors = Vec::new();
     let mut pending_sites = pending.map_or(&[][..], |pending| pending.sites.as_slice()).iter().peekable();
+    // Both indexes are derived once from the exact prepared whole-move
+    // receipts. Only enrolled owners use the edge-local specialized lane.
+    let (guarded_move_points, guarded_move_owners) = cfg.guarded_runtime_moves.map_or_else(
+        || (HashMap::new(), HashSet::new()),
+        |moves| moves.values().map(|receipt| ((receipt.moved, &receipt.source), &receipt.source)).unzip(),
+    );
     loop {
         let id = if let Some((_, queued, ready)) = &mut fallback {
             let Some(id) = ready.pop_front() else { break };
@@ -10147,6 +10219,7 @@ fn transfer_reference_facts(
                     && matches!(original_points[id.0].successors.as_slice(), [first, second]
                         if (*first, *second) == (edge.present, edge.absent)
                             || (*first, *second) == (edge.absent, edge.present)));
+        let enrolled_move_owner = guarded_allocation_edge.is_some_and(|edge| guarded_move_owners.contains(&edge.binding));
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
         let mut local_access_conflicts = None;
@@ -11174,6 +11247,9 @@ fn transfer_reference_facts(
                             origins,
                         });
                     }
+                    if guarded_move_points.get(&id) == Some(&&place.binding) && place.projections.is_empty() {
+                        state.guarded_whole_moves.entry(place.binding.clone()).or_insert_with(|| point.source_span.clone());
+                    }
                     if !state.moved.iter().any(|(moved, _)| moved == &place) {
                         state.moved.push((place, point.source_span.clone()));
                     }
@@ -11338,7 +11414,9 @@ fn transfer_reference_facts(
                         if let Some(owner) = cfg.fallible_aliases.and_then(|aliases| aliases.get(binding)) {
                             require_available_fallible_read(bindings, &state, owner, point, false, &mut errors);
                         } else {
-                            require_available_fallible_read(bindings, &state, binding, point, true, &mut errors);
+                            let whole = !cfg.guarded_runtime_moves.and_then(|moves| moves.get(&id))
+                                .is_some_and(|transfer| &transfer.source == binding);
+                            require_available_fallible_read(bindings, &state, binding, point, whole, &mut errors);
                         }
                     }
                     let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
@@ -11944,9 +12022,17 @@ fn transfer_reference_facts(
             {
                 flow.expire_before(cutoff, last_use);
             }
+            if enrolled_move_owner {
+                let edge = guarded_allocation_edge.expect("enrolled guarded owner");
+                if let Some(origin) = state.guarded_whole_moves.get(&edge.binding) {
+                    errors.push(ReferenceAnalysisError::ConflictingPlace {
+                        source_span: point.source_span.clone(), origins: vec![origin.clone()],
+                    });
+                }
+            }
             let prune_for_successor = |next: &mut ReferenceEdgeState, successor| {
                 if let Some(edge) = guarded_allocation_edge {
-                    next.refine_allocation_edge(edge, successor);
+                    next.refine_allocation_edge(edge, successor, enrolled_move_owner);
                 }
                 if common_aggregate_cutoff.is_some_and(|cutoff| cutoff < successor) {
                     if let (Some(last_use), Some(flow)) = (&aggregate_deadlines, &mut next.aggregate) {
@@ -16607,6 +16693,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
                     guarded_allocation_edges: Some(&template_result.proof_points.guarded_allocation_edges),
                     guarded_indexed_stores: Some(&template_result.proof_points.guarded_indexed_stores),
+                    guarded_runtime_moves: Some(&template_result.proof_points.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
@@ -16904,6 +16991,26 @@ fn seal_guarded_scalar_allocations(
     for (ordinal, owner) in &points.fallible_alias_accesses {
         owners[*owner_indices.get(owner)?].2.push(ordinal.0);
     }
+    let mut moves_by_owner = HashMap::<&ReferenceBindingId, Vec<GuardedRuntimeMove>>::new();
+    for (read, receipt) in &points.guarded_runtime_moves {
+        let source = bindings.get(&receipt.source)?;
+        if !aggregate::same_runtime_array_type(&source.ty, &receipt.target_ty) { return None; }
+        let before = cfg.points.get(read.0)?;
+        let moved = cfg.points.get(receipt.moved.0)?;
+        let [installed] = moved.successors.as_slice() else { return None; };
+        let installed = cfg.points.get(installed.0)?;
+        let exit = points.guarded_allocation_scopes.get(&receipt.scope.0)?.exit;
+        if before.scope != receipt.scope || moved.scope != receipt.scope || installed.scope != receipt.scope
+            || !matches!(&before.kind, CfgPointKind::Read { binding } if binding == &receipt.source)
+            || before.successors.as_slice() != [moved.id]
+            || !matches!(&moved.kind, CfgPointKind::Move { place, owner, ty }
+                if owner == &receipt.source && place.binding == receipt.source && place.projections.is_empty()
+                    && aggregate::same_runtime_array_type(ty, &receipt.target_ty))
+            || !matches!(&installed.kind, CfgPointKind::Bind { binding } if binding == &receipt.target)
+            || !points.scope_exit_bindings.as_ref()?.get(&exit)?.contains(&receipt.target)
+        { return None; }
+        moves_by_owner.entry(&receipt.source).or_default().push(receipt.clone());
+    }
     owners.into_iter().map(|(binding, mut guards, mut accesses)| {
         let declared = bindings.get(binding)?;
         let scope = points.guarded_allocation_scopes.get(&declared.scope.0)?;
@@ -16925,6 +17032,7 @@ fn seal_guarded_scalar_allocations(
             binding: binding.clone(), ty: declared.ty.clone(), runtime_literal_length: declared.runtime_literal_length,
             runtime_returned: declared.runtime_returned,
             guards: guards.into_boxed_slice(), alias_accesses: accesses.into_boxed_slice(),
+            runtime_moves: moves_by_owner.remove(binding).unwrap_or_default().into_boxed_slice(),
         })
     }).collect()
 }
@@ -17418,16 +17526,19 @@ fn build_function_reference_cfg(
             let sites = builder.proof_points.fallible_allocation_bindings.as_ref();
             let is_guarded_array = |owner| sites.and_then(|sites| sites.get(owner))
                 .is_some_and(|site| site.has_indexed_extent());
-            if builder.proof_points.fallible_aliases.values().any(is_guarded_array) {
-                let borrows = builder.cfg.initial_points.iter().filter_map(|point|
+            let moves = &builder.proof_points.guarded_runtime_moves;
+            if builder.proof_points.fallible_aliases.values().any(is_guarded_array) || !moves.is_empty() {
+                let origins = builder.cfg.initial_points.iter().filter_map(|point|
                     matches!(&point.kind, CfgPointKind::Borrow { place, .. } if is_guarded_array(&place.binding))
-                        .then_some(&point.source_span)).collect::<HashSet<_>>();
+                        .then_some(&point.source_span)).chain(moves.values().filter_map(|receipt|
+                            builder.cfg.initial_points.get(receipt.moved.0).map(|point| &point.source_span)))
+                    .collect::<HashSet<_>>();
                 let mut diagnosed = errors.iter().filter_map(|error|
                     matches!(error, ReferenceAnalysisError::ConflictingPlace { .. })
                         .then_some(error.source_span().clone())).collect::<HashSet<_>>();
                 for error in &provisional {
-                    if let ReferenceAnalysisError::ConflictingPlace { source_span, origins } = error {
-                        if origins.iter().any(|origin| borrows.contains(origin)) && diagnosed.insert(source_span.clone()) {
+                    if let ReferenceAnalysisError::ConflictingPlace { source_span, origins: related } = error {
+                        if related.iter().any(|origin| origins.contains(origin)) && diagnosed.insert(source_span.clone()) {
                             errors.push(error.clone());
                         }
                     }

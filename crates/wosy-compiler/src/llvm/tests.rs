@@ -14653,3 +14653,105 @@ if (observed(3, 1) != 99 || observed(0, 0) != 0 || observed(3, 2) != 3
         }
     }
 }
+
+#[test]
+fn guarded_fallible_runtime_owner_moves_only_on_the_selected_present_edge() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64[](u64) _make = fn(count) { u64[count] fresh; fresh };
+u64(bool, u64, u64) observed = fn(relocate, count, index) {
+    u64[] held =? _make(count);
+    if (&held == null) { 99 } else {
+        if (relocate) {
+            u64[] relocated = held;
+            relocated[index] = 7;
+            core.array_len(&relocated)
+        } else {
+            held[index] = 9;
+            core.array_len(&held)
+        }
+    }
+};
+if (observed(true, 3, 1) != 99 || observed(true, 3, 2) != 3 || observed(false, 2, 1) != 2
+    || observed(true, 2, 4294967297) != 0) { core.system_panic(); };
+%%end";
+    let early = text.replace("    if (&held == null)", "    u64[] too_early = held;
+    core.array_len(&too_early);
+    if (&held == null)");
+    let live_loan = text.replace(
+        "            u64[] relocated = held;",
+        "            *u64 cell = &held[index];
+            u64[] relocated = held;
+            *cell;",
+    );
+    let moved_access = text.replace("            relocated[index] = 7;", "            relocated[index] = 7;
+            core.array_len(&held);");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (text, expected) in [
+            (early.as_str(), "fallible allocation is not known to be available"),
+            (live_loan.as_str(), "read or move of unavailable place"),
+        ] {
+            let prepared = prepare_initializer_test(text, layout);
+            let analysis = analyze_scalar_build(&prepared);
+            assert!(analysis.diagnostics().iter().any(|diagnostic| diagnostic.message.contains(expected)),
+                "{expected}: {:?}", analysis.diagnostics());
+        }
+        // The extent consumer authenticates the live owner before yielding
+        // its count. It diagnoses the exact post-move observation.
+        let moved = prepare_initializer_test(&moved_access, layout);
+        let moved = analyze_scalar_build(&moved);
+        let use_site = "core.array_len(&held)";
+        let start = moved_access.find(use_site).unwrap() as u32;
+        let span = ByteSpan::new(start, start + use_site.len() as u32);
+        assert!(moved.diagnostics().iter().any(|diagnostic|
+            diagnostic.code == "B0003" && diagnostic.message == "core.array_len requires an exact local array extent"
+                && diagnostic.labels.iter().any(|label|
+                    label.kind == crate::DiagnosticLabelKind::Primary && label.span.range == span)),
+            "{:?}", moved.diagnostics());
+        let prepared = prepare_initializer_test(text, layout);
+        let source = prepared.project().modules[0].source.clone();
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let fallback = analyze_scalar_build(&prepared);
+        let release_checked = analyze_scalar_build(&release);
+        assert!(fallback.diagnostics().is_empty(), "{:?}", fallback.diagnostics());
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&fallback)),
+            ("project", true, emit_scalar_build_project_llvm(&fallback)),
+            ("release-project", true, emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "guarded runtime owner move");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let function = |name: &str| module.get_function(&self_tail_test_symbol(&source, project, name)).unwrap();
+            let observed = function("observed");
+            let instructions = observed.get_basic_blocks().into_iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .collect::<Vec<_>>();
+            let calls_to = |callee| instructions.iter().copied().filter(|&instruction|
+                CallSiteValue::try_from(instruction).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .collect::<Vec<_>>();
+            let producer = calls_to(function("_make"));
+            let [result] = producer.as_slice() else { panic!("{llvm}") };
+            let backing = result.get_next_instruction().unwrap();
+            assert_eq!(backing.get_indices(), vec![0]);
+            assert!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).is_empty());
+            let frees = calls_to(module.get_function("__wosy_core_free").unwrap());
+            assert_eq!(frees.len(), 2);
+            assert!(frees.iter().all(|&free| known_field_operand(free, 0).unwrap().as_instruction_value() == Some(backing)));
+            if let Some(out) = std::env::var_os("WOSY_GUARDED_RUNTIME_ARRAY_MOVE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

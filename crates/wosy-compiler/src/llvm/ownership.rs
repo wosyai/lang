@@ -1162,6 +1162,7 @@ struct GuardedScalarSite {
     ty: ScalarType,
     runtime_literal_length: Option<u64>,
     runtime_returned: bool,
+    movable: bool,
 }
 
 pub(super) struct GuardedScalarSites<'ctx> {
@@ -1169,6 +1170,7 @@ pub(super) struct GuardedScalarSites<'ctx> {
     declarations: HashMap<(u32, u32), usize>,
     conditions: HashMap<usize, (usize, bool)>,
     aliases: HashMap<usize, usize>,
+    runtime_moves: HashMap<(u32, u32), (usize, usize, usize)>,
     active: Vec<Option<GuardedScalarOwner<'ctx>>>,
     lexical: Vec<usize>,
 }
@@ -1190,14 +1192,29 @@ impl<'ctx> GuardedScalarSites<'ctx> {
                 if aliases.insert(alias, index).is_some() { return None; }
             }
         }
+        let mut sites = proofs.iter().map(|proof| GuardedScalarSite {
+            scope: proof.binding().block_span, ty: proof.ty().clone(),
+            runtime_literal_length: proof.runtime_literal_length(),
+            runtime_returned: proof.runtime_returned(), movable: !proof.runtime_moves().is_empty(),
+        }).collect::<Vec<_>>();
+        let mut runtime_moves = HashMap::new();
+        for (source, proof) in proofs.iter().enumerate() {
+            for receipt in proof.runtime_moves() {
+                if &receipt.source != proof.binding() { return None; }
+                let span = receipt.target.declaration_span;
+                let declaration = (span.start, span.end);
+                let target = sites.len();
+                if declarations.insert(declaration, target).is_some()
+                    || runtime_moves.insert(declaration, (source, target, receipt.rhs)).is_some()
+                { return None; }
+                sites.push(GuardedScalarSite { scope: receipt.target.block_span, ty: receipt.target_ty.clone(),
+                    runtime_literal_length: None, runtime_returned: true, movable: false });
+            }
+        }
+        let active = vec![None; sites.len()];
         Some(Box::new(Self {
-            sites: proofs.iter().map(|proof| GuardedScalarSite {
-                scope: proof.binding().block_span, ty: proof.ty().clone(),
-                runtime_literal_length: proof.runtime_literal_length(),
-                runtime_returned: proof.runtime_returned(),
-            }).collect(),
-            declarations, conditions, aliases,
-            active: vec![None; proofs.len()], lexical: Vec::new(),
+            sites: sites.into_boxed_slice(), declarations, conditions, aliases, runtime_moves,
+            active, lexical: Vec::new(),
         }))
     }
 }
@@ -1207,6 +1224,59 @@ struct GuardedScalarOwner<'ctx> {
     backing: PointerValue<'ctx>,
     present: inkwell::values::IntValue<'ctx>,
     runtime_extent: Option<inkwell::values::IntValue<'ctx>>,
+    live_slot: Option<PointerValue<'ctx>>,
+}
+
+fn enroll_guarded_owner<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    index: usize,
+    mut owner: GuardedScalarOwner<'ctx>,
+) -> Result<(), String> {
+    if state.guarded_scalar.as_ref().ok_or("missing guarded owner sites")?.sites[index].movable {
+        let slot = entry_alloca(state, context.bool_type().into(), "fallible.owner_live")?;
+        state.builder.build_store(slot, owner.present).map_err(builder_error)?;
+        owner.live_slot = Some(slot);
+    }
+    let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
+    sites.active[index] = Some(owner);
+    sites.lexical.push(index);
+    Ok(())
+}
+
+pub(super) fn move_guarded_runtime_owner<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+) -> Result<bool, String> {
+    let Some(sites) = state.guarded_scalar.as_ref().filter(|sites| !sites.runtime_moves.is_empty()) else { return Ok(false); };
+    let [receiver] = binding.receivers.as_slice() else { return Ok(false); };
+    let span = receiver.name_span;
+    let Some(&(source, target, rhs)) = sites.runtime_moves.get(&(span.start, span.end)) else { return Ok(false); };
+    let ScalarExpression::Name { name, .. } = &binding.value else { return Err("guarded move lost its exact lexical source".into()); };
+    let nodes = state.body_call_nodes.ok_or("guarded move lacks exact prepared binding")?;
+    let declaration = nodes.lexical_expression_declaration(&binding.value)
+        .map(|span| (span.start, span.end));
+    let owner = sites.active[source].ok_or("guarded move has no source receipt")?;
+    if nodes.expression_ordinal(&binding.value) != Some(rhs) || nodes.binding_position(binding).is_none()
+        || declaration.and_then(|span| sites.declarations.get(&span)) != Some(&source)
+        || sites.active[target].is_some()
+        || receiver.ty != sites.sites[target].ty
+        || !matches!(state.storage.get(name), Some((backing, ty)) if *backing == owner.backing && *ty == sites.sites[source].ty)
+    { return Err("guarded move differs from its checked operands".into()); }
+    let extent = if sites.sites[source].runtime_returned { owner.runtime_extent }
+        else { sites.sites[source].runtime_literal_length.map(|length| context.i64_type().const_int(length, false)) }
+        .ok_or("guarded move lost the source extent")?;
+    let live_slot = owner.live_slot.ok_or("guarded move lacks source lifetime state")?;
+    // Analysis already proved presence here. Retire the source on this
+    // edge only; an untaken move leaves its original cleanup obligation.
+    state.builder.build_store(live_slot, context.bool_type().const_zero()).map_err(builder_error)?;
+    state.storage.insert(receiver.name.clone(), (owner.backing, receiver.ty.clone()));
+    enroll_guarded_owner(context, state, target, GuardedScalarOwner {
+        backing: owner.backing, present: context.bool_type().const_all_ones(),
+        runtime_extent: Some(extent), live_slot: None,
+    })?;
+    Ok(true)
 }
 
 enum GuardedAggregateInitializer<'ctx, 'module> {
@@ -1248,10 +1318,9 @@ pub(super) fn bind_guarded_scalar<'ctx>(
             .map_err(builder_error)?.into_int_value();
         let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
         state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-        let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
-        sites.active[index] = Some(GuardedScalarOwner { backing, present, runtime_extent: Some(extent) });
-        sites.lexical.push(index);
-        return Ok(());
+        return enroll_guarded_owner(context, state, index, GuardedScalarOwner {
+            backing, present, runtime_extent: Some(extent), live_slot: None,
+        });
     }
     let runtime_layout = match (&receiver.ty, sites.sites[index].runtime_literal_length) {
         (ScalarType::RuntimeArray { element, .. }, Some(length)) => {
@@ -1360,10 +1429,9 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         (address.as_basic_value().into_pointer_value(), availability.as_basic_value().into_int_value())
     } else { (backing, present) };
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
-    sites.active[index] = Some(GuardedScalarOwner { backing, present, runtime_extent: None });
-    sites.lexical.push(index);
-    Ok(())
+    enroll_guarded_owner(context, state, index, GuardedScalarOwner {
+        backing, present, runtime_extent: None, live_slot: None,
+    })
 }
 
 pub(super) fn guarded_array_extent<'ctx>(
@@ -1439,16 +1507,23 @@ pub(super) fn release_guarded_scalar<'ctx>(
 
 fn release_guarded_scalar_owner<'ctx>(
     context: &'ctx Context,
-    state: &EmitState<'ctx, '_>,
+    state: &mut EmitState<'ctx, '_>,
     owner: GuardedScalarOwner<'ctx>,
 ) -> Result<(), String> {
+    let live = if let Some(slot) = owner.live_slot {
+        state.builder.build_load(context.bool_type(), slot, "fallible.owner_live")
+            .map_err(builder_error)?.into_int_value()
+    } else { owner.present };
+    if live.get_zero_extended_constant() == Some(1) {
+        return consume_runtime_array_release(context, state, RuntimeArrayRelease { pointer: owner.backing.into(), live: None });
+    }
     let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or_else(|| "missing guarded scalar release function".to_owned())?;
     let release = state.module.get_function(CORE_FREE_SYMBOL)
         .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
     let present = context.append_basic_block(parent, "fallible.release");
     let next = context.append_basic_block(parent, "fallible.released");
-    state.builder.build_conditional_branch(owner.present, present, next).map_err(builder_error)?;
+    state.builder.build_conditional_branch(live, present, next).map_err(builder_error)?;
     state.builder.position_at_end(present);
     state.builder.build_call(release, &[owner.backing.into()], "").map_err(builder_error)?;
     state.builder.build_unconditional_branch(next).map_err(builder_error)?;
