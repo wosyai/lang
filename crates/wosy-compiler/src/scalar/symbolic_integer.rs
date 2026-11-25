@@ -351,6 +351,17 @@ impl<'a> IntegerShowConstraints<'a> {
             && self.upper.as_ref().is_none_or(|(bound, open)| last < bound.as_ref() || (!open && last == bound.as_ref()))
     }
 
+    pub(super) fn first_violation_in_interval<'b>(&'b self, low: &'b BigInt, high: &'b BigInt) -> Option<&'b BigInt> {
+        if !self.endpoints_hold(low, low) { return Some(low); }
+        if !self.endpoints_hold(high, high) { return Some(high); }
+        self.excluded.get(self.excluded.partition_point(|hole| hole.as_ref() < low))
+            .map(std::borrow::Cow::as_ref).filter(|hole| *hole <= high)
+    }
+
+    pub(super) fn interval_lookup_work(&self) -> usize {
+        (usize::BITS - self.excluded.len().leading_zeros()) as usize + 2
+    }
+
     pub(super) fn holds_value(&self, value: &BigInt) -> bool {
         self.endpoints_hold(value, value) && self.excluded.binary_search_by(|hole| hole.as_ref().cmp(value)).is_err()
     }
@@ -521,6 +532,12 @@ impl IntegerSet {
 
     pub(super) fn interval_count(&self) -> usize {
         self.0.len()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn first_intersection_point<'a>(&'a self, low: &'a BigInt, high: &BigInt) -> Option<&'a BigInt> {
+        let interval = self.0.get(self.0.partition_point(|part| &part.last < low))?;
+        (&interval.first <= high).then_some(std::cmp::max(&interval.first, low))
     }
 
     pub(super) fn extremes(&self) -> Option<(&BigInt, &BigInt)> {

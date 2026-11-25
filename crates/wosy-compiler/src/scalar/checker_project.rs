@@ -6271,6 +6271,21 @@ impl SelectedSymbolicProof<'_, '_> {
         if group.result_pair {
             return self.verify_result_pair(group, calls, function, source, effects);
         }
+        if group.quantified_return {
+            let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
+            let MainFlowProofBound::Quantified(goal) = first.bound else { return Err(ProjectCheck::Unsupported); };
+            if !rest.is_empty() || first.proof_source != source || first.owner != source {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let (active, directives, returned, rejected) = super::checker_flow::collect_ordered_root_quantified_proof(
+                calls, &function.body, goal, first.filter,
+            ).ok_or(ProjectCheck::Unsupported)?;
+            if active || !directives.is_empty() { return Err(ProjectCheck::Unsupported); }
+            if let Some(failure) = rejected {
+                self.record(first, function, source, effects.records.len(), failure, None)?;
+            }
+            return Ok(Some(returned));
+        }
         if group.literal_leaf.is_some() {
             return self.verify_literal_leaf(group, calls, function, source, effects);
         }
@@ -6713,6 +6728,7 @@ impl ShowEqualityIndex {
 
 #[cfg(feature = "internal-checker")]
 enum MainFlowProofBound<'a> {
+    Quantified(super::checker_flow::QuantifiedIntegerReturn<'a>),
     ResultPair(&'a super::checker_flow::ResultPairProof),
     Literal(&'a BigInt),
     Entry(usize),
@@ -6724,7 +6740,7 @@ impl<'a> MainFlowProofBound<'a> {
     fn literal(&self) -> Option<&'a BigInt> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::ResultPair(_) | Self::Entry(_) | Self::EntryAffine { .. } => None,
+            Self::Quantified(_) | Self::ResultPair(_) | Self::Entry(_) | Self::EntryAffine { .. } => None,
         }
     }
 
@@ -6745,7 +6761,7 @@ impl<'a> MainFlowProofBound<'a> {
                 let value = transform.apply_point(entry);
                 integer_literal_fits_type(&value, parameter).then_some(Cow::Owned(value))
             }
-            Self::ResultPair(_) | Self::EntryAffine { .. } => None,
+            Self::Quantified(_) | Self::ResultPair(_) | Self::EntryAffine { .. } => None,
         }
     }
 }
@@ -6906,6 +6922,34 @@ impl<'a> MainFlowProofCase<'a> {
             && proof_target_tokens(plan.proof)?.0.is_some() && citation.is_none() && plan.typed.measure.is_none())
         {
             return Err(ProjectCheck::Unsupported);
+        }
+        use super::checker_flow::QuantifiedIntegerReturn as Quantified;
+        let quantified = match &plan.typed.goal {
+            TypedProofGoal::UniversalNotEqual(excluded) => Some(Quantified::Avoiding(None, excluded)),
+            TypedProofGoal::UniversalConjunction(goal) => Some(match goal {
+                UniversalConjunction::Vacuous => Quantified::Vacuous,
+                UniversalConjunction::Impossible => Quantified::Impossible,
+                UniversalConjunction::Output(bounds) => Quantified::Output(bounds),
+                UniversalConjunction::OutputAvoiding(both) => Quantified::Avoiding(Some(&both.0), &both.1),
+            }),
+            _ => None,
+        };
+        if let Some(claim) = quantified {
+            if citation.is_some() || qualified_leaf || !plan.has_no_authored_steps()
+                || plan.typed.measure.is_some() || !valid_arbitrary_proof_body(body)
+                || !body.checker_pure_calling_frame() || !body.callable_escapes.is_empty()
+                || !body.structure.module_storage_uses.is_empty() || body.contextual_formal().is_some()
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let filter = plan.filter.as_deref().unwrap_or_default();
+            let guard = checked_scalar_guard_slots::<false>(body, filter, false, false).ok_or(ProjectCheck::Unsupported)?;
+            let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+            return Ok((Self {
+                proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
+                goal: wosy_syntax::byte_span(&goal), guard, filter, relation: None,
+                bound: MainFlowProofBound::Quantified(claim), qualified_leaf, literal_leaf: None,
+            }, None));
         }
         if let TypedProofGoal::ResultPair(pair) = &plan.typed.goal {
             if citation.is_some() { return Err(ProjectCheck::Unsupported); }
@@ -7261,6 +7305,7 @@ struct MainFlowProofTarget<'a> {
     observed_nested: HashSet<wosy_syntax::SourceSpan>,
     literal_leaf: Option<ProofLiteralType>,
     result_pair: bool,
+    quantified_return: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7310,13 +7355,14 @@ impl<'a> MainFlowProofTarget<'a> {
         let qualified_leaf = first.qualified_leaf;
         let literal_leaf = first.literal_leaf;
         let result_pair = first.result_pair().is_some();
+        let quantified_return = matches!(first.bound, MainFlowProofBound::Quantified(_));
         let cases = if let Some(step) = step {
             MainFlowProofCases::Authored(vec![(first, Some(step))])
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
         Self { citation_output_type, exact_citations: None, has_case_citations, case_citations: None,
-            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, issuer: None, qualified_issuer: None, qualified_closed_leaf: false, seen: false,
+            qualified_leaf, literal_leaf, result_pair, nested_observation_work, cases, quantified_return, issuer: None, qualified_issuer: None, qualified_closed_leaf: false, seen: false,
             required_nested: 0, observed_nested: HashSet::new() }
     }
 
@@ -7412,7 +7458,9 @@ impl<'a> MainFlowProofObserver<'a> {
         let citation_output_type = MainFlowProofTarget::citation_output_type(proof.1.as_ref());
         let has_case_citations = matches!(&proof.1, Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations());
         let nested_case_work = MainFlowProofTarget::nested_case_work(&proof.0, proof.1.as_ref());
+        let quantified_return = matches!(proof.0.bound, MainFlowProofBound::Quantified(_));
         if self.first.0 == target {
+            self.first.1.quantified_return |= quantified_return;
             self.first.1.issuer = None;
             self.first.1.qualified_leaf |= proof.0.qualified_leaf;
             self.first.1.has_case_citations |= has_case_citations;
@@ -7424,6 +7472,7 @@ impl<'a> MainFlowProofObserver<'a> {
         match self.other.entry(target) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let group = entry.get_mut();
+                group.quantified_return |= quantified_return;
                 group.issuer = None;
                 group.qualified_leaf |= proof.0.qualified_leaf;
                 group.has_case_citations |= has_case_citations;
@@ -7704,6 +7753,17 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         continue;
                     }
                     self.active = true;
+                    if let MainFlowProofBound::Quantified(claim) = proof.bound {
+                        let Some(failure) = claim.rejected_point(value, value, &mut self.named_exact_work) else {
+                            self.incomplete = true;
+                            return;
+                        };
+                        if failure.is_some() && !emit(proof, None) {
+                            self.incomplete = true;
+                            return;
+                        }
+                        continue;
+                    }
                     let Ok(relation) = proof.relation() else { self.incomplete = true; return; };
                     let Some(bound) = proof.bound.for_actual(arguments, parameters) else {
                         self.incomplete = true;
@@ -21189,6 +21249,59 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(failed.symbolic_diagnostic.is_none() && failed.additional_symbolic_diagnostics.is_empty());
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_catalog_uses_quantified_scalar_domains_with_one_ordered_execution() {
+        use super::super::checker_flow::{take_array_return_observations, take_integer_observations};
+        let text = r#"%%start
+            u8(u8) band = fn(value) { value };
+            u8[1]() make = fn { [7] };
+            u8(u8) scheduled = fn(value) { value };
+            proof interval for band(entry) -> (out) where (entry >= 3 && entry <= 5)
+                forall (u8 floor where floor <= 2)
+                forall (u8 omitted where omitted == 2 || omitted == 6)
+                ensures (out >= floor && out != omitted) {}
+            proof cell for make() -> (items)
+                forall (u64 i where i == 0) ensures (items[i] == 7) {}
+            proof later for scheduled(entry) -> (out) where (entry >= 3 && entry <= 5)
+                forall (u8 excluded where excluded == 2 || excluded == 6)
+                ensures (out != excluded) {}
+        %%end"#;
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let _ = take_integer_observations();
+        let _ = take_array_return_observations();
+        let good = check_array_proof_cohort(text, scope).unwrap();
+        assert!(good.active && good.directives.is_empty() && good.symbolic_diagnostic.is_none()
+            && good.additional_symbolic_diagnostics.is_empty() && good.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (1, 0));
+        let wrong = text.replace("omitted == 6", "omitted == 4").replace("excluded == 6", "excluded == 5")
+            .replace("items[i] == 7", "items[i] == 8");
+        let invalid = check_array_proof_cohort(&wrong, scope).unwrap();
+        let first = invalid.symbolic_diagnostic.unwrap();
+        let [second] = invalid.additional_symbolic_diagnostics.as_slice() else { panic!("two differently owned scalar goals"); };
+        assert!(first.proof.range.start < second.proof.range.start && invalid.directives.is_empty());
+        for (failure, expected) in [(&first, 4), (second, 5)] {
+            let point = BigInt::from(expected);
+            assert_eq!(failure.returned, point);
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&point, &point)]));
+        }
+        let [array] = invalid.aggregate_diagnostics.as_slice() else { panic!("one array goal"); };
+        assert_eq!(array.cell.as_ref().unwrap().value, BigInt::from(7));
+        assert_eq!(take_array_return_observations(), (1, 0));
+        let idle = check_array_proof_cohort(&wrong, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.symbolic_diagnostic.is_none() && idle.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (0, 0));
+
+        let observed = wrong.replace("%%end", "u8 first = band(4); u8 second = band(first); u8[1] values = make(); %%end");
+        let _ = take_integer_observations();
+        let receipt = check_array_proof_cohort(&observed, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(receipt.symbolic_diagnostic.is_none() && receipt.additional_symbolic_diagnostics.is_empty());
+        let [first, second] = receipt.diagnostics.as_slice() else { panic!("two actual fitted arguments, two actual goals"); };
+        assert_ne!(first.invocation.call, second.invocation.call);
+        assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
+        assert_eq!(take_array_return_observations(), (0, 1));
     }
 
     #[cfg(feature = "internal-checker")]

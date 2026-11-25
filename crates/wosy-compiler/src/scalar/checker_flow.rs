@@ -611,9 +611,42 @@ struct LiteralGuardAtReturn<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
+pub(super) enum QuantifiedIntegerReturn<'a> {
+    Vacuous,
+    Impossible,
+    Output(&'a IntegerShowConstraints<'static>),
+    Avoiding(Option<&'a IntegerShowConstraints<'static>>, &'a IntegerSet),
+}
+
+#[cfg(feature = "internal-checker")]
+impl QuantifiedIntegerReturn<'_> {
+    pub(super) fn rejected_point<'a>(self, low: &'a BigInt, high: &'a BigInt, work: &mut usize) -> Option<Option<&'a BigInt>>
+    where Self: 'a,
+    {
+        let failure = match self {
+            Self::Vacuous => { charge_call_work(work, 1)?; None }
+            Self::Impossible => { charge_call_work(work, 1)?; Some(low) }
+            Self::Output(bounds) => {
+                charge_call_work(work, bounds.interval_lookup_work())?;
+                bounds.first_violation_in_interval(low, high)
+            }
+            Self::Avoiding(bounds, excluded) => {
+                let depth = (usize::BITS - excluded.interval_count().leading_zeros()) as usize + 1;
+                charge_call_work(work, depth.checked_add(bounds.map_or(0, IntegerShowConstraints::interval_lookup_work))?)?;
+                bounds.and_then(|bounds| bounds.first_violation_in_interval(low, high))
+                    .or_else(|| excluded.first_intersection_point(low, high))
+            }
+        };
+        Some(failure)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
 enum OrderedReturnedGoal<'a> {
     Literal(IntegerRelation, &'a BigInt),
     Entry(&'a IntegerAffineTransform),
+    Quantified(QuantifiedIntegerReturn<'a>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -686,6 +719,32 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
                     observed.1 = Some(SymbolicLiteralFailure::from_row(
                         slot, roots, row, None, Cow::Owned(returned), Some((0, witness)),
                     ));
+                    break;
+                }
+            }
+            return Some(());
+        }
+        if let OrderedReturnedGoal::Quantified(claim) = self.goal {
+            let work = &mut *self.imported_relation_work?.borrow_mut();
+            for row in &path.0 {
+                observed.0 = true;
+                let witness = match (value, axis) {
+                    (IntegerReturn::Const(value), None) => claim.rejected_point(value, value, work)?,
+                    (IntegerReturn::Alias(_), Some(axis)) => {
+                        let mut found = None;
+                        for (low, high) in row.get(axis)?.intervals() {
+                            if let Some(point) = claim.rejected_point(low, high, work)? {
+                                found = Some(point);
+                                break;
+                            }
+                        }
+                        found
+                    }
+                    _ => return None,
+                };
+                if let Some(point) = witness {
+                    charge_call_work(work, roots.parameters.checked_add(1)?)?;
+                    observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Owned(point.clone()), None));
                     break;
                 }
             }
@@ -3402,6 +3461,16 @@ pub(super) fn collect_imported_root_entry_relationship<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_quantified_proof<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, goal: QuantifiedIntegerReturn<'_>,
+    entry_filter: &[CheckerPredicate],
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    collect_ordered_root_literal_proof_with_imports::<true>(
+        calls, body, OrderedReturnedGoal::Quantified(goal), None, Some(entry_filter), &mut [],
+    )
+}
+
+#[cfg(feature = "internal-checker")]
 fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, goal: OrderedReturnedGoal<'_>,
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
@@ -3435,7 +3504,7 @@ fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
         None
     };
     let (imported_binding, imported_relation_work) = if imports.is_empty() {
-        (None, None)
+        (None, matches!(goal, OrderedReturnedGoal::Quantified(_)).then(|| std::cell::RefCell::new(0)))
     } else {
         if imports.len() > 4 || imports.iter().any(Option::is_none) { return None; }
         let last = imports.last()?.as_ref()?;

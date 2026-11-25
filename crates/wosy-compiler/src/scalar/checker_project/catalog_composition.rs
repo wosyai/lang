@@ -119,6 +119,11 @@ impl<Scalar: SymbolicRootProof, Array: SymbolicRootProof> SymbolicRootProof
         self.array.seed(roots, reached);
     }
 
+    fn complete(&self) -> Result<(), ProjectCheck> {
+        self.scalar.complete()?;
+        self.array.complete()
+    }
+
     fn watches_literal_leaf(&self, target: PreparedCallable) -> bool {
         self.scalar.watches_literal_leaf(target)
     }
