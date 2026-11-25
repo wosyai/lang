@@ -505,6 +505,10 @@ fn resolve_expression_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+            resolve_expression_places(selected, scope, program, names, unsafe_context, overloads, owners);
+            for argument in arguments { resolve_expression_places(argument, scope, program, names, unsafe_context, overloads, owners); }
+        }
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
@@ -1394,6 +1398,10 @@ fn resolve_expression_module_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+            resolve_expression_module_places(selected, scope, module, modules, names, unsafe_context, declarations, current_module, overloads, owners);
+            for argument in arguments { resolve_expression_module_places(argument, scope, module, modules, names, unsafe_context, declarations, current_module, overloads, owners); }
+        }
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }

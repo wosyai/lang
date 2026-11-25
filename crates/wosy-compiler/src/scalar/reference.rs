@@ -2887,6 +2887,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 Ok(ReferenceValue::Other)
             }
+            ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+                let selection = self.expression_ordinal(parent, OccurrenceEdge::CallableSelection);
+                self.expression(selected, scope, selection)?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    let child = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(index));
+                    self.expression(argument, scope, child)?;
+                }
+                self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                Ok(ReferenceValue::Other)
+            }
             ScalarExpression::Dereference { place, .. }
             | ScalarExpression::IndexedRead { place, .. } => self.checked_place_read(
                 place,
@@ -13845,6 +13855,7 @@ pub(super) enum OccurrenceParent {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum OccurrenceEdge {
+    CallableSelection,
     CallArgument(usize),
     BinaryLeft,
     BinaryRight,
@@ -15364,6 +15375,12 @@ impl StructuralWalker<'_, '_> {
             }
             ScalarExpression::Block(block) => {
                 self.block(block, names, types, parent, OccurrenceEdge::BlockBody, false)?;
+            }
+            ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+                self.expression(selected, names, types, parent, OccurrenceEdge::CallableSelection)?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    self.expression(argument, names, types, parent, OccurrenceEdge::CallArgument(index))?;
+                }
             }
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }

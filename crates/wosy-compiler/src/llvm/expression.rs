@@ -168,6 +168,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
         ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::ValueField { receiver, .. } =>
             emit_value_field(context, state, expression, receiver, None),
+        ScalarExpression::IndexedInvoke { .. } => Err("indexed invocation requires prepared lexical callable storage".into()),
         ScalarExpression::IndexedRead { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context
@@ -442,6 +443,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
         ),
         ScalarExpression::ValueField { receiver, .. } =>
             emit_value_field(context, state, expression, receiver, Some((module, modules))),
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => super::local_callable::invoke_indexed(
+            context, state, selected, arguments, ProjectCallScope { module, modules },
+        ),
         ScalarExpression::IndexedRead { place, .. } => emit_place_value_in_project(
             context,
             state,

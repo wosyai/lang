@@ -19009,3 +19009,77 @@ if (observe(3,2,1) != 21 || empty(0) != 0) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn direct_indexed_callable_invocation_snapshots_selection_before_arguments() {
+    let text = "%%start
+u64(u64) selector = fn(index) { index };
+u64(u64) argument = fn(value) { value + 1 };
+u64(u64) named = fn(value) { value + 10 };
+u64(u64,u64) fixed = fn(index,value) {
+    u64(u64)[2] operations = [named, fn(value) { value + 20 }];
+    operations[selector(index)](argument(value))
+};
+u64(u64) captured = fn(index) {
+    u64()[3] operations = [fn(i) { fn() { i } }; 3];
+    operations[selector(index)]()
+};
+u64(u64,u64,u64) generated = fn(count,first,second) {
+    u64()[] operations = [fn(i) { fn() { i } }; count];
+    operations[selector(first)]() * 10 + operations[selector(second)]()
+};
+u64(u64) empty = fn(count) {
+    u8()[] operations = [fn(_) { fn() { 7 } }; count];
+    core.array_len(&operations)
+};
+if (fixed(0,3) != 14 || fixed(1,3) != 24 || captured(2) != 2 || generated(3,2,1) != 21 || empty(0) != 0) {
+    core.system_panic();
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/indexed-invoke.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = parse(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        let selector = format!("call i64 @{}(", project_function_name(&source, "selector"));
+        let argument = format!("call i64 @{}(", project_function_name(&source, "argument"));
+        let fixed = self_tail_test_body(&ir, "i64", &project_function_name(&source, "fixed"));
+        assert_eq!(fixed.matches(&selector).count(), 1, "{fixed}");
+        assert_eq!(fixed.matches(&bounds).count(), 1, "{fixed}");
+        assert_eq!(fixed.matches(&argument).count(), 1, "{fixed}");
+        let selectors = fixed.find(&selector).unwrap();
+        let guard = fixed.find(&bounds).unwrap();
+        let snapshot = fixed.find("local_callable_target = load ptr").unwrap();
+        let invocation_arg = fixed.find(&argument).unwrap();
+        let invoke = fixed.find("call i64 %local_callable_target(").unwrap();
+        assert!(selectors < guard && guard < snapshot && snapshot < invocation_arg && invocation_arg < invoke, "{fixed}");
+        for (name, count) in [("captured", 1), ("generated", 2)] {
+            let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, name));
+            assert_eq!(body.matches(&selector).count(), count, "{body}");
+            assert_eq!(body.matches(&bounds).count(), count, "{body}");
+            assert_eq!(body.matches("extractvalue { ptr, i64 }").count(), count * 2, "{body}");
+        }
+        let wrong_arity = text.replace("operations[selector(index)](argument(value))",
+            "operations[selector(index)](argument(value),1)");
+        let errors = parse(&wrong_arity).err().expect("wrong indexed call arity cannot lower").diagnostics.clone();
+        assert!(errors.iter().any(|error| error.message.contains("matching argument count")), "{errors:?}");
+        if let Some(out) = std::env::var_os("WOSY_DEV4_INDEXED_CALL_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-indexed-call.ll")), controlled).unwrap();
+        }
+    }
+}

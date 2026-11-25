@@ -203,6 +203,7 @@ struct CallableProofNodes<'a> {
     blocks: HashMap<*const ScalarBlock, BlockOrdinal>,
     final_outputs: HashMap<*const ScalarExpression, usize>,
     callable_array_statements: std::collections::HashSet<*const ScalarAssignment>,
+    indexed_callable_roots: std::collections::HashSet<*const ScalarPlace>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -762,7 +763,7 @@ impl<'a> CallableBodyCallNodes<'a> {
                 if owners.contains(&binding.declaration_span)))
             && self.named_place_roots.iter().all(|(place, root)| !matches!(root,
                 NamedPlaceRootIdentity::Lexical(binding) if owners.contains(&binding.declaration_span))
-                || allowed.contains(place))
+                || allowed.contains(place) || self.proof_nodes.indexed_callable_roots.contains(place))
             && !self.proof_nodes.places.values().any(|&ordinal|
                 matches!(calls.prepared_direct_destination(ordinal), Some(DirectDestinationIdentity::Existing(binding))
                     if owners.contains(&binding.declaration_span)))
@@ -1180,6 +1181,19 @@ impl<'a> Binder<'a, '_> {
             ScalarExpression::GeneratedArray { factory, count, .. } => {
                 self.expression(parent, Edge::AggregateElement(0), factory)?;
                 self.expression(parent, Edge::AggregateElement(1), count)?;
+            }
+            ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+                if let Some(nodes) = &mut self.proof_nodes {
+                    if let ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, .. }, .. } = selected.as_ref() {
+                        if matches!(base.as_ref(), ScalarPlace::Name { .. }) {
+                            nodes.indexed_callable_roots.insert(std::ptr::from_ref(base.as_ref()));
+                        }
+                    }
+                }
+                self.expression(parent, Edge::CallableSelection, selected)?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    self.expression(parent, Edge::CallArgument(index), argument)?;
+                }
             }
             ScalarExpression::Call { arguments, .. } => {
                 (self.bind_call)(ordinal, expression)?;

@@ -404,6 +404,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::IndexedRead { span, .. }
+        | ScalarExpression::IndexedInvoke { span, .. }
         | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
@@ -3547,6 +3548,32 @@ fn check_expression_type_in_module(
             overloads,
             inference,
         ),
+        ScalarExpression::IndexedInvoke { selected, arguments, span } => {
+            let selected_type = expression_type_in_module(
+                selected, scope, visible_names, folded_names, module, modules, diagnostics,
+                unsafe_context, overloads, inference,
+            );
+            let ScalarType::Callable { parameters, outputs } = &selected_type else {
+                if !is_error_type(&selected_type) {
+                    diagnostics.push(module_diagnostic(module, "B0003", "indexed invocation requires a lexical callable array", *span));
+                }
+                return ScalarType::Error;
+            };
+            if !super::anonymous_callable::closed_scalar_signature(&selected_type)
+                || parameters.len() != arguments.len() || unsafe_context
+            {
+                diagnostics.push(module_diagnostic(module, "B0003", "indexed invocation requires an ordinary scalar callable and matching argument count", *span));
+                return ScalarType::Error;
+            }
+            for (argument, expected) in arguments.iter().zip(parameters) {
+                let actual = expression_type_in_module_expected(
+                    argument, Some(expected), scope, visible_names, folded_names, module, modules, diagnostics,
+                    unsafe_context, overloads, inference,
+                );
+                expect_module_type(module, expected, &actual, expression_span(argument), diagnostics);
+            }
+            outputs.outputs[0].ty.clone()
+        }
         ScalarExpression::IndexedRead { place, .. } => {
             let ty = check_place_type_in_module(
                 place, scope, module, modules, diagnostics, overloads, inference,
@@ -7248,6 +7275,10 @@ fn validate_unit_if_position(
         ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             validate_unit_if_position(operand, false, source, diagnostics);
         }
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+            validate_unit_if_position(selected, false, source, diagnostics);
+            for argument in arguments { validate_unit_if_position(argument, false, source, diagnostics); }
+        }
         ScalarExpression::Call { arguments, .. } => {
             for argument in arguments {
                 validate_unit_if_position(argument, false, source, diagnostics);
@@ -7875,6 +7906,10 @@ impl<'tree> StaticUseAnalyzer<'tree> {
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. } => self.place(place),
+            ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+                self.expression(selected);
+                for argument in arguments { self.expression(argument); }
+            }
             ScalarExpression::IndexedRead { place, .. } => self.place(place),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
@@ -8596,6 +8631,10 @@ fn check_expression_type(
             overloads,
             inference,
         ),
+        ScalarExpression::IndexedInvoke { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0003", "indexed invocation requires an exact prepared lexical callable array", *span));
+            ScalarType::Error
+        }
         ScalarExpression::IndexedRead { place, .. } => {
             let ty = check_place_type(
                 place, scope, program, diagnostics, overloads, inference,

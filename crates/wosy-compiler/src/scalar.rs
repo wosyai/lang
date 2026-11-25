@@ -1242,6 +1242,7 @@ enum ScalarExpressionIdentity {
     CheckedAddress(ScalarReferenceMutability, ScalarPlaceIdentity),
     Dereference(ScalarPlaceIdentity),
     IndexedRead(ScalarPlaceIdentity),
+    IndexedInvoke(Box<ScalarExpressionIdentity>, Vec<ScalarExpressionIdentity>),
     StructLiteral(Vec<(String, ScalarExpressionIdentity)>),
     ArrayLiteral(Vec<ScalarExpressionIdentity>),
     AnonymousCallable(ByteSpan),
@@ -1375,6 +1376,9 @@ fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpression
         ScalarExpression::IndexedRead { place, .. } => {
             ScalarExpressionIdentity::IndexedRead(scalar_place_identity(place))
         }
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => ScalarExpressionIdentity::IndexedInvoke(
+            Box::new(scalar_expression_identity(selected)), arguments.iter().map(scalar_expression_identity).collect(),
+        ),
         ScalarExpression::StructLiteral { fields, .. } => ScalarExpressionIdentity::StructLiteral(
             fields
                 .iter()
@@ -2136,6 +2140,11 @@ pub enum ScalarExpression {
     },
     IndexedRead {
         place: ScalarPlace,
+        span: ByteSpan,
+    },
+    IndexedInvoke {
+        selected: Box<ScalarExpression>,
+        arguments: Vec<ScalarExpression>,
         span: ByteSpan,
     },
     StructLiteral {
@@ -4971,6 +4980,15 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 )
             }
         }
+        SyntaxKind::IndexedCallableInvocation => {
+            let nodes = direct_nodes(&actual);
+            let (selected, arguments) = nodes.split_first().expect("indexed callable selection");
+            ScalarExpression::IndexedInvoke {
+                selected: Box::new(derive_expression(selected)),
+                arguments: arguments.iter().map(derive_expression).collect(),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
             place: derive_place(&actual),
             span: wosy_syntax::byte_span(&actual),
@@ -5351,6 +5369,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::IndexedRead { span, .. }
+        | ScalarExpression::IndexedInvoke { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. } => *span,
         ScalarExpression::Block(block) => block.span,

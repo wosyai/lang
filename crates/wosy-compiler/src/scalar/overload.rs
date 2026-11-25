@@ -443,6 +443,12 @@ fn record_expression_overload_selection(
 ) {
     match expression {
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
+        ScalarExpression::IndexedInvoke { selected, arguments, .. } => {
+            record_expression_overload_selection(selected, None, scope, overloads);
+            for argument in arguments {
+                record_expression_overload_selection(argument, None, scope, overloads);
+            }
+        }
         ScalarExpression::Call {
             receiver,
             name,

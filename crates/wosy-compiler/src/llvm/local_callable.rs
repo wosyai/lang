@@ -436,6 +436,32 @@ pub(super) fn invoke<'ctx, 'module>(
     let slot = state.local_callable_slots.get(&key).ok_or_else(|| "missing local callable slot".to_owned())?;
     let (storage, parameters, outputs, generated) =
         (slot.storage, slot.parameters.clone(), slot.outputs.clone(), slot.generated);
+    invoke_from_storage(context, state, storage, generated, &parameters, &outputs, arguments, project)
+}
+
+pub(super) fn invoke_indexed<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, selected: &ScalarExpression,
+    arguments: &[ScalarExpression], project: ProjectCallScope<'_>,
+) -> Result<EmitValue<'ctx>, String> {
+    let ScalarExpression::IndexedRead { place, .. } = selected else {
+        return Err("indexed invocation lost its canonical selection".into());
+    };
+    let nodes = state.body_call_nodes.ok_or("indexed invocation lacks prepared selection nodes")?;
+    let array = selected_array(state, place).ok_or("indexed invocation requires its exact lexical callable array")?;
+    let element = nodes.checked_expression_type(selected)
+        .filter(|ty| same_scalar_signature(ty, &array.element))
+        .ok_or("indexed invocation changed its prepared element signature")?;
+    let (parameters, outputs) = scalar_only_signature(element).ok_or("indexed invocation requires a closed scalar signature")?;
+    let (parameters, outputs, generated) = (parameters.to_vec(), outputs.clone(), array.generated);
+    let storage = selected_pointer(context, state, place, Some(project))?;
+    invoke_from_storage(context, state, storage, generated, &parameters, &outputs, arguments, Some(project))
+}
+
+fn invoke_from_storage<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, storage: PointerValue<'ctx>,
+    generated: Option<bool>, parameters: &[ScalarType], outputs: &crate::ScalarOutputSequence,
+    arguments: &[ScalarExpression], project: Option<ProjectCallScope<'_>>,
+) -> Result<EmitValue<'ctx>, String> {
     if arguments.len() != parameters.len() {
         return Err("local callable slot argument count differs from its signature".into());
     }
@@ -457,10 +483,10 @@ pub(super) fn invoke<'ctx, 'module>(
             .map_err(builder_error)?.into_pointer_value(), None)
     };
     let ty = basic_type(context, &outputs.outputs[0].ty, state.target_layout)?.fn_type(&types, false);
-    let mut values = super::expression::emit_contextual_arguments(context, state, arguments, &parameters, project)?
+    let mut values = super::expression::emit_contextual_arguments(context, state, arguments, parameters, project)?
         .into_iter().map(|value| take_basic(value).map(Into::into)).collect::<Result<Vec<_>, _>>()?;
     if let Some(capture) = capture { values.insert(0, capture.into()); }
     let call = state.builder.build_indirect_call(ty, pointer, &values, "local_callable_call").map_err(builder_error)?;
     state.call_owner_flags.clear();
-    super::expression::ordinary_call_result(call.try_as_basic_value(), &outputs)
+    super::expression::ordinary_call_result(call.try_as_basic_value(), outputs)
 }

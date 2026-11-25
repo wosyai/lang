@@ -98,6 +98,7 @@ pub enum SyntaxKind {
     InvalidTemporaryPlace,
     CallableLiteral,
     GeneratedArray,
+    IndexedCallableInvocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -195,6 +196,7 @@ impl Language for WosyLanguage {
             85 => SyntaxKind::InvalidTemporaryPlace,
             86 => SyntaxKind::CallableLiteral,
             87 => SyntaxKind::GeneratedArray,
+            88 => SyntaxKind::IndexedCallableInvocation,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -923,6 +925,8 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::final_output_list | Rule::generated_callable_final_output => SyntaxKind::FinalOutputList,
         Rule::expression | Rule::generated_callable_output => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
+        Rule::indexed_callable_invocation => SyntaxKind::IndexedCallableInvocation,
+        Rule::indexed_callable_selection => SyntaxKind::IndexedPlace,
         Rule::qualified_call => SyntaxKind::QualifiedCall,
         Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
