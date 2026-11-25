@@ -144,6 +144,12 @@ enum LocalRuntimeExtent<'ctx> {
     ManagedLengthSlot(PointerValue<'ctx>),
 }
 
+#[derive(Default)]
+struct RuntimeBorrowIndex<'ctx> {
+    sites: HashMap<usize, (wosy_syntax::ByteSpan, Option<wosy_syntax::ByteSpan>)>,
+    owners: HashMap<wosy_syntax::ByteSpan, Option<PointerValue<'ctx>>>,
+}
+
 type StorageBinding<'ctx> = (PointerValue<'ctx>, ScalarType);
 
 #[derive(Default)]
@@ -232,6 +238,7 @@ struct EmitState<'ctx, 'module> {
     // only the backing (or paired replacement slot) still installed.
     local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>, bool)>,
     indexed_runtime_allocations: BTreeSet<(u32, u32)>,
+    runtime_borrow_index: RuntimeBorrowIndex<'ctx>,
     observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
 
     runtime_array_live: BTreeMap<String, PointerValue<'ctx>>,
@@ -270,12 +277,12 @@ enum CheckedAssignmentOwner {
     Borrowed,
 }
 
-fn runtime_allocation_access(
+fn runtime_allocation_access<'ctx>(
     reference_cfg: &ScalarReferenceCfg,
     body_nodes: Option<&CallableBodyCallNodes<'_>>,
     plan: Option<&crate::scalar::ClosedBody>,
     checked_access: bool,
-) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>) {
+) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>, RuntimeBorrowIndex<'ctx>) {
     let mut mutable = BTreeSet::new();
     let mut indexed = BTreeSet::new();
     let mut unproved_writes = BTreeSet::new();
@@ -354,28 +361,23 @@ fn runtime_allocation_access(
             CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
                 for place in candidates { record_index(&mut indexed, place); }
             }
-            CfgPointKind::ReadPlace { place: crate::ScalarPlace::Index { base, .. },
-                pointer_point: Some(pointer), .. } if checked_access =>
-            {
-                if let Some((_, creation)) = crate::scalar::immediate_shared_array_place(base) {
-                    if let Some(CfgPointKind::Borrow { place, loan }) =
-                        reference_cfg.points.get(pointer.0).map(|point| &point.kind)
-                    {
-                        if loan.parent.is_none() && loan.creation_span == creation
-                            && loan.mode == crate::scalar::ScalarReferenceMutability::Shared
-                            && place.projections.is_empty()
-                            && reference_cfg.allocations.contains(&place.binding)
-                        {
-                            indexed.insert(key(place.declaration_span));
-                        }
-                    }
-                }
-            }
             _ => {}
         }
     }
     indexed.retain(|id| !unproved_writes.contains(id));
-    (mutable, indexed)
+    let mut borrowed = RuntimeBorrowIndex::default();
+    if checked_access {
+        for &(access, point, handle) in &reference_cfg.runtime_array_read_sites {
+            let Some(owner) = reference_cfg.runtime_array_read_origin(point) else { continue; };
+            let declaration = owner.declaration_span;
+            // A general mutable pointer slot is not an extent receipt.
+            if mutable.contains(&key(declaration)) { continue; }
+            indexed.insert(key(declaration));
+            borrowed.sites.insert(access, (declaration, handle));
+            borrowed.owners.entry(declaration).or_insert(None);
+        }
+    }
+    (mutable, indexed, borrowed)
 }
 
 fn resolved_invalidations(
@@ -2194,6 +2196,11 @@ fn store_runtime_allocation<'ctx, 'module>(
             let extent = if widened { LocalRuntimeExtent::WidenedLiteral { length, signed: None } }
                 else { LocalRuntimeExtent::Construction { length: allocation.length, signed: allocation.signed } };
             state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
+            if let Some(backing) = state.runtime_borrow_index.owners.get_mut(&receiver.name_span) {
+                if widened || !checked_extent || backing.replace(slot).is_some() {
+                    return Err("invalid checked borrow backing construction".into());
+                }
+            }
         }
         state
             .storage
@@ -2669,7 +2676,7 @@ fn emit_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
-    let (mutable_runtime_allocations, indexed_runtime_allocations) =
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index) =
         runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access);
     let mut state = EmitState {
         prepared_render,
@@ -2717,6 +2724,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        runtime_borrow_index,
         observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations,
@@ -2918,6 +2926,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        runtime_borrow_index: RuntimeBorrowIndex::default(),
         observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
@@ -3033,7 +3042,7 @@ fn emit_project_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
-    let (mutable_runtime_allocations, indexed_runtime_allocations) =
+    let (mutable_runtime_allocations, indexed_runtime_allocations, runtime_borrow_index) =
         runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, project_names.require_release_checked_access);
     let mut state = EmitState {
         prepared_render,
@@ -3081,6 +3090,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        runtime_borrow_index,
         observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations,
@@ -3307,6 +3317,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        runtime_borrow_index: RuntimeBorrowIndex::default(),
         observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),

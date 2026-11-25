@@ -647,6 +647,8 @@ pub struct ScalarReferenceCfg {
     pub(crate) observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
     #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
+    #[serde(skip)]
+    pub(crate) runtime_array_read_sites: Vec<(usize, CfgPointId, Option<ByteSpan>)>,
 }
 
 impl PartialEq for ScalarReferenceCfg {
@@ -682,7 +684,23 @@ impl ScalarReferenceCfg {
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: Vec::new(),
         }
+    }
+
+    pub(crate) fn runtime_array_read_origin(&self, id: CfgPointId) -> Option<&ReferenceBindingId> {
+        let read = self.points.get(id.0)?;
+        let CfgPointKind::ReadPlace { pointer_point: Some(_), candidates, reads_origin: false, .. } = &read.kind
+        else { return None; };
+        let mut origins = read.possible_origins.as_ref()?.iter();
+        let origin = origins.next()?;
+        if origins.next().is_some() { return None; }
+        let [candidate] = candidates.as_slice() else { return None; };
+        let ReferenceOrigin::Fresh { loan, .. } = self.facts.get(origin.0)? else { return None; };
+        (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+            && loan.origin_place.projections.is_empty() && loan.origin_place.binding == candidate.binding
+            && self.allocations.contains(&candidate.binding))
+            .then_some(&candidate.binding)
     }
 
     pub(crate) fn primary_call_point(
@@ -3708,6 +3726,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: Vec::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
@@ -3812,6 +3831,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
                     primary_call_points: HashMap::new(),
+                    runtime_array_read_sites: Vec::new(),
                     observed_runtime_allocations: None,
                     guarded_scalar_allocation: None,
                     facts: Vec::new(),
@@ -3843,6 +3863,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            runtime_array_read_sites: Vec::new(),
             observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),

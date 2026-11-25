@@ -610,6 +610,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             origin_index: ReferenceOriginIndex::default(),
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                runtime_array_read_sites: Vec::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
@@ -3724,26 +3725,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
         } else {
             None
         };
-        if let (ScalarPlace::Index { base, .. }, Some(ScalarType::CheckedReference { inner, .. })) =
+        let mut runtime_read = None;
+        if let (ScalarPlace::Index { base, .. }, Some(ScalarType::CheckedReference { inner, mutability })) =
             (place, pointer_type)
         {
             if let ScalarType::RuntimeArray { element, .. } = inner.as_ref() {
-                let local = if let (true, Some(root), Some((addressed, _))) =
-                    (prepared, canonical_root.as_ref(), super::immediate_shared_array_place(base))
-                {
-                    let pointer = self.expression_ordinal(OccurrenceParent::Place(root.ordinal),
+                let eligible = (|| {
+                    let CheckedReadSource::Place(access) = source else { return None };
+                    if !prepared || *mutability != ScalarReferenceMutability::Shared
+                        || !aggregate::ordinary_value(element)
+                    { return None; }
+                    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+                    if super::immediate_shared_array_place(base).is_some() { return Some((access, None)); }
+                    let ScalarExpression::Name { .. } = pointer.as_ref() else { return None; };
+                    let pointer = self.expression_ordinal(OccurrenceParent::Place(canonical_root.as_ref()?.ordinal),
                         OccurrenceEdge::DereferencePointer);
-                    let addressed_place = self.place_ordinal(OccurrenceParent::Expression(pointer),
-                        OccurrenceEdge::ExpressionPlace);
-                    let ScalarPlace::Name { span, .. } = addressed else { unreachable!() };
-                    matches!(self.prepared_place_root(addressed_place, *span)?,
-                        Some(PreparedPlaceRoot::Lexical(owner)) if self.cfg.allocations.contains(owner)
-                            && self.binding_types.get(owner) == Some(inner.as_ref()))
-                } else { false };
-                if !local || !aggregate::ordinary_value(element) {
+                    match self.call_sites.prepared_plain_name(pointer)? {
+                        PlainNameIdentity::Lexical(handle) => Some((access, Some(handle.declaration_span))),
+                        _ => None,
+                    }
+                })();
+                let Some(site) = eligible else {
                     return Err(self.missing_context(span,
                         ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
-                }
+                };
+                runtime_read = Some(site);
             }
         }
         let checked_pointee = matches!(pointer_type, Some(ScalarType::CheckedReference { .. }));
@@ -3812,6 +3818,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if checked_pointee && pointer_point.is_some() {
             self.proof_points.checked_pointee_reads.push(point);
         }
+        if let Some((access, handle)) = runtime_read {
+            self.cfg.runtime_array_read_sites.push((access.0, point, handle));
+        }
+
         if uncomputed {
             Ok(ReferenceValue::Uncomputed)
         } else {
@@ -17964,6 +17974,16 @@ fn build_function_reference_cfg(
             None,
         );
         drop(provisional_origin_index);
+        // The ordinary reference transfer has now resolved the actual reaching
+        // loan. A type or a reference name is not an extent authority.
+        for &(_, point, _) in &builder.cfg.runtime_array_read_sites {
+            if builder.cfg.runtime_array_read_origin(point).is_none() {
+                errors.push(ReferenceAnalysisError::MissingContext {
+                    source_span: builder.cfg.points[point.0].source_span.clone(),
+                    reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
+                });
+            }
+        }
         builder.proof_points.forward_initial_graph = forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {
             let first_unproved = pending.sites.iter().find(|site|

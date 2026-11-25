@@ -16754,3 +16754,81 @@ if (observe(3, 1) != 37) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn named_runtime_array_index_follows_exact_lexical_loan_after_rebind() {
+    let text = "%%start
+u64(u64) select = fn(index) { index };
+u16(u64,u64,u64) observe = fn(first_length, second_length, index) {
+    u16[first_length] first;
+    u16[second_length] second;
+    *(u16[]) view = &first;
+    u16 prior = (*view)[select(index)];
+    view = &second;
+    u16 after = (*view)[select(index)];
+    prior + after
+};
+if (observe(3, 4, 1) != 40) { core.system_panic(); };
+%%end";
+    let ambiguous = text.replace("u64,u64,u64) observe = fn(first_length, second_length, index)",
+        "u64,u64,u64,bool) observe = fn(first_length, second_length, index, choose)")
+        .replace("    view = &second;", "    if (choose) { view = &second; };")
+        .replace("observe(3, 4, 1)", "observe(3, 4, 1, true)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i16", &project_function_name(&source, "observe"));
+        let helper_source = prepared.checked_access_source().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(helper_source, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(helper_source, "check_index_in_extent"));
+        let select = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let accesses: Vec<_> = body.match_indices(&non_null).map(|(offset, _)| offset).collect();
+        assert_eq!(accesses.len(), 2, "{body}");
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 2, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 2, "{body}");
+        for (position, parameter) in ["first_length", "second_length"].into_iter().enumerate() {
+            let slot = body.lines().find_map(|line| {
+                line.trim_start().strip_prefix(&format!("store i64 %{parameter}, ptr "))
+                    .and_then(|rest| rest.split(',').next())
+            }).unwrap();
+            let length = body.lines().find_map(|line| {
+                let (name, load) = line.trim_start().split_once(" = load i64, ptr ")?;
+                (load.split(',').next() == Some(slot)).then_some(name)
+            }).unwrap();
+            let path = &body[accesses[position]..accesses.get(position + 1).copied().unwrap_or(body.len())];
+            let mut previous = 0;
+            for needle in ["inttoptr", &select, &bounds, "getelementptr inbounds i16"] {
+                assert_eq!(path.matches(needle).count(), 1, "{path}");
+                let offset = path.find(needle).unwrap();
+                assert!(previous < offset, "{path}");
+                previous = offset;
+            }
+            assert!(path.lines().find(|line| line.contains(&bounds)).unwrap()
+                .ends_with(&format!(", i64 {length})")), "{path}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_NAMED_RUNTIME_INDEX_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+        let ambiguous = match prepare(&ambiguous) {
+            Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            Err(error) => error.diagnostics.clone(),
+        };
+        assert!(ambiguous.iter().any(|diagnostic| diagnostic.message.contains("extent of the dereferenced backing")),
+            "{ambiguous:?}");
+    }
+}
