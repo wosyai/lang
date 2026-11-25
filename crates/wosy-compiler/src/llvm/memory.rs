@@ -819,6 +819,48 @@ pub(super) fn struct_member_place<'ctx, 'module>(
     }))
 }
 
+fn ordinary_aggregate_failure<'ctx, 'a>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>,
+    members: impl Iterator<Item = &'a ScalarExpression>,
+    label: &str,
+) -> Result<Option<inkwell::basic_block::BasicBlock<'ctx>>, String> {
+    let mut members = members;
+    if !members.any(|member|
+        super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, member))
+    { return Ok(None); }
+    let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing ordinary aggregate literal function")?;
+    Ok(Some(context.append_basic_block(parent, label)))
+}
+
+fn emit_ordinary_aggregate_member<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>,
+    member: &ScalarExpression, ty: &ScalarType, path: ExpressionPath<'_>,
+    failure: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    if super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, member) {
+        let (value, _) = super::expression::emit_fallible_numeric_to(context, state, member, ty, path, failure)?;
+        return Ok(EmitValue::Basic(value));
+    }
+    match (path, member) {
+        (ExpressionPath::Project { module, modules },
+            ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. }) =>
+            emit_project_typed_expression(context, state, member, ty, module, modules),
+        _ => emit_typed_expression(context, state, member, ty),
+    }
+}
+
+fn finish_ordinary_aggregate_fields<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    failure: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(), String> {
+    let success = state.builder.get_insert_block().ok_or("missing successful ordinary aggregate members")?;
+    state.builder.position_at_end(failure);
+    super::expression::emit_terminal_system_panic(context, state)?;
+    state.builder.position_at_end(success);
+    Ok(())
+}
+
 pub(super) fn emit_struct_literal<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -841,29 +883,12 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     align_storage_alloca(destination, Some(layout.alignment))?;
-    let values = if fields.iter().any(|field|
-        super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, &field.value))
-    {
-        let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
-            .ok_or("missing ordinary struct literal function")?;
-        let failure = context.append_basic_block(parent, "ordinary.struct_allocation_absent");
-        let values = prepare_struct_literal_with(state, id, fields, |state, field, ty| {
-            if super::aggregate_transfer::ordinary_fallible_allocation_expression_at(state, field) {
-                let (value, _) = super::expression::emit_fallible_numeric_to(context, state, field, ty, path, failure)?;
-                Ok(EmitValue::Basic(value))
-            } else {
-                match (path, field) {
-                    (ExpressionPath::Project { module, modules },
-                        ScalarExpression::Call { .. } | ScalarExpression::If { .. } | ScalarExpression::Binary { .. }) =>
-                        emit_project_typed_expression(context, state, field, ty, module, modules),
-                    _ => emit_typed_expression(context, state, field, ty),
-                }
-            }
-        })?;
-        let success = state.builder.get_insert_block().ok_or("missing successful ordinary struct fields")?;
-        state.builder.position_at_end(failure);
-        super::expression::emit_terminal_system_panic(context, state)?;
-        state.builder.position_at_end(success);
+    let failure = ordinary_aggregate_failure(context, state, fields.iter().map(|field| &field.value),
+        "ordinary.struct_allocation_absent")?;
+    let values = if let Some(failure) = failure {
+        let values = prepare_struct_literal_with(state, id, fields, |state, field, ty|
+            emit_ordinary_aggregate_member(context, state, field, ty, path, failure))?;
+        finish_ordinary_aggregate_fields(context, state, failure)?;
         values
     } else {
         prepare_struct_literal(context, state, id, fields)?
@@ -936,6 +961,7 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     expected: &ScalarType,
     elements: &[ScalarExpression],
+    path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let ScalarType::Array {
         element, length, ..
@@ -950,6 +976,17 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
         storage_type_and_alignment(context, expected, state.layouts, state.target_layout)?;
     let destination = entry_alloca(state, storage, "array_literal")?;
     align_storage_alloca(destination, alignment)?;
+    let failure = ordinary_aggregate_failure(context, state, elements.iter(), "ordinary.array_allocation_absent")?;
+    let staged = if let Some(failure) = failure {
+        let values = elements.iter().map(|element_value|
+            emit_ordinary_aggregate_member(context, state, element_value, element, path, failure))
+            .collect::<Result<Vec<_>, _>>()?;
+        finish_ordinary_aggregate_fields(context, state, failure)?;
+        Some(values.into_iter())
+    } else {
+        None
+    };
+    let mut staged = staged;
     for (index, expression) in elements.iter().enumerate() {
         let pointer = unsafe {
             state.builder.build_in_bounds_gep(
@@ -963,7 +1000,10 @@ pub(super) fn emit_array_literal<'ctx, 'module>(
             )
         }
         .map_err(builder_error)?;
-        let value = emit_typed_expression(context, state, expression, element)?;
+        let value = match staged.as_mut() {
+            Some(staged) => staged.next().expect("one staged value per array element"),
+            None => emit_typed_expression(context, state, expression, element)?,
+        };
         store_value(context, state, pointer, element, value)?;
     }
     Ok(EmitValue::Basic(destination.into()))
@@ -988,7 +1028,7 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
             emit_struct_literal(context, state, expected, fields, ExpressionPath::Single)
         }
         (ScalarExpression::ArrayLiteral { elements, .. }, ScalarType::Array { .. }) => {
-            emit_array_literal(context, state, expected, elements)
+            emit_array_literal(context, state, expected, elements, ExpressionPath::Single)
         }
         (
             ScalarExpression::Unary {

@@ -13918,3 +13918,93 @@ if (guarded(7, 9) != 14 || construct(0, 0) != 0 || replace(7, 9) != 14 || replac
         }
     }
 }
+
+#[test]
+fn ordinary_fallible_array_elements_stage_before_replacing_prior_storage() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let template = "%%start
+struct Pair { u64 first; u64 second; u64 tag; }
+u64(u64) _read_from_buffer = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _read_next = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64, u64) guarded = fn(first, second) {
+    Pair result =? { .second = _read_from_buffer(first); .first = _read_next(second); .tag = 7; };
+    if (&result == null) { 99 } else { result.first ^ result.second }
+};
+u64(u64, u64) construct = fn(first, second) {
+    u64[2] result = [_read_from_buffer(first), _read_next(second) ^ 0];
+    result[0] ^ result[1]
+};
+u64(u64, u64) replace = fn(first, second) {
+    u8[first] prior;
+    u64[2] result = [41, 42];
+    u64 before = result[0] ^ result[1];
+    result = [_read_from_buffer(first), _read_next(second) ^ 0];
+    core.array_len(&prior) ^ first ^ before ^ 3 ^ result[0] ^ result[1]
+};
+if (guarded(7, 9) != 14 || construct(0, 0) != 0 || replace(7, 9) != 14 || replace(FIRST, SECOND) != 0) {
+    core.system_panic();
+};
+%%end";
+    for (witness, first, second) in [("first", "11", "9"), ("middle", "13", "13")] {
+        let text = template.replace("FIRST", first).replace("SECOND", second);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "ordinary fallible array elements");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                for (caller, assignment) in [(authored("construct"), false), (authored("replace"), true)] {
+                    assert_eq!(caller.get_type().get_return_type(), Some(context.i64_type().into()));
+                    let blocks = caller.get_basic_blocks();
+                    let calls_to = |callee| blocks.iter().flat_map(|block| std::iter::successors(
+                        block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                        .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                            .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                    let [first] = calls_to(authored("_read_from_buffer"))[..] else { panic!("{llvm}") };
+                    let [second] = calls_to(authored("_read_next"))[..] else { panic!("{llvm}") };
+                    let failure = *blocks.iter().find(|block| block.get_name().to_bytes() == b"ordinary.array_allocation_absent").unwrap();
+                    let panic = module.get_function("__wosy_core_system_panic").unwrap();
+                    let fail_call = failure.get_first_instruction().unwrap();
+                    assert_eq!(CallSiteValue::try_from(fail_call).unwrap().get_called_fn_value(), Some(panic));
+                    assert_eq!(fail_call.get_next_instruction(), failure.get_terminator());
+                    assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                    fn edges<'ctx>(instruction: InstructionValue<'ctx>) -> Vec<inkwell::basic_block::BasicBlock<'ctx>> {
+                        instruction.get_operands()
+                            .filter_map(|operand| operand.and_then(|operand| operand.block())).collect()
+                    }
+                    let first_branch = first.get_parent().unwrap().get_terminator().unwrap();
+                    let second_block = second.get_parent().unwrap();
+                    assert!(edges(first_branch).contains(&second_block) && edges(first_branch).contains(&failure));
+                    assert!(!std::iter::successors(second_block.get_first_instruction(), |i| i.get_next_instruction())
+                        .any(|i| i.get_opcode() == InstructionOpcode::Store));
+                    let second_successors = edges(second_block.get_terminator().unwrap());
+                    assert!(second_successors.contains(&failure));
+                    let success = *second_successors.iter().find(|&&block| block != failure).unwrap();
+                    let success_instructions = std::iter::successors(success.get_first_instruction(), |i| i.get_next_instruction())
+                        .collect::<Vec<_>>();
+                    assert_eq!(success_instructions.iter().filter(|i| i.get_opcode() == InstructionOpcode::Store).count(), 2);
+                    assert!(success_instructions.into_iter().any(|i|
+                        CallSiteValue::try_from(i).ok().and_then(|call| call.get_called_fn_value())
+                            .is_some_and(|callee| callee.get_name().to_bytes().starts_with(b"llvm.memmove."))));
+                    assert_eq!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).len(), usize::from(assignment));
+                    assert_eq!(calls_to(module.get_function("__wosy_core_free").unwrap()).len(), usize::from(assignment));
+                }
+                if let Some(out) = std::env::var_os("WOSY_ORDINARY_ARRAY_ELEMENTS_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(witness).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

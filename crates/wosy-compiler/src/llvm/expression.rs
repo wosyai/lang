@@ -378,7 +378,7 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
             emit_struct_literal(context, state, expected, fields, ExpressionPath::Project { module, modules })
         }
         ScalarExpression::ArrayLiteral { elements, .. } => {
-            emit_array_literal(context, state, expected, elements)
+            emit_array_literal(context, state, expected, elements, ExpressionPath::Project { module, modules })
         }
         _ => emit_project_expression(context, state, expression, module, modules),
     }
