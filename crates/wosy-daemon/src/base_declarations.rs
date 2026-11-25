@@ -87,6 +87,12 @@ fn detached_identity(executable: NodeId) -> SourceIdentity {
     SourceIdentity::new(String::new(), String::new(), String::new(), executable.hex())
 }
 
+struct BaseOutput {
+    id: NodeId,
+    declarations: Option<ScalarSourceDeclarations>,
+    disposition: QueryDisposition,
+}
+
 impl SourceStore {
     /// Resolve only a file inside a currently supported published source
     /// snapshot. Derived queries are optional: snapshot reads never need CAS.
@@ -95,64 +101,101 @@ impl SourceStore {
     ) -> Result<Option<BaseDeclarationsView>> {
         let Some(view) = self.snapshot(root)? else { return Ok(None); };
         let Some(file) = view.files.get(key) else { return Ok(None); };
-        let executable = file.executable;
         let module = view.modules[key];
-        let query = query_key(executable);
-        let source = file_source(file)?;
-        let spans = AuthoredSpanMap::from_comments(&read_comments(&view.tx, file.annotation)?);
+        let file = file.clone();
         drop(view);
+        self.authored_base_declarations(&file, module, None).await.map(Some)
+    }
+
+    pub(super) async fn authored_base_declarations(
+        &self, file: &super::FileEntry, module: NodeId, projected: Option<NodeId>,
+    ) -> Result<BaseDeclarationsView> {
+        let executable = file.executable;
+        let source = file_source(file)?;
+        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+        let spans = AuthoredSpanMap::from_comments(&read_comments(&tx, file.annotation)?);
+        let cached = if let Some(id) = projected {
+            self.read_base_declarations(&tx, id, executable)?.map(|declarations| BaseOutput {
+                id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
+            })
+        } else { None };
+        drop(tx);
+        let output = if let Some(output) = cached { output } else {
+            let output = self.query_base(executable, true).await?;
+            if projected.is_some_and(|id| id != output.id) {
+                return Err("recomputed declarations differ from the rooted projection".into());
+            }
+            output
+        };
+        Ok(BaseDeclarationsView {
+            id: output.id, executable, module, source, disposition: output.disposition,
+            declarations: output.declarations.expect("requested declaration payload"), spans,
+        })
+    }
+
+    /// Composing a graph needs IDs, not decoded ASTs from already derived files.
+    pub(super) async fn ensure_base_declaration_id(
+        &self, executable: NodeId,
+    ) -> Result<(NodeId, QueryDisposition)> {
+        let output = self.query_base(executable, false).await?;
+        Ok((output.id, output.disposition))
+    }
+
+    async fn query_base(&self, executable: NodeId, load: bool) -> Result<BaseOutput> {
+        let query = query_key(executable);
 
         // The admitted file stays immutable; start the query transaction after
         // joining its flight so waiters see an already committed result.
         let gate = self.base_flights.acquire(query);
         let _permit = gate.lock().await;
         let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        let (id, declarations, disposition) = if let Some((id, declarations)) =
-            self.read_base_declarations(&read, &query, executable)?
-        {
-            (id, declarations, QueryDisposition::Reused)
-        } else {
-            let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(&read, executable)?);
-            let declarations = derive_scalar_declarations_from_cst(&cst);
-            drop(cst);
-            drop(read);
-            let bytes = serde_json::to_vec(&declarations)?;
-            let payload = self.pack_payload(bytes)?;
-            let node = Node { kind: Kind::BaseDeclarations, data: payload, children: vec![executable] };
-            let encoded = node.encode();
-            let id = Node::id(&encoded);
-            loop {
-                let mut tx = self.tree.begin()?;
-                tx.set_durability(Durability::Eventual);
-                if let Some(existing) = tx.get(&query)? {
-                    // A prior query may point at a lost CAS blob. The identical
-                    // interned record now resolves again after pack_payload.
-                    if existing.as_slice() != id.0 {
-                        return Err("base declaration query changed for an immutable input".into());
-                    }
-                    break;
-                }
-                if tx.get(&super::key(INTERN, id))?.is_none() {
-                    write_node(&mut tx, id, &encoded)?;
-                    write_edge(&mut tx, id, Edge::DeclarationSource, executable)?;
-                }
-                tx.set(&query, &id.0)?;
-                match tx.commit().await {
-                    Ok(()) => break,
-                    Err(surrealkv::Error::TransactionWriteConflict) => continue,
-                    Err(error) => return Err(error.into()),
-                }
+        if let Some(id) = read.get(&query)? {
+            let id = NodeId(id.as_slice().try_into()?);
+            let disposition = QueryDisposition::Reused;
+            if !load {
+                return Ok(BaseOutput { id, declarations: None, disposition });
             }
-            (id, declarations, QueryDisposition::Derived)
-        };
-        Ok(Some(BaseDeclarationsView { id, executable, module, source, disposition, declarations, spans }))
+            if let Some(declarations) = self.read_base_declarations(&read, id, executable)? {
+                return Ok(BaseOutput { id, declarations: Some(declarations), disposition });
+            }
+        }
+        let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(&read, executable)?);
+        let declarations = derive_scalar_declarations_from_cst(&cst);
+        drop(cst);
+        drop(read);
+        let bytes = serde_json::to_vec(&declarations)?;
+        let payload = self.pack_payload(bytes)?;
+        let node = Node { kind: Kind::BaseDeclarations, data: payload, children: vec![executable] };
+        let encoded = node.encode();
+        let id = Node::id(&encoded);
+        loop {
+            let mut tx = self.tree.begin()?;
+            tx.set_durability(Durability::Eventual);
+            if let Some(existing) = tx.get(&query)? {
+                // A prior query may point at a lost CAS blob. The identical
+                // interned record now resolves again after pack_payload.
+                if existing.as_slice() != id.0 {
+                    return Err("base declaration query changed for an immutable input".into());
+                }
+                break;
+            }
+            if tx.get(&super::key(INTERN, id))?.is_none() {
+                write_node(&mut tx, id, &encoded)?;
+                write_edge(&mut tx, id, Edge::DeclarationSource, executable)?;
+            }
+            tx.set(&query, &id.0)?;
+            match tx.commit().await {
+                Ok(()) => break,
+                Err(surrealkv::Error::TransactionWriteConflict) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived })
     }
 
     fn read_base_declarations(
-        &self, tx: &Transaction, query: &[u8; 33], executable: NodeId,
-    ) -> Result<Option<(NodeId, ScalarSourceDeclarations)>> {
-        let Some(id) = tx.get(query)? else { return Ok(None); };
-        let id = NodeId(id.as_slice().try_into()?);
+        &self, tx: &Transaction, id: NodeId, executable: NodeId,
+    ) -> Result<Option<ScalarSourceDeclarations>> {
         let node = read_node(tx, id)?;
         if node.kind != Kind::BaseDeclarations || node.children != [executable] {
             return Err("invalid canonical declaration query result".into());
@@ -180,7 +223,7 @@ impl SourceStore {
         use serde::Deserialize;
         let declarations = ScalarSourceDeclarations::deserialize(&mut parser)?;
         parser.end()?;
-        Ok(Some((id, declarations)))
+        Ok(Some(declarations))
     }
 
     fn pack_payload(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {

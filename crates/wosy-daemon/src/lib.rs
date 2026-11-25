@@ -41,12 +41,17 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
+mod project_declarations;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
+pub use project_declarations::{
+    ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
+};
 
 pub struct SourceStore {
     tree: Tree,
     blobs: PathBuf,
     base_flights: base_declarations::Flights,
+    project_commit: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -64,7 +69,10 @@ impl SourceStore {
             .with_versioning(false, 0)
             .with_enable_vlog(false)
             .build()?;
-        Ok(Self { tree, blobs: dir.join("cas"), base_flights: Default::default() })
+        Ok(Self {
+            tree, blobs: dir.join("cas"), base_flights: Default::default(),
+            project_commit: Default::default(),
+        })
     }
 
     pub async fn close(self) -> Result<()> {
@@ -105,7 +113,9 @@ impl SourceStore {
             tx,
             executable: index.executable,
             annotation: index.annotation,
+            config: index.config,
             modules: index.modules,
+            module_edges: index.module_edges,
             files: index.files,
         }))
     }
@@ -188,6 +198,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         Executables | AnnotationTree | Dependencies => node.data.is_empty(),
         SourcePreparation => supported_top(node),
         NamespaceFacts | BaseDeclarations => count == 1,
+        ModuleDeclarations => count >= 2,
     };
     if good { Ok(()) } else { Err("invalid base source schema or node shape".into()) }
 }
@@ -214,6 +225,9 @@ enum Edge {
     NamespaceSource,
     NamespaceAuthority,
     DeclarationSource,
+    ModuleDeclarationSource,
+    ModuleDeclarationBody,
+    ModuleDeclarationImport,
 }
 
 fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
@@ -242,6 +256,11 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
         },
         NamespaceFacts => (Edge::NamespaceSource, Exact(Syntax)),
         BaseDeclarations => (Edge::DeclarationSource, Exact(Syntax)),
+        ModuleDeclarations => match i {
+            0 => (Edge::ModuleDeclarationSource, Exact(Module)),
+            1 => (Edge::ModuleDeclarationBody, Exact(BaseDeclarations)),
+            _ => (Edge::ModuleDeclarationImport, Exact(ModuleDeclarations)),
+        },
         Token | Annotations | Config => unreachable!("validated leaf"),
     }
 }
@@ -537,7 +556,9 @@ pub struct SourceView {
     tx: Transaction,
     pub executable: NodeId,
     pub annotation: NodeId,
+    config: NodeId,
     pub modules: BTreeMap<FileKey, NodeId>,
+    module_edges: BTreeMap<FileKey, Vec<NodeId>>,
     pub files: BTreeMap<FileKey, FileEntry>,
 }
 

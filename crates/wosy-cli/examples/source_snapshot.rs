@@ -4,9 +4,9 @@ use std::time::Instant;
 use wosy_cli::source_preparation::prepare;
 use rowan::{GreenNodeBuilder, NodeOrToken, WalkEvent};
 use wosy_compiler::{ScalarExpression, ScalarItem, ScalarSourceDeclarations};
-use wosy_daemon::{BaseDeclarationsView, QueryDisposition, SourceStore};
+use wosy_daemon::{BaseDeclarationsView, ProjectDeclarationsView, QueryDisposition, SourceStore};
 use wosy_syntax::{CanonicalCstRoot, CstNode, SyntaxKind};
-use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext};
+use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext, SourceNodeId};
 use wosy_protocol::{FileKey, NodeId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -73,6 +73,92 @@ fn verify_declarations(project: &Path, key: &FileKey, view: &BaseDeclarationsVie
     Ok(())
 }
 
+async fn report_project(
+    store: &SourceStore, project: &Path, root: NodeId, mode: Option<&str>,
+) -> Result<serde_json::Value> {
+    let start = Instant::now();
+    let view = store.project_declarations(root).await?.ok_or("unknown rooted project")?;
+    let query_ms = milliseconds(start);
+    let modules: Vec<_> = view.modules().iter().map(|module| serde_json::json!({
+        "key": module.key, "source": module.source, "module": module.module.hex(),
+        "projection": module.projection.hex(), "body": module.body.hex(),
+        "imports": module.imports.iter().map(|import| serde_json::json!({
+            "authored": import.authored, "target": import.target,
+        })).collect::<Vec<_>>(),
+    })).collect();
+    let materialized = match mode {
+        Some("--oracle") => Some(materialize_project(&view, project, true).await?),
+        Some("--load") => Some(materialize_project(&view, project, false).await?),
+        _ => None,
+    };
+    Ok(serde_json::json!({
+        "snapshot": view.snapshot.hex(), "projection": view.entry_projection.hex(),
+        "modules_derived": view.report.modules_derived, "modules_reused": view.report.modules_reused,
+        "bodies_derived": view.report.bodies_derived, "modules": modules,
+        "query_ms": query_ms, "materialized": materialized,
+    }))
+}
+
+async fn materialize_project(
+    view: &ProjectDeclarationsView<'_>, project: &Path, oracle: bool,
+) -> Result<serde_json::Value> {
+    if oracle {
+        let project = project.canonicalize()?;
+        let (cfg, manifest) = ProjectConfiguration::load_with_manifest(&project)?;
+        let target = cfg.resolve_target(None)?;
+        let ctx = ProjectContext::from_manifest(&project, &target, manifest.as_table())?;
+        let graph = wosy_cli::project_sources::load(&project, &ctx, &cfg, true, |source, rev, text| {
+            let identity = wosy_syntax::SourceIdentity::new(
+                source.project.clone(), source.package.clone(),
+                source.path.as_path().to_str().ok_or("expected UTF-8 fixture path")?.to_owned(),
+                rev.0.clone(),
+            );
+            let (fresh, diagnostics) =
+                wosy_compiler::parse_source_with_snapshot(identity, text, &ctx.comment_categories);
+            if !diagnostics.is_empty() { return Err(format!("{diagnostics:?}")); }
+            let declarations = wosy_compiler::derive_scalar_declarations_from_cst(fresh.result().canonical_cst());
+            wosy_cli::project_sources::imports(&declarations)
+        }).map_err(|error| match error {
+            wosy_cli::project_sources::Error::Observe(error) => error,
+            wosy_cli::project_sources::Error::Graph(error) => format!("{error:?}"),
+        })?;
+        assert_eq!(view.modules().len(), graph.nodes.len());
+        for (ordinal, (module, node)) in view.modules().iter().zip(&graph.nodes).enumerate() {
+            assert_eq!(SourceNodeId(ordinal), graph.initialization_order[ordinal]);
+            assert_eq!(module.key, FileKey::from(&node.source));
+            assert_eq!(module.source.project, node.source.project);
+            assert_eq!(module.source.revision, node.content_revision.0);
+            assert_eq!(module.imports.len(), node.namespace_edges.len());
+            for (stored, fresh) in module.imports.iter().zip(&node.namespace_edges) {
+                assert_eq!(stored.target, fresh.target);
+                assert_eq!(stored.authored.binding, fresh.binding);
+                assert_eq!(stored.authored.origin, fresh.origin);
+                assert_eq!(stored.authored.span.start, fresh.span.range.start);
+                assert_eq!(stored.authored.span.end, fresh.span.range.end);
+            }
+        }
+    }
+    let start = Instant::now();
+    let mut items = 0;
+    let mut diagnostics = Vec::new();
+    let mut derived = 0;
+    for (ordinal, module) in view.modules().iter().enumerate() {
+        let body = view.declarations(SourceNodeId(ordinal)).await?.ok_or("missing rooted declaration")?;
+        assert_eq!(body.id, module.body);
+        assert_eq!(body.source, module.source);
+        assert_eq!(body.module, module.module);
+        if oracle { verify_declarations(project, &module.key, &body)?; }
+        items += body.executable_declarations().items().len();
+        derived += usize::from(body.disposition == QueryDisposition::Derived);
+        diagnostics.extend(body.authored_diagnostics());
+    }
+    assert!(view.declarations(SourceNodeId(view.modules().len())).await?.is_none());
+    Ok(serde_json::json!({
+        "items": items, "diagnostics": diagnostics, "bodies_derived": derived,
+        "load_ms": milliseconds(start),
+    }))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let process = Instant::now();
@@ -85,6 +171,21 @@ async fn main() -> Result<()> {
     let store = SourceStore::open(&dir, 8 << 20)?;
     let open_ms = milliseconds(start);
     if let Some(package) = args.next() {
+        if package == "--project-declarations" {
+            let root = prior.ok_or("project query needs a root")?;
+            let mode = args.next();
+            if mode.as_deref() == Some("--concurrent") {
+                let other = args.next().map(|text| NodeId::parse_hex(&text)).transpose()?.unwrap_or(root);
+                let (first, second) = tokio::join!(
+                    report_project(&store, &project, root, None),
+                    report_project(&store, &project, other, None),
+                );
+                println!("{}", serde_json::json!([first?, second?]));
+            } else {
+                println!("{}", report_project(&store, &project, root, mode.as_deref()).await?);
+            }
+            return store.close().await;
+        }
         let key = FileKey {
             package,
             path: PackageRelativePath::new(args.next().ok_or("expected file path")?.into())?,
