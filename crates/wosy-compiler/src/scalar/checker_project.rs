@@ -8663,7 +8663,9 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
             arrays.extend(array_quantifier::ArrayProof::prepare(source, selected, &mut array_work)?);
         } else {
-            let plan = prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)?;
+            let plan = prepared.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
+                source, name.text(), selected, LOCAL_CATALOGS,
+            )?;
             if first_plan.is_none() { first_plan = Some(plan); } else { plans.push(plan); }
         }
     }
@@ -9706,6 +9708,17 @@ impl PreparedProofModule {
     fn plan_resolved_module_proof<'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool, const DEFER_OUTPUT_UNION: bool>(
         &'a self, proof_source: &'a SourceIdentity, proof_name: &'a str, proof: SelectedModuleProof<'a>,
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
+        self.plan_resolved_module_proof_with_qualified_entry::<ALLOW_INDUCTION, ALLOW_DOMAIN, DEFER_OUTPUT_UNION>(
+            proof_source, proof_name, proof, false,
+        )
+    }
+
+    fn plan_resolved_module_proof_with_qualified_entry<
+        'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool, const DEFER_OUTPUT_UNION: bool,
+    >(
+        &'a self, proof_source: &'a SourceIdentity, proof_name: &'a str, proof: SelectedModuleProof<'a>,
+        allow_qualified_entry: bool,
+    ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (module, item, function) = proof.function;
         let steps = match proof.ordered_steps {
             Some(prepared) => Cow::Borrowed(&prepared.steps),
@@ -9715,6 +9728,7 @@ impl PreparedProofModule {
         let variant_match = proof.ordered_steps.and_then(|prepared| prepared.variant_match.as_ref());
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(
             proof.owner, function, proof.body, proof.node, &steps, !DEFER_OUTPUT_UNION,
+            (allow_qualified_entry && proof_source == &proof.owner.source).then_some(module),
         )?;
         if variant_match.is_some() && !matches!(typed.goal, TypedProofGoal::Literal { .. }) {
             return Err(ProjectCheck::Unsupported);
@@ -12311,6 +12325,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     declaration: &CstNode,
     steps: &ScalarBlock,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] qualified_owner: Option<usize>,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
     let pattern = child(declaration, SyntaxKind::ProofTarget)?;
     let input_names = if matches!(body.boundary.results.as_slice(),
@@ -12491,7 +12506,15 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             #[cfg(feature = "internal-checker")]
             let affine = if allow_named_entry_facts && measure.is_none()
                 && (supports_rectangular_calling_proof(body)
-                    || steps.items.is_empty() && supports_unary_entry_proof(body, &result.ty))
+                    || steps.items.is_empty() && (supports_unary_entry_proof(body, &result.ty)
+                        || qualified_owner.is_some_and(|owner| {
+                            // Typing alone never issues a fact. The qualified
+                            // scheduler must authenticate each completed owner
+                            // and check this goal on the exact imported row.
+                            matches!(body.boundary.parameters.as_slice(), [input] if input.ty == result.ty)
+                                && ranked_scalar_return_origins(body).is_some_and(|origins|
+                                    origins.iter().all(|(target, _, _, _)| target.0 != owner))
+                        })))
             {
                 checked_affine_old_output(&ensures, output, &input_names, body, &result.ty)
             } else { None };
@@ -12531,7 +12554,7 @@ fn check_selected_proof(
     let target = &project.modules[module];
     let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let TypedProofPostcondition { target, body, result_type, input_names, output, goal, .. } =
-        typed_proof_postcondition::<false, false>(target, function, body, declaration, &steps, false)?;
+        typed_proof_postcondition::<false, false>(target, function, body, declaration, &steps, false, None)?;
     let TypedProofGoal::Literal { operator, bound, .. } = goal else {
         return Err(ProjectCheck::Unsupported);
     };

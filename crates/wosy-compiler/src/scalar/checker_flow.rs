@@ -603,10 +603,16 @@ struct LiteralGuardAtReturn<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
+enum OrderedReturnedGoal<'a> {
+    Literal(IntegerRelation, &'a BigInt),
+    Entry(&'a IntegerAffineTransform),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
 struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
     conditions: OrderedRootConditions<'a, TOTAL>,
-    relation: IntegerRelation,
-    bound: &'observation BigInt,
+    goal: OrderedReturnedGoal<'observation>,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
     imported_binding: Option<&'a ReferenceBindingId>,
     imported_relation_work: Option<&'observation std::cell::RefCell<usize>>,
@@ -648,7 +654,37 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
         if observed.1.is_some() {
             return Some(());
         }
-        let rejected = self.relation.complement();
+        if let OrderedReturnedGoal::Entry(expected) = self.goal {
+            let axis = axis?;
+            let work = &mut *self.imported_relation_work?.borrow_mut();
+            let [input] = roots.axes.get(..roots.parameters)? else { return None; };
+            let (minimum, maximum) = super::typecheck::integer_bounds(input.1)?;
+            for row in &path.0 {
+                let domain = row.entry_domain(0);
+                charge_call_work(work, row.len().checked_add(domain.interval_count())?.checked_add(1)?)?;
+                expected.fits(domain, &minimum, &maximum)?;
+                let actual_transform;
+                let actual = if row.entry_alias(0, axis) {
+                    AxisProofValue::Identity
+                } else if let Some(constant) = row.get(axis)?.singleton_value() {
+                    AxisProofValue::Literal(constant)
+                } else {
+                    actual_transform = row.entry_affine(0, axis)?;
+                    AxisProofValue::Affine(&actual_transform)
+                };
+                observed.0 = true;
+                if let Some((violated, returned)) = rejected_entry_relationship(domain, actual, expected, work)? {
+                    let witness = violated.extremes()?.0;
+                    observed.1 = Some(SymbolicLiteralFailure::from_row(
+                        slot, roots, row, None, Cow::Owned(returned), Some((0, witness)),
+                    ));
+                    break;
+                }
+            }
+            return Some(());
+        }
+        let OrderedReturnedGoal::Literal(relation, bound) = self.goal else { return None; };
+        let rejected = relation.complement();
         let mut applicable = self.guard.is_none();
         let mut failing = None;
         for row in &path.0 {
@@ -672,18 +708,18 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
                 None
             };
             let returned = match (value, axis) {
-                (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound)).then_some(value),
+                (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(bound)).then_some(value),
                 (IntegerReturn::Alias(_), Some(axis)) if axis >= roots.parameters => {
                     let result_domain = row.get(axis)?;
                     if let Some(work) = self.imported_relation_work {
                         charge_call_work(&mut work.borrow_mut(), result_domain.interval_count().checked_add(1)?)?;
-                        result_domain.first_comparison_point(rejected, self.bound)
+                        result_domain.first_comparison_point(rejected, bound)
                     } else {
                         let returned = result_domain.singleton_value()?;
-                        rejected.accepts(returned.cmp(self.bound)).then_some(returned)
+                        rejected.accepts(returned.cmp(bound)).then_some(returned)
                     }
                 }
-                (IntegerReturn::Alias(_), Some(axis)) => row.get(axis)?.first_comparison_point(rejected, self.bound),
+                (IntegerReturn::Alias(_), Some(axis)) => row.get(axis)?.first_comparison_point(rejected, bound),
                 _ => return None,
             };
             if let Some(returned) = returned {
@@ -3243,7 +3279,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<TOTAL>(
-        calls, body, relation, bound, predicate, entry_filter, &mut [],
+        calls, body, OrderedReturnedGoal::Literal(relation, bound), predicate, entry_filter, &mut [],
     )
 }
 
@@ -3253,18 +3289,31 @@ pub(super) fn collect_imported_root_literal_proof<'a>(
     entry_filter: &[CheckerPredicate], imports: &mut [Option<ImportedLocal<'a>>],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     collect_ordered_root_literal_proof_with_imports::<true>(
-        calls, body, relation, bound, None, Some(entry_filter), imports,
+        calls, body, OrderedReturnedGoal::Literal(relation, bound), None, Some(entry_filter), imports,
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_imported_root_entry_relationship<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, expected: &IntegerAffineTransform,
+    entry_filter: &[CheckerPredicate], imports: &mut [Option<ImportedLocal<'a>>],
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    let [input] = calls.boundary.parameters.as_slice() else { return None; };
+    if imports.is_empty() || &input.ty != integer_tail_type(calls)? { return None; }
+    collect_ordered_root_literal_proof_with_imports::<true>(
+        calls, body, OrderedReturnedGoal::Entry(expected), None, Some(entry_filter), imports,
     )
 }
 
 #[cfg(feature = "internal-checker")]
 fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
-    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, goal: OrderedReturnedGoal<'_>,
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
     imports: &mut [Option<ImportedLocal<'a>>],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let bounds;
     let guard = if let Some(predicate) = predicate {
+        let OrderedReturnedGoal::Literal(relation, bound) = goal else { return None; };
         let bindings = calls.boundary.checker_parameter_bindings.as_deref()?;
         let axis = bindings.iter().position(|binding| binding == &predicate.binding)?;
         let parameter = calls.boundary.parameters.get(axis)?;
@@ -3298,13 +3347,13 @@ fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
             result: ImportedVerifiedReturn::EntryAlias(_) | ImportedVerifiedReturn::EntryAffine { .. }, ..
         });
         let binding = &calls.structure.checker_integer_call_locals.get(&(calls.structure.root, last.position))?.binding;
-        (Some(binding), relational.then(|| std::cell::RefCell::new(0)))
+        (Some(binding), (relational || matches!(goal, OrderedReturnedGoal::Entry(_))).then(|| std::cell::RefCell::new(0)))
     };
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let scope = OrderedRootLiteralProof::<TOTAL> {
-        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), imported_binding,
+        conditions: OrderedRootConditions(body, false), goal, guard: guard.as_ref(), imported_binding,
         imported_relation_work: imported_relation_work.as_ref(), observed: &observed,
     };
     let active = if TOTAL {

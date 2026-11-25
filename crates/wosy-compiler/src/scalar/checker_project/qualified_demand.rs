@@ -95,10 +95,15 @@ impl<'proof, 'run, 'case> Job<'proof, 'run, 'case> {
             ranked_scalar_return_origins(body)?
         };
         if origins.iter().any(|(callee, _, _, _)| callee.0 == target.0)
-            || (first.bound.literal().is_none() && !(origins.is_empty()
-                && matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
+            || (first.bound.literal().is_none() && !(
+                matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
                 && first.relation == IntegerRelation::from_operator(&BinaryOperator::Equal)
-                && body.boundary.results.first().is_some_and(|out| supports_unary_entry_proof(body, &out.ty))))
+                && (if origins.is_empty() {
+                    body.boundary.results.first().is_some_and(|out| supports_unary_entry_proof(body, &out.ty))
+                } else {
+                    matches!(body.boundary.parameters.as_slice(), [input]
+                        if body.boundary.results.first().is_some_and(|out| out.ty == input.ty))
+                })))
         {
             return None;
         }
@@ -234,8 +239,8 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         let index = std::mem::take(&mut self.qualified.verified);
         let previous_failure = self.failure.take();
         let evaluated = (|| {
-            if job.case.bound.literal().is_none() {
-                if !job.origins.is_empty() || job.export_issuer().is_none() {
+            if job.case.bound.literal().is_none() && job.origins.is_empty() {
+                if job.export_issuer().is_none() {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let checked = Self::prove_unary_entry_relationship(
@@ -258,6 +263,29 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
                 let import = summary.import_local(job.target, job.body, position, origin, occurrence, true, Some(job.owner.target_layout))?
                     .ok_or(ProjectCheck::Unsupported)?;
                 imports.push(Some(import));
+            }
+            if job.case.bound.literal().is_none() {
+                if job.export_issuer().is_none() { return Err(ProjectCheck::Unsupported); }
+                let identity;
+                let (expected, result) = match job.case.bound {
+                    MainFlowProofBound::Entry(0) => {
+                        identity = super::super::checker_flow::IntegerAffineTransform::unit(false, BigInt::from(0));
+                        (&identity, VerifiedSymbolicResult::EntryAlias(0))
+                    }
+                    MainFlowProofBound::EntryAffine { slot: 0, transform } =>
+                        (transform.as_ref(), VerifiedSymbolicResult::EntryAffine { slot: 0, transform: Rc::clone(transform) }),
+                    _ => return Err(ProjectCheck::Unsupported),
+                };
+                let (active, directives, returned, failure) =
+                    super::super::checker_flow::collect_imported_root_entry_relationship(
+                        job.body, &job.function.body, expected, job.case.filter, &mut imports,
+                    ).ok_or(ProjectCheck::Unsupported)?;
+                if active || !directives.is_empty() { return Err(ProjectCheck::Unsupported); }
+                if let Some(failure) = failure {
+                    self.record(job.case, job.function, &job.owner.source, 0, failure, None)?;
+                    return Ok(Evaluation::Checked { active: returned, reusable: false, entry_result: None });
+                }
+                return Ok(Evaluation::Checked { active: returned, reusable: returned, entry_result: Some(result) });
             }
             let mut scratch = OrderedFailures::default();
             let (active, reusable) = self.check_ranked_scalar_import(
@@ -400,6 +428,93 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_entry_relationships_reexport_ordered_composed_proofs() {
+        let [app, hub, left, right] = ["main", "hub", "left", "right"].map(|name| {
+            SourceIdentity::new("project".into(), "package".into(), format!("src/{name}.w"), name.into())
+        });
+        let main = r#"%%start
+            joined = namespace package "src/hub.w";
+            unit() check_low = fn() {
+                u8 seen = joined.compose(0);
+                core.require(seen == 2, { .stdout = ""; .stderr = "composed lower"; .code = 67; .files = []; });
+            };
+            unit() check_high = fn() {
+                u8 seen = joined.compose(7);
+                core.require(seen == 9, { .stdout = ""; .stderr = "composed upper"; .code = 68; .files = []; });
+            };
+        %%end"#;
+        let wrapper = r#"%%start
+            first = namespace package "src/left.w";
+            second = namespace package "src/right.w";
+            u8(u8) compose = fn(input) {
+                u8 first_result = first.shift(input);
+                u8 final_result = second.shift(first_result);
+                final_result
+            };
+            proof composition for compose(input) -> (out) where (input <= 7) ensures (out == core.old(input) + 2) {}
+        %%end"#;
+        let increment = r#"%%start
+            u8(u8) shift = fn(input) { u8 next = input + 1; next };
+            proof shifted for shift(input) -> (out) where (input <= 7) ensures (out == core.old(input) + 1) {}
+        %%end"#;
+        let decrement = r#"%%start
+            u8(u8) shift = fn(input) { u8 next = input - 1; next };
+            proof shifted for shift(input) -> (out) where (input >= 1 && input <= 8) ensures (out == core.old(input) - 1) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |main: &str, wrapper: &str, lhs: &str, rhs: &str, scope| {
+                let parse = |source: &SourceIdentity, text: &str| {
+                    crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1
+                };
+                let edge = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                    binding: binding.to_owned(), target: target.clone(), span: ByteSpan::new(0, 0),
+                };
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(),
+                    [(parse(&app, main), vec![edge("joined", &hub)]),
+                    (parse(&hub, wrapper), vec![edge("first", &left), edge("second", &right)]),
+                    (parse(&left, lhs), Vec::new()), (parse(&right, rhs), Vec::new())],
+                    vec![app.clone(), hub.clone(), right.clone(), left.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            let package = ScalarCheckerScope::CurrentPackage;
+            let wide = increment.replace("input <= 7", "input <= 8");
+            let valid = run(main, wrapper, increment, &wide, package).unwrap();
+            assert!(valid.active && valid.directives.is_empty() && valid.symbolic_diagnostic.is_none());
+            let bad = main.replace("seen == 9", "seen == 8");
+            let failure = run(&bad, wrapper, increment, &wide, package).unwrap();
+            let [directive] = failure.directives.as_slice() else { panic!("one actual result"); };
+            assert_eq!(directive.code(), &BigInt::from(68));
+            let nine = BigInt::from(9);
+            assert!(directive.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
+            assert!(failure.symbolic_diagnostic.is_none());
+            let wrong = wrapper.replace("core.old(input) + 2", "core.old(input) + 1");
+            let failure = run(main, &wrong, increment, &wide, package).unwrap();
+            assert!(failure.directives.is_empty() && failure.additional_symbolic_diagnostics.is_empty());
+            let witness = failure.symbolic_diagnostic.unwrap();
+            assert_eq!(witness.proof.source, hub);
+            assert_eq!(witness.returned, BigInt::from(2));
+            let zero = BigInt::from(0);
+            assert!(witness.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+            assert!(matches!(run(main, wrapper, increment, increment, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let identity = wrapper.replace("core.old(input) + 2", "core.old(input)");
+            let identity_main = main.replace("seen == 2", "seen == 0").replace("seen == 9", "seen == 7");
+            let valid = run(&identity_main, &identity, increment, decrement, package).unwrap();
+            assert!(valid.active && valid.directives.is_empty() && valid.symbolic_diagnostic.is_none());
+            let not_identity = identity_main.replace("seen == 7", "seen == 8");
+            let failure = run(&not_identity, &identity, increment, decrement, package).unwrap();
+            let [directive] = failure.directives.as_slice() else { panic!("one actual identity"); };
+            let seven = BigInt::from(7);
+            assert_eq!(directive.code(), &BigInt::from(68));
+            assert!(directive.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+            assert!(failure.symbolic_diagnostic.is_none());
+            let dormant = run(&not_identity, &wrong, increment, decrement, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!dormant.active && dormant.directives.is_empty() && dormant.symbolic_diagnostic.is_none());
+        }
+    }
 
     #[test]
     fn qualified_entry_dependent_summary_preserves_the_admitted_input_axis() {
