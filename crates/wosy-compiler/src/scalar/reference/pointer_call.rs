@@ -33,7 +33,7 @@ pub(super) fn checked<'a>(
     body: &'a FunctionCallSites, cfg: &'a ScalarReferenceCfg, facts: &CallablePointFacts,
     callee: EntryPointeeWrite<'a>, claimed: &BigInt, wanted: Option<OccurrenceOrdinal>,
 ) -> Option<CallerPointeeEffect<'a>> {
-    if callee.offset() != claimed || &callee.formal().source != source || cfg.points.len() > 24
+    if callee.offset() != claimed || &callee.formal().source != source || cfg.points.len() > 32
         || !(1..=4).contains(&cfg.facts.len()) || !cfg.allocations.is_empty() || function.body.unsafe_context
         || !function.generic_parameters.is_empty() || !body.arms.is_empty()
         || !body.boundary.parameters.is_empty() || !body.callable_escapes.is_empty()
@@ -43,41 +43,52 @@ pub(super) fn checked<'a>(
     }
     let structure = &body.structure;
     let root = structure.root;
-    let [first, subsequent @ ..] = structure.blocks.get(root.0)?.items.as_slice() else { return None; };
-    let BlockItemKind::Binding(binding) = &first.kind else { return None; };
-    let [receiver] = binding.receivers() else { return None; };
-    let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
-    if !outputs.secondary.is_empty() || receiver.contextual_storage.is_some()
-        || &receiver.ty != callee.width() || structure.checked_types.expressions.get(&outputs.primary)? != callee.width()
-    {
-        return None;
+    struct Cell<'a> {
+        binding: &'a ReferenceBindingId,
+        entry: BigInt,
+        observed: bool,
     }
-    let BindingDefinition::Initialized { bind, value } = *facts.definitions.get(&(root, first.position, 0))?
-        else { return None; };
-    if facts.evaluations.get(&outputs.primary) != Some(&value) { return None; }
-    let entry_point = cfg.points.get(value.0)?;
-    let CfgPointKind::Evaluate(ScalarExpression::Integer { value: entry, .. }) = &entry_point.kind
-        else { return None; };
-    let CfgPointKind::Bind { binding } = &cfg.points.get(bind.0)?.kind else { return None; };
-    if &binding.source != source || binding.function_span != function.span || binding.declaration_span != receiver.span {
-        return None;
-    }
-    if value.0 >= bind.0 { return None; }
     let width = callee.width();
     let (min, max) = super::super::typecheck::integer_bounds(width)?;
-    let mut entry = entry.clone();
+    let mut cells: Vec<Cell<'_>> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut points = Vec::new();
-    let mut previous = bind;
+    let mut previous = CfgPointId(0);
     let mut position = 0usize;
-    for item in subsequent.iter().take(7) {
+    for item in structure.blocks.get(root.0)?.items.iter().take(11) {
+        if let BlockItemKind::Binding(region) = &item.kind {
+            let [receiver] = region.receivers() else { return None; };
+            let BindingInitialization::Outputs(outputs) = &region.initialization else { return None; };
+            if cells.len() == 4 || !outputs.secondary.is_empty() || receiver.contextual_storage.is_some()
+                || &receiver.ty != width || structure.checked_types.expressions.get(&outputs.primary)? != width
+            {
+                return None;
+            }
+            let BindingDefinition::Initialized { bind, value } = *facts.definitions.get(&(root, item.position, 0))?
+                else { return None; };
+            if facts.evaluations.get(&outputs.primary) != Some(&value) || !(previous.0 < value.0 && value.0 < bind.0) {
+                return None;
+            }
+            let CfgPointKind::Evaluate(ScalarExpression::Integer { value: entry, .. }) = &cfg.points.get(value.0)?.kind
+                else { return None; };
+            let CfgPointKind::Bind { binding } = &cfg.points.get(bind.0)?.kind else { return None; };
+            if entry < &min || entry > &max || &binding.source != source || binding.function_span != function.span
+                || binding.declaration_span != receiver.span || cells.iter().any(|cell| cell.binding == binding)
+            {
+                return None;
+            }
+            points.extend([value, bind]);
+            previous = bind;
+            cells.push(Cell { binding, entry: entry.clone(), observed: false });
+            continue;
+        }
         if let BlockItemKind::Assignment { group } = item.kind {
             // The initial escrow remains the literal declaration. A later
             // ordinary overwrite must replace, not refine, the old epoch.
-            if position == 0 { return None; }
             let (destination, ty, rhs, place) =
                 super::super::checker_flow::checked_scalar_assignment(body, group)?;
-            if destination != binding || ty != width || structure.checked_types.expressions.get(&rhs)? != width
+            let cell = cells.iter_mut().find(|cell| cell.binding == destination && cell.observed)?;
+            if ty != width || structure.checked_types.expressions.get(&rhs)? != width
                 || structure.checked_types.places.get(&place)? != width
             {
                 return None;
@@ -90,7 +101,7 @@ pub(super) fn checked<'a>(
                 || !matches!(&cfg.points.get(rhs_point.0)?.kind,
                     CfgPointKind::Evaluate(ScalarExpression::Integer { value, .. }) if value == literal)
                 || !matches!(&install.kind, CfgPointKind::Assign { target, rhs_point: exact, previous_origins, previous_loans }
-                    if *exact == rhs_point && &target.binding == binding && &target.source == source
+                    if *exact == rhs_point && &target.binding == cell.binding && &target.source == source
                         && target.projections.is_empty() && previous_origins.is_empty() && previous_loans.is_empty())
                 || install.source_span.range != body.occurrences.get(place.0)?.span
             {
@@ -98,7 +109,7 @@ pub(super) fn checked<'a>(
             }
             points.extend([rhs_point, install.id]);
             previous = install.id;
-            entry = literal.clone();
+            cell.entry = literal.clone();
             continue;
         }
         let BlockItemKind::Evaluation { expression: call } = item.kind else { return None; };
@@ -138,21 +149,23 @@ pub(super) fn checked<'a>(
         if origins.len() != 1 { return None; }
         let origin = origins.iter().next()?;
         let ReferenceOrigin::Fresh { allocation, loan: issued } = cfg.facts.get(origin.0)? else { return None; };
+        let cell = cells.iter_mut().find(|cell| cell.binding == &place.binding)?;
         if !seen.insert(*origin)
             || &allocation.source != source || allocation.function_span != function.span
-            || allocation.declaration_span != binding.declaration_span || allocation.creation_span != borrow_point.source_span.range
-            || &place.binding != binding || &place.source != source || !place.projections.is_empty()
+            || allocation.declaration_span != cell.binding.declaration_span || allocation.creation_span != borrow_point.source_span.range
+            || &place.source != source || !place.projections.is_empty()
             || &loan.origin_place != place || loan != issued || loan.parent.is_some()
             || loan.mode != ScalarReferenceMutability::Mutable
             || !(previous.0 < borrow.0 && borrow.0 < call_point.id.0)
         {
             return None;
         }
-        let exit = super::super::typecheck::wrapping_integer_sum(&entry, claimed, &min, &max)?;
+        let exit = super::super::typecheck::wrapping_integer_sum(&cell.entry, claimed, &min, &max)?;
         points.extend([*borrow, call_point.id]);
         previous = call_point.id;
         if wanted.is_some_and(|wanted| wanted != call) {
-            entry = exit;
+            cell.entry = exit;
+            cell.observed = true;
             position += 1;
             continue;
         }
@@ -167,16 +180,14 @@ pub(super) fn checked<'a>(
             match &point.kind {
                 CfgPointKind::Entry if index == 0 => {}
                 CfgPointKind::ScopeEnter if point.scope == ReferenceScopeId(0) => {}
-                CfgPointKind::Evaluate(_) if point.id == value || points.contains(&point.id) => {}
-                CfgPointKind::Bind { .. } if point.id == bind => {}
-                CfgPointKind::Borrow { .. } | CfgPointKind::Call { .. } | CfgPointKind::Assign { .. }
-                    if points.contains(&point.id) => {}
+                CfgPointKind::Evaluate(_) | CfgPointKind::Bind { .. } | CfgPointKind::Borrow { .. }
+                    | CfgPointKind::Call { .. } | CfgPointKind::Assign { .. } if points.contains(&point.id) => {}
                 _ => return None,
             }
         }
         return Some(CallerPointeeEffect {
             call: &call_point.source_span, place, loan, width,
-            entry_epoch: call_point.id, position, entry, exit,
+            entry_epoch: call_point.id, position, entry: cell.entry.clone(), exit,
         });
     }
     None

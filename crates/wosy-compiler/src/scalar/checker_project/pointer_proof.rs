@@ -278,6 +278,29 @@ mod tests {
                     assert!(run(&excluded, scope).is_err(), "{excluded}");
                 }
 
+                let separate = overwritten
+                    .replace("u32 local = 4294967295;", "u32 local = 4294967295; u32 another = 10;")
+                    .replace("local = 9;", "increment(&!another); local = 9;")
+                    .replace("            };", r#"                core.require(another == 13, { .stdout = ""; .stderr = "other exit"; .code = 1; .files = []; });
+            };"#);
+                let approved = run(&separate, scope).unwrap();
+                assert!(approved.active && approved.directives.is_empty() && approved.pointer_effect_diagnostic.is_none());
+                for (from, bad) in [("local == 12", "local == 5"), ("another == 13", "another == 10")] {
+                    let stale = separate.replace(from, bad);
+                    let report = run(&stale, scope).unwrap();
+                    let [failed] = report.directives.as_slice() else { panic!("each cell needs its own update"); };
+                    assert_eq!(&stale[failed.condition.start as usize..failed.condition.end as usize], bad);
+                    let twelve = BigInt::from(12);
+                    let thirteen = BigInt::from(13);
+                    assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&twelve, &twelve)]));
+                    assert!(failed.witness.intervals_at(0, 1).unwrap().eq([(&thirteen, &thirteen)]));
+                }
+                let wrong_width = separate.replace("u32 another = 10;", "u16 another = 10;");
+                assert!(run(&wrong_width, scope).is_err());
+                let unrelated_write = separate.replace("increment(&!another); local = 9;",
+                    "another = 9; increment(&!another); local = 9;");
+                assert!(run(&unrelated_write, scope).is_err());
+
                 let old = program.replace("core.require(local == 0", "core.require(local == 4294967295");
                 let witnessed = run(&old, scope).unwrap();
                 assert!(witnessed.pointer_effect_diagnostic.is_none());
