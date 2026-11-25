@@ -7588,7 +7588,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                     witness: ScalarCheckerIntegerWitness {
                         equal_axes: Vec::new(),
                         axes,
-                        state: IntegerInputs::entry_point(base.earlier.as_ref(), &base.entry),
+                        state: IntegerInputs::entry_point(&base.coordinates),
                     },
                     returned: base.returned.clone(),
                     returned_literal: None,
@@ -7768,10 +7768,12 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
     if plan.proof_source != &plan.typed.target.source {
         return Err(ProjectCheck::Unsupported);
     }
+    let existing_transfer_arity = rank.entries().count() <= 2;
     Ok(RankedOrderedEvidence {
         plan, rank,
-        allow_reached: plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count),
-        allow_symbolic_summary: plan.proof_source == root_source,
+        allow_reached: existing_transfer_arity
+            && (plan.proof_source == root_source || (LOCAL_CATALOGS && plan.target.0 < startup_count)),
+        allow_symbolic_summary: existing_transfer_arity && plan.proof_source == root_source,
         reached_return: None,
     })
 }
@@ -11018,13 +11020,23 @@ impl TypedProofPostcondition<'_> {
 
 type TypedEntryMeasure<'a> = (&'a super::reference::ParameterSlot, &'a ReferenceBindingId);
 
+const MAX_RANKED_INTEGER_AXES: usize = 4;
+
 #[derive(Clone, Copy)]
 struct TypedInductionRank<'a> {
-    first_parameter: TypedEntryMeasure<'a>,
-    second_parameter: Option<TypedEntryMeasure<'a>>,
+    parameters: [Option<TypedEntryMeasure<'a>>; MAX_RANKED_INTEGER_AXES],
+    components: [Option<TypedEntryMeasure<'a>>; MAX_RANKED_INTEGER_AXES],
     sum: bool,
-    earlier: Option<TypedEntryMeasure<'a>>,
-    descending: TypedEntryMeasure<'a>,
+}
+
+impl<'a> TypedInductionRank<'a> {
+    fn entries(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
+        self.parameters.into_iter().flatten()
+    }
+
+    fn axes(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
+        self.components.into_iter().flatten()
+    }
 }
 
 fn typed_proof_decreases<'a>(
@@ -11035,14 +11047,14 @@ fn typed_proof_decreases<'a>(
     let Some(clause) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofDecreases) else {
         return Ok(None);
     };
-    let mut expressions = clause.children().filter(|node| node.kind() == SyntaxKind::Expression);
-    let first = expressions.next().ok_or(ProjectCheck::InvalidProof)?;
-    let second = expressions.next();
-    if second.is_some() && (input_names.len() != 2 || expressions.next().is_some()) {
+    if !(1..=MAX_RANKED_INTEGER_AXES).contains(&input_names.len()) {
         return Err(ProjectCheck::Unsupported);
     }
+    let mut expressions = clause.children().filter(|node| node.kind() == SyntaxKind::Expression).peekable();
+    let first = expressions.next().ok_or(ProjectCheck::InvalidProof)?;
     let entry = |slot: usize| -> Result<TypedEntryMeasure<'a>, ProjectCheck> {
         let parameter = body.boundary.parameters.get(slot).ok_or(ProjectCheck::InvalidProof)?;
+        if parameter.ordinal != slot { return Err(ProjectCheck::InvalidProof); }
         let binding = body.boundary.checker_parameter_bindings.as_deref()
             .and_then(|bindings| bindings.get(slot)).ok_or(ProjectCheck::Unsupported)?;
         Ok((parameter, binding))
@@ -11063,29 +11075,38 @@ fn typed_proof_decreases<'a>(
         Ok(selected)
     };
     let first_expression = derive_expression(&first);
-    let (sum, earlier, descending) = if let Some(second) = second {
-        (false, Some(scalar(&first_expression)?), scalar(&derive_expression(&second))?)
-    } else if let ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. } = &first_expression {
+    let mut components = [None; MAX_RANKED_INTEGER_AXES];
+    let sum = if let ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. } = &first_expression {
+        if expressions.peek().is_some() || input_names.len() != 2 { return Err(ProjectCheck::Unsupported); }
         let (left, right) = (scalar(left)?, scalar(right)?);
-        if left.0.ty != right.0.ty {
+        if left.0.ty != right.0.ty || left.0.ordinal == right.0.ordinal {
             return Err(ProjectCheck::Unsupported);
         }
-        (true, Some(left), right)
+        components[0] = Some(left);
+        components[1] = Some(right);
+        true
     } else {
-        (false, None, scalar(&first_expression)?)
+        let first = scalar(&first_expression)?;
+        components[0] = Some(first);
+        let mut selected = [false; MAX_RANKED_INTEGER_AXES];
+        selected[first.0.ordinal] = true;
+        for (i, expression) in expressions.enumerate() {
+            let component = components.get_mut(i + 1).ok_or(ProjectCheck::Unsupported)?;
+            let axis = scalar(&derive_expression(&expression))?;
+            if std::mem::replace(&mut selected[axis.0.ordinal], true) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            *component = Some(axis);
+        }
+        false
     };
-    if earlier.is_some_and(|first| first.0.ordinal == descending.0.ordinal) {
-        return Err(ProjectCheck::Unsupported);
+    let mut parameters = [None; MAX_RANKED_INTEGER_AXES];
+    for (i, slot) in parameters.iter_mut().take(input_names.len()).enumerate() {
+        let parameter = entry(i)?;
+        if !is_integer_type(&parameter.0.ty) { return Err(ProjectCheck::Unsupported); }
+        *slot = Some(parameter);
     }
-    let (first_parameter, second_parameter) = match input_names.len() {
-        1 => (entry(0)?, None),
-        2 => (entry(0)?, Some(entry(1)?)),
-        _ => return Err(ProjectCheck::Unsupported),
-    };
-    if std::iter::once(first_parameter).chain(second_parameter).any(|(slot, _)| !is_integer_type(&slot.ty)) {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let rank = TypedInductionRank { first_parameter, second_parameter, sum, earlier, descending };
+    let rank = TypedInductionRank { parameters, components, sum };
     Ok(Some(rank))
 }
 
@@ -11111,9 +11132,7 @@ enum RankedInductionOutcome<'a> {
 struct RankedBaseWitness<'a> {
     proof_source: &'a SourceIdentity,
     return_source: &'a SourceIdentity,
-    entry_type: ScalarType,
-    earlier: Option<BigInt>,
-    entry: BigInt,
+    coordinates: Vec<BigInt>,
     returned: &'a BigInt,
     return_span: ByteSpan,
     rejected: RankedBaseRejection,
@@ -17166,6 +17185,67 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_induction_rank_checks_four_guarded_axes_without_transfer() {
+        let app = source("src/main.w", "ordered-four-axis-rank");
+        let program = r#"%%start
+            u8(u8,u8,u8,u8) descend = fn(page, slot, left, quota) {
+                if (left > 0) { descend(page, slot, left - 1, quota) }
+                else {
+                    if (slot > 0) { descend(page, slot - 1, 3, quota) }
+                    else { if (page > 0) { descend(page - 1, 3, 3, quota) } else { 7 } }
+                }
+            };
+            proof rank for descend(page, slot, left, quota) -> (out)
+                where (page <= 3 && slot <= 3 && left <= 3 && quota >= 4 && quota <= 5)
+                ensures (out == 7) decreases (page, slot, left) {
+                if (left > 0) { core.use(rank(page, slot, left - 1, quota)); }
+                else {
+                    if (slot > 0) { core.use(rank(page, slot - 1, 3, quota)); }
+                    else { if (page > 0) { core.use(rank(page - 1, 3, 3, quota)); } else { core.show(out == 7); } }
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let unused = run(program, main).unwrap();
+        assert!(!unused.active && unused.symbolic_diagnostic.is_none());
+        let full = program.replace("decreases (page, slot, left)", "decreases (quota, page, slot, left)");
+        for text in [program, &full] {
+            let receipt = run(text, package).unwrap();
+            assert!(receipt.active && receipt.directives.is_empty()
+                && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+        }
+        for text in [
+            program.replace("decreases (page, slot, left)", "decreases (left, slot, page)"),
+            program.replace("decreases (page, slot, left)", "decreases (page, page, left)"),
+            program.replace("left - 1, quota", "left - 1, 6"),
+            program.replace("rank(page, slot, left - 1, quota)", "rank(page, slot, left - 1, 4)"),
+            program.replace("left - 1, quota", "left - 0, quota"),
+        ] {
+            assert!(matches!(run(&text, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+        let reached = program.replace("%%end", "u8 answer = descend(2, 3, 1, 4); answer; %%end");
+        for scope in [main, package] {
+            assert!(matches!(run(&reached, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+        let refuted = program.replace("out == 7) decreases", "out == 8) decreases");
+        let receipt = run(&refuted, package).unwrap();
+        let witness = receipt.symbolic_diagnostic.unwrap();
+        assert_eq!(witness.returned, BigInt::from(7));
+        for (axis, value) in [0, 0, 0, 4].into_iter().enumerate() {
+            let value = BigInt::from(value);
+            assert!(witness.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_induction_rank_checks_a_coupled_checked_sum() {
         let app = source("src/main.w", "ordered-coupled-rank");
         let program = r#"%%start
@@ -21172,8 +21252,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let RankedInductionOutcome::Refuted(witness) = outcome else {
                 panic!("one-axis admitted base refutation");
             };
-            assert_eq!(witness.entry_type, ScalarType::U8);
-            assert_eq!(witness.entry, BigInt::from(2));
+            assert_eq!(witness.coordinates, [BigInt::from(2)]);
             assert_eq!(witness.returned, &BigInt::from(4));
             assert_eq!(witness.proof_source, &file);
             assert_eq!(witness.return_source, &file);
@@ -21204,7 +21283,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let (module, item, _) = proof.function;
         let body = prepared.prepared.parts().1.function_body(module, item, None).unwrap();
         let (slot, binding) = typed_proof_decreases(proof.node, &["other".into(), "measure".into()], body)
-            .unwrap().expect("can derive the typed measure independently of trusting it").descending;
+            .unwrap().expect("can derive the typed measure independently of trusting it").axes().last().unwrap();
         assert_eq!(slot.ordinal, 1);
         assert_eq!(slot.ty, ScalarType::U16);
         assert_eq!(binding, &body.boundary.checker_parameter_bindings.as_deref().unwrap()[1]);

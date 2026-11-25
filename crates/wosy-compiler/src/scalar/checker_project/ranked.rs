@@ -12,16 +12,6 @@ fn charge(work: &mut usize, cost: usize) -> Result<(), ProjectCheck> {
     charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)
 }
 
-impl<'a> TypedInductionRank<'a> {
-    pub(super) fn entries(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
-        std::iter::once(self.first_parameter).chain(self.second_parameter)
-    }
-
-    fn axes(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
-        self.earlier.into_iter().chain([self.descending])
-    }
-}
-
 #[derive(Clone)]
 struct Rectangle(Vec<IntegerSet>);
 
@@ -62,7 +52,7 @@ impl Rectangle {
             charge(work, 1)?;
             // Every precondition state (therefore every admitted successor)
             // must evaluate the authored checked sum without overflow.
-            let ty = &rank.first_parameter.0.ty;
+            let ty = &rank.entries().next().ok_or(ProjectCheck::Unsupported)?.0.ty;
             if !integer_literal_fits_type(&(first_low + second_low), ty)
                 || !integer_literal_fits_type(&(first_high + second_high), ty)
             {
@@ -197,7 +187,7 @@ fn transition(
 ) -> Result<InductionPremise, ProjectCheck> {
     if !path.reachable() { return Ok(InductionPremise::Unreachable); }
     use std::cmp::Ordering;
-    let mut comparisons = [Ordering::Equal; 2];
+    let mut comparisons = [Ordering::Equal; MAX_RANKED_INTEGER_AXES];
     let mut sum_delta = rank.sum.then(BigInt::default);
     // Authenticate every actual call argument and its guard, even if a
     // coordinate is not ranked or an earlier coordinate already descends.
@@ -310,11 +300,13 @@ pub(super) fn verify<'a>(
                     let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
                     RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
                 };
-                let point = |i: usize| path.0[i].extremes().expect("reachable axis").0.clone();
+                charge(&mut work, path.0.len())?;
+                let coordinates = path.0.iter().map(|axis| axis.extremes()
+                    .map(|(first, _)| first.clone()).ok_or(ProjectCheck::Unsupported))
+                    .collect::<Result<Vec<_>, _>>()?;
                 failure = Some(RankedBaseWitness {
                     proof_source: plan.proof_source, return_source: &typed.target.source,
-                    entry_type: rank.second_parameter.unwrap_or(rank.first_parameter).0.ty.clone(), earlier: rank.second_parameter.map(|_| point(0)),
-                    entry: point(path.0.len() - 1), returned: value,
+                    coordinates, returned: value,
                     return_span: body.occurrences.get(output.0).ok_or(ProjectCheck::Unsupported)?.span, rejected,
                 });
             }
