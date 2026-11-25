@@ -483,8 +483,17 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             origins.push(((callee, binding.position, origin, occurrence), &receiver.ty));
         }
+        // Match only the prepared lexical identities already used as axes by
+        // the integer walker. Function-boundary formals are immutable in this
+        // closed consumer; the suffix admits no writes or other bindings.
+        let formal_bindings = calls.boundary.checker_parameter_bindings.as_deref();
+        let caller_formals = match (formal_bindings, calls.boundary.parameters.as_slice()) {
+            (Some([binding]), [formal]) if is_integer_type(&formal.ty) => Some((binding, &formal.ty)),
+            _ => None,
+        };
         let Some(prepared_comparisons) = qualified_requirement_suffix(calls, requirements, |binding, predicate_type| {
-            origins.iter().any(|((_, _, origin, _), ty)| binding == &origin.binding && predicate_type == *ty)
+            caller_formals.is_some_and(|(formal, ty)| binding == formal && predicate_type == ty)
+                || origins.iter().any(|((_, _, origin, _), ty)| binding == &origin.binding && predicate_type == *ty)
         }) else {
             return Ok(None);
         };
@@ -709,6 +718,44 @@ mod tests {
             assert_eq!(failure.code(), &BigInt::from(74));
             assert_eq!(failure.source, app);
             assert_eq!(&alternate[failure.condition.start as usize..failure.condition.end as usize], "second_value == 99");
+            let symbolic = r#"%%start
+                joined = namespace package "src/hub.w";
+                next = namespace package "src/right.w";
+                unit(u8) check = fn(input) {
+                    u8 first_value = joined.compose(input);
+                    u8 second_value = next.shift(first_value);
+                    if (first_value == input && second_value <= 127) {
+                        core.require(input <= 127, { .stdout = ""; .stderr = "lower"; .code = 76; .files = []; });
+                    } else {
+                        core.require(second_value >= 128, { .stdout = ""; .stderr = "upper"; .code = 77; .files = []; });
+                        core.require(input >= 128, { .stdout = ""; .stderr = "entry"; .code = 78; .files = []; });
+                    };
+                    core.require(first_value <= 255, { .stdout = ""; .stderr = "joined"; .code = 79; .files = []; });
+                };
+            %%end"#;
+            let pass_through = r#"%%start
+                second = namespace package "src/right.w";
+                u8(u8) compose = fn(input) { u8 forwarded = second.shift(input); forwarded };
+                proof composition for compose(input) -> (out) ensures (out == core.old(input)) {}
+            %%end"#;
+            let exact_alias = r#"%%start
+                u8(u8) shift = fn(input) { input };
+                proof shifted for shift(input) -> (out) ensures (out == core.old(input)) {}
+            %%end"#;
+            let covered = run(symbolic, pass_through, increment, exact_alias, package).unwrap();
+            assert!(covered.active && covered.directives.is_empty() && covered.symbolic_diagnostic.is_none());
+            let false_entry = symbolic.replace("core.require(input >= 128", "core.require(input >= 129");
+            let report = run(&false_entry, pass_through, increment, exact_alias, package).unwrap();
+            let [failure] = report.directives.as_slice() else { panic!("only the reachable altered entry obligation"); };
+            assert_eq!(failure.code(), &BigInt::from(78));
+            assert_eq!(failure.source, app);
+            assert_eq!(&false_entry[failure.condition.start as usize..failure.condition.end as usize], "input >= 129");
+            let at_boundary = BigInt::from(128);
+            for axis in 0..3 {
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&at_boundary, &at_boundary)]));
+            }
+            let without_symbolic_root = run(&false_entry, pass_through, increment, exact_alias, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!without_symbolic_root.active && without_symbolic_root.directives.is_empty());
             let dormant_branch = run(&wrong_branch_and_join, &mixed, increment, &wide, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_branch.active && dormant_branch.directives.is_empty());
             let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");
