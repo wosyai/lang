@@ -5893,7 +5893,8 @@ fn writable_path_type_in_module(
                 diagnostics,
             );
             match base_type {
-                ScalarType::RuntimeArray { .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. }) => {
+                ScalarType::RuntimeArray { .. } if matches!(base.as_ref(), ScalarPlace::Dereference { .. })
+                    && !inference.allows_private_runtime_write_candidate(base.as_ref()) => {
                     diagnostics.push(module_diagnostic(module, "B0003",
                         "checked runtime array write requires the extent of the dereferenced backing", *span));
                     ScalarType::Error

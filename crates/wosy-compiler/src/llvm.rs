@@ -438,7 +438,7 @@ fn runtime_allocation_access<'ctx>(
         }
     }
     if let Some(plan) = plan {
-        for &owner in &plan.private_runtime_read_owners {
+        for &owner in &plan.private_runtime_access_owners {
             let id = key(owner);
             indexed.insert(id);
             not_portable.insert(id);
@@ -2873,7 +2873,7 @@ fn emit_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
-            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_read_formal.is_some()) {
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
                 aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
             } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
@@ -3245,7 +3245,7 @@ fn emit_project_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
-            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_read_formal.is_some()) {
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
                 aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
             } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(

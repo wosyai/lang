@@ -17319,6 +17319,102 @@ if (observe(3,5,1) != 117) { core.system_panic(); };
 }
 
 #[test]
+fn private_runtime_formal_write_keeps_exact_exclusive_owner_and_checked_store_order() {
+    let text = "%%start
+u16(u16) rhs = fn(value) { value };
+u64(u64) select = fn(index) { index };
+unit(*!(u16[]),u64,u16) _write = fn(view,index,value) {
+    (*view)[select(index)] = rhs(value);
+};
+u16(*(u16[]),u64) _read = fn(view,index) { (*view)[index] };
+u16(u64,u64,u64) observe = fn(length,other_length,index) {
+    u16[length] cells;
+    u16[other_length] other;
+    _write(&!cells,0,9);
+    _write(&!cells,index,37);
+    _write(&!other,index,71);
+    u16 first = _read(&cells,0);
+    u16 second = _read(&other,index);
+    u16 replay = _read(&cells,index);
+    if (first != 9 || second != 71 || replay != 37) { core.system_panic(); };
+    first + second + replay
+};
+if (observe(3,5,1) != 117) { core.system_panic(); };
+%%end";
+    let public = text.replace("_write", "write");
+    let shared = text.replace("*!(u16[])", "*(u16[])").replace("&!", "&");
+    let unsealed = text.replace("_write(&!cells,index,37)", "_write(&!cells,index,rhs(37))");
+    let conflict = text.replace("    _write(&!cells,0,9);", "    *u16 retained = &cells[index];\n    _write(&!cells,0,9);")
+        .replace("u16 replay = _read(&cells,index);", "u16 replay = *retained;");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |authored: &str| {
+            let parsed = parse_source(source.clone(), authored.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        for (authored, error) in [
+            (public.as_str(), "checked runtime array write requires the extent of the dereferenced backing"),
+            (shared.as_str(), "assignment dereference requires a mutable checked reference"),
+            (unsealed.as_str(), "checked runtime array write requires the extent of the dereferenced backing"),
+            (conflict.as_str(), "read or move of unavailable place"),
+        ] {
+            let diagnostics = match prepare(authored) {
+                Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+                Err(error) => error.diagnostics.clone(),
+            };
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.message == error
+                && (authored != conflict || diagnostic.labels.iter().any(|label|
+                    label.message == "origin of conflicting place or loan"))), "{diagnostics:?}");
+        }
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helper = prepared.checked_access_source().unwrap();
+        let write = project_function_name(&source, "_write");
+        let body = self_tail_test_body(&ir, "internal void", &write);
+        let rhs = format!("call i16 @{}(", project_function_name(&source, "rhs"));
+        let non_null = format!("call void @{}(", project_function_name(helper, "check_non_null_address"));
+        let selector = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let bounds = format!("call void @{}(", project_function_name(helper, "check_index_in_extent"));
+        let value = body.lines().find(|line| line.contains(&rhs)).unwrap().trim().split_once(" = ").unwrap().0;
+        let snapshot_head = format!("store i16 {value}, ptr ");
+        let snapshot = body.lines().find(|line| line.trim_start().starts_with(&snapshot_head)).unwrap();
+        let slot = snapshot.trim_start().strip_prefix(&snapshot_head).unwrap().split(',').next().unwrap();
+        let reload = body.lines().find(|line| line.contains(&format!("load i16, ptr {slot},"))).unwrap();
+        let value = reload.trim().split_once(" = ").unwrap().0;
+        let gep = body.lines().find(|line| line.contains("getelementptr inbounds i16")).unwrap();
+        let address = gep.trim().split_once(" = ").unwrap().0;
+        let actual_store = format!("store i16 {value}, ptr {address},");
+        let order = [&rhs, snapshot, reload, &non_null, "inttoptr", &selector, &bounds, gep, &actual_store];
+        assert!(order.windows(2).all(|pair| body.find(pair[0]).unwrap() < body.find(pair[1]).unwrap()), "{body}");
+        for needle in [&rhs, &non_null, &selector, &bounds, &actual_store] {
+            assert_eq!(body.matches(needle).count(), 1, "{body}");
+        }
+        let guard = body.lines().find(|line| line.contains(&bounds)).unwrap();
+        assert!(guard.contains("%borrowed_array_extent"), "{body}");
+        if layout == ScalarTargetLayout::WASM32 {
+            assert!(body.find(&bounds).unwrap() < body.find("trunc i64").unwrap()
+                && body.find("trunc i64").unwrap() < body.find(gep).unwrap(), "{body}");
+        }
+        let observe = self_tail_test_body(&ir, "i16", &project_function_name(&source, "observe"));
+        assert_eq!(observe.matches(&format!("call void @{write}(")).count(), 3, "{observe}");
+        assert_eq!(observe.matches("call ptr @__wosy_core_alloc").count(), 2, "{observe}");
+        assert_eq!(observe.matches("call void @__wosy_core_free").count(), 2, "{observe}");
+        if let Some(out) = std::env::var_os("WOSY_PRIVATE_RUNTIME_WRITE_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
+
+#[test]
 fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
     for (body, output) in [
         ("values[index]", "u8"),

@@ -210,6 +210,7 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     occurrences: PreparationOccurrenceTyping,
     float_literal_shapes: HashMap<*const ScalarExpression, bool>,
     in_module_initialization: bool,
+    private_runtime_write_formal: Option<String>,
     suppress_checked_occurrences: bool,
 }
 
@@ -221,6 +222,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
             occurrences: PreparationOccurrenceTyping::default(),
             float_literal_shapes: HashMap::new(),
             in_module_initialization: false,
+            private_runtime_write_formal: None,
             suppress_checked_occurrences: true,
         }
     }
@@ -494,6 +496,25 @@ impl<'a> ScalarInferenceBuilder<'a> {
     pub(super) fn set_validation_root(&mut self, item: &ScalarItem) {
         self.in_module_initialization =
             matches!(item, ScalarItem::Binding(_) | ScalarItem::Executable(_));
+        self.private_runtime_write_formal = match item {
+            ScalarItem::Function(function) if !self.suppress_checked_occurrences && function.overload_arms.is_empty()
+                && function.generic_parameters.is_empty() && super::typecheck::is_module_private_name(&function.name) =>
+            {
+                match &function.signature {
+                    ScalarType::Callable { parameters, outputs }
+                        if super::private_runtime_write_signature(parameters, &outputs.outputs) =>
+                            function.parameters.first().cloned(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+    }
+
+    pub(super) fn allows_private_runtime_write_candidate(&self, base: &ScalarPlace) -> bool {
+        matches!((self.private_runtime_write_formal.as_deref(), base),
+            (Some(formal), ScalarPlace::Dereference { pointer, .. }) if matches!(pointer.as_ref(),
+                ScalarExpression::Name { name, .. } if name == formal))
     }
 
     pub(super) fn record_assignment_outputs(

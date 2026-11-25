@@ -389,23 +389,25 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let formal_receipt = state.aggregate.as_ref().filter(|aggregate| !aggregate.plan().private_runtime_reads.is_empty())
+            let formal_receipt = state.aggregate.as_ref().filter(|aggregate|
+                !aggregate.plan().private_runtime_reads.is_empty() || !aggregate.plan().private_runtime_writes.is_empty())
                 .and_then(|aggregate| {
                     let nodes = state.body_call_nodes?;
                     let ordinal = nodes.place_ordinal(place)?;
-                    aggregate.plan().private_runtime_reads.contains(&ordinal).then_some((aggregate, nodes))
+                    (aggregate.plan().private_runtime_reads.contains(&ordinal) || aggregate.plan().private_runtime_writes.contains(&ordinal))
+                        .then_some((aggregate, nodes))
                 });
             let formal_pair = if let Some((aggregate, nodes)) = formal_receipt {
                 let (ScalarType::RuntimeArray { element, .. }, ScalarPlace::Dereference { pointer, .. }) =
                     (&base_type, base.as_ref())
                     else { return Err("private runtime index lost its exact dereferenced formal".into()); };
                 if !state.require_release_checked_access
-                    || nodes.lexical_expression_declaration(pointer) != aggregate.plan().private_runtime_read_formal
+                    || nodes.lexical_expression_declaration(pointer) != aggregate.plan().private_runtime_access_formal
                     || signed_runtime_scalar_element(element).is_none()
                 {
                     return Err("private runtime index changed its prepared formal or scalar element".into());
                 }
-                Some(aggregate.private_runtime_read_pair.ok_or("missing authenticated private runtime array formal")?)
+                Some(aggregate.private_runtime_access_pair.ok_or("missing authenticated private runtime array formal")?)
             } else { None };
             let borrowed_extent = if let Some((_, count)) = formal_pair { Some(count) } else { match (&base_type, base.as_ref()) {
                 (ScalarType::RuntimeArray { element, .. }, crate::ScalarPlace::Dereference { pointer, .. })

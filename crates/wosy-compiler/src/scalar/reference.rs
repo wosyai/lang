@@ -2552,14 +2552,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.aggregate_facts.read_calls.insert(id, read_call);
                 }
                 let capture_runtime_pair = self.capture_private_runtime_reads && !self.capture_call_points
+                    && !calls.declared_unsafe_calls.contains(&ordinal.0)
                     && matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
                         output: 0, target: ResolvedCallTarget::ModuleCallable {
                             concrete: ConcreteCallSelection::Declaration, .. }, argument_points, ..
-                    } if matches!(argument_points.as_slice(), [borrow, _]
-                        if self.borrowed_extent_argument(*borrow, 0).is_some()))
-                    && !calls.declared_unsafe_calls.contains(&ordinal.0)
-                    && signature.is_some_and(|signature|
-                        aggregate::private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs));
+                    } if signature.is_some_and(|signature|
+                        match argument_points.as_slice() {
+                            [borrow, _] => self.borrowed_extent_argument(*borrow, 0).is_some()
+                                && aggregate::private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs),
+                            [borrow, _, _] => self.exact_runtime_exclusive_argument(*borrow)
+                                && aggregate::private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs),
+                            _ => false,
+                        }));
                 if self.capture_call_points || self.private_scalar_tail_active || capture_runtime_pair {
                     let previous = self.cfg.primary_call_points.insert(ordinal, id);
                     assert!(previous.is_none(), "duplicate CFG call for {ordinal:?}");
@@ -4901,6 +4905,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 Some(PlainNameIdentity::Lexical(prepared)) if prepared == source)
     }
 
+    fn exact_runtime_exclusive_argument(&self, point: CfgPointId) -> bool {
+        matches!(self.cfg.points.get(point.0).map(|point| &point.kind),
+            Some(CfgPointKind::Borrow { place, loan })
+                if loan.mode == ScalarReferenceMutability::Mutable && loan.parent.is_none()
+                    && place.projections.is_empty() && loan.origin_place.binding == place.binding
+                    && matches!(place.place, ScalarPlace::Name { .. })
+                    && self.cfg.allocations.contains(&place.binding))
+    }
+
+    fn private_runtime_formal_store(
+        &self, place: &ScalarPlace, destination: OccurrenceOrdinal,
+        pointer_point: CfgPointId, value_type: &ScalarType,
+    ) -> bool {
+        let ScalarPlace::Index { base, .. } = place else { return false; };
+        let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return false; };
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) { return false; }
+        let [formal, _, _] = self.call_sites.boundary.parameters.as_slice() else { return false; };
+        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &formal.ty
+            else { return false; };
+        let ScalarType::RuntimeArray { element, .. } = inner.as_ref() else { return false; };
+        if element.as_ref() != value_type || !aggregate::ordinary_value(value_type) { return false; }
+        let CfgPointKind::Read { binding } = &self.cfg.points[pointer_point.0].kind else { return false; };
+        if binding.declaration_span != formal.span { return false; }
+        let base = self.place_ordinal(OccurrenceParent::Place(destination), OccurrenceEdge::PlaceBase);
+        let pointer = self.expression_ordinal(OccurrenceParent::Place(base), OccurrenceEdge::DereferencePointer);
+        let index = self.expression_ordinal(OccurrenceParent::Place(destination), OccurrenceEdge::PlaceIndex);
+        let checked = &self.call_sites.structure.checked_types;
+        matches!(self.call_sites.prepared_plain_name(pointer), Some(PlainNameIdentity::Lexical(exact)) if exact == binding)
+            && checked.places.get(&destination) == Some(value_type)
+            && checked.expressions.get(&index) == Some(&ScalarType::U64)
+    }
+
     fn borrowed_extent_argument(
         &self,
         argument: CfgPointId,
@@ -6753,6 +6789,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
                         };
                         let FrozenInstall { rhs: rhs_point, install } = emitted;
+                        if let CfgPointKind::AssignThrough { pointer_point, .. } = self.cfg.points[install.0].kind {
+                            let runtime_writer = matches!(&target.place, ScalarPlace::Index { base, .. }
+                                if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
+                                && matches!(&self.cfg.points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                                    if matches!(self.binding_types.get(binding),
+                                        Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                                            if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })));
+                            if runtime_writer {
+                                if !self.capture_private_runtime_reads || capture.is_some()
+                                    || assignment.targets.len() != 1 || assignment.values.len() != 1 || position != 0
+                                    || !self.private_runtime_formal_store(&target.place, slot.destination, pointer_point, &output_types[position])
+                                {
+                                    return Err(self.missing_context(target.target_span,
+                                        ReferenceAnalysisErrorReason::MissingDereferencedArrayWriteExtent));
+                                }
+                                self.proof_points.private_runtime_formal_stores.insert(install, slot.destination);
+                            }
+                        }
                         if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
                             && position == 0 && aggregate::ordinary_value(&output_types[position])
                             && matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ty == &output_types[position])
@@ -16330,10 +16384,12 @@ fn derive_module_reference_cohort(
                 source, function, &module_names, &call_sites.functions[&index],
                 structs, enums, Some(&call_sites.shared_scalar_read_effects), capture, &mut errors,
             );
-            if capture.private_runtime_reads && !result.cfg.runtime_array_read_sites.is_empty()
-                && aggregate::private_runtime_read_declaration(function)
-                && result.cfg.runtime_array_read_sites.keys().any(|&point| result.cfg.pending_runtime_array_formal(point).is_some())
-            {
+            if capture.private_runtime_reads && (
+                (!result.cfg.runtime_array_read_sites.is_empty()
+                    && aggregate::private_runtime_read_declaration(function)
+                    && result.cfg.runtime_array_read_sites.keys().any(|&point| result.cfg.pending_runtime_array_formal(point).is_some()))
+                || !result.proof_points.private_runtime_formal_stores.is_empty()
+            ) {
                 pending_runtime_read(index);
             }
             let position = updates.len();

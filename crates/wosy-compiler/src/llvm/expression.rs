@@ -811,7 +811,7 @@ fn emit_prepared_call<'ctx, 'module>(
     let Some(ScalarType::Callable { parameters, .. }) = state.signatures.get(target) else {
         return Err(state.missing_prepared_signature(target));
     };
-    if let Some(value) = aggregate_transfer::emit_private_runtime_read_call(
+    if let Some(value) = aggregate_transfer::emit_private_runtime_access_call(
         context, state, expression, target, arguments, parameters, project,
     )? {
         return Ok(value);
