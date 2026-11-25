@@ -175,7 +175,7 @@ pub(super) fn run<Scalar: ScalarCatalogEvidence>(
         (run.active, run.directives, run.actual.into_diagnostics(run.symbolic), Vec::new(), run.entry_evidence)
     };
     Ok(MainFlowProofReceipt {
-        active, directives, diagnostics: scalar.actual, contextual_diagnostic: None,
+        active, directives, diagnostics: scalar.actual, contextual_diagnostic: None, pointer_effect_diagnostic: None,
         aggregate_diagnostics, symbolic_diagnostic: scalar.symbolic,
         additional_symbolic_diagnostics: scalar.additional, entry_evidence,
     })

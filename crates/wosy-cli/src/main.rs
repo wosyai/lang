@@ -1295,7 +1295,23 @@ fn check_command(
             message: "proof obligation failed".to_owned(), labels, notes,
         }
     });
-    let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).collect::<Vec<_>>();
+    let pointer_effect = report.pointer_effect_diagnostic.iter().map(|failure| Diagnostic {
+        code: String::new(), severity: DiagnosticSeverity::Error,
+        message: "proof obligation failed".to_owned(),
+        labels: vec![
+            DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
+                message: "not satisfied by this symbolic pointee update".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.read.clone(),
+                message: "first read of the entry pointee".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.write.clone(),
+                message: "write determining the exit pointee".to_owned() },
+        ],
+        notes: vec![format!("pointee at entry: {}; at exit: {}; goal requires: {}",
+            failure.entry, failure.observed, failure.expected)],
+    });
+    let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).chain(pointer_effect).collect::<Vec<_>>();
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);

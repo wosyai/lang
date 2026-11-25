@@ -11,6 +11,8 @@ mod case_splits;
 #[cfg(feature = "internal-checker")]
 mod catalog_composition;
 #[cfg(feature = "internal-checker")]
+mod pointer_proof;
+#[cfg(feature = "internal-checker")]
 mod ranked;
 #[cfg(feature = "internal-checker")]
 mod ranked_float;
@@ -4794,10 +4796,23 @@ pub struct MainFlowProofReceipt {
     pub directives: Vec<ScalarOrderedCheckerFailure>,
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
+    pub pointer_effect_diagnostic: Option<PointerEffectProofDiagnostic>,
     pub aggregate_diagnostics: Vec<AggregateProofDiagnostic>,
     pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
     pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
     pub entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct PointerEffectProofDiagnostic {
+    pub proof: wosy_syntax::SourceSpan,
+    pub goal: wosy_syntax::SourceSpan,
+    pub read: wosy_syntax::SourceSpan,
+    pub write: wosy_syntax::SourceSpan,
+    pub entry: BigInt,
+    pub expected: BigInt,
+    pub observed: BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -8132,7 +8147,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
+        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
     })
@@ -8241,7 +8256,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             }
         };
         return Ok(MainFlowProofReceipt {
-            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostics: Vec::new(),
+            active, directives, diagnostics: Vec::new(), contextual_diagnostic, pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
@@ -8299,6 +8314,12 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     let mut plans = Vec::new();
     for (source, name, definition, query) in std::iter::once(&first).chain(&others) {
         let selected = prepared.resolve_selected_proof(definition, *query)?;
+        if pointer_proof::is_unit_target(&selected) {
+            if !others.is_empty() || startup_count != 1 || project.modules.len() != 1 || *source != &prepared.source {
+                return Err(ProjectCheck::Unsupported);
+            }
+            return pointer_proof::Plan::prepare(source, selected)?.run(&prepared.prepared, scope);
+        }
         if array_quantifier::is_array_target(&selected) {
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
             arrays.push(array_quantifier::ArrayProof::prepare(source, selected)?);
