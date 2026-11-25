@@ -15768,6 +15768,61 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_authored_compound_cases_partition_reached_and_symbolic_inputs() {
+        let app = source("src/main.w", "ordered-authored-compound-cases");
+        let program = r#"%%start
+            u8(u8) classify = fn(value) {
+                if (value == 0) { 1 }
+                else { if (value >= 10) { 1 } else { 2 } }
+            };
+            proof partitioned for classify(x) -> (out) ensures (out <= 2) {
+                if (!(x >= 1 && x < 10) || false) {
+                    if (x == 0 || x == 255) { core.show(out == 1); }
+                    else { core.show(out < 2); }
+                } else {
+                    core.show(out == 2);
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, parsed) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(parsed, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let checked = run(program, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(checked.active && checked.symbolic_diagnostic.is_none());
+        assert!(!run(program, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+        let wrong = program.replace("x < 10", "x <= 10");
+        let symbolic = run(&wrong, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        let span = symbolic.failed_step.unwrap().range;
+        assert_eq!(&wrong[span.start as usize..span.end as usize], "core.show(out == 2)");
+        let ten = BigInt::from(10);
+        assert_eq!(symbolic.returned, BigInt::from(1));
+        assert!(symbolic.witness.intervals_at(0, 0).unwrap().eq([(&ten, &ten)]));
+        let reach = |text: &str| text.replace("%%end",
+            "u8 low = classify(0); u8 mid = classify(5); u8 edge = classify(10);
+             u8 high = classify(255); %%end");
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let valid = run(&reach(program), scope).unwrap();
+            assert!(valid.active && valid.diagnostics.is_empty() && valid.symbolic_diagnostic.is_none());
+            let actual = reach(&wrong);
+            let failure = run(&actual, scope).unwrap();
+            let [diagnostic] = failure.diagnostics.as_slice() else { panic!("only one actual input fails"); };
+            let snippet = |span: ByteSpan| &actual[span.start as usize..span.end as usize];
+            assert_eq!(snippet(diagnostic.failed_step.as_ref().unwrap().range), "core.show(out == 2)");
+            assert_eq!(snippet(diagnostic.invocation.call.range), "classify(10)");
+            assert_eq!(diagnostic.invocation.arguments, [(ScalarType::U8, ten.clone())]);
+            assert!(failure.symbolic_diagnostic.is_none());
+        }
+        let invalid = program.replace("|| false", "|| (false && x == 256)");
+        assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::InvalidProof)));
+        let unsupported = program.replace("|| false", "|| (false && core.old(x) == 99)");
+        assert!(matches!(run(&unsupported, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_pure_affine_proof_observes_typed_conditional_joins_and_returns() {
         let app = source("src/main.w", "ordinary-branching-pure-proof");
         let text = r#"%%start

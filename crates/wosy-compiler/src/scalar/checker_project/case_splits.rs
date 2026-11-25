@@ -51,6 +51,7 @@ impl Claim<'_> {
 
 enum Condition {
     Boolean(bool),
+    Partition { yes: IntegerSet, no: IntegerSet },
     Integer { operator: BinaryOperator, relation: IntegerRelation, bound: BigInt },
 }
 
@@ -58,6 +59,7 @@ impl Condition {
     fn holds(&self, input: &BigInt) -> bool {
         match self {
             Self::Boolean(value) => *value,
+            Self::Partition { yes, .. } => yes.contains(input),
             Self::Integer { relation, bound, .. } => relation.accepts(input.cmp(bound)),
         }
     }
@@ -155,6 +157,77 @@ struct CompileWork {
     has_citations: bool,
 }
 
+fn compile_condition(
+    expression: &ScalarExpression, plan: &PlannedModuleProof<'_>, entry: &ReferenceBindingId,
+    work: &mut CompileWork,
+) -> Result<Condition, ProjectCheck> {
+    let typed = &plan.typed;
+    let leaf = |expression: &ScalarExpression| {
+        match proof_input_condition::<true>(expression, &typed.input_names, typed.body, false)? {
+            CheckerPredicate::Boolean(value) => Ok(Condition::Boolean(value)),
+            CheckerPredicate::Integer(guard) if &guard.binding == entry => {
+                let relation = IntegerRelation::from_operator(&guard.operator).ok_or(ProjectCheck::Unsupported)?;
+                Ok(Condition::Integer { operator: guard.operator, relation, bound: guard.bound })
+            }
+            _ => Err(ProjectCheck::Unsupported),
+        }
+    };
+    if !matches!(expression, ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, .. }
+        | ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. })
+    {
+        return leaf(expression);
+    }
+    let [parameter] = typed.body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let universe = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
+    let (yes, no) = compile_partition(expression, &universe, &leaf, 0, &mut work.preparation)?;
+    charge_call_work(&mut work.observation, yes.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+    Ok(Condition::Partition { yes, no })
+}
+
+fn intersect(left: &IntegerSet, right: &IntegerSet) -> IntegerSet {
+    match left.intersection(right) {
+        IntegerIntersection::Unchanged => left.clone(),
+        IntegerIntersection::Empty => IntegerSet::default(),
+        IntegerIntersection::Changed(result) => result,
+    }
+}
+
+// Both sides describe the same typed universe. Boolean operations combine
+// exact complementary domains, not independent approximations of truth.
+fn compile_partition(
+    expression: &ScalarExpression, universe: &IntegerSet,
+    leaf: &impl Fn(&ScalarExpression) -> Result<Condition, ProjectCheck>,
+    depth: usize, work: &mut usize,
+) -> Result<(IntegerSet, IntegerSet), ProjectCheck> {
+    if depth == MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
+    charge_call_work(work, 1).ok_or(ProjectCheck::Unsupported)?;
+    match expression {
+        ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } => {
+            let (yes, no) = compile_partition(operand, universe, leaf, depth + 1, work)?;
+            Ok((no, yes))
+        }
+        ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
+            // Validate both sides even when a literal makes one side unreachable.
+            let (left_yes, left_no) = compile_partition(left, universe, leaf, depth + 1, work)?;
+            let (right_yes, right_no) = compile_partition(right, universe, leaf, depth + 1, work)?;
+            for set in [&left_yes, &left_no, &right_yes, &right_no] {
+                charge_call_work(work, set.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            }
+            if *operator == BinaryOperator::And {
+                Ok((intersect(&left_yes, &right_yes), left_no.join(right_no)))
+            } else {
+                Ok((left_yes.join(right_yes), intersect(&left_no, &right_no)))
+            }
+        }
+        _ => match leaf(expression)? {
+            Condition::Boolean(true) => Ok((universe.clone(), IntegerSet::default())),
+            Condition::Boolean(false) => Ok((IntegerSet::default(), universe.clone())),
+            Condition::Integer { relation, bound, .. } => Ok(universe.split_relation(relation, &bound)),
+            Condition::Partition { .. } => Err(ProjectCheck::Unsupported),
+        }
+    }
+}
+
 fn compile<'a>(
     block: &'a ScalarBlock, plan: &'a PlannedModuleProof<'a>, entry: &ReferenceBindingId,
     catalog: Option<&PublicProofCatalog<'a>>, mut current: rewrite::Goal<'a>,
@@ -167,16 +240,6 @@ fn compile<'a>(
     charge_call_work(&mut work.preparation, block.items.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
         .ok_or(ProjectCheck::Unsupported)?;
     charge_call_work(&mut work.observation, 1).ok_or(ProjectCheck::Unsupported)?;
-    let condition = |expression: &ScalarExpression| {
-        match proof_input_condition::<true>(expression, &typed.input_names, typed.body, false)? {
-            CheckerPredicate::Boolean(value) => Ok(Condition::Boolean(value)),
-            CheckerPredicate::Integer(guard) if &guard.binding == entry => {
-                let relation = IntegerRelation::from_operator(&guard.operator).ok_or(ProjectCheck::Unsupported)?;
-                Ok(Condition::Integer { operator: guard.operator, relation, bound: guard.bound })
-            }
-            _ => Err(ProjectCheck::Unsupported),
-        }
-    };
     let mut steps = Vec::with_capacity(block.items.len());
     for (item, &terminated) in block.items.iter().zip(&block.terminated_items) {
         let visible = VisibleShows { local: &steps, outer };
@@ -194,11 +257,11 @@ fn compile<'a>(
         let cited = terminated.then(|| plan.peer_use_step(item)).flatten();
         let step = match item {
             ScalarBlockItem::Expression(ScalarExpression::If { condition: predicate, then_branch, else_branch, .. }) =>
-                Step::Split(condition(predicate)?,
+                Step::Split(compile_condition(predicate, plan, entry, work)?,
                     compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?,
                     compile(else_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?),
             ScalarBlockItem::Expression(ScalarExpression::UnitIf { condition: predicate, then_branch, .. }) =>
-                Step::Split(condition(predicate)?,
+                Step::Split(compile_condition(predicate, plan, entry, work)?,
                     compile(then_branch, plan, entry, catalog, current.clone(), Some(&visible), depth + 1, work)?, Vec::new()),
             _ if cited.is_some() => {
                 let name = cited.ok_or(ProjectCheck::Unsupported)?;
@@ -260,6 +323,16 @@ fn check_partitions<'body>(
             }
             Step::Split(Condition::Boolean(guard), yes, no) =>
                 check_partitions(if *guard { yes } else { no }, producer, returned, domain, work, cite)?,
+            Step::Split(Condition::Partition { yes: positive, no: negative }, yes, no) => {
+                let cost = domain.interval_count().checked_mul(2)?
+                    .checked_add(positive.interval_count())?.checked_add(negative.interval_count())?;
+                charge_call_work(work, cost)?;
+                let admitted = intersect(domain, positive);
+                let verdict = check_partitions(yes, producer, returned, &admitted, work, cite)?;
+                if !matches!(verdict, Verdict::Established) { return Some(verdict); }
+                let excluded = intersect(domain, negative);
+                check_partitions(no, producer, returned, &excluded, work, cite)?
+            }
             Step::Split(Condition::Integer { operator, bound, .. }, yes, no) => {
                 charge_call_work(work, domain.interval_count())?;
                 let (admitted, excluded) = domain.split(operator, bound)?;
