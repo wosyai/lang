@@ -16992,3 +16992,77 @@ if (observe(1, 42) != 84) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn fixed_checked_array_element_reborrow_keeps_exact_parent_and_lifetime() {
+    let text = "%%start
+u8(u8) update = fn(value) {
+    u8[3] cells = [7, 8, 9];
+    *!(u8[3]) writer = &!cells;
+    *!u8 element = &!(*writer)[1];
+    *element = value;
+    u8 written = *element;
+    written + (*writer)[2]
+};
+u8(u8) read = fn(value) {
+    u8[3] cells = [7, 8, value];
+    *(u8[3]) reader = &cells;
+    *u8 element = &(*reader)[2];
+    *element
+};
+if (update(42) != 51 || read(19) != 19) { core.system_panic(); };
+%%end";
+    let dynamic = text.replace("u8(u8) update = fn(value)", "u8(u8,u64) update = fn(value,index)")
+        .replace("&!(*writer)[1]", "&!(*writer)[index]").replace("update(42)", "update(42,1)");
+    let overlap = text.replace("    u8 written = *element;", "    (*writer)[1] = value;\n    u8 written = *element;");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let checked_source = prepared.checked_access_source().unwrap();
+        let null = format!("call void @{}(", project_function_name(checked_source, "check_non_null_address"));
+        for (name, index) in [("update", 1), ("read", 2)] {
+            let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, name));
+            let guard = body.find(&null).unwrap();
+            let from_parent = body[guard..].lines().find(|line| line.contains(" = inttoptr ")).unwrap();
+            let parent = from_parent.trim().split_once(" = ").unwrap().0;
+            let element = body.lines().find(|line|
+                line.contains(&format!("getelementptr inbounds [3 x i8], ptr {parent},"))).unwrap();
+            let address = element.trim().split_once(" = ").unwrap().0;
+            let child = format!("ptrtoint ptr {address} to i");
+            let locations = [&null[..], from_parent, element, &child].map(|needle| body.find(needle).unwrap());
+            assert!(locations.windows(2).all(|pair| pair[0] < pair[1]), "{body}");
+            assert!(element.trim_end().ends_with(&format!(" {index}")), "{body}");
+            assert!(body[locations[3]..].contains(&null), "{body}");
+        }
+        if let Some(out) = std::env::var_os("WOSY_FIXED_ELEMENT_REBORROW_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+        for (test, reason) in [
+            (&dynamic, "checked projected borrow requires a proved in-range index"),
+            (&overlap, "read or move of unavailable place"),
+        ] {
+            let diagnostics = match prepare(test) {
+                Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+                Err(error) => error.diagnostics.clone(),
+            };
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.message == reason
+                && (test != &overlap || diagnostic.labels.iter().any(|label|
+                    label.message == "origin of conflicting place or loan"))), "{diagnostics:?}");
+        }
+    }
+}

@@ -3072,6 +3072,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.reject_fallible_address(place, place_ordinal, span)?;
                 }
                 let proof_place = self.proof_place(place, place_ordinal);
+                if direct_checked_index_base(place).is_some_and(|(_, index)| !matches!(index, ScalarExpression::Integer { .. })) {
+                    return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedCheckedArrayIndex));
+                }
                 if let ScalarPlace::Index { base, index, .. } = proof_place.as_ref() {
                     if direct_checked_field_base(base).is_some()
                         && !matches!(index.as_ref(), ScalarExpression::Integer { .. })
@@ -3382,7 +3385,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         BTreeSet::from([id]),
                     );
                     if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
-                        self.has_projected_child |= direct_checked_field_base(place).is_some();
+                        self.has_projected_child |= is_direct_checked_leaf(place);
                         self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
                             borrow,
                             pointer,
@@ -9827,6 +9830,16 @@ fn direct_checked_field_base(place: &ScalarPlace) -> Option<(&ScalarExpression, 
     Some((pointer, field))
 }
 
+fn direct_checked_index_base(place: &ScalarPlace) -> Option<(&ScalarExpression, &ScalarExpression)> {
+    let ScalarPlace::Index { base, index, .. } = place else { return None; };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+    Some((pointer, index))
+}
+
+fn is_direct_checked_leaf(place: &ScalarPlace) -> bool {
+    direct_checked_field_base(place).is_some() || direct_checked_index_base(place).is_some()
+}
+
 #[derive(Clone, Copy)]
 struct CheckedProjectedReborrowRead<'a> {
     pointer: CfgPointId,
@@ -9844,9 +9857,23 @@ fn checked_projected_reborrow_read<'a>(
         return None;
     }
     let read = points.get(authority.pointer.0)?;
+    let CfgPointKind::Borrow { place, .. } = &borrow.kind else { return None; };
+    let binding = if let Some((_, index @ ScalarExpression::Integer { .. })) = direct_checked_index_base(&place.place) {
+        let [selector] = read.successors.as_slice() else { return None; };
+        let selector = points.get(selector.0)?;
+        if read.id >= selector.id || selector.id >= borrow.id || read.scope != borrow.scope
+            || selector.scope != borrow.scope || selector.successors.as_slice() != [borrow.id]
+            || !matches!(&selector.kind, CfgPointKind::Evaluate(actual) if actual == index)
+            || selector.source_span.range != expression_span(index)
+        { return None; }
+        let CfgPointKind::Read { binding } = &read.kind else { return None; };
+        binding
+    } else {
+        exact_reborrow_read_edge(read, borrow)?
+    };
     Some(CheckedProjectedReborrowRead {
         pointer: authority.pointer,
-        binding: exact_reborrow_read_edge(read, borrow)?,
+        binding,
         span: read.source_span.range,
         origin: authority.origin,
     })
@@ -9871,12 +9898,24 @@ fn checked_projected_reborrow_parent_on_edge(
     authority: CheckedProjectedReborrowRead<'_>,
     loan: &ReferenceLoanId,
 ) -> bool {
-    let Some((ScalarExpression::Name { span, .. }, field @ ScalarFieldReference::Resolved(_))) =
-        direct_checked_field_base(&loan.origin_place.place)
-    else { return false };
-    let [ReferencePlaceProjection::Dereference(projected_parent), ReferencePlaceProjection::Field(projected_field)] =
-        loan.origin_place.projections.as_slice()
-    else { return false };
+    let projections = loan.origin_place.projections.as_slice();
+    let (span, projected_parent) = if let (
+        Some((ScalarExpression::Name { span, .. }, field @ ScalarFieldReference::Resolved(_))),
+        [ReferencePlaceProjection::Dereference(parent), ReferencePlaceProjection::Field(projected)],
+    ) = (direct_checked_field_base(&loan.origin_place.place), projections)
+    {
+        if field != projected { return false; }
+        (span, parent)
+    } else if let (
+        Some((ScalarExpression::Name { span, .. }, index @ ScalarExpression::Integer { .. })),
+        [ReferencePlaceProjection::Dereference(parent), ReferencePlaceProjection::Index(projected)],
+    ) = (direct_checked_index_base(&loan.origin_place.place), projections)
+    {
+        if index != projected { return false; }
+        (span, parent)
+    } else {
+        return false;
+    };
     let Some(ReferenceOrigin::Fresh { loan: parent, .. }) = facts.get(authority.origin.0)
     else { return false };
     let binding = authority.binding;
@@ -9886,7 +9925,6 @@ fn checked_projected_reborrow_parent_on_edge(
         || !matches!(owner.place, ScalarPlace::Name { .. })
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
         || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
-        || field != projected_field
         || (loan.mode == ScalarReferenceMutability::Mutable && parent.mode != ScalarReferenceMutability::Mutable)
     {
         return false;
@@ -10420,7 +10458,7 @@ fn transfer_reference_facts(
         }
         match &point.kind {
             CfgPointKind::Borrow { loan, .. }
-                if direct_checked_field_base(&loan.origin_place.place).is_some() =>
+                if is_direct_checked_leaf(&loan.origin_place.place) =>
             {
                 let authority = cfg.named_reborrow_parents
                     .binary_search_by_key(&point.id, |parent| parent.borrow)
@@ -10878,7 +10916,7 @@ fn transfer_reference_facts(
             Some((family, holder, argument))
         });
         let projected_loan = match &initial_point.kind {
-            CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
+            CfgPointKind::Borrow { place, loan } if is_direct_checked_leaf(&place.place) => Some(loan),
             _ => None,
         };
         let projected_authority = projected_loan.and_then(|_| projected_leaf_sites.get(&id).copied());

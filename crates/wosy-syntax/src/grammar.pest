@@ -66,7 +66,7 @@ conditional_else = !{ &ANY ~ "else" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 assignment = { assignment_targets ~ "=" ~ output_list }
 assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
-assignment_target = { indexed_value_place | indexed_dereference_assignment | dereference | qualified_member | dereferenced_field | identifier }
+assignment_target = { indexed_value_place | indexed_dereference_place | dereference | qualified_member | dereferenced_field | identifier }
 receiver_list = { receiver ~ ("," ~ receiver)* }
 receiver = { type_spec ~ identifier }
 output_list = { expression ~ ("," ~ expression)* }
@@ -91,10 +91,10 @@ struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
 array_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 raw_address = { "&?" ~ place_target }
-checked_address = { "&" ~ checked_address_mutability? ~ (place_target | parenthesized_dereference_place) }
+checked_address = { "&" ~ checked_address_mutability? ~ (place_target | indexed_dereference_place | parenthesized_dereference_place) }
 checked_address_mutability = { "!" }
 parenthesized_dereference_place = { "(" ~ dereference ~ ")" }
-indexed_dereference_assignment = { parenthesized_dereference_place ~ index_suffix+ }
+indexed_dereference_place = { parenthesized_dereference_place ~ index_suffix+ }
 place_target = { indexed_place | non_indexed_assignment_target }
 non_indexed_assignment_target = { dereference | qualified_member | dereferenced_field | identifier }
 indexed_place = { indexed_place_body }

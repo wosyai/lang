@@ -4730,7 +4730,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| {
                     matches!(
                         child.kind(),
-                        SyntaxKind::PlaceTarget | SyntaxKind::ParenthesizedDereferencePlace
+                        SyntaxKind::PlaceTarget | SyntaxKind::ParenthesizedDereferencePlace | SyntaxKind::IndexedPlace
                     )
                 })
                 .expect("checked address target");

@@ -5201,13 +5201,18 @@ fn permits_named_checked_field_borrow(
         && matches!(inner.as_ref(), ScalarType::Struct(_)))
 }
 
-fn named_checked_field_index<'a>(
+fn named_checked_fixed_projection_index<'a>(
     place: &'a ScalarPlace,
     mode: ScalarReferenceMutability,
     scope: &BTreeMap<String, ScalarType>,
 ) -> Option<(&'a ScalarPlace, &'a ScalarExpression)> {
     let ScalarPlace::Index { base, index, .. } = place else { return None };
-    permits_named_checked_field_borrow(base, mode, scope).then_some((base, index))
+    let direct = matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+        if matches!(pointer.as_ref(), ScalarExpression::Name { name, .. }
+            if matches!(scope.get(name), Some(ScalarType::CheckedReference { mutability, inner })
+                if (mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+                    && matches!(inner.as_ref(), ScalarType::Array { .. }))));
+    (direct || permits_named_checked_field_borrow(base, mode, scope)).then_some((base, index))
 }
 
 fn checked_projected_element(
@@ -5256,7 +5261,7 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if let Some((base, index)) = named_checked_field_index(place, mutability, scope) {
+    if let Some((base, index)) = named_checked_fixed_projection_index(place, mutability, scope) {
         let array = checked_dereference_type(base, span, scope, program, diagnostics, false, overloads, inference);
         let index_type = expression_type_expected(index, &ScalarType::U64, scope,
             &BTreeSet::new(), &BTreeMap::new(), program, diagnostics, false, overloads, inference);
@@ -5354,7 +5359,7 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if let Some((base, index)) = named_checked_field_index(place, mutability, scope) {
+    if let Some((base, index)) = named_checked_fixed_projection_index(place, mutability, scope) {
         let array = checked_dereference_type_in_module(base, span, scope, module, modules,
             diagnostics, false, overloads, inference);
         let index_type = expression_type_in_module_expected(index, Some(&ScalarType::U64), scope,
