@@ -13,6 +13,10 @@ fn charge(work: &mut usize, cost: usize) -> Result<(), ProjectCheck> {
 }
 
 impl<'a> TypedInductionRank<'a> {
+    pub(super) fn entries(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
+        std::iter::once(self.first_parameter).chain(self.second_parameter)
+    }
+
     fn axes(self) -> impl Iterator<Item = TypedEntryMeasure<'a>> {
         self.earlier.into_iter().chain([self.descending])
     }
@@ -25,7 +29,7 @@ impl Rectangle {
     fn entry(
         rank: TypedInductionRank<'_>, filter: &[CheckerPredicate], work: &mut usize,
     ) -> Result<Self, ProjectCheck> {
-        let mut axes = rank.axes().map(|(slot, _)| IntegerSet::from_type(&slot.ty)
+        let mut axes = rank.entries().map(|(slot, _)| IntegerSet::from_type(&slot.ty)
             .ok_or(ProjectCheck::Unsupported)).collect::<Result<Vec<_>, _>>()?;
         charge(work, filter.len())?;
         for atom in filter {
@@ -33,13 +37,13 @@ impl Rectangle {
                 CheckerPredicate::Boolean(false) => axes[0] = IntegerSet::default(),
                 CheckerPredicate::Boolean(true) => {}
                 CheckerPredicate::Integer(p) => {
-                    let i = rank.axes().position(|(slot, id)| id == &p.binding && slot.ty == p.ty)
+                    let i = rank.entries().position(|(slot, id)| id == &p.binding && slot.ty == p.ty)
                         .ok_or(ProjectCheck::Unsupported)?;
                     charge(work, axes[i].interval_count())?;
                     axes[i] = axes[i].keep(&p.operator, &p.bound).ok_or(ProjectCheck::Unsupported)?;
                 }
                 CheckerPredicate::EntryDomain { binding, values } => {
-                    let i = rank.axes().position(|(_, id)| id == binding).ok_or(ProjectCheck::Unsupported)?;
+                    let i = rank.entries().position(|(_, id)| id == binding).ok_or(ProjectCheck::Unsupported)?;
                     charge(work, axes[i].interval_count().saturating_add(values.interval_count()))?;
                     match axes[i].intersection(values) {
                         IntegerIntersection::Unchanged => {}
@@ -66,7 +70,7 @@ impl Rectangle {
                 if *value { (0, full, IntegerSet::default()) } else { (0, IntegerSet::default(), full) }
             }
             CheckerPredicate::Integer(p) => {
-                let i = rank.axes().position(|(slot, id)| id == &p.binding && slot.ty == p.ty)
+                let i = rank.entries().position(|(slot, id)| id == &p.binding && slot.ty == p.ty)
                     .ok_or(ProjectCheck::Unsupported)?;
                 let (yes, no) = std::mem::take(&mut self.0[i]).split(&p.operator, &p.bound)
                     .ok_or(ProjectCheck::Unsupported)?;
@@ -121,11 +125,11 @@ fn self_use<'a>(
         else { return Err(ProjectCheck::Unsupported); };
     if steps.terminated_items.as_slice() != [true] || core != "core" || instruction != "use"
         || cited != name || !type_arguments.is_empty() || !outer_types.is_empty()
-        || arguments.len() != typed.input_names.len() || arguments.len() != rank.axes().count()
+        || arguments.len() != typed.input_names.len() || arguments.len() != rank.entries().count()
     {
         return Err(ProjectCheck::Unsupported);
     }
-    rank.axes().map(|(slot, _)| {
+    rank.entries().map(|(slot, _)| {
         let entry = typed.input_names.get(slot.ordinal).ok_or(ProjectCheck::Unsupported)?;
         Coordinate::read(&arguments[slot.ordinal], &slot.ty,
             |expr| matches!(expr, ScalarExpression::Name { name, .. } if name == entry))
@@ -156,7 +160,7 @@ fn check_tail(
         (body.occurrences.get(child.0)?.span == expression_span(expr)
             && structure.checked_types.expressions.get(child) == Some(ty)).then_some(*child)
     };
-    for ((slot, binding), expected) in rank.axes().zip(proof_args) {
+    for ((slot, binding), expected) in rank.entries().zip(proof_args) {
         if signature.parameters[slot.ordinal] != slot.ty { return Err(ProjectCheck::Unsupported); }
         let expr = &arguments[slot.ordinal];
         let arg = operand(call, OccurrenceEdge::CallArgument(slot.ordinal), expr, &slot.ty).ok_or(ProjectCheck::Unsupported)?;
@@ -177,23 +181,20 @@ fn transition(
     rank: TypedInductionRank<'_>, entry: &Rectangle, path: &Rectangle, arguments: &[Coordinate<'_>], work: &mut usize,
 ) -> Result<InductionPremise, ProjectCheck> {
     if !path.reachable() { return Ok(InductionPremise::Unreachable); }
-    let mut tie = true;
-    for (i, ((slot, _), arg)) in rank.axes().zip(arguments).enumerate() {
+    use std::cmp::Ordering;
+    let mut comparisons = [Ordering::Equal; 2];
+    // Authenticate every actual call argument and its guard, even if a
+    // coordinate is not ranked or an earlier coordinate already descends.
+    for (i, ((slot, _), arg)) in rank.entries().zip(arguments).enumerate() {
         let domain = &entry.0[i];
         let active = &path.0[i];
         let (low, high) = active.extremes().ok_or(ProjectCheck::Unsupported)?;
-        match arg {
-            Coordinate::Entry => {}
+        comparisons[i] = match arg {
+            Coordinate::Entry => Ordering::Equal,
             Coordinate::Literal(value) => {
                 charge(work, domain.interval_count())?;
                 if !domain.contains(value) { return Ok(InductionPremise::CalleeWhereUnproved); }
-                if tie {
-                    match value.as_ref().cmp(low) {
-                        std::cmp::Ordering::Greater => return Ok(InductionPremise::NotStrict),
-                        std::cmp::Ordering::Equal => {}
-                        std::cmp::Ordering::Less => tie = false,
-                    }
-                }
+                value.as_ref().cmp(low)
             }
             Coordinate::Offset { add, magnitude } => {
                 let moved = |x: &BigInt| if *add { x + *magnitude } else { x - *magnitude };
@@ -204,14 +205,20 @@ fn transition(
                 if !active.intervals().all(|(lo, hi)| domain.covers_closed(&moved(lo), &moved(hi))) {
                     return Ok(InductionPremise::CalleeWhereUnproved);
                 }
-                if tie && magnitude.sign() == num_bigint::Sign::Plus {
-                    if *add { return Ok(InductionPremise::NotStrict); }
-                    tie = false;
-                }
+                moved(low).cmp(low)
             }
+        };
+    }
+    // With independent axes, if an earlier coordinate can tie, all values
+    // in each suffix coordinate are possible on that tie.
+    for (slot, _) in rank.axes() {
+        match comparisons[slot.ordinal] {
+            Ordering::Greater => return Ok(InductionPremise::NotStrict),
+            Ordering::Less => return Ok(InductionPremise::Established),
+            Ordering::Equal => {}
         }
     }
-    Ok(if tie { InductionPremise::NotStrict } else { InductionPremise::Established })
+    Ok(InductionPremise::NotStrict)
 }
 
 pub(super) fn verify<'a>(
@@ -220,7 +227,7 @@ pub(super) fn verify<'a>(
     let typed = &plan.typed;
     let body = typed.body;
     let structure = &body.structure;
-    if typed.input_names.len() != rank.axes().count() || body.call_occurrences.is_empty()
+    if typed.input_names.len() != rank.entries().count() || body.call_occurrences.is_empty()
         || !body.assignments.is_empty() || !body.allocation_length_calls.is_empty()
         || !structure.checker_directives.is_empty() || !body.arms.is_empty()
         || structure.has_ordinary_contextual_places() || structure.checker_has_bool_contextual_declaration
@@ -276,7 +283,7 @@ pub(super) fn verify<'a>(
                 let point = |i: usize| path.0[i].extremes().expect("reachable axis").0.clone();
                 failure = Some(RankedBaseWitness {
                     proof_source: plan.proof_source, return_source: &typed.target.source,
-                    entry_type: rank.descending.0.ty.clone(), earlier: rank.earlier.map(|_| point(0)),
+                    entry_type: rank.second_parameter.unwrap_or(rank.first_parameter).0.ty.clone(), earlier: rank.second_parameter.map(|_| point(0)),
                     entry: point(path.0.len() - 1), returned: value,
                     return_span: body.occurrences.get(output.0).ok_or(ProjectCheck::Unsupported)?.span, rejected,
                 });

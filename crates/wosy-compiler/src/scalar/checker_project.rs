@@ -7578,9 +7578,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                         (wosy_syntax::byte_span(&goal), Some(proof_span(range)))
                     }
                 };
-                let earlier = self.rank.earlier.zip(base.earlier.as_ref());
-                let axes = earlier.into_iter().map(|((slot, binding), _)| (binding.clone(), slot.ty.clone()))
-                    .chain([(self.rank.descending.1.clone(), base.entry_type)]).collect();
+                let axes = self.rank.entries().map(|(slot, binding)| (binding.clone(), slot.ty.clone())).collect();
                 self.failure = Some(SymbolicProofDiagnostic {
                     proof: proof_span(wosy_syntax::byte_span(self.plan.proof)),
                     goal: proof_span(goal), failed_step,
@@ -7590,7 +7588,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                     witness: ScalarCheckerIntegerWitness {
                         equal_axes: Vec::new(),
                         axes,
-                        state: IntegerInputs::entry_point(earlier.map(|(_, value)| value), &base.entry),
+                        state: IntegerInputs::entry_point(base.earlier.as_ref(), &base.entry),
                     },
                     returned: base.returned.clone(),
                     returned_literal: None,
@@ -11022,6 +11020,8 @@ type TypedEntryMeasure<'a> = (&'a super::reference::ParameterSlot, &'a Reference
 
 #[derive(Clone, Copy)]
 struct TypedInductionRank<'a> {
+    first_parameter: TypedEntryMeasure<'a>,
+    second_parameter: Option<TypedEntryMeasure<'a>>,
     earlier: Option<TypedEntryMeasure<'a>>,
     descending: TypedEntryMeasure<'a>,
 }
@@ -11040,33 +11040,46 @@ fn typed_proof_decreases<'a>(
     if second.is_some() && (input_names.len() != 2 || expressions.next().is_some()) {
         return Err(ProjectCheck::Unsupported);
     }
+    let entry = |slot: usize| -> Result<TypedEntryMeasure<'a>, ProjectCheck> {
+        let parameter = body.boundary.parameters.get(slot).ok_or(ProjectCheck::InvalidProof)?;
+        let binding = body.boundary.checker_parameter_bindings.as_deref()
+            .and_then(|bindings| bindings.get(slot)).ok_or(ProjectCheck::Unsupported)?;
+        Ok((parameter, binding))
+    };
     let scalar = |expression: &CstNode| -> Result<TypedEntryMeasure<'a>, ProjectCheck> {
         let ScalarExpression::Name { name, .. } = derive_expression(expression) else {
             return Err(ProjectCheck::Unsupported);
         };
         let slot = input_names.iter().position(|input| *input == name).ok_or(ProjectCheck::InvalidProof)?;
-        let parameter = body.boundary.parameters.get(slot).ok_or(ProjectCheck::InvalidProof)?;
-        if !is_integer_type(&parameter.ty) {
-            return Err(if matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
+        let selected = entry(slot)?;
+        if !is_integer_type(&selected.0.ty) {
+            return Err(if matches!(selected.0.ty, ScalarType::F32 | ScalarType::F64) {
                 ProjectCheck::Unsupported
             } else {
                 ProjectCheck::InvalidProof
             });
         }
-        let binding = body.boundary.checker_parameter_bindings.as_deref()
-            .and_then(|bindings| bindings.get(slot)).ok_or(ProjectCheck::Unsupported)?;
-        Ok((parameter, binding))
+        Ok(selected)
     };
     let first = scalar(&first)?;
-    let rank = if let Some(second) = second {
+    let (earlier, descending) = if let Some(second) = second {
         let second = scalar(&second)?;
-        if first.0.ordinal != 0 || second.0.ordinal != 1 {
+        if first.0.ordinal == second.0.ordinal {
             return Err(ProjectCheck::Unsupported);
         }
-        TypedInductionRank { earlier: Some(first), descending: second }
+        (Some(first), second)
     } else {
-        TypedInductionRank { earlier: None, descending: first }
+        (None, first)
     };
+    let (first_parameter, second_parameter) = match input_names.len() {
+        1 => (entry(0)?, None),
+        2 => (entry(0)?, Some(entry(1)?)),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    if std::iter::once(first_parameter).chain(second_parameter).any(|(slot, _)| !is_integer_type(&slot.ty)) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let rank = TypedInductionRank { first_parameter, second_parameter, earlier, descending };
     Ok(Some(rank))
 }
 
@@ -17143,6 +17156,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             "where ((entry == -120 || entry == -110) && entry == -115)");
         let checked = run(&dead, ScalarCheckerScope::CurrentPackage).unwrap();
         assert!(!checked.active && checked.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_induction_rank_projects_checked_entries_in_authored_order() {
+        let app = source("src/main.w", "ordered-projected-rank");
+        let program = r#"%%start
+            u8(u8, u8) descend = fn(mode, left) {
+                if (left == 0) { if (mode >= 4) { 7 } else { 7 } } else { descend(5, left - 1) }
+            };
+            proof rank for descend(mode, left) -> (out)
+                where (mode >= 4 && mode <= 5 && left <= 8)
+                ensures (out == 7) decreases (left) {
+                if (left == 0) { core.show(out == 7); } else { core.use(rank(5, left - 1)); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let reached = program.replace("%%end", &format!(
+            "u8 actual = descend(4, 6); core.require(actual == 7, {OUTPUT}); %%end"));
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            for text in [reached.clone(), reached.replace("decreases (left)", "decreases (left, mode)")] {
+                let receipt = run(&text, scope).unwrap();
+                assert!(receipt.active && receipt.directives.is_empty()
+                    && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            }
+            for text in [
+                reached.replace("decreases (left)", "decreases (mode, left)"),
+                reached.replace("decreases (left)", "decreases (mode)"),
+                reached.replace("mode <= 5", "mode <= 4"),
+                reached.replace("descend(5, left", "descend(6, left"),
+                reached.replace("left - 1", "left - 0"),
+                reached.replace("descend(4, 6)", "descend(3, 6)"),
+            ] {
+                assert!(matches!(run(&text, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+        let refuted = program.replace("out == 7) decreases (left)", "out == 8) decreases (left, mode)");
+        let receipt = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+        let witness = receipt.symbolic_diagnostic.unwrap();
+        assert_eq!(witness.returned, BigInt::from(7));
+        assert!(witness.failed_step.is_none());
+        let (mode, left) = (BigInt::from(4), BigInt::from(0));
+        assert!(witness.witness.intervals_at(0, 0).unwrap().eq([(&mode, &mode)]));
+        assert!(witness.witness.intervals_at(0, 1).unwrap().eq([(&left, &left)]));
     }
 
     #[cfg(feature = "internal-checker")]
