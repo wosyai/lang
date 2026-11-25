@@ -1904,6 +1904,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_exact_contextual_counter_argument: bool,
     #[cfg(feature = "internal-checker")]
+    allow_exact_contextual_resource_guard: bool,
+    #[cfg(feature = "internal-checker")]
     allow_symbolic_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
     allow_real_integer_tail_call: bool,
@@ -6668,6 +6670,7 @@ fn independent_uniform(
 fn prepared_comparison_axes(
     roots: &IntegerRoots<'_>, comparison: &super::reference::CheckerOrdinaryIntegerComparison,
 ) -> Option<[usize; 2]> {
+    if comparison.contextual && !roots.allow_exact_contextual_resource_guard { return None; }
     let (left, left_ty) = roots.lookup(&comparison.operands[0])?;
     let (right, right_ty) = roots.lookup(&comparison.operands[1])?;
     (left_ty == &comparison.ty && right_ty == &comparison.ty).then_some([left, right])
@@ -8931,7 +8934,7 @@ impl<'a> ExactCallCursor<'a> {
 
     #[cfg(feature = "internal-checker")]
     pub(super) fn enter_contextual_unit(
-        &mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType, entry: BigInt,
+        &mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType, entry: BigInt, guarded_resource: bool,
     ) -> Option<()> {
         let axis = self.roots.axes.len();
         if axis > 1 || axis != self.roots.parameters || self.tail.is_some() || self.contextual_entry.is_some()
@@ -8948,6 +8951,7 @@ impl<'a> ExactCallCursor<'a> {
         self.block.depth = self.roots.axes.len();
         self.contextual_entry = Some((axis, entry));
         self.roots.allow_exact_contextual_counter_argument = axis == 1;
+        self.roots.allow_exact_contextual_resource_guard = axis == 1 && guarded_resource;
         Some(())
     }
 

@@ -695,6 +695,7 @@ struct ReachedContextualProof {
     retain_observations: bool,
     explicit: Option<String>,
     saw_proved_occurrence: bool,
+    saw_guarded_nonreturn: bool,
     reached_at_startup: bool,
     examined_symbolic_root: bool,
     refutation: Option<ContextualProofOccurrence>,
@@ -936,7 +937,7 @@ fn prepare_contextual_effects(
         if contextual_proofs.entries.insert(target, ReachedContextualProof {
             source: proof_source, proof: header.proof, target, formal: formal.clone(), ty: ty.clone(), goal: header.goal,
             add: header.add, amount: header.amount, observations: Vec::new(),
-            retain_observations, explicit: header.explicit, saw_proved_occurrence: false, reached_at_startup: false,
+            retain_observations, explicit: header.explicit, saw_proved_occurrence: false, saw_guarded_nonreturn: false, reached_at_startup: false,
             examined_symbolic_root: false, refutation: None,
             reusable_body: (startup_count == 1 && super::checker_flow::exact_contextual_summary_leaf(body))
                 .then_some(std::ptr::from_ref(body)),
@@ -954,7 +955,8 @@ fn complete_contextual_effects<E: OrderedRunEvidence>(
 ) -> Result<(), ProjectCheck> {
     for proof in report.contextual_proofs.entries.values() {
         if proof.refutation.is_none()
-            && (((proof.reached_at_startup || retain_observations) && !proof.saw_proved_occurrence)
+            && (((proof.reached_at_startup || retain_observations) && !proof.saw_proved_occurrence
+                && !proof.saw_guarded_nonreturn)
                 || (scope == ScalarCheckerScope::CurrentPackage && !proof.reached_at_startup && !proof.examined_symbolic_root))
         {
             return Err(ProjectCheck::Unsupported);
@@ -3105,7 +3107,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             #[cfg(not(feature = "internal-checker"))]
             let ordinary_named = false;
             let (body, source) = (frame.body, frame.source);
-            let mut sink = |failure| {
+            #[cfg(feature = "internal-checker")]
+            let mut guarded_nonreturn = false;
+            let mut sink = |failure: IntegerCheckFailure<'_>| {
+                #[cfg(feature = "internal-checker")]
+                if frame.contextual_explicit.is_some()
+                    && body.structure.checker_directives.get(&failure.directive)
+                        .is_some_and(|directive| directive.operation == CheckerOperation::Narrow)
+                    && body.structure.checker_ordinary_integer_comparisons.get(&failure.directive)
+                        .is_some_and(|comparison| comparison.contextual)
+                {
+                    guarded_nonreturn = true;
+                }
                 if let Some(collection) = active_collection {
                     collection.failures.borrow_mut().push_callable(body, source, failure);
                 }
@@ -3267,6 +3280,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         parent.cursor.resume_exact_local_update(binding, ty, entry, exit)
                             .ok_or(ProjectCheck::Unsupported)?;
                         continue;
+                    }
+                    #[cfg(feature = "internal-checker")]
+                    if guarded_nonreturn && matches!(result, ActualCallResult::EmptyUnit) {
+                        let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
+                        let mut effects = ordered.failures.borrow_mut();
+                        let proof = effects.contextual_proofs.entries.get_mut(&target).ok_or(ProjectCheck::Unsupported)?;
+                        if !matches!(proof.amount, super::contextual::ContextualProofAmount::EntryParameter(_)) {
+                            return Err(ProjectCheck::Unsupported);
+                        }
+                        // Only a real direct Narrow failure with no return:
+                        // retain its ordinary witness, never manufacture an
+                        // exit, summary, or postcondition for this occurrence.
+                        proof.saw_guarded_nonreturn = true;
                     }
                     parent.cursor.resume(effect, caller_axis, result).ok_or(ProjectCheck::Unsupported)?;
                 }
@@ -3649,7 +3675,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let verified_result = if let Some(exit) = verified_exit {
                 Some((value, exit))
             } else {
-                cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
+                let guarded_resource = explicit.is_some() && collection.is_some_and(|ordered|
+                    ordered.failures.borrow().contextual_proofs.entries.get(&target).is_some_and(|proof|
+                        matches!(proof.amount, super::contextual::ContextualProofAmount::EntryParameter(_))));
+                cursor.enter_contextual_unit(formal, ty, value, guarded_resource).ok_or(ProjectCheck::Unsupported)?;
                 None
             };
             (Some(origin), explicit, verified_result)
@@ -24579,6 +24608,59 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert_eq!(&stale[after.start as usize..after.end as usize], "core.context.credit == 3");
                 let unmatched = provider.split_once("proof debit").unwrap().0.to_owned() + "%%end";
                 assert!(matches!(run(&root, &unmatched, scope), Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn guarded_variable_credit_debit_closes_insufficient_paths_and_restores_shadow() {
+        let app = source("src/main.w", "guarded-variable-debit-root");
+        let lib = source("src/credit.w", "guarded-variable-debit-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                if (true) {
+                    u8 core.context.credit = 5;
+                    accounting.spend(2);
+                    core.require(core.context.credit == 3, OUTPUT);
+                };
+                core.require(core.context.credit == 3, OUTPUT);
+                u8 cost = 1;
+                accounting.spend(cost);
+                core.require(core.context.credit == 2, OUTPUT);
+            };
+            entry();
+        %%end"#.replace("OUTPUT", OUTPUT);
+        let provider = r#"%%start
+            unit(u8) spend = fn(charged) {
+                core.narrow(core.context.credit >= charged, {
+                    .stdout = ""; .stderr = "insufficient credit"; .code = 68; .files = [];
+                });
+                core.context.credit = core.context.credit - charged;
+            };
+            proof debit for spend(cost) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - cost) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, scope| {
+                let (_, root_proof) = crate::parse_configured_root_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+                let (_, lib_proof) = crate::parse_configured_proof_source(lib.clone(), provider.to_owned(), &[]).ok().unwrap();
+                let import = ScalarNamespaceBinding { binding: "accounting".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(lib_proof, Vec::new()), (root_proof, vec![import])],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let passed = run(&root, scope).unwrap();
+                assert!(passed.active && passed.directives.is_empty() && passed.contextual_diagnostic.is_none());
+                let failed = run(&root.replace("spend(2)", "spend(6)").replace("credit == 2", "credit == 7"), scope).unwrap();
+                assert!(failed.active && failed.contextual_diagnostic.is_none());
+                let [guard] = failed.directives.as_slice() else { panic!("guard only; no returned debit or later check"); };
+                assert_eq!(guard.code(), &BigInt::from(68));
+                assert_eq!(guard.operation, ScalarCheckerOperation::Narrow);
+                assert_eq!(guard.source, lib);
+                assert_eq!(&provider[guard.condition.start as usize..guard.condition.end as usize], "core.context.credit >= charged");
             }
         }
     }

@@ -6306,6 +6306,7 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
     pub(super) operands: [ReferenceBindingId; 2],
     pub(super) ty: ScalarType,
     pub(super) relation: super::symbolic_integer::IntegerRelation,
+    pub(super) contextual: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7717,9 +7718,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     #[cfg(feature = "internal-checker")]
     fn ordinary_integer_comparison(
         &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, condition: Option<OccurrenceOrdinal>,
+        allow_contextual: bool,
     ) -> Option<CheckerOrdinaryIntegerComparison> {
         let WalkMode::Callable(callable) = &self.mode else { return None; };
-        let (relation, operands, ty) = if let Some(condition) = condition {
+        let (relation, operands, ty, contextual) = if let Some(condition) = condition {
             // Normal branches already walked their children and transferred
             // checked types/identities into the occurrence tables.
             let ScalarExpression::Binary { operator, .. } = expression else { return None; };
@@ -7734,23 +7736,27 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let (left, left_ty) = lexical(OccurrenceEdge::BinaryLeft)?;
             let (right, right_ty) = lexical(OccurrenceEdge::BinaryRight)?;
             if left_ty != right_ty || !is_integer_type(left_ty) { return None; }
-            (relation, [left.clone(), right.clone()], left_ty.clone())
+            (relation, [left.clone(), right.clone()], left_ty.clone(), false)
         } else {
             // Canonical directive conditions are elided from the occurrence
             // tree; resolve their checked operands once in the current scope.
             let (relation, left, right) = self.checked_initializer_comparison(expression)?;
             let ty = self.occurrence_typing.checked_expression_type(left)?.clone();
-            let ScalarExpression::Name { name: left, .. } = left else { return None; };
-            let ScalarExpression::Name { name: right, .. } = right else { return None; };
-            let lexical = |name: &str| {
-                let PlainNameIdentity::Lexical(id) = callable.target_resolver.plain_name(name, names)? else { return None; };
-                Some(id)
+            let operand = |expression: &ScalarExpression| match expression {
+                ScalarExpression::Name { name, .. } => {
+                    let PlainNameIdentity::Lexical(id) = callable.target_resolver.plain_name(name, names)? else { return None; };
+                    Some((id, false))
+                }
+                ScalarExpression::Contextual { binding, .. } if allow_contextual => Some((binding.clone(), true)),
+                _ => None,
             };
-            let lhs = lexical(left)?;
-            let rhs = if left == right { lhs.clone() } else { lexical(right)? };
-            (relation, [lhs, rhs], ty)
+            let (lhs, left_context) = operand(left)?;
+            let (rhs, right_context) = operand(right)?;
+            if left_context && right_context { return None; }
+            (relation, [lhs, rhs], ty, left_context || right_context)
         };
-        Some(CheckerOrdinaryIntegerComparison { operands, ty, relation })
+        Some(CheckerOrdinaryIntegerComparison { operands, ty, relation, contextual })
+
     }
 
     #[cfg(feature = "internal-checker")]
@@ -7890,7 +7896,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     Boolean::Binding(binding)
                 } else if let Some(call) = occurrence.and_then(|call| self.ordinary_bool_call(expression, call)) {
                     Boolean::Call(call)
-                } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence) {
+                } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence, false) {
                     Boolean::Lexical(comparison)
                 } else if let Some(predicate) = self.ordinary_literal_predicate(expression, names, occurrence) {
                     Boolean::Integer(predicate)
@@ -8050,7 +8056,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         let boolean_binding = matches!(compound, CheckerOrdinaryBoolean::Binding(_));
                         self.structure.checker_ordinary_booleans.insert(ordinal, compound);
                         (true, boolean_binding)
-                    } else if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None) {
+                    } else if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None, marker.operation == CheckerOperation::Narrow) {
                         self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
                         (true, false)
                     } else {
@@ -8447,7 +8453,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 let (has_call, nodes) = compound.call_guard_shape();
                 if has_call { self.structure.checker_ordinary_call_guards.insert(ordinal, nodes); }
                 self.structure.checker_ordinary_booleans.insert(ordinal, compound);
-            } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, Some(ordinal)) {
+            } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, Some(ordinal), false) {
                 self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
             }
         }
