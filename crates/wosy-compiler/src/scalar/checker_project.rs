@@ -5754,7 +5754,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             debug_assert!(imports.windows(2).all(|adjacent|
                 adjacent[0].as_ref().map(|local| local.position) < adjacent[1].as_ref().map(|local| local.position)
             ));
-            let active = super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, false, &mut emit)
+            let active = super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, false, None, &mut emit)
                 .ok_or(ProjectCheck::Unsupported)?;
             return Ok(Some(active));
         }
@@ -5773,9 +5773,9 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             } else {
                 [Some(second_import), Some(first_import)]
             };
-            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, false, &mut emit)
+            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, false, None, &mut emit)
         } else {
-            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut [Some(first_import)], false, &mut emit)
+            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut [Some(first_import)], false, None, &mut emit)
         }.ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }

@@ -483,6 +483,21 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             }
             origins.push(((callee, binding.position, origin, occurrence), &receiver.ty));
         }
+        let (enum_match, requirements) = if let Some(BlockItem {
+            position, kind: BlockItemKind::Binding(region),
+        }) = requirements.first()
+        {
+            let [receiver] = region.receivers() else { return Ok(None); };
+            let Some(origin) = body.checker_ordinary_scalar_locals.get(&(body.root, *position)) else { return Ok(None); };
+            if !matches!(&origin.kind, super::super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch {
+                qualified_prefix: true, ..
+            }) || !is_integer_type(&receiver.ty) || receiver.contextual_storage.is_some() {
+                return Ok(None);
+            }
+            (Some((*position, &origin.binding, &receiver.ty)), &requirements[1..])
+        } else {
+            (None, requirements)
+        };
         // Match only the prepared lexical identities already used as axes by
         // the integer walker. Function-boundary formals are immutable in this
         // closed consumer; the suffix admits no writes or other bindings.
@@ -493,6 +508,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
         };
         let Some(prepared_comparisons) = qualified_requirement_suffix(calls, requirements, |binding, predicate_type| {
             caller_formals.is_some_and(|(formal, ty)| binding == formal && predicate_type == ty)
+                || enum_match.is_some_and(|(_, output, ty)| binding == output && predicate_type == ty)
                 || origins.iter().any(|((_, _, origin, _), ty)| binding == &origin.binding && predicate_type == *ty)
         }) else {
             return Ok(None);
@@ -519,7 +535,7 @@ impl<'proof, 'case> SelectedSymbolicProof<'proof, 'case> {
             imports.push(Some(import));
         }
         let active = super::super::checker_flow::collect_ordered_imported_root_locals(
-            calls, &mut imports, prepared_comparisons, &mut |failure| effects.push_callable(calls, source, failure),
+            calls, &mut imports, prepared_comparisons, enum_match.map(|(position, ..)| position), &mut |failure| effects.push_callable(calls, source, failure),
         ).ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }
@@ -786,6 +802,38 @@ mod tests {
             let dormant_affine = run(&wrong_affine_join, &reflected_wrapper, increment, &reflected_leaf,
                 ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_affine.active && dormant_affine.directives.is_empty());
+            let enum_source = r#"%%start
+                joined = namespace package "src/hub.w";
+                next = namespace package "src/right.w";
+                enum copy Region { left(u16, u8); right(u8, u16); }
+                unit(u8) check = fn(input) {
+                    u8 first_value = joined.compose(input);
+                    u8 second_value = next.shift(first_value);
+                    u8 chosen = match (if (first_value <= 127) { Region.left(4097, second_value) } else { Region.right(200, 8193) }) {
+                        right(wide, decoy) { wide }
+                        left(decoy, wide) { wide }
+                    };
+                    if (input <= 127) {
+                        core.require(chosen <= 127, { .stdout = ""; .stderr = "copied"; .code = 80; .files = []; });
+                    } else {
+                        core.require(chosen == 200, { .stdout = ""; .stderr = "other tag"; .code = 81; .files = []; });
+                    };
+                };
+            %%end"#;
+            let matched = run(enum_source, pass_through, increment, exact_alias, package).unwrap();
+            assert!(matched.active && matched.directives.is_empty() && matched.symbolic_diagnostic.is_none());
+            let bad_enum = enum_source.replace("core.require(chosen <= 127", "core.require(chosen <= 126");
+            let report = run(&bad_enum, pass_through, increment, exact_alias, package).unwrap();
+            let [failure] = report.directives.as_slice() else { panic!("one match payload counterexample"); };
+            assert_eq!(failure.code(), &BigInt::from(80));
+            assert_eq!(failure.source, app);
+            assert_eq!(&bad_enum[failure.condition.start as usize..failure.condition.end as usize], "chosen <= 126");
+            for axis in 0..4 {
+                let edge = BigInt::from(127);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&edge, &edge)]));
+            }
+            let unchecked = enum_source.replace("left(decoy, wide) { wide }", "left(decoy, wide) { wide + 1 }");
+            assert!(run(&unchecked, pass_through, increment, exact_alias, package).is_err());
             let dormant_branch = run(&wrong_branch_and_join, &mixed, increment, &wide, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!dormant_branch.active && dormant_branch.directives.is_empty());
             let guarded = wide.replace("input <= 8", "input >= 3 && input <= 8");

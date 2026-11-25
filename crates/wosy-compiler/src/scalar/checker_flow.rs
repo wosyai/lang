@@ -151,6 +151,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     fn allows_extended_scalar_locals(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
+    #[cfg(feature = "internal-checker")]
+    fn imported_enum_match_position(self) -> Option<usize> { None }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -4721,12 +4723,13 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct ImportedRequirementConditions(bool);
+struct ImportedRequirementConditions { comparisons: bool, enum_match: Option<usize> }
 
 impl<'a> ScopedAuthoredReturn<'a> for ImportedRequirementConditions {
     const ENABLED: bool = false;
     #[cfg(feature = "internal-checker")]
-    fn allows_imported_condition_comparisons(self) -> bool { self.0 }
+    fn allows_imported_condition_comparisons(self) -> bool { self.comparisons }
+    fn imported_enum_match_position(self) -> Option<usize> { self.enum_match }
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs,
@@ -4735,13 +4738,14 @@ impl<'a> ScopedAuthoredReturn<'a> for ImportedRequirementConditions {
 
 pub(super) fn collect_ordered_imported_root_locals<'a>(
     calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], prepared_comparisons: bool,
+    enum_match: Option<usize>,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
     let mut failures = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
-        calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, ImportedRequirementConditions(prepared_comparisons),
+        calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, ImportedRequirementConditions { comparisons: prepared_comparisons, enum_match },
     )?.ok()? else { return None; };
     Some(active)
 }
@@ -8138,13 +8142,21 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     continue;
                 }
                 #[cfg(feature = "internal-checker")]
-                if roots.allow_ordinary_integer_locals {
+                let exact_imported_match = block == structure.root
+                    && authored_return.imported_enum_match_position() == Some(item.position);
+                #[cfg(feature = "internal-checker")]
+                if roots.allow_ordinary_integer_locals || exact_imported_match {
                     if let Some(origin) = structure.checker_ordinary_scalar_locals.get(&(block, item.position)) {
                         let [receiver] = binding.receivers() else { return None; };
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
                         if origin.source != outputs.primary || !outputs.secondary.is_empty()
                             || receiver.contextual_storage.is_some()
                             || structure.checked_types.expressions.get(&origin.source)? != &receiver.ty
+                        {
+                            return None;
+                        }
+                        if exact_imported_match && !matches!(&origin.kind,
+                            super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch { qualified_prefix: true, .. })
                         {
                             return None;
                         }
@@ -8202,8 +8214,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     }
                                 }
                             }
-                            super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch(transfer) => {
-                                if !roots.allow_extended_scalar_locals { return None; }
+                            super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch { transfer, qualified_prefix } => {
+                                if if *qualified_prefix { !exact_imported_match } else { !roots.allow_extended_scalar_locals } {
+                                    return None;
+                                }
                                 path = bind_enum_match_value(roots, path, transfer, &receiver.ty)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {

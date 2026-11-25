@@ -425,7 +425,7 @@ impl Plan {
 
     #[cfg(feature = "internal-checker")]
     pub(super) fn prepare_check_transfer(&mut self, work: &mut usize) -> Option<()> {
-        if !self.initializer || !self.prefix.is_empty() || self.outputs.len() != 1 { return None; }
+        if !self.initializer || self.prefix.len() > 4 || self.outputs.len() != 1 { return None; }
         // This is projection of already-typed leaves, not evaluation. Check
         // never silently omits effects or unsupported computations in a case.
         analysis_budget::charge_call_work(work, self.arms.len().checked_add(1)?)?;
@@ -512,9 +512,11 @@ impl Plan {
 
     #[cfg(feature = "internal-checker")]
     pub(super) fn checked_input(&self, span: ByteSpan) -> Option<(&str, &ScalarType)> {
-        let index = self.inputs.binary_search_by_key(&span.start, |(span, _)| span.start).ok()?;
-        let (declared, ty) = &self.inputs[index];
-        (*declared == span).then_some((self.input_names.get(index)?.as_str(), ty))
+        if let Ok(index) = self.inputs.binary_search_by_key(&span.start, |(span, _)| span.start) {
+            let (declared, ty) = &self.inputs[index];
+            return (*declared == span).then_some((self.input_names.get(index)?.as_str(), ty));
+        }
+        self.prefix.iter().find(|input| input.declaration == span).map(|input| (input.name.as_str(), &input.ty))
     }
 
     pub(super) fn is_initializer(&self) -> bool { self.initializer }

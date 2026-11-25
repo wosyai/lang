@@ -6266,7 +6266,7 @@ pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
     SnapshotRead { shape: std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, index: CheckerSnapshotReadIndex },
     Conditional,
-    EnumMatch(super::runtime_enum_match::MatchTransfer<ReferenceBindingId>),
+    EnumMatch { transfer: super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, qualified_prefix: bool },
     BoolLiteral(bool),
     BoolCall(OccurrenceOrdinal),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
@@ -9699,7 +9699,7 @@ impl StructuralWalker<'_, '_> {
                         let ScalarExpression::RuntimeMatch(site) = expression else { return None; };
                         let plan = &site.0;
                         if plan.source != *resolver.source || plan.owner != resolver.function_span
-                            || position.block != self.structure.root || position.item != 0
+                            || position.block != self.structure.root || position.item != plan.prefix.len()
                             || site.ty() != &receiver.ty
                         { return None; }
                         let transfer = plan.check_transfer.as_ref()?.bind(&receiver.ty, |span, ty| {
@@ -9708,7 +9708,16 @@ impl StructuralWalker<'_, '_> {
                             let PlainNameIdentity::Lexical(identity) = resolver.plain_name(name, &scope.names)? else { return None; };
                             (identity.declaration_span == span).then_some(identity)
                         })?;
-                        Some(CheckerOrdinaryScalarLocalKind::EnumMatch(transfer))
+                        let qualified_prefix = !plan.prefix.is_empty();
+                        if qualified_prefix && !plan.prefix.iter().enumerate().all(|(item, declaration)| {
+                            self.structure.checker_integer_call_locals.get(&(position.block, item)).is_some_and(|origin| {
+                                origin.binding.declaration_span == declaration.declaration
+                                    && self.structure.checker_direct_targets.contains_key(&origin.call)
+                            })
+                        }) {
+                            return None;
+                        }
+                        Some(CheckerOrdinaryScalarLocalKind::EnumMatch { transfer, qualified_prefix })
                     })
                     .or_else(|| {
                         let MemberFacts::Prepared(members) = &self.members else { return None; };
@@ -9837,7 +9846,7 @@ impl StructuralWalker<'_, '_> {
                     self.structure.checker_has_finite_scalar_local |= finite;
                     self.structure.checker_has_extended_scalar_local |= finite || matches!(kind,
                         CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
-                            | CheckerOrdinaryScalarLocalKind::EnumMatch(_));
+                            | CheckerOrdinaryScalarLocalKind::EnumMatch { .. });
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
                         CheckerOrdinaryScalarLocal { binding, source, kind });
                 }
