@@ -54,7 +54,22 @@ impl Rectangle {
                 _ => return Err(ProjectCheck::Unsupported),
             }
         }
-        Ok(Self(axes))
+        let rectangle = Self(axes);
+        if rank.sum && rectangle.reachable() {
+            let [first, second] = rectangle.0.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            let (first_low, first_high) = first.extremes().ok_or(ProjectCheck::Unsupported)?;
+            let (second_low, second_high) = second.extremes().ok_or(ProjectCheck::Unsupported)?;
+            charge(work, 1)?;
+            // Every precondition state (therefore every admitted successor)
+            // must evaluate the authored checked sum without overflow.
+            let ty = &rank.first_parameter.0.ty;
+            if !integer_literal_fits_type(&(first_low + second_low), ty)
+                || !integer_literal_fits_type(&(first_high + second_high), ty)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+        }
+        Ok(rectangle)
     }
 
     fn reachable(&self) -> bool { self.0.iter().all(|domain| !domain.is_empty()) }
@@ -183,6 +198,7 @@ fn transition(
     if !path.reachable() { return Ok(InductionPremise::Unreachable); }
     use std::cmp::Ordering;
     let mut comparisons = [Ordering::Equal; 2];
+    let mut sum_delta = rank.sum.then(BigInt::default);
     // Authenticate every actual call argument and its guard, even if a
     // coordinate is not ranked or an earlier coordinate already descends.
     for (i, ((slot, _), arg)) in rank.entries().zip(arguments).enumerate() {
@@ -194,6 +210,10 @@ fn transition(
             Coordinate::Literal(value) => {
                 charge(work, domain.interval_count())?;
                 if !domain.contains(value) { return Ok(InductionPremise::CalleeWhereUnproved); }
+                if let Some(delta) = &mut sum_delta {
+                    charge(work, 1)?;
+                    *delta += value.as_ref() - low;
+                }
                 value.as_ref().cmp(low)
             }
             Coordinate::Offset { add, magnitude } => {
@@ -205,9 +225,19 @@ fn transition(
                 if !active.intervals().all(|(lo, hi)| domain.covers_closed(&moved(lo), &moved(hi))) {
                     return Ok(InductionPremise::CalleeWhereUnproved);
                 }
+                if let Some(delta) = &mut sum_delta {
+                    charge(work, 1)?;
+                    if *add { *delta += *magnitude; } else { *delta -= *magnitude; }
+                }
                 moved(low).cmp(low)
             }
         };
+    }
+    if let Some(max_delta) = sum_delta {
+        // These coordinate changes use independent input axes, so their
+        // maxima are simultaneously attainable at a guarded path point.
+        return Ok(if max_delta.sign() == num_bigint::Sign::Minus { InductionPremise::Established }
+            else { InductionPremise::NotStrict });
     }
     // With independent axes, if an earlier coordinate can tie, all values
     // in each suffix coordinate are possible on that tie.

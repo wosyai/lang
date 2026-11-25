@@ -11022,6 +11022,7 @@ type TypedEntryMeasure<'a> = (&'a super::reference::ParameterSlot, &'a Reference
 struct TypedInductionRank<'a> {
     first_parameter: TypedEntryMeasure<'a>,
     second_parameter: Option<TypedEntryMeasure<'a>>,
+    sum: bool,
     earlier: Option<TypedEntryMeasure<'a>>,
     descending: TypedEntryMeasure<'a>,
 }
@@ -11046,11 +11047,11 @@ fn typed_proof_decreases<'a>(
             .and_then(|bindings| bindings.get(slot)).ok_or(ProjectCheck::Unsupported)?;
         Ok((parameter, binding))
     };
-    let scalar = |expression: &CstNode| -> Result<TypedEntryMeasure<'a>, ProjectCheck> {
-        let ScalarExpression::Name { name, .. } = derive_expression(expression) else {
+    let scalar = |expression: &ScalarExpression| -> Result<TypedEntryMeasure<'a>, ProjectCheck> {
+        let ScalarExpression::Name { name, .. } = expression else {
             return Err(ProjectCheck::Unsupported);
         };
-        let slot = input_names.iter().position(|input| *input == name).ok_or(ProjectCheck::InvalidProof)?;
+        let slot = input_names.iter().position(|input| input == name).ok_or(ProjectCheck::InvalidProof)?;
         let selected = entry(slot)?;
         if !is_integer_type(&selected.0.ty) {
             return Err(if matches!(selected.0.ty, ScalarType::F32 | ScalarType::F64) {
@@ -11061,16 +11062,21 @@ fn typed_proof_decreases<'a>(
         }
         Ok(selected)
     };
-    let first = scalar(&first)?;
-    let (earlier, descending) = if let Some(second) = second {
-        let second = scalar(&second)?;
-        if first.0.ordinal == second.0.ordinal {
+    let first_expression = derive_expression(&first);
+    let (sum, earlier, descending) = if let Some(second) = second {
+        (false, Some(scalar(&first_expression)?), scalar(&derive_expression(&second))?)
+    } else if let ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. } = &first_expression {
+        let (left, right) = (scalar(left)?, scalar(right)?);
+        if left.0.ty != right.0.ty {
             return Err(ProjectCheck::Unsupported);
         }
-        (Some(first), second)
+        (true, Some(left), right)
     } else {
-        (None, first)
+        (false, None, scalar(&first_expression)?)
     };
+    if earlier.is_some_and(|first| first.0.ordinal == descending.0.ordinal) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let (first_parameter, second_parameter) = match input_names.len() {
         1 => (entry(0)?, None),
         2 => (entry(0)?, Some(entry(1)?)),
@@ -11079,7 +11085,7 @@ fn typed_proof_decreases<'a>(
     if std::iter::once(first_parameter).chain(second_parameter).any(|(slot, _)| !is_integer_type(&slot.ty)) {
         return Err(ProjectCheck::Unsupported);
     }
-    let rank = TypedInductionRank { first_parameter, second_parameter, earlier, descending };
+    let rank = TypedInductionRank { first_parameter, second_parameter, sum, earlier, descending };
     Ok(Some(rank))
 }
 
@@ -17156,6 +17162,64 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             "where ((entry == -120 || entry == -110) && entry == -115)");
         let checked = run(&dead, ScalarCheckerScope::CurrentPackage).unwrap();
         assert!(!checked.active && checked.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_induction_rank_checks_a_coupled_checked_sum() {
+        let app = source("src/main.w", "ordered-coupled-rank");
+        let program = r#"%%start
+            u8(u8, u8) descend = fn(mode, left) {
+                if (left >= 2) {
+                    if (mode < 5) { descend(mode + 1, left - 2) }
+                    else { descend(mode, left - 2) }
+                } else {
+                    if (mode >= 2) { descend(mode - 2, 1) } else { 7 }
+                }
+            };
+            proof rank for descend(mode, left) -> (out)
+                where (mode <= 5 && left <= 8)
+                ensures (out == 7) decreases (mode + left) {
+                if (left >= 2) {
+                    if (mode < 5) { core.use(rank(mode + 1, left - 2)); }
+                    else { core.use(rank(mode, left - 2)); }
+                } else {
+                    if (mode >= 2) { core.use(rank(mode - 2, 1)); } else { core.show(out == 7); }
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let reached = program.replace("%%end", &format!(
+            "u8 actual = descend(2, 6); core.require(actual == 7, {OUTPUT}); %%end"));
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            for text in [reached.clone(), reached.replace("mode + left", "left + mode")] {
+                let checked = run(&text, scope).unwrap();
+                assert!(checked.active && checked.directives.is_empty()
+                    && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+            }
+            for text in [
+                reached.replace("mode + left", "mode, left"),
+                reached.replace("mode + left", "left, mode"),
+                reached.replace("mode + left", "left + left"),
+                reached.replace("mode + left", "mode + left, left"),
+                reached.replace("left - 2", "left - 1"),
+                reached.replace("left <= 8", "left <= 255"),
+                reached.replace("mode <= 5", "mode <= 4"),
+                reached.replace("rank(mode + 1, left", "rank(mode, left"),
+            ] {
+                assert!(matches!(run(&text, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+        let refuted = program.replace("out == 7) decreases", "out == 8) decreases");
+        let receipt = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+        let witness = receipt.symbolic_diagnostic.unwrap();
+        assert_eq!(witness.returned, BigInt::from(7));
+        assert!(witness.failed_step.is_none());
     }
 
     #[cfg(feature = "internal-checker")]
