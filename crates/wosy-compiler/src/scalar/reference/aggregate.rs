@@ -1254,13 +1254,7 @@ pub(super) enum GuardedNumericNode {
 }
 
 impl GuardedNumericExpression {
-    fn proves_ordinary_arithmetic(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> bool {
-        self.ordinary_arithmetic_bound(allocated).is_some()
-    }
-
-    fn ordinary_arithmetic_bound(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> Option<u64> {
-        // A materialized U64 result in this graph is a checked extent of
-        // a nonzero-sized scalar array, including across sealed relays.
+    fn ordinary_arithmetic_bound(&self, bound_at: impl Fn(OccurrenceOrdinal) -> Option<u64>) -> Option<u64> {
         let mut bounds = Vec::<u64>::new();
         for node in &self.operations {
             let bound = match *node {
@@ -1268,7 +1262,7 @@ impl GuardedNumericExpression {
                 GuardedNumericNode::Call(site, staged_arguments) => {
                     let Some(keep) = bounds.len().checked_sub(staged_arguments) else { return None; };
                     bounds.truncate(keep);
-                    if allocated(site) { u64::from(u32::MAX) } else { u64::MAX }
+                    bound_at(site).unwrap_or(u64::MAX)
                 }
                 GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Logical | GuardedNumericNode::Select => {
                     let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return None; };
@@ -7220,18 +7214,23 @@ fn closed_aggregates<'a>(
             }).collect::<Option<Vec<_>>>()?;
             Some((proof, dependencies, payload.ty.clone(), spans))
         };
-        let mut complete_suffixes = BTreeSet::new();
-        let mut allocated_sites = BTreeSet::new();
+        let mut result_bounds = BTreeMap::<BodyKey, u64>::new();
+        let mut allocated_sites = BTreeMap::new();
         let mut active = BTreeSet::new();
+        enum BoundTransfer {
+            Leaf(u64),
+            Forward(BodyKey),
+            Expression(GuardedNumericExpression, HashMap<OccurrenceOrdinal, BodyKey>),
+        }
         enum Visit {
             Enter(BodyKey, (BodyKey, usize), Option<ScalarType>),
-            Exit(BodyKey),
+            Exit(BodyKey, BoundTransfer),
         }
         for (caller, source, cfg, call, ordinal, choice) in fallible_call_requests {
             let unsupported = || format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}");
             let target = target_body(&declarations, cfg, call).ok_or_else(unsupported)?;
             if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
-            allocated_sites.insert((caller, ordinal.0));
+            allocated_sites.insert((caller, ordinal.0), target);
             if let Some(choice) = choice {
                 fallible_choices.insert((caller, choice.0));
             }
@@ -7239,9 +7238,17 @@ fn closed_aggregates<'a>(
             while let Some(task) = work.pop() {
                 let (current, incoming, expected) = match task {
                     Visit::Enter(body, incoming, expected) => (body, incoming, expected),
-                    Visit::Exit(body) => {
+                    Visit::Exit(body, transfer) => {
+                        let bound = match transfer {
+                            BoundTransfer::Leaf(bound) => bound,
+                            BoundTransfer::Forward(child) => *result_bounds.get(&child)
+                                .ok_or("missing sealed scalar relay result bound")?,
+                            BoundTransfer::Expression(proof, callees) => proof.ordinary_arithmetic_bound(|site|
+                                callees.get(&site).and_then(|target| result_bounds.get(target)).copied())
+                                .ok_or("fallible scalar tail has no proved in-range result")?,
+                        };
                         active.remove(&body);
-                        complete_suffixes.insert(body);
+                        result_bounds.insert(body, bound);
                         continue;
                     }
                 };
@@ -7252,20 +7259,26 @@ fn closed_aggregates<'a>(
                         Err("sealed fallible allocation relay changes the result payload type".to_owned())
                     } else { Ok(()) }
                 };
-                if complete_suffixes.contains(&current) {
+                if result_bounds.contains_key(&current) {
                     check_payload(fallible_payloads.get(&current).ok_or("missing completed fallible allocation payload")?)?;
                     continue;
                 }
                 if !active.insert(current) {
                     return Err("fallible allocating callable relay cycle requires an allocation leaf".into());
                 }
-                work.push(Visit::Exit(current));
                 if let Some((actual, allocations)) = allocation_leaf(current) {
                     check_payload(&actual)?;
+                    // For U64 an exact leaf returns the successful extent
+                    // of a nonzero-size scalar array. The standard allocator
+                    // limits that byte request to UINT32_MAX. I32 is at
+                    // most that wide and an exact Bool is one bit.
+                    let bound = if actual == ScalarType::Bool { 1 } else { u64::from(u32::MAX) };
+                    work.push(Visit::Exit(current, BoundTransfer::Leaf(bound)));
                     fallible_payloads.insert(current, actual);
                     if allocations.len() > 1 { fallible_prefixes.insert(current, allocations); }
                 } else if let Some((next, ordinal, allocation, actual)) = relay(current) {
                     check_payload(&actual)?;
+                    work.push(Visit::Exit(current, BoundTransfer::Forward(next)));
                     work.push(Visit::Enter(next, (current, ordinal.0), Some(actual.clone())));
                     fallible_payloads.insert(current, actual);
                     fallible_allocation_relays.insert(current);
@@ -7274,24 +7287,21 @@ fn closed_aggregates<'a>(
                     let (proof, mut callees, actual, spans) = scalar_tail(current).ok_or_else(unsupported)?;
                     check_payload(&actual)?;
                     callees.retain(|(target, _, _)| !allocation_free_integer_graph(*target, &mut memo, dependencies));
-                    let sealed = callees.iter().map(|(_, ordinal, _)| *ordinal).collect::<HashSet<_>>();
-                    let bound = proof.ordinary_arithmetic_bound(|ordinal| sealed.contains(&ordinal));
-                    if sealed.is_empty() || bound.is_none()
-                        || (actual == ScalarType::U64 && bound.is_some_and(|bound| bound > u64::from(u32::MAX)))
-                    {
-                        return Err("fallible scalar tail does not preserve the sealed result bound".into());
-                    }
+                    if callees.is_empty() { return Err(unsupported()); }
+                    let sealed = callees.iter().map(|(target, ordinal, _)| (*ordinal, *target)).collect::<HashMap<_, _>>();
+                    fallible_choices.insert((current, proof.expression.0));
+                    work.push(Visit::Exit(current, BoundTransfer::Expression(proof, sealed)));
                     fallible_payloads.insert(current, actual);
                     fallible_allocation_relays.insert(current);
                     if !spans.is_empty() { fallible_prefixes.insert(current, spans); }
-                    fallible_choices.insert((current, proof.expression.0));
                     work.extend(callees.into_iter().rev().map(|(callee, ordinal, payload)|
                         Visit::Enter(callee, (current, ordinal.0), Some(payload))));
                 }
             }
         }
         for (caller, proof) in fallible_expressions {
-            if !proof.proves_ordinary_arithmetic(|occurrence| allocated_sites.contains(&(caller, occurrence.0))) {
+            if proof.ordinary_arithmetic_bound(|occurrence|
+                allocated_sites.get(&(caller, occurrence.0)).and_then(|target| result_bounds.get(target)).copied()).is_none() {
                 return Err("fallible checked addition has no proved in-range result".into());
             }
         }
@@ -7315,7 +7325,8 @@ fn closed_aggregates<'a>(
                     }
                 });
                 if has_allocating_call { marked.push(proof.expression.0); }
-                all_calls && proof.proves_ordinary_arithmetic(|occurrence| checked.contains_key(&occurrence.0))
+                all_calls && proof.ordinary_arithmetic_bound(|occurrence|
+                    checked.get(&occurrence.0).and_then(|target| result_bounds.get(target)).copied()).is_some()
             });
             if complete && !checked.is_empty() {
                 ordinary_choices.extend(marked.into_iter().map(|ordinal| (caller, ordinal)));

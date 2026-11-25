@@ -15447,7 +15447,7 @@ if (composed(2) != 99 || composed(3) != 99 || composed(5) != 0
     || composed(7) != 2 || selected(4) != 4 || selected(8) != 99
     || selected(8) != 9) { core.system_panic(); };
 %%end";
-    let arithmetic = text.replace("_left(count) ^ _right(5)", "_left(count) + _right(5)");
+    let arithmetic = text.replace("_left(count) ^ _right(5)", "(_left(count) ^ _right(5)) + 18446744073709551615");
     let other_abi = "%%start
 u64(u64) _leaf = fn(count) { u8[count] scratch; core.array_len(&scratch) };
 u64(bool) _choose = fn(first) { if (first) { _leaf(4) } else { _leaf(9) } };
@@ -15468,7 +15468,7 @@ selected(true);
         let negative = analyze_scalar_build(&negative);
         assert!(negative.diagnostics().is_empty(), "{:?}", negative.diagnostics());
         assert!(matches!(emit_scalar_build_project_llvm(&negative), Err(error)
-            if error.contains("does not preserve the sealed result bound")));
+            if error.contains("fallible scalar tail has no proved in-range result")));
         let prepared = prepare_initializer_test(text, layout);
         let source = &prepared.project().modules[0].source;
         let checked = analyze_scalar_build(&prepared);
@@ -15587,6 +15587,56 @@ if (observed(1) != 99 || observed(2) != 99 || observed(3) != 99
                 }
             }
             if let Some(out) = std::env::var_os("WOSY_FALLIBLE_OWNING_TAIL_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn fallible_scalar_bound_is_transferred_through_computed_and_direct_relays() {
+    let text = "%%start
+u64(u64) _leaf = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _wide = fn(count) { _leaf(count) + 4294967296 };
+u64(u64) _relay = fn(count) { _wide(count) };
+u64(u64) guarded = fn(count) {
+    u64 value =? _relay(count) + 1;
+    if (&value == null) { 99 } else { value }
+};
+u64(u64) regular = fn(count) {
+    u64 value = _relay(count) + 2;
+    value
+};
+if (guarded(2) != 99 || guarded(0) != 4294967297
+    || regular(3) != 4294967301) { core.system_panic(); };
+%%end";
+    let guarded_overflow = text.replace("_relay(count) + 1", "_relay(count) + 18446744069414584320");
+    let ordinary_overflow = text.replace("_relay(count) + 2", "_relay(count) + 18446744069414584320");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (negative, reason) in [
+            (&guarded_overflow, "fallible checked addition has no proved in-range result"),
+            (&ordinary_overflow, "requires exclusively checked fallible initializer uses or sealed ordinary scalar bindings"),
+        ] {
+            let negative = prepare_initializer_test(negative, layout);
+            let checked = analyze_scalar_build(&negative);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            assert!(matches!(emit_scalar_build_project_llvm(&checked), Err(error) if error.contains(reason)));
+        }
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, output) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&checked)),
+            ("project", emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let bytes = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "transferred scalar result bound");
+            context.create_module_from_ir(bytes).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_SCALAR_BOUND_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
