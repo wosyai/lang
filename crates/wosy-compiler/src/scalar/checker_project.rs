@@ -4872,10 +4872,27 @@ pub struct SymbolicProofDiagnostic {
     pub other_output: Option<wosy_syntax::SourceSpan>,
     pub directive_position: usize,
     pub witness: ScalarCheckerIntegerWitness,
+    pub ieee_entry: Option<ScalarCheckerIeeeEntry>,
     pub returned: BigInt,
     pub returned_literal: Option<ScalarCheckerProofLiteral>,
     pub result_slot: Option<usize>,
     pub returned_pair: Option<[(BigInt, Option<ScalarCheckerProofLiteral>); 2]>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub enum ScalarCheckerIeeeValue {
+    F32(u32),
+    F64(u64),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ScalarCheckerIeeeEntry {
+    pub binding: wosy_syntax::SourceSpan,
+    pub value: ScalarCheckerIeeeValue,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5239,6 +5256,7 @@ impl SelectedSymbolicProof<'_, '_> {
             proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failed_step.map(proof_span),
             callable: callable_span(function.name_span), output: callable_span(failure.output), other_output: None,
             directive_position: position,
+            ieee_entry: None,
             witness: ScalarCheckerIntegerWitness {
                 equal_axes: Vec::new(),
                 axes: failure.axes.into_iter().map(|(binding, ty)| {
@@ -5312,6 +5330,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failure.step.map(proof_span),
                 callable: callable_span(function.name_span), output: callable_span(output), other_output,
                 directive_position: effects.records.len(),
+                ieee_entry: None,
                 witness: ScalarCheckerIntegerWitness {
                     equal_axes: Vec::new(),
                     axes: axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
@@ -7830,18 +7849,31 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                         (wosy_syntax::byte_span(&goal), Some(proof_span(range)))
                     }
                 };
-                let axes = self.rank.entries().map(|(slot, binding)| (binding.clone(), slot.ty.clone())).collect();
+                let (witness, ieee_entry) = match base.entry {
+                    RankedBaseEntry::Integer(coordinates) => {
+                        let axes = self.rank.entries().map(|(slot, binding)| (binding.clone(), slot.ty.clone())).collect();
+                        (ScalarCheckerIntegerWitness { equal_axes: Vec::new(), axes, state: IntegerInputs::entry_point(&coordinates) }, None)
+                    }
+                    RankedBaseEntry::Ieee(atom) => {
+                        let (_, binding) = self.rank.float_entry().ok_or(ProjectCheck::Unsupported)?;
+                        let value = match atom {
+                            ranked_float::Atom::Single(bits) => ScalarCheckerIeeeValue::F32(bits),
+                            ranked_float::Atom::Double(bits) => ScalarCheckerIeeeValue::F64(bits),
+                        };
+                        // The legacy integer receipt has no numerical
+                        // coordinates for a typed floating-point entry.
+                        (ScalarCheckerIntegerWitness { equal_axes: Vec::new(), axes: Vec::new(), state: IntegerInputs::closed() },
+                            Some(ScalarCheckerIeeeEntry { binding: wosy_syntax::SourceSpan::new(binding.source.clone(), binding.declaration_span), value }))
+                    }
+                };
                 self.failure = Some(SymbolicProofDiagnostic {
                     proof: proof_span(wosy_syntax::byte_span(self.plan.proof)),
                     goal: proof_span(goal), failed_step,
                     callable: callable_span(function.name_span),
                     output: wosy_syntax::SourceSpan { source: base.return_source.clone(), range: base.return_span },
                     directive_position: effects.records.len(),
-                    witness: ScalarCheckerIntegerWitness {
-                        equal_axes: Vec::new(),
-                        axes,
-                        state: IntegerInputs::entry_point(&base.coordinates),
-                    },
+                    witness,
+                    ieee_entry,
                     returned: base.returned.clone(),
                     returned_literal: None,
                     result_slot: None, returned_pair: None, other_output: None,
@@ -11427,10 +11459,16 @@ enum RankedInductionOutcome<'a> {
 struct RankedBaseWitness<'a> {
     proof_source: &'a SourceIdentity,
     return_source: &'a SourceIdentity,
-    coordinates: Vec<BigInt>,
+    entry: RankedBaseEntry,
     returned: &'a BigInt,
     return_span: ByteSpan,
     rejected: RankedBaseRejection,
+}
+
+#[cfg(feature = "internal-checker")]
+enum RankedBaseEntry {
+    Integer(Vec<BigInt>),
+    Ieee(ranked_float::Atom),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -17520,6 +17558,31 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         }
         let empty = program.replace(expected_guard, "entry >= 2.0 && entry <= 1.0");
         assert!(!run(&empty, package).unwrap().active);
+        for (text, atom) in [
+            (program, ScalarCheckerIeeeValue::F32(1.0f32.to_bits())),
+            (&double, ScalarCheckerIeeeValue::F64(1.0f64.to_bits())),
+        ] {
+            let bad = text.replace("out == 7) decreases", "out == 8) decreases");
+            let checked = run(&bad, package).unwrap();
+            let failure = checked.symbolic_diagnostic.unwrap();
+            assert!(failure.failed_step.is_none() && failure.witness.axes().len() == 0);
+            assert_eq!(failure.returned, BigInt::from(7));
+            assert_eq!(&bad[failure.output.range.start as usize..failure.output.range.end as usize], "7");
+            assert_eq!(&bad[failure.goal.range.start as usize..failure.goal.range.end as usize], "out == 8");
+            let entry = failure.ieee_entry.unwrap();
+            assert_eq!(entry.value, atom);
+            assert_eq!(entry.binding.source, app);
+            assert_eq!(&bad[entry.binding.range.start as usize..entry.binding.range.end as usize], "value");
+        }
+        let signed_zero = program.replace(expected_guard, "entry == 0.0")
+            .replace("<= 1.0)", "<= 0.0)").replace("core.show(out == 7)", "core.show(out == 8)");
+        let checked = run(&signed_zero, package).unwrap();
+        let failure = checked.symbolic_diagnostic.unwrap();
+        let failed_step = failure.failed_step.unwrap();
+        assert_eq!(&signed_zero[failed_step.range.start as usize..failed_step.range.end as usize], "core.show(out == 8)");
+        assert_eq!(failure.ieee_entry.unwrap().value, ScalarCheckerIeeeValue::F32((-0.0f32).to_bits()));
+        let idle = run(&signed_zero, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!idle.active && idle.symbolic_diagnostic.is_none());
         for text in [
             program.replace("0.00000011920928955078125", "0.0000000001"),
             double.replace("0.0000000000000002220446049250313", "0.00000000000000000001"),
@@ -17527,7 +17590,6 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             program.replace(expected_guard, "entry >= 0.0 && entry <= 3.0"),
             program.replace("0.00000011920928955078125", "1.0"),
             program.replace("rank(entry - 0.00000011920928955078125)", "rank(entry)"),
-            program.replace("out == 7) decreases", "out == 8) decreases"),
             program.replace("%%end", r#"u8 reached = descend(1.0); core.require(reached == 7, { .stdout = ""; .stderr = ""; .code = 1; .files = []; }); %%end"#),
         ] {
             assert!(matches!(run(&text, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
@@ -21867,7 +21929,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let RankedInductionOutcome::Refuted(witness) = outcome else {
                 panic!("one-axis admitted base refutation");
             };
-            assert_eq!(witness.coordinates, [BigInt::from(2)]);
+            assert!(matches!(witness.entry, RankedBaseEntry::Integer(coordinates) if coordinates == [BigInt::from(2)]));
             assert_eq!(witness.returned, &BigInt::from(4));
             assert_eq!(witness.proof_source, &file);
             assert_eq!(witness.return_source, &file);

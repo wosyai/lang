@@ -171,6 +171,11 @@ fn charge(work: &mut usize, units: usize) -> Result<(), ProjectCheck> {
 }
 
 impl Lane {
+    pub(super) fn first(&self, work: &mut usize) -> Result<Atom, ProjectCheck> {
+        charge(work, 1)?;
+        self.atom(self.keys.first().ok_or(ProjectCheck::Unsupported)?.0)
+    }
+
     fn atom(&self, key: u64) -> Result<Atom, ProjectCheck> {
         self.sample.with_key(key).filter(|point| point.finite()).ok_or(ProjectCheck::Unsupported)
     }

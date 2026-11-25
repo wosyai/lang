@@ -1209,7 +1209,15 @@ fn check_command(
         } else if let Some(slot) = failure.result_slot {
             format!("symbolic call can return output {} = {value}", slot + 1)
         } else { format!("symbolic call can return {value}") }];
-        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
+        if let Some(ieee) = &failure.ieee_entry {
+            let name = entry_binding_name(&ieee.binding.source, ieee.binding.range, publication.texts).unwrap_or("argument 1");
+            use wosy_compiler::ScalarCheckerIeeeValue;
+            let detail = match ieee.value {
+                ScalarCheckerIeeeValue::F32(bits) => format!("{:?} (f32 bits 0x{bits:08x})", f32::from_bits(bits)),
+                ScalarCheckerIeeeValue::F64(bits) => format!("{:?} (f64 bits 0x{bits:016x})", f64::from_bits(bits)),
+            };
+            notes.push(format!("symbolic call entry: {name} = {detail}"));
+        } else if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1312,6 +1320,18 @@ fn proof_pair_text<T: std::fmt::Display>([(left, left_literal), (right, right_li
 }
 
 #[cfg(feature = "internal-checker")]
+fn entry_binding_name<'a>(
+    binding_source: &SourceIdentity,
+    declaration: wosy_syntax::ByteSpan,
+    texts: &'a BTreeMap<ProjectSourceIdentity, String>,
+) -> Option<&'a str> {
+    PackageRelativePath::new(binding_source.path.clone().into()).ok()
+        .map(|path| ProjectSourceIdentity::new(binding_source.project.clone(), binding_source.package.clone(), path))
+        .and_then(|source| texts.get(&source))
+        .and_then(|text| text.get(declaration.start as usize..declaration.end as usize))
+}
+
+#[cfg(feature = "internal-checker")]
 fn entry_point_note(
     witness: &wosy_compiler::ScalarCheckerIntegerWitness,
     texts: &BTreeMap<ProjectSourceIdentity, String>,
@@ -1322,10 +1342,7 @@ fn entry_point_note(
         let mut points = witness.intervals_at(0, axis)?;
         let (first, last) = points.next()?;
         if first != last || points.len() != 0 { return None; }
-        let name = PackageRelativePath::new(binding.source.path.clone().into()).ok()
-            .map(|path| ProjectSourceIdentity::new(binding.source.project.clone(), binding.source.package.clone(), path))
-            .and_then(|source| texts.get(&source))
-            .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
+        let name = entry_binding_name(&binding.source, binding.declaration_span, texts);
         let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
         let literal = if categorical { wosy_compiler::ScalarCheckerProofLiteral::from_atom(ty, first) } else { None };
         Some(format!("{name} = {}", proof_scalar_text(first, literal)))

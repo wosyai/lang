@@ -370,16 +370,19 @@ pub(super) fn verify<'a>(
                     let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
                     RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
                 };
-                // The current report can render only an integer entry
-                // witness. A false float base never becomes a certificate.
-                let RankLane::Integers(path) = path else { return Err(ProjectCheck::Unsupported); };
-                charge(&mut work, path.0.len())?;
-                let coordinates = path.0.iter().map(|axis| axis.extremes()
-                    .map(|(first, _)| first.clone()).ok_or(ProjectCheck::Unsupported))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let entry = match path {
+                    RankLane::Integers(path) => {
+                        charge(&mut work, path.0.len())?;
+                        let coordinates = path.0.iter().map(|axis| axis.extremes()
+                            .map(|(first, _)| first.clone()).ok_or(ProjectCheck::Unsupported))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        RankedBaseEntry::Integer(coordinates)
+                    }
+                    RankLane::Float(path) => RankedBaseEntry::Ieee(path.first(&mut work)?),
+                };
                 failure = Some(RankedBaseWitness {
                     proof_source: plan.proof_source, return_source: &typed.target.source,
-                    coordinates, returned: value,
+                    entry, returned: value,
                     return_span: body.occurrences.get(output.0).ok_or(ProjectCheck::Unsupported)?.span, rejected,
                 });
             }
