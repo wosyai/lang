@@ -353,8 +353,17 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
     }
 
     pub(super) fn closed_local_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
+        self.closed_local_callable_symbol_with_reader(expression, true)
+    }
+
+    pub(super) fn closed_local_scalar_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
+        self.closed_local_callable_symbol_with_reader(expression, false)
+    }
+
+    fn closed_local_callable_symbol_with_reader(&self, expression: &ScalarExpression, allow_reader: bool) -> Option<&str> {
         let declaration = self.body_call_nodes?.callable_value_declaration(expression)?;
         let entry = self.symbols().functions.get(&declaration.source)?.get(&declaration.range)?;
+        if !allow_reader && entry.closed_shared_reader { return None; }
         let closed = entry.local_purity.get().unwrap_or_else(|| {
             let closed = entry.closed_shared_reader || entry.ordinary_body.is_some_and(|(function, cfg)| {
                 super::local_callable::closed_scalar_target(function, cfg)

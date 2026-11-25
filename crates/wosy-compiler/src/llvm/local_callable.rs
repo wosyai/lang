@@ -7,6 +7,84 @@ pub(super) struct LocalCallableSlot<'ctx> {
     pub(super) outputs: crate::ScalarOutputSequence,
 }
 
+/// A private array of the same capture-free pointers as lexical callable slots.
+pub(super) struct LocalCallableArray<'ctx> {
+    storage: PointerValue<'ctx>,
+    llvm_type: inkwell::types::ArrayType<'ctx>,
+    length: u64,
+    element: ScalarType,
+}
+
+fn array_element(ty: &ScalarType) -> Option<(&ScalarType, u64)> {
+    let ScalarType::Array { element, length, .. } = ty else { return None; };
+    matches!(element.as_ref(), ScalarType::Callable { .. }).then_some((element.as_ref(), *length))
+}
+
+fn scalar_only_signature(ty: &ScalarType) -> Option<(&[ScalarType], &crate::ScalarOutputSequence)> {
+    signature(ty).filter(|(parameters, _)| parameters.iter().all(scalar))
+}
+
+fn same_scalar_signature(left: &ScalarType, right: &ScalarType) -> bool {
+    scalar_only_signature(left).zip(scalar_only_signature(right)).is_some_and(
+        |((left_parameters, left_outputs), (right_parameters, right_outputs))|
+            left_parameters == right_parameters
+                && left_outputs.outputs[0].ty == right_outputs.outputs[0].ty)
+}
+
+fn array_binding<'a>(
+    state: &EmitState<'_, '_>, binding: &'a ScalarBinding,
+) -> Result<(&'a crate::scalar::ScalarOutputReceiver, &'a ScalarType, u32), String> {
+    let Some((element, length)) = array_element(&binding.declared_type) else {
+        return Err("missing fixed callable-array element type".into());
+    };
+    let [receiver] = binding.receivers.as_slice() else { return Err("fixed callable array requires one receiver".into()); };
+    if !state.prepared_render || !state.require_release_checked_access || binding.is_allocation
+        || binding.fallible_assignment.is_some() || !array_element(&receiver.ty)
+            .is_some_and(|(ty, actual)| actual == length && same_scalar_signature(ty, element))
+        || state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)).is_none()
+        || scalar_only_signature(element).is_none()
+    {
+        return Err("fixed callable array requires a prepared lexical scalar-only declaration".into());
+    }
+    let bytes = length.checked_mul(state.target_layout.pointer_size).ok_or("fixed callable array size overflows")?;
+    memory::check_fixed_address_domain(state.target_layout, bytes)?;
+    Ok((receiver, element, u32::try_from(length).map_err(|_| "fixed callable array exceeds LLVM array count")?))
+}
+
+fn selected_array<'a, 'ctx>(
+    state: &'a EmitState<'ctx, '_>, place: &crate::ScalarPlace,
+) -> Option<&'a LocalCallableArray<'ctx>> {
+    let nodes = state.body_call_nodes?;
+    let root = match place {
+        crate::ScalarPlace::Index { base, .. } => base,
+        other => other,
+    };
+    state.local_callable_arrays.get(&nodes.lexical_place_declaration(root)?)
+}
+
+fn selected_pointer<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, place: &crate::ScalarPlace,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<PointerValue<'ctx>, String> {
+    let crate::ScalarPlace::Index { base, index, .. } = place else {
+        return Err("fixed callable array requires a direct indexed element".into());
+    };
+    let nodes = state.body_call_nodes.ok_or("fixed callable element lacks prepared nodes")?;
+    let selected = selected_array(state, place).ok_or("fixed callable element lacks its lexical array")?;
+    if !matches!(base.as_ref(), crate::ScalarPlace::Name { .. })
+        || nodes.place_ordinal(place).is_none()
+        || !nodes.checked_place_type(base).and_then(array_element)
+            .is_some_and(|(element, length)| same_scalar_signature(element, &selected.element) && length == selected.length)
+        || !nodes.checked_place_type(place).is_some_and(|ty| same_scalar_signature(ty, &selected.element))
+    {
+        return Err("fixed callable array changed its checked place or element".into());
+    }
+    let (storage, array, length) = (selected.storage, selected.llvm_type, selected.length);
+    let selected = memory::emit_place_index(context, state, index, project)?;
+    memory::check_fixed_index(context, state, selected, length, None)?;
+    memory::fixed_array_storage_element_pointer(context, state, array.into(), storage, selected)
+}
+
 fn scalar(ty: &ScalarType) -> bool {
     integer_width(ty).is_some()
         || matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::Enum(_)
@@ -57,9 +135,10 @@ pub(super) fn closed_scalar_target(function: &ScalarFunction, cfg: &ScalarRefere
 
 fn target<'ctx>(
     state: &EmitState<'ctx, '_>, expression: &ScalarExpression,
-    parameters: &[ScalarType], outputs: &crate::ScalarOutputSequence,
+    parameters: &[ScalarType], outputs: &crate::ScalarOutputSequence, allow_reader: bool,
 ) -> Result<PointerValue<'ctx>, String> {
-    let symbol = state.closed_local_callable_symbol(expression)
+    let symbol = (if allow_reader { state.closed_local_callable_symbol(expression) }
+        else { state.closed_local_scalar_callable_symbol(expression) })
         .ok_or_else(|| "local callable slot requires a proved direct scalar target".to_owned())?;
     let definition = state.functions.get(symbol).ok_or_else(|| state.missing_prepared_signature(symbol))?;
     let (actual_parameters, actual_outputs) = state.signatures.get(symbol).and_then(signature)
@@ -74,9 +153,24 @@ fn target<'ctx>(
     Ok(definition.as_global_value().as_pointer_value())
 }
 
-pub(super) fn binding_value<'ctx>(
-    state: &EmitState<'ctx, '_>, binding: &ScalarBinding,
+pub(super) fn binding_value<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, binding: &ScalarBinding,
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
+    if array_element(&binding.declared_type).is_some() {
+        let (_, element, length) = array_binding(state, binding)?;
+        let ScalarExpression::ArrayLiteral { elements, .. } = &binding.value else {
+            return Err("fixed callable array requires complete literal construction".into());
+        };
+        if elements.len() != length as usize {
+            return Err("fixed callable array literal count differs from its extent".into());
+        }
+        let (parameters, outputs) = scalar_only_signature(element).ok_or("invalid fixed callable array signature")?;
+        let resolved = elements.iter().map(|expression| target(state, expression, parameters, outputs, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        let array = context.ptr_type(AddressSpace::default()).const_array(&resolved);
+        return Ok(Some(EmitValue::Basic(array.into())));
+    }
     if !state.prepared_render || state.body_call_nodes.is_none()
         || !matches!(binding.declared_type, ScalarType::Callable { .. })
     {
@@ -84,13 +178,40 @@ pub(super) fn binding_value<'ctx>(
     }
     let (parameters, outputs) = signature(&binding.declared_type)
         .ok_or_else(|| "unsupported local callable slot signature".to_owned())?;
-    Ok(Some(EmitValue::Basic(target(state, &binding.value, parameters, outputs)?.into())))
+    if let ScalarExpression::IndexedRead { place, .. } = &binding.value {
+        let nodes = state.body_call_nodes.expect("prepared local callable receiver");
+        if binding.fallible_assignment.is_some() || binding.receivers.len() != 1
+            || nodes.binding_position(binding).is_none()
+            || !nodes.checked_place_type(place).is_some_and(|ty| same_scalar_signature(ty, &binding.declared_type))
+        {
+            return Err("indexed callable requires one exact typed lexical receiver".into());
+        }
+        let pointer = selected_pointer(context, state, place, project)?;
+        let value = state.builder.build_load(context.ptr_type(AddressSpace::default()), pointer, "selected_callable")
+            .map_err(builder_error)?;
+        return Ok(Some(EmitValue::Basic(value)));
+    }
+    Ok(Some(EmitValue::Basic(target(state, &binding.value, parameters, outputs, true)?.into())))
 }
 
 pub(super) fn store_binding<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
     binding: &ScalarBinding, value: &EmitValue<'ctx>,
 ) -> Result<bool, String> {
+    if array_element(&binding.declared_type).is_some() {
+        let (receiver, element, length) = array_binding(state, binding)?;
+        let EmitValue::Basic(BasicValueEnum::ArrayValue(array)) = value else {
+            return Err("fixed callable array lacks fully initialized storage".into());
+        };
+        let llvm_type = context.ptr_type(AddressSpace::default()).array_type(length);
+        if array.get_type() != llvm_type { return Err("fixed callable array changed its physical extent".into()); }
+        let storage = entry_alloca(state, llvm_type.into(), "local_callable_array")?;
+        state.builder.build_store(storage, *array).map_err(builder_error)?;
+        if state.local_callable_arrays.insert(receiver.name_span, LocalCallableArray {
+            storage, llvm_type, length: length.into(), element: element.clone(),
+        }).is_some() { return Err("duplicate fixed callable array declaration".into()); }
+        return Ok(true);
+    }
     if !state.prepared_render || state.body_call_nodes.is_none()
         || !matches!(binding.declared_type, ScalarType::Callable { .. })
     {
@@ -115,9 +236,37 @@ pub(super) fn store_binding<'ctx>(
     Ok(true)
 }
 
-pub(super) fn replace<'ctx>(
-    state: &mut EmitState<'ctx, '_>, assignment: &ScalarAssignment,
+pub(super) fn replace<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>, assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
+    if !state.local_callable_arrays.is_empty() {
+        if let Some(destination) = assignment.targets.iter()
+            .find(|destination| selected_array(state, &destination.place).is_some())
+        {
+            let [expression] = assignment.values.as_slice() else {
+                return Err("fixed callable array update requires one direct target".into());
+            };
+            if assignment.targets.len() != 1 || !matches!(destination.place, crate::ScalarPlace::Index { .. }) {
+                return Err("fixed callable array cannot be rebound or included in a compound write".into());
+            }
+            let nodes = state.body_call_nodes.ok_or("fixed callable update lacks prepared nodes")?;
+            if !nodes.is_callable_array_statement(assignment)
+                || assignment.receiver != destination.receiver || assignment.receiver_span != destination.receiver_span
+                || project.is_some_and(|project| assignment.receiver.as_ref().is_some_and(|receiver|
+                    state.project_names.is_some_and(|names| names.for_module(project.module)
+                        .namespaces.contains_key(receiver.as_str()))))
+            {
+                return Err("fixed callable array update requires an ordinary lexical statement without a previous result".into());
+            }
+            let array = selected_array(state, &destination.place).expect("authenticated callable array");
+            let (parameters, outputs) = scalar_only_signature(&array.element).ok_or("invalid fixed callable array signature")?;
+            let value = target(state, expression, parameters, outputs, false)?;
+            let pointer = selected_pointer(context, state, &destination.place, project)?;
+            state.builder.build_store(pointer, value).map_err(builder_error)?;
+            return Ok(Some(EmitValue::Unit));
+        }
+    }
     let Some(nodes) = state.body_call_nodes.filter(|_| !state.local_callable_slots.is_empty()) else {
         return Ok(None);
     };
@@ -132,7 +281,7 @@ pub(super) fn replace<'ctx>(
     if assignment.targets.len() != 1 || !matches!(assignment.targets[0].place, crate::ScalarPlace::Name { .. }) {
         return Err("local callable replacement requires one lexical destination".into());
     }
-    let pointer = target(state, expression, &slot.parameters, &slot.outputs)?;
+    let pointer = target(state, expression, &slot.parameters, &slot.outputs, true)?;
     state.builder.build_store(slot.storage, pointer).map_err(builder_error)?;
     Ok(Some(EmitValue::Unit))
 }

@@ -214,6 +214,7 @@ struct EmitState<'ctx, 'module> {
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
     local_callable_slots: HashMap<(u32, u32), local_callable::LocalCallableSlot<'ctx>>,
+    local_callable_arrays: HashMap<wosy_syntax::ByteSpan, local_callable::LocalCallableArray<'ctx>>,
     guarded_scalar: Option<Box<ownership::GuardedScalarSites<'ctx>>>,
     initializer_symbols: Option<&'module InitializerSymbols<'module>>,
     builder: &'ctx Builder<'ctx>,
@@ -2101,7 +2102,7 @@ fn emit_binding_value<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
 ) -> Result<EmitValue<'ctx>, String> {
-    if let Some(value) = local_callable::binding_value(state, binding)? {
+    if let Some(value) = local_callable::binding_value(context, state, binding, None)? {
         return Ok(value);
     }
     if binding.output_sequence.outputs.len() == 1 {
@@ -2778,7 +2779,7 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    if let Some(value) = local_callable::binding_value(state, binding)? {
+    if let Some(value) = local_callable::binding_value(context, state, binding, Some(ProjectCallScope { module, modules }))? {
         return Ok(value);
     }
     if binding.output_sequence.outputs.len() == 1 {
@@ -2872,6 +2873,7 @@ fn emit_function<'ctx, 'module>(
         initializer_nodes: None,
         body_call_nodes,
         local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
         guarded_scalar: ownership::GuardedScalarSites::from_cfg(reference_cfg),
         initializer_symbols: Some(initializer_symbols),
         builder,
@@ -3085,6 +3087,7 @@ fn emit_main<'ctx, 'module>(
         initializer_nodes,
         body_call_nodes: None,
         local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
         guarded_scalar: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
@@ -3246,6 +3249,7 @@ fn emit_project_function<'ctx, 'module>(
         initializer_nodes: None,
         body_call_nodes,
         local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
         guarded_scalar: ownership::GuardedScalarSites::from_cfg(reference_cfg),
         initializer_symbols: Some(initializer_symbols),
         builder,
@@ -3484,6 +3488,7 @@ fn emit_project_main<'ctx, 'module>(
         initializer_nodes: None,
         body_call_nodes: None,
         local_callable_slots: HashMap::new(),
+        local_callable_arrays: HashMap::new(),
         guarded_scalar: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
@@ -4774,7 +4779,7 @@ fn emit_assignment<'ctx, 'module>(
         || emit_widened_rebind(context, state, assignment, None)? {
         return Ok(EmitValue::Unit);
     }
-    if let Some(value) = local_callable::replace(state, assignment)? {
+    if let Some(value) = local_callable::replace(context, state, assignment, None)? {
         return Ok(value);
     }
     let expected = assignment
@@ -4877,7 +4882,7 @@ fn emit_project_assignment<'ctx, 'module>(
         || emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
         return Ok(EmitValue::Unit);
     }
-    if let Some(value) = local_callable::replace(state, assignment)? {
+    if let Some(value) = local_callable::replace(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
         return Ok(value);
     }
     let names = state.project_names.expect("project emission names");

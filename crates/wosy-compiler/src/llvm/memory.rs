@@ -836,7 +836,7 @@ fn index_has_raw_root(state: &EmitState<'_, '_>, mut place: &crate::ScalarPlace)
     }
 }
 
-fn emit_place_index<'ctx>(
+pub(super) fn emit_place_index<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     index: &ScalarExpression,
@@ -860,13 +860,25 @@ fn fixed_array_element_pointer<'ctx>(
 ) -> Result<PointerValue<'ctx>, String> {
     if checked && state.require_release_checked_access {
         let (bytes, _) = allocation_layout(ty, state.layouts, state.target_layout)?;
-        let max_offset = signed_array_max_bytes(state.target_layout.pointer_size)
-            .ok_or("unsupported fixed-array pointer index width")?;
-        if bytes > max_offset {
-            return Err("fixed array exceeds the target's addressable index domain".to_owned());
-        }
+        check_fixed_address_domain(state.target_layout, bytes)?;
     }
     let array = storage_type(context, ty, state.layouts, state.target_layout)?;
+    fixed_array_storage_element_pointer(context, state, array, base, index)
+}
+
+pub(super) fn check_fixed_address_domain(target: ScalarTargetLayout, bytes: u64) -> Result<(), String> {
+    let max_offset = signed_array_max_bytes(target.pointer_size)
+        .ok_or("unsupported fixed-array pointer index width")?;
+    if bytes > max_offset {
+        return Err("fixed array exceeds the target's addressable index domain".to_owned());
+    }
+    Ok(())
+}
+
+pub(super) fn fixed_array_storage_element_pointer<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, array: BasicTypeEnum<'ctx>,
+    base: PointerValue<'ctx>, index: inkwell::values::IntValue<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
     // The release helper and domain checks consume the full language-level
     // selector; target-width conversion belongs only at address construction.
     let index = array_address_index(context, state, index)?;
@@ -935,7 +947,7 @@ pub(super) fn checked_ordinary_snapshot_element_pointer<'ctx>(
     fixed_array_element_pointer(context, state, ty, pointer, index, true)
 }
 
-fn check_fixed_index<'ctx>(
+pub(super) fn check_fixed_index<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     index: inkwell::values::IntValue<'ctx>,

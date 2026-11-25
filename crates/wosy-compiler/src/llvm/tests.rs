@@ -17506,6 +17506,151 @@ if (portable(3,5,1) != 117 || signed_only(3,5,1) != 117) {{ core.system_panic();
 }
 
 #[test]
+fn fixed_callable_arrays_check_selection_and_snapshot_named_targets() {
+    let declarations = "%%start
+u8() first = fn { 11 };
+u8() second = fn { 17 };
+u8() replacement = fn { 29 };
+u64(u64) select_index = fn(index) { index };
+u8(u64,u64) observe = fn(index,other) {
+    u8()[2] operations = [first, second];
+    u8() kept = operations[select_index(index)];
+    operations[select_index(index)] = replacement;
+    u8() current = operations[select_index(index)];
+    u8() sibling = operations[select_index(other)];
+    if (kept() == 11 && current() == 29 && sibling() == 17) { 77 } else { 0 }
+};
+u8(u64) read_only = fn(index) {
+    u8()[2] operations = [first, second];
+    u8() selected = operations[select_index(index)];
+    selected()
+};
+unit(u64) write_only = fn(index) {
+    u8()[2] operations = [first, second];
+    operations[index] = replacement;
+};
+";
+    let routes = [
+        ("valid", "if (observe(0,1) != 77 || read_only(1) != 17) { core.system_panic(); };"),
+        ("read-boundary", "read_only(2);"),
+        ("write-boundary", "write_only(2);"),
+    ];
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: String| {
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        for (route, entry) in routes {
+            let text = format!("{declarations}{entry}\n%%end");
+            let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let helper = prepared.checked_access_source().unwrap();
+            let bounds = format!("call void @{}(", project_function_name(helper, "check_index_in_extent"));
+            let selector = format!("call i64 @{}(", project_function_name(&source, "select_index"));
+            for (name, result, accesses) in [("observe", "i8", 4), ("read_only", "i8", 1), ("write_only", "void", 1)] {
+                let body = self_tail_test_body(&ir, result, &project_function_name(&source, name));
+                assert_eq!(body.matches(&bounds).count(), accesses, "{body}");
+                assert_eq!(body.matches(&selector).count(), if name == "write_only" { 0 } else { accesses }, "{body}");
+                let accesses: Vec<_> = body.match_indices("getelementptr inbounds [2 x ptr]").collect();
+                assert_eq!(accesses.len(), if name == "observe" { 4 } else { 1 }, "{body}");
+                let stores: &[bool] = match name {
+                    "observe" => &[false, true, false, false],
+                    "read_only" => &[false],
+                    "write_only" => &[true],
+                    _ => unreachable!(),
+                };
+                let mut prior = 0;
+                let replacement = project_function_name(&source, "replacement");
+                for ((at, _), writes) in accesses.into_iter().zip(stores) {
+                    let before = &body[prior..at];
+                    let guard_at = before.find(&bounds).unwrap();
+                    assert_eq!(before.matches(&bounds).count(), 1, "{before}");
+                    let guard = before[guard_at..].lines().next().unwrap();
+                    let selector_result = if name == "write_only" {
+                        let selected = loaded_runtime_extent_parameter(body, "index");
+                        assert!(before[..guard_at].contains(&format!("{selected} = load i64")), "{before}");
+                        selected
+                    } else {
+                        let selector_at = before[..guard_at].find(&selector).unwrap();
+                        assert_eq!(before.matches(&selector).count(), 1, "{before}");
+                        before[..selector_at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap()
+                    };
+                    assert!(guard.contains(&format!("i64 {selector_result}, i64 2)")), "{guard}");
+                    let gep = body[at..].lines().next().unwrap();
+                    let address = body[..at].lines().last().unwrap().trim_start().strip_suffix(" = ").unwrap();
+                    let suffix = if target_layout == ScalarTargetLayout::WASM32 {
+                        let narrow = before[guard_at..].lines().find(|line|
+                            line.ends_with(&format!(" = trunc i64 {selector_result} to i32"))).unwrap();
+                        let narrowed = narrow.trim_start().split_once(" = ").unwrap().0;
+                        format!(", i32 {narrowed}")
+                    } else {
+                        format!(", i64 {selector_result}")
+                    };
+                    assert!(gep.ends_with(&suffix), "{gep}");
+                    let access = body[at + gep.len()..].trim_start().lines().next().unwrap();
+                    if *writes {
+                        assert!(access.starts_with(&format!("store ptr @{replacement}, ptr {address},")), "{access}");
+                    } else {
+                        assert!(access.split_once(" = ").is_some_and(|(_, op)|
+                            op.starts_with(&format!("load ptr, ptr {address},"))), "{access}");
+                    }
+                    prior = at + gep.len();
+                }
+                assert!(body.contains("store [2 x ptr] [ptr @"), "{body}");
+                assert!(!body.contains("__wosy_core_alloc") && !body.contains("__wosy_core_free"), "{body}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_FIXED_CALLABLE_ARRAY_IR_DIR") {
+                let target = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, ir);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}.ll")), controlled).unwrap();
+            }
+        }
+        let rebound = declarations.replace(
+            "operations[select_index(index)] = replacement;",
+            "operations = [second,first];",
+        );
+        let rebound = format!("{rebound}observe(0,1);\n%%end");
+        let diagnostic_span = rebound.find("operations = [second,first];").unwrap() as u32;
+        let assert_rebind = |diagnostics: &[crate::Diagnostic]| {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.iter().any(|label|
+                    (diagnostic_span..diagnostic_span + 28).contains(&label.span.range.start))), "{diagnostics:?}");
+        };
+        match prepare(rebound) {
+            Ok(prepared) => {
+                let checked = analyze_scalar_build(&prepared);
+                if checked.diagnostics().is_empty() {
+                    // The specialized backing is never exposed to the
+                    // generic assignment, so it cannot acquire a fixed
+                    // array destination for the replacement literal.
+                    let error = emit_scalar_build_project_llvm(&checked)
+                        .err().expect("whole callable array unexpectedly lowered");
+                    assert_eq!(error, "array literal requires an expected fixed array type");
+                } else {
+                    assert_rebind(checked.diagnostics());
+                }
+            }
+            Err(error) => assert_rebind(&error.diagnostics),
+        }
+        let bad = declarations.replace("operations = [first, second]", "operations = [first]");
+        let diagnostics = match prepare(format!("{bad}observe(0,1);\n%%end")) {
+            Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            Err(error) => error.diagnostics.clone(),
+        };
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "array literal element count does not match fixed array length"), "{diagnostics:?}");
+    }
+}
+
+#[test]
 fn runtime_element_reborrows_keep_original_extent_and_parent_loan() {
     let text = "%%start
 u16(u64,u64) read_shared = fn(count,index) {
