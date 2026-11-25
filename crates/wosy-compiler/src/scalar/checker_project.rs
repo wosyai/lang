@@ -22083,6 +22083,75 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn public_ordered_library_credit_proof_feeds_each_actual_downstream_requirement() {
+        let app = source("src/main.w", "ordered-library-credit-root");
+        let lib = source("src/credit.w", "ordered-library-credit-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend();
+                core.require(core.context.credit == 2, { .stdout = ""; .stderr = "first debit"; .code = 71; .files = []; });
+                if (true) {
+                    u8 core.context.credit = 3;
+                    accounting.spend();
+                    core.require(core.context.credit == 2, { .stdout = ""; .stderr = "shadow debit"; .code = 72; .files = []; });
+                };
+                accounting.spend();
+                core.require(core.context.credit == 1, { .stdout = ""; .stderr = "second debit"; .code = 73; .files = []; });
+            };
+            entry();
+        %%end"#;
+        let library = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() spend = fn { consume(); };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, library: &str, scope| {
+                let (_, app_catalog) = crate::parse_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+                let (_, lib_catalog) = crate::parse_proof_source(lib.clone(), library.to_owned(), &[]).ok().unwrap();
+                let import = ScalarNamespaceBinding { binding: "accounting".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), [(lib_catalog, Vec::new()), (app_catalog, vec![import])],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let checked = run(root, library, scope).unwrap();
+                assert!(checked.active && checked.directives.is_empty() && checked.contextual_diagnostic.is_none());
+                let stale = root.replace("core.context.credit == 1", "core.context.credit == 2");
+                let result = run(&stale, library, scope).unwrap();
+                assert!(result.contextual_diagnostic.is_none());
+                let [failed] = result.directives.as_slice() else { panic!("only the second ordinary debit obligation"); };
+                assert_eq!(failed.code(), &BigInt::from(73));
+                let condition = failed.condition;
+                assert_eq!(failed.source, app);
+                assert_eq!(&stale[condition.start as usize..condition.end as usize], "core.context.credit == 2");
+                let unchanged = library.replace("credit = core.context.credit - 1;", "credit = core.context.credit - 0;");
+                let false_proof = run(root, &unchanged, scope).unwrap();
+                let failure = false_proof.contextual_diagnostic.unwrap();
+                assert!(false_proof.directives.is_empty());
+                assert_eq!((&failure.entry, &failure.exit), (&BigInt::from(3), &BigInt::from(3)));
+                assert_eq!(&failure.call.source, &lib);
+                // The same one-debit program succeeds at credit 1 and
+                // refuses at credit 0; no concurrent shadow or later call
+                // can account for this outcome.
+                let one = root.split_once("                if (true)").unwrap().0
+                    .replace("u8 core.context.credit = 3;", "u8 core.context.credit = 1;")
+                    .replace("core.context.credit == 2", "core.context.credit == 0")
+                    + "            }; entry(); %%end";
+                let paid = run(&one, library, scope).unwrap();
+                assert!(paid.active && paid.contextual_diagnostic.is_none() && paid.directives.is_empty());
+                let overdrawn = one.replace("u8 core.context.credit = 1;", "u8 core.context.credit = 0;");
+                assert!(matches!(run(&overdrawn, library, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn public_ordered_unused_contextual_proof_observes_arbitrary_entry_and_exact_exit() {
         let app = source("src/main.w", "public-symbolic-contextual-proof");
         let text = r#"%%start
