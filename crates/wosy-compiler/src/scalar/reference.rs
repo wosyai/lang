@@ -9431,8 +9431,9 @@ impl StructuralWalker<'_, '_> {
                 let site = walk.sites.get(walk.call_occurrences[association].site)?;
                 let ResolvedCallTarget::ModuleCallable { source: owner, declaration_span, concrete: ConcreteCallSelection::Declaration } =
                     &site.target else { return None; };
-                if owner != source || !self.structure.checker_direct_targets.contains_key(&call)
-                    || !walk.target_resolver.declarations.checker_proof_targets.contains(&(source, *declaration_span))
+                if owner.project != source.project || owner.package != source.package
+                    || !self.structure.checker_direct_targets.contains_key(&call)
+                    || !walk.target_resolver.declarations.checker_proof_targets.contains(&(owner, *declaration_span))
                 {
                     return None;
                 }
