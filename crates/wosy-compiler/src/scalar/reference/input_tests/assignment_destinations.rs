@@ -13,7 +13,7 @@ fn rename_destination_root(place: &mut ScalarPlace, spelling: &str) {
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
             rename_destination_root(base, spelling);
         }
-        ScalarPlace::Dereference { .. } => panic!("named destination root"),
+        ScalarPlace::Contextual { .. } | ScalarPlace::Dereference { .. } => panic!("named destination root"),
     }
 }
 
@@ -354,6 +354,7 @@ fn checked_assignment_retains_original_destination_before_retargeting_on_both_pi
             structs,
             enums,
             diagnostics,
+            ..
         } = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
         assert!(diagnostics.is_empty());
         let order = vec![source.clone()];

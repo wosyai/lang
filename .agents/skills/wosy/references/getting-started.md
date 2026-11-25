@@ -39,6 +39,8 @@ wosy build app --profile dev
 wosy run app --profile dev -- <program-args>
 ```
 
+To verify proofs or checker directives, see [`wosy check`](cli.md#wosy-check).
+
 `build` type-checks every reachable module, emits `partition.ll` plus `runtime.ll`, invokes the configured builder, and writes `artifact-manifest.json`. `run` verifies the manifest is fresh and invokes the configured runner. Any source or `wosy.toml` change requires a rebuild; otherwise `run` reports `artifact manifest is stale`.
 
 ## Example

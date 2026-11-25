@@ -316,6 +316,8 @@ pub struct ReferenceBindingId {
 pub enum ReferenceBindingKind {
     Declared,
     CallOutput { point: CfgPointId, output: usize },
+    CheckerSnapshotField(usize),
+    ContextualFormal,
 }
 
 impl Ord for ReferenceBindingId {
@@ -623,6 +625,9 @@ pub enum CfgPointKind {
         then_point: CfgPointId,
         else_point: CfgPointId,
     },
+    /// An authenticated check-only statement, not a runtime call or load.
+    #[doc(hidden)]
+    CheckerRequire,
 }
 
 #[cfg_attr(not(test), derive(Clone))]
@@ -910,6 +915,11 @@ pub enum ScalarPlace {
         name: String,
         span: ByteSpan,
     },
+    Contextual {
+        binding: ReferenceBindingId,
+        ty: ScalarType,
+        span: ByteSpan,
+    },
     Field {
         base: Box<ScalarPlace>,
         field: ScalarFieldReference,
@@ -930,6 +940,7 @@ pub enum ScalarPlace {
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarPlaceIdentity {
     Name(String),
+    Contextual(ReferenceBindingId),
     Field(Box<ScalarPlaceIdentity>, ScalarFieldIdentity),
     Dereference(Box<ScalarExpressionIdentity>),
     Index(Box<ScalarPlaceIdentity>, Box<ScalarExpressionIdentity>),
@@ -943,7 +954,9 @@ enum ScalarFieldIdentity {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarExpressionIdentity {
+    RuntimeMatch(runtime_enum_match::Occurrence),
     Name(String),
+    Contextual(ReferenceBindingId),
     Member(String, String),
     ValueField(Box<ScalarExpressionIdentity>, String),
     Integer(BigInt),
@@ -1033,6 +1046,7 @@ enum ScalarBlockItemIdentity {
 fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
     match place {
         ScalarPlace::Name { name, .. } => ScalarPlaceIdentity::Name(name.clone()),
+        ScalarPlace::Contextual { binding, .. } => ScalarPlaceIdentity::Contextual(binding.clone()),
         ScalarPlace::Field { base, field, .. } => ScalarPlaceIdentity::Field(
             Box::new(scalar_place_identity(base)),
             match field {
@@ -1054,7 +1068,7 @@ fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
 
 fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
     match place {
-        ScalarPlace::Name { span, .. } | ScalarPlace::Dereference { span, .. } => *span,
+        ScalarPlace::Name { span, .. } | ScalarPlace::Contextual { span, .. } | ScalarPlace::Dereference { span, .. } => *span,
         ScalarPlace::Field { base, span, .. } | ScalarPlace::Index { base, span, .. } => {
             ByteSpan::new(scalar_place_target_span(base).start, span.end)
         }
@@ -1063,7 +1077,9 @@ fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
 
 fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpressionIdentity {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => ScalarExpressionIdentity::RuntimeMatch(site.clone()),
         ScalarExpression::Name { name, .. } => ScalarExpressionIdentity::Name(name.clone()),
+        ScalarExpression::Contextual { binding, .. } => ScalarExpressionIdentity::Contextual(binding.clone()),
         ScalarExpression::Member { receiver, name, .. } => {
             ScalarExpressionIdentity::Member(receiver.clone(), name.clone())
         }
@@ -1304,6 +1320,8 @@ pub struct ScalarEnumVariant {
     pub name: String,
     pub name_span: ByteSpan,
     pub tag: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<ScalarTypeArgument>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1311,16 +1329,57 @@ pub struct ScalarEnum {
     pub id: ScalarEnumId,
     pub name: String,
     pub name_span: ByteSpan,
-    pub variants: Vec<ScalarEnumVariant>,
+    variants: ScalarEnumVariants,
     pub copy_policy: CopyPolicy,
     pub copy_modifier_span: Option<ByteSpan>,
     pub span: ByteSpan,
+}
+
+// Compute the gate once while collecting the canonical declaration. The
+// immutable collection prevents the gate becoming stale. The serialized
+// form stays a plain variant sequence; never trust a serialized layout gate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct ScalarEnumVariants {
+    entries: Vec<ScalarEnumVariant>,
+    #[serde(skip)]
+    has_payload: bool,
+}
+
+impl FromIterator<ScalarEnumVariant> for ScalarEnumVariants {
+    fn from_iter<T: IntoIterator<Item = ScalarEnumVariant>>(variants: T) -> Self {
+        let mut has_payload = false;
+        let entries = variants.into_iter().inspect(|variant| {
+            has_payload |= !variant.payload.is_empty();
+        }).collect();
+        Self { entries, has_payload }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScalarEnumVariants {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<ScalarEnumVariant>::deserialize(deserializer).map(|variants| variants.into_iter().collect())
+    }
+}
+
+impl ScalarEnum {
+    pub fn variants(&self) -> &[ScalarEnumVariant] {
+        &self.variants.entries
+    }
+
+    // Until the ordinary tagged-union layout exists, the legacy i32 path
+    // must never materialize any variant of a payload-bearing enum.
+    pub(super) fn has_tag_only_layout(&self) -> bool {
+        !self.variants.has_payload
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarOutputReceiver {
     pub name: String,
     pub name_span: ByteSpan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contextual_storage: Option<ReferenceBindingId>,
     pub ty: ScalarType,
     pub allocation_length: Option<ScalarExpression>,
     pub span: ByteSpan,
@@ -1721,6 +1780,7 @@ fn overload_argument_type(
     scope: &BTreeMap<String, ScalarType>,
 ) -> Option<ScalarOverloadArgument> {
     match expression {
+        ScalarExpression::Contextual { ty, .. } => Some(ScalarOverloadArgument::Typed(ty.clone())),
         ScalarExpression::Name { name, .. } => {
             scope.get(name).cloned().map(ScalarOverloadArgument::Typed)
         }
@@ -1767,6 +1827,7 @@ pub enum BinaryOperator {
     BitXor,
     ShiftLeft,
     ShiftRight,
+    WrappingAdd,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1778,8 +1839,15 @@ pub enum UnaryOperator {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScalarExpression {
+    #[serde(skip)]
+    RuntimeMatch(runtime_enum_match::Occurrence),
     Name {
         name: String,
+        span: ByteSpan,
+    },
+    Contextual {
+        binding: ReferenceBindingId,
+        ty: ScalarType,
         span: ByteSpan,
     },
     Member {
@@ -2063,6 +2131,10 @@ pub(crate) enum ScalarBindingOutput<'a> {
 }
 
 impl ScalarBinding {
+    pub(crate) fn contextual_storage(&self) -> Option<&ReferenceBindingId> {
+        self.receivers.first()?.contextual_storage.as_ref()
+    }
+
     pub(crate) fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
         if position == 0 {
             return ScalarBindingOutput::Evaluate(&self.value);
@@ -2097,6 +2169,8 @@ pub struct ScalarFunction {
     pub parameters: Vec<String>,
     pub parameter_spans: Vec<ByteSpan>,
     pub body: ScalarBlock,
+    #[serde(skip)]
+    pub(crate) runtime_enum_match: Option<Box<runtime_enum_match::Plan>>,
     pub span: ByteSpan,
     pub generic_parameters: Vec<ScalarGenericParameter>,
     pub overload_arms: Vec<ScalarFunction>,
@@ -2274,6 +2348,12 @@ pub struct ScalarSourceDeclarations {
     structs: Vec<ScalarStruct>,
     enums: Vec<ScalarEnum>,
     diagnostics: Vec<super::Diagnostic>,
+    #[allow(dead_code)]
+    contextual_places: contextual::ContextualPlaces,
+    build_proofs: Vec<CstNode>,
+    // Guarded plans, not executable declarations or lowering authority.
+    #[allow(dead_code)]
+    runtime_enum_matches: Vec<runtime_enum_match::Plan>,
 }
 
 impl ScalarSourceDeclarations {
@@ -2315,55 +2395,179 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
 pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(
+        canonical,
+        false,
+        false,
+        false,
+        None,
+        #[cfg(any(test, feature = "internal-checker"))]
+        None,
+        #[cfg(feature = "internal-checker")]
+        false,
+    )
+}
+
+/// Retains proof declarations solely for the canonical Build static typing pass.
+#[doc(hidden)]
+pub fn derive_scalar_build_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(canonical, false, false, true, None,
+        #[cfg(any(test, feature = "internal-checker"))] None,
+        #[cfg(feature = "internal-checker")] false)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn derive_scalar_check_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(canonical, false, false, false, None, None, true)
+}
+
+fn derive_scalar_declarations(
+    canonical: &CanonicalCstRoot,
+    dormant_context: bool,
+    contextual_proof_runtime: bool,
+    retain_build_proofs: bool,
+    deferred_contextual_boundary: Option<&mut Option<Diagnostic>>,
+    #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
+    #[cfg(feature = "internal-checker")] check_typed_runtime_matches: bool,
+) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
-    let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
-    let mut struct_prefix = Vec::new();
-    let mut enum_prefix = Vec::new();
-    let mut struct_descendants = Vec::new();
-    let mut enum_descendants = Vec::new();
-    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, |node| {
-        let Some(root) = source_root.as_ref() else { return };
-        let (prefix, descendants) = match node.kind() {
-            SyntaxKind::StructDecl => (&mut struct_prefix, &mut struct_descendants),
-            SyntaxKind::EnumDecl => (&mut enum_prefix, &mut enum_descendants),
-            _ => unreachable!("aggregate declaration"),
-        };
-        let Some(parent) = node.parent() else { return };
-        if &parent == root {
-            prefix.push(node.clone());
-        } else if !parent.ancestors().any(|ancestor| &ancestor == root) {
-            return;
+    let mut build_proofs = Vec::new();
+    let source_root = canonical
+        .root
+        .children()
+        .find(|node| node.kind() == SyntaxKind::Root)
+        .expect("source root");
+    let has_named_proofs = source_root.children().any(|node| node.kind() == SyntaxKind::ProofDecl);
+    let pruned = has_named_proofs.then(|| runtime_module_roots(&source_root));
+    let runtime_roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&source_root));
+    #[cfg(any(test, feature = "internal-checker"))]
+    let include_proof_diagnostics = proofs.is_some() && !contextual_proof_runtime;
+    #[cfg(not(any(test, feature = "internal-checker")))]
+    let include_proof_diagnostics = false;
+    let diagnostic_roots = if has_named_proofs && !include_proof_diagnostics {
+        runtime_roots
+    } else {
+        std::slice::from_ref(&canonical.root)
+    };
+    let mut structs = Vec::new();
+    let mut enums = Vec::new();
+    let mut contextual = false;
+    let mut pending_runtime_matches = Vec::new();
+    let (mut diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, diagnostic_roots, |node| {
+        match node.kind() {
+            SyntaxKind::StructDecl => {
+                let id = ScalarStructId { source: canonical.source.clone(), index: structs.len() };
+                structs.push(derive_struct(node, id));
+            }
+            SyntaxKind::EnumDecl => {
+                let id = ScalarEnumId { source: canonical.source.clone(), index: enums.len() };
+                enums.push(derive_enum(node, id));
+            }
+            SyntaxKind::ContextualPlace => contextual = true,
+            SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr => pending_runtime_matches.push(node),
+            _ => {}
         }
-        descendants.push(node);
     });
-    if invalid_projection {
+    #[cfg(any(test, feature = "internal-checker"))]
+    let include_proof_projections = retain_build_proofs || proofs.is_some();
+    #[cfg(not(any(test, feature = "internal-checker")))]
+    let include_proof_projections = retain_build_proofs;
+    let proof_diagnostic_start = diagnostics.len();
+    if has_named_proofs && include_proof_projections && !include_proof_diagnostics {
+        diagnostics.extend(source_root.children()
+            .filter(|node| node.kind() == SyntaxKind::ProofDecl)
+            .flat_map(|node| node.descendants())
+            .filter_map(|node| invalid_projection_diagnostic(&canonical.source, &node)));
+    }
+    let mut runtime_enum_matches = Vec::new();
+    let guarded_runtime = !pending_runtime_matches.is_empty();
+    if guarded_runtime && diagnostics.is_empty() {
+        let mut runtime_match_work = 0;
+        for node in pending_runtime_matches {
+            match runtime_enum_match::prepare(&canonical.source, &enums, &node, &mut runtime_match_work) {
+                Ok(plan) => {
+                    #[cfg(feature = "internal-checker")]
+                    let (plan, checked) = {
+                        let mut plan = plan;
+                        let checked = check_typed_runtime_matches && plan.prepare_check_transfer(&mut runtime_match_work).is_some();
+                        (plan, checked)
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let checked = false;
+                    if !retain_build_proofs && !checked {
+                        diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span,
+                            "typed runtime enum match is not yet eligible for this preparation route"));
+                    }
+                    runtime_enum_matches.push(plan);
+                }
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+    }
+    if invalid_projection || diagnostics.len() != proof_diagnostic_start || (guarded_runtime && !diagnostics.is_empty()) {
         return ScalarSourceDeclarations {
             source: canonical.source.clone(),
             items,
             structs: Vec::new(),
             enums: Vec::new(),
             diagnostics,
+            contextual_places: contextual::ContextualPlaces::default(),
+            build_proofs,
+            runtime_enum_matches,
         };
     }
-    let source_root = source_root.expect("source root");
-    let structs = struct_prefix.into_iter().chain(struct_descendants).enumerate()
-        .map(|(index, node)| derive_struct(node, ScalarStructId { source: canonical.source.clone(), index }))
-        .collect();
-    let enums = enum_prefix.into_iter().chain(enum_descendants).enumerate()
-        .map(|(index, node)| derive_enum(node, ScalarEnumId { source: canonical.source.clone(), index }))
-        .collect();
+    let mut contextual_places = if contextual {
+        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics,
+            dormant_context && (!has_named_proofs || contextual_proof_runtime), contextual_proof_runtime)
+    } else {
+        contextual::ContextualPlaces::default()
+    };
+    if contextual && has_named_proofs && include_proof_diagnostics {
+        let boundary = contextual::reported_error(
+            SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&source_root)),
+            "contextual storage with named proofs is not supported by this checker boundary",
+        );
+        if let Some(deferred) = deferred_contextual_boundary {
+            *deferred = Some(boundary);
+        } else {
+            diagnostics.push(boundary);
+        }
+    }
+    let mut executable_matches = HashMap::new();
+    for plan in runtime_enum_matches {
+        if plan.is_initializer() {
+            contextual_places.runtime_matches.insert(plan.span, runtime_enum_match::Occurrence(std::sync::Arc::new(plan)));
+        } else {
+            executable_matches.insert(plan.owner.start, plan);
+        }
+    }
+    let mut function_from_source = |node: &CstNode, places: &contextual::ContextualPlaces| {
+        let plan = executable_matches.remove(&wosy_syntax::byte_span(node).start);
+        derive_function_with_runtime_match(node, places, plan)
+    };
+    let derive_items = !contextual || diagnostics.is_empty();
     let mut generic_function = false;
-    for node in source_root.children() {
+    for node in source_root.children().filter(|_| derive_items) {
         match node.kind() {
+            SyntaxKind::ProofDecl => {
+                if retain_build_proofs { build_proofs.push(node.clone()); }
+                #[cfg(any(test, feature = "internal-checker"))]
+                if let Some(proofs) = proofs.as_deref_mut() {
+                    proofs.push(node);
+                }
+                generic_function = false;
+                continue;
+            }
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
-            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
+            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, &contextual_places))),
             SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node)))
+                items.push(ScalarItem::Function(function_from_source(&node, &contextual_places)))
             }
-            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node))),
+            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node, &contextual_places))),
             SyntaxKind::GenericFunctionDecl => {
-                items.push(ScalarItem::Function(derive_generic_function(&node)));
+                items.push(ScalarItem::Function(derive_generic_function(&node, &contextual_places)));
                 generic_function = true;
             }
             SyntaxKind::Item => {
@@ -2380,19 +2584,19 @@ pub fn derive_scalar_declarations_from_cst(
                             items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
                         SyntaxKind::BindingDecl => {
-                            items.push(ScalarItem::Binding(derive_binding(&item)))
+                            items.push(ScalarItem::Binding(derive_binding(&item, &contextual_places)))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item)))
+                            items.push(ScalarItem::Function(function_from_source(&item, &contextual_places)))
                         }
                         SyntaxKind::OverloadDecl => {
-                            items.push(ScalarItem::Function(derive_overload(&item)))
+                            items.push(ScalarItem::Function(derive_overload(&item, &contextual_places)))
                         }
                         SyntaxKind::GenericFunctionDecl => {
-                            items.push(ScalarItem::Function(derive_generic_function(&item)))
+                            items.push(ScalarItem::Function(derive_generic_function(&item, &contextual_places)))
                         }
                         SyntaxKind::TopLevelItem => {
-                            items.push(ScalarItem::Executable(derive_executable_item(&item)))
+                            items.push(ScalarItem::Executable(derive_executable_item(&item, &contextual_places)))
                         }
                         _ => {}
                     }
@@ -2404,12 +2608,18 @@ pub fn derive_scalar_declarations_from_cst(
             generic_function = false;
         }
     }
+    if let Some(plan) = executable_matches.into_values().next() {
+        diagnostics.push(runtime_enum_match::diagnostic(&plan.source, plan.span, "missing runtime match callable owner"));
+    }
     ScalarSourceDeclarations {
         source: canonical.source.clone(),
         items,
         structs,
         enums,
         diagnostics,
+        contextual_places,
+        build_proofs,
+        runtime_enum_matches: Vec::new(),
     }
 }
 
@@ -2431,6 +2641,7 @@ fn typecheck_scalar_program_with_occurrences(
         structs,
         enums,
         mut diagnostics,
+        ..
     } = declarations;
     let mut program = ScalarProgram {
         source,
@@ -2481,7 +2692,12 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
 }
 
+mod contextual;
 mod declarations;
+mod proof_typing;
+mod proof_match;
+pub(crate) mod runtime_enum_match;
+mod analysis_budget;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};
@@ -2492,7 +2708,7 @@ use overload::{
     ScalarOverloadHeader, ScalarTypingView,
 };
 pub(crate) mod layout;
-pub use layout::ScalarTargetLayouts;
+pub use layout::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout, ScalarEnumVariantLayout, ScalarTargetLayouts};
 use layout::{resolve_program_struct_layouts, resolve_project_struct_layouts};
 mod resolution;
 use resolution::{
@@ -2510,16 +2726,34 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    collect_scalar_diagnostics(canonical, |_| {}).0
+    let pruned = canonical.root.children()
+        .find(|node| node.kind() == SyntaxKind::Root)
+        .filter(|module| module.children().any(|node| node.kind() == SyntaxKind::ProofDecl))
+        .map(|module| runtime_module_roots(&module));
+    let roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&canonical.root));
+    let mut runtime = Vec::new();
+    let (mut diagnostics, _) = collect_scalar_diagnostics(canonical, roots, |node| {
+        if matches!(node.kind(), SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr) {
+            runtime.push(runtime_enum_match::diagnostic(&canonical.source, wosy_syntax::byte_span(&node),
+                "runtime enum match is not yet eligible for lowering"));
+        }
+    });
+    diagnostics.append(&mut runtime);
+    diagnostics
+}
+
+fn runtime_module_roots(module: &CstNode) -> Vec<CstNode> {
+    module.children().filter(|node| node.kind() != SyntaxKind::ProofDecl).collect()
 }
 
 fn collect_scalar_diagnostics(
     canonical: &CanonicalCstRoot,
+    roots: &[CstNode],
     mut record_declaration: impl FnMut(CstNode),
 ) -> (Vec<Diagnostic>, bool) {
     let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
         [const { Vec::new() }; 6];
-    for element in canonical.root.descendants_with_tokens() {
+    for element in roots.iter().flat_map(CstNode::descendants_with_tokens) {
         match element {
             NodeOrToken::Token(token) => {
                 let (diagnostics, code, message, span) = match token.kind() {
@@ -2575,31 +2809,9 @@ fn collect_scalar_diagnostics(
                 lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
             }
             NodeOrToken::Node(node)
-                if node.kind() == SyntaxKind::InvalidTemporaryPlace
-                    || (node.kind() == SyntaxKind::ValueField
-                        && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
-            {
-                let message = if node.kind() == SyntaxKind::InvalidTemporaryPlace {
-                    "a field of a temporary is not an assignable or borrowable place"
-                } else {
-                    "an indexed call result field is not supported"
-                };
-                projections.push(Diagnostic {
-                    code: "B0003".to_owned(),
-                    severity: DiagnosticSeverity::Error,
-                    message: message.to_owned(),
-                    labels: vec![DiagnosticLabel {
-                        kind: DiagnosticLabelKind::Primary,
-                        span: SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&node)),
-                        message: message.to_owned(),
-                    }],
-                    notes: Vec::new(),
-                });
-            }
-            NodeOrToken::Node(node)
-                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl) =>
+                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl | SyntaxKind::ContextualPlace | SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr) =>
                 record_declaration(node),
-            _ => {}
+            NodeOrToken::Node(node) => projections.extend(invalid_projection_diagnostic(&canonical.source, &node)),
         }
     }
     strings.append(&mut chars);
@@ -2611,6 +2823,26 @@ fn collect_scalar_diagnostics(
     (strings, invalid_projection)
 }
 
+fn invalid_projection_diagnostic(source: &SourceIdentity, node: &CstNode) -> Option<Diagnostic> {
+    let message = match node.kind() {
+        SyntaxKind::InvalidTemporaryPlace => "a field of a temporary is not an assignable or borrowable place",
+        SyntaxKind::ValueField if node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix) =>
+            "an indexed call result field is not supported",
+        _ => return None,
+    };
+    Some(Diagnostic {
+        code: "B0003".to_owned(),
+        severity: DiagnosticSeverity::Error,
+        message: message.to_owned(),
+        labels: vec![DiagnosticLabel {
+            kind: DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(node)),
+            message: message.to_owned(),
+        }],
+        notes: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     typecheck_scalar_project_with_occurrences(project).0
@@ -2619,13 +2851,44 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
 fn typecheck_scalar_project_with_occurrences(
     project: ScalarProject,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_in_mode(
+        project,
+        #[cfg(any(test, feature = "internal-checker"))]
+        false,
+    )
+}
+
+fn typecheck_scalar_project_in_mode(
+    project: ScalarProject,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_with_formals(project, HashMap::new(),
+        #[cfg(any(test, feature = "internal-checker"))]
+        checker_directives,
+    )
+}
+
+fn typecheck_scalar_project_with_formals(
+    project: ScalarProject, contextual_formals: HashMap<ReferenceBindingId, ScalarType>,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_with_build_proofs(project, contextual_formals, &HashMap::new(),
+        #[cfg(any(test, feature = "internal-checker"))] checker_directives)
+}
+
+fn typecheck_scalar_project_with_build_proofs(
+    project: ScalarProject, contextual_formals: HashMap<ReferenceBindingId, ScalarType>,
+    build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
         module.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
-    let declarations = declarations::resolve_project_types(&mut project.modules);
+    let mut project_declarations = declarations::resolve_project_types(&mut project.modules);
+    project_declarations.set_contextual_formal_types(contextual_formals);
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
     let (struct_policies, enum_policies) = compute_copy_policies(
         &project
@@ -2669,18 +2932,21 @@ fn typecheck_scalar_project_with_occurrences(
             items,
             &modules[ordinal],
             &modules,
-            &declarations,
+            &project_declarations,
             ordinal,
             &overloads.typing(ordinal),
             &owners[ordinal],
         );
     }
-    drop(declarations);
+    let mut proof_runtime_scopes = (!build_proofs.is_empty()).then(Vec::new);
+    let proof_declarations = proof_runtime_scopes.as_ref().map(|_| project_declarations);
     let mut inferences = Vec::with_capacity(modules.len());
     for (ordinal, module) in modules.iter().enumerate() {
         let items: &[ScalarItem] = module_items[ordinal];
         let overloads = overloads.typing(ordinal);
         let mut inference = ScalarInferenceBuilder::for_validation(&owners[ordinal]);
+        #[cfg(any(test, feature = "internal-checker"))]
+        inference.enable_checker_directives(checker_directives);
         validate_unit_if_positions_in_module(items, module.source, &mut diagnostics);
         for structure in module.structs {
             for field in &structure.fields {
@@ -2791,6 +3057,7 @@ fn typecheck_scalar_project_with_occurrences(
                 validate_extern(&module.source, extern_decl, &mut diagnostics);
             }
         }
+        let mut proof_inferred_scope = proof_runtime_scopes.as_ref().map(|_| BTreeMap::new());
         for item in items {
             inference.set_validation_root(item);
             match item {
@@ -2907,6 +3174,13 @@ fn typecheck_scalar_project_with_occurrences(
                             &mut folded_names,
                             &mut diagnostics,
                         );
+                        if let Some(plan) = &function.runtime_enum_match {
+                            if !plan.authenticates(module.source, function) {
+                                diagnostics.push(module_diagnostic(module, "B0003",
+                                    "runtime match does not authenticate its typed callable", function.span));
+                            }
+                            continue;
+                        }
                         if outputs.outputs.len() > 1
                             && !function.body.final_output_values.is_empty()
                         {
@@ -3060,6 +3334,22 @@ fn typecheck_scalar_project_with_occurrences(
                         &overloads,
                         &mut inference,
                     );
+                    // Ordinary inference records actual output types in this
+                    // initialization scope; carry only inferred declaration
+                    // destinations, never raw assignment spelling as authority.
+                    if let (Some(inferred), ScalarBlockItem::Assignment(assignment)) =
+                        (&mut proof_inferred_scope, executable)
+                    {
+                        for target in &assignment.targets {
+                            if let ScalarPlace::Name { name, .. } = &target.place {
+                                if !declarations.contains_key(name) {
+                                    if let Some(actual) = scope.get(name) {
+                                        inferred.entry(name.clone()).or_insert_with(|| actual.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3072,6 +3362,15 @@ fn typecheck_scalar_project_with_occurrences(
             ));
         }
         inferences.push(inference);
+        if let (Some(scopes), Some(inferred)) = (&mut proof_runtime_scopes, proof_inferred_scope) {
+            declarations.extend(inferred);
+            scopes.push(declarations);
+        }
+    }
+    if let (Some(scopes), Some(declarations)) = (proof_runtime_scopes, proof_declarations) {
+        if diagnostics.is_empty() {
+            proof_typing::validate_build_proofs(build_proofs, &modules, &scopes, &declarations, &overloads, &mut diagnostics);
+        }
     }
     drop(module_items);
     drop(modules);
@@ -3102,13 +3401,57 @@ fn typecheck_scalar_project_with_occurrences(
     )
 }
 
+#[cfg(any(test, feature = "internal-checker"))]
+pub(crate) fn prepare_internal_contextual_runtime(
+    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
+) -> Result<PreparedScalarProject, String> {
+    contextual::prepare_contextual_transport(canonical, inputs, false, false)
+        .map(|(prepared, _)| prepared)
+        .map_err(|reason| format!("unsupported contextual runtime transport: {reason:?}"))
+}
+
 pub fn prepare_scalar_project(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+    let build_proofs = declarations.iter_mut().filter_map(|(module, _)| {
+        (!module.build_proofs.is_empty()).then(|| (module.source.clone(), std::mem::take(&mut module.build_proofs)))
+    }).collect::<HashMap<_, _>>();
+    let project = project_from_declarations(declarations, initialization_order, inputs)?;
+    if build_proofs.is_empty() {
+        PreparedScalarProject::new(project)
+    } else {
+        PreparedScalarProject::from_canonical_typing(typecheck_scalar_project_with_build_proofs(
+            project, HashMap::new(), &build_proofs,
+            #[cfg(any(test, feature = "internal-checker"))] false,
+        ))
+    }
+}
+
+fn project_from_declarations(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
+    project_from_declarations_with_context_types(declarations, initialization_order, inputs, false)
+        .map(|(project, _)| project)
+}
+
+fn project_from_declarations_with_context_types(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, allow_pending: bool,
+) -> Result<(ScalarProject, HashMap<ReferenceBindingId, ScalarType>), ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
+    let mut pending_formals = Vec::new();
+    // The global entry preserves invariant type and its first diagnostic
+    // label. Pending formals separately need a provider in their own
+    // project/package, independent of which declaration was global first.
+    let mut package_providers = (allow_pending && declarations.iter().any(|(source, _)| source.contextual_places.has_pending_formals))
+        .then(HashMap::<String, HashMap<String, HashSet<String>>>::new);
+    let mut contextual_types = HashMap::<String, (ScalarType, SourceSpan, bool)>::new();
+    let mut inherited = Vec::new();
     for (declarations, namespace_bindings) in declarations {
         let ScalarSourceDeclarations {
             source,
@@ -3116,7 +3459,53 @@ pub fn prepare_scalar_project(
             structs,
             enums,
             diagnostics: extraction_diagnostics,
+            contextual_places,
+            ..
         } = declarations;
+        for index in contextual_places.first_declarations {
+            let storage = &contextual_places.declarations[index];
+            if let Some(providers) = &mut package_providers {
+                providers.entry(source.project.clone()).or_default()
+                    .entry(source.package.clone()).or_default().insert(storage.name.clone());
+            }
+            match contextual_types.get_mut(&storage.name) {
+                Some((ty, first_span, conflicted)) if *ty != storage.ty => {
+                    *conflicted = true;
+                    let mut diagnostic = contextual::reported_error(
+                        storage.declaration.clone(),
+                        "contextual name must have one static type",
+                    );
+                    diagnostic.labels.push(DiagnosticLabel {
+                        kind: DiagnosticLabelKind::Secondary,
+                        span: first_span.clone(),
+                        message: "first declaration of this contextual name".to_owned(),
+                    });
+                    diagnostics.push(diagnostic);
+                }
+                Some(_) => {}
+                None => {
+                    contextual_types.insert(
+                        storage.name.clone(),
+                        (storage.ty.clone(), storage.declaration.clone(), false),
+                    );
+                }
+            }
+        }
+        for name in contextual_places.conflicted_types {
+            if let Some((_, _, conflicted)) = contextual_types.get_mut(&name) {
+                *conflicted = true;
+            }
+        }
+        let offset = diagnostics.len();
+        if contextual_places.has_pending_formals {
+            pending_formals.extend(contextual_places.inherited.into_iter().map(|occurrence| {
+                (contextual::contextual_formal(&source, occurrence.function), occurrence.span, occurrence.name)
+            }));
+        } else {
+            inherited.extend(contextual_places.inherited.into_iter().map(|occurrence| {
+                (offset + occurrence.diagnostic, occurrence.span, occurrence.name)
+            }));
+        }
         let mut module = ScalarModule::new(source, items, namespace_bindings);
         module.structs = structs;
         module.enums = enums;
@@ -3124,6 +3513,38 @@ pub fn prepare_scalar_project(
         module.layouts = ScalarTargetLayouts::new(inputs.target_layout);
         modules.push(module);
         diagnostics.extend(extraction_diagnostics);
+    }
+    // Final catalog authority is independent of the declaration's
+    // module order and never implies that its storage is active at a call.
+    for (index, occurrence_span, name) in inherited {
+        let Some((_, declaration, false)) = contextual_types.get(&name) else { continue; };
+        let Some(diagnostic) = diagnostics.get_mut(index) else { continue; };
+        if diagnostic.labels.first().is_none_or(|label| label.span.range != occurrence_span) {
+            continue;
+        }
+        diagnostic.labels.push(DiagnosticLabel {
+            kind: DiagnosticLabelKind::Secondary,
+            span: declaration.clone(),
+            message: "project contextual type declared here; call binding is not resolved".to_owned(),
+        });
+    }
+    let mut resolved = HashMap::new();
+    for (formal, span, name) in pending_formals {
+        let ty = if allow_pending {
+            contextual_types.get(&name).and_then(|(ty, _, conflict)| {
+                let local = package_providers.as_ref()
+                    .and_then(|projects| projects.get(&formal.source.project))
+                    .and_then(|packages| packages.get(&formal.source.package))
+                    .is_some_and(|names| names.contains(&name));
+                (!*conflict && is_integer_type(ty) && local).then_some(ty)
+            })
+        } else { None };
+        if let Some(ty) = ty {
+            resolved.insert(formal, ty.clone());
+        } else {
+            diagnostics.push(contextual::reported_error(SourceSpan::new(formal.source, span),
+                "no unambiguous checked project type for inherited contextual binding"));
+        }
     }
     let project = ScalarProject::new(modules, initialization_order);
     if !diagnostics.is_empty() {
@@ -3134,7 +3555,7 @@ pub fn prepare_scalar_project(
             },
         ));
     }
-    PreparedScalarProject::new(project)
+    Ok((project, resolved))
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
@@ -3220,7 +3641,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     }
 }
 
-fn derive_binding(node: &CstNode) -> ScalarBinding {
+fn derive_binding(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBinding {
     let receiver_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::ReceiverList)
@@ -3229,11 +3650,16 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .children()
         .filter(|child| child.kind() == SyntaxKind::Receiver)
         .map(|receiver| {
-            let name = direct_token(&receiver, SyntaxKind::Identifier).expect("receiver name");
+            let contextual = receiver.children().find(|child| child.kind() == SyntaxKind::ContextualPlace);
+            let name = direct_token(contextual.as_ref().unwrap_or(&receiver), SyntaxKind::Identifier).expect("receiver name");
+            let storage = contextual.as_ref().map(|node| {
+                places.storage(wosy_syntax::byte_span(node), contextual::ContextualRole::Declare)
+                    .expect("prepared contextual declaration")
+            });
             let allocation_length = receiver
                 .children()
                 .find(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child));
+                .map(|child| derive_expression_with_places(&child, places));
             let ty = allocation_length.as_ref().map_or_else(
                 || {
                     let ty_node = direct_nodes(&receiver)
@@ -3254,6 +3680,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
             ScalarOutputReceiver {
                 name: name.text().to_owned(),
                 name_span: token_span(&name),
+                contextual_storage: storage.map(|slot| slot.binding.clone()),
                 ty,
                 allocation_length,
                 span: wosy_syntax::byte_span(&receiver),
@@ -3268,7 +3695,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_list
             .children()
             .filter(|child| child.kind() == SyntaxKind::Expression)
-            .map(|child| derive_expression(&child))
+            .map(|child| derive_expression_with_places(&child, places))
             .collect::<Vec<_>>()
     });
     let value = outputs
@@ -3380,6 +3807,11 @@ fn derive_enum(node: CstNode, id: ScalarEnumId) -> ScalarEnum {
                 name: name.text().to_owned(),
                 name_span: token_span(&name),
                 tag: u32::try_from(tag).expect("enum variant tag fits u32"),
+                payload: variant.children().find(|child| child.kind() == SyntaxKind::EnumVariantPayload)
+                    .into_iter().flat_map(|payload| payload.children())
+                    .filter(|child| child.kind() == SyntaxKind::TypeSpec)
+                    .map(|ty| ScalarTypeArgument { ty: derive_type(&ty), span: wosy_syntax::byte_span(&ty) })
+                    .collect(),
             }
         })
         .collect();
@@ -3559,7 +3991,13 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
     }
 }
 
-fn derive_function(node: &CstNode) -> ScalarFunction {
+fn derive_function(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
+    derive_function_with_runtime_match(node, places, None)
+}
+
+fn derive_function_with_runtime_match(node: &CstNode, places: &contextual::ContextualPlaces,
+    runtime_enum_match: Option<runtime_enum_match::Plan>,
+) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
         children
@@ -3599,7 +4037,11 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
     let mut body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
-        .map(|node| derive_block(node))
+        .map(|node| derive_block_with_context(node, false, places))
+        .or_else(|| runtime_enum_match.as_ref().map(|plan| ScalarBlock {
+            span: plan.span, items: Vec::new(), terminated_items: Vec::new(), expressions: Vec::new(),
+            final_output_values: Vec::new(), unsafe_context: false,
+        }))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -3613,6 +4055,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         parameters,
         parameter_spans,
         body,
+        runtime_enum_match: runtime_enum_match.map(Box::new),
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
@@ -3638,7 +4081,7 @@ fn derive_generic_parameters(node: &CstNode) -> Vec<ScalarGenericParameter> {
         .unwrap_or_default()
 }
 
-fn derive_generic_function(node: &CstNode) -> ScalarFunction {
+fn derive_generic_function(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
     let generic = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::GenericDecl)
@@ -3647,13 +4090,13 @@ fn derive_generic_function(node: &CstNode) -> ScalarFunction {
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::FunctionDecl)
         .expect("generic function declaration");
-    let mut function = derive_function(&function);
+    let mut function = derive_function(&function, places);
     function.generic_parameters = derive_generic_parameters(&generic);
     function.span = wosy_syntax::byte_span(node);
     function
 }
 
-fn derive_overload(node: &CstNode) -> ScalarFunction {
+fn derive_overload(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
     let name = direct_token(node, SyntaxKind::Identifier).expect("overload name");
     let arms: Vec<ScalarFunction> = node
         .children()
@@ -3694,11 +4137,12 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                         })
                         .collect()
                 });
-            let mut body = derive_block(
+            let mut body = derive_block_with_context(
                 children
                     .iter()
                     .find(|child| child.kind() == SyntaxKind::Block)
                     .expect("overload arm block"),
+                false, places,
             );
             if let ScalarType::Callable { outputs, .. } = &signature {
                 for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -3713,6 +4157,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 parameter_spans,
                 body,
                 span: wosy_syntax::byte_span(&arm),
+                runtime_enum_match: None,
                 generic_parameters: children
                     .iter()
                     .find(|child| child.kind() == SyntaxKind::GenericDecl)
@@ -3745,6 +4190,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
             unsafe_context: false,
         },
         span: wosy_syntax::byte_span(node),
+        runtime_enum_match: None,
         generic_parameters: Vec::new(),
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
@@ -3762,6 +4208,22 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
+#[cfg(any(test, feature = "internal-checker"))]
+mod checker_directive;
+#[cfg(any(test, feature = "internal-checker"))]
+mod checker_flow;
+#[cfg(any(test, feature = "internal-checker"))]
+mod checker_project;
+#[cfg(any(test, feature = "internal-checker"))]
+mod symbolic_integer;
+#[cfg(feature = "internal-checker")]
+pub use checker_directive::{CheckedOutputTargets, ScalarCheckerTextFile};
+#[cfg(feature = "internal-checker")]
+pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ContextualProofDiagnostic, MainFlowProofDiagnostic, MainFlowProofInvocation, ScalarCheckerProofLiteral, SymbolicProofDiagnostic, ScalarCheckerIeeeEntry, ScalarCheckerIeeeValue, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
+#[cfg(feature = "internal-checker")]
+pub(crate) use checker_project::derive_scalar_proof_declarations_from_cst;
+#[cfg(feature = "internal-checker")]
+pub(crate) use checker_project::{derive_configured_scalar_proof_declarations_from_cst, derive_configured_root_scalar_proof_declarations_from_cst};
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
@@ -4123,17 +4585,17 @@ fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan 
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
-    derive_block_with_context(node, false)
+    derive_block_with_context(node, false, &contextual::ContextualPlaces::default())
 }
 
-fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
+fn derive_block_with_context(node: &CstNode, unsafe_context: bool, places: &contextual::ContextualPlaces) -> ScalarBlock {
     let block_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
         .collect::<Vec<_>>();
     let mut items = block_items
         .iter()
-        .map(derive_block_item)
+        .map(|item| derive_block_item(item, places))
         .collect::<Vec<_>>();
     let mut final_output_values = direct_nodes(node)
         .into_iter()
@@ -4148,7 +4610,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .filter(|child| child.kind() == SyntaxKind::Expression)
                 .enumerate()
                 .map(|(position, child)| {
-                    let value = derive_expression(&child);
+                    let value = derive_expression_with_places(&child, places);
                     ScalarOutputValue {
                         position,
                         ty: ScalarType::Error,
@@ -4218,40 +4680,40 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
     }
 }
 
-fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_block_item(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBlockItem {
     let child = direct_nodes(node).into_iter().next().expect("block item");
     match child.kind() {
-        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
+        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child, places)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual, places)),
+                _ => ScalarBlockItem::Expression(derive_expression_with_places(&child, places)),
             }
         }
         _ => panic!("block item grammar"),
     }
 }
 
-fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_executable_item(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBlockItem {
     let child = direct_nodes(node)
         .into_iter()
         .next()
         .expect("executable item");
     match child.kind() {
-        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child)),
+        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child, places)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual, places)),
+                _ => ScalarBlockItem::Expression(derive_expression_with_places(&child, places)),
             }
         }
         _ => panic!("top-level item grammar"),
     }
 }
 
-fn derive_assignment(node: &CstNode) -> ScalarAssignment {
+fn derive_assignment(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarAssignment {
     let targets_node = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::AssignmentTargets)
@@ -4270,7 +4732,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
                 })
                 .collect();
             let target = identifiers.last().expect("assignment target name");
-            let place = derive_place(&target_node);
+            let place = derive_place(&target_node, places);
             ScalarAssignmentTarget {
                 receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
                 target: target.text().to_owned(),
@@ -4307,7 +4769,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
     let values = output_list
         .children()
         .filter(|child| child.kind() == SyntaxKind::Expression)
-        .map(|child| derive_expression(&child))
+        .map(|child| derive_expression_with_places(&child, places))
         .collect::<Vec<_>>();
     let value = values[0].clone();
     ScalarAssignment {
@@ -4323,26 +4785,35 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
 }
 
 fn derive_expression(node: &CstNode) -> ScalarExpression {
+    derive_expression_with_places(node, &contextual::ContextualPlaces::default())
+}
+
+fn derive_expression_with_places(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarExpression {
     let actual = if node.kind() == SyntaxKind::Expression {
         direct_nodes(node)[0].clone()
     } else {
         node.clone()
     };
     match actual.kind() {
+        SyntaxKind::RuntimeMatchExpr => {
+            let span = wosy_syntax::byte_span(&actual);
+            places.runtime_matches.get(&span).cloned().map(ScalarExpression::RuntimeMatch)
+                .unwrap_or(ScalarExpression::InvalidInteger { span, error_span: Some(span) })
+        }
         SyntaxKind::IfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::If {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
-                else_branch: derive_block(&children[2]),
+                condition: Box::new(derive_expression_with_places(&children[0], places)),
+                then_branch: derive_block_with_context(&children[1], false, places),
+                else_branch: derive_block_with_context(&children[2], false, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
         SyntaxKind::UnitIfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::UnitIf {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
+                condition: Box::new(derive_expression_with_places(&children[0], places)),
+                then_branch: derive_block_with_context(&children[1], false, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4351,13 +4822,13 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Block)
                 .expect("unsafe block"),
-            true,
+            true, places,
         )),
         SyntaxKind::ArrayLiteral => ScalarExpression::ArrayLiteral {
             elements: direct_nodes(&actual)
                 .into_iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child))
+                .map(|child| derive_expression_with_places(&child, places))
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
@@ -4373,7 +4844,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             let (_, first) = children
                 .next()
                 .unwrap_or_else(|| semantic_child_out_of_bounds(0));
-            let mut value = derive_element(&first);
+            let mut value = derive_element(&first, places);
             while let Some((index, element)) = children.next() {
                 let NodeOrToken::Token(operator_token) = element else {
                     panic!("binary operator token")
@@ -4382,7 +4853,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 let (_, right) = children
                     .next()
                     .unwrap_or_else(|| semantic_child_out_of_bounds(index + 1));
-                let right = derive_element(&right);
+                let right = derive_element(&right, places);
                 let span = ByteSpan::new(span_of(&value).start, span_of(&right).end);
                 value = ScalarExpression::Binary {
                     operator,
@@ -4399,7 +4870,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 panic!("unary expression children")
             };
             let NodeOrToken::Token(operator_token) = first else {
-                return derive_element(&first);
+                return derive_element(&first, places);
             };
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
@@ -4407,7 +4878,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
-            let operand = derive_element(&children.next().expect("unary operand"));
+            let operand = derive_element(&children.next().expect("unary operand"), places);
             let span = ByteSpan::new(
                 operator_token.text_range().start().into(),
                 span_of(&operand).end,
@@ -4481,7 +4952,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 first_argument.map_or((None, children), |(first, rest)| (Some(first), rest));
             let arguments = first_argument.into_iter().chain(remaining_arguments)
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child))
+                .map(|child| derive_expression_with_places(&child, places))
                 .collect();
             ScalarExpression::Call {
                 receiver: receiver.as_ref().map(|token| token.text().to_owned()),
@@ -4539,7 +5010,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::DereferencedField)
             {
                 ScalarExpression::Dereference {
-                    place: derive_place(&field),
+                    place: derive_place(&field, places),
                     span: wosy_syntax::byte_span(&actual),
                 }
             } else {
@@ -4547,15 +5018,22 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     &semantic_children(&actual)
                         .next()
                         .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+                    places,
                 )
             }
         }
+        SyntaxKind::ContextualPlace => {
+            let span = wosy_syntax::byte_span(&actual);
+            let (binding, ty) = places.operand(span, contextual::ContextualRole::Read)
+                .expect("prepared contextual read");
+            ScalarExpression::Contextual { binding: binding.clone(), ty: ty.clone(), span }
+        }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
-            place: derive_place(&actual),
+            place: derive_place(&actual, places),
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Dereference | SyntaxKind::DereferencedField => ScalarExpression::Dereference {
-            place: derive_place(&actual),
+            place: derive_place(&actual, places),
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::CheckedAddress => {
@@ -4576,7 +5054,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 } else {
                     ScalarReferenceMutability::Shared
                 },
-                place: derive_place(&target),
+                place: derive_place(&target, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4586,7 +5064,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::PlaceTarget)
                 .expect("raw address target");
             ScalarExpression::RawAddress {
-                place: derive_place(&target),
+                place: derive_place(&target, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4599,7 +5077,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     let value = field
                         .descendants()
                         .find(|child| child.kind() == SyntaxKind::Expression)
-                        .map(|child| derive_expression(&child))
+                        .map(|child| derive_expression_with_places(&child, places))
                         .expect("field value");
                     ScalarStructLiteralField {
                         name: name.text().to_owned(),
@@ -4611,33 +5089,35 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
-        SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
+        SyntaxKind::Parenthesized => derive_expression_with_places(&direct_nodes(&actual)[0], places),
         SyntaxKind::Expression => derive_element(
             &semantic_children(&actual)
                 .next()
                 .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+            places,
         ),
         _ => semantic_children(&actual)
             .next()
-            .map(|first| derive_element(&first))
+            .map(|first| derive_element(&first, places))
             .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind())),
     }
 }
 
-fn derive_place(node: &CstNode) -> ScalarPlace {
+fn derive_place(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarPlace {
     match node.kind() {
         SyntaxKind::ParenthesizedDereferencePlace => derive_place(
             &direct_nodes(node)
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("parenthesized dereference place"),
+            places,
         ),
         SyntaxKind::PlaceTarget => {
-            derive_place(&direct_nodes(node).into_iter().next().expect("place target"))
+            derive_place(&direct_nodes(node).into_iter().next().expect("place target"), places)
         }
         SyntaxKind::AssignmentTarget => {
             if let Some(child) = direct_nodes(node).into_iter().next() {
-                derive_place(&child)
+                derive_place(&child, places)
             } else {
                 let name = direct_token(node, SyntaxKind::Identifier).expect("place name");
                 ScalarPlace::Name {
@@ -4654,6 +5134,12 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             }
         }
         SyntaxKind::QualifiedMember => derive_qualified_member_place(node, node.children().next()),
+        SyntaxKind::ContextualPlace => {
+            let span = wosy_syntax::byte_span(node);
+            let (binding, ty) = places.operand(span, contextual::ContextualRole::Assign)
+                .expect("prepared contextual assignment");
+            ScalarPlace::Contextual { binding: binding.clone(), ty: ty.clone(), span }
+        }
         SyntaxKind::DereferencedField => {
             let field = direct_token(node, SyntaxKind::Identifier).expect("field name");
             let parent = direct_nodes(node)
@@ -4665,7 +5151,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("dereference expression");
             ScalarPlace::Field {
-                base: Box::new(derive_place(&dereference)),
+                base: Box::new(derive_place(&dereference, places)),
                 field: ScalarFieldReference::Unresolved {
                     name: field.text().to_owned(),
                     span: token_span(&field),
@@ -4674,11 +5160,12 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             }
         }
         SyntaxKind::Dereference => ScalarPlace::Dereference {
-            pointer: Box::new(derive_expression(
+            pointer: Box::new(derive_expression_with_places(
                 &direct_nodes(node)
                     .into_iter()
                     .next()
                     .expect("dereference pointer"),
+                places,
             )),
             span: wosy_syntax::byte_span(node),
         },
@@ -4689,7 +5176,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .find(|child| {
                     !matches!(child.kind(), SyntaxKind::IndexSuffix | SyntaxKind::IndexFieldSuffix)
                 })
-                .map(derive_place)
+                .map(|child| derive_place(child, places))
                 .unwrap_or_else(|| {
                     let name =
                         direct_token(node, SyntaxKind::Identifier).expect("indexed place name");
@@ -4709,7 +5196,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 let index_span = wosy_syntax::byte_span(&index);
                 place = ScalarPlace::Index {
                     base: Box::new(place),
-                    index: Box::new(derive_expression(&index)),
+                    index: Box::new(derive_expression_with_places(&index, places)),
                     span: ByteSpan::new(
                         wosy_syntax::byte_span(node).start,
                         wosy_syntax::byte_span(&suffix).end,
@@ -4808,9 +5295,9 @@ fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {
         })
 }
 
-fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression {
+fn derive_element(element: &NodeOrToken<CstNode, CstToken>, places: &contextual::ContextualPlaces) -> ScalarExpression {
     match element {
-        NodeOrToken::Node(node) => derive_expression(node),
+        NodeOrToken::Node(node) => derive_expression_with_places(node, places),
         NodeOrToken::Token(token) => match token.kind() {
             SyntaxKind::Boolean => ScalarExpression::Boolean {
                 value: token.text() == "true",
@@ -4911,7 +5398,9 @@ fn token_span(token: &CstToken) -> ByteSpan {
 
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.span(),
         ScalarExpression::Name { span, .. }
+        | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::Integer { span, .. }

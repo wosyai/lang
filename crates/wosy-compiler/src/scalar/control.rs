@@ -182,6 +182,8 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) callable_escapes: HashSet<SourceSpan>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) initializer_predicates: HashMap<OccurrenceOrdinal, super::checker_directive::InitializerPredicate>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -461,6 +463,7 @@ pub(super) struct BindingReceiverSlot {
     pub(super) name: String,
     pub(super) span: ByteSpan,
     pub(super) ty: ScalarType,
+    pub(super) contextual_storage: Option<super::ReferenceBindingId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -498,6 +501,7 @@ impl BindingRegion {
             name: binding.name.clone(),
             span: binding.name_span,
             ty: binding.declared_type.clone(),
+            contextual_storage: binding.receivers.first().and_then(|receiver| receiver.contextual_storage.clone()),
         });
         receivers.extend(binding.receivers.iter().enumerate().skip(1).map(
             |(position, receiver)| BindingReceiverSlot {
@@ -505,6 +509,7 @@ impl BindingRegion {
                 name: receiver.name.clone(),
                 span: receiver.name_span,
                 ty: receiver.ty.clone(),
+                contextual_storage: receiver.contextual_storage.clone(),
             },
         ));
         Self {
@@ -535,14 +540,21 @@ pub(super) struct BlockItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BlockRegion {
     pub(super) span: ByteSpan,
+    #[cfg(feature = "internal-checker")]
+    pub(super) unsafe_context: bool,
     pub(super) items: Vec<BlockItem>,
     projected_outputs: Vec<FinalOutputSlot>,
 }
 
 impl BlockRegion {
-    pub(super) fn new(span: ByteSpan, items: Vec<BlockItem>) -> Self {
+    pub(super) fn new(
+        span: ByteSpan, items: Vec<BlockItem>,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] unsafe_context: bool,
+    ) -> Self {
         Self {
             span,
+            #[cfg(feature = "internal-checker")]
+            unsafe_context,
             items,
             projected_outputs: Vec::new(),
         }

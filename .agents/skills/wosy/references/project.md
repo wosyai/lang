@@ -90,6 +90,8 @@ Package-owned tool metadata. Base-language builds need no entries.
 
 The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace is_even "math.w";` loads `src/math.w` when `is_even` uses `source_root = "src"`. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
 
+For checker source discovery, see [`wosy check`](cli.md#wosy-check).
+
 ## Build outputs
 
 `wosy build` writes under `.wosy/`:

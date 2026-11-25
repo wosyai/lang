@@ -496,6 +496,8 @@ pub struct TargetProfile {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TargetConfig {
     pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
     pub artifacts: std::collections::BTreeMap<String, ArtifactConfig>,
     pub profiles: std::collections::BTreeMap<String, TargetProfile>,
 }
@@ -514,12 +516,28 @@ pub struct ProjectConfiguration {
     pub resolved_packages: BTreeMap<String, ResolvedPackage>,
 }
 
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct DirectDependencyCheckTarget {
+    pub source_directory: PackageRelativePath,
+    pub project: ProjectContext,
+    pub configuration: ProjectConfiguration,
+    pub layout: TargetLayout,
+}
+
 impl ProjectConfiguration {
     pub fn load(root: &Path) -> Result<Self, String> {
         Self::load_with_manifest(root).map(|(configuration, _)| configuration)
     }
 
     pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
+        let (configuration, document, _) = Self::load_snapshot(root, None)?;
+        Ok((configuration, document))
+    }
+
+    fn load_snapshot(
+        root: &Path, selected: Option<&str>,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, Option<packages::SelectedLocalManifest>), String> {
         let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
             toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
@@ -539,7 +557,29 @@ impl ProjectConfiguration {
             })
             .transpose()?;
         let dependencies = project_dependencies(root, &package_name, &document)?;
-        let resolved_packages = packages::resolve_installed(&snapshot, root, &package_name, &dependencies)?;
+        if let Some(selected) = selected {
+            let declaration = dependencies.get(selected)
+                .ok_or_else(|| format!("direct dependency {selected} is missing"))?;
+            if !matches!(declaration.source, DependencySource::Local { .. }) {
+                return Err("checking a managed Git dependency as its own target is unsupported".to_owned());
+            }
+        }
+        let (resolved_packages, selected) =
+            packages::resolve_installed(&snapshot, root, &package_name, &dependencies, selected)?;
+        let configuration = Self::configure(&document, module_source_root, dependencies, resolved_packages)?;
+        Ok((configuration, document, selected))
+    }
+
+    fn configure(
+        document: &toml_edit::ImDocument<String>,
+        module_source_root: Option<PackageRelativePath>,
+        dependencies: BTreeMap<String, DependencyDeclaration>,
+        resolved_packages: BTreeMap<String, ResolvedPackage>,
+    ) -> Result<Self, String> {
+        let package = document
+            .get("package")
+            .and_then(Item::as_table)
+            .ok_or_else(|| "package is missing".to_owned())?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
@@ -557,29 +597,63 @@ impl ProjectConfiguration {
                 .and_then(Item::as_value)
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| format!("target {name} has no root"))?;
+            let default_profile = table.get("default_profile").map(|item| {
+                item.as_value().and_then(|value| value.as_str()).filter(|profile| !profile.is_empty())
+                    .map(str::to_owned).ok_or_else(|| format!("target {name} default_profile must be a nonempty string"))
+            }).transpose()?;
             let artifacts = parse_artifacts(table.get("artifacts"))?;
             let profiles = parse_target_profiles(table.get("profiles"))?;
             targets.insert(
                 name.to_owned(),
                 TargetConfig {
                     root: PathBuf::from(root),
+                    default_profile,
                     artifacts,
                     profiles,
                 },
             );
         }
-        Ok((
-            Self {
-                default_target,
-                module_source_root,
-                builders,
-                runners,
-                targets,
-                dependencies,
-                resolved_packages,
-            },
-            document,
-        ))
+        Ok(Self {
+            default_target,
+            module_source_root,
+            builders,
+            runners,
+            targets,
+            dependencies,
+            resolved_packages,
+        })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn load_with_direct_dependency_check_target(
+        root: &Path, dependency: &str, target: Option<&str>, profile: Option<&str>,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, DirectDependencyCheckTarget), String> {
+        let (configuration, document, captured) = Self::load_snapshot(root, Some(dependency))?;
+        let packages::SelectedLocalManifest { root: child_root, document: child, dependencies } =
+            captured.ok_or_else(|| format!("dependency {dependency} is not a resolved local package"))?;
+        let resolved = configuration.resolved_packages.get(dependency)
+            .ok_or_else(|| format!("direct dependency {dependency} is missing"))?;
+        let source_directory = resolved.identity.path.clone();
+        let mut resolved_packages = BTreeMap::new();
+        let mut reached: Vec<_> = dependencies.keys().collect();
+        while let Some(name) = reached.pop() {
+            if let std::collections::btree_map::Entry::Vacant(binding) = resolved_packages.entry(name.clone()) {
+                let package = configuration.resolved_packages.get(name)
+                    .expect("reachable package resolved in installed graph");
+                reached.extend(&package.dependencies);
+                binding.insert(package.clone());
+            }
+        }
+        let child_configuration = Self::configure(&child, Some(source_directory.clone()), dependencies, resolved_packages)?;
+        let target = child_configuration.resolve_target(target)?;
+        let project = ProjectContext::from_manifest(&child_root, &target, child.as_table())?;
+        let profile = profile.or(child_configuration.target_config(&target)?.default_profile.as_deref())
+            .ok_or_else(|| format!("target {target} has no declared default_profile"))?;
+        let (_, _, artifact, _) = child_configuration.artifact_profile(&target, profile)?;
+        let layout = artifact.target_layout()?;
+        let selection = DirectDependencyCheckTarget { source_directory, project, configuration: child_configuration, layout };
+        Ok((configuration, document, selection))
     }
 
     pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
@@ -823,10 +897,19 @@ fn load_dependency_package(
     git_checkout: Option<packages::GitDirectory>,
     inspected: Option<toml_edit::ImDocument<String>>,
 ) -> Result<(ResolvedPackage, BTreeMap<String, DependencyDeclaration>), DependencyResolutionError> {
+    let document = dependency_document(&package_root, declaration, git_checkout.as_ref(), inspected)?;
+    load_dependency_from_document(package_root, declaration, git_checkout, &document)
+}
+
+fn load_dependency_from_document(
+    package_root: PathBuf,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<packages::GitDirectory>,
+    document: &toml_edit::ImDocument<String>,
+) -> Result<(ResolvedPackage, BTreeMap<String, DependencyDeclaration>), DependencyResolutionError> {
     let name = &declaration.name;
     let error = |message| dependency_manifest_error(declaration, message);
-    let document = dependency_document(&package_root, declaration, git_checkout.as_ref(), inspected)?;
-    let package_table = dependency_package_table(&document, declaration)?;
+    let package_table = dependency_package_table(document, declaration)?;
     let resolved_name = name.clone();
     let source_root = package_table
         .get("source_root")
@@ -1211,6 +1294,29 @@ impl ProjectContext {
             PathBuf::from(source),
             comment_categories,
         ))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn read_package_identity(manifest: &Path) -> Result<String, String> {
+        let content = fs::read_to_string(manifest).map_err(|error| error.to_string())?;
+        let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+        let package = document.get("package").and_then(Item::as_table)
+            .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;
+        let name = scalar_string(package, "name")?;
+        if name.is_empty() || name.trim() != name {
+            return Err("package name must not be empty or padded".to_owned());
+        }
+        Ok(name)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn declared_package_source_root(document: &toml_edit::Table) -> Result<PackageRelativePath, String> {
+        let table = document.get("package").and_then(Item::as_table)
+            .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;
+        let path = scalar_string(table, "source_root")?;
+        PackageRelativePath::new(path.into())
     }
 
     pub fn source_path(&self) -> PathBuf {

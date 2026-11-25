@@ -44,6 +44,7 @@ fn assert_conditional_types(
         structs: &[],
         enums: &[],
         target_layout: ScalarTargetLayout::NATIVE64,
+        struct_index: Default::default(),
     };
     for typing in [
         TailConditionalTyping::Program(&program),

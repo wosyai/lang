@@ -139,7 +139,7 @@ fn extraction_preserves_complete_ordered_unresolved_declarations_and_borrowed_na
     assert_eq!(declarations.enums[0].name, "Mode");
     assert_eq!(
         declarations.enums[0]
-            .variants
+            .variants()
             .iter()
             .map(|variant| (variant.name.as_str(), variant.tag))
             .collect::<Vec<_>>(),

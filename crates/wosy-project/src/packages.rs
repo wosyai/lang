@@ -1,5 +1,5 @@
 use super::{
-    dependency_document, dependency_package_table, load_dependency_package, parse_dependencies, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
+    dependency_document, dependency_package_table, load_dependency_from_document, load_dependency_package, parse_dependencies, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -179,18 +179,45 @@ impl GitProject {
 
 }
 
+pub(super) struct SelectedLocalManifest {
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) root: PathBuf,
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) document: toml_edit::ImDocument<String>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) dependencies: BTreeMap<String, DependencyDeclaration>,
+}
+
 pub(super) fn resolve_installed(
     snapshot: &ProjectSnapshot,
     root: &Path,
     package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
-) -> Result<BTreeMap<String, ResolvedPackage>, String> {
+    selected: Option<&str>,
+) -> Result<(BTreeMap<String, ResolvedPackage>, Option<SelectedLocalManifest>), String> {
     let mut git = None;
+    let mut captured = None;
     let resolution = graph::resolve(root, package, dependencies, |binding, parent, declaration| {
         let name = declaration.name.as_str();
         match binding {
+            graph::Binding::Local(actual) if Some(name) == selected => {
+                if !std::fs::symlink_metadata(actual.join("wosy.toml")).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(format!("dependency {name} manifest is not a regular non-aliased file"));
+                }
+                let diagnostic = |error: crate::DependencyResolutionError| error.diagnostics[0].message.clone();
+                let document = dependency_document(actual, declaration, None, None).map_err(diagnostic)?;
+                let (package, dependencies) =
+                    load_dependency_from_document(actual.clone(), declaration, None, &document).map_err(diagnostic)?;
+                captured = Some(SelectedLocalManifest {
+                    root: actual.clone(), document, dependencies: dependencies.clone(),
+                });
+                Ok((package, dependencies).into())
+            }
             graph::Binding::Local(_) => load_local(parent, declaration, None),
             graph::Binding::Git(requirement) => {
+                if selected.is_some() {
+                    return Err("direct dependency checking in a Git dependency graph is unsupported".to_owned());
+                }
                 let pin = snapshot.pin_for(name, requirement)?;
                 if git.is_none() {
                     git = Some(snapshot.git_project()?);
@@ -208,7 +235,7 @@ pub(super) fn resolve_installed(
         }
     })?;
     snapshot.check_reached(&resolution.git_packages)?;
-    Ok(resolution.packages)
+    Ok((resolution.packages, captured))
 }
 
 fn load_local(

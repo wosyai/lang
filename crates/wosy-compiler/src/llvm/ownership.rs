@@ -852,6 +852,8 @@ fn extend_return_bindings_from_expression(
     expression: &ScalarExpression,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::Block(block) => bindings.extend(return_bindings(block)),
         ScalarExpression::If {
             then_branch,
@@ -892,6 +894,8 @@ fn escaped_runtime_array_owners(
     visited: &mut BTreeSet<String>,
 ) -> BTreeSet<String> {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => BTreeSet::new(),
+        ScalarExpression::Contextual { .. } => BTreeSet::new(),
         ScalarExpression::Name { name, .. } => {
             if !visited.insert(name.clone()) {
                 return BTreeSet::new();
@@ -967,6 +971,7 @@ fn escaped_runtime_array_owners_in_place(
     visited: &mut BTreeSet<String>,
 ) -> BTreeSet<String> {
     match place {
+        crate::ScalarPlace::Contextual { .. } => BTreeSet::new(),
         crate::ScalarPlace::Name { name, .. } => {
             let mut owners = BTreeSet::from([name.clone()]);
             if let Some(value) = bindings.get(name) {

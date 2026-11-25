@@ -15,6 +15,9 @@ impl PreparedProgram {
                 structs: program.structs.clone(),
                 enums: program.enums.clone(),
                 diagnostics: Vec::new(),
+                contextual_places: contextual::ContextualPlaces::default(),
+                build_proofs: Vec::new(),
+                runtime_enum_matches: Vec::new(),
             },
             program.target_layout,
         )
@@ -180,6 +183,38 @@ impl ScalarProjectPreparationRejection {
     }
 }
 
+pub(super) fn prepare_project_occurrences(
+    (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    #[cfg(any(test, feature = "internal-checker"))] checker_targets: &[reference::CheckerTargetQuery<'_>],
+) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    if !validation.diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection::extraction_or_typing(
+            validation,
+        ));
+    }
+    let project = validation.project;
+    #[cfg(not(any(test, feature = "internal-checker")))]
+    let calls = reference::resolve_project_call_sites_with_occurrences(&project.modules, occurrence_typing);
+    #[cfg(any(test, feature = "internal-checker"))]
+    let calls = reference::resolve_project_call_sites_with_checker_targets(
+        &project.modules, occurrence_typing, checker_targets,
+    );
+    let diagnostics = calls
+        .lookup_errors()
+        .map(ReferenceAnalysisError::diagnostic)
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection {
+            inspection: ScalarProjectValidation {
+                project,
+                diagnostics,
+            },
+            kind: ProjectPreparationRejectionKind::StaticLookup(calls),
+        });
+    }
+    Ok((project, calls))
+}
+
 impl PreparedScalarProject {
     #[cfg(test)]
     pub(super) fn function_calls(
@@ -191,31 +226,34 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
-        if !validation.diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection::extraction_or_typing(
-                validation,
-            ));
-        }
-        let project = validation.project;
-        let calls = reference::resolve_project_call_sites_with_occurrences(
-            &project.modules,
-            occurrence_typing,
-        );
-        let diagnostics = calls
-            .lookup_errors()
-            .map(ReferenceAnalysisError::diagnostic)
-            .collect::<Vec<_>>();
-        if !diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection {
-                inspection: ScalarProjectValidation {
-                    project,
-                    diagnostics,
-                },
-                kind: ProjectPreparationRejectionKind::StaticLookup(calls),
-            });
-        }
+        Self::from_canonical_typing(typecheck_scalar_project_with_occurrences(project))
+    }
+
+    pub(super) fn from_canonical_typing(
+        result: (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
+        let (project, calls) = prepare_project_occurrences(
+            result,
+            #[cfg(any(test, feature = "internal-checker"))] &[],
+        )?;
         Ok(Self { project, calls })
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn from_contextual_transport(project: ScalarProject, calls: reference::ProjectCallSiteResults) -> Self {
+        Self { project, calls }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn contextual_formal(&self, module: usize, item: usize, arm: Option<usize>)
+        -> Option<(&ReferenceBindingId, &ScalarType)>
+    {
+        self.calls.function_body(module, item, arm)?.contextual_formal()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn into_contextual_parts(self) -> (ScalarProject, reference::ProjectCallSiteResults) {
+        (self.project, self.calls)
     }
 
     pub fn project(&self) -> &ScalarProject {
@@ -338,6 +376,23 @@ pub struct ScalarBuildValidation<'a> {
 }
 
 impl<'a> ScalarBuildValidation<'a> {
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(crate) fn pointer_caller_effect(
+        &self, module: usize, caller: usize, callee: usize, claimed: &BigInt,
+    ) -> Option<reference::pointer_call::CallerPointeeEffect<'_>> {
+        self.results.pointer_caller_effect(&self.prepared.project.modules, &self.prepared.calls,
+            module, caller, callee, claimed, None)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(crate) fn pointer_entry_wrapping_write(
+        &self, module: usize, item: usize,
+    ) -> Option<reference::pointer_entry::EntryPointeeWrite<'_>> {
+        self.results.pointer_entry_wrapping_write(&self.prepared.project.modules, &self.prepared.calls, module, item)
+    }
+
     pub(crate) fn aggregate(&self, reservations: &AggregateReservations) -> Result<ClosedAggregates, String> {
         self.results
             .closed_aggregates(&self.prepared.project, &self.prepared.calls, reservations)
@@ -385,6 +440,57 @@ impl<'a> ScalarBuildValidation<'a> {
         };
         self.prepared
             .bind_body_with_proof(module, item, None, &function.body, proof)
+    }
+
+    pub(crate) fn bind_runtime_enum_initializer<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction, nodes: &control::CallableBodyCallNodes<'_>,
+    ) -> Result<Option<(&'b runtime_enum_match::Occurrence, &'b ScalarEnumPayloadLayout)>, String> {
+        let Some(position) = nodes.runtime_match_binding() else { return Ok(None); };
+        let Some((preceding, remainder)) = function.body.items.split_at_checked(position) else {
+            return Err("missing runtime enum initializer position".into());
+        };
+        let Some(ScalarBlockItem::LocalBinding(binding)) = remainder.first() else {
+            return Err("missing runtime enum initializer binding".into());
+        };
+        let ScalarExpression::RuntimeMatch(site) = &binding.value else {
+            return Err("missing runtime enum initializer occurrence".into());
+        };
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum initializer module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum initializer callable".to_owned());
+        };
+        if !std::ptr::eq(original, function) || self.reference_cfg(module, item, None).is_none()
+            || !site.0.authenticates_initializer(&owner.source, function, binding)
+            || nodes.canonical_expression_type(&binding.value) != Some(site.ty())
+        {
+            return Err("runtime enum initializer requires its checked original lexical binding".to_owned());
+        }
+        if !preceding.is_empty() && !self.callable_point_facts(module, item, None)
+            .is_some_and(|facts| site.0.authenticates_prefix(preceding, nodes, facts))
+        {
+            return Err("runtime match prefix must contain checked pure primitive locals".into());
+        }
+        let layout = owner.layouts.enum_payload(&site.0.enumeration)
+            .ok_or("missing freshly prepared runtime enum initializer layout")?;
+        Ok(Some((site, layout)))
+    }
+
+    pub(crate) fn bind_runtime_enum_match<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction,
+    ) -> Result<&'b runtime_enum_match::Plan, String> {
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum callable".to_owned());
+        };
+        let plan = original.runtime_enum_match.as_deref().ok_or("missing runtime enum source plan")?;
+        let cfg = self.reference_cfg(module, item, None).ok_or("missing canonical runtime enum reference check")?;
+        if !std::ptr::eq(original, function) || !plan.authenticates(&owner.source, function)
+            || !cfg.facts.is_empty() || !cfg.allocations.is_empty() || !cfg.specialized_policies.is_empty()
+            || !cfg.primary_call_points.is_empty()
+        {
+            return Err("runtime enum match is not the sealed primitive Build body".to_owned());
+        }
+        Ok(plan)
     }
 
     pub(crate) fn reference_cfg(

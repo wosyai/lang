@@ -5,27 +5,30 @@ use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 #[cfg(test)]
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(feature = "internal-checker")]
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_artifact_llvm,
+    analyze_scalar_build, emit_scalar_build_project_artifact_llvm,
     emit_scalar_build_single_module_artifact_llvm, emit_scalar_build_wasm_root_exports_artifact_llvm,
-    parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
-    LlvmPartition, ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication, LlvmPartition, ParseOutput,
+    ScalarPreparationInputs, ScalarTargetLayout,
 };
+#[cfg(feature = "internal-checker")]
+use wosy_compiler::{ScalarCheckerScope, ScalarNamespaceBinding};
 use wosy_project::{
-    artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
-    publish_artifact, ArtifactIdentity, ContentRevision, NamespaceEdgeInput, NamespacePackages,
-    PackageRelativePath, ProjectConfiguration, ProjectContext,
-    SourceIdentity as ProjectSourceIdentity, SourceNodeInput, SourceObservation,
-    SourceSpan as ProjectSourceSpan,
+    artifact_manifest_path, discover_root, load_artifact_manifest,
+    publish_artifact, ArtifactIdentity, ContentRevision, PackageRelativePath,
+    ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity,
+    SourceObservation,
 };
 #[cfg(test)]
 use wosy_compiler::parse_source;
@@ -54,6 +57,18 @@ enum Command {
         target: Option<String>,
         #[arg(long, default_value = "dev")]
         profile: String,
+    },
+    /// Check the selected target and unused functions in the current package
+    #[cfg(feature = "internal-checker")]
+    #[command(group(clap::ArgGroup::new("check_scope").args(["main_flow_only", "declared_package"])))]
+    Check {
+        target: Option<String>,
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        #[arg(long, help = "Check only the selected target's main flow")]
+        main_flow_only: bool,
+        #[arg(long, help = "Check the current package (the default scope)")]
+        declared_package: bool,
     },
     Run {
         target: Option<String>,
@@ -130,6 +145,22 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        #[cfg(feature = "internal-checker")]
+        Command::Check { target, profile, main_flow_only, .. } => {
+            // Clap rejects both scope flags. An omitted scope is exactly the explicit package scope.
+            let scope = if main_flow_only {
+                ScalarCheckerScope::MainFlowOnly
+            } else {
+                ScalarCheckerScope::CurrentPackage
+            };
+            match check_command(target.as_deref(), &profile, scope) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("wosy: {error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Command::Run {
             target,
             profile,
@@ -448,6 +479,299 @@ fn observe_open_source(file: fs::File, path: &std::path::Path) -> Result<Content
     Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
 }
 
+mod canonical_loader;
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+mod configured_check;
+#[cfg(feature = "internal-checker")]
+use configured_check::{InternalCheckEffect, InternalCheckStatus, OrderedCheckEffects};
+
+use canonical_loader::{
+    CanonicalLoadFailure, CanonicalLoadPurpose, CanonicalProjectInputs,
+};
+#[cfg(feature = "internal-checker")]
+use canonical_loader::{canonical_source_identity, parse_canonical_ordinary_source};
+use canonical_loader::compiler_source_identity;
+
+fn load_canonical_project_inputs(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    purpose: CanonicalLoadPurpose,
+) -> Result<CanonicalProjectInputs, CanonicalLoadFailure> {
+    canonical_loader::load_canonical_project_inputs(root, project, configuration, purpose, || {
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+    })
+}
+
+impl CanonicalLoadFailure {
+    fn report(self, purpose: &str) -> String {
+        match self {
+            Self::Input(error) => error,
+            Self::Syntax { source, text, diagnostics } => {
+                render_diagnostics(&text, &diagnostics, &source);
+                format!("{purpose} rejected by syntax diagnostics")
+            }
+            Self::Derivation { diagnostics, texts } => {
+                render_project_diagnostics(&diagnostics, &texts);
+                format!("{purpose} rejected by CST derivation diagnostics")
+            }
+            Self::Graph { error, texts } => {
+                render_graph_diagnostics(&error, &texts);
+                format_graph_error(error)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+struct InternalCheckReceipt<Outcome = wosy_compiler::ScalarCheckerOutcome> {
+    outcome: Outcome,
+    texts: BTreeMap<ProjectSourceIdentity, String>,
+}
+
+#[cfg(feature = "internal-checker")]
+type InternalOrderedCheckReceipt = InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
+    fn effects(&self) -> Option<OrderedCheckEffects<'_>> {
+        use wosy_compiler::ScalarOrderedCheckerOutcome;
+        match &self.outcome {
+            ScalarOrderedCheckerOutcome::Passed | ScalarOrderedCheckerOutcome::NoChecks =>
+                Some(OrderedCheckEffects::new(&[])),
+            ScalarOrderedCheckerOutcome::Failed(reports) => Some(OrderedCheckEffects::new(reports)),
+            ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_) => None,
+        }
+    }
+
+    fn selected_status(&self) -> Option<InternalCheckStatus<'_>> {
+        self.effects().map(OrderedCheckEffects::selected_status)
+    }
+
+    fn visit_authored_effects<E>(
+        &self,
+        sink: impl FnMut(InternalCheckEffect<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self.effects() {
+            Some(effects) => effects.visit_authored_effects(sink),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct DormantSourceInput {
+    identity: ProjectSourceIdentity,
+    text: String,
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_explicit_dormant_sources(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    sources: Vec<DormantSourceInput>,
+    texts: &mut BTreeMap<ProjectSourceIdentity, String>,
+) -> Result<Vec<wosy_compiler::ScalarSourceDeclarations>, CanonicalLoadFailure> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let boundaries = canonical_loader::DormantSourceBoundaries::new(root, project, configuration);
+    let mut selected = HashSet::with_capacity(sources.len());
+    for DormantSourceInput { identity, .. } in &sources {
+        boundaries.validate(identity)?;
+        let spelling = identity.path.as_path().display();
+        if texts.contains_key(identity) || !selected.insert(identity) {
+            return Err(format!("dormant source was already selected: {spelling}").into());
+        }
+    }
+
+    sources.into_iter().map(|DormantSourceInput { identity, text }| {
+        let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
+        let (text, declarations) = parse_canonical_ordinary_source(
+            source, text, &project.comment_categories, false, true, None,
+        )?;
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        texts.insert(identity, text);
+        Ok(declarations)
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_project(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
+) -> Result<InternalCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_project_with(
+        root, project, configuration, target_layout, scope, dormant_sources,
+        wosy_compiler::check_scalar_package_with_dormant_sources,
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_ordered_project(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
+) -> Result<InternalOrderedCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_project_with(
+        root, project, configuration, target_layout, scope, dormant_sources,
+        wosy_compiler::check_scalar_package_ordered_with_dormant_sources,
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_ordered_dependency(
+    selection: &wosy_project::DirectDependencyCheckTarget,
+) -> Result<InternalOrderedCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_ordered_project(
+        &selection.project.root, &selection.project, &selection.configuration,
+        scalar_target_layout(selection.layout), wosy_compiler::ScalarCheckerScope::CurrentPackage, Vec::new(),
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_loaded_project_with<Outcome>(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
+    check: impl FnOnce(
+        Vec<(wosy_compiler::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        Vec<SourceIdentity>,
+        Vec<wosy_compiler::ScalarSourceDeclarations>,
+        ScalarPreparationInputs,
+        wosy_compiler::ScalarCheckerScope,
+    ) -> Outcome,
+) -> Result<InternalCheckReceipt<Outcome>, CanonicalLoadFailure> {
+    let CanonicalProjectInputs { declarations, initialization_order, mut texts, .. } =
+        load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
+    let dormant = if scope == wosy_compiler::ScalarCheckerScope::CurrentPackage {
+        prepare_explicit_dormant_sources(root, project, configuration, dormant_sources, &mut texts)?
+    } else {
+        Vec::new()
+    };
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcome = check(
+        declarations, initialization_order, dormant, ScalarPreparationInputs { target_layout }, scope,
+    );
+    Ok(InternalCheckReceipt { outcome, texts })
+}
+
+#[cfg(feature = "internal-checker")]
+type InternalProofResults = Result<
+    (Result<Vec<wosy_compiler::ScalarModuleProofOutcome>, wosy_compiler::ScalarModuleProofOutcome>, BTreeMap<ProjectSourceIdentity, String>),
+    CanonicalLoadFailure,
+>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proofs(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    proof_file: PackageRelativePath,
+    proof_names: &[&str],
+) -> InternalProofResults {
+    let selections = proof_names.iter().map(|&name| (&proof_file, name)).collect::<Vec<_>>();
+    check_loaded_proof_selections(root, project, configuration, target_layout, &selections)
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proof_selections(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    selections: &[(&PackageRelativePath, &str)],
+) -> InternalProofResults {
+    if selections.is_empty() {
+        return Ok((Ok(Vec::new()), BTreeMap::new()));
+    }
+    let selected = selections.iter().map(|(path, _)| (*path).clone()).collect();
+    let loaded = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Proof(selected))?;
+    let mut authorities = HashMap::new();
+    for &(path, _) in selections {
+        if let std::collections::hash_map::Entry::Vacant(entry) = authorities.entry(path) {
+            let Some((proof, _)) = loaded.proofs.get(path) else {
+                return Err(selected_source_outside_graph("proof", path));
+            };
+            entry.insert(proof.declarations().source().clone());
+        }
+    }
+    let proofs = selections.iter().map(|&(path, name)| (&authorities[path], name)).collect::<Vec<_>>();
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcomes = wosy_compiler::check_loaded_scalar_module_proof_selections(
+        &proofs, loaded.declarations, loaded.proofs.into_values().collect(), loaded.initialization_order,
+        ScalarPreparationInputs { target_layout },
+    );
+    Ok((outcomes, loaded.texts))
+}
+
+#[cfg(feature = "internal-checker")]
+fn selected_source_outside_graph(role: &str, path: &PackageRelativePath) -> CanonicalLoadFailure {
+    CanonicalLoadFailure::Input(format!(
+        "selected {role} source {} is outside the canonical target graph",
+        path.as_path().display(),
+    ))
+}
+
+#[cfg(feature = "internal-checker")]
+type InternalProofCallResult = Result<
+    (wosy_compiler::ScalarProofCallOutcome, BTreeMap<ProjectSourceIdentity, String>),
+    CanonicalLoadFailure,
+>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proof_call(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    (proof_file, proof_name): (&PackageRelativePath, &str),
+    (caller_file, caller_name): (&PackageRelativePath, &str),
+) -> InternalProofCallResult {
+    let mut loaded = load_canonical_project_inputs(
+        root, project, configuration, CanonicalLoadPurpose::Proof(HashSet::from([proof_file.clone()])),
+    )?;
+    let catalog = loaded.proofs.remove(proof_file).ok_or_else(|| selected_source_outside_graph("proof", proof_file))?;
+    let caller_node = loaded.graph.nodes.iter().find(|node| {
+        node.source.package == project.package && &node.source.path == caller_file
+    }).ok_or_else(|| selected_source_outside_graph("caller", caller_file))?;
+    let caller_source = compiler_source_identity(&caller_node.source, &caller_node.content_revision);
+    let proof_source = catalog.0.declarations().source().clone();
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcome = wosy_compiler::check_loaded_scalar_module_proof_call(
+        (&proof_source, proof_name), (&caller_source, caller_name), loaded.declarations, catalog,
+        loaded.initialization_order, ScalarPreparationInputs { target_layout },
+    );
+    Ok((outcome, loaded.texts))
+}
+
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -455,177 +779,31 @@ fn compile_project(
     target_layout: ScalarTargetLayout,
     root_exports: Option<&BTreeMap<String, String>>,
 ) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
-    let root_path = PackageRelativePath::new(project.source_root.clone())?;
-    let root_project = root.to_string_lossy().into_owned();
-    let packages = NamespacePackages {
-        root_name: &project.package,
-        root_source: configuration.module_source_root.as_ref(),
-        dependencies: &configuration.resolved_packages,
-    };
-    let mut discovered = HashMap::from([(
-        project.package.as_str(),
-        HashSet::from([root_path.clone()]),
-    )]);
-    let mut pending = VecDeque::from([(project.package.as_str(), root_path, None::<fs::File>)]);
-    let mut root_node = None;
-    let mut nodes = Vec::new();
-    let mut declarations_by_path = BTreeMap::new();
-    let mut texts = BTreeMap::new();
+    compile_project_with_persistence(
+        root, project, configuration, target_layout, Some(persist_fresh_cst), root_exports,
+    )
+}
 
-    while let Some((package, path, checked_git_source)) = pending.pop_front() {
-        let (package_root, project_identity) = if package == project.package {
-            (root, root_project.clone())
-        } else {
-            let resolved = configuration
-                .resolved_packages
-                .get(package)
-                .ok_or_else(|| format!("dependency package {package} is missing"))?;
-            (
-                resolved.project_root.as_path(),
-                resolved.identity.project.clone(),
-            )
-        };
-        let source_path = package_root.join(path.as_path());
-        let read_error = |error| format!("failed to read {}: {error}", source_path.display());
-        let text = if let Some(mut file) = checked_git_source {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(read_error)?;
-            text
-        } else {
-            fs::read_to_string(&source_path).map_err(read_error)?
-        };
-        let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
-        let source = SourceIdentity::new(
-            project_identity,
-            package.to_owned(),
-            path.as_path().to_string_lossy().replace('\\', "/"),
-            revision.clone(),
-        );
-        let (fresh, diagnostics) =
-            parse_source_with_snapshot(source, text, &project.comment_categories);
-        let result = fresh.result();
-        let source = &result.source;
-        render_diagnostics(&result.text, &diagnostics, source);
-        if !diagnostics.is_empty() {
-            return Err("build rejected by syntax diagnostics".to_owned());
-        }
-        persist_cst(root, &source.revision, &fresh.snapshot_json_serializable())?;
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.extractions += 1);
-        let declarations = derive_scalar_declarations_from_cst(result.canonical_cst());
-        let mut namespace_edges = Vec::new();
-        for namespace in declarations.namespaces() {
-            let module_path = serde_json::from_str::<String>(&namespace.path)
-                .map_err(|error| format!("invalid namespace path: {error}"))?;
-            let module_path = PackageRelativePath::new(module_path.into())?;
-            let module = packages
-                .resolve(&namespace.package, &module_path)
-                .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
-            let target_package = module.package;
-            let already_discovered = discovered
-                .get(target_package)
-                .is_some_and(|paths| paths.contains(module.path.as_ref()));
-            if !already_discovered {
-                let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
-                    checkout.source(module.path.as_path())?.map(Some)
-                } else {
-                    let target_root = module
-                        .dependency
-                        .map_or(root, |resolved| resolved.project_root.as_path());
-                    target_root.join(module.path.as_path()).is_file().then_some(None)
-                };
-                if let Some(checked_git_source) = available {
-                    let target_path = module.path.into_owned();
-                    discovered
-                        .entry(target_package)
-                        .or_default()
-                        .insert(target_path.clone());
-                    pending.push_back((target_package, target_path, checked_git_source));
-                }
-            }
-            namespace_edges.push(NamespaceEdgeInput {
-                origin: namespace.package.clone(),
-                path: module_path,
-                binding: namespace.binding.clone(),
-                span: ProjectSourceSpan {
-                    source: ProjectSourceIdentity::new(
-                        source.project.clone(),
-                        source.package.clone(),
-                        path.clone(),
-                    ),
-                    range: wosy_project::ByteSpan::new(namespace.span.start, namespace.span.end),
-                },
-            });
-        }
-        let graph_source = ProjectSourceIdentity::new(
-            source.project.clone(),
-            source.package.clone(),
-            path.clone(),
-        );
-        let node = SourceNodeInput {
-            source: graph_source.clone(),
-            content_revision: ContentRevision(revision),
-            namespace_edges,
-        };
-        if root_node.is_none() {
-            root_node = Some(node);
-        } else {
-            nodes.push(node);
-        }
-        declarations_by_path.insert((package, path), declarations);
-        texts.insert(graph_source, fresh.into_result().text);
-    }
-    drop((discovered, pending));
-
-    let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(&packages, root_node, nodes).map_err(|error| {
-        render_graph_diagnostics(&error, &texts);
-        format_graph_error(error)
-    })?;
-    let source_identities: Vec<_> = graph
-        .nodes
-        .iter()
-        .map(|node| compiler_source_identity(&node.source, &node.content_revision))
-        .collect();
-    let root_exports = root_exports.map(|exports| (exports, source_identities[0].clone()));
-    let mut project_declarations = Vec::with_capacity(graph.nodes.len());
-    let mut derivation_diagnostics = Vec::new();
-    for node in &graph.nodes {
-        let declarations = declarations_by_path
-            .remove(&(node.source.package.as_str(), node.source.path.clone()))
-            .ok_or_else(|| {
-                format!(
-                    "missing canonical CST for {}",
-                    node.source.path.as_path().display()
-                )
-            })?;
-        derivation_diagnostics.extend_from_slice(declarations.diagnostics());
-        let namespace_bindings = node
-            .namespace_edges
-            .iter()
-            .map(|edge| ScalarNamespaceBinding {
-                binding: edge.binding.clone(),
-                target: source_identities[edge.target.0].clone(),
-                span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
-            })
-            .collect();
-        project_declarations.push((declarations, namespace_bindings));
-    }
-    render_project_diagnostics(&derivation_diagnostics, &texts);
-    if !derivation_diagnostics.is_empty() {
-        return Err("build rejected by CST derivation diagnostics".to_owned());
-    }
-    let initialization_order = graph
-        .initialization_order
-        .iter()
-        .map(|id| source_identities[id.0].clone())
-        .collect();
-    drop(source_identities);
-    drop(declarations_by_path);
+fn compile_project_with_persistence(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    persist: Option<canonical_loader::PersistCst>,
+    root_exports: Option<&BTreeMap<String, String>>,
+) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
+    let CanonicalProjectInputs {
+        declarations,
+        initialization_order,
+        graph,
+        texts,
+        ..
+    } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build(persist))
+        .map_err(|failure| failure.report("build"))?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
     let prepared = prepare_scalar_project(
-        project_declarations,
+        declarations,
         initialization_order,
         ScalarPreparationInputs { target_layout },
     )
@@ -641,7 +819,9 @@ fn compile_project(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     drop(texts);
-    let llvm = if let Some((exports, source)) = root_exports {
+    let llvm = if let Some(exports) = root_exports {
+        let entry = graph.nodes.first().ok_or_else(|| "project root source is missing".to_owned())?;
+        let source = compiler_source_identity(&entry.source, &entry.content_revision);
         emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, &source, exports)?
     } else if graph.nodes.len() == 1 {
         #[cfg(test)]
@@ -669,6 +849,13 @@ fn scalar_target_layout(layout: wosy_project::TargetLayout) -> ScalarTargetLayou
         (8, 8) => ScalarTargetLayout::NATIVE64,
         _ => unreachable!("project target layouts are supported"),
     }
+}
+
+fn persist_fresh_cst(
+    root: &std::path::Path,
+    fresh: &wosy_syntax::FreshParseResult,
+) -> Result<(), String> {
+    persist_cst(root, &fresh.result().source.revision, &fresh.snapshot_json_serializable())
 }
 
 fn persist_cst(
@@ -748,18 +935,6 @@ fn load_canonical_cst(path: &std::path::Path) -> Result<wosy_syntax::CanonicalCs
         .map_err(|error| error.to_string())?;
     deserializer.end().map_err(|error| error.to_string())?;
     Ok(wosy_syntax::CanonicalCstRoot::from_snapshot(snapshot))
-}
-
-fn compiler_source_identity(
-    source: &ProjectSourceIdentity,
-    revision: &ContentRevision,
-) -> SourceIdentity {
-    SourceIdentity::new(
-        source.project.clone(),
-        source.package.clone(),
-        source.path.as_path().to_string_lossy().replace('\\', "/"),
-        revision.0.clone(),
-    )
 }
 
 fn format_graph_error(error: wosy_project::GraphLoadError) -> String {
@@ -865,16 +1040,359 @@ fn render_project_diagnostics(
                 )
             })
             .collect();
-        let report = Report::error()
-            .with_code(diagnostic.code.clone())
+        let mut report = Report::error()
             .with_message(diagnostic.message.clone())
             .with_labels(labels)
             .with_notes(diagnostic.notes.clone());
+        if !diagnostic.code.is_empty() {
+            report = report.with_code(diagnostic.code.clone());
+        }
         let config = term::Config::default();
         let stream = StandardStream::stderr(ColorChoice::Auto);
         let mut stream_lock = stream.lock();
         let _ = term::emit(&mut stream_lock, &config, &files, &report);
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_command(
+    target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+) -> Result<u8, String> {
+    use configured_check::{CheckPublicationError, CheckPublicationPreflightError, ConfiguredCheckLoadError as LoadError};
+    use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
+        ScalarOrderedCheckerOutcome};
+
+    let current = env::current_dir().map_err(|error| error.to_string())?;
+    let root = discover_root(&current)?;
+    let receipt = match scope {
+        ScalarCheckerScope::MainFlowOnly => configured_check::check_target(&root, target, profile, scope, Vec::new()),
+        ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(&root, target, profile),
+    }.map_err(|failure| match failure {
+            LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
+            LoadError::Root => "check: invalid project root".to_owned(),
+            LoadError::Manifest(error) => format!("check: invalid manifest: {error}"),
+            LoadError::Target => "check: invalid target".to_owned(),
+            LoadError::Profile => "check: invalid target profile".to_owned(),
+            LoadError::Layout => "check: unsupported target layout".to_owned(),
+            LoadError::Dependency(error) => format!("check: {error}"),
+            LoadError::PackageSourceRoot(error) => format!("check: {error}"),
+            LoadError::DormantPath => "check: invalid declared source path".to_owned(),
+        })?;
+    let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
+    let publication = match receipt.plan_publication() {
+        Ok(publication) => publication,
+        Err(CheckPublicationError::Incomplete(ScalarOrderedCheckerOutcome::Invalid(diagnostics))) => {
+            render_project_diagnostics(diagnostics, &receipt.texts);
+            return Ok(2);
+        }
+        Err(CheckPublicationError::Incomplete(_)) => return Err("check: unsupported analysis; no result published".to_owned()),
+        Err(CheckPublicationError::InvalidPath { .. } | CheckPublicationError::ConflictingPath { .. }) =>
+            return Err(unsupported_output()),
+    };
+    let report = publication.report;
+    if scope == ScalarCheckerScope::MainFlowOnly
+        && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty())
+    {
+        return Err(unsupported_output());
+    }
+    let authored = publication.prepare(&receipt.root).map_err(|error| match error {
+        CheckPublicationPreflightError::UnsupportedFilePublication => unsupported_output(),
+        CheckPublicationPreflightError::File(error) =>
+            format!("check: could not prepare authored files; no result published: {error}"),
+        CheckPublicationPreflightError::ExitStatusOutsideByteRange =>
+            "check: selected exit code is outside 0..=255; no result published".to_owned(),
+    })?;
+    let actual = report.diagnostics.iter().map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.clone().unwrap_or_else(|| failure.goal.clone()),
+                message: "not satisfied by this call".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.proof.clone(),
+                message: "proof declaration".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.invocation.call.clone(),
+                message: "applicable call".to_owned(),
+            },
+        ];
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.goal.clone(),
+                message: "proof goal".to_owned(),
+            });
+        }
+        labels.extend(failure.invocation.intermediate_calls.iter().map(|span| DiagnosticLabel {
+            kind: DiagnosticLabelKind::Secondary,
+            span: span.clone(),
+            message: "through this call".to_owned(),
+        }));
+        if let Some(outer) = &failure.invocation.outer_call {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: outer.clone(),
+                message: "reached from this call".to_owned(),
+            });
+        }
+        if let Some(owner) = &failure.invocation.namespaced_callable {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary, span: owner.clone(),
+                message: "proved callable declared here".to_owned(),
+            });
+        }
+        let value = proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal);
+        let mut notes = vec![if let Some(pair) = &failure.invocation.returned_pair {
+            format!("call returned {}", proof_pair_text(pair))
+        } else if let Some(slot) = failure.invocation.result_slot {
+            format!("call returned output {} = {value}", slot + 1)
+        } else { format!("call returned {value}") }];
+        if let Some((name, value)) = &failure.quantified_witness {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
+        if (failure.entry_dependent_witness || failure.invocation.outer_call.is_some()
+            || failure.invocation.result_slot.is_some() || failure.invocation.returned_pair.is_some()
+            || matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_))))
+            && !failure.invocation.arguments.is_empty()
+        {
+            let entries = failure.invocation.arguments.iter().enumerate().map(|(index, (ty, value))| {
+                format!("argument {} = {}", index + 1, proof_scalar_text(value, wosy_compiler::ScalarCheckerProofLiteral::from_atom(ty, value)))
+            }).collect::<Vec<_>>();
+            notes.push(format!("call entry: {}", entries.join(", ")));
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels, notes,
+        }
+    });
+    let symbolic = report.symbolic_diagnostic.iter().chain(&report.additional_symbolic_diagnostics).map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.clone().unwrap_or_else(|| failure.goal.clone()),
+                message: "not satisfied by this symbolic call".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.proof.clone(),
+                message: "proof declaration".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.callable.clone(),
+                message: "unused function checked symbolically".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.output.clone(),
+                message: "return with a counterexample".to_owned(),
+            },
+        ];
+        if let Some(output) = &failure.other_output {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: output.clone(),
+                message: "other output from this return".to_owned(),
+            });
+        }
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.goal.clone(),
+                message: "proof goal".to_owned(),
+            });
+        }
+        let value = proof_scalar_text(&failure.returned, failure.returned_literal);
+        let mut notes = vec![if let Some(pair) = &failure.returned_pair {
+            format!("symbolic call can return {}", proof_pair_text(pair))
+        } else if let Some(slot) = failure.result_slot {
+            format!("symbolic call can return output {} = {value}", slot + 1)
+        } else { format!("symbolic call can return {value}") }];
+        if let Some((name, value)) = &failure.quantified_witness {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
+        if let Some(ieee) = &failure.ieee_entry {
+            let name = entry_binding_name(&ieee.binding.source, ieee.binding.range, publication.texts).unwrap_or("argument 1");
+            use wosy_compiler::ScalarCheckerIeeeValue;
+            let detail = match ieee.value {
+                ScalarCheckerIeeeValue::F32(bits) => format!("{:?} (f32 bits 0x{bits:08x})", f32::from_bits(bits)),
+                ScalarCheckerIeeeValue::F64(bits) => format!("{:?} (f64 bits 0x{bits:016x})", f64::from_bits(bits)),
+            };
+            notes.push(format!("symbolic call entry: {name} = {detail}"));
+        } else if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
+            notes.push(entry);
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels,
+            notes,
+        }
+    });
+    let contextual = report.contextual_diagnostic.iter().chain(&report.additional_contextual_diagnostics).map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
+                message: if failure.symbolic { "not satisfied by this symbolic contextual call" }
+                    else { "not satisfied by this contextual call" }.to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+        ];
+        if failure.symbolic {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
+                message: "unused callable checked with an arbitrary contextual entry".to_owned() });
+        } else {
+            labels.extend([
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.supplying_call.clone(),
+                    message: "call supplying this context".to_owned() },
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
+                    message: "checked call".to_owned() },
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.binding.clone(),
+                    message: "active contextual binding".to_owned() },
+            ]);
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels,
+            notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
+        }
+    });
+    let aggregate = report.aggregate_diagnostics.iter().map(|failure| {
+        let actual = failure.call.is_some();
+        let (primary, output, note) = if let Some(cell) = &failure.cell {
+            ("not satisfied by this returned array cell", "returned cell",
+                if actual { format!("call returned cell [{}] = {}", cell.index, cell.value) }
+                else { format!("symbolic call can return cell [{}] = {}", cell.index, cell.value) })
+        } else {
+            ("no index satisfies this existential goal", "returned array",
+                if actual { "call returned an array with no matching index".to_owned() }
+                else { "symbolic call can return an array with no matching index".to_owned() })
+        };
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.as_ref().unwrap_or(&failure.goal).clone(),
+                message: primary.to_owned(),
+            },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.output.clone(),
+                message: output.to_owned() },
+        ];
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.goal.clone(),
+                message: "proof goal".to_owned() });
+        }
+        if let Some(call) = &failure.call {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: call.clone(),
+                message: "applicable call".to_owned() });
+        }
+        let mut notes = vec![note];
+        if let Some((name, value)) = failure.cell.as_ref().and_then(|cell| cell.universal.as_ref()) {
+            notes.push(format!("quantified witness input: {name} = {value}"));
+        }
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual, false) {
+            notes.push(entry);
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels, notes,
+        }
+    });
+    let pointer_effect = report.pointer_effect_diagnostic.iter().map(|failure| Diagnostic {
+        code: String::new(), severity: DiagnosticSeverity::Error,
+        message: "proof obligation failed".to_owned(),
+        labels: vec![
+            DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
+                message: "not satisfied by this symbolic pointee update".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.read.clone(),
+                message: "first read of the entry pointee".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.write.clone(),
+                message: "write determining the exit pointee".to_owned() },
+        ],
+        notes: std::iter::once(format!("pointee at entry: {}; at exit: {}; goal requires: {}",
+            failure.entry, failure.observed, failure.expected))
+            .chain(failure.guard.map(|value| format!("Boolean guard input at entry: {value}"))).collect(),
+    });
+    let mut diagnostics = Vec::new();
+    if let Some(positions) = &report.mixed_context_after_scalar {
+        let mut scalar = actual.chain(symbolic);
+        let mut contextual = contextual;
+        let mut emitted = 0;
+        for &position in positions {
+            if position < emitted { return Err("check: invalid mixed proof diagnostic order".to_owned()); }
+            while emitted < position {
+                diagnostics.push(scalar.next().ok_or_else(|| "check: incomplete mixed proof diagnostic order".to_owned())?);
+                emitted += 1;
+            }
+            diagnostics.push(contextual.next().ok_or_else(|| "check: missing mixed contextual diagnostic".to_owned())?);
+        }
+        if contextual.next().is_some() { return Err("check: incomplete mixed contextual diagnostic order".to_owned()); }
+        diagnostics.extend(scalar);
+    } else {
+        diagnostics.extend(actual);
+        diagnostics.extend(symbolic);
+        diagnostics.extend(contextual);
+    }
+    diagnostics.extend(aggregate);
+    diagnostics.extend(pointer_effect);
+    let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
+    render_project_diagnostics(&diagnostics, publication.texts);
+    Ok(if authored_status != 0 { authored_status } else { u8::from(!diagnostics.is_empty()) })
+}
+
+#[cfg(feature = "internal-checker")]
+fn proof_scalar_text(value: impl std::fmt::Display, literal: Option<wosy_compiler::ScalarCheckerProofLiteral>) -> String {
+    use wosy_compiler::ScalarCheckerProofLiteral::{Boolean, Character};
+    match literal {
+        Some(Boolean(value)) => value.to_string(),
+        Some(Character(value)) => format!("{value:?}"),
+        None => value.to_string(),
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn proof_pair_text<T: std::fmt::Display>([(left, left_literal), (right, right_literal)]: &[(T, Option<wosy_compiler::ScalarCheckerProofLiteral>); 2])
+    -> String
+{
+    format!("(output 1 = {}, output 2 = {})", proof_scalar_text(left, *left_literal), proof_scalar_text(right, *right_literal))
+}
+
+#[cfg(feature = "internal-checker")]
+fn entry_binding_name<'a>(
+    binding_source: &SourceIdentity,
+    declaration: wosy_syntax::ByteSpan,
+    texts: &'a BTreeMap<ProjectSourceIdentity, String>,
+) -> Option<&'a str> {
+    PackageRelativePath::new(binding_source.path.clone().into()).ok()
+        .map(|path| ProjectSourceIdentity::new(binding_source.project.clone(), binding_source.package.clone(), path))
+        .and_then(|source| texts.get(&source))
+        .and_then(|text| text.get(declaration.start as usize..declaration.end as usize))
+}
+
+#[cfg(feature = "internal-checker")]
+fn entry_point_note(
+    witness: &wosy_compiler::ScalarCheckerIntegerWitness,
+    texts: &BTreeMap<ProjectSourceIdentity, String>,
+    actual: bool, categorical: bool,
+) -> Option<String> {
+    if witness.row_count() != 1 || witness.axes().len() == 0 { return None; }
+    let entries = witness.axes().enumerate().map(|(axis, (binding, ty))| {
+        let mut points = witness.intervals_at(0, axis)?;
+        let (first, last) = points.next()?;
+        if first != last || points.len() != 0 { return None; }
+        let name = entry_binding_name(&binding.source, binding.declaration_span, texts);
+        let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
+        let literal = if categorical { wosy_compiler::ScalarCheckerProofLiteral::from_atom(ty, first) } else { None };
+        Some(format!("{name} = {}", proof_scalar_text(first, literal)))
+    }).collect::<Option<Vec<_>>>()?;
+    let origin = if actual { "call entry" } else { "symbolic call entry" };
+    Some(format!("{origin}: {}", entries.join(", ")))
 }
 
 fn artifact_identity(
@@ -1012,6 +1530,7 @@ mod routing_observations {
         pub(super) extractions: usize,
         pub(super) preparations: usize,
         pub(super) builds: usize,
+        pub(super) checks: usize,
         pub(super) single_module_emissions: usize,
         pub(super) project_emissions: usize,
     }
@@ -1029,10 +1548,7 @@ mod routing_observations {
         });
     }
 
-    pub(super) fn observe_compile(
-        project: &ProjectContext,
-        configuration: &ProjectConfiguration,
-    ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+    pub(super) fn observe<T>(run: impl FnOnce() -> T) -> (T, Counts) {
         struct Restore(Option<Counts>);
 
         impl Drop for Restore {
@@ -1042,15 +1558,18 @@ mod routing_observations {
         }
 
         let _restore = Restore(COUNTS.replace(Some(Counts::default())));
-        let result = compile_project(
-            &project.root,
-            project,
-            configuration,
-            ScalarTargetLayout::NATIVE64,
-            None,
-        )
-        .map(|(llvm, sources)| (llvm.to_text(), sources));
+        let result = run();
         (result, COUNTS.get().expect("active routing observations"))
+    }
+
+    pub(super) fn observe_compile(
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+    ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
+        observe(|| {
+            compile_project(&project.root, project, configuration, ScalarTargetLayout::NATIVE64, None)
+                .map(|(llvm, sources)| (llvm.to_text(), sources))
+        })
     }
 }
 
@@ -1103,6 +1622,1054 @@ mod tests {
             resolved_packages: BTreeMap::new(),
         };
         (project, configuration)
+    }
+
+    fn compile_project_text(
+        root: &std::path::Path,
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+        target_layout: ScalarTargetLayout,
+        root_exports: Option<&BTreeMap<String, String>>,
+    ) -> Result<(String, Vec<SourceObservation>), String> {
+        compile_project(root, project, configuration, target_layout, root_exports)
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
+    }
+
+    fn compile_project_text_with_persistence(
+        root: &std::path::Path,
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+        target_layout: ScalarTargetLayout,
+        persist: Option<canonical_loader::PersistCst>,
+        root_exports: Option<&BTreeMap<String, String>>,
+    ) -> Result<(String, Vec<SourceObservation>), String> {
+        compile_project_with_persistence(root, project, configuration, target_layout, persist, root_exports)
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_loads_explicit_reachable_module_once_without_outputs() {
+        use wosy_compiler::ScalarModuleProofOutcome;
+        let sources = [
+            ("main.w", "%%start\nlib = namespace app \"lib.w\"; u8 value = lib.project(7);\n%%end"),
+            ("lib.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof established for project(input) -> (out) ensures (out <= 7) {}
+                proof contradicted for project(input) -> (out) ensures (out <= 6) {}
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-graph", &sources);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_proofs(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                PackageRelativePath::new("lib.w".into()).unwrap(),
+                &["contradicted", "established", "contradicted"],
+            )
+        });
+        let (outcomes, texts) = result.expect("canonical proof inputs");
+        assert_eq!(outcomes.unwrap(), [
+            ScalarModuleProofOutcome::Refuted,
+            ScalarModuleProofOutcome::Proved,
+            ScalarModuleProofOutcome::Refuted,
+        ]);
+        assert_eq!(texts.len(), sources.len());
+        assert!(texts.values().any(|value| value == sources[1].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_batches_multiple_exact_sources_in_request_order() {
+        use wosy_compiler::ScalarModuleProofOutcome;
+        let sources = [
+            ("main.w", r#"%%start
+                first = namespace app "first.w";
+                second = namespace app "second.w";
+                ignored = namespace app "ignored.w";
+                u8 a = first.project(7);
+                u8 b = second.project(12);
+            %%end"#),
+            ("first.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof same for project(input) -> (out) ensures (out <= 7) {}
+            %%end"#),
+            ("second.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof same for project(input) -> (out) ensures (out <= 10) {}
+            %%end"#),
+            ("ignored.w", r#"%%start
+                u8(u8) project = fn(input) { input };
+                proof inert for project(input) -> (out) ensures (out <= 255) { core.show(out == 1__0); }
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-multi-sources", &sources);
+        let first = PackageRelativePath::new("first.w".into()).unwrap();
+        let second = PackageRelativePath::new("second.w".into()).unwrap();
+        let (result, counts) = routing_observations::observe(|| check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            &[(&second, "same"), (&first, "same"), (&second, "same")],
+        ));
+        let (outcomes, texts) = result.expect("all selected proof sources are in the graph");
+        assert_eq!(outcomes.unwrap(), [
+            ScalarModuleProofOutcome::Refuted, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Refuted,
+        ]);
+        assert_eq!(texts.len(), sources.len());
+        assert_eq!(counts, routing_observations::Counts { extractions: 4, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+        let missing_one = PackageRelativePath::new("absent-z.w".into()).unwrap();
+        let missing_two = PackageRelativePath::new("absent-a.w".into()).unwrap();
+        let missing = check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            &[(&second, "same"), (&missing_one, "same"), (&missing_two, "same")],
+        );
+        assert!(matches!(missing, Err(CanonicalLoadFailure::Input(error)) if error.contains("absent-z.w")));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_verifies_two_local_citations_without_expanding_source_scope() {
+        use wosy_compiler::ScalarModuleProofOutcome::{Proved, Unsupported};
+        let sources = [
+            ("main.w", r#"%%start
+                lib = namespace app "lib.w";
+                other = namespace app "other.w";
+            %%end"#),
+            ("lib.w", r#"%%start
+                i8(i8) echo = fn(value) { value };
+                proof nonnegative for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out >= 0) {}
+                proof nonzero for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out != 0) {}
+                proof joint for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out > 0) {
+                    core.use(nonnegative(entry));
+                    core.use(nonzero(entry));
+                }
+                proof wrong_source for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out > 0) {
+                    core.use(nonnegative(entry));
+                    core.use(foreign(entry));
+                }
+            %%end"#),
+            ("other.w", r#"%%start
+                i8(i8) echo = fn(value) { value };
+                proof foreign for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out != 0) {}
+            %%end"#),
+            ("unreachable.w", "this file is not in the target graph"),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-two-local-citations", &sources);
+        let lib = PackageRelativePath::new("lib.w".into()).unwrap();
+        let outside = PackageRelativePath::new("unreachable.w".into()).unwrap();
+        let check = |selections: &[(&PackageRelativePath, &str)]| check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, selections,
+        );
+        let (result, counts) = routing_observations::observe(|| check(
+            &[(&lib, "joint"), (&lib, "wrong_source"), (&lib, "joint")],
+        ));
+        let (outcomes, texts) = result.expect("canonical selected proof input");
+        assert_eq!(outcomes.unwrap(), [Proved, Unsupported, Proved]);
+        assert_eq!(texts.len(), 3);
+        assert!(texts.values().any(|text| text == sources[2].1));
+        assert!(!texts.values().any(|text| text == sources[3].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 3, checks: 1, ..Default::default() });
+        let (result, counts) = routing_observations::observe(|| check(&[(&lib, "joint"), (&outside, "foreign")]));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(error)) if error.contains("unreachable.w")));
+        assert_eq!(counts, routing_observations::Counts { extractions: 3, ..Default::default() });
+        let mut remaining = fs::read_dir(&project.root).unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+        remaining.sort_unstable();
+        assert_eq!(remaining, ["lib.w", "main.w", "other.w", "unreachable.w"]);
+        for (name, text) in sources {
+            assert_eq!(fs::read_to_string(project.root.join(name)).unwrap(), text);
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_reuses_only_the_selected_producer_and_caller_from_one_graph() {
+        use wosy_compiler::ScalarProofCallOutcome;
+        let sources = [
+            ("main.w", r#"%%start
+                lib = namespace app "lib.w";
+                u8(u8) alternate = fn(input) { input };
+                unit() consumer = fn {
+                    u8 result = lib.producer(7);
+                    core.require(result <= 10, { .stdout = ""; .stderr = "bad"; .code = 23; .files = []; });
+                };
+                unit() wrong = fn {
+                    u8 result = alternate(7);
+                    core.require(result <= 10, { .stdout = ""; .stderr = "bad"; .code = 23; .files = []; });
+                };
+            %%end"#),
+            ("lib.w", r#"%%start
+                u8(u8) producer = fn(input) { input };
+                proof cap for producer(input) -> (out) where (input > 4 && input <= 10) ensures (out <= 10) {}
+            %%end"#),
+            ("unreachable.w", "this file is not in the target graph"),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-one-caller", &sources);
+        let main = PackageRelativePath::new("main.w".into()).unwrap();
+        let lib = PackageRelativePath::new("lib.w".into()).unwrap();
+        let unreachable = PackageRelativePath::new("unreachable.w".into()).unwrap();
+        let check = |path, name| check_loaded_proof_call(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            (&lib, "cap"), (path, name),
+        );
+        let (result, counts) = routing_observations::observe(|| check(&main, "consumer"));
+        let (result, texts) = result.expect("canonical selected proof and caller");
+        assert_eq!(result, ScalarProofCallOutcome::Established);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert_eq!(check(&main, "wrong").unwrap().0, ScalarProofCallOutcome::Unavailable);
+        assert!(matches!(
+            check(&unreachable, "consumer"),
+            Err(CanonicalLoadFailure::Input(error)) if error.contains("caller source unreachable.w"),
+        ));
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[test]
+    fn canonical_build_statically_types_then_erases_proofs_without_verifying_them() {
+        let erased = r#"%%start
+            u8(u8) identity = fn(input) { input };
+            unit() noop = fn {};
+            (u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };
+            generic T;
+            T(T) generic_identity = fn(value) { value };
+            single = overload { u8(u8) => fn(value) { value }; };
+            choose = overload { u8(u8) => fn(value) { value }; bool(bool) => fn(value) { value }; };
+        %%end"#;
+        let (project, configuration) = routing_test_project("build-statically-types-proofs", &[("main.w", erased)]);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let build_without_persistence = || compile_project_text_with_persistence(
+                &project.root, &project, &configuration, layout, None, None,
+            );
+            let build = || compile_project_text(&project.root, &project, &configuration, layout, None);
+            std::fs::write(project.root.join("main.w"), erased).unwrap();
+            let (baseline, _) = build().expect("runtime-only baseline");
+            let with_proof = |proof: &str| erased.replace("%%end", &format!("{proof}\n%%end"));
+            let false_proof = "proof impossible for identity(input) -> (out) ensures (out == core.old(input) && out != input) { core.show(false); }";
+            let nullary = "proof empty for noop() -> () ensures (false) {}";
+            let pair = "proof two for pair(input) -> (amount, flag) ensures (amount == 7 && flag == input) {}";
+            let single = "proof arm for single(input) -> (out) ensures (out == input) {}";
+            std::fs::write(project.root.join("main.w"),
+                with_proof(&format!("{false_proof}\n{nullary}\n{pair}\n{single}"))).unwrap();
+            let (result, counts) = routing_observations::observe(build);
+            let (proved_erased, _) = result.expect("well-typed refuted proof still builds");
+            assert_eq!(proved_erased.as_bytes(), baseline.as_bytes());
+            assert_eq!(build_without_persistence().unwrap().0.as_bytes(), baseline.as_bytes());
+            assert_eq!(counts, routing_observations::Counts {
+                extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
+            });
+            for invalid in [
+                false_proof.replace("core.old(input)", "unknown_name"),
+                false_proof.replace("out == core.old(input) && out != input", "input"),
+                false_proof.replace("core.show(false)", "core.show(unknown_step_name)"),
+                false_proof.replace("for identity(input)", "for unknown_target(input)"),
+                false_proof.replace("for identity(input)", "for generic_identity(input)"),
+                false_proof.replace("for identity(input)", "for choose(input)"),
+                pair.replace("(amount, flag)", "(amount)"),
+                nullary.replace("noop()", "noop(arg)"),
+            ] {
+                std::fs::write(project.root.join("main.w"), with_proof(&invalid)).unwrap();
+                let (rejected, counts) = routing_observations::observe(build);
+                assert_eq!(rejected.unwrap_err(), "build rejected by semantic diagnostics", "{invalid}");
+                assert_eq!(build_without_persistence().unwrap_err(), "build rejected by semantic diagnostics", "{invalid}");
+                assert_eq!(counts, routing_observations::Counts { extractions: 1, preparations: 1, ..Default::default() });
+            }
+        }
+    }
+
+    #[test]
+    fn configured_wasm_root_exports_keep_canonical_static_proof_boundary() {
+        let root = "%%start\ni32(i32) score = fn(points) { points };\n";
+        let proof = "proof impossible for score(points) -> (out) ensures (false) {}";
+        let source = format!("{root}{proof}\n%%end");
+        let (project, configuration) =
+            routing_test_project("wasm-root-exports-keep-proof-boundary", &[("main.w", &source)]);
+        let exports = BTreeMap::from([("demo_score".into(), "score".into())]);
+        let compile = || {
+            compile_project_text(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, Some(&exports),
+            )
+        };
+        let (with_proof, _) = compile().expect("well-typed proof is erased");
+        assert!(with_proof.contains("define i32 @demo_score("));
+        fs::write(project.root.join("main.w"), format!("{root}%%end")).unwrap();
+        assert_eq!(compile().unwrap().0, with_proof);
+        fs::write(
+            project.root.join("main.w"),
+            format!("{root}{}\n%%end", proof.replace("false", "unknown_name")),
+        ).unwrap();
+        assert_eq!(compile().unwrap_err(), "build rejected by semantic diagnostics");
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn canonical_build_prepares_proof_against_inferred_callable_binding() {
+        let text = r#"%%start
+            u8(u8) identity = fn(input) { input };
+            operation = identity;
+            proof inferred for operation(input) -> (out) ensures (out == input) {}
+        %%end"#;
+        let (project, configuration) = routing_test_project("build-inferred-proof-target", &[("main.w", text)]);
+        let load = || load_canonical_project_inputs(&project.root, &project, &configuration, CanonicalLoadPurpose::Build(None)).unwrap();
+        let CanonicalProjectInputs { declarations, initialization_order, .. } = load();
+        prepare_scalar_project(declarations, initialization_order,
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 })
+            .unwrap_or_else(|rejected| panic!("canonical inferred callable target: {:?}", rejected.into_ordered_diagnostics()));
+        std::fs::write(project.root.join("main.w"), text.replace("out == input", "out == false")).unwrap();
+        let CanonicalProjectInputs { declarations, initialization_order, .. } = load();
+        let rejected = prepare_scalar_project(declarations, initialization_order,
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 });
+        let Err(rejected) = rejected else { panic!("inferred callable result must be typed"); };
+        assert!(rejected.into_ordered_diagnostics().iter().any(|diagnostic| diagnostic.code == "B0003"));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_refuses_unselected_sources_and_build_erases_named_proofs() {
+        let vertex = PackageRelativePath::new("main.w".into()).unwrap();
+        let (project, configuration) = routing_test_project("internal-proof-outside-graph", &[
+            ("main.w", "%%start\nu8(u8) identity = fn(input) { input };\n%%end"),
+            ("stray.w", "this source is not in the target graph"),
+        ]);
+        let (result, counts) = routing_observations::observe(|| check_loaded_proofs(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            PackageRelativePath::new("stray.w".into()).unwrap(), &["unselected"],
+        ));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))));
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+
+        let text = "%%start\nu8(u8) identity = fn(input) { input };\nproof alpha for identity(input) -> (out) ensures (out <= 10) {}\n%%end";
+        let (project, configuration) = routing_test_project("ordinary-build-erases-proof", &[("main.w", text)]);
+        let selected = check_loaded_proofs(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, vertex, &["alpha"]);
+        let (outcomes, _) = selected.expect("valid explicit proof source");
+        assert_eq!(outcomes.unwrap(), [wosy_compiler::ScalarModuleProofOutcome::Refuted]);
+        assert!(!project.root.join(".wosy").exists());
+        let (built, counts) = routing_observations::observe(|| {
+            compile_project_text(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, None)
+        });
+        let (llvm, observations) = built.expect("ordinary Build ignores the proof");
+        assert_eq!(observations.len(), 1);
+        assert!(!llvm.contains("alpha"));
+        assert_eq!(counts, routing_observations::Counts {
+            extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
+        });
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_visit_only_authored_bytes_and_deferred_files_in_order() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let text = r#"%%start
+            core.require(false, { .stdout = "ação\n"; .stderr = "first"; .code = 0;
+                .files = [{ .path = "logs/a.txt"; .text = "☕"; }, { .path = "empty.txt"; .text = ""; }]; });
+            core.require(false, { .stdout = ""; .stderr = "last\t"; .code = 0;
+                .files = [{ .path = "logs/b.txt"; .text = "β"; }]; });
+        %%end"#;
+        let (project, configuration) = routing_test_project("ordered-internal-effects", &[("main.w", text)]);
+        let receipt = check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).expect("complete ordered receipt");
+        let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected authored effects"); };
+        assert_eq!(receipt.selected_status(), Some(InternalCheckStatus::Zero));
+        let mut events = Vec::new();
+        receipt.visit_authored_effects(|effect| {
+            match effect {
+                InternalCheckEffect::Stdout(bytes) => events.push(("stdout", None, bytes.to_vec())),
+                InternalCheckEffect::Stderr(bytes) => events.push(("stderr", None, bytes.to_vec())),
+                InternalCheckEffect::DeferredFile(file) => events.push(("file", Some(file.path.to_string()), file.text.to_vec())),
+            }
+            Ok::<(), ()>(())
+        }).unwrap();
+        assert_eq!(events, [
+            ("stdout", None, "ação\n".as_bytes().to_vec()),
+            ("stderr", None, b"first".to_vec()),
+            ("file", Some("logs/a.txt".into()), "☕".as_bytes().to_vec()),
+            ("file", Some("empty.txt".into()), Vec::new()),
+            ("stderr", None, b"last\t".to_vec()),
+            ("file", Some("logs/b.txt".into()), "β".as_bytes().to_vec()),
+        ]);
+        let mut calls = 0;
+        let refused = receipt.visit_authored_effects(|effect| {
+            calls += 1;
+            if let InternalCheckEffect::DeferredFile(file) = effect {
+                assert!(std::ptr::eq(file, &reports[0].files()[0]));
+                return Err("sink refused");
+            }
+            Ok(())
+        });
+        assert_eq!(refused, Err("sink refused"));
+        assert_eq!(calls, 3);
+        assert!(!project.root.join("logs").exists());
+        assert!(!project.root.join("empty.txt").exists());
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_share_payload_by_origin_without_merging_reports() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let output = r#"{ .stdout = "same out"; .stderr = "same err"; .code = 23;
+            .files = [{ .path = "report.txt"; .text = "same bytes"; }]; }"#;
+        let text = format!(r#"%%start
+            unit(u8) leaf = fn(value) {{ core.require(value < 2, {output}); }};
+            leaf(3);
+            core.require(false, {output});
+            leaf(4);
+        %%end"#);
+        let (project, configuration) = routing_test_project("ordered-effects-shared-origin", &[("main.w", &text)]);
+        let receipt = check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ).expect("completed ordered receipt");
+        let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected reports"); };
+        let [first, separate, repeated] = reports.as_slice() else { panic!("three authored reports"); };
+        assert_eq!(first.directive, repeated.directive);
+        assert_ne!(first.directive, separate.directive);
+        assert_eq!(first.stdout(), separate.stdout());
+        assert_eq!(first.stderr(), separate.stderr());
+        assert_eq!(first.files()[0].text, separate.files()[0].text);
+        assert!(std::ptr::eq(first.stdout(), repeated.stdout()));
+        assert!(std::ptr::eq(first.stderr(), repeated.stderr()));
+        assert!(std::ptr::eq(&first.files()[0], &repeated.files()[0]));
+        assert!(std::ptr::eq(first.code(), repeated.code()));
+        assert!(!std::ptr::eq(first.stdout(), separate.stdout()));
+        assert!(!std::ptr::eq(&first.files()[0], &separate.files()[0]));
+        assert_eq!(first.witness.intervals_at(0, 0).unwrap().next(), Some((&3.into(), &3.into())));
+        assert_eq!(repeated.witness.intervals_at(0, 0).unwrap().next(), Some((&4.into(), &4.into())));
+        let Some(InternalCheckStatus::FirstNonzero(selected)) = receipt.selected_status() else {
+            panic!("expected first authored nonzero");
+        };
+        assert!(std::ptr::eq(first, selected));
+        let mut visited = Vec::new();
+        receipt.visit_authored_effects(|effect| {
+            match effect {
+                InternalCheckEffect::Stdout(bytes) => {
+                    assert_eq!(bytes, b"same out");
+                    visited.push(("stdout", bytes.as_ptr()));
+                }
+                InternalCheckEffect::Stderr(bytes) => {
+                    assert_eq!(bytes, b"same err");
+                    visited.push(("stderr", bytes.as_ptr()));
+                }
+                InternalCheckEffect::DeferredFile(file) => {
+                    assert_eq!(&*file.text, b"same bytes");
+                    visited.push(("file", file.text.as_ptr()));
+                }
+            }
+            Ok::<(), ()>(())
+        }).unwrap();
+        assert_eq!(visited, [
+            ("stdout", first.stdout().as_ptr()), ("stderr", first.stderr().as_ptr()), ("file", first.files()[0].text.as_ptr()),
+            ("stdout", separate.stdout().as_ptr()), ("stderr", separate.stderr().as_ptr()), ("file", separate.files()[0].text.as_ptr()),
+            ("stdout", repeated.stdout().as_ptr()), ("stderr", repeated.stderr().as_ptr()), ("file", repeated.files()[0].text.as_ptr()),
+        ]);
+        assert!(!project.root.join("report.txt").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_do_not_emit_for_invalid_unsupported_or_no_failure() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let authored = r#"core.require(false, { .stdout = "never"; .stderr = ""; .code = 0; .files = []; });"#;
+        for (tail, expected) in [
+            ("unit() leaf = fn { leaf(); }; unit() nested = fn { leaf(); }; nested();", "unsupported"),
+            ("core.require(true, {});", "invalid"),
+            ("", "failed"),
+        ] {
+            let text = format!("%%start\n{authored}\n{tail}\n%%end");
+            let (project, configuration) = routing_test_project("ordered-internal-effect-completion", &[("main.w", &text)]);
+            let receipt = check_loaded_ordered_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+                ScalarCheckerScope::MainFlowOnly, Vec::new(),
+            ).expect("well-formed canonical source");
+            match &receipt.outcome {
+                ScalarOrderedCheckerOutcome::Unsupported => assert_eq!(expected, "unsupported"),
+                ScalarOrderedCheckerOutcome::Invalid(_) => assert_eq!(expected, "invalid"),
+                ScalarOrderedCheckerOutcome::Failed(_) => assert_eq!(expected, "failed"),
+                outcome => panic!("unexpected {outcome:?}"),
+            }
+            let mut effects = 0;
+            receipt.visit_authored_effects(|_| { effects += 1; Ok::<(), ()>(()) }).unwrap();
+            assert_eq!(effects, usize::from(expected == "failed"));
+        }
+        for outcome in [ScalarOrderedCheckerOutcome::Passed, ScalarOrderedCheckerOutcome::NoChecks] {
+            let receipt = InternalCheckReceipt { outcome, texts: BTreeMap::new() };
+            receipt.visit_authored_effects::<()>(|_| panic!("no authored effects")).unwrap();
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_dependency_uses_its_own_declared_target_and_layout_once() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let (scratch, _) = routing_test_project("ordered-own-dependency", &[]);
+        let root = &scratch.root;
+        let dep = root.join("dep");
+        fs::create_dir_all(dep.join("src")).unwrap();
+        let manifest = |package, source_root, target, path, profile, output| format!(r#"
+[package]
+name = "{package}"
+default_target = "{target}"
+source_root = "{source_root}"
+
+[comments]
+categories = []
+
+[builders]
+
+[runners]
+
+[targets.{target}]
+root = "{path}"
+
+[targets.{target}.artifacts.main]
+artifact = "RuntimeStdio"
+
+[targets.{target}.artifacts.main.profiles.{profile}]
+backend = "llvm"
+output = "{output}"
+builder = "never"
+run_runner = "never"
+
+[targets.{target}.profiles.{profile}]
+main_artifact = "main"
+"#);
+        let parent_manifest = manifest("app", ".", "main", "main.w", "dev", "native");
+        fs::write(root.join("wosy.toml"), format!("{parent_manifest}
+[dependencies.dep]
+path = \"dep\"
+")).unwrap();
+        fs::write(dep.join("wosy.toml"), manifest("dep", "src", "own", "src/own.w", "checked", "wasm-wasip1")).unwrap();
+        let emit = |text, code| format!(
+            "core.require(false, {{ .stdout = \"{text}\"; .stderr = \"\"; .code = {code}; .files = []; }});",
+        );
+        fs::write(root.join("main.w"), format!("%%start
+vendor = namespace dep \"borrowed.w\";
+{}
+%%end", emit("parent", 3))).unwrap();
+        fs::write(dep.join("src/borrowed.w"), format!("%%start
+{}
+%%end", emit("parent import", 5))).unwrap();
+        fs::write(dep.join("src/own.w"), format!(
+            "%%start
+{}
+unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep\"; .stderr = \"\"; .code = 9; .files = []; }}); }};
+%%end",
+            emit("own dep", 7),
+        )).unwrap();
+
+        let (parent, document, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("checked")).unwrap();
+        let parent_project = ProjectContext::from_manifest(root, "main", document.as_table()).unwrap();
+        let parent_layout = parent.artifact_profile("main", "dev").unwrap().2.target_layout().unwrap();
+        assert_eq!(parent_layout.pointer_size, 8);
+        assert_eq!(selection.layout.pointer_size, 4);
+        assert_eq!(selection.project.root, dep);
+        assert_eq!(selection.project.source_root, std::path::PathBuf::from("src/own.w"));
+        let (child, counts) = routing_observations::observe(|| check_loaded_ordered_dependency(&selection));
+        assert_eq!(counts.checks, 1);
+        assert_eq!(counts.extractions, 1);
+        assert_eq!(counts.builds, 0);
+        let child = child.unwrap();
+        let ScalarOrderedCheckerOutcome::Failed(failures) = child.outcome else { panic!("own target and unused root failures"); };
+        assert_eq!(failures.iter().map(|failure| failure.stdout()).collect::<Vec<_>>(), [b"own dep".as_slice(), b"unused dep".as_slice()]);
+        assert_eq!(child.texts.len(), 1);
+        let parent = check_loaded_ordered_project(root, &parent_project, &parent, scalar_target_layout(parent_layout), ScalarCheckerScope::CurrentPackage, Vec::new()).unwrap();
+        let ScalarOrderedCheckerOutcome::Failed(failures) = parent.outcome else { panic!("parent and imported startup failures"); };
+        assert_eq!(failures.iter().map(|failure| failure.stdout()).collect::<Vec<_>>(), [b"parent import".as_slice(), b"parent".as_slice()]);
+        assert_eq!(parent.texts.len(), 2);
+        assert_eq!(
+            ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("dev")).err().as_deref(),
+            Some("target own profile dev is missing"),
+        );
+        use configured_check::{check_direct_dependency_primary, CheckPublicationError, ConfiguredCheckLoadError};
+        let child_manifest = manifest("dep", "src", "own", "src/own.w", "checked", "wasm-wasip1");
+        let explicit = "root = \"src/own.w\"";
+        let selectors = format!("{explicit}\ndefault_profile = \"checked\"");
+        let child_manifest = child_manifest.replace(explicit, &selectors);
+        fs::write(dep.join("wosy.toml"), &child_manifest).unwrap();
+        fs::write(dep.join("src/own.w"), r#"%%start
+    i16(i16, i16) choose = fn(left, right) { if (right < 0) { left } else { right } };
+    proof identity for choose(entry, selector) -> (out)
+        where (entry >= -5) ensures (out == core.old(entry)) {}
+    i16 answer = choose(4, 8);
+    core.require(false, { .stdout = "child startup"; .stderr = ""; .code = 11;
+        .files = [{ .path = "child.txt"; .text = "not yet published"; }]; });
+%%end"#).unwrap();
+        fs::write(dep.join("src/fallback.w"), r#"%%start
+    u8(u8) fallback = fn(value) { value };
+    proof every_return for fallback(entry) -> (out) ensures (out != 7) {}
+%%end"#).unwrap();
+
+        let (_, _, primary) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", None, None).unwrap();
+        assert_eq!(primary.layout.pointer_size, 4);
+        let checked = check_direct_dependency_primary(root, "dep").ok().expect("direct child input");
+        let publication = checked.plan_publication().ok().expect("closed child proof scope");
+        assert_eq!(checked.root, dep);
+        assert_eq!(publication.report.diagnostics.len(), 1);
+        assert_eq!(publication.report.diagnostics[0].invocation.call.source.path, "src/own.w");
+        assert_eq!(publication.report.symbolic_diagnostic.as_ref().unwrap().proof.source.path, "src/fallback.w");
+        assert_eq!(publication.report.directives.len(), 1);
+        assert_eq!(publication.report.directives[0].stdout(), b"child startup");
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+
+        let unsupported = fs::read_to_string(dep.join("src/own.w")).unwrap().replace("core.old(entry)", "core.old(unknown)");
+        fs::write(dep.join("src/own.w"), unsupported).unwrap();
+        let incomplete = check_direct_dependency_primary(root, "dep").ok().expect("incomplete child proof");
+        assert!(matches!(incomplete.plan_publication(), Err(CheckPublicationError::Incomplete(_))));
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+        fs::write(dep.join("wosy.toml"), child_manifest.replace(&selectors, explicit)).unwrap();
+        assert!(matches!(check_direct_dependency_primary(root, "dep"), Err(ConfiguredCheckLoadError::Dependency(message))
+            if message.contains("target own has no declared default_profile")));
+        assert!(ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("checked")).is_ok());
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_checker_selects_exact_typed_status_and_keeps_every_report() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        for (second, third) in [
+            ("23", "9"),
+            ("0", "0"),
+            ("340282366920938463463374607431768211456", "9"),
+        ] {
+            let main = r#"%%start
+                core.require(false, { .stdout = "primeiro"; .stderr = ""; .code = 0;
+                    .files = [{ .path = "report.txt"; .text = "α"; }]; });
+                lib = namespace app "lib.w";
+            %%end"#;
+            let library = format!(r#"%%start
+                core.require(false, {{ .stdout = ""; .stderr = "second☕"; .code = {second}; .files = []; }});
+            %%end"#);
+            let dormant = format!(r#"%%start
+                core.require(false, {{ .stdout = "must not initialize"; .stderr = ""; .code = 7; .files = []; }});
+                unit(u8) unused = fn(value) {{
+                    core.require(value < 3, {{ .stdout = "third"; .stderr = ""; .code = {third}; .files = []; }});
+                }};
+            %%end"#);
+            let (project, configuration) = routing_test_project("ordered-internal-checker-receipt", &[
+                ("main.w", main), ("lib.w", &library), ("extra.w", "invalid on-disk source"),
+            ]);
+            let observed = |scope| routing_observations::observe(|| check_loaded_ordered_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, scope,
+                vec![received_source(&project.root, "extra.w", &dormant)],
+            ));
+            let (receipt, counts) = observed(ScalarCheckerScope::CurrentPackage);
+            let receipt = receipt.expect("ordered canonical receipt");
+            let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected authored reports"); };
+            let [first, next, last] = reports.as_slice() else { panic!("expected all three reports"); };
+            assert_eq!(reports.iter().map(|report| report.code().to_string()).collect::<Vec<_>>(), ["0", second, third]);
+            assert_eq!((first.source.path.as_str(), next.source.path.as_str(), last.source.path.as_str()),
+                ("main.w", "lib.w", "extra.w"));
+            assert_eq!(first.stdout(), b"primeiro");
+            assert_eq!(next.stderr(), "second☕".as_bytes());
+            assert_eq!(last.stdout(), b"third");
+            assert_eq!(&*first.files()[0].text, "α".as_bytes());
+            if second == "0" {
+                assert_eq!(receipt.selected_status(), Some(InternalCheckStatus::Zero));
+            } else {
+                let Some(InternalCheckStatus::FirstNonzero(selected)) = receipt.selected_status() else {
+                    panic!("expected exact first nonzero candidate");
+                };
+                assert!(std::ptr::eq(selected, next));
+                assert_eq!(selected.code().to_string(), second);
+            }
+            assert_eq!(receipt.texts.len(), 3);
+            assert!(receipt.texts.values().any(|text| text == &dormant));
+            assert_eq!(counts, routing_observations::Counts { extractions: 3, checks: 1, ..Default::default() });
+
+            let (main_only, counts) = observed(ScalarCheckerScope::MainFlowOnly);
+            let main_only = main_only.expect("without dormant selection");
+            assert!(matches!(&main_only.outcome, ScalarOrderedCheckerOutcome::Failed(reports) if reports.len() == 2));
+            assert_eq!(main_only.texts.len(), 2);
+            assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+            assert!(!project.root.join(".wosy").exists());
+            assert!(!project.root.join("report.txt").exists());
+        }
+        let default = Arguments::try_parse_from(["wosy", "check"]).unwrap();
+        assert!(matches!(default.command, Command::Check {
+            target: None, main_flow_only: false, declared_package: false, ..
+        }));
+        assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only", "--declared-package"]).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_checker_does_not_map_incomplete_analysis_to_zero() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let text = r#"%%start
+            unit() leaf = fn { leaf(); };
+            unit() parent = fn { leaf(); };
+            core.require(false, { .stdout = "not published"; .stderr = ""; .code = 0; .files = []; });
+            parent();
+        %%end"#;
+        let (project, configuration) = routing_test_project("ordered-internal-unsupported", &[("main.w", text)]);
+        let (receipt, counts) = routing_observations::observe(|| check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ));
+        let receipt = receipt.expect("well-formed canonical source");
+        assert_eq!(receipt.outcome, ScalarOrderedCheckerOutcome::Unsupported);
+        assert_eq!(receipt.selected_status(), None);
+        assert_eq!(receipt.texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_uses_canonical_graph_once_and_never_publishes() {
+        use wosy_compiler::{ScalarCheckerOperation, ScalarCheckerOutcome};
+        let sources = [
+            ("main.w", "%%start\nlib = namespace app \"lib.w\"; lib.require_small(8);\n%%end"),
+            ("lib.w", r#"%%start
+                unit(u8) require_small = fn(value) {
+                    core.require(value <= 7, { .stdout = "out"; .stderr = "bad"; .code = 17; .files = []; });
+                };
+            %%end"#),
+        ];
+        let (project, configuration) = routing_test_project("internal-checked-graph", &sources);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                wosy_compiler::ScalarCheckerScope::default(), Vec::new(),
+            )
+        });
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical checker input");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored dependency failure"); };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+        assert_eq!(failure.source.path, "lib.w");
+        assert_eq!(failure.source.revision, blake3::hash(sources[1].1.as_bytes()).to_string());
+        assert_eq!(&*failure.stdout, b"out");
+        assert_eq!(&*failure.stderr, b"bad");
+        assert_eq!(failure.code, 17.into());
+        let (binding, ty) = failure.witness.axes().next().expect("canonical call input with inclusive singleton");
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert_eq!(binding.source, failure.source);
+        let at = |span: wosy_syntax::ByteSpan| &sources[1].1[span.start as usize..span.end as usize];
+        assert_eq!(at(binding.declaration_span), "value");
+        assert_eq!(at(failure.condition), "value <= 7");
+        assert_eq!(ty, &wosy_compiler::ScalarType::U8);
+        assert_eq!(failure.witness.row_count(), 1);
+        let mut singleton = failure.witness.intervals_at(0, 0).expect("existing axis and row");
+        assert_eq!(singleton.next(), Some((&8.into(), &8.into())));
+        assert_eq!(singleton.next(), None);
+        assert!(failure.witness.intervals_at(1, 0).is_none());
+        assert!(failure.witness.intervals_at(0, 1).is_none());
+        assert_eq!(texts.len(), 2);
+        assert!(texts.values().any(|text| text == sources[1].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_retains_exact_signed_intervals_without_writing() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope, ScalarType};
+        let (project, configuration) = routing_test_project("internal-signed-receipt", &[(
+            "main.w", r#"%%start
+                unit(i128) unused = fn(value) {
+                    core.require(value == 0, { .stdout = "saída"; .stderr = "☕"; .code = 340282366920938463463374607431768211456; .files = [{ .path = "report.txt"; .text = "α"; }]; });
+                };
+            %%end"#,
+        )]);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        });
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical symbolic receipt");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored symbolic failure"); };
+        let mut axes = failure.witness.axes();
+        let (binding, ty) = axes.next().expect("canonical symbolic input");
+        assert_eq!(binding.source, failure.source);
+        assert_eq!(ty, &ScalarType::I128);
+        assert_eq!(axes.next(), None);
+        assert_eq!(failure.witness.row_count(), 1);
+        let mut intervals = failure.witness.intervals_at(0, 0).expect("exact failing intervals");
+        assert_eq!(intervals.next(), Some((&i128::MIN.into(), &(-1).into())));
+        assert_eq!(intervals.next(), Some((&1.into(), &i128::MAX.into())));
+        assert_eq!(intervals.next(), None);
+        assert_eq!(failure.stdout.as_ref(), "saída".as_bytes());
+        assert_eq!(failure.stderr.as_ref(), "☕".as_bytes());
+        assert_eq!(failure.code.to_string(), "340282366920938463463374607431768211456");
+        assert_eq!(failure.files.len(), 1);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join("report.txt").exists());
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_preserves_load_errors_without_build_receipts() {
+        let samples = [
+            ("checker-parse-rejection", "%%start\n???\n%%end"),
+            ("checker-graph-rejection", "%%start\nmissing = namespace app \"missing.w\";\n%%end"),
+        ];
+        for (name, text) in samples {
+            let (project, configuration) = routing_test_project(name, &[("main.w", text)]);
+            let (result, counts) = routing_observations::observe(|| {
+                check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                wosy_compiler::ScalarCheckerScope::default(), Vec::new(),
+            )
+            });
+            if name == "checker-parse-rejection" {
+                let Err(CanonicalLoadFailure::Syntax { source, diagnostics, .. }) = result else { panic!("expected typed syntax error"); };
+                assert_eq!(source.path, "main.w");
+                assert_eq!(diagnostics[0].code, "S0001");
+                assert_eq!(counts.extractions, 0);
+            } else {
+                let Err(CanonicalLoadFailure::Graph { error, texts }) = result else { panic!("expected typed graph error"); };
+                assert_eq!(error.diagnostics.len(), 1);
+                assert_eq!(format_graph_error(error), "M0001: missing module app::missing.w");
+                assert_eq!(texts.len(), 1);
+                assert_eq!(counts.extractions, 1);
+            }
+            assert_eq!(counts.checks, 0);
+            assert_eq!(counts.builds, 0);
+            assert!(!project.root.join(".wosy").exists());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_and_opt_in_cli_preserve_main_flow_scope() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope};
+        let (project, configuration) = routing_test_project("internal-main-flow", &[(
+            "main.w", r#"%%start
+                unit() unused = fn {
+                    core.require(false, { .stdout = ""; .stderr = "unused"; .code = 4; .files = []; });
+                };
+                unit() main_flow = fn {};
+                main_flow();
+            %%end"#,
+        )]);
+        let observed = |scope| {
+            let (result, counts) = routing_observations::observe(|| {
+                check_loaded_project(
+                    &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, scope, Vec::new(),
+                )
+            });
+            assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+            result.expect("valid source").outcome
+        };
+        assert!(matches!(observed(ScalarCheckerScope::default()), ScalarCheckerOutcome::Failed(_)));
+        assert_eq!(observed(ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
+        assert!(!project.root.join(".wosy").exists());
+        let selected = Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).unwrap();
+        assert!(matches!(selected.command, Command::Check {
+            target: Some(target), profile, main_flow_only: true, declared_package: false,
+        } if target == "app" && profile == "dev"));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_declared_package_scope_uses_exact_membership_without_dormant_initializers() {
+        use configured_check::{check_declared_package_target, ConfiguredCheckLoadError};
+        let root = snapshot_test_path("declared-scope").with_extension("");
+        let manifest = r#"
+[package]
+name = "app"
+default_target = "app"
+source_root = "src"
+
+[comments]
+categories = []
+[builders]
+[runners]
+
+[targets.app]
+root = "src/main.w"
+[targets.app.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "never"
+run_runner = "never"
+[targets.app.profiles.dev]
+main_artifact = "main"
+"#;
+        let main = r#"%%start
+            imported = namespace app "live.w";
+            u8 actual = imported.run(7);
+        %%end"#;
+        let dormant = r#"%%start
+            core.require(false, { .stdout = "forbidden initializer"; .stderr = ""; .code = 19; .files = []; });
+            u8(u8) dormant = fn(value) { value };
+            proof checks for dormant(entry) -> (out) ensures (out != 7) {}
+        %%end"#;
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        for (path, content) in [
+            ("wosy.toml", manifest), ("src/main.w", main),
+            ("src/live.w", "%%start u8(u8) run = fn(value) { value }; %%end"),
+            ("src/features/dormant.w", dormant),
+            ("stray.w", "intentionally invalid outside the declared tree"),
+            ("src/other_package/wosy.toml", r#"[package]
+name = "other"
+source_root = "src"
+"#),
+            ("src/other_package/src/broken.w", "intentionally invalid in the nested package"),
+            ("src/.wosy/broken.w", "intentionally invalid in generated state"),
+        ] {
+            write(path, content);
+        }
+        let checked = check_declared_package_target(&root, None, "dev")
+            .unwrap_or_else(|_| panic!("configured tree should close"));
+        let report = checked.outcome.unwrap();
+        assert!(report.active && report.directives.is_empty() && report.diagnostics.is_empty());
+        let failure = report.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.proof.source.path, "src/features/dormant.w");
+        assert_eq!(failure.returned.to_string(), "7");
+        assert!(report.additional_symbolic_diagnostics.is_empty());
+        assert_eq!(checked.texts.len(), 3);
+        assert!(!root.join(".wosy").exists());
+
+        write("wosy.toml", &manifest.replace("source_root = \"src\"\n", ""));
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::PackageSourceRoot(_))));
+        write("wosy.toml", manifest);
+        write("src/main.w", &main.replace("live.w", "other_package/src/broken.w"));
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Canonical(CanonicalLoadFailure::Input(message)))
+                if message.contains("outside the declared package source tree")));
+        write("src/main.w", main);
+        let nested = "src/other_package/wosy.toml";
+        write(nested, "[package]\nname =");
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                if message.contains("invalid nested package identity")));
+        fs::remove_file(root.join(nested)).unwrap();
+        fs::create_dir(root.join(nested)).unwrap();
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                if message.contains("nested package manifest is not a non-aliased regular file")));
+        fs::remove_dir(root.join(nested)).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("wosy.toml"), root.join(nested)).unwrap();
+            assert!(matches!(check_declared_package_target(&root, None, "dev"),
+                Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                    if message.contains("nested package manifest is not a non-aliased regular file")));
+            fs::remove_file(root.join(nested)).unwrap();
+        }
+        write(nested, "[package]\nname = \"other\"\nsource_root = \"src\"\n");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("stray.w"), root.join("src/alias.w")).unwrap();
+            assert!(matches!(check_declared_package_target(&root, None, "dev"),
+                Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                    if message.contains("package source path is aliased")));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(feature = "internal-checker"))]
+    #[test]
+    fn build_only_cli_does_not_offer_the_checker() {
+        assert!(Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn received_source(root: &std::path::Path, path: &str, text: &str) -> DormantSourceInput {
+        DormantSourceInput {
+            identity: ProjectSourceIdentity::new(
+                root.to_string_lossy().into_owned(), "app".into(),
+                PackageRelativePath::new(path.into()).expect("relative fixture"),
+            ),
+            text: text.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_prepares_explicit_dormant_receipts_once_without_reading_files() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope};
+        let extra = r#"%%start
+            core.require(false, { .stdout = "initializer must not run"; .stderr = ""; .code = 5; .files = []; });
+            unit(u8) dormant_check = fn(value) {
+                core.require(value < 3, { .stdout = "dormant witness"; .stderr = ""; .code = 7; .files = []; });
+            };
+        %%end"#;
+        let (project, configuration) = routing_test_project("internal-dormant-graph", &[
+            ("main.w", "%%start\nunit() main_flow = fn {}; main_flow();\n%%end"),
+            ("extra.w", "invalid on-disk source, unused"),
+            ("not-selected.w", "not valid source"),
+        ]);
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::CurrentPackage, vec![received_source(&project.root, "extra.w", extra)],
+        ));
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical dormant receipt");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected unused function obligation"); };
+        assert_eq!(failure.source.package, project.package);
+        assert_eq!(failure.source.project, project.root.to_string_lossy());
+        assert_eq!(failure.source.path, "extra.w");
+        assert_eq!(failure.source.revision, blake3::hash(extra.as_bytes()).to_string());
+        assert_eq!(failure.stdout.as_ref(), b"dormant witness");
+        assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&3.into(), &255.into())));
+        assert_eq!(texts.len(), 2);
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, vec![received_source(&project.root, "missing.w", "invalid syntax")],
+        ));
+        let InternalCheckReceipt { outcome, texts } = result.expect("no dormant parsing for this scope");
+        assert_eq!(outcome, ScalarCheckerOutcome::NoChecks);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_rejects_dormant_identity_aliases_before_parsing_any_receipt() {
+        use wosy_compiler::ScalarCheckerScope;
+        let main = "%%start\nunit() main_flow = fn {};\n%%end";
+        let (project, mut configuration) = routing_test_project("internal-dormant-aliases", &[("main.w", main)]);
+        let dependency = project.root.join("vendor");
+        configuration.resolved_packages.insert("vendor".into(), wosy_project::ResolvedPackage {
+            name: "vendor".into(),
+            project_root: dependency.clone(),
+            source_root: dependency.clone(),
+            identity: ProjectSourceIdentity::new(dependency.to_string_lossy().into_owned(), "vendor".into(), PackageRelativePath::new("src".into()).unwrap()),
+            git_checkout: None,
+            git_pin_identity: None,
+            patch_stack_id: None,
+            local_root_identity: Some(dependency),
+            dependencies: Vec::new(),
+        });
+        for invalid in ["main.w", "./main.w", "duplicate.w", "deps/other.w", "vendor/other.w"] {
+            let (result, counts) = routing_observations::observe(|| check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                ScalarCheckerScope::CurrentPackage,
+                vec![received_source(&project.root, "duplicate.w", "invalid syntax"), received_source(&project.root, invalid, "invalid syntax")],
+            ));
+            assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))), "{invalid}: {result:?}");
+            assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        }
+        let mut excluded = received_source(&project.root, "foreign.w", "invalid syntax");
+        excluded.identity.package = "foreign".into();
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            ScalarCheckerScope::CurrentPackage, vec![excluded],
+        ));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))));
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
     }
 
     fn assert_wasm_root_forwarder(llvm: &str, label: &str, result: &str, types: &[&str]) {
@@ -1180,14 +2747,13 @@ mod tests {
         ];
         let (project, configuration) = routing_test_project("explicit-wasm-root-exports", &sources);
         let compile = |exports| {
-            compile_project(
+            compile_project_text(
                 &project.root,
                 &project,
                 &configuration,
                 ScalarTargetLayout::WASM32,
                 exports,
             )
-            .map(|(llvm, sources)| (llvm.to_text(), sources))
         };
         let exports = BTreeMap::from([
             ("demo_score".into(), "score".into()),
@@ -1214,14 +2780,13 @@ mod tests {
         )];
         let (project, configuration) = routing_test_project("singleton-root-export", &sources);
         let compile = |exports| {
-            compile_project(
+            compile_project_text(
                 &project.root,
                 &project,
                 &configuration,
                 ScalarTargetLayout::WASM32,
                 exports,
             )
-            .map(|(llvm, sources)| (llvm.to_text(), sources))
         };
         let same = BTreeMap::from([("score".into(), "score".into())]);
         let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");
@@ -1262,6 +2827,7 @@ mod tests {
                     extractions: sources.len(),
                     preparations: 1,
                     builds: 1,
+                    checks: 0,
                     single_module_emissions,
                     project_emissions,
                 },

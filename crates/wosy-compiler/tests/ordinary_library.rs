@@ -897,3 +897,51 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         }
     }
 }
+
+#[test]
+fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_same_llvm() {
+    use wosy_compiler::emit_scalar_build_single_module_llvm_text;
+    let source = SourceIdentity::new("local".into(), "app".into(), "main.w".into(), "pinned-source".into());
+    let compile = |proofs: &str, target_layout| {
+        let text = format!("%%start\nu8(u8) identity = fn(value) {{ value }};\n{proofs}\n%%end");
+        let parsed = parse_source(source.clone(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics().is_empty(), "{:?}", declarations.diagnostics());
+        let prepared = prepare_scalar_project(
+            vec![(declarations, Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).expect("ordinary source preparation");
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        emit_scalar_build_single_module_llvm_text(&validated).expect("real LLVM emission")
+    };
+    let proofs = r#"
+        proof false_claim for identity(v) -> (out) ensures (out <= 10) {}
+        proof ghost_quantifier for identity(v) -> (out) forall (u8 i where i < 4) ensures (out <= i) {}
+        proof ghost_witness for identity(v) -> (out) ensures (exists (u8 i where i < 4) { out == i }) { core.witness(255); }
+        proof bad_where for identity(v) -> (out) where (unknown <= 10) ensures (out <= 1) {}
+        proof unknown_target for missing(v) -> (out) ensures (out <= 255) {}
+        proof unchecked_measure for identity(v) -> (out) ensures (out <= 255) decreases (unknown, v) {
+            core.use(unchecked_measure(v - 1));
+        }
+        proof bad_literal for identity(v) -> (out) ensures (out <= 255) {
+            core.show(out == 1__0);
+        }
+    "#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        assert_eq!(compile(proofs, target_layout), compile("", target_layout));
+    }
+    let bad_runtime = parse_source(
+        source.clone(),
+        format!("%%start\nu8() value = fn {{ 1__0 }};\n{proofs}\n%%end"),
+        &[],
+    );
+    assert!(bad_runtime.diagnostics.is_empty());
+    let diagnostics = wosy_compiler::derive_scalar_diagnostics_from_cst(bad_runtime.result.canonical_cst());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, "B0010");
+    let malformed = parse_source(source, "%%start\nproof bad for identity(v) -> (out) ensures (out == 7) {\n%%end".into(), &[]);
+    assert!(!malformed.diagnostics.is_empty());
+}

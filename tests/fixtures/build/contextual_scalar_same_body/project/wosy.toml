@@ -1,0 +1,48 @@
+[package]
+name = "contextual_scalar_same_body"
+default_target = "app"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[builders.wasi]
+command = ["python", "scripts/build-wasi"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[runners.wasi]
+command = ["python", "scripts/run-wasi"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.native]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.app.artifacts.main.profiles.wasi]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasi"
+run_runner = "wasi"
+
+[targets.app.profiles.native]
+main_artifact = "main"
+
+[targets.app.profiles.wasi]
+main_artifact = "main"

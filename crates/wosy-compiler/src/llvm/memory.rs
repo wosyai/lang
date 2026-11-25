@@ -325,6 +325,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<PointerValue<'ctx>, String> {
     match place {
+        crate::ScalarPlace::Contextual { binding, .. } => state.contextual_storage.get(binding).map(|(pointer, _)| *pointer).ok_or_else(|| "missing prepared LLVM contextual storage".to_owned()),
         crate::ScalarPlace::Name { name, .. } => {
             if let Some((slot, ty)) = state.storage.get(name).cloned() {
                 if matches!(ty, ScalarType::RuntimeArray { .. }) {
@@ -566,6 +567,7 @@ pub(super) fn emit_place_value_in_project<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let pointer = place_pointer(context, state, place, project)?;
     let ty = match place {
+        crate::ScalarPlace::Contextual { ty, .. } => ty.clone(),
         crate::ScalarPlace::Field { field, .. } => {
             let ScalarFieldReference::Resolved(field) = field else {
                 return Err("unresolved LLVM struct field".to_owned());
@@ -915,7 +917,17 @@ pub(super) fn build_aggregate<'ctx, 'module>(
     outputs: &crate::ScalarOutputSequence,
     values: Vec<EmitValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let ty = aggregate_type(context, outputs, state.target_layout)?;
+    build_aggregate_at(context, state.builder, state.target_layout, outputs, values)
+}
+
+pub(super) fn build_aggregate_at<'ctx>(
+    context: &'ctx Context,
+    builder: &inkwell::builder::Builder<'ctx>,
+    target: ScalarTargetLayout,
+    outputs: &crate::ScalarOutputSequence,
+    values: Vec<EmitValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    let ty = aggregate_type(context, outputs, target)?;
     let mut aggregate = ty.const_zero();
     for (index, (output, value)) in outputs.outputs.iter().zip(values).enumerate() {
         let value = if output.ty == ScalarType::Unit {
@@ -923,8 +935,7 @@ pub(super) fn build_aggregate<'ctx, 'module>(
         } else {
             take_basic(value)?
         };
-        aggregate = state
-            .builder
+        aggregate = builder
             .build_insert_value(aggregate, value, index as u32, "output")
             .map_err(builder_error)?
             .into_struct_value();

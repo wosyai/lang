@@ -91,10 +91,26 @@ pub enum SyntaxKind {
     AllocationBinding,
     ParenthesizedDereferencePlace,
     CopyModifier,
-    IndexFieldSuffix,
-    DirectFieldChainTail,
-    ValueField,
-    InvalidTemporaryPlace,
+    ProofDecl = 81,
+    ProofTarget = 82,
+    ProofOutputs = 83,
+    ProofWhere = 84,
+    ProofEnsures = 85,
+    ProofDecreases = 86,
+    ProofForall = 87,
+    ProofQuantifierGuard = 88,
+    ProofExists = 89,
+    IndexFieldSuffix = 90,
+    DirectFieldChainTail = 91,
+    ContextualPlace = 92,
+    ValueField = 93,
+    InvalidTemporaryPlace = 94,
+    ProofMatchBlock = 95,
+    ProofMatch = 96,
+    ProofMatchArm = 97,
+    EnumVariantPayload = 98,
+    RuntimeMatchBody = 99,
+    RuntimeMatchExpr = 100,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -185,10 +201,26 @@ impl Language for WosyLanguage {
             78 => SyntaxKind::AllocationBinding,
             79 => SyntaxKind::ParenthesizedDereferencePlace,
             80 => SyntaxKind::CopyModifier,
-            81 => SyntaxKind::IndexFieldSuffix,
-            82 => SyntaxKind::DirectFieldChainTail,
-            83 => SyntaxKind::ValueField,
-            84 => SyntaxKind::InvalidTemporaryPlace,
+            81 => SyntaxKind::ProofDecl,
+            82 => SyntaxKind::ProofTarget,
+            83 => SyntaxKind::ProofOutputs,
+            84 => SyntaxKind::ProofWhere,
+            85 => SyntaxKind::ProofEnsures,
+            86 => SyntaxKind::ProofDecreases,
+            87 => SyntaxKind::ProofForall,
+            88 => SyntaxKind::ProofQuantifierGuard,
+            89 => SyntaxKind::ProofExists,
+            90 => SyntaxKind::IndexFieldSuffix,
+            91 => SyntaxKind::DirectFieldChainTail,
+            92 => SyntaxKind::ContextualPlace,
+            93 => SyntaxKind::ValueField,
+            94 => SyntaxKind::InvalidTemporaryPlace,
+            95 => SyntaxKind::ProofMatchBlock,
+            96 => SyntaxKind::ProofMatch,
+            97 => SyntaxKind::ProofMatchArm,
+            98 => SyntaxKind::EnumVariantPayload,
+            99 => SyntaxKind::RuntimeMatchBody,
+            100 => SyntaxKind::RuntimeMatchExpr,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -481,22 +513,76 @@ pub fn parse_with_snapshot(
 }
 
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
+    parse_entry(source, text, configured_comments, Rule::source)
+}
+
+#[cfg(any(test, feature = "checker-test-support"))]
+#[doc(hidden)]
+pub struct ProofFragmentParse(ParseResult);
+
+#[cfg(any(test, feature = "checker-test-support"))]
+impl ProofFragmentParse {
+    pub fn as_result(&self) -> &ParseResult {
+        &self.0
+    }
+}
+
+#[cfg(any(test, feature = "checker-test-support"))]
+#[doc(hidden)]
+pub fn parse_proof_fragment(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> ProofFragmentParse {
+    ProofFragmentParse(parse_entry(source, text, configured_comments, Rule::proof_fragment))
+}
+
+#[cfg(any(test, feature = "checker-test-support", feature = "internal-checker"))]
+#[doc(hidden)]
+pub fn parse_proof_module(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> ParseResult {
+    parse(source, text, configured_comments)
+}
+
+fn parse_entry(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+    rule: Rule,
+) -> ParseResult {
     let mut errors = Vec::new();
     let comments = scan_comments(&text, configured_comments, &mut errors);
     let mut builder = GreenNodeBuilder::new();
     builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Root));
-    let parsed = WosyParser::parse(Rule::source, &text);
-    if let Ok(mut pairs) = parsed {
-        let pair = pairs.next().expect("source pair");
-        build_pair(&mut builder, pair, &text, &comments, &mut errors);
-    } else {
-        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
-        add_gap(&mut builder, &text, 0, &comments);
-        builder.finish_node();
-        errors.push(SyntaxError {
-            span: ByteSpan::new(0, text.len() as u32),
-            message: "source does not match the base grammar".to_owned(),
-        });
+    match WosyParser::parse(rule, &text) {
+        Ok(mut pairs) => {
+            let pair = pairs.next().expect("grammar entry pair");
+            build_pair(&mut builder, pair, &text, &comments, &mut errors);
+        }
+        Err(_error) => {
+            builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
+            add_gap(&mut builder, &text, 0, &comments);
+            builder.finish_node();
+            let span = ByteSpan::new(0, text.len() as u32);
+            #[cfg(any(test, feature = "checker-test-support"))]
+            let span = if matches!(rule, Rule::proof_fragment) {
+                match _error.location {
+                    pest::error::InputLocation::Pos(at) => ByteSpan::new(at as u32, at as u32),
+                    pest::error::InputLocation::Span((start, end)) => {
+                        ByteSpan::new(start as u32, end as u32)
+                    }
+                }
+            } else {
+                span
+            };
+            errors.push(SyntaxError {
+                span,
+                message: "source does not match the base grammar".to_owned(),
+            });
+        }
     }
     builder.finish_node();
     let root = CstNode::new_root(builder.finish());
@@ -603,6 +689,12 @@ fn build_pair(
             SyntaxKind::IfExpr
         } else {
             SyntaxKind::UnitIfExpr
+        }
+    } else if pair.as_rule() == Rule::function_block {
+        if pair.clone().into_inner().any(|child| child.as_rule() == Rule::proof_match) {
+            SyntaxKind::RuntimeMatchBody
+        } else {
+            SyntaxKind::Block
         }
     } else {
         kind(pair.as_rule())
@@ -859,6 +951,23 @@ fn collect_comments(
 fn kind(rule: Rule) -> SyntaxKind {
     match rule {
         Rule::source => SyntaxKind::Root,
+        #[cfg(any(test, feature = "checker-test-support"))]
+        Rule::proof_fragment => SyntaxKind::Root,
+        Rule::proof_decl => SyntaxKind::ProofDecl,
+        Rule::proof_target => SyntaxKind::ProofTarget,
+        Rule::proof_outputs => SyntaxKind::ProofOutputs,
+        Rule::proof_where => SyntaxKind::ProofWhere,
+        Rule::proof_ensures => SyntaxKind::ProofEnsures,
+        Rule::proof_decreases => SyntaxKind::ProofDecreases,
+        Rule::proof_forall => SyntaxKind::ProofForall,
+        Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
+        Rule::proof_exists => SyntaxKind::ProofExists,
+        Rule::binding_output_list => SyntaxKind::OutputList,
+        Rule::runtime_match_input => SyntaxKind::Expression,
+        Rule::runtime_match_expr => SyntaxKind::RuntimeMatchExpr,
+        Rule::proof_match_block => SyntaxKind::ProofMatchBlock,
+        Rule::proof_match => SyntaxKind::ProofMatch,
+        Rule::proof_match_arm => SyntaxKind::ProofMatchArm,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,
         Rule::extern_decl => SyntaxKind::ExternDecl,
@@ -888,7 +997,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::unsafe_marker => SyntaxKind::Unsafe,
         Rule::identifier => SyntaxKind::Identifier,
         Rule::parameters => SyntaxKind::Parameters,
-        Rule::block => SyntaxKind::Block,
+        Rule::block | Rule::function_block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::unsafe_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
@@ -898,6 +1007,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
+        Rule::contextual_place => SyntaxKind::ContextualPlace,
         Rule::assignment_target | Rule::non_indexed_assignment_target => SyntaxKind::AssignmentTarget,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::assignment => SyntaxKind::Assignment,
@@ -906,6 +1016,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::enum_decl => SyntaxKind::EnumDecl,
         Rule::copy_modifier => SyntaxKind::CopyModifier,
         Rule::enum_variant => SyntaxKind::EnumVariant,
+        Rule::enum_variant_payload => SyntaxKind::EnumVariantPayload,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
         Rule::receiver_list => SyntaxKind::ReceiverList,
@@ -2823,5 +2934,216 @@ mod tests {
         assert_eq!(literals[1].0, "2E+3");
         assert_eq!(literals[0].1, ByteSpan::new(16, 28));
         assert_eq!(literals[1].1, ByteSpan::new(38, 42));
+    }
+}
+
+#[cfg(test)]
+mod proof_fragment_tests {
+    use super::*;
+
+    fn source() -> SourceIdentity {
+        SourceIdentity::new("local".into(), "demo".into(), "proof.w".into(), "test".into())
+    }
+
+    fn proof(result: &ParseResult) -> CstNode {
+        assert!(result.is_valid(), "{:?}", result.errors);
+        result
+            .canonical_cst()
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::ProofDecl)
+            .expect("canonical proof declaration")
+    }
+
+    #[test]
+    fn wrapping_addition_remains_one_canonical_additive_token_in_a_pointer_proof() {
+        let text = "proof increment_effect for increment(p) -> () ensures (*p == core.old(*p) +@ 1) {}";
+        let parsed = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let result = parsed.as_result();
+        let declaration = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        let operators: Vec<_> = declaration.descendants_with_tokens().filter_map(|item| item.into_token())
+            .filter(|token| token.kind() == SyntaxKind::Operator)
+            .map(|token| token.text().to_owned()).collect();
+        assert!(operators.iter().any(|op| op == "+@"), "{operators:?}");
+        for invalid in [text.replace("+@", "+ @"), text.replace("+@", "+@=")] {
+            assert!(!parse_proof_fragment(source(), invalid, &[]).as_result().is_valid());
+        }
+    }
+
+    #[test]
+    fn proof_fragment_reuses_canonical_binders_expressions_and_block() {
+        let text = r#"proof bounded for clamp_bounded(x) -> (out)
+    where (x <= 10)
+    ensures (out <= 10) {
+    core.show(out == x);
+}"#;
+        let result = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let result = result.as_result();
+        let proof = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        assert!(proof.children_with_tokens().any(|element| {
+            element.into_token().is_some_and(|token| {
+                token.kind() == SyntaxKind::Identifier && token.text() == "bounded"
+            })
+        }));
+        let children = proof.children().collect::<Vec<_>>();
+        let [target, outputs, entry, goal, body] = children.as_slice() else {
+            panic!("expected five structural children");
+        };
+        assert_eq!(target.kind(), SyntaxKind::ProofTarget);
+        assert_eq!(outputs.kind(), SyntaxKind::ProofOutputs);
+        assert_eq!(entry.kind(), SyntaxKind::ProofWhere);
+        assert_eq!(goal.kind(), SyntaxKind::ProofEnsures);
+        assert_eq!(body.kind(), SyntaxKind::Block);
+        assert!(target.children().any(|node| node.kind() == SyntaxKind::Parameters && node.text() == "(x)"));
+        assert!(outputs.children().any(|node| node.kind() == SyntaxKind::Parameters && node.text() == "(out)"));
+        assert!(entry.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "x <= 10"));
+        assert!(goal.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "out <= 10"));
+        assert!(body.descendants().any(|node| node.kind() == SyntaxKind::Call && node.text() == "core.show(out == x)"));
+    }
+
+    #[test]
+    fn named_function_uses_one_ordinary_binding_prefix_before_choosing_its_tail() {
+        let ordinary = "%%start u8(u8) f = fn(x) { u8 local = if (x == 0) { 1 } else { x }; local }; %%end";
+        let lexical = "%%start u8(u8) f = fn(x) { Region local = if (x == 0) { Region.a(1) } else { Region.b(x) }; match (local) { a(a_value) { a_value } b(b_value) { b_value } } }; %%end";
+        for (text, tail, kind) in [
+            (ordinary, Rule::final_output_list, SyntaxKind::Block),
+            (lexical, Rule::proof_match, SyntaxKind::RuntimeMatchBody),
+        ] {
+            let body = WosyParser::parse(Rule::source, text).unwrap().flatten()
+                .find(|pair| pair.as_rule() == Rule::function_block).unwrap();
+            let parts = body.into_inner().collect::<Vec<_>>();
+            assert_eq!(parts.iter().map(|pair| pair.as_rule()).collect::<Vec<_>>(),
+                [Rule::block_item, tail]);
+            assert_eq!(parts[0].clone().into_inner().filter(|pair| pair.as_rule() == Rule::local_binding).count(), 1);
+            let parsed = parse(source(), text.to_owned(), &[]);
+            assert!(parsed.is_valid(), "{:?}", parsed.errors);
+            let named = parsed.root.descendants().find(|node| node.kind() == SyntaxKind::FunctionDecl).unwrap();
+            assert!(named.children().any(|node| node.kind() == kind));
+            assert_eq!(parsed.reconstruct(), text);
+        }
+        // Grammar topology (not timing): there is no special alternative
+        // that can retry the typed binding before selecting the body rule.
+        let grammar = include_str!("grammar.pest");
+        let callable = grammar.lines().find(|line| line.starts_with("function_decl =")).unwrap();
+        let body = grammar.lines().find(|line| line.starts_with("function_block =")).unwrap();
+        assert!(callable.contains("parameters? ~ function_block ~"));
+        assert_eq!(body.matches("block_prefix").count(), 1);
+        assert!(body.contains("block_prefix ~ (proof_match | final_output_list)?"));
+    }
+
+    #[test]
+    fn proof_only_match_keeps_canonical_selector_and_arm_spans() {
+        let matching = "match (if (x == 0) { Region.left } else { Region.right }) { left { core.show(out == 0); } right {} }";
+        let text = format!("proof split for classify(x) -> (out) ensures (out <= 1) {{ {matching} }}");
+        let parsed = parse_proof_fragment(source(), text.clone(), &[]);
+        let result = parsed.as_result();
+        let declaration = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        let matching_node = declaration.descendants().find(|node| node.kind() == SyntaxKind::ProofMatch).unwrap();
+        let span = byte_span(&matching_node);
+        assert_eq!(&text[span.start as usize..span.end as usize], matching);
+        let arms = matching_node.children().filter(|node| node.kind() == SyntaxKind::ProofMatchArm).collect::<Vec<_>>();
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].text(), "left { core.show(out == 0); }");
+        assert_eq!(arms[1].text(), "right {}");
+        let runtime = format!("%%start u8(u8) classify = fn(x) {{ {matching} }}; %%end");
+        let ordinary = parse(source(), runtime, &[]);
+        assert!(ordinary.is_valid(), "{:?}", ordinary.errors);
+        assert!(ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::RuntimeMatchBody));
+        assert!(!ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::ProofMatchBlock));
+    }
+
+    #[test]
+    fn proof_fragment_retains_empty_body_without_where() {
+        let text = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
+        let fragment: ProofFragmentParse = parse_proof_fragment(source(), text.to_owned(), &[]);
+        let result = fragment.as_result();
+        let proof = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        assert!(!proof.children().any(|node| node.kind() == SyntaxKind::ProofWhere));
+        assert!(proof.children().any(|node| node.kind() == SyntaxKind::Block && node.text() == "{}"));
+    }
+
+    #[test]
+    fn proof_fragment_is_not_enabled_in_ordinary_source() {
+        let proof = "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}";
+        let result = parse(source(), proof.to_owned(), &[]);
+        assert!(!result.is_valid());
+        assert_eq!(result.reconstruct(), proof);
+        assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
+    }
+
+    #[test]
+    fn proof_module_keeps_proofs_as_module_siblings_with_exact_spans() {
+        let first = "proof bounded for identity(x) -> (out) where (x <= 10) ensures (out <= 10) {}";
+        let second = "proof limit for library.identity(v) -> (r) ensures (r <= 255) {}";
+        let text = format!("%%start\n{first}\nu8(u8) identity = fn(value) {{ value }};\n{second}\n%%end");
+        let identity = source();
+        let result: ParseResult = parse_proof_module(identity.clone(), text.clone(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.canonical_cst().source, identity);
+        let module = result.root.children().find(|node| node.kind() == SyntaxKind::Root).unwrap();
+        let declarations: Vec<_> = module.children()
+            .filter(|node| matches!(node.kind(), SyntaxKind::ProofDecl | SyntaxKind::Item))
+            .collect();
+        assert_eq!(declarations.len(), 3);
+        assert!(declarations[1].children().any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        for (node, original) in [(&declarations[0], first), (&declarations[2], second)] {
+            let start = text.find(original).unwrap() as u32;
+            assert_eq!(node.kind(), SyntaxKind::ProofDecl);
+            assert_eq!(byte_span(node), ByteSpan::new(start, start + original.len() as u32));
+            assert_eq!(node.text(), original);
+        }
+        let target = declarations[2].children().find(|node| node.kind() == SyntaxKind::ProofTarget).unwrap();
+        assert!(target.children().any(|node| node.kind() == SyntaxKind::QualifiedCall && node.text() == "library.identity"));
+        let ordinary = parse(identity, text, &[]);
+        assert!(ordinary.is_valid());
+        assert_eq!(ordinary.canonical_cst().snapshot(), result.canonical_cst().snapshot());
+    }
+
+    #[test]
+    fn proof_module_rejects_proofs_in_blocks_or_outside_source_boundaries() {
+        let declaration = "proof bounded for identity(x) -> (out) ensures (out <= 10) {}";
+        for text in [
+            declaration.to_owned(),
+            format!("%%start\nu8(u8) identity = fn(value) {{ {declaration} value }};\n%%end"),
+            format!("%%start\nu8(u8) identity = fn(value) {{ value }};\n%%end\n{declaration}"),
+        ] {
+            let result = parse_proof_module(source(), text.clone(), &[]);
+            assert!(!result.is_valid(), "{text}");
+            assert_eq!(result.reconstruct(), text);
+            assert!(!result.root.descendants().any(|node| node.kind() == SyntaxKind::ProofDecl));
+        }
+    }
+
+    #[test]
+    fn proof_fragment_rejects_partial_and_malformed_input() {
+        for text in [
+            "proofbounded for clamp_bounded(x) -> (out) ensures (out <= 10) {}",
+            "proof bounded forclamp_bounded(x) -> (out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (out) where () ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(u8 x) -> (out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (u8 out) ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> out ensures (out <= 10) {}",
+            "proof bounded for clamp_bounded(x) -> (out) {}",
+            "proof bounded for clamp_bounded(x) -> (out) ensures (out <= 10) {} trailing",
+        ] {
+            let fragment = parse_proof_fragment(source(), text.to_owned(), &[]);
+            let result = fragment.as_result();
+            assert!(!result.is_valid(), "{text}");
+            assert_eq!(result.reconstruct(), text);
+            let [error] = result.errors.as_slice() else {
+                panic!("expected one grammar error: {:?}", result.errors);
+            };
+            assert!(error.span.start <= error.span.end);
+            assert!(text.is_char_boundary(error.span.start as usize));
+            assert!(text.is_char_boundary(error.span.end as usize));
+            if let Some(start) = text.find("trailing") {
+                assert_eq!(error.span, ByteSpan::new(start as u32, start as u32));
+            }
+        }
     }
 }

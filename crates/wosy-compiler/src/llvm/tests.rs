@@ -758,6 +758,7 @@ fn emit_initializer_test_input(
             input,
             &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
+            None,
             super::PartitionMetadata::Full,
             &[],
         ),
@@ -1268,6 +1269,7 @@ i32 nested = unsafe { echo(33) };
                 input,
                 &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
+                None,
                 super::PartitionMetadata::Full,
                 &[],
             )
@@ -4360,6 +4362,124 @@ fn retains_core_runtime_declarations_when_serializing_wasm_externs() {
 }
 
 #[test]
+fn emits_internal_contextual_pointer_transport_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) identity = fn(value) { value };
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        unit() relay = fn { consume(); };
+        unit() entry = fn {
+            i8 core.context.credit = 3;
+            relay();
+            if (core.context.credit != 2) { core.system_panic(); };
+            if (true) {
+                i8 core.context.credit = 20;
+                relay();
+                if (core.context.credit != 19) { core.system_panic(); };
+            };
+            relay();
+            i8 count = identity(core.context.credit);
+            if (count != 1) { core.system_panic(); };
+        };
+        entry();
+    %%end"#;
+    for (target, target_layout) in [("native", ScalarTargetLayout::NATIVE64), ("wasm", ScalarTargetLayout::WASM32)] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout },
+        ).expect("authenticated contextual graph");
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = super::emit_scalar_build_project_llvm_text(&build).expect("verified contextual LLVM");
+        let name = |name| project_function_name(&source, name);
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("relay"))), "{ir}");
+        assert!(ir.contains(&format!("define void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("define i8 @{}(i8 %value)", name("identity"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        let relay_prefix = format!("call void @{}(ptr ", name("relay"));
+        let pointers = ir.lines().filter_map(|line| line.split_once(&relay_prefix).map(|(_, tail)| tail)).collect::<Vec<_>>();
+        let [outer, inner, restored] = pointers.as_slice() else { panic!("{ir}"); };
+        assert_ne!(outer, inner);
+        assert_eq!(outer, restored);
+        if std::env::var_os("WOSY_CONTEXTUAL_EMIT_TEST_IR").is_some() {
+            eprintln!("WOSY-CONTEXT-IR-START-{target}\n{ir}WOSY-CONTEXT-IR-END-{target}");
+        }
+    }
+
+    for invalid in [
+        text.replace("i8 core.context.credit = 3;", ""),
+        text.replace("i8 core.context.credit = 20", "i16 core.context.credit = 20"),
+    ] {
+        let parsed = parse_source(source.clone(), invalid, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        ).is_err());
+    }
+}
+
+#[test]
+fn emits_contextual_scoped_integer_places_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) counter = fn(selector) {
+            i8 core.context.count = 1;
+            if (selector < 0) {
+                i8 core.context.count = core.context.count;
+                core.context.count = 2;
+            } else {
+                core.context.count = 3;
+            };
+            core.context.count
+        };
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        let llvm = emit_scalar_llvm(&validation).expect("contextual integer cells").to_text();
+        assert_eq!(llvm.lines().filter(|line|
+            line.trim_start().starts_with("%contextual") && line.contains(" = alloca i8")
+        ).count(), 2, "{llvm}");
+        assert!(llvm.contains("store i8 2"), "{llvm}");
+        assert!(llvm.contains("store i8 3"), "{llvm}");
+    }
+}
+
+#[test]
+fn emits_contextual_scoped_bool_places_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        bool(bool) toggle = fn(live) {
+            bool core.context.ready = false;
+            if (live) {
+                bool core.context.ready = core.context.ready;
+                core.context.ready = true;
+                if (!core.context.ready) { core.system_panic(); };
+            } else {
+                core.context.ready = true;
+            };
+            core.context.ready
+        };
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        let llvm = emit_scalar_llvm(&validation).expect("contextual bool cells").to_text();
+        assert_eq!(llvm.lines().filter(|line|
+            line.trim_start().starts_with("%contextual") && line.contains(" = alloca i1")
+        ).count(), 2, "{llvm}");
+        assert!(llvm.contains("store i1 false"), "{llvm}");
+        assert!(llvm.contains("store i1 true"), "{llvm}");
+    }
+}
+
+#[test]
 fn emits_mutable_typed_place_writes_for_wasm32_and_native64() {
     let source = SourceIdentity::new(
         "project".into(),
@@ -5226,6 +5346,44 @@ fn emits_float_conversions_for_single_file_and_project() {
     assert!(project.contains("fptoui"), "{project}");
     assert!(project.contains("fptrunc"), "{project}");
     assert!(project.contains("fpext"), "{project}");
+}
+
+#[test]
+fn lowers_wrapping_addition_at_each_integer_width_without_no_wrap_flags() {
+    let mut text = String::from("%%start\nunit(*!u32) increment = fn(p) { *p = *p +@ 1; };\n");
+    for ty in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128"] {
+        text += &format!("{ty}({ty}, {ty}) wrap_{ty} = fn(a, b) {{ a +@ b }}; wrap_{ty}(1, 2);\n");
+    }
+    text += "%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(&text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let standalone = derive_scalar_program_with_layout(&parse_source(source, text.clone(), &[]).result, layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        for partition in [
+            emit_scalar_llvm(&standalone),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            for width in [8, 16, 32, 64, 128] {
+                assert!(ir.contains(&format!("add i{width} ")), "{layout:?}: {ir}");
+            }
+            assert!(!ir.contains("add nsw") && !ir.contains("add nuw"), "{layout:?}: {ir}");
+        }
+    }
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    for invalid in [
+        "f32(f32, f32) bad = fn(a, b) { a +@ b };",
+        "bool(bool, bool) bad = fn(a, b) { a +@ b };",
+        "u16(u16, u8) bad = fn(a, b) { a +@ b };",
+    ] {
+        let text = format!("%%start {invalid} %%end");
+        let standalone = derive_scalar_program_with_layout(&parse_source(source.clone(), text, &[]).result, ScalarTargetLayout::NATIVE64);
+        assert!(!standalone.diagnostics.is_empty(), "{invalid}");
+    }
 }
 
 #[test]

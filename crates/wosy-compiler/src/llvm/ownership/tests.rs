@@ -178,6 +178,7 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
         parameter_spans: vec![span],
         body,
         span,
+        runtime_enum_match: None,
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {

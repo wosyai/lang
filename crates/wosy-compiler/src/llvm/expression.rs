@@ -90,6 +90,20 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => super::runtime_enum_match::emit_initializer(context, state, site),
+        ScalarExpression::Contextual { binding, ty, .. } => {
+            let (slot, stored) = state.contextual_storage.get(binding)
+                .ok_or_else(|| "missing prepared LLVM contextual storage".to_owned())?;
+            if ty != stored {
+                return Err("invalid prepared LLVM contextual storage type".to_owned());
+            }
+            let value = state.builder.build_load(
+                storage_type(context, ty, state.layouts, state.target_layout)?,
+                *slot,
+                "contextual.value",
+            ).map_err(builder_error)?;
+            Ok(EmitValue::Basic(value))
+        }
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
                 return Ok(EmitValue::Basic(
@@ -233,6 +247,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -380,6 +395,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => super::runtime_enum_match::emit_initializer(context, state, site),
         ScalarExpression::Member {
             receiver,
             name,
@@ -459,6 +475,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -608,6 +625,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 .collect::<Result<Vec<_>, _>>()?;
             emit_call_values(context, state, &target, values)
         }
+        ScalarExpression::Contextual { .. } => emit_expression(context, state, expression),
         ScalarExpression::Name { name, .. } => emit_expression(
             context,
             state,
@@ -753,6 +771,7 @@ fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     selected: &PreparedCall<'_>,
+    expression: &ScalarExpression,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
@@ -786,6 +805,17 @@ fn emit_prepared_call<'ctx, 'module>(
         return Err(state.missing_prepared_signature(target));
     };
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    #[cfg(any(test, feature = "internal-checker"))]
+    if let Some((binding, ty)) = state.body_call_nodes.and_then(|nodes| nodes.contextual_argument(expression)) {
+        let Some(&(pointer, ref stored)) = state.contextual_storage.get(binding) else {
+            return Err("missing live contextual call binding".into());
+        };
+        if stored != ty {
+            return Err("contextual call binding type mismatch".into());
+        }
+        return emit_call_values_with_context(context, state, target, values, Some(pointer));
+    }
+    let _ = expression;
     emit_call_values(context, state, target, values)
 }
 
@@ -842,6 +872,7 @@ fn emit_call<'ctx, 'module>(
 
 fn allocation_root_name(place: &crate::ScalarPlace) -> Result<&str, String> {
     match place {
+        crate::ScalarPlace::Contextual { .. } => Err("contextual storage is not an allocation root".to_owned()),
         crate::ScalarPlace::Name { name, .. } => Ok(name),
         crate::ScalarPlace::Index { base, .. } | crate::ScalarPlace::Field { base, .. } => {
             allocation_root_name(base)
@@ -2185,18 +2216,26 @@ fn float_conversion_source_type(
 }
 
 fn emit_call_values<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>,
+    name: &str, values: Vec<EmitValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    emit_call_values_with_context(context, state, name, values, None)
+}
+
+fn emit_call_values_with_context<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     name: &str,
     values: Vec<EmitValue<'ctx>>,
+    contextual_pointer: Option<PointerValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
     let function = *state
         .functions
         .get(name)
         .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
-    if function.get_linkage() == Linkage::Internal {
+    if function.get_linkage() == Linkage::Internal && contextual_pointer.is_none() {
         return Err(format!(
-            "closed aggregate callable {name} requires its bound transfer"
+            "internal callable {name} requires its bound transfer"
         ));
     }
     let mut arguments = values
@@ -2214,14 +2253,23 @@ fn emit_call_values<'ctx, 'module>(
     else {
         return Err(format!("LLVM callable {name} has no callable signature"));
     };
-    let owner_outputs = if function.count_params() as usize > parameters.len() {
-        state
-            .dynamic_owner_outputs
-            .get(name)
-            .ok_or_else(|| format!("missing owner signature for {name}"))?
+    let owner_outputs = if let Some(pointer) = contextual_pointer {
+        if function.get_linkage() != Linkage::Internal || function.count_params() as usize != parameters.len() + 1
+            || state.dynamic_owner_outputs.get(name).is_some_and(|outputs| !outputs.is_empty())
+            || !matches!(function.get_nth_param(parameters.len() as u32), Some(BasicValueEnum::PointerValue(_)))
+        {
+            return Err("contextual pointer does not match a scalar ABI".into());
+        }
+        arguments.push(pointer.into());
+        &BTreeSet::new()
+    } else if function.count_params() as usize > parameters.len() {
+        state.dynamic_owner_outputs.get(name).ok_or_else(|| format!("missing owner signature for {name}"))?
     } else {
         &BTreeSet::new()
     };
+    if function.count_params() as usize != arguments.len() + owner_outputs.len() {
+        return Err("call sidecar count does not match prepared arguments".into());
+    }
     let owner_slots = stage_checked_return_sidecars(context, state, owner_outputs, &mut arguments)?;
     let call = state
         .builder
@@ -2489,7 +2537,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         ScalarExpression::Binary { operator, left, right, .. }
             if (float || integer) && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
                 | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)
-                || integer && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr
+                || integer && matches!(operator, BinaryOperator::WrappingAdd | BinaryOperator::BitAnd | BinaryOperator::BitOr
                     | BinaryOperator::BitXor | BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight) =>
         {
             let left = emit_contextual_numeric(context, state, left, expected, path)?;
@@ -2709,6 +2757,7 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 .map(|value| EmitValue::Basic(value.into())),
             BinaryOperator::And
             | BinaryOperator::Or
+            | BinaryOperator::WrappingAdd
             | BinaryOperator::BitAnd
             | BinaryOperator::BitOr
             | BinaryOperator::BitXor
@@ -2721,51 +2770,47 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
     }
     let left = left.into_int_value();
     let right = right.into_int_value();
+    Ok(EmitValue::Basic(emit_integer_binary(state.builder, operator, left, right, unsigned)?.into()))
+}
+
+pub(super) fn emit_integer_binary<'ctx>(
+    builder: &Builder<'ctx>, operator: &BinaryOperator,
+    left: inkwell::values::IntValue<'ctx>, right: inkwell::values::IntValue<'ctx>, unsigned: bool,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
     let value = match operator {
-        BinaryOperator::Add => state
-            .builder
+        // LLVM integer add without no-wrap flags is arithmetic modulo
+        // the bit width. Leave the ordinary addition lowering unchanged.
+        BinaryOperator::Add | BinaryOperator::WrappingAdd => builder
             .build_int_add(left, right, "add")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Subtract => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Subtract => builder
             .build_int_sub(left, right, "sub")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Multiply => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Multiply => builder
             .build_int_mul(left, right, "mul")
-            .map_err(builder_error)?
-            .into(),
+            .map_err(builder_error)?,
         BinaryOperator::Divide => if unsigned {
-            state.builder.build_int_unsigned_div(left, right, "div")
+            builder.build_int_unsigned_div(left, right, "div")
         } else {
-            state.builder.build_int_signed_div(left, right, "div")
+            builder.build_int_signed_div(left, right, "div")
         }
-        .map_err(builder_error)?
-        .into(),
+        .map_err(builder_error)?,
         BinaryOperator::Remainder => if unsigned {
-            state.builder.build_int_unsigned_rem(left, right, "rem")
+            builder.build_int_unsigned_rem(left, right, "rem")
         } else {
-            state.builder.build_int_signed_rem(left, right, "rem")
+            builder.build_int_signed_rem(left, right, "rem")
         }
-        .map_err(builder_error)?
-        .into(),
+        .map_err(builder_error)?,
         BinaryOperator::And | BinaryOperator::Or => {
             return Err("short-circuit operators require expression lowering".to_owned())
         }
-        BinaryOperator::Equal => state
-            .builder
+        BinaryOperator::Equal => builder
             .build_int_compare(IntPredicate::EQ, left, right, "eq")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::NotEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::NotEqual => builder
             .build_int_compare(IntPredicate::NE, left, right, "ne")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Less => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Less => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::ULT
@@ -2776,10 +2821,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "lt",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::LessEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::LessEqual => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::ULE
@@ -2790,10 +2833,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "le",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::Greater => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::Greater => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::UGT
@@ -2804,10 +2845,8 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "gt",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::GreaterEqual => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::GreaterEqual => builder
             .build_int_compare(
                 if unsigned {
                     IntPredicate::UGE
@@ -2818,35 +2857,24 @@ pub(super) fn emit_binary_values<'ctx, 'module>(
                 right,
                 "ge",
             )
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitAnd => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitAnd => builder
             .build_and(left, right, "and")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitOr => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitOr => builder
             .build_or(left, right, "or")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::BitXor => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::BitXor => builder
             .build_xor(left, right, "xor")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::ShiftLeft => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::ShiftLeft => builder
             .build_left_shift(left, right, "shl")
-            .map_err(builder_error)?
-            .into(),
-        BinaryOperator::ShiftRight => state
-            .builder
+            .map_err(builder_error)?,
+        BinaryOperator::ShiftRight => builder
             .build_right_shift(left, right, !unsigned, "shr")
-            .map_err(builder_error)?
-            .into(),
+            .map_err(builder_error)?,
     };
-    Ok(EmitValue::Basic(value))
+    Ok(value)
 }
 
 pub(super) fn emit_unary_value<'ctx, 'module>(
