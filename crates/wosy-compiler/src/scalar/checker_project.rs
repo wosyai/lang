@@ -5679,24 +5679,36 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         let position = effects.records.len();
         struct PeerVerdict<'a> {
             established: bool,
-            failure: Option<super::checker_flow::SymbolicLiteralFailure<'a>>,
+            failure: Option<(super::checker_flow::SymbolicLiteralFailure<'a>, Option<ByteSpan>)>,
         }
         let mut verdicts = (0..cases.len()).map(|_| PeerVerdict { established: false, failure: None })
             .collect::<Vec<_>>();
         for (index, (proof, _)) in cases.iter().enumerate() {
             if index == cohort.consumer || domains[index].is_empty() { continue; }
+            if let Some(MainFlowAuthoredShows::Cases(steps)) = &cases[index].1 {
+                match steps.check_partitions(body, &returned, &domains[index], &mut work, |_, _, _| None)
+                    .ok_or(ProjectCheck::Unsupported)?
+                {
+                    case_splits::Verdict::Refuted((failure, span)) => {
+                        verdicts[index].failure = Some((failure, Some(span)));
+                        continue;
+                    }
+                    case_splits::Verdict::Blocked => return Err(ProjectCheck::Unsupported),
+                    case_splits::Verdict::Established => {}
+                }
+            }
             let goal = PartitionedProofGoal::Literal(proof.relation()?, proof.bound.literal().ok_or(ProjectCheck::Unsupported)?);
             let checked = verify_partitioned_call_return(body, &returned, &domains[index], false, goal, Some(&mut work))
                 .ok_or(ProjectCheck::Unsupported)?;
             if !checked.applicable { return Err(ProjectCheck::Unsupported); }
-            verdicts[index] = PeerVerdict { established: checked.failure.is_none(), failure: checked.failure };
+            verdicts[index] = PeerVerdict { established: checked.failure.is_none(), failure: checked.failure.map(|failure| (failure, cohort.peer_steps[index])) };
         }
         // Authority is computed before it can be used. Diagnostics, however,
         // belong to declaration order, just like actual observations.
         for (index, (proof, authored)) in cases.iter().enumerate() {
             if index != cohort.consumer {
-                if let Some(failure) = verdicts[index].failure.take() {
-                    self.record(proof, function, source, position, failure, cohort.peer_steps[index])?;
+                if let Some((failure, span)) = verdicts[index].failure.take() {
+                    self.record(proof, function, source, position, failure, span)?;
                 }
                 continue;
             }
@@ -7068,6 +7080,7 @@ struct CaseCitationCohort {
 struct CaseCitationPoint {
     admitted: bool,
     established: bool,
+    failed_step: Option<ByteSpan>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7092,6 +7105,11 @@ impl CaseCitationCohort {
                     if peers.insert(proof.proof.start, index).is_some() { return Err(ProjectCheck::Unsupported); }
                     peer_steps[index] = Some(step.span);
                 }
+                Some(MainFlowAuthoredShows::Cases(steps))
+                    if !steps.has_citations() && !proof.qualified_leaf && proof.bound.literal().is_some() =>
+                {
+                    if peers.insert(proof.proof.start, index).is_some() { return Err(ProjectCheck::Unsupported); }
+                }
                 _ => return Err(ProjectCheck::Unsupported),
             }
         }
@@ -7101,11 +7119,23 @@ impl CaseCitationCohort {
     fn at_invocation(
         &self, cases: &[MainFlowProofPlan<'_>], arguments: &[&BigInt], returned: &BigInt,
     ) -> Option<Vec<CaseCitationPoint>> {
-        cases.iter().enumerate().map(|(index, (proof, _))| {
+        cases.iter().enumerate().map(|(index, (proof, authored))| {
             let admitted = proof.guard.accepts(arguments);
-            let established = admitted && index != self.consumer
-                && proof.relation().ok()?.accepts(returned.cmp(proof.bound.literal()?));
-            Some(CaseCitationPoint { admitted, established })
+            let mut point = CaseCitationPoint { admitted, established: false, failed_step: None };
+            if !admitted || index == self.consumer { return Some(point); }
+            if let Some(MainFlowAuthoredShows::Cases(steps)) = authored {
+                let [entry] = arguments else { return None; };
+                match steps.check_actual(entry, returned, |_| None)? {
+                    case_splits::Verdict::Established => {}
+                    case_splits::Verdict::Blocked => return None,
+                    case_splits::Verdict::Refuted(span) => {
+                        point.failed_step = Some(span);
+                        return Some(point);
+                    }
+                }
+            }
+            point.established = proof.relation().ok()?.accepts(returned.cmp(proof.bound.literal()?));
+            Some(point)
         }).collect()
     }
 }
@@ -7629,6 +7659,13 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 return;
                             }
                             if !applies() { continue; }
+                            if let Some((cohort, points)) = &case_points {
+                                if index != cohort.consumer {
+                                    if points[index].established { continue; }
+                                    if !emit(proof, points[index].failed_step) { self.incomplete = true; return; }
+                                    continue;
+                                }
+                            }
                             match steps.check_actual(entry, value, |declaration| {
                                 let (cohort, points) = case_points.as_ref()?;
                                 let peer = &points[*cohort.peers.get(&declaration)?];
@@ -10218,19 +10255,6 @@ impl PlannedModuleProof<'_> {
                 Err(ProjectCheck::Unsupported),
             RankedInductionOutcome::Refuted(_) => Ok(ProjectCheck::Refuted),
         }
-    }
-
-    fn has_closed_case_citation_steps(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
-        if self.has_no_authored_steps() { return true; }
-        if self.variant_match.is_some() { return false; }
-        let ([item], [terminated]) = (self.steps.items.as_slice(), self.steps.terminated_items.as_slice()) else {
-            return false;
-        };
-        let Some(comparison) = proof_show_expression(item, *terminated).ok().and_then(IntegerComparison::from_expression) else {
-            return false;
-        };
-        checked_literal_output_goal_borrowed(comparison, &self.typed.output, &self.typed.input_names, self.typed.result_type)
-            .is_ok_and(|(_, shown_relation, shown_bound)| shown_relation == relation && shown_bound.as_ref() == bound)
     }
 
     fn uses_direct_goal(&self) -> bool {
@@ -16847,6 +16871,43 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 }
             }
         }
+        let branched = text.replace("{ core.show(value == 10); }", r#"{
+            if (input == 11) {
+                core.show(value == 10);
+                core.rewrite(value == 10, _ == 10);
+            } else {
+                if (input == 13) { core.show(value >= 10); }
+                else { core.show(value <= 10); }
+            }
+        }"#);
+        let run_branch = |program: &str, reached: bool| {
+            let mut program = program.to_owned();
+            if reached {
+                program = program.replace("%%end", "u8 first = clamp(11); u8 second = clamp(13); %%end");
+            }
+            let scope = if reached { ScalarCheckerScope::MainFlowOnly } else { ScalarCheckerScope::CurrentPackage };
+            (run(&program, scope).unwrap(), program)
+        };
+        for reached in [false, true] {
+            let (passed, _) = run_branch(&branched, reached);
+            assert!(passed.active && passed.diagnostics.is_empty() && passed.symbolic_diagnostic.is_none());
+            // The earlier branch and peer's own equality hold; only the
+            // authored premise on the second selected path is false.
+            let (failed, source) = run_branch(&branched.replace("value >= 10", "value > 10"), reached);
+            let spelling = |span: ByteSpan| &source[span.start as usize..span.end as usize];
+            if reached {
+                let [failed] = failed.diagnostics.as_slice() else { panic!("only the second call fails"); };
+                assert_eq!(spelling(failed.invocation.call.range), "clamp(13)");
+                assert_eq!(spelling(failed.failed_step.as_ref().unwrap().range), "core.show(value > 10)");
+            } else {
+                assert!(failed.additional_symbolic_diagnostics.is_empty());
+                let failed = failed.symbolic_diagnostic.unwrap();
+                assert!(spelling(failed.proof.range).starts_with("proof high"));
+                assert_eq!(spelling(failed.failed_step.unwrap().range), "core.show(value > 10)");
+            }
+        }
+        assert!(run(&branched.replace("core.show(value >= 10)", "core.use(clamped(input))"),
+            ScalarCheckerScope::CurrentPackage).is_err());
         for unsupported in [
             text.replace("core.show(value == 10)", "core.show(value <= 10)"),
             text.replace("core.show(value == 10);", "core.show(value == 10); core.show(value == 10);"),

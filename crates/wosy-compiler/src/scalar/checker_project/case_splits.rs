@@ -466,7 +466,7 @@ fn compile<'a>(
                     .ok_or(ProjectCheck::Unsupported)?;
                 let (relation, equality) = peer.peer_literal_goal().ok_or(ProjectCheck::Unsupported)?;
                 charge_call_work(&mut work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
-                if !peer.has_closed_case_citation_steps(relation, equality) || !plan.same_peer_target(peer)
+                if !plan.same_peer_target(peer)
                     || Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal)
                 {
                     return Err(ProjectCheck::Unsupported);
