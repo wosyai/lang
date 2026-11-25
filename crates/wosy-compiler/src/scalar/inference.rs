@@ -538,7 +538,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
             {
                 match &function.signature {
                     ScalarType::Callable { parameters, outputs }
-                        if super::private_runtime_write_signature(parameters, &outputs.outputs) =>
+                        if super::private_runtime_write_signature(parameters, &outputs.outputs)
+                            || (!function.body.unsafe_context && super::private_runtime_copy_write_signature(parameters, &outputs.outputs)) =>
                             function.parameters.first().cloned(),
                     _ => None,
                 }

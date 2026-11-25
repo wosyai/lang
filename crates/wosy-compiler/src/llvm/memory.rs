@@ -408,7 +408,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     || nodes.lexical_expression_declaration(pointer) != aggregate.plan().private_runtime_access_formal
                 { return Err("private runtime index changed its prepared formal".into()); }
                 if let ScalarType::Struct(id) = element.as_ref() {
-                    if portable_formal || aggregate.plan().private_runtime_copy_fields.is_empty() {
+                    if portable_formal || (aggregate.plan().private_runtime_copy_fields.is_empty()
+                        && aggregate.plan().private_runtime_copy_writes.is_empty()) {
                         return Err("private runtime Copy index lacks its signed field plan".into());
                     }
                     private_runtime_copy_row(state, id)?;
@@ -641,9 +642,11 @@ fn require_runtime_field_extent(
         let nodes = nodes.ok_or("private runtime Copy field lacks prepared places")?;
         let (leaf, prefix) = nodes.place_ordinal(leaf).zip(nodes.place_ordinal(base)).ok_or("private runtime Copy field lacks exact projection")?;
         let plan = state.aggregate.as_ref().ok_or("runtime Copy field lacks its private formal plan")?.plan();
-        if plan.private_runtime_copy_fields.get(&leaf) != Some(&(prefix, field.clone()))
-            || &field.structure != id || !plan.private_runtime_reads.contains(&prefix)
-            || nodes.checked_expression_type(index) != Some(&ScalarType::U64)
+        let receipt = |rows: &std::collections::HashMap<_, _>| rows.get(&leaf)
+            .is_some_and(|(actual_prefix, actual_field)| *actual_prefix == prefix && actual_field == field);
+        let exact = (plan.private_runtime_reads.contains(&prefix) && receipt(&plan.private_runtime_copy_fields))
+            || (plan.private_runtime_writes.contains(&prefix) && receipt(&plan.private_runtime_copy_writes));
+        if !exact || &field.structure != id || nodes.checked_expression_type(index) != Some(&ScalarType::U64)
             || !matches!(nodes.checked_place_type(base), Some(ScalarType::Struct(actual)) if actual == id)
         { return Err("runtime Copy field changed its private formal projection".into()); }
         private_runtime_copy_row(state, id)?;

@@ -66,7 +66,7 @@ conditional_else = !{ &ANY ~ "else" ~ block }
 unsafe_expr = { unsafe_keyword ~ block }
 assignment = { assignment_targets ~ "=" ~ output_list }
 assignment_targets = { assignment_target ~ ("," ~ assignment_target)* }
-assignment_target = { indexed_value_place | indexed_dereference_place | dereference | qualified_member | dereferenced_field | identifier }
+assignment_target = { indexed_dereferenced_field_place | indexed_value_place | indexed_dereference_place | dereference | qualified_member | dereferenced_field | identifier }
 receiver_list = { receiver ~ ("," ~ receiver)* }
 receiver = { type_spec ~ identifier }
 output_list = { expression ~ ("," ~ expression)* }

@@ -3116,6 +3116,7 @@ pub(crate) struct ClosedBody {
     pub(crate) private_runtime_read_forward: Option<usize>,
     pub(crate) private_runtime_reads: HashSet<usize>,
     pub(crate) private_runtime_copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
+    pub(crate) private_runtime_copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
     pub(crate) private_runtime_writes: HashSet<usize>,
     pub(crate) private_runtime_access_calls: HashMap<usize, PrivateRuntimePairCall>,
     pub(crate) private_runtime_access_relay_target: Option<BodyKey>,
@@ -9357,6 +9358,7 @@ struct PrivateRuntimeReadPlan {
     forward: Option<usize>,
     accesses: HashSet<usize>,
     copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
+    copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
     writes: HashSet<usize>,
     calls: HashMap<usize, PrivateRuntimePairCall>,
     relay_target: Option<BodyKey>,
@@ -9417,6 +9419,7 @@ impl ClosedAggregates {
             body.private_runtime_read_forward = plan.forward;
             body.private_runtime_reads.clone_from(&plan.accesses);
             body.private_runtime_copy_fields.clone_from(&plan.copy_fields);
+            body.private_runtime_copy_writes.clone_from(&plan.copy_writes);
             body.private_runtime_writes.clone_from(&plan.writes);
             body.private_runtime_access_calls.clone_from(&plan.calls);
             body.private_runtime_access_relay_target = plan.relay_target;
@@ -9453,7 +9456,17 @@ pub(crate) fn private_runtime_write_signature(parameters: &[ScalarType], outputs
         && (outputs.is_empty() || matches!(outputs, [output] if output.ty == ScalarType::Unit))
 }
 
-fn exclusive_runtime_store_origin(cfg: &ScalarReferenceCfg, install: CfgPointId, formal: ByteSpan) -> Option<CfgPointId> {
+pub(crate) fn private_runtime_copy_write_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
+    matches!(parameters, [ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Mutable, inner,
+    }, ScalarType::U64, value] if ordinary_value(value) && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+        if matches!(element.as_ref(), ScalarType::Struct(_))))
+        && (outputs.is_empty() || matches!(outputs, [output] if output.ty == ScalarType::Unit))
+}
+
+fn exclusive_runtime_store_origin(
+    cfg: &ScalarReferenceCfg, install: CfgPointId, formal: ByteSpan, field: Option<&ScalarStructFieldId>,
+) -> Option<CfgPointId> {
     let store = cfg.points.get(install.0)?;
     let CfgPointKind::AssignThrough { place, pointer_point, rhs_point, candidates, .. } = &store.kind else { return None; };
     let staged = cfg.initial_points.get(install.0)?;
@@ -9477,7 +9490,18 @@ fn exclusive_runtime_store_origin(cfg: &ScalarReferenceCfg, install: CfgPointId,
         && loan.parent.is_none() && loan.origin_place.binding == *binding
         && loan.origin_place.projections.is_empty() && &candidate.loan == loan
         && candidate.place.binding == *binding
-        && matches!(candidate.place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])
+        && match (field, candidate.place.projections.as_slice()) {
+            (None, [ReferencePlaceProjection::Index(_)]) => true,
+            (Some(field), [ReferencePlaceProjection::Index(actual_index), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual_field))]) => {
+                let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(authored_field), .. } = place else { return None; };
+                let ScalarPlace::Index { base: owner, index: authored_index, .. } = base.as_ref() else { return None; };
+                field == authored_field && field == actual_field
+                    && matches!(owner.as_ref(), ScalarPlace::Dereference { .. })
+                    && candidate.place.place == *place && candidate.place.binding == loan.origin_place.binding
+                    && actual_index == authored_index.as_ref()
+            },
+            _ => false,
+        }
         && read.possible_origins.as_ref().is_some_and(|origins|
             origins.len() == 1 && origins.contains(&candidate.origin)))
         .then_some(*pointer_point)
@@ -9650,7 +9674,8 @@ impl ProjectReferenceResults {
                 let Some(function) = function(module, item) else { continue };
                 let ScalarType::Callable { parameters, outputs } = &function.signature else { continue };
                 if arm.is_some() || !normal(function) || !crate::scalar::typecheck::is_module_private_name(&function.name)
-                    || !private_runtime_write_signature(parameters, &outputs.outputs)
+                    || !(private_runtime_write_signature(parameters, &outputs.outputs)
+                        || private_runtime_copy_write_signature(parameters, &outputs.outputs))
                 { continue; }
                 let Some(result) = self.function_result(module, item, arm) else { continue };
                 let Some(sites) = module_at(module).and_then(|input| input.calls.function_body(item, arm)) else { continue; };
@@ -9659,8 +9684,13 @@ impl ProjectReferenceResults {
                 }
                 let Some(formal) = sites.boundary.parameters.first().map(|slot| slot.span) else { continue; };
                 let cfg = &result.cfg;
-                let Some(allowed) = stores.keys().map(|&site| exclusive_runtime_store_origin(cfg, site, formal))
-                    .collect::<Option<HashSet<_>>>() else { continue; };
+                let copy = private_runtime_copy_write_signature(parameters, &outputs.outputs);
+                let field_stores = &result.proof_points.private_runtime_formal_copy_stores;
+                let Some(allowed) = stores.keys().map(|&site| {
+                    let field = field_stores.get(&site).map(|(_, field)| field);
+                    if copy != field.is_some() { return None; }
+                    exclusive_runtime_store_origin(cfg, site, formal, field)
+                }).collect::<Option<HashSet<_>>>() else { continue; };
                 if cfg.points.iter().all(|point| match &point.kind {
                     CfgPointKind::Read { binding } if binding.declaration_span == formal => allowed.contains(&point.id),
                     CfgPointKind::Assign { target, .. } => target.binding.declaration_span != formal,
@@ -9718,7 +9748,8 @@ impl ProjectReferenceResults {
                 let ordinal = OccurrenceOrdinal(occurrence);
                 let signature = sites.checked_call_signatures.get(&ordinal)?;
                 let mutable = matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
-                let copy_fields = private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs);
+                let copy_fields = private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)
+                    || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs);
                 // The callee's exact field receipt already authenticated Copy.
                 // The declaration, actual and formal must share the same
                 // authored module and exact type identity below.
@@ -9726,6 +9757,7 @@ impl ProjectReferenceResults {
                 let mode = if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared };
                 let exact_signature = if mutable {
                     private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs)
+                        || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs)
                 } else {
                     private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
                         || private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)
@@ -9846,7 +9878,14 @@ impl ProjectReferenceResults {
                 }
                 PrivateRuntimeAccessRoute::Write(formal) => {
                     plan.formal = Some(formal);
-                    plan.writes.extend(pending_writes[&target].values().map(|access| access.0));
+                    let result = self.function_result(target.0, target.1, target.2)
+                        .expect("closed private runtime writer");
+                    for (point, prefix) in pending_writes[&target] {
+                        plan.writes.insert(prefix.0);
+                        if let Some((leaf, field)) = result.proof_points.private_runtime_formal_copy_stores.get(point) {
+                            plan.copy_writes.insert(leaf.0, (prefix.0, field.clone()));
+                        }
+                    }
                 }
                 PrivateRuntimeAccessRoute::Forward { formal, call, target } => {
                     plan.formal = Some(formal);

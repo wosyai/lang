@@ -377,7 +377,7 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         return Err("private runtime array call changed its exact owner".into());
     }
     let copy_field = matches!(element.as_ref(), ScalarType::Struct(_));
-    if copy_field && (portable || *mutability != crate::scalar::ScalarReferenceMutability::Shared
+    if copy_field && (portable
         || !matches!(nodes.checked_place_type(place), Some(ScalarType::RuntimeArray { element: actual, .. }) if actual == element))
     { return Err("private runtime Copy field lost its signed original layout".into()); }
     if let ScalarType::Struct(id) = element.as_ref() {
@@ -410,9 +410,10 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     let mutable = *mutability == crate::scalar::ScalarReferenceMutability::Mutable;
     let function_type = function.get_type();
     let exact_abi =
-        if mutable && crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs) {
+        if mutable && (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
+            || crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs)) {
             function_type.get_param_types().as_slice()
-                == [descriptor.into(), context.i64_type().into(), basic_type(context, element, state.target_layout)?.into()]
+                == [descriptor.into(), context.i64_type().into(), basic_type(context, &parameters[2], state.target_layout)?.into()]
                 && function_type.get_return_type().is_none()
         } else if !mutable && (crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs)
             || crate::scalar::private_runtime_copy_read_signature(parameters, &outputs.outputs)) {
@@ -804,8 +805,10 @@ pub(super) fn definition_type<'ctx>(
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("private runtime array reader is not callable".into());
         };
-        if crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
-            && plan.is_some_and(|body| !body.private_runtime_writes.is_empty()
+        let copy_write = crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs);
+        if (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs) || copy_write)
+            && plan.is_some_and(|body| (!copy_write || (!body.private_runtime_copy_writes.is_empty() && !body.private_runtime_portable_formal))
+                && !body.private_runtime_writes.is_empty()
                 && body.private_runtime_reads.is_empty() && body.private_runtime_read_forward.is_none())
         {
             return Ok(context.void_type().fn_type(&[borrowed_extent_type(context, layout).into(),

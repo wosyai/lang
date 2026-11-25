@@ -19239,3 +19239,79 @@ if (observe(2,1) != 202) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn private_exclusive_runtime_copy_field_writes_after_rhs_using_original_pair() {
+    let text = "%%start
+struct copy Cell { u8 tag; u64 value; }
+u64(u64) rhs = fn(value) { value };
+u64(u64) select = fn(index) { index };
+unit(*!(Cell[]),u64,u64) _write = fn(view,index,value) {
+    (*view)[select(index)].value = rhs(value);
+};
+u64(u64,u64) observe = fn(count,index) {
+    Cell[count] rows;
+    rows[index].tag = 7;
+    _write(&!rows,index,202);
+    rows[index].value
+};
+if (observe(2,1) != 202) { core.system_panic(); };
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/private-copy-field-write.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&validated).unwrap().to_text();
+        let access = prepared.checked_access().unwrap();
+        let non_null = format!("call void @{}(", project_function_name(&access.source, &access.non_null));
+        let bounds = format!("call void @{}(", project_function_name(&access.source, &access.in_extent));
+        let rhs = format!("call i64 @{}(", project_function_name(&source, "rhs"));
+        let selector = format!("call i64 @{}(", project_function_name(&source, "select"));
+        let name = project_function_name(&source, "_write");
+        let body = self_tail_test_body(&ir, "internal void", &name);
+        for operation in [&rhs, &selector, &non_null, &bounds] {
+            assert_eq!(body.matches(operation).count(), 1, "{body}");
+        }
+        let rhs_value = body.lines().find(|line| line.contains(&rhs)).unwrap().trim().split_once(" = ").unwrap().0;
+        let snapshot_head = format!("store i64 {rhs_value}, ptr ");
+        let snapshot = body.lines().find(|line| line.trim_start().starts_with(&snapshot_head)).unwrap();
+        let slot = snapshot.trim_start().strip_prefix(&snapshot_head).unwrap().split(',').next().unwrap();
+        let reload = body.lines().find(|line| line.contains(&format!("load i64, ptr {slot},"))).unwrap();
+        let value = reload.trim().split_once(" = ").unwrap().0;
+        let row_gep = body.lines().find(|line| line.contains("getelementptr inbounds [16 x i8]")).unwrap();
+        let row = row_gep.trim().split_once(" = ").unwrap().0;
+        let field_gep = body.lines().find(|line| line.contains(&format!(" = getelementptr inbounds i8, ptr {row}, i8 8"))).unwrap();
+        let field = field_gep.trim().split_once(" = ").unwrap().0;
+        let actual_store = format!("store i64 {value}, ptr {field},");
+        let order = [&rhs, snapshot, reload, &non_null, "inttoptr", &selector, &bounds, row_gep, field_gep, &actual_store];
+        assert!(order.windows(2).all(|pair| body.find(pair[0]).unwrap() < body.find(pair[1]).unwrap()), "{body}");
+        let check = body.lines().find(|line| line.contains(&bounds)).unwrap();
+        assert!(check.contains("i64 %borrowed_array_extent"), "{body}");
+        let caller = self_tail_test_body(&ir, "i64", &project_function_name(&source, "observe"));
+        assert_eq!(caller.matches("call ptr @__wosy_core_alloc(").count(), 1, "{caller}");
+        assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
+        assert!(caller.contains(&format!("call void @{name}(")) && caller.contains("%private_runtime_argument"), "{caller}");
+        let shared = text.replace("*!(Cell[])", "*(Cell[])").replace("&!rows", "&rows");
+        let refused = match prepare(&shared) {
+            Ok(prepared) => !analyze_scalar_build(&prepared).diagnostics().is_empty(),
+            Err(_) => true,
+        };
+        assert!(refused);
+        if let Some(out) = std::env::var_os("WOSY_DEV4_PRIVATE_COPY_FIELD_WRITE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-private-copy-field-write.ll")), controlled).unwrap();
+        }
+    }
+}
