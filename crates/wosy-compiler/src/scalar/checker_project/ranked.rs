@@ -257,14 +257,14 @@ fn transition(
 #[derive(Clone)]
 enum RankLane {
     Integers(Rectangle),
-    Float(Vec<ranked_float::Atom>),
+    Float(ranked_float::Lane),
 }
 
 impl RankLane {
     fn reachable(&self) -> bool {
         match self {
             Self::Integers(rectangle) => rectangle.reachable(),
-            Self::Float(points) => !points.is_empty(),
+            Self::Float(lane) => lane.reachable(),
         }
     }
 
@@ -273,26 +273,13 @@ impl RankLane {
     ) -> Result<InductionPremise, ProjectCheck> {
         match (self, entry) {
             (Self::Integers(path), Self::Integers(entry)) => transition(rank, entry, path, arguments, work),
-            (Self::Float(path), Self::Float(entry)) => {
-                if path.is_empty() { return Ok(InductionPremise::Unreachable); }
-                let [argument] = arguments else { return Err(ProjectCheck::Unsupported); };
-                let probes = (usize::BITS - entry.len().leading_zeros()) as usize;
-                charge(work, path.len().checked_mul(probes + 3).ok_or(ProjectCheck::Unsupported)?)?;
-                for &point in path {
-                    let successor = match argument {
-                        Coordinate::Entry => point,
-                        Coordinate::FloatLiteral(value) => *value,
-                        Coordinate::FloatOffset { add, magnitude } => {
-                            let Some(value) = point.offset(*magnitude, *add) else { return Ok(InductionPremise::NotStrict); };
-                            value
-                        }
-                        _ => return Err(ProjectCheck::Unsupported),
-                    };
-                    if !successor.strictly_less(point) { return Ok(InductionPremise::NotStrict); }
-                    if !ranked_float::contains(entry, successor) { return Ok(InductionPremise::CalleeWhereUnproved); }
-                }
-                Ok(InductionPremise::Established)
-            }
+            (Self::Float(path), Self::Float(entry)) => match arguments {
+                [_] if !path.reachable() => Ok(InductionPremise::Unreachable),
+                [Coordinate::Entry] => Ok(InductionPremise::NotStrict),
+                [Coordinate::FloatLiteral(value)] => path.literal_transition(entry, *value, work),
+                [Coordinate::FloatOffset { add, magnitude }] => path.offset_transition(entry, *magnitude, *add, work),
+                _ => Err(ProjectCheck::Unsupported),
+            },
             _ => Err(ProjectCheck::Unsupported),
         }
     }
@@ -317,9 +304,7 @@ pub(super) fn verify<'a>(
     };
     let mut work = 0;
     let entry = if let Some((slot, _)) = rank.float_entry() {
-        let points = ranked_float::guarded_entry(plan, &slot.ty, &mut work)?;
-        charge(&mut work, points.len())?;
-        RankLane::Float(points)
+        RankLane::Float(ranked_float::guarded_entry(plan, &slot.ty, &mut work)?)
     } else {
         let entry = Rectangle::entry(rank, plan.filter.as_deref().unwrap_or_default(), &mut work)?;
         for axis in &entry.0 { charge(&mut work, axis.interval_count())?; }
@@ -368,8 +353,8 @@ pub(super) fn verify<'a>(
                             .ok_or(ProjectCheck::Unsupported)?;
                         if authored != guard { return Err(ProjectCheck::Unsupported); }
                     }
-                    charge(&mut work, points.len().checked_mul(2).ok_or(ProjectCheck::Unsupported)?)?;
-                    let (yes, no) = points.into_iter().partition(|&point| guard.accepts(point));
+                    let yes = points.keep(&guard, true, &mut work)?;
+                    let no = points.keep(&guard, false, &mut work)?;
                     (RankLane::Float(yes), RankLane::Float(no))
                 }
             };

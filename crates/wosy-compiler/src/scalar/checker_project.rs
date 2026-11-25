@@ -17510,6 +17510,14 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(!idle.active && idle.symbolic_diagnostic.is_none());
         }
         let expected_guard = "entry >= 1.0 && entry <= 1.0000002384185791015625";
+        for text in [program, &double] {
+            let broad = text.replace("entry >= 1.0", "entry >= 0.0")
+                .replace("1.0000002384185791015625", "1024.0")
+                .replace("1.0000000000000004440892098500626", "1024.0")
+                .replace("0.00000011920928955078125", "1.0")
+                .replace("0.0000000000000002220446049250313", "1.0");
+            assert!(run(&broad, package).unwrap().active);
+        }
         let empty = program.replace(expected_guard, "entry >= 2.0 && entry <= 1.0");
         assert!(!run(&empty, package).unwrap().active);
         for text in [
