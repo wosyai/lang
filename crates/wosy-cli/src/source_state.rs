@@ -2,7 +2,7 @@
 //! public current.json view are not stored here.
 use crate::source_preparation::{prepare_with_files, Files, PreparedSources};
 use crate::source_recovery::{
-    sparse_delta, trace_reachable, ClientSourceLimits, ClientSourceUsage, RetainedSources,
+    sparse_delta, trace_reachable, ClientSourceLimits, ClientSourceUsage, Closure, RetainedSources,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, N
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+mod delta;
 mod pins;
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 
@@ -238,12 +239,12 @@ impl SqliteSourceState {
 
     fn load_root(&self, target: &str, root: NodeId, attempt: Option<SourceAttempt>) -> Result<SourceReplay> {
         let mut read = StoredNodes::new(&self.db)?;
-        self.header(&mut read, target, root)?;
+        Self::header(&self.project, &mut read, target, root)?;
         let (delta, usage) = read.closure(root, self.limits)?;
         Ok(SourceReplay { source: PreparedSources { root, delta, parsed: 0, reused: 0 }, usage, attempt })
     }
 
-    fn header(&self, read: &mut StoredNodes<'_>, target: &str, root: NodeId) -> Result<(SourceConfig, Vec<NodeId>)> {
+    fn header(project: &Path, read: &mut StoredNodes<'_>, target: &str, root: NodeId) -> Result<(SourceConfig, Vec<NodeId>)> {
         let top = read.record(root)?;
         let parts = source_preparation_parts(&top).ok_or("unsupported persisted source schema")?;
         let config = read.record(parts.config)?;
@@ -252,7 +253,7 @@ impl SqliteSourceState {
         if config.target != target || top.data != config.schema()
             || config.parser.schema.0 != *wosy_syntax::base_cst_schema()
             || config.namespaces.get(&config.entry.package).is_none_or(|ns| {
-                ns.git.is_some() || Path::new(&ns.project) != self.project
+                ns.git.is_some() || Path::new(&ns.project) != project
             })
         {
             return Err("persisted source does not match this project, target, or parser".into());
@@ -262,20 +263,10 @@ impl SqliteSourceState {
 
     fn observe_again(&self, target: &str, root: NodeId) -> Result<Observation> {
         let mut read = StoredNodes::new(&self.db)?;
-        let (config, entries) = self.header(&mut read, target, root)?;
+        let (config, entries) = Self::header(&self.project, &mut read, target, root)?;
         let budget = load_usage(&self.db, root)?;
         if let Some(usage) = budget { usage.admit(self.limits)?; }
-        let parser = config.parser.id();
-        let mut files = Files::new();
-        for id in entries {
-            let file = FileEntry::from_node(id, read.record(id)?)?;
-            if file.metadata.policy != parser
-                || files.insert(FileKey::from(&file.metadata.source), file).is_some()
-            {
-                return Err("invalid persisted source file index".into());
-            }
-        }
-        if !files.contains_key(&config.entry) { return Err("persisted entry file is missing".into()); }
+        let files = read.file_index(&config, entries)?;
         let (mut source, _) = prepare_with_files(&self.project, Some(target), Some(&files))?;
         // An unchanged observation only compares the selected root. An
         // attempt to use or publish canonical bytes must still visit the
@@ -334,15 +325,38 @@ impl<'a> StoredNodes<'a> {
         Ok(record)
     }
 
+    fn file_index(&mut self, config: &SourceConfig, entries: Vec<NodeId>) -> Result<Files> {
+        let parser = config.parser.id();
+        let mut files = Files::new();
+        for id in entries {
+            let file = FileEntry::from_node(id, self.record(id)?)?;
+            let key = FileKey::from(&file.metadata.source);
+            if file.metadata.policy != parser
+                || config.namespaces.get(&key.package).is_none_or(|namespace| {
+                    namespace.project != file.metadata.source.project
+                })
+                || files.insert(key, file).is_some()
+            {
+                return Err("invalid persisted source file index".into());
+            }
+        }
+        if !files.contains_key(&config.entry) { return Err("persisted entry file is missing".into()); }
+        Ok(files)
+    }
+
     fn closure(&mut self, root: NodeId, limits: ClientSourceLimits) -> Result<(Delta, ClientSourceUsage)> {
         let mut nodes = Delta::default();
-        let closure = trace_reachable(root, limits, |id| {
-            match self.checked.nodes.remove(&id) {
-                Some(bytes) => Ok(bytes),
-                None => self.fetch(id),
-            }
-        }, |id, bytes| { nodes.nodes.insert(id, bytes); })?;
+        let closure = self.trace(root, limits, |id, bytes| { nodes.nodes.insert(id, bytes); })?;
         Ok((nodes, closure.usage()))
+    }
+
+    fn trace(
+        &mut self, root: NodeId, limits: ClientSourceLimits, keep: impl FnMut(NodeId, Vec<u8>),
+    ) -> Result<Closure> {
+        trace_reachable(root, limits, |id| match self.checked.nodes.remove(&id) {
+            Some(bytes) => Ok(bytes),
+            None => self.fetch(id),
+        }, keep)
     }
 }
 

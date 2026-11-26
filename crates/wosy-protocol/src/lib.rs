@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use wosy_project::packages::{LockedInputId, PatchStackId};
 use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
+mod source_delta;
+pub use source_delta::{BaseCstProposal, CstAddition, CstDelta, SourceIndexAddition, BASE_CST_DELTA_VERSION};
+
 mod build_diagnostics;
 pub use build_diagnostics::{
     BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,

@@ -4,9 +4,9 @@ use std::path::Path;
 use std::time::Instant;
 use wosy_cli::source_recovery::ClientSourceLimits;
 use wosy_cli::source_state::{LocalSourcePin, ReplaySource, SourceAttempt, SourceReplay, SqliteSourceState};
-use wosy_daemon::SourceStore;
+use wosy_daemon::{encode_session_frame, SessionFrameReader, SourceStore};
 use wosy_project::PackageRelativePath;
-use wosy_protocol::{FileKey, NodeId};
+use wosy_protocol::{BaseCstProposal, Delta, FileKey, NodeId, SourceUpdate, BASE_CST_DELTA_VERSION};
 
 fn local_pin(pin: &LocalSourcePin) -> serde_json::Value {
     serde_json::json!({
@@ -20,7 +20,7 @@ pub(super) async fn run(
     let target = args.next().ok_or("expected fixture target")?;
     let mode = args.next().ok_or("expected local source action")?;
     let start = Instant::now();
-    let limits = if mode == "stage-limited" {
+    let limits = if matches!(mode.as_str(), "stage-limited" | "proposal-limited") {
         ClientSourceLimits {
             nodes: args.next().ok_or("expected fixture node limit")?.parse()?,
             encoded_bytes: args.next().ok_or("expected fixture byte limit")?.parse()?,
@@ -41,6 +41,63 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "proposal" | "proposal-oracle" | "proposal-limited" => {
+            let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
+            let generation = args.next().ok_or("expected fixture attempt")?.parse()?;
+            let attempt = SourceAttempt::new(root, generation);
+            let proposed = client.pending_base_cst_proposal(&target, attempt)?;
+            let proposal_ms = milliseconds(start);
+            let encoded = encode_session_frame(&proposed)?;
+            let restored = SessionFrameReader::default().read::<_, BaseCstProposal>(&mut encoded.as_ref())
+                .await?.ok_or("expected a framed base CST proposal")?;
+            assert_eq!(restored.version, BASE_CST_DELTA_VERSION);
+            assert_eq!(encode_session_frame(&restored)?, encoded);
+            let mut added = Delta::default();
+            for (id, bytes) in restored.files.iter()
+                .flat_map(|file| file.added.iter().map(|node| (node.id(), node.encoded())))
+                .chain(restored.source_index.iter().map(|node| (node.id(), node.encoded())))
+            {
+                assert_eq!(wosy_protocol::Node::id(bytes), id);
+                assert!(added.nodes.insert(id, bytes.to_vec()).is_none());
+            }
+            let files: Vec<_> = restored.files.iter().map(|file| serde_json::json!({
+                "file": file.file, "old": file.old_file_root.map(NodeId::hex),
+                "new": file.new_file_root.map(NodeId::hex), "added": file.added.len(),
+            })).collect();
+            let oracle = if mode == "proposal-oracle" {
+                let base = client.replay(&target, ReplaySource::Selected)?.ok_or("expected selected source")?;
+                let full = client.replay(&target, ReplaySource::Pending)?.ok_or("expected pending source")?;
+                let exact: Vec<_> = full.source.delta.nodes.iter()
+                    .filter(|(id, _)| !base.source.delta.nodes.contains_key(id)).collect();
+                assert!(added.nodes.iter().eq(exact));
+                assert_eq!((restored.base, restored.root), (base.source.root, full.source.root));
+                let store = SourceStore::open(dir, 8 << 20)?;
+                assert!(store.snapshot(restored.root)?.is_none());
+                let result = store.publish_update(SourceUpdate {
+                    base: restored.base, root: restored.root, added: Some(&added),
+                    base_payload: &base.source.delta,
+                }).await?;
+                assert_eq!(result.mode, wosy_daemon::SourcePublicationMode::Incremental);
+                let from_delta = typed_preparation::run(&store, project, restored.root, "dev", Some("--oracle"), None, None).await?;
+                store.close().await?;
+                let other = dir.with_extension("oracle");
+                let store = SourceStore::open(&other, 8 << 20)?;
+                store.publish(full.source.root, &full.source.delta).await?;
+                let from_full = typed_preparation::run(&store, project, full.source.root, "dev", None, None, None).await?;
+                for key in ["snapshot", "project_ast", "prepared_identity", "layout", "modules", "ready", "diagnostics"] {
+                    assert_eq!(from_delta[key], from_full[key]);
+                }
+                store.close().await?;
+                true
+            } else {
+                false
+            };
+            serde_json::json!({
+                "root": root.hex(), "base": restored.base.hex(), "files": files,
+                "added": added.nodes.len(), "index": restored.source_index.len(),
+                "wire_bytes": encoded.len(), "proposal_ms": proposal_ms, "oracle": oracle,
+            })
+        }
         "leased-build" => {
             let profile = args.next().ok_or("expected fixture Build profile")?;
             let (mut oracle, mut framed) = (false, false);

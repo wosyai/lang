@@ -183,6 +183,8 @@ pub(crate) struct Closure {
 }
 
 impl Closure {
+    pub(crate) fn contains(&self, node: NodeId) -> bool { self.nodes.contains(&node) }
+
     pub(crate) fn usage(&self) -> ClientSourceUsage {
         ClientSourceUsage { nodes: self.nodes.len(), encoded_bytes: self.encoded_bytes }
     }
