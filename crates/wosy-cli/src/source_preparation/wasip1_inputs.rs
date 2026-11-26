@@ -93,6 +93,8 @@ impl Wasip1InputsBasis {
 }
 
 impl PreparedWasip1ComptimeInputs {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn project(&self) -> &Path { &self.basis.project }
     pub fn source_root(&self) -> NodeId { self.basis.root }
     pub fn authored_cst(&self) -> NodeId { self.basis.authored_cst }
     pub fn watches(&self) -> &PreparedComptimeWatches { &self.basis.watches }

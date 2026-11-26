@@ -19,7 +19,8 @@ use wosy_syntax::{FreshParseResult, SourceIdentity};
 #[cfg(target_os = "linux")]
 mod provision;
 #[cfg(target_os = "linux")]
-pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime};
+pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime,
+    ProvisionedWasip1Comptime, Wasip1ComptimeModuleObservation};
 #[cfg(target_os = "linux")]
 mod stdout;
 #[cfg(target_os = "linux")]
@@ -205,19 +206,11 @@ impl ClosedComptimeStaging {
     pub fn configuration_identity(&self) -> &str { &self.selected.configuration_identity }
 
     pub fn builder<'a>(&'a self, paths: ClosedComptimePaths<'a>) -> ClosedComptimeInvocation<'a> {
-        let (_, builder) = self.tools().builder();
-        self.invocation(&builder.command, &builder.args, [paths.evaluator_ir, paths.output_dir, paths.manifest])
+        selected_builder_invocation(&self.selected.workspace, self.tools(), paths)
     }
 
     pub fn runner<'a>(&'a self, manifest: &'a Path) -> ClosedComptimeInvocation<'a> {
-        let (_, runner) = self.tools().runner();
-        self.invocation(&runner.command, &runner.args, [manifest])
-    }
-
-    fn invocation<'a, const N: usize>(
-        &'a self, command: &'a [String], configured: &'a [String], paths: [&'a Path; N],
-    ) -> ClosedComptimeInvocation<'a> {
-        literal_invocation(&self.selected.workspace, command, configured, paths)
+        selected_runner_invocation(&self.selected.workspace, self.tools(), manifest)
     }
 
     /// Stream the ordinary compiler IR exactly once to a caller-owned sink.
@@ -226,6 +219,20 @@ impl ClosedComptimeStaging {
     pub fn write_evaluator_ir(&self, output: &mut impl Write, max_bytes: usize) -> io::Result<StagedEvaluatorIr> {
         write_compiler_evaluator_ir(&self.fragment, output, max_bytes)
     }
+}
+
+fn selected_builder_invocation<'a>(
+    project: &'a Path, tools: &'a SelectedComptimeTools, paths: ClosedComptimePaths<'a>,
+) -> ClosedComptimeInvocation<'a> {
+    let (_, builder) = tools.builder();
+    literal_invocation(project, &builder.command, &builder.args, [paths.evaluator_ir, paths.output_dir, paths.manifest])
+}
+
+fn selected_runner_invocation<'a>(
+    project: &'a Path, tools: &'a SelectedComptimeTools, manifest: &'a Path,
+) -> ClosedComptimeInvocation<'a> {
+    let (_, runner) = tools.runner();
+    literal_invocation(project, &runner.command, &runner.args, [manifest])
 }
 
 fn literal_invocation<'a, const N: usize>(

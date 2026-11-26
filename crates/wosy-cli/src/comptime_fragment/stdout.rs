@@ -1,7 +1,7 @@
 //! Select an ordinary compiler result shape and parse already collected stdout.
 //! Neither entry point launches a program or accepts a result into a build.
 use super::{
-    literal_invocation, write_comptime_partition_ir, ClosedComptimeInvocation, ClosedComptimeModuleObservation,
+    selected_builder_invocation, selected_runner_invocation, write_comptime_partition_ir, ClosedComptimeInvocation, ClosedComptimeModuleObservation,
     ClosedComptimePaths, ClosedComptimePlanError, StagedEvaluatorIr,
 };
 use crate::project_sources::{self, Error as SourceError};
@@ -73,13 +73,11 @@ impl ProjectComptimeStdoutEvaluator {
     }
 
     pub fn builder<'a>(&'a self, paths: ClosedComptimePaths<'a>) -> ClosedComptimeInvocation<'a> {
-        let (_, builder) = self.tools.builder();
-        literal_invocation(&self.project, &builder.command, &builder.args, [paths.evaluator_ir, paths.output_dir, paths.manifest])
+        selected_builder_invocation(&self.project, &self.tools, paths)
     }
 
     pub fn runner<'a>(&'a self, manifest: &'a Path) -> ClosedComptimeInvocation<'a> {
-        let (_, runner) = self.tools.runner();
-        literal_invocation(&self.project, &runner.command, &runner.args, [manifest])
+        selected_runner_invocation(&self.project, &self.tools, manifest)
     }
 
     pub fn read_stdout(&self, status: ExitStatus, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeReadbackError> {

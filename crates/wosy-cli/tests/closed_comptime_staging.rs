@@ -834,3 +834,71 @@ fn retained_wasip1_watch_inputs_distinguish_source_and_watch_changes() {
     assert_eq!(current(), SourceOrConfigurationChanged);
     assert!(!project.join(".wosy").exists());
 }
+
+
+#[cfg(target_os = "linux")]
+#[test]
+fn owned_retained_wasip1_handoff_uses_the_selected_preparation_and_tool_paths() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use wosy_cli::source_preparation::{prepare_wasip1_comptime_inputs, Wasip1ComptimeInputSelection};
+    use wosy_project::packages::ComptimeWatchLimits;
+
+    let fixture = Fixture::new();
+    let project = fixture.project().canonicalize().unwrap();
+    let scratch = fixture.0.join("private evaluator handoff");
+    fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+    fixture.manifest(&MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\""));
+    fs::write(project.join("src/main.w"), "%%start\nu32 value = comptime prepare { u32 seed = 7; seed ^ 9 };\n%%end\n").unwrap();
+    let selection = Wasip1ComptimeInputSelection {
+        target: "app", profile: "override", id: "prepare", max_authored_source_bytes: 1 << 17,
+        max_stdout_bytes: 256, watch_limits: ComptimeWatchLimits::default(),
+    };
+    let (_, insufficient) = prepare_wasip1_comptime_inputs(&project, selection).unwrap();
+    assert!(insufficient.provision(&scratch, 1).is_err());
+    assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+
+    let (sources, inputs) = prepare_wasip1_comptime_inputs(&project, selection).unwrap();
+    assert_eq!(sources.parsed, 1);
+    let expected = inputs.continuation().evaluator().llvm().to_text();
+    let staged = inputs.provision(&scratch, expected.len()).unwrap();
+    assert_eq!(staged.preparation().source_root(), sources.root);
+    assert_eq!(staged.evaluator_ir().blake3, blake3::hash(expected.as_bytes()));
+    assert_eq!(staged.evaluator_ir().bytes, expected.len());
+    assert_eq!(staged.preparation().declared_tools().build_permissions(), Some([].as_slice()));
+    assert!(staged.preparation().declared_tools().build_mounts().is_some_and(<[_]>::is_empty));
+
+    let module_path = staged.expected_module_path();
+    let output = module_path.parent().unwrap();
+    let ir_path = output.join("evaluator.ll");
+    let manifest = staged.manifest_path();
+    assert_eq!(fs::metadata(output).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::read(&ir_path).unwrap(), expected.as_bytes());
+    let builder = staged.builder_invocation();
+    assert_eq!(builder.executable, OsStr::new("path to declared comptime builder"));
+    assert_eq!(builder.working_directory, project);
+    assert_eq!(builder.arguments, [
+        OsStr::new("literal *"), OsStr::new("$WORD"), OsStr::new("--label=two words"),
+        ir_path.as_os_str(), output.as_os_str(), manifest.as_os_str(),
+    ]);
+    let runner = staged.runner_invocation();
+    assert_eq!(runner.executable, OsStr::new("path to declared comptime runner"));
+    assert_eq!(runner.working_directory, project);
+    assert_eq!(runner.arguments, [OsStr::new("literal runner"), OsStr::new("--literal=${VAR}"), manifest.as_os_str()]);
+    assert!(!manifest.exists());
+    assert!(matches!(staged.observe_module(48), Err(error) if error.kind() == io::ErrorKind::NotFound));
+
+    // Dummy data only: a bounded observation of the exact slot, not a
+    // builder/runner receipt, execution evidence, or authority to resume.
+    let dummy = b"inert evaluator slot fixture";
+    fs::write(module_path, dummy).unwrap();
+    assert!(staged.observe_module(dummy.len() as u64 - 1).is_err());
+    let module = staged.observe_module(dummy.len() as u64).unwrap();
+    assert!(std::ptr::eq(module.provision(), &staged));
+    assert_eq!(module.result_type(), &ScalarType::U32);
+    assert_eq!(module.bytes(), dummy.len() as u64);
+    assert_eq!(module.digest(), blake3::hash(dummy));
+
+    let output = output.to_owned();
+    drop(staged);
+    assert!(!output.exists() && !project.join(".wosy").exists());
+}

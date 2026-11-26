@@ -650,6 +650,34 @@ mod continuation_tests {
         Ok(emit_scalar_build_single_module_artifact_llvm(&build).expect("ordinary fixture emitter"))
     }
 
+    // A future execution authority must issue completion for this consumed
+    // preparation. Until it exists only this test harness may construct one;
+    // it owns the exact Rowan continuation, not a caller-comparable digest.
+    struct RetainedFixtureCompletion {
+        owner: PreparedWasip1ComptimeContinuation,
+        value: ScalarExpression,
+    }
+
+    impl RetainedFixtureCompletion {
+        fn capture_successful_fixture(
+            owner: PreparedWasip1ComptimeContinuation, stdout: &[u8],
+        ) -> Result<Self, ComptimeStdoutError> {
+            let value = owner.evaluator().output().parse_stdout(stdout, 256)?;
+            Ok(Self { owner, value })
+        }
+
+        fn resume(self) -> Result<LlvmPartition, Vec<Diagnostic>> {
+            let Self { owner, value } = self;
+            let declarations = owner.sources.into_iter().enumerate().map(|(index, (fresh, namespaces))| {
+                let embedding = (index == 0).then_some(EmbeddedComptimeExpression {
+                    site: &owner.occurrence.site, expression: &owner.occurrence.initializer, value: &value,
+                });
+                (derive_scalar_declarations_with_embedding(fresh.result().canonical_cst(), embedding), namespaces)
+            }).collect();
+            analyze(declarations, owner.order)
+        }
+    }
+
     #[test]
     fn retained_wasip1_fixture_value_reenters_ordinary_build_with_exact_ir_and_diagnostics() {
         for bad in [false, true] {
@@ -666,18 +694,8 @@ mod continuation_tests {
             assert_eq!(plan.occurrence_span(), plan.evaluator().output().site().range);
             assert_eq!(plan.initializer_span(), plan.occurrence_span());
 
-            // Only this trusted test supplies bytes. They are decoded once
-            // by the original expected type, then embedded at the original
-            // exact Rowan occurrence without reparsing the source.
-            let value = plan.evaluator().output().parse_stdout(b"[7,14]\n", 256).expect("approved fixture oracle");
-            let mut declarations = Vec::with_capacity(plan.sources.len());
-            for (index, (fresh, namespaces)) in plan.sources.into_iter().enumerate() {
-                let embedding = (index == 0).then_some(EmbeddedComptimeExpression {
-                    site: &plan.occurrence.site, expression: &plan.occurrence.initializer, value: &value,
-                });
-                declarations.push((derive_scalar_declarations_with_embedding(fresh.result().canonical_cst(), embedding), namespaces));
-            }
-            let retained = analyze(declarations, plan.order);
+            let retained = RetainedFixtureCompletion::capture_successful_fixture(plan, b"[7,14]\n")
+                .expect("approved fixture oracle").resume();
             let known = analyze(vec![(derive_scalar_declarations_from_cst(authored(control).result().canonical_cst()),
                 Vec::new())], vec![identity]);
             if bad {
@@ -693,4 +711,22 @@ mod continuation_tests {
             }
         }
     }
+
+    #[test]
+    fn retained_wasip1_fixture_completion_exists_only_for_the_selected_result_shape() {
+        let prepare = |source| {
+            let fresh = authored(source);
+            let identity = fresh.result().source.clone();
+            prepare_wasip1_comptime_continuation(vec![(fresh, Vec::new())],
+                vec![identity], "solve", 1 << 16, 256).unwrap()
+        };
+        let pair = prepare(format!("%%start\nstruct copy Pair {{ u32 first; u32 second; }}\nPair result = {SITE};\n%%end\n"));
+        assert!(matches!(RetainedFixtureCompletion::capture_successful_fixture(pair, b"14\n"),
+            Err(ComptimeStdoutError::NonCanonical)));
+        let scalar = prepare("%%start\nu32 result = comptime solve { u32 second = 7; second ^ 9 };\n%%end\n".into());
+        let llvm = RetainedFixtureCompletion::capture_successful_fixture(scalar, b"14\n").unwrap()
+            .resume().unwrap().to_text();
+        assert!(llvm.contains("store i32 14") && !llvm.contains("@fd_write"));
+    }
+
 }
