@@ -45,7 +45,7 @@ Rules:
 
 - `[package]` needs `name` and `default_target`. `source_root` sets the base for namespace paths (the project root when omitted from the root manifest). Target entries stay relative to the project root.
 - `[dependencies.<name>]` uses local `path`, or `git` with an optional repository-relative `path` (default `"."`). A dependency manifest needs the matching package name and a `source_root`.
-- `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
+- `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`. In a new project, add `TYPE`, `REPLAY`, or `NOISE` explicitly if you need them.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
 - Supported backend/output pairs are `llvm/native`, `llvm/wasm-wasip1`, `llvm/wasm-wasip2`, and `llvm/wasm-web`.

@@ -6,7 +6,7 @@ default_target = "app"
 [comments]
 categories = [
     "INTENT", "WHY", "ASSUMPTION", "RISK", "SOURCE", "WORKAROUND", "TODO",
-    "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP", "TYPE", "REPLAY", "NOISE",
+    "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP",
 ]
 
 [builders.native]
