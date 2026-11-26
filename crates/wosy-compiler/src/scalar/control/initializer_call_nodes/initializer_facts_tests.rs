@@ -568,3 +568,29 @@ data[0] = 2;
         assert_ne!(observed_across_revisions[0], observed_across_revisions[1]);
     }
 }
+
+#[test]
+fn initializer_local_byte_extent_requires_one_closed_qualified_block() {
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (extra, enrolled) in [("", true), ("if (true) { data[1] = 8; };", false)] {
+            let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u8[count] data; data[0] = 7; {extra} 1 }} else {{ 2 }};\n%%end");
+            let source = SourceIdentity::new("p".into(), "app".into(), "extent.w".into(), "r1".into());
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&source, &text), Vec::new())],
+                vec![source],
+                ScalarPreparationInputs { target_layout: layout },
+            ).unwrap_or_else(|error| panic!("{layout:?}: {:?}", error.diagnostics));
+            let facts = prepared.initializer_facts(0).unwrap();
+            let nodes = InitializerCallNodes::bind(facts.region, facts.items).unwrap();
+            let ScalarItem::Binding(selected) = &facts.items[0] else { unreachable!() };
+            let ScalarExpression::If { then_branch, .. } = &selected.value else { unreachable!() };
+            let ScalarBlockItem::LocalBinding(data) = &then_branch.items[1] else { unreachable!() };
+            let ScalarBlockItem::Assignment(write) = &then_branch.items[2] else { unreachable!() };
+            let place = &write.targets[0].place;
+            let ScalarPlace::Index { base, .. } = place else { unreachable!() };
+            assert_eq!(nodes.checked_local_array(data), enrolled);
+            assert_eq!(nodes.checked_local_index(place, base), enrolled.then_some(data.receivers[0].name_span));
+            assert_eq!(nodes.checked_local_index(place, &base.as_ref().clone()), None);
+        }
+    }
+}

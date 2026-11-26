@@ -494,7 +494,18 @@ pub(super) fn place_pointer<'ctx, 'module>(
             {
                 // Snapshot the extent paired with this base before a selector
                 // expression may evaluate arbitrary calls or local assignments.
-                capture_local_runtime_extent(context, state, base, base_pointer, true)?
+                if let Some(declaration) = state.initializer_nodes.and_then(|nodes| nodes.checked_local_index(place, base)) {
+                    let crate::ScalarPlace::Name { name, .. } = base.as_ref() else {
+                        return Err("checked initializer index lost its exact lexical base".into());
+                    };
+                    let Some((storage, ScalarType::RuntimeArray { element, .. })) = state.storage.get(name) else {
+                        return Err("checked initializer index lost its original storage".into());
+                    };
+                    capture_paired_runtime_extent(context, state, name, storage, element, base_pointer,
+                        true, || Some(declaration))?
+                } else {
+                    capture_local_runtime_extent(context, state, base, base_pointer, true)?
+                }
             } else {
                 None
             };

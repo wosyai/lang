@@ -20,6 +20,8 @@ pub(crate) struct InitializerCallNodes<'a> {
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     float_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     integer_conversion_sources: HashMap<*const ScalarExpression, &'a ScalarType>,
+    checked_local_arrays: HashSet<*const ScalarBinding>,
+    checked_local_indexes: HashMap<*const ScalarPlace, (*const ScalarPlace, ByteSpan)>,
     items: PhantomData<&'a [ScalarItem]>,
 }
 
@@ -46,6 +48,8 @@ impl<'a> InitializerCallNodes<'a> {
             members: HashMap::with_capacity(topology.identities.members.len()),
             float_types: HashMap::new(),
             integer_conversion_sources: HashMap::new(),
+            checked_local_arrays: HashSet::new(),
+            checked_local_indexes: HashMap::new(),
             items: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -107,6 +111,11 @@ impl<'a> InitializerCallNodes<'a> {
                 }
             }
         };
+        let mut initializer_places = topology.identities.roots.iter().any(|(place, root)| {
+            matches!(root, InitializationStorage::Lexical(_))
+                && matches!(topology.structure.checked_types.places.get(place),
+                    Some(ScalarType::RuntimeArray { element, .. }) if element.as_ref() == &ScalarType::U8)
+        }).then(|| CallableProofNodes { initializer_bindings: true, ..Default::default() });
         Binder {
             structure: &topology.structure,
             source: &region.source,
@@ -114,9 +123,12 @@ impl<'a> InitializerCallNodes<'a> {
             bind_call: &mut bind_call,
             bind_type: Some(&mut bind_type),
             bind_named_place: None,
-            proof_nodes: None,
+            proof_nodes: initializer_places.as_mut(),
         }
         .initializer_items(region, items)?;
+        if let Some(initializer_places) = initializer_places {
+            nodes.collect_local_array_indexes(topology, initializer_places);
+        }
         if nodes.targets.len() != topology.calls.len() {
             return Err(format!(
                 "internal error: initializer call topology does not match canonical items in {:?}",
@@ -124,6 +136,109 @@ impl<'a> InitializerCallNodes<'a> {
             ));
         }
         Ok(nodes)
+    }
+
+    fn collect_local_array_indexes(
+        &mut self,
+        topology: &ModuleInitializationTopology,
+        nodes: CallableProofNodes<'a>,
+    ) {
+        let structure = &topology.structure;
+        let mut rejected = HashSet::new();
+        for identity in topology.identities.names.values() {
+            if let InitializationName::Storage(InitializationStorage::Lexical(local)) = identity {
+                rejected.insert(local.declaration_span);
+            }
+        }
+        for destination in topology.identities.destinations.values() {
+            if let InitializationDestination::Existing(InitializationStorage::Lexical(local)) = destination {
+                rejected.insert(local.declaration_span);
+            }
+        }
+        for member in topology.identities.members.values() {
+            if let InitializationMember::Field { receiver: InitializationStorage::Lexical(local), .. } = member {
+                rejected.insert(local.declaration_span);
+            }
+        }
+        let write_indexes = structure.edges.iter().filter_map(|(&(parent, edge), &node)| {
+            match (parent, edge, node) {
+                (Parent::Block(block), Edge::AssignmentDestination { item, destination: 0 }, Node::Place(index)) =>
+                    Some((index, (block, item))),
+                _ => None,
+            }
+        }).collect::<HashMap<_, _>>();
+        let indexed_bases = structure.edges.iter().filter_map(|(&(parent, edge), &node)| {
+            match (parent, edge, node) {
+                (Parent::Place(index), Edge::PlaceBase, Node::Place(base)) => Some((base, index)),
+                _ => None,
+            }
+        }).collect::<HashMap<_, _>>();
+        let places = nodes.places.into_iter().map(|(place, ordinal)| (ordinal, place)).collect::<HashMap<_, _>>();
+        let mut candidates = Vec::new();
+        for (&base, &root) in &topology.identities.roots {
+            let InitializationStorage::Lexical(local) = root else { continue };
+            let exact = (|| {
+                let &index = indexed_bases.get(&base)?;
+                let &(block, item) = write_indexes.get(&index)?;
+                if structure.blocks.get(block.0)?.span != local.block_span { return None; }
+                let Node::Expression(selector) = *structure.edges.get(&(Parent::Place(index), Edge::PlaceIndex))?
+                    else { return None };
+                let ScalarType::RuntimeArray { element, .. } = structure.checked_types.places.get(&base)?
+                    else { return None };
+                if *element.as_ref() != ScalarType::U8
+                    || structure.checked_types.places.get(&index) != Some(element.as_ref())
+                    || structure.checked_types.expressions.get(&selector) != Some(&ScalarType::U64)
+                { return None; }
+                let group = topology.assignments.get(&(block, item))?;
+                let destinations = group.destinations();
+                let [target] = destinations.as_slice() else { return None };
+                if target.destination != index || group.rhs_evaluations().len() != 1
+                    || group.projected_outputs().len() != 0
+                { return None; }
+                Some((local, block, item, *places.get(&index)?, *places.get(&base)?))
+            })();
+            if let Some(candidate) = exact { candidates.push(candidate); }
+            else { rejected.insert(local.declaration_span); }
+        }
+        // The qualified owner must be the original allocation in this very
+        // block and precede its only admitted uses. Never treat a spelling or
+        // a coincident byte capacity as authority to enroll another binding.
+        let mut owners = HashMap::new();
+        for binding_node in nodes.initializer_allocations {
+            let binding = std::ptr::from_ref(binding_node);
+            let Some(position) = nodes.bindings.get(&binding) else { continue };
+            let Some(region) = structure.blocks.get(position.block.0) else { continue };
+            let Some(Node::Expression(length)) = structure.edges.get(&(
+                Parent::Block(position.block), Edge::BindingAllocationLength { item: position.item, position: 0 },
+            )) else { continue };
+            if structure.checked_types.expressions.get(length) != Some(&ScalarType::U64) { continue; }
+            let [receiver] = binding_node.receivers.as_slice() else { continue };
+            if !binding_node.is_allocation || !matches!(&receiver.ty,
+                ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+            { continue; }
+            if owners.insert(receiver.name_span, (binding, position, region.span)).is_some() {
+                rejected.insert(receiver.name_span);
+            }
+        }
+        for &(local, block, item, _, _) in &candidates {
+            if !owners.get(&local.declaration_span).is_some_and(|(_, position, span)|
+                position.block == block && position.item < item && *span == local.block_span)
+            { rejected.insert(local.declaration_span); }
+        }
+        for (local, _, _, index, base) in candidates {
+            if rejected.contains(&local.declaration_span) { continue; }
+            self.checked_local_arrays.insert(owners[&local.declaration_span].0);
+            self.checked_local_indexes.insert(index, (base, local.declaration_span));
+        }
+    }
+
+    pub(crate) fn checked_local_array(&self, binding: &ScalarBinding) -> bool {
+        self.checked_local_arrays.contains(&std::ptr::from_ref(binding))
+    }
+
+    pub(crate) fn checked_local_index(&self, projection: &ScalarPlace, base: &ScalarPlace) -> Option<ByteSpan> {
+        let &(expected, declaration) = self.checked_local_indexes.get(&std::ptr::from_ref(projection))?;
+        (expected == std::ptr::from_ref(base)).then_some(declaration)
     }
 
     pub(crate) fn checked_float_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
@@ -197,6 +312,7 @@ pub(crate) struct CallableBodyCallNodes<'a> {
 struct CallableProofNodes<'a> {
     calls: Option<&'a FunctionCallSites>,
     initializer_bindings: bool,
+    initializer_allocations: Vec<&'a ScalarBinding>,
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
@@ -1336,6 +1452,9 @@ impl<'a> Binder<'a, '_> {
         binding: &'a ScalarBinding,
     ) -> Result<(), String> {
         if let (Some(nodes), Parent::Block(block)) = (&mut self.proof_nodes, parent) {
+            if nodes.initializer_bindings && binding.is_allocation {
+                nodes.initializer_allocations.push(binding);
+            }
             if nodes.calls.is_some() || nodes.initializer_bindings {
                 nodes
                     .bindings

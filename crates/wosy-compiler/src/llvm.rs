@@ -2672,7 +2672,10 @@ fn store_runtime_allocation<'ctx, 'module>(
     { return Err("generated array requires its ordinary direct owning backing".into()); }
     let grouped_extent = state.aggregate.as_ref().is_some_and(|aggregate|
         aggregate.plan().grouped_owning_extent_roots.contains(&declaration));
-    let checked_extent = widened || generated || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+    let checked_initializer = construction == RuntimeArrayConstructionKind::Ordinary && !mutable
+        && state.require_release_checked_access
+        && state.initializer_nodes.is_some_and(|nodes| nodes.checked_local_array(binding));
+    let checked_extent = widened || generated || checked_initializer || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
         || (prepared && (state.require_release_checked_access || grouped_extent)
             && state.indexed_runtime_allocations.contains(&declaration));
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
