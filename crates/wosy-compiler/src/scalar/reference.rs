@@ -7072,6 +7072,17 @@ impl ProjectCallSiteResults {
         &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
         declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
     ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
+        self.owned_startup_callable_uses_with_forwarder(caller, sources, declarations, rank_self, None)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn owned_startup_callable_uses_with_forwarder<'a>(
+        &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
+        declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>,
+        rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
+        forwarder: Option<(usize, OccurrenceOrdinal)>,
+    ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
+        if forwarder.is_some() && (sources.len() != 2 || rank_self.is_none()) { return None; }
         if !(1..=super::checker_flow::MAX_ACTUAL_CALL_DEPTH).contains(&sources.len())
             || self.modules.len() != sources.len() || sources.first().copied() != Some(caller)
             || sources.iter().any(|source| source.project != caller.project || source.package != caller.package)
@@ -7114,12 +7125,21 @@ impl ProjectCallSiteResults {
                     charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
                         .checked_add(body.callable_escapes.len())?)?;
                     if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
-                        || body.sites.iter().any(|site| resolved(&site.target, &startup_uses)
-                            && !matches!((&site.target, rank_self),
-                                (ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration },
-                                    Some((self_owner, self_item, self_span)))
-                                    if source == self_owner && &module.initialization.source == self_owner
-                                        && item == self_item && *declaration_span == self_span && std::ptr::eq(body, function)))
+                        || body.sites.iter().any(|site| {
+                            if !resolved(&site.target, &startup_uses) { return false; }
+                            let (ResolvedCallTarget::ModuleCallable {
+                                source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                            }, Some((self_owner, self_item, self_span))) = (&site.target, rank_self)
+                                else { return true; };
+                            if source != self_owner || *declaration_span != self_span || !std::ptr::eq(body, function) {
+                                return true;
+                            }
+                            let recursive = &module.initialization.source == self_owner && item == self_item;
+                            let forwarded = &module.initialization.source == caller
+                                && forwarder.is_some_and(|(wrapper, occurrence)| item == wrapper
+                                    && body.resolved_call_site(occurrence).is_some_and(|expected| std::ptr::eq(expected, site)));
+                            !(recursive || forwarded)
+                        })
                         || body.allocation_length_call_targets.values().any(|call| resolved(call, &startup_uses))
                     { return None; }
                 }

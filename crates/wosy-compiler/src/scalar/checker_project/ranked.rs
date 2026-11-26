@@ -324,6 +324,7 @@ impl RankLane {
 pub(super) struct CappedTailRecipe {
     pub(super) target: PreparedCallable,
     pub(super) site: OccurrenceOrdinal,
+    pub(super) forwarder: Option<(PreparedCallable, OccurrenceOrdinal)>,
     operations: Vec<IntegerTailOperand>,
     rank_axes: Vec<usize>,
     domains: Vec<IntegerSet>,
@@ -567,7 +568,7 @@ fn verify_impl<'a>(
                     Coordinate::Literal(v) => IntegerTailOperand::Literal(v.clone().into_owned()),
                     _ => return Err(ProjectCheck::Unsupported),
                 })).collect::<Result<Vec<_>, _>>()?;
-                **capture = Some(CappedTailRecipe { target: plan.target, site: output, operations,
+                **capture = Some(CappedTailRecipe { target: plan.target, site: output, operations, forwarder: None,
                     rank_axes: rank.axes().map(|(axis, _)| axis.ordinal).collect(), domains: entry.0.clone() });
             }
             if let Some((equation, context)) = rewrite {

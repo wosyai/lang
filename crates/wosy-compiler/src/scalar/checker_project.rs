@@ -2257,7 +2257,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
         topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|target|
             ordered.failures.borrow().startup_search.as_ref().is_some_and(|search| {
                 let search = search.borrow();
-                search.owns_initialization(caller) && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == *target)
+                search.owns_initialization(caller) && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == *target || recipe.forwarder.is_some_and(|(wrapper, _)| wrapper == *target))
                     && search.required_sites.get(&occurrence) == Some(&(*target, failure_search::StartupProofRole::Ranked))
             })));
     #[cfg(not(feature = "internal-checker"))]
@@ -3588,16 +3588,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         let cited_helper = NAMED && frame.source == child.source
                             && matches!(call, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
                             && target.is_some_and(|target| self.enrolled_citation_helper(&trace.borrow(), active_collection, frame.body, call.occurrence(), target));
-                        if !(qualified_scalar || context_edge || cited_helper || (rank_self && frame.source == child.source)) {
-                            return Err(ProjectCheck::Unsupported);
-                        }
                         let span = frame.body.occurrences.get(call.occurrence().0)
                             .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        let wide_forward = frame.source != child.source && trace.borrow().pending_wide_forward.as_ref()
+                            .is_some_and(|(_, inner, _)| inner.range == span && &inner.source == frame.source)
+                            && target == traced_rank;
+                        if !(qualified_scalar || context_edge || cited_helper || wide_forward || (rank_self && frame.source == child.source)) {
+                            return Err(ProjectCheck::Unsupported);
+                        }
                         trace.borrow_mut().append(failure_search::PathStep::Call(
                             wosy_syntax::SourceSpan::new(frame.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
                         child.cursor.track_startup_path(child.source, Rc::clone(&trace), false).ok_or(ProjectCheck::Unsupported)?;
                         #[cfg(test)]
-                        if rank_self { trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?); }
+                        if rank_self || wide_forward { trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?); }
                     }
                     frames.push(child);
                 }
@@ -3738,8 +3741,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         drop(trace_state);
                         let span = parent.body.occurrences.get(effect.occurrence().0)
                             .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-                        trace.borrow_mut().append(failure_search::PathStep::Return(
-                            wosy_syntax::SourceSpan::new(parent.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                        let site = wosy_syntax::SourceSpan::new(parent.source.clone(), span);
+                        let mut trace = trace.borrow_mut();
+                        if parent.source != completed.source && trace.ranked_target == Some(target) {
+                            let (outer, inner, arguments) = trace.pending_wide_forward.take().ok_or(ProjectCheck::Unsupported)?;
+                            let ActualCallResult::Integer(returned) = &result else { return Err(ProjectCheck::Unsupported); };
+                            if inner != site { return Err(ProjectCheck::Unsupported); }
+                            trace.wide_rank_observations.push(failure_search::WideRankObservation {
+                                target, site: inner, outer: Some(outer), arguments, returned: returned.clone(),
+                            });
+                        }
+                        trace.append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
                     }
                     parent.cursor.resume(effect, caller_axis, result).ok_or(ProjectCheck::Unsupported)?;
                 }
@@ -3966,6 +3978,23 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         && completed_namespace_owner(startup, parent.source, target.0, ordered.visits)))))
                 .then(|| Rc::clone(recipe))
         });
+        #[cfg(feature = "internal-checker")]
+        let forward_recipe = collection.and_then(|ordered| {
+            let effects = ordered.failures.borrow();
+            let trace = effects.startup_search.as_ref()?.borrow();
+            let recipe = trace.wide_rank_recipe.as_ref()?;
+            let (wrapper, occurrence) = recipe.forwarder?;
+            let outer = ordered.startup_site?;
+            let startup = ordered.startup_site_source?;
+            (matches!(effect, ExactCallEffect::TailInteger { .. }) && !NAMED && occurrence == call
+                && recipe.target == target && parent.source == startup && trace.owns_initialization(startup)
+                && trace.required_sites.get(&outer.occurrence) == Some(&(wrapper, failure_search::StartupProofRole::Ranked))
+                && self.calls.function_body(wrapper.0, wrapper.1, None).is_some_and(|actual| std::ptr::eq(actual, caller))
+                && completed_namespace_owner(startup, &owner.source, target.0, ordered.visits))
+                .then(|| Rc::clone(recipe))
+        });
+        #[cfg(not(feature = "internal-checker"))]
+        let forward_recipe: Option<()> = None;
         #[cfg(not(feature = "internal-checker"))]
         let wide_recipe: Option<()> = None;
         #[cfg(feature = "internal-checker")]
@@ -3977,7 +4006,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let traced_self = false;
         #[cfg(feature = "internal-checker")]
         if matches!(effect, ExactCallEffect::TailInteger { .. }) {
-            if collection.is_none() || parent.source != &owner.source || (self.active.contains(&target) && !traced_self) {
+            if collection.is_none() || (parent.source != &owner.source && forward_recipe.is_none()) || (self.active.contains(&target) && !traced_self) {
                 return Err(ProjectCheck::Unsupported);
             }
             if !ACTUAL_STARTUP {
@@ -4011,7 +4040,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let enrolled_cross_source_leaf = nested_scalar && cross_source_leaf;
         #[cfg(not(feature = "internal-checker"))]
         let enrolled_cross_source_leaf = false;
-        if collection.is_some_and(|collection| parent.source != &owner.source && !enrolled_cross_source_leaf
+        if collection.is_some_and(|collection| parent.source != &owner.source && !enrolled_cross_source_leaf && forward_recipe.is_none()
             && !self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, collection.visits))
         {
             return Err(ProjectCheck::Unsupported);
@@ -4049,10 +4078,30 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 .borrow_mut().charge_formal_replay(1, recipe.work().ok_or(ProjectCheck::Unsupported)?)
                 .ok_or(ProjectCheck::Unsupported)?;
             Some(recipe.compute(caller, &parent.cursor, &signature.parameters).ok_or(ProjectCheck::Unsupported)?)
+        } else if let Some(recipe) = &forward_recipe {
+            let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
+            let startup_site = ordered.startup_site.ok_or(ProjectCheck::Unsupported)?;
+            let outer_range = startup_site.topology.occurrences.get(startup_site.occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
+            let inner_range = caller.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span;
+            let effects = ordered.failures.borrow();
+            let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
+            if trace.pending_wide_forward.is_some() { return Err(ProjectCheck::Unsupported); }
+            trace.charge_formal_replay(1, recipe.work().ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+            let formals = caller.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+            if formals.len() != signature.parameters.len() { return Err(ProjectCheck::Unsupported); }
+            let tuple = formals.iter().zip(&signature.parameters)
+                .map(|(binding, ty)| parent.cursor.contextual_singleton(binding, ty))
+                .collect::<Option<Vec<_>>>().ok_or(ProjectCheck::Unsupported)?;
+            if !recipe.accepts(&tuple) { return Err(ProjectCheck::Unsupported); }
+            let values = tuple.into_iter().cloned().collect::<Vec<_>>();
+            trace.pending_wide_forward = Some((
+                wosy_syntax::SourceSpan::new(parent.source.clone(), outer_range),
+                wosy_syntax::SourceSpan::new(parent.source.clone(), inner_range), values.clone()));
+            Some(values)
         } else { None };
         #[cfg(not(feature = "internal-checker"))]
         let wide_values: Option<Vec<BigInt>> = None;
-        let arguments = if wide_recipe.is_some() { NestedIntegerArgument::Single(None) } else { parent.cursor.arguments(
+        let arguments = if wide_values.is_some() { NestedIntegerArgument::Single(None) } else { parent.cursor.arguments(
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
@@ -4257,7 +4306,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         self.active_depth += 1;
         Ok(ExactCallActivation {
             body, source: &owner.source, cursor,
-            entry: if traced_self { exact.first().copied() } else { self.exact_self_entry(Some(exact)) }.cloned(),
+            entry: if traced_self || forward_recipe.is_some() { exact.first().copied() } else { self.exact_self_entry(Some(exact)) }.cloned(),
             followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
             named_site,
@@ -4309,7 +4358,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     || (signature.parameters.len() == 1 && is_integer_type(expected) && plain_scalar_wrapper));
             let matches_wide_rank = pending == Some(&(target, Ranked))
                 && (caller == &owner.source || search.allows_qualified_scalar_proof(caller, call, target))
-                && ordered.scalar_initializer.is_some() && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == target)
+                && ordered.scalar_initializer.is_some() && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == target || recipe.forwarder.is_some_and(|(wrapper, _)| wrapper == target))
                 && (3..=MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len());
             let matches_ranked = pending == Some(&(target, Ranked))
                 && (caller == &owner.source || search.allows_qualified_scalar_proof(caller, call, target))
@@ -4656,9 +4705,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let caller_site = wosy_syntax::SourceSpan::new(ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?.clone(), at);
             if startup_wide_rank {
                 if role != Ranked { return Err(ProjectCheck::Unsupported); }
-                trace.wide_rank_observations.push(failure_search::WideRankObservation {
-                    target, site: caller_site, arguments: exact.iter().map(|value| (*value).clone()).collect(), returned: value.clone(),
-                });
+                let recipe = trace.wide_rank_recipe.as_ref().ok_or(ProjectCheck::Unsupported)?;
+                if recipe.forwarder.is_some() {
+                    if trace.pending_wide_forward.is_some() || !trace.wide_rank_observations.last().is_some_and(|inner|
+                        inner.outer.as_ref() == Some(&caller_site) && inner.target == recipe.target && inner.returned == value) {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                } else { trace.wide_rank_observations.push(failure_search::WideRankObservation {
+                    target, site: caller_site, outer: None, arguments: exact.iter().map(|value| (*value).clone()).collect(), returned: value.clone(),
+                }); }
                 if proof_only && !trace.proof_only_continuation() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
                 return Ok(ActualCallResult::Integer(value));
             }
@@ -11064,7 +11119,8 @@ fn run_startup_authored_path(
         search.enroll_proof_sites(target, Bare, sites).ok_or(ProjectCheck::Unsupported)?;
     }
     if let Some((target, sites)) = ranked {
-        search.enroll_proof_sites(target, Ranked, sites).ok_or(ProjectCheck::Unsupported)?;
+        let start = search.wide_rank_recipe.as_ref().and_then(|recipe| recipe.forwarder).map_or(target, |(wrapper, _)| wrapper);
+        search.enroll_proof_sites(start, Ranked, sites).ok_or(ProjectCheck::Unsupported)?;
     }
     let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
@@ -11072,7 +11128,7 @@ fn run_startup_authored_path(
     );
     let mut search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || !search.required_sites.is_empty() { return Err(ProjectCheck::Unsupported); }
+    if search.invalid() || !search.required_sites.is_empty() || search.pending_wide_forward.is_some() { return Err(ProjectCheck::Unsupported); }
     let (completion, active) = match outcome {
         Ok((initialization, _)) if cap.is_none() =>
             (StartupAuthoredCompletion::LimitReached, initialization.had_obligations),
@@ -11768,12 +11824,24 @@ fn run_private_named_after_startup(
     if (plans.is_empty() && ranked.is_none()) || (ranked.is_some() && plans.len() > 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
     { return Err(ProjectCheck::Unsupported); }
-    let incoming = calls.owned_direct_startup_callable_uses_in(root,
-        &project.initialization_order.iter().collect::<Vec<_>>(),
-        plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
-        ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
-    let ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
+    let forwarder = if qualified && plans.is_empty() && expected.is_none() {
+        if let Some(plan) = ranked.as_ref().filter(|plan| plan.typed.body.boundary.parameters.len() > 2) {
+            private_wide_rank_forwarder(project, calls, root, &ordinals, plan)?
+        } else { None }
+    } else { None };
+    let sources = project.initialization_order.iter().collect::<Vec<_>>();
+    let incoming = calls.owned_startup_callable_uses_with_forwarder(root, &sources,
+        plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span))
+            .chain(forwarder.iter().map(|(_, span, _)| (root, *span))),
+        ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span)),
+        forwarder.map(|(wrapper, _, site)| (wrapper.1, site))).ok_or(ProjectCheck::Unsupported)?;
+    let direct_ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
         .map(Vec::as_slice).ok_or(ProjectCheck::Unsupported)).transpose()?.unwrap_or_default();
+    let ranked_sites = if let Some((_, span, _)) = forwarder {
+        let sites = incoming.get(&(root, span)).ok_or(ProjectCheck::Unsupported)?;
+        if !direct_ranked_sites.is_empty() || sites.is_empty() { return Err(ProjectCheck::Unsupported); }
+        sites.as_slice()
+    } else { direct_ranked_sites };
     let reached_rank = !ranked_sites.is_empty();
     if reached_rank && ranked_requires_equality { return Err(ProjectCheck::Unsupported); }
     let mut invoked = Vec::new();
@@ -11832,7 +11900,8 @@ fn run_private_named_after_startup(
         let plan = ranked.as_ref().ok_or(ProjectCheck::Unsupported)?;
         if plan.typed.body.boundary.parameters.len() > 2 {
             if !plans.is_empty() || expected.is_some() { return Err(ProjectCheck::Unsupported); }
-            let (verified, recipe) = prepare_capped_wide_ranked_receipts(plan)?;
+            let (verified, mut recipe) = prepare_capped_wide_ranked_receipts(plan)?;
+            recipe.forwarder = forwarder.map(|(target, _, site)| (target, site));
             (Some(verified), Some(Rc::new(recipe)))
         } else { (Some(prepare_capped_ranked_receipts(plan)?), None) }
     } else { (None, None) };
@@ -11920,6 +11989,53 @@ fn prepare_capped_ranked_receipts<'a>(
     { return Err(ProjectCheck::Unsupported); }
     VerifiedInductionExactReturn::verify(plan, plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)
         .1.ok_or(ProjectCheck::Unsupported)
+}
+
+/// Select only a pure, single-call root wrapper that forwards its
+/// original checked formal tuple, unchanged, to the exact provider.
+#[cfg(feature = "internal-checker")]
+fn private_wide_rank_forwarder(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, root: &SourceIdentity,
+    ordinals: &HashMap<&SourceIdentity, usize>, rank: &PlannedModuleProof<'_>,
+) -> Result<Option<(PreparedCallable, ByteSpan, OccurrenceOrdinal)>, ProjectCheck> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let &module = ordinals.get(root).ok_or(ProjectCheck::Unsupported)?;
+    let mut found = None;
+    let mut work = 0;
+    for (index, item) in project.modules[module].items.iter().enumerate() {
+        super::checker_flow::charge_call_work(&mut work, 1).ok_or(ProjectCheck::Unsupported)?;
+        let ScalarItem::Function(function) = item else { continue; };
+        let body = calls.function_body(module, index, None).ok_or(ProjectCheck::Unsupported)?;
+        let [call] = body.call_occurrences.as_slice() else { continue; };
+        if body.structure.checker_direct_targets.get(&call.ordinal) != Some(&rank.target) { continue; }
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+            || !body.checker_pure_calling_frame() || body.contextual_formal().is_some()
+            || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
+            || !body.conditionals.is_empty() || !body.assignments.is_empty()
+            || !body.structure.checker_directives.is_empty()
+            || body.boundary.parameters.len() != rank.typed.body.boundary.parameters.len()
+            || !matches!(body.boundary.results.as_slice(), [result] if &result.ty == rank.typed.result_type)
+        { return Err(ProjectCheck::Unsupported); }
+        let signature = body.checked_call_signatures.get(&call.ordinal).ok_or(ProjectCheck::Unsupported)?;
+        let formals = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+        if signature.parameters.len() != formals.len() { return Err(ProjectCheck::Unsupported); }
+        for (slot, formal) in formals.iter().enumerate() {
+            let Some(OccurrenceNode::Expression(arg)) = body.structure.edges.get(&(
+                OccurrenceParent::Expression(call.ordinal), OccurrenceEdge::CallArgument(slot),
+            )) else { return Err(ProjectCheck::Unsupported); };
+            if signature.parameters[slot] != body.boundary.parameters[slot].ty
+                || signature.parameters[slot] != rank.typed.body.boundary.parameters[slot].ty
+                || body.structure.checked_types.expressions.get(arg) != signature.parameters.get(slot)
+                || !matches!(body.prepared_plain_name(*arg), Some(PlainNameIdentity::Lexical(binding)) if binding == formal)
+            { return Err(ProjectCheck::Unsupported); }
+        }
+        // Precisely a sole typed tail, not a result approximation or a
+        // path that can bypass the enrolled provider occurrence.
+        if ranked_output_at(body, body.structure.root, rank.typed.result_type) != Some(call.ordinal)
+            || found.replace(((module, index), function.name_span, call.ordinal)).is_some()
+        { return Err(ProjectCheck::Unsupported); }
+    }
+    Ok(found)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -25607,6 +25723,63 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 ]);
                 let formal = prepare(&main, &provider).unwrap().run_private_proofs_after_command_cap().unwrap();
                 assert!(formal.active && formal.directives.is_empty());
+                let nested = main.replace("u8 actual = lib.descend(8, 12, 1, 4);", r#"
+                    u8(u8,u16,u8,u16) forward = fn(left, page, flag, quota) {
+                        lib.descend(left, page, flag, quota)
+                    };
+                    u8 actual = forward(8, 12, 1, 4);
+                "#);
+                for n in [1, 2, 3] {
+                    let (report, end) = prepare(&nested, &provider).unwrap()
+                        .run_private_authored_root(NonZeroUsize::new(n).unwrap()).unwrap();
+                    assert_eq!(report.directives.iter().map(|record| &record.source).collect::<Vec<_>>(),
+                        [&provider, &root][..n.min(2)]);
+                    assert_eq!(end, Some(if n <= 2 { StartupAuthoredCompletion::LimitReached }
+                        else { StartupAuthoredCompletion::Exhausted }));
+                    assert!(report.active && report.diagnostics.is_empty());
+                }
+                let prepared = prepare(&nested, &provider).unwrap();
+                let PreparedConfiguredCheck::Named { owner, .. } = &prepared.owner else { panic!("nested catalog"); };
+                let plan = owner.plan_module_proof_in_scope::<true, false, false>(&provider, "rank").unwrap();
+                let (project, calls) = owner.prepared.parts();
+                let (_, ordinals) = package_startup_order(project, &project.modules).unwrap();
+                let (wrapper, name, inner) = private_wide_rank_forwarder(project, calls, &root, &ordinals, &plan).unwrap().unwrap();
+                let (token, mut recipe) = prepare_capped_wide_ranked_receipts(&plan).unwrap();
+                recipe.forwarder = Some((wrapper, inner));
+                let sites = calls.owned_startup_callable_uses_with_forwarder(&root, &[&root, &provider],
+                    [(&provider, plan.function.name_span), (&root, name)], Some((&provider, plan.target.1, plan.function.name_span)),
+                    Some((wrapper.1, inner))).unwrap();
+                let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::new(3).unwrap()),
+                    &[], true, &[], None, Some((token.target, &sites[&(&root, name)])), false, Some(Rc::new(recipe))).unwrap();
+                let [observed] = trace.wide_rank_observations.as_slice() else { panic!("one original nested qualified return"); };
+                assert_eq!(observed.site.source, root);
+                assert_eq!(observed.arguments, [8, 12, 1, 4].map(BigInt::from));
+                assert_eq!(observed.returned, 7.into());
+                let leaf = observed.site.range;
+                let outer = observed.outer.as_ref().unwrap().range;
+                assert_eq!(&nested[leaf.start as usize..leaf.end as usize], "lib.descend(left, page, flag, quota)");
+                assert_eq!(&nested[outer.start as usize..outer.end as usize], "forward(8, 12, 1, 4)");
+                let nested_edges = trace.current_path().iter().filter_map(|step| match step {
+                    PathStep::Call(span) => Some((false, span)),
+                    PathStep::Return(span) => Some((true, span)),
+                    _ => None,
+                }).map(|(returning, span)| {
+                    let source = if span.source == root { &nested } else { assert_eq!(span.source, provider); &lib };
+                    (returning, &span.source, &source[span.range.start as usize..span.range.end as usize])
+                }).collect::<Vec<_>>();
+                let inner_call = "lib.descend(left, page, flag, quota)";
+                let recursive = "descend(left - 3, page, flag, quota)";
+                assert_eq!(nested_edges, [
+                    (false, &root, "forward(8, 12, 1, 4)"), (false, &root, inner_call),
+                    (false, &provider, recursive), (false, &provider, recursive),
+                    (true, &provider, recursive), (true, &provider, recursive),
+                    (true, &root, inner_call), (true, &root, "forward(8, 12, 1, 4)"),
+                ]);
+                let formal = prepare(&nested, &provider).unwrap().run_private_proofs_after_command_cap().unwrap();
+                assert!(formal.active && formal.directives.is_empty());
+                let permuted = nested.replace("lib.descend(left, page, flag, quota)", "lib.descend(flag, page, left, quota)");
+                assert!(matches!(prepare(&permuted, &provider).and_then(|check| check.run_private_authored_root(NonZeroUsize::MIN)),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 let outside = main.replace("descend(8, 12, 1, 4)", "descend(8, 12, 1, 5)");
                 let foreign = SourceIdentity { project: "other-project".into(), ..provider.clone() };
                 for (program, owner) in [(&outside, &provider), (&main, &foreign)] {
