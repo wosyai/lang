@@ -7137,6 +7137,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             if let ReferenceAssignmentDestination::Through(pointer_point) =
                                 destination
                             {
+                                if capture.is_none() && assignment.targets.len() == 1
+                                    && assignment.values.len() == 1
+                                    && aggregate::ordinary_value(&output_types[position])
+                                    && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
+                                {
+                                    if let Some(author) = &mut self.local_borrow {
+                                        author.prepare_projected_write(CfgPointId(self.cfg.points.len()));
+                                    }
+                                }
                                 let assign = CfgPointKind::AssignThrough {
                                     place: self.proof_place(&target.place, slot.destination).into_owned(),
                                     pointer_point,
@@ -7229,8 +7238,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     && assignment.values.len() == 1
                                     && aggregate::ordinary_value(&output_types[position])
                                     && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
-                                    && matches!(&self.cfg.points[self.cursor.expect("assignment install point").0].kind,
-                                        CfgPointKind::Assign { target, .. } if local_borrow::direct_fixed_projection(target)))
+                                    && match &self.cfg.points[self.cursor.expect("assignment install point").0].kind {
+                                        CfgPointKind::Assign { target, .. } => local_borrow::direct_fixed_projection(target),
+                                        CfgPointKind::AssignThrough { .. } => true, // already qualified by the author
+                                        _ => false,
+                                    })
                             {
                                 self.local_borrow = None;
                             }

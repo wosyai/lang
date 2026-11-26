@@ -107,6 +107,7 @@ pub(crate) struct Author {
     last_literal_aggregate: Option<CfgPointId>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
     pending_scalar_read: Option<(CfgPointId, CfgPointId, usize)>,
+    prepared_projected_write: Option<CfgPointId>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
     authored_roots: HashSet<ReferenceBindingId>,
@@ -122,6 +123,26 @@ pub(super) fn direct_fixed_projection(place: &ReferencePlaceId) -> bool {
         && place.projections.iter().all(|projection| matches!(projection,
             ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))
             | ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })))
+}
+
+fn aggregate_parent_type(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+}
+
+fn direct_root_for_summary(place: &ReferencePlaceId) -> bool {
+    direct_fixed_projection(place)
+        || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. }))
+}
+
+fn fixed_parent_projection(place: &ScalarPlace) -> bool {
+    matches!(place,
+        ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(_), .. }
+            if matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+                if matches!(pointer.as_ref(), ScalarExpression::Name { .. })))
+        || matches!(place, ScalarPlace::Index { base, index, .. }
+            if matches!(index.as_ref(), ScalarExpression::Integer { .. })
+                && matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
+                    if matches!(pointer.as_ref(), ScalarExpression::Name { .. })))
 }
 
 fn scalar_literal_tree(expression: &ScalarExpression) -> bool {
@@ -147,6 +168,7 @@ impl Author {
     ) -> bool {
         let child_hint = self.prepared_child.take();
         let scalar_read = self.pending_scalar_read.take();
+        let projected_write = self.prepared_projected_write.take();
         if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
             && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. })
             && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id))
@@ -186,7 +208,11 @@ impl Author {
             }
             CfgPointKind::Bind { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { inner, .. }) =>
-                    scope == ReferenceScopeId(0) && aggregate::ordinary_value(inner),
+                    scope == ReferenceScopeId(0) && (aggregate::ordinary_value(inner)
+                        || (aggregate_parent_type(inner) && self.pending_loan.is_some_and(|pending|
+                            matches!(points.get(pending.issued.0).map(|point| &point.kind),
+                                Some(CfgPointKind::Borrow { place, loan }) if loan.parent.is_none()
+                                    && place.projections.is_empty() && types.get(&place.binding) == Some(inner.as_ref()))))),
                 Some(ty) => {
                     let aggregate = matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
                         && self.last_literal_aggregate.is_some_and(|value| value.0.checked_add(1) == Some(id.0));
@@ -214,6 +240,14 @@ impl Author {
                         && (self.pending_loan.is_some()
                             || types.get(&target.binding).is_some_and(aggregate::ordinary_value))
                 },
+            CfgPointKind::AssignThrough { place, pointer_point, .. } =>
+                projected_write == Some(id) && fixed_parent_projection(place)
+                    && self.last_holder_read == Some(*pointer_point)
+                    && matches!(points.get(pointer_point.0).map(|point| &point.kind),
+                        Some(CfgPointKind::Read { binding }) if matches!(types.get(binding),
+                            Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                                if aggregate_parent_type(inner))
+                            && self.holders.get(binding).is_some_and(|holder| holder.writes.len() == 1)),
             CfgPointKind::ReadPlace { place: ScalarPlace::Dereference { .. }, pointer_point: Some(pointer),
                 candidates, reads_origin: false, .. } =>
                 candidates.is_empty() && self.last_holder_read == Some(*pointer)
@@ -241,6 +275,9 @@ impl Author {
                             aggregate::ordinary_value(&binding.ty)
                             && (binding.local_reborrow_scope == Some(ReferenceScopeId(0))
                                 || self.authored_roots.contains(&place.binding))))
+                        || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })
+                            && self.authored_roots.contains(&place.binding)
+                            && types.get(&place.binding).is_some_and(aggregate_parent_type))
                         || (direct_fixed_projection(place) && self.authored_roots.contains(&place.binding)
                             && matches!(types.get(&place.binding), Some(ScalarType::Struct(_) | ScalarType::Array { .. })))) =>
             {
@@ -268,13 +305,25 @@ impl Author {
                 let [installed] = holder.writes.as_slice() else { return false };
                 let Some(CfgPointKind::Borrow { place: original, loan: exact }) =
                     points.get(installed.loan.issued.0).map(|point| &point.kind) else { return false };
-                if self.last_holder_read != Some(parent) || parent.0.checked_add(1) != Some(id.0)
+                let plain = matches!(&place.place, ScalarPlace::Dereference { pointer, .. }
+                    if matches!(pointer.as_ref(), ScalarExpression::Name { .. }));
+                let projected = fixed_parent_projection(&place.place)
+                    && original.projections.is_empty()
+                    && types.get(&original.binding).is_some_and(aggregate_parent_type);
+                let [ReferencePlaceProjection::Dereference(carried), rest @ ..] = place.projections.as_slice()
+                    else { return false; };
+                let selector_ok = if matches!(&place.place, ScalarPlace::Index { .. }) {
+                    parent.0.checked_add(2) == Some(id.0)
+                        && matches!(points.last().map(|point| &point.kind),
+                            Some(CfgPointKind::Evaluate(ScalarExpression::Integer { .. })))
+                } else { parent.0.checked_add(1) == Some(id.0) };
+                if self.last_holder_read != Some(parent) || !selector_ok
                     || !self.open_forks.is_empty() || self.forks.len() != 0
                     || read.scope != scope || installed.version >= parent
-                    || !matches!(&place.place, ScalarPlace::Dereference { pointer, .. }
-                        if matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
-                    || !matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(carried)]
-                        if carried.as_ref() == parent_loan)
+                    || !(plain && rest.is_empty() || projected && matches!(rest,
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))]
+                        | [ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })]))
+                    || carried.as_ref() != parent_loan
                     || exact != parent_loan || exact.parent.is_some()
                     || exact.origin_place != *original || loan.origin_place != *place
                     || original.binding != place.binding
@@ -295,6 +344,10 @@ impl Author {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn prepare_projected_write(&mut self, at: CfgPointId) {
+        self.prepared_projected_write = Some(at);
     }
 
     pub(super) fn prepare_named_child(&mut self, child: CfgPointId, parent: CfgPointId) {
@@ -1058,9 +1111,7 @@ impl Sealed {
             };
             if &place.binding != owner || loan.origin_place != *place { return None; }
             match loan.parent.as_deref() {
-                None if (direct_fixed_projection(place)
-                    || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })))
-                    && mode.accepts(loan.mode == ScalarReferenceMutability::Mutable) => {}
+                None if direct_root_for_summary(place) && mode.accepts(loan.mode == ScalarReferenceMutability::Mutable) => {}
                 Some(parent) => {
                     let parent_issue = *self.child_parents.get(&issue)?;
                     let CfgPointKind::Borrow { loan: original, .. } = &points.get(parent_issue.0)?.kind
@@ -1772,6 +1823,109 @@ unit() examine = fn {
             assert_eq!(actual, definitive(&mut incumbent));
             assert!(actual.is_empty(), "{actual:?}");
             assert!(counts[8] > 0, "actual transfer must refine the sibling store: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn authored_projected_child_keeps_existing_parent_mediated_sibling_write() {
+        let text = "%%start
+struct Pair { u16 left; u16 right; }
+unit() examine = fn {
+    Pair owner = { .left = 7; .right = 9; };
+    *!Pair parent = &!owner;
+    *u16 child = &(*parent).left;
+    (*parent).right = 3;
+    u16 observed = *child;
+    owner.right = 11;
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "field-child.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = || {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().next().unwrap().1
+            };
+            let mut staged = prepared();
+            let mut incumbent = prepared();
+            incumbent.proof_points.local_borrow = None;
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("authored field child");
+            let points = &staged.cfg.initial_points;
+            let [(&child, &issue)] = sealed.child_parents.iter().collect::<Vec<_>>().as_slice()
+                else { panic!("one exact field child and original whole parent"); };
+            let CfgPointKind::Borrow { place, loan } = &points[child.0].kind else { unreachable!() };
+            let CfgPointKind::Borrow { loan: parent, .. } = &points[issue.0].kind else { unreachable!() };
+            assert_eq!(loan.parent.as_deref(), Some(parent));
+            assert!(parent.origin_place.projections.is_empty());
+            assert!(matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_),
+                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))]));
+            assert!(points.iter().any(|point| matches!(&point.kind, CfgPointKind::AssignThrough { .. })));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[7] > 0, "actual transfer must clear the direct store after both last uses: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn authored_fixed_index_child_preserves_whole_parent_issuance() {
+        let text = "%%start
+unit() examine = fn {
+    u16[2] owner = [7, 9];
+    *!(u16[2]) parent = &!owner;
+    *u16 child = &(*parent)[0];
+    u16 observed = *child;
+    owner[1] = 11;
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "index-child.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = || {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().next().unwrap().1
+            };
+            let mut staged = prepared();
+            let mut incumbent = prepared();
+            incumbent.proof_points.local_borrow = None;
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("authored fixed-index child");
+            let points = &staged.cfg.initial_points;
+            let [(&child, &issue)] = sealed.child_parents.iter().collect::<Vec<_>>().as_slice()
+                else { panic!("one fixed-index child and original whole parent"); };
+            let CfgPointKind::Borrow { place, loan } = &points[child.0].kind else { unreachable!() };
+            let CfgPointKind::Borrow { loan: parent, .. } = &points[issue.0].kind else { unreachable!() };
+            assert_eq!(loan.parent.as_deref(), Some(parent));
+            assert!(parent.origin_place.projections.is_empty());
+            assert!(matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_),
+                ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })]));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[7] > 0, "actual transfer must clear the direct store after both last uses: {counts:?}");
         }
     }
 
