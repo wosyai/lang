@@ -10939,13 +10939,13 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        run_startup_authored_path(&self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None)
+        run_startup_authored_path(&self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None, false)
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>,
+    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if proof_free_scalars.is_some() || qualified { project.initialization_order.len() }
@@ -10971,7 +10971,7 @@ fn run_startup_authored_path(
     let bare_activations = named.iter().try_fold(0usize, |total, (_, sites)| total.checked_add(sites.len()))
         .ok_or(ProjectCheck::Unsupported)?;
     search.metered_frames = bare_activations > 1 || ranked.is_some_and(|(_, sites)| sites.len() > 1);
-    search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || ranked.is_some();
+    search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || ranked.is_some() || retain_single_bare;
     use failure_search::StartupProofRole::{Bare, Ranked};
     for &(target, sites) in named {
         search.enroll_proof_sites(target, Bare, sites).ok_or(ProjectCheck::Unsupported)?;
@@ -11671,6 +11671,7 @@ fn run_private_named_after_startup(
     let reached_rank = !ranked_sites.is_empty();
     if reached_rank && ranked_requires_equality { return Err(ProjectCheck::Unsupported); }
     let mut invoked = Vec::new();
+    let mut reached_scalar_relation = false;
     let mut activation_count = 0usize;
     for plan in &plans {
         let sites = incoming.get(&(plan.proof_source, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
@@ -11679,6 +11680,8 @@ fn run_private_named_after_startup(
             return Err(ProjectCheck::Unsupported);
         }
         activation_count = activation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
+        reached_scalar_relation |= ordinary_relations
+            && !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. });
         invoked.push((plan.target, sites.as_slice()));
     }
     // The old exact named adapters keep their explicit route assertions,
@@ -11721,7 +11724,7 @@ fn run_private_named_after_startup(
     } else { None };
     let mut verified_rank = reached_rank.then(|| prepare_capped_ranked_receipts(ranked.as_ref().ok_or(ProjectCheck::Unsupported)?)).transpose()?;
     let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, &invoked, qualified,
-        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)))?;
+        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)), reached_scalar_relation)?;
     if let Some(rank) = &mut verified_rank {
         if trace.ranked_observations.len() != ranked_sites.len() { return Err(ProjectCheck::Unsupported); }
         check_capped_ranked_receipts(rank, &mut trace, &owner.source)?;
@@ -16991,7 +16994,7 @@ mod tests {
                     let bare_sites = test_exact_startup_sites(&owner, bare.1, false);
                     let rank_sites = test_exact_startup_sites(&owner, rank.1, true);
                     let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), &[(bare, &bare_sites)], false,
-                        &[], None, Some((rank, &rank_sites))).unwrap();
+                        &[], None, Some((rank, &rank_sites)), false).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
                     assert_eq!(trace.ranked_observations[0].returned, BigInt::from(4));
                     assert!(trace.call_paths().iter().all(|path| {
@@ -17027,7 +17030,7 @@ mod tests {
                     let bare_sites = test_exact_startup_sites(&owner, bare_target.1, false);
                     let rank_sites = test_exact_startup_sites(&owner, rank_target.1, true);
                     let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), &[(bare_target, &bare_sites)],
-                        false, &[], None, Some((rank_target, &rank_sites))).unwrap();
+                        false, &[], None, Some((rank_target, &rank_sites)), false).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
                     let bare = trace.named_observations.into_iter().next().unwrap();
                     let rank = trace.ranked_observations.into_iter().next().unwrap();
@@ -17060,7 +17063,7 @@ mod tests {
                 let bare_sites = test_exact_startup_sites(&owner, bare.1, false);
                 let rank_sites = test_exact_startup_sites(&owner, rank.1, true);
                 let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), &[(bare, &bare_sites)],
-                    false, &[], None, Some((rank, &rank_sites))).unwrap();
+                    false, &[], None, Some((rank, &rank_sites)), false).unwrap();
                 assert_eq!(trace.ranked_entries, [8, 5, 2, 5, 2].map(BigInt::from));
                 assert_eq!(trace.ranked_observations.iter().map(|receipt| (
                     &cohort[receipt.site.range.start as usize..receipt.site.range.end as usize], receipt.returned.clone(),
@@ -17249,7 +17252,7 @@ mod tests {
                         matches!(item, ScalarItem::Function(function) if function.name == "echo")).unwrap();
                     let sites = test_exact_startup_sites(&owner, target, false);
                     let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), &[((0, target), &sites)],
-                        false, &[], None, None).unwrap();
+                        false, &[], None, None, false).unwrap();
                     let expected_sites = [first.invocation.call.clone(), second.invocation.call.clone()];
                     assert_eq!(trace.named_observations.iter().map(|entry| &entry.site).collect::<Vec<_>>(),
                         expected_sites.iter().collect::<Vec<_>>());
