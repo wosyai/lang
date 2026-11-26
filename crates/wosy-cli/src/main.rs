@@ -2765,6 +2765,233 @@ core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
 
     #[cfg(all(feature = "internal-checker", target_os = "linux"))]
     #[test]
+    fn private_configured_release_matrix_classifies_real_incumbent_and_candidate() {
+        use codespan_reporting::term::termcolor::Buffer;
+        use std::{num::NonZeroUsize, path::Path, time::Instant};
+        let (fixture, _) = routing_test_project("private-check-release-matrix", &[]);
+        let root = &fixture.root;
+        let manifest = |package: &str, layout: &str| format!(r#"
+[package]
+name = "{package}"
+default_target = "main"
+source_root = "src"
+[comments]
+categories = []
+[builders]
+[runners]
+[targets.main]
+root = "src/main.w"
+default_profile = "dev"
+[targets.main.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.main.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "{layout}"
+builder = "never"
+run_runner = "never"
+[targets.main.profiles.dev]
+main_artifact = "main"
+"#);
+        let output = |status, label: &str| format!(r#"{{ .stdout = "{label}"; .stderr = ""; .code = {status}; .files = []; }}"#);
+        let first = output(0, "startup");
+        let report = output(7, "after");
+        let context = format!(r#"%%start
+            unit(i8) keep = fn(entry) {{ core.narrow(entry >= 0, {first}); }};
+            unit(i8) caller = fn(input) {{
+                i8 core.context.count = input;
+                keep(core.context.count);
+                core.require(input >= 0, {first});
+                if (input == 2) {{
+                    i8 core.context.count = core.context.count;
+                    core.context.count = 7;
+                    core.require(core.context.count == 2, {});
+                }};
+                if (input == 2) {{ core.require(core.context.count == 7, {}); }};
+            }};
+            keep(0);
+        %%end"#, output(51, "inner"), output(52, "restored"));
+        let snapshots = r#"%%start
+            struct Snapshot { i8 raised; i8 reflected; i8 plain; }
+            unit(i8) inspect = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                Snapshot snapshot = { .raised = value + 2; .reflected = 7 - value; .plain = value; };
+                if (value == 1) {
+                    i8 read = snapshot.raised;
+                    core.require(read == 3, { .stdout = ""; .stderr = "lost preimage"; .code = 58; .files = []; });
+                };
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = "construction"; .code = 59;
+                    .files = [{ .path = "state.json"; .state = snapshot; }]; });
+            };
+        %%end"#;
+        let units = format!(r#"%%start
+            unit(u8, u8) leaf = fn(left, right) {{
+                if (left < 128) {{ core.narrow(right < 64, {first}); }};
+            }};
+            unit(u8, u8) inspect = fn(a, b) {{
+                leaf(a, b);
+                core.require(b != 3, {report});
+            }};
+        %%end"#);
+        let nominal = format!(r#"%%start
+            enum copy Region {{ left(u8, u16); right(u16, u8); }}
+            unit(i8, u16) inspect = fn(input, entry) {{
+                u16 actual = match (if (input < 0) {{ Region.left(3, entry) }} else {{ Region.right(513, 7) }}) {{
+                    right(wide, narrow) {{ wide }}
+                    left(narrow, wide) {{ wide }}
+                }};
+                core.require(input < 0 || actual == 512, {report});
+            }};
+        %%end"#);
+        let named = format!(r#"%%start
+            u8(u8) echo = fn(value) {{ value }};
+            proof honest for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {{}}
+            u8 actual = echo(3);
+            core.require(actual == 4, {first});
+        %%end"#);
+        let startup = format!(r#"%%start
+            bool(bool, i8) choose = fn(flag, entry) {{
+                core.require(entry != 3, {first});
+                if (flag) {{ true }} else {{ false }}
+            }};
+            bool initialized = true;
+            bool ready = choose(initialized, 3);
+            i8 status = if (ready) {{ 7 }} else {{ 8 }};
+            core.require(status < 7, {report});
+        %%end"#);
+        let dep_app = format!("%%start\ncore.require(false, {first});\n%%end");
+        let dependency_files = |label: &str| format!(r#"%%start
+            core.require(false, {{ .stdout = "{label}"; .stderr = ""; .code = 11;
+                .files = [{{ .path = "{label}.txt"; .text = "{label}"; }}]; }});
+        %%end"#);
+        let cases = [
+            ("typed-bool-startup", startup, false),
+            ("nested-binary-unit", units, false),
+            ("nominal-arm-payload", nominal, false),
+            ("named-real-invocation", named, false),
+            ("ordinary-context-restore", context, false),
+            ("affine-snapshot-actual", snapshots.replace("%%end", "inspect(1); %%end"), false),
+            ("affine-snapshot-symbolic", snapshots.to_owned(), false),
+            ("configured-transitive-dependencies", dep_app, true),
+        ];
+        let type_labels = |receipts: &[configured_check::ConfiguredCheckReceipt]| {
+            use wosy_compiler::ScalarOrderedCheckerOutcome as Outcome;
+            receipts.iter().map(|receipt| match &receipt.outcome {
+                Ok(_) => "Ready", Err(Outcome::Unsupported) => "Unsupported",
+                Err(Outcome::Invalid(_)) => "Invalid", Err(Outcome::NoChecks) => "NoChecks",
+                Err(Outcome::Passed) => "Passed", Err(Outcome::Failed(_)) => "Failed",
+            }).collect::<Vec<_>>()
+        };
+        fn authored_files(root: &Path, dir: &Path, files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            if !dir.is_dir() { return; }
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() { authored_files(root, &path, files); }
+                else {
+                    assert!(kind.is_file());
+                    files.insert(path.strip_prefix(root).unwrap().to_owned(), fs::read(path).unwrap());
+                }
+            }
+        }
+        let package_roots = ["", "dep", "dep/leaf"];
+        let snapshot = || {
+            let mut files = BTreeMap::new();
+            for package in package_roots {
+                let path = root.join(package).join(".wosy");
+                assert!(!path.join("artifacts").exists(), "Check must never build an artifact");
+                authored_files(root, &path.join("outputs/check"), &mut files);
+            }
+            files
+        };
+        let reset = || for package in package_roots {
+            let state = root.join(package).join(".wosy");
+            if state.exists() { fs::remove_dir_all(state).unwrap(); }
+        };
+        let mut samples = 0;
+        for layout in ["native", "wasm-wasip1"] {
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                for (name, program, dependencies) in &cases {
+                    let dependencies = *dependencies;
+                    let mut primary = manifest("app", layout);
+                    if dependencies { primary.push_str("\n[dependencies.dep]\npath = \"dep\"\n"); }
+                    fs::create_dir_all(root.join("src")).unwrap();
+                    fs::write(root.join("wosy.toml"), primary).unwrap();
+                    fs::write(root.join("src/main.w"), program).unwrap();
+                    if dependencies {
+                        for (path, suffix, backend) in [("dep", "dep", "wasm-wasip1"), ("dep/leaf", "leaf", "native")] {
+                            let package = root.join(path);
+                            fs::create_dir_all(package.join("src")).unwrap();
+                            let mut config = manifest(suffix, backend);
+                            if suffix == "dep" { config.push_str("\n[dependencies.leaf]\npath = \"leaf\"\n"); }
+                            fs::write(package.join("wosy.toml"), config).unwrap();
+                            fs::write(package.join("src/main.w"), dependency_files(suffix)).unwrap();
+                        }
+                    }
+                    reset();
+                    let publish = |receipts: &[configured_check::ConfiguredCheckReceipt]| {
+                        let mut stdout = Vec::new();
+                        let mut stderr = Buffer::no_color();
+                        let started = Instant::now();
+                        let status = publish_configured_check_receipts(receipts, scope, dependencies, &mut stdout, &mut stderr);
+                        let elapsed = started.elapsed();
+                        ((status, stdout, stderr.as_slice().to_vec(), snapshot()), elapsed)
+                    };
+                    let started = Instant::now();
+                    let incumbent = if dependencies {
+                        configured_check::check_target_with_dependencies(root, None, "dev", scope)
+                    } else if scope == ScalarCheckerScope::CurrentPackage {
+                        configured_check::check_declared_package_target(root, None, "dev").map(|receipt| vec![receipt])
+                    } else {
+                        configured_check::check_target(root, None, "dev", scope, Vec::new()).map(|receipt| vec![receipt])
+                    }.unwrap_or_else(|error| panic!("incumbent {name} {layout} {scope:?} load error: {:?}", std::mem::discriminant(&error)));
+                    let old_load = started.elapsed();
+                    let (baseline, old_publish) = publish(&incumbent);
+                    let old_status = type_labels(&incumbent);
+                    for cap in [1, 64] {
+                        reset();
+                        let start = Instant::now();
+                        let cap_value = NonZeroUsize::new(cap).unwrap();
+                        let candidate = if dependencies {
+                            configured_check::check_targets_with_private_authored_limit(root, None, "dev", scope, cap_value)
+                        } else {
+                            configured_check::check_target_with_private_authored_limit(root, None, "dev", scope, cap_value)
+                        }.unwrap_or_else(|error| panic!("candidate {name} {layout} {scope:?} load error: {:?}", std::mem::discriminant(&error)));
+                        let load = start.elapsed();
+                        let (observed, emit) = publish(&candidate);
+                        let new_status = type_labels(&candidate);
+                        let status_match = baseline.0 == observed.0;
+                        let label = if baseline.0.is_err() || baseline.0 == Ok(2) && old_status.contains(&"Invalid") {
+                            "incumbent-refused"
+                        } else if new_status.iter().any(|label| matches!(*label, "Unsupported" | "Invalid")) || observed.0.is_err() {
+                            assert!(observed.1.is_empty() && observed.3.is_empty(), "unsupported result must be atomic");
+                            "release-blocker"
+                        } else if observed == baseline {
+                            "observed-terminal-byte-parity"
+                        } else if cap == 1 {
+                            "cap1-terminal-difference"
+                        } else {
+                            "cap64-terminal-difference"
+                        };
+                        // These are terminal observations, not a proof of
+                        // structural path parity or exhaustion at cap 64.
+                        eprintln!("CHECK-MATRIX {name} {layout} {scope:?} cap={cap} {label} status_match={status_match} old={old_status:?}/{:?} new={new_status:?}/{:?} stdout={}/{} stderr={}/{} files={:?}/{:?} preparation_check_us={}/{} publication_us={}/{}",
+                            baseline.0, observed.0, baseline.1.len(), observed.1.len(), baseline.2.len(), observed.2.len(),
+                            baseline.3.iter().map(|(path, data)| (path, data.len())).collect::<Vec<_>>(),
+                            observed.3.iter().map(|(path, data)| (path, data.len())).collect::<Vec<_>>(),
+                            old_load.as_micros(), load.as_micros(), old_publish.as_micros(), emit.as_micros());
+                        samples += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(samples, 64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(feature = "internal-checker", target_os = "linux"))]
+    #[test]
     fn private_configured_terminal_preserves_proofs_files_status_and_atomicity() {
         use std::num::NonZeroUsize;
         use codespan_reporting::term::termcolor::Buffer;
