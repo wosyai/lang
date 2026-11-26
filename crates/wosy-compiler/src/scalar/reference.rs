@@ -7197,6 +7197,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                             }
+                            if self.local_borrow.is_some()
+                                && !(capture.is_none() && assignment.targets.len() == 1
+                                    && assignment.values.len() == 1
+                                    && aggregate::ordinary_value(&output_types[position])
+                                    && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
+                                    && matches!(&self.cfg.points[self.cursor.expect("assignment install point").0].kind,
+                                        CfgPointKind::Assign { target, .. } if local_borrow::direct_fixed_projection(target)))
+                            {
+                                self.local_borrow = None;
+                            }
                             FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
                         };
                         let FrozenInstall { rhs: rhs_point, install } = emitted;
@@ -12864,14 +12874,15 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let staged = if !state.projected.live_loans && place.projections.is_empty()
-                        && matches!(&point.kind, CfgPointKind::Read { .. }) {
+                    let staged = if !state.projected.live_loans && (matches!(&point.kind, CfgPointKind::Read { .. })
+                        || local_borrow::direct_fixed_projection(place)) {
+                        let projected = (!place.projections.is_empty()).then_some(place);
                         cfg.local_borrow.and_then(|sealed| {
                             if incoming_count == 1 {
-                                sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared)
+                                sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared, projected)
                             } else {
                                 local_access_conflicts.get_or_insert_with(||
-                                    sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared)).clone()
+                                    sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared, projected)).clone()
                             }
                         })
                     } else {
@@ -13050,10 +13061,12 @@ fn transfer_reference_facts(
                             && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
                     {
                         let staged = cfg.local_borrow.filter(|_| !state.projected.live_loans).and_then(|sealed| {
-                            if !target.projections.is_empty() || !matches!(&target.place, ScalarPlace::Name { .. }) {
+                            if !(local_borrow::direct_fixed_projection(&target)
+                                || (target.projections.is_empty() && matches!(&target.place, ScalarPlace::Name { .. }))) {
                                 return None;
                             }
-                            let verdict = || sealed.conflicts(&target.binding, id, incoming_count, original_points, local_borrow::AccessMode::Exclusive);
+                            let projected = (!target.projections.is_empty()).then_some(&target);
+                            let verdict = || sealed.conflicts(&target.binding, id, incoming_count, original_points, local_borrow::AccessMode::Exclusive, projected);
                             if incoming_count == 1 { verdict() }
                             else { local_access_conflicts.get_or_insert_with(verdict).clone() }
                         });
@@ -13489,8 +13502,8 @@ fn transfer_reference_facts(
                                 let CfgPointKind::Borrow { place: original, loan: issuance } =
                                     &original_points[id.0].kind else { return None };
                                 if original != place || issuance != loan || loan.origin_place != *place
-                                    || loan.parent.is_some() || !place.projections.is_empty()
-                                    || !matches!(&place.place, ScalarPlace::Name { .. })
+                                    || loan.parent.is_some() || !(local_borrow::direct_fixed_projection(place)
+                                        || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })))
                                 {
                                     return None;
                                 }
@@ -13498,7 +13511,8 @@ fn transfer_reference_facts(
                                     ScalarReferenceMutability::Shared => local_borrow::AccessMode::Shared,
                                     ScalarReferenceMutability::Mutable => local_borrow::AccessMode::Exclusive,
                                 };
-                                let verdict = || sealed.conflicts(&place.binding, id, incoming_count, original_points, mode);
+                                let projected = (!place.projections.is_empty()).then_some(place);
+                                let verdict = || sealed.conflicts(&place.binding, id, incoming_count, original_points, mode, projected);
                                 if incoming_count == 1 { verdict() }
                                 else { local_access_conflicts.get_or_insert_with(verdict).clone() }
                             });

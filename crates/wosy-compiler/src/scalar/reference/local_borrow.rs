@@ -93,6 +93,8 @@ struct PendingFork {
 pub(crate) struct Author {
     pending_loan: Option<Loan>,
     pending_rhs: Option<CfgPointId>,
+    last_holder_read: Option<CfgPointId>,
+    last_literal_aggregate: Option<CfgPointId>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
@@ -102,6 +104,25 @@ pub(crate) struct Author {
     nested: bool,
     root_exit: Option<CfgPointId>,
     pending_exit: Option<(CfgPointId, ReferenceScopeId)>,
+}
+
+pub(super) fn direct_fixed_projection(place: &ReferencePlaceId) -> bool {
+    !place.projections.is_empty() && direct_lexical_loan_root(place).is_some()
+        && place.projections.iter().all(|projection| matches!(projection,
+            ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))
+            | ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })))
+}
+
+fn scalar_literal_tree(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. }
+        | ScalarExpression::Float { .. } | ScalarExpression::Char { .. } => true,
+        ScalarExpression::StructLiteral { fields, .. } =>
+            fields.iter().all(|field| scalar_literal_tree(&field.value)),
+        ScalarExpression::ArrayLiteral { elements, .. } =>
+            elements.iter().all(scalar_literal_tree),
+        _ => false,
+    }
 }
 
 impl Author {
@@ -135,14 +156,21 @@ impl Author {
                 self.pending_exit = Some((id, scope));
                 true
             }
-            CfgPointKind::Entry | CfgPointKind::ScopeEnter
-            | CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. }
-                | ScalarExpression::Float { .. } | ScalarExpression::Char { .. }) => true,
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter => true,
+            CfgPointKind::Evaluate(expression) => {
+                if !scalar_literal_tree(expression) { return false; }
+                if matches!(expression, ScalarExpression::ArrayLiteral { .. } | ScalarExpression::StructLiteral { .. }) {
+                    self.last_literal_aggregate = Some(id);
+                }
+                true
+            }
             CfgPointKind::Bind { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { inner, .. }) =>
                     scope == ReferenceScopeId(0) && aggregate::ordinary_value(inner),
                 Some(ty) => {
-                    if !aggregate::ordinary_value(ty) || self.pending_loan.is_some() { return false; }
+                    let aggregate = matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+                        && self.last_literal_aggregate.is_some_and(|value| value.0.checked_add(1) == Some(id.0));
+                    if (!aggregate && !aggregate::ordinary_value(ty)) || self.pending_loan.is_some() { return false; }
                     // Deferred reborrow enrollment intentionally excludes bodies
                     // with calls. This sealed author independently sees the
                     // actual typed root declaration and scope at its Bind.
@@ -156,15 +184,28 @@ impl Author {
                 }
                 None => false,
             },
-            CfgPointKind::Assign { target, .. } => target.projections.is_empty()
-                && matches!(&target.place, ScalarPlace::Name { .. })
-                && (self.pending_loan.is_some()
-                    || types.get(&target.binding).is_some_and(aggregate::ordinary_value)),
+            CfgPointKind::Assign { target, .. } =>
+                if direct_fixed_projection(target) {
+                    self.pending_loan.is_none() && self.authored_roots.contains(&target.binding)
+                } else {
+                    target.projections.is_empty()
+                        && matches!(&target.place, ScalarPlace::Name { .. })
+                        && (self.pending_loan.is_some()
+                            || types.get(&target.binding).is_some_and(aggregate::ordinary_value))
+                },
+            CfgPointKind::ReadPlace { place: ScalarPlace::Dereference { .. }, pointer_point: Some(pointer),
+                candidates, reads_origin: false, .. } =>
+                candidates.is_empty() && self.last_holder_read == Some(*pointer)
+                    && pointer.0.checked_add(1) == Some(id.0),
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. } =>
+                matches!(candidates.as_slice(), [place] if direct_fixed_projection(place)
+                    && self.authored_roots.contains(&place.binding)),
             CfgPointKind::Read { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { .. }) => {
                     let arm = self.arm();
                     let Some(holder) = self.holders.get_mut(binding) else { return false };
                     holder.record_read(id, arm);
+                    self.last_holder_read = Some(id);
                     true
                 }
                 Some(ty) => aggregate::ordinary_value(ty),
@@ -173,12 +214,14 @@ impl Author {
             CfgPointKind::Borrow { place, loan }
                 if loan.parent.is_none()
                     && loan.origin_place == *place
-                    && place.projections.is_empty()
-                    && matches!(&place.place, ScalarPlace::Name { .. })
-                    && types.0.get(&place.binding).is_some_and(|binding|
-                        aggregate::ordinary_value(&binding.ty)
-                        && (binding.local_reborrow_scope == Some(ReferenceScopeId(0))
-                            || self.authored_roots.contains(&place.binding))) =>
+                    && ((place.projections.is_empty()
+                        && matches!(&place.place, ScalarPlace::Name { .. })
+                        && types.0.get(&place.binding).is_some_and(|binding|
+                            aggregate::ordinary_value(&binding.ty)
+                            && (binding.local_reborrow_scope == Some(ReferenceScopeId(0))
+                                || self.authored_roots.contains(&place.binding))))
+                        || (direct_fixed_projection(place) && self.authored_roots.contains(&place.binding)
+                            && matches!(types.get(&place.binding), Some(ScalarType::Struct(_) | ScalarType::Array { .. })))) =>
             {
                 let owner = match self.owners.get(&place.binding) {
                     Some(&owner) => owner,
@@ -461,7 +504,7 @@ impl Refinement {
         }
     }
 
-    fn excludes_owner(&self, reaching: Reaching, owner: usize, mode: AccessMode) -> bool {
+    fn excludes_owner(&self, reaching: Reaching, conflicts: impl Fn(Loan) -> bool) -> bool {
         let Self::Branching { unions, .. } = self else { return false };
         let mut pending = vec![reaching];
         // A chain of unions is represented once. Limit work per disputed
@@ -470,7 +513,7 @@ impl Refinement {
         while let Some(reaching) = pending.pop() {
             match reaching {
                 Reaching::Absent => {}
-                Reaching::One(loan) if loan.owner == owner && mode.accepts(loan.mutable) => return false,
+                Reaching::One(loan) if conflicts(loan) => return false,
                 Reaching::One(_) => {}
                 Reaching::Diverse(index) => {
                     if seen.insert(index) {
@@ -729,7 +772,7 @@ impl NestedGraph {
         }
     }
 
-    fn excludes(&self, holder: &Holder, access: CfgPointId, owner: usize, mode: AccessMode,
+    fn excludes(&self, holder: &Holder, access: CfgPointId, conflicts: impl Fn(Loan) -> bool,
         points: &[ReferenceFlowPoint],
     ) -> bool {
         let install = |point| holder.writes.binary_search_by_key(&point, |install| install.version)
@@ -759,7 +802,7 @@ impl NestedGraph {
             let Some(remaining) = budget.checked_sub(1) else { return false };
             budget = remaining;
             if let Some(loan) = install(point) {
-                if loan.owner == owner && mode.accepts(loan.mutable) { return false; }
+                if conflicts(loan) { return false; }
             } else {
                 pending.extend_from_slice(&self.predecessors[point.0]);
             }
@@ -821,7 +864,7 @@ impl Sealed {
     pub(super) fn conflicts(
         &self, owner: &ReferenceBindingId, access: CfgPointId, _incoming_count: usize,
         points: &[ReferenceFlowPoint],
-        mode: AccessMode,
+        mode: AccessMode, projected: Option<&ReferencePlaceId>,
     ) -> Option<Vec<SourceSpan>> {
         let Some(&owner_index) = self.owner_index.get(owner) else { return Some(Vec::new()) };
         let summary = &self.owners[owner_index];
@@ -846,12 +889,20 @@ impl Sealed {
         }
         #[cfg(test)]
         tests::observe(refine_stage);
+        let overlaps = |loan: Loan| {
+            if loan.owner != owner_index || !mode.accepts(loan.mutable) { return false; }
+            let Some(access) = projected else { return true };
+            let Some(CfgPointKind::Borrow { place, loan }) = points.get(loan.issued.0).map(|point| &point.kind)
+                else { return true };
+            loan.parent.is_some() || loan.origin_place != *place || &place.binding != owner
+                || reference_places_overlap(access, place)
+        };
         let mut conflicts = Vec::new();
         // Carrier indices were assigned by the authored BTreeMap in binding order.
         for holder in carriers {
             let entry = &self.holders[holder];
             if let Some(graph) = &self.nested {
-                if graph.excludes(&entry.holder, access, owner_index, mode, points) { continue; }
+                if graph.excludes(&entry.holder, access, overlaps, points) { continue; }
                 return None; // Preserve exact incoming-edge diagnostics on any matching path.
             }
             let Some(precise) = entry.refined.get_or_init(|| {
@@ -862,9 +913,9 @@ impl Sealed {
             let (reaching, live) = precise.facts_at(access);
             if !live { continue; }
             let issue = match reaching {
-                Reaching::One(loan) if loan.owner == owner_index && mode.accepts(loan.mutable) => loan.issued,
+                Reaching::One(loan) if overlaps(loan) => loan.issued,
                 Reaching::Diverse(_) => {
-                    if precise.excludes_owner(reaching, owner_index, mode) { continue; }
+                    if precise.excludes_owner(reaching, overlaps) { continue; }
                     #[cfg(test)]
                     tests::observe(3);
                     return None;
@@ -875,7 +926,7 @@ impl Sealed {
                 return None;
             };
             if &place.binding != owner || loan.origin_place != *place
-                || !place.projections.is_empty() || !matches!(&place.place, ScalarPlace::Name { .. })
+                || !(direct_fixed_projection(place) || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })))
                 || loan.parent.is_some() || !mode.accepts(loan.mode == ScalarReferenceMutability::Mutable)
             {
                 return None;
@@ -1243,7 +1294,7 @@ pub(super) mod tests {
             modes & 2 != 0 && contains(&sealed.holders[holder].live, read.id)));
         assert!(!contains(&owner.active[1], read.id));
         let before = COUNTS.with(|counts| counts.get());
-        assert_eq!(sealed.conflicts(binding, read.id, 1, points, AccessMode::Shared), Some(Vec::new()));
+        assert_eq!(sealed.conflicts(binding, read.id, 1, points, AccessMode::Shared, None), Some(Vec::new()));
         let after = COUNTS.with(|counts| counts.get());
         assert_eq!(after[0], before[0] + 1);
         assert_eq!(after[1..], before[1..]);
@@ -1461,6 +1512,67 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn authored_direct_scalar_projections_refine_live_same_root_candidates() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (declaration, borrowed, sibling) in [
+                ("Pair owner = { .left = 7; .right = 9; };", "owner.left", "owner.right"),
+                ("u16[2] owner = [7, 9];", "owner[0]", "owner[1]"),
+            ] {
+                let text = format!("%%start
+struct Pair {{ u16 left; u16 right; }}
+unit() examine = fn {{
+    {declaration}
+    *u16 held = &{borrowed};
+    {sibling} = 3;
+    u16 observed = *held;
+    observed;
+}};
+%%end");
+                let source = SourceIdentity::new("p".into(), "local".into(), "projected.w".into(), "r1".into());
+                let parsed = crate::parse_source(source, text.into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+                let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+                assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+                let program = typed.program;
+                let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+                let prepared = || {
+                    let (results, errors) = derive_module_reference_origins(
+                        &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                    );
+                    assert!(errors.is_empty(), "{errors:?}");
+                    results.into_iter().next().unwrap().1
+                };
+                let mut staged = prepared();
+                let mut incumbent = prepared();
+                incumbent.proof_points.local_borrow = None;
+                let sealed = staged.proof_points.local_borrow.as_ref().expect("authored projected graph");
+                let points = &staged.cfg.initial_points;
+                let (store, destination) = points.iter().find_map(|point| match &point.kind {
+                    CfgPointKind::Assign { target, .. } if direct_fixed_projection(target) =>
+                        Some((point.id, target)),
+                    _ => None,
+                }).expect("prepared projected store");
+                let source = points.iter().find_map(|point| match &point.kind {
+                    CfgPointKind::Borrow { place, .. } if direct_fixed_projection(place) => Some(place),
+                    _ => None,
+                }).expect("prepared projected borrow");
+                assert_eq!(source.binding, destination.binding);
+                assert_eq!(sealed.conflicts(&destination.binding, store, 1, points,
+                    AccessMode::Exclusive, Some(destination)), Some(Vec::new()));
+                assert!(sealed.conflicts(&source.binding, store, 1, points,
+                    AccessMode::Exclusive, Some(source)).is_some_and(|spans| spans.len() == 1));
+                COUNTS.with(|counts| counts.set([0; 9]));
+                let actual = definitive(&mut staged);
+                let counts = COUNTS.with(|counts| counts.get());
+                assert_eq!(actual, definitive(&mut incumbent));
+                assert!(actual.is_empty(), "{actual:?}");
+                assert!(counts[8] > 0, "the existing transfer must use the location-sensitive stage: {counts:?}");
+            }
+        }
+    }
+
+    #[test]
     fn authored_nested_branch_graph_keeps_bypass_and_exact_incumbent_labels() {
         for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
             for overwrite_bypass in [true, false] {
@@ -1502,7 +1614,7 @@ pub(super) mod tests {
                     && matches!(points[rhs_point.0].kind, CfgPointKind::Evaluate(_))))
                     .expect("ordinary root store after nested join");
                 let CfgPointKind::Assign { target, .. } = &store.kind else { unreachable!() };
-                let verdict = sealed.conflicts(&target.binding, store.id, 1, points, AccessMode::Exclusive);
+                let verdict = sealed.conflicts(&target.binding, store.id, 1, points, AccessMode::Exclusive, None);
                 assert_eq!(verdict, overwrite_bypass.then(Vec::new));
                 let actual = definitive(&mut staged);
                 assert_eq!(actual, definitive(&mut incumbent));
@@ -1637,12 +1749,12 @@ unit(bool, bool) examine = fn(a, b) {
         }
         let (joined, live) = facts.facts_at(at(11));
         assert!(live && matches!(joined, Reaching::Diverse(_)));
-        assert!(!facts.excludes_owner(joined, old.owner, AccessMode::Exclusive));
-        assert!(!facts.excludes_owner(joined, taken.owner, AccessMode::Exclusive));
-        assert!(facts.excludes_owner(joined, taken.owner, AccessMode::Shared));
-        assert!(facts.excludes_owner(joined, 2, AccessMode::Exclusive));
+        assert!(!facts.excludes_owner(joined, |loan| loan.owner == old.owner && AccessMode::Exclusive.accepts(loan.mutable)));
+        assert!(!facts.excludes_owner(joined, |loan| loan.owner == taken.owner && AccessMode::Exclusive.accepts(loan.mutable)));
+        assert!(facts.excludes_owner(joined, |loan| loan.owner == taken.owner && AccessMode::Shared.accepts(loan.mutable)));
+        assert!(facts.excludes_owner(joined, |loan| loan.owner == 2 && AccessMode::Exclusive.accepts(loan.mutable)));
         let (replaced, _) = facts.facts_at(at(17));
-        assert!(facts.excludes_owner(replaced, taken.owner, AccessMode::Exclusive));
+        assert!(facts.excludes_owner(replaced, |loan| loan.owner == taken.owner && AccessMode::Exclusive.accepts(loan.mutable)));
         assert!(!AccessMode::Shared.accepts(taken.mutable));
         assert!(AccessMode::Exclusive.accepts(taken.mutable));
         let mut linear = Holder::default();
