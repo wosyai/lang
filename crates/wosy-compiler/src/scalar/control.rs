@@ -208,6 +208,7 @@ pub(super) struct NamedReborrowParent {
     pub(super) pointer: super::CfgPointId,
     pub(super) origin: super::ReferenceOriginId,
     pub(super) runtime_selector: Option<super::CfgPointId>,
+    pub(super) exact_entry_parent: bool,
 }
 
 #[derive(Default)]

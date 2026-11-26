@@ -417,7 +417,8 @@ unit(Pair) inspect = fn(owner) {
         span,
     };
     let authority = super::super::control::NamedReborrowParent {
-                runtime_selector: None,
+        runtime_selector: None,
+        exact_entry_parent: false,
         pointer: read.id,
         borrow: borrow.id,
         origin,
@@ -448,6 +449,18 @@ unit(Pair) inspect = fn(owner) {
     assert!(!allowed(&present, &mismatched));
     assert!(!allowed(&present, &unproven_field));
 
+    // The entry-parent route requires identical singleton provenance in every
+    // incoming state, not the first branch or a union of candidate origins.
+    let formal_place = ReferencePlaceId { binding: binding.clone(), ..owner.clone() };
+    let every = |states: &[ReferenceEdgeState]| {
+        exact_runtime_entry_parent_on_all_edges(states, &formal_place, read.id, origin)
+    };
+    assert!(every(&[present.clone(), present.clone()]));
+    assert!(!every(&[present.clone(), replaced]));
+    assert!(!every(&[ambiguous, present.clone()]));
+    assert!(!every(&[present.clone(), absent]));
+    assert!(!every(&[]));
+
     let mut projected = cfg.clone();
     projected.initial_points[borrow.id.0].kind = CfgPointKind::Borrow {
         place: child.origin_place.clone(),
@@ -466,6 +479,7 @@ unit(Pair) inspect = fn(owner) {
         if proven {
             proof.named_reborrow_parents.push(super::super::control::NamedReborrowParent {
                 runtime_selector: None,
+                exact_entry_parent: false,
                 borrow: borrow.id,
                 pointer: read.id,
                 origin,

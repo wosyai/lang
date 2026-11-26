@@ -394,6 +394,7 @@ enum ExpressionReadMode {
     FallibleAliasInitializer,
     DereferenceOperand,
     ArrayLengthArgument,
+    ExclusiveRuntimeCallArgument,
     GuardedWholeReleaseArgument,
     WidenedBorrowAddress(ByteSpan),
     WidenedOwningRoundtrip(ByteSpan),
@@ -2036,6 +2037,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut aggregate_arguments = BTreeMap::new();
                 let mut array_argument = None;
                 let mut raw_arguments = Vec::new();
+                let parent_call_ordinal = ordinal;
                 for (position, argument) in arguments.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
@@ -2048,6 +2050,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.expression_with_read_mode(
                             argument, scope, ordinal, ExpressionReadMode::WidenedBorrowAddress(owner),
                         )?;
+                    } else if position == 0 && self.capture_private_runtime_reads
+                        && !calls.declared_unsafe_calls.contains(&parent_call_ordinal.0)
+                        && matches!(&target, ResolvedCallTarget::ModuleCallable {
+                            source, concrete: ConcreteCallSelection::Declaration, ..
+                        } if source == &self.source)
+                        && signature.is_some_and(|signature| aggregate::exclusive_runtime_relay_signature(
+                            &signature.parameters, &signature.outputs.outputs))
+                    {
+                        self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::ExclusiveRuntimeCallArgument)?;
                     } else {
                         self.expression(argument, scope, ordinal)?;
                     }
@@ -3169,6 +3180,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
 
                 let mut named_parent_point = None;
+                let mut exact_entry_parent = false;
                 let mut reborrow = None;
                 let parents = match root.place {
                     ScalarPlace::Dereference { pointer, .. } => {
@@ -3183,6 +3195,43 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             if direct_checked_field_base(base).is_some());
                         let ordinary_origins = match value {
                             ReferenceValue::Checked(origins) if !indexed_projection => Some(origins),
+                            ReferenceValue::Uncomputed
+                                if matches!(read_mode, ExpressionReadMode::ExclusiveRuntimeCallArgument)
+                                    && matches!(place, ScalarPlace::Dereference { .. })
+                                    && *mutability == ScalarReferenceMutability::Mutable =>
+                            {
+                                // Seed only the typed declaration's exact formal. This does
+                                // not restore the authored origin map at the join: transfer
+                                // must prove that this parent is live at this use on every edge.
+                                let seed = (|| {
+                                    let formal = self.call_sites.boundary.parameters.first()?;
+                                    let ScalarType::CheckedReference {
+                                        mutability: ScalarReferenceMutability::Mutable, inner,
+                                    } = &formal.ty else { return None; };
+                                    if !matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element)) {
+                                        return None;
+                                    }
+                                    let Some(PlainNameIdentity::Lexical(binding)) = self.call_sites.prepared_plain_name(pointer_ordinal)
+                                        else { return None; };
+                                    let entry = self.cfg.points.first()?;
+                                    let [bind] = entry.successors.as_slice() else { return None; };
+                                    let bind = self.cfg.points.get(bind.0)?;
+                                    let read = self.cfg.points.get(self.cursor?.0)?;
+                                    if binding.declaration_span != formal.span
+                                        || !matches!(&bind.kind, CfgPointKind::Bind { binding: declared } if declared == binding)
+                                        || !matches!(&read.kind, CfgPointKind::Read { binding: observed } if observed == binding)
+                                    { return None; }
+                                    let origins = bind.possible_origins.as_ref()?;
+                                    let origin = *origins.first().filter(|_| origins.len() == 1)?;
+                                    let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = self.cfg.facts.get(origin.0)?
+                                        else { return None; };
+                                    (loan.mode == ScalarReferenceMutability::Mutable && loan.parent.is_none()
+                                        && loan.origin_place.projections.is_empty() && &loan.origin_place.binding == binding)
+                                        .then(|| origins.clone())
+                                })();
+                                exact_entry_parent = seed.is_some();
+                                seed
+                            }
                             _ => None,
                         };
                         let Some(origins) = ordinary_origins else {
@@ -3523,6 +3572,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             pointer,
                             origin,
                             runtime_selector,
+                            exact_entry_parent,
                         });
                         if let Some(handle) = runtime_child {
                             self.cfg.runtime_array_child_sites.push(RuntimeArrayChildSite {
@@ -10005,6 +10055,20 @@ fn exact_live_reborrow_holder(
 }
 
 
+fn exact_runtime_entry_parent_on_all_edges(
+    states: &[ReferenceEdgeState],
+    place: &ReferencePlaceId,
+    read: CfgPointId,
+    origin: ReferenceOriginId,
+) -> bool {
+    !states.is_empty() && states.iter().all(|state| {
+        exact_live_reborrow_holder(state, &place.binding, origin)
+            && state.point_values.get(read).is_some_and(|origins|
+                origins.len() == 1 && origins.contains(&origin))
+            && !unavailable_place(state, place)
+    })
+}
+
 struct JoinedReborrowShape<'a> {
     parent: &'a ReferenceBindingId,
     holders: HashMap<&'a ReferenceBindingId, CfgPointId>,
@@ -11543,6 +11607,20 @@ fn transfer_reference_facts(
         let named_parent = || cfg.named_reborrow_parents
             .binary_search_by_key(&id, |parent| parent.borrow)
             .ok().map(|index| &cfg.named_reborrow_parents[index]);
+        let exact_entry_parent_failed = named_parent().is_some_and(|parent| {
+            if !parent.exact_entry_parent { return false; }
+            let Some(ReferenceOrigin::BorrowedFrom { parameter: 0, loan }) = cfg.facts.get(parent.origin.0)
+                else { return true; };
+            !strictly_forward || !exact_runtime_entry_parent_on_all_edges(
+                states.as_slice(), &loan.origin_place, parent.pointer, parent.origin,
+            )
+        });
+        if exact_entry_parent_failed {
+            errors.push(ReferenceAnalysisError::MissingContext {
+                source_span: initial_point.source_span.clone(),
+                reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+            });
+        }
         let joined_cardinality = (2..=MAX_JOINED_REBORROW_PARENTS).contains(&incoming_count)
             || (incoming_count == 1 && matches!(&initial_point.kind,
                 CfgPointKind::ReborrowThrough { place: ScalarPlace::Index { base, .. }, .. }
@@ -12976,6 +13054,10 @@ fn transfer_reference_facts(
                 | CfgPointKind::Borrow { .. }
                 | CfgPointKind::Call { .. } => 'value: {
                     if let CfgPointKind::Borrow { place, loan } = &point.kind {
+                        if exact_entry_parent_failed {
+                            point.possible_origins = None;
+                            break 'value None;
+                        }
                         let check = if projected_loan.is_some() {
                             if projected_rejected {
                                 errors.push(ReferenceAnalysisError::MissingContext {

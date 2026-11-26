@@ -17490,39 +17490,46 @@ u8(u64) sample = fn(count) {
 };
 if (sample(3) != 13) { core.system_panic(); };
 %%end";
-    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let source = SourceIdentity::new(
-            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
-        );
-        let parsed = parse_source(source.clone(), text.into(), &[]);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let prepared = crate::prepare_scalar_project_with_access(
-            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
-            vec![source], ScalarPreparationInputs { target_layout: layout },
-            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
-        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
-        let checked = analyze_scalar_build(&prepared);
-        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
-        let source = &prepared.project().modules[0].source;
-        let fill = project_function_name(source, "_fill");
-        let write = project_function_name(source, "_write_byte");
-        let body = self_tail_test_body(&ir, "internal void", &fill);
-        assert!(body.contains("borrowed_array_extent") && body.contains("exclusive_forward_pair")
-            && body.contains(&format!("call void @{fill}(")) && body.contains(&format!("call void @{write}(")),
-            "{body}");
-        assert_eq!(body.lines().filter(|line| line.contains("exclusive_forward_pair")
-            && line.contains("i64 %borrowed_array_extent")).count(), 2, "{body}");
-        assert!(!body.contains("llvm.memcpy") && !body.contains("__wosy_core_alloc"), "{body}");
-        let writer = self_tail_test_body(&ir, "internal void", &write);
-        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
-        let guard = writer.find(&format!("call void @{helper}(")).expect("ordinary bounds helper");
-        let address = writer[guard..].lines().find(|line| line.contains("getelementptr"))
-            .expect("checked destination");
-        let destination = address.trim().split_once(" = ").unwrap().0;
-        let store = writer.find(&format!(", ptr {destination}, align 1")).expect("exact checked store");
-        assert!(guard < writer.find(address).unwrap() && writer.find(address).unwrap() < store
-            && writer[..store].lines().last().unwrap().trim_start().starts_with("store i8 "), "{writer}");
+    let joined = text.replace(
+        "        _write_byte(&!(*bytes), index, 13);",
+        "        if (index == 0) { _write_byte(&!(*bytes), index, 13); };
+        _write_byte(&!(*bytes), index, 13);",
+    );
+    for (text, call_count) in [(text, 2), (joined.as_str(), 3)] {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new(
+                "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+            );
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let source = &prepared.project().modules[0].source;
+            let fill = project_function_name(source, "_fill");
+            let write = project_function_name(source, "_write_byte");
+            let body = self_tail_test_body(&ir, "internal void", &fill);
+            assert!(body.contains("borrowed_array_extent") && body.contains("exclusive_forward_pair")
+                && body.contains(&format!("call void @{fill}(")) && body.contains(&format!("call void @{write}(")),
+                "{body}");
+            assert_eq!(body.lines().filter(|line| line.contains("exclusive_forward_pair")
+                && line.contains("i64 %borrowed_array_extent")).count(), call_count, "{body}");
+            assert!(!body.contains("llvm.memcpy") && !body.contains("__wosy_core_alloc"), "{body}");
+            let writer = self_tail_test_body(&ir, "internal void", &write);
+            let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+            let guard = writer.find(&format!("call void @{helper}(")).expect("ordinary bounds helper");
+            let address = writer[guard..].lines().find(|line| line.contains("getelementptr"))
+                .expect("checked destination");
+            let destination = address.trim().split_once(" = ").unwrap().0;
+            let store = writer.find(&format!(", ptr {destination}, align 1")).expect("exact checked store");
+            assert!(guard < writer.find(address).unwrap() && writer.find(address).unwrap() < store
+                && writer[..store].lines().last().unwrap().trim_start().starts_with("store i8 "), "{writer}");
+        }
     }
 }
 
