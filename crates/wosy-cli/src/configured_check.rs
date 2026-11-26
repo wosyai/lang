@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, ffi::OsStr, io::{self, Write}, path::{Component, Path, PathBuf}};
 
 use wosy_compiler::{
-    check_loaded_scalar_ordered_local_proof_contexts, CheckedOutputTargets, MainFlowProofReceipt, ScalarCheckerScope,
+    prepare_loaded_scalar_ordered_local_proof_contexts, CheckedOutputTargets, MainFlowProofReceipt,
+    PreparedScalarOrderedCheck, ScalarCheckerScope,
     ScalarCheckerTextFile, ScalarOrderedCheckerFailure, ScalarOrderedCheckerOutcome,
     ScalarPreparationInputs, ScalarTargetLayout,
 };
@@ -16,6 +17,22 @@ pub(crate) struct ConfiguredCheckReceipt {
     pub(crate) root: PathBuf,
     pub(crate) outcome: Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome>,
     pub(crate) texts: BTreeMap<SourceIdentity, String>,
+}
+
+struct PreparedConfiguredCheckReceipt {
+    root: PathBuf,
+    check: Result<PreparedScalarOrderedCheck, ScalarOrderedCheckerOutcome>,
+    texts: BTreeMap<SourceIdentity, String>,
+}
+
+impl PreparedConfiguredCheckReceipt {
+    fn run(self) -> ConfiguredCheckReceipt {
+        ConfiguredCheckReceipt {
+            root: self.root,
+            outcome: self.check.and_then(PreparedScalarOrderedCheck::run),
+            texts: self.texts,
+        }
+    }
 }
 
 pub(crate) struct PlannedCheckPublication<'a> {
@@ -295,6 +312,15 @@ fn check_configured_proof_scope(
     scope: ScalarCheckerScope, selection: DormantSelection<'_>,
     checkout: Option<&wosy_project::packages::GitDirectory>,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    prepare_configured_proof_scope(project, configuration, layout, scope, selection, checkout)
+        .map(PreparedConfiguredCheckReceipt::run)
+}
+
+fn prepare_configured_proof_scope(
+    project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
+    scope: ScalarCheckerScope, selection: DormantSelection<'_>,
+    checkout: Option<&wosy_project::packages::GitDirectory>,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = project.root.as_path();
     let target_layout = ScalarTargetLayout {
@@ -326,11 +352,11 @@ fn check_configured_proof_scope(
     }
     let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts, checkout)
         .map_err(LoadError::Dormant)?;
-    let outcome = check_loaded_scalar_ordered_local_proof_contexts(
+    let check = prepare_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
         ScalarPreparationInputs { target_layout }, scope, dormant,
     );
-    Ok(ConfiguredCheckReceipt { root: root.to_owned(), outcome, texts: loaded.texts })
+    Ok(PreparedConfiguredCheckReceipt { root: root.to_owned(), check, texts: loaded.texts })
 }
 
 #[derive(Debug, PartialEq)]

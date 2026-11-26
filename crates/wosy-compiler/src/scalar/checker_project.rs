@@ -881,12 +881,24 @@ fn check_internal_contextual_proof(
     Ok((proved.observations, report.directives))
 }
 
-#[cfg(feature = "internal-checker")]
+#[cfg(all(test, feature = "internal-checker"))]
 fn check_prepared_contextual_proofs(
     sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
     inputs: ScalarPreparationInputs, scope: ScalarCheckerScope, retain_observations: bool,
 ) -> Result<PreparedOrderedRun<ProofFreeOrderedEvidence>, ProjectCheck> {
+    let (prepared, effects, startup_count) = prepare_contextual_check(
+        sources, initialization_order, headers, inputs, retain_observations,
+    )?;
+    run_contextual_check(&prepared, effects, startup_count, scope, retain_observations)
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_contextual_check(
+    sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
+    inputs: ScalarPreparationInputs, retain_observations: bool,
+) -> Result<(PreparedCheckerProject, OrderedFailures, usize), ProjectCheck> {
     let startup_count = initialization_order.len();
     let (prepared, context) = super::contextual::prepare_contextual_transport_graph_with_proof_root(
         sources, initialization_order, inputs, true, !retain_observations,
@@ -894,7 +906,15 @@ fn check_prepared_contextual_proofs(
         .map_err(|_| ProjectCheck::Unsupported)?;
     let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
     let effects = prepare_contextual_effects(&prepared, &context, headers, startup_count, retain_observations)?;
-    let mut report = run_prepared_ordered_check_with_effects(&prepared, scope, startup_count,
+    Ok((prepared, effects, startup_count))
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_contextual_check(
+    prepared: &PreparedCheckerProject, effects: OrderedFailures, startup_count: usize,
+    scope: ScalarCheckerScope, retain_observations: bool,
+) -> Result<PreparedOrderedRun<ProofFreeOrderedEvidence>, ProjectCheck> {
+    let mut report = run_prepared_ordered_check_with_effects(prepared, scope, startup_count,
         OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, effects)?;
     complete_contextual_effects(&mut report, scope, retain_observations)?;
     Ok(report)
@@ -9352,11 +9372,11 @@ fn ordered_contextual_diagnostics(mut contextual: ContextualProofCohort) -> Resu
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_mixed_scalar_contextual(
+fn prepare_mixed_scalar_contextual(
     sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>, ordinary: Vec<ModuleProofCatalog>,
     initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
-    inputs: ScalarPreparationInputs, scope: ScalarCheckerScope, configured_root: bool,
-) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    inputs: ScalarPreparationInputs, configured_root: bool,
+) -> Result<PreparedConfiguredCheck, ProjectCheck> {
     let [catalog] = ordinary.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let [root, ..] = initialization_order.as_slice() else { return Err(ProjectCheck::MissingRoot); };
     let [(context_owner, _), ..] = headers.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -9373,20 +9393,29 @@ fn check_mixed_scalar_contextual(
         root.clone(), sources, ordinary, initialization_order, inputs, Vec::new(), OrderedProofPreparation::All,
         configured_root,
     )?;
-    let catalog = prepared.proofs.get(&ordinary_source).ok_or(ProjectCheck::MissingRoot)?;
+    Ok(PreparedConfiguredCheck::Mixed { owner: prepared, ordinary_source, headers, startup_count, configured_root })
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_mixed_scalar_contextual(
+    prepared: &PreparedProofModule, ordinary_source: &SourceIdentity,
+    headers: Vec<(SourceIdentity, ContextualProofHeader)>, startup_count: usize,
+    scope: ScalarCheckerScope, configured_root: bool,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    let catalog = prepared.proofs.get(ordinary_source).ok_or(ProjectCheck::MissingRoot)?;
     let mut selections = Vec::with_capacity(catalog.definitions.len());
     let mut names = HashSet::new();
     for (index, definition) in catalog.definitions.iter().enumerate() {
         let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
         if !names.insert(name.text().to_owned()) { return Err(ProjectCheck::AmbiguousRoot); }
         let selected = prepared.resolve_selected_proof(definition, catalog.first_query + index)?;
-        if selected.owner.source != ordinary_source { return Err(ProjectCheck::Unsupported); }
+        if &selected.owner.source != ordinary_source { return Err(ProjectCheck::Unsupported); }
         selections.push((name, Some(selected)));
     }
     let mut plans = Vec::with_capacity(selections.len());
     for (name, selected) in &mut selections {
         let plan = prepared.plan_resolved_module_proof::<false, false, false>(
-            &ordinary_source, name.text(), selected.take().ok_or(ProjectCheck::Unsupported)?,
+            ordinary_source, name.text(), selected.take().ok_or(ProjectCheck::Unsupported)?,
         )?;
         let body = plan.typed.body;
         if !plan.has_no_authored_steps() || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
@@ -9442,12 +9471,34 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     scope: ScalarCheckerScope,
     dormant: Vec<ScalarProofDeclarations>,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    let owner = prepare_configured_ordered_check::<LOCAL_CATALOGS>(declarations, proofs, initialization_order, inputs, scope, dormant)?;
+    run_configured_ordered_check::<LOCAL_CATALOGS>(owner, scope)
+}
+
+#[cfg(feature = "internal-checker")]
+enum PreparedConfiguredCheck {
+    Plain { owner: PreparedCheckerProject, startup_count: usize },
+    Contextual { owner: PreparedCheckerProject, effects: OrderedFailures, startup_count: usize },
+    Mixed { owner: PreparedProofModule, ordinary_source: SourceIdentity,
+        headers: Vec<(SourceIdentity, ContextualProofHeader)>, startup_count: usize, configured_root: bool },
+    Named { owner: PreparedProofModule, startup_count: usize },
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_configured_ordered_check<const LOCAL_CATALOGS: bool>(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+    dormant: Vec<ScalarProofDeclarations>,
+) -> Result<PreparedConfiguredCheck, ProjectCheck> {
     let dormant = if scope == ScalarCheckerScope::CurrentPackage { dormant } else { Vec::new() };
     if proofs.is_empty() && dormant.is_empty() {
         let (prepared, startup_count) = prepare_checked_package_scope(
             declarations, initialization_order, Vec::new(), inputs, scope,
         )?;
-        return run_closed_without_named_proofs(&prepared, scope, startup_count);
+        return Ok(PreparedConfiguredCheck::Plain { owner: prepared, startup_count });
     }
     let startup_count = initialization_order.len();
     let configured_root = proofs.iter().find(|(proof, _)| proof.configured_contextual_root).map(|(proof, _)| proof.declarations.source());
@@ -9480,22 +9531,11 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             sources.push((proof.declarations, namespaces));
         }
         if !ordinary.is_empty() {
-            return check_mixed_scalar_contextual(sources, ordinary, initialization_order, headers, inputs, scope, configured_root);
+            return prepare_mixed_scalar_contextual(sources, ordinary, initialization_order, headers, inputs, configured_root);
         }
         if startup_count > 2 { return Err(ProjectCheck::Unsupported); }
-        let mut report = check_prepared_contextual_proofs(sources, initialization_order, headers, inputs, scope, false)?;
-        let mut rest = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
-        let contextual_diagnostic = rest.next();
-        if contextual_diagnostic.is_some() {
-            // Preserve the existing contextual diagnostic priority over buffered ordinary directives.
-            report.directives.clear();
-        }
-        return Ok(MainFlowProofReceipt {
-            mixed_context_after_scalar: None,
-            active: report.active, directives: report.directives, diagnostics: Vec::new(), contextual_diagnostic,
-            additional_contextual_diagnostics: rest.collect(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
-            symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
-        });
+        let (owner, effects, startup_count) = prepare_contextual_check(sources, initialization_order, headers, inputs, false)?;
+        return Ok(PreparedConfiguredCheck::Contextual { owner, effects, startup_count });
     }
     let ordered = match (LOCAL_CATALOGS, scope) {
         (true, ScalarCheckerScope::CurrentPackage) => OrderedProofPreparation::All,
@@ -9503,6 +9543,35 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         (false, _) => OrderedProofPreparation::None,
     };
     let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant, ordered)?;
+    Ok(PreparedConfiguredCheck::Named { owner: prepared, startup_count })
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_configured_ordered_check<const LOCAL_CATALOGS: bool>(
+    owner: PreparedConfiguredCheck, scope: ScalarCheckerScope,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    let (prepared, startup_count) = match owner {
+        PreparedConfiguredCheck::Plain { owner, startup_count } =>
+            return run_closed_without_named_proofs(&owner, scope, startup_count),
+        PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count, configured_root } =>
+            return run_mixed_scalar_contextual(&owner, &ordinary_source, headers, startup_count, scope, configured_root),
+        PreparedConfiguredCheck::Contextual { owner, effects, startup_count } => {
+            let mut report = run_contextual_check(&owner, effects, startup_count, scope, false)?;
+            let mut rest = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
+            let contextual_diagnostic = rest.next();
+            if contextual_diagnostic.is_some() {
+                // Preserve the existing contextual diagnostic priority over buffered ordinary directives.
+                report.directives.clear();
+            }
+            return Ok(MainFlowProofReceipt {
+                mixed_context_after_scalar: None,
+                active: report.active, directives: report.directives, diagnostics: Vec::new(), contextual_diagnostic,
+                additional_contextual_diagnostics: rest.collect(), pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(),
+                symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+            });
+        }
+        PreparedConfiguredCheck::Named { owner, startup_count } => (owner, startup_count),
+    };
     let project = prepared.prepared.parts().0;
     let sources = if LOCAL_CATALOGS {
         project.initialization_order.as_slice()
@@ -9624,12 +9693,46 @@ pub fn check_loaded_scalar_ordered_local_proof_contexts(
     scope: ScalarCheckerScope,
     dormant: Vec<ScalarProofDeclarations>,
 ) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
-    check_loaded_ordered_proof_diagnostics_in_scope::<true>(
-        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, scope, dormant,
-    ).map_err(|error| match error {
+    prepare_loaded_scalar_ordered_local_proof_contexts(declarations, local_catalogs, initialization_order, inputs, scope, dormant)?.run()
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct PreparedScalarOrderedCheck {
+    owner: PreparedConfiguredCheck,
+    scope: ScalarCheckerScope,
+}
+
+#[cfg(feature = "internal-checker")]
+impl PreparedScalarOrderedCheck {
+    /// Executes the single checked owner captured by preparation.
+    pub fn run(self) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
+        run_configured_ordered_check::<true>(self.owner, self.scope).map_err(configured_ordered_error)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn configured_ordered_error(error: ProjectCheck) -> ScalarOrderedCheckerOutcome {
+    match error {
         ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
         _ => ScalarOrderedCheckerOutcome::Unsupported,
-    })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn prepare_loaded_scalar_ordered_local_proof_contexts(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    local_catalogs: impl IntoIterator<Item = (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+    dormant: Vec<ScalarProofDeclarations>,
+) -> Result<PreparedScalarOrderedCheck, ScalarOrderedCheckerOutcome> {
+    let owner = prepare_configured_ordered_check::<true>(
+        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, scope, dormant,
+    ).map_err(configured_ordered_error)?;
+    Ok(PreparedScalarOrderedCheck { owner, scope })
 }
 
 #[cfg(feature = "internal-checker")]
