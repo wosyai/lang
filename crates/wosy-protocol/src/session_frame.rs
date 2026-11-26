@@ -120,9 +120,26 @@ impl SessionFrameReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BuildSessionCommand, BuildSessionCommandId, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, NodeId};
     use std::future::{poll_fn, Future};
     use std::task::Poll;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[test]
+    fn legacy_start_and_started_wire_bytes() {
+        let id = BuildSessionCommandId(7);
+        let command = BuildSessionCommand { id, request: BuildSessionRequest::Start { version: 1 } };
+        let response = BuildSessionResponse::<()> {
+            id, reply: BuildSessionReply::Started { version: 1, source_root: NodeId([0; 32]) },
+        };
+        let start = br#"{"id":7,"request":{"kind":"start","version":1}}"#;
+        let started = br#"{"id":7,"reply":{"kind":"started","version":1,"source_root":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}"#;
+        for (encoded, payload) in [(encode_session_frame(&command), &start[..]), (encode_session_frame(&response), &started[..])] {
+            let mut expected = (payload.len() as u32).to_be_bytes().to_vec();
+            expected.extend_from_slice(payload);
+            assert_eq!(encoded.unwrap().as_ref(), expected);
+        }
+    }
 
     #[test]
     fn bound_prefix_body_eof_and_cancellation() {

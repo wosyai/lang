@@ -10,9 +10,11 @@ use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, N
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+mod diagnostics;
 mod delta;
 mod pins;
 pub use delta::{PendingGitBaseProjection, ProjectedGitBaseFile};
+pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 
 pub struct SqliteSourceState {
@@ -26,6 +28,7 @@ pub struct SourceSelection {
     pub selected: Option<NodeId>,
     pub pending: Option<SourceAttempt>,
     generation: i64,
+    selected_generation: Option<i64>,
 }
 
 /// A local upload attempt is distinct from its immutable source root. A
@@ -114,7 +117,7 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 1;
                  PRAGMA cst.user_version = 1;",
             )?,
-            (1 | 2 | 3, 1) => {}
+            (1 | 2 | 3 | 4, 1) => {}
             _ => return Err("incompatible local source state schema".into()),
         }
         if version < 2 {
@@ -126,6 +129,19 @@ impl SqliteSourceState {
         }
         if version < 3 {
             pins::initialize(&tx)?;
+        }
+        if version < 4 {
+            // Historical databases know only the latest issued attempt.
+            // Establish the initial epoch for the existing selection and
+            // record the accepted attempt precisely from this point on.
+            tx.execute_batch(
+                "ALTER TABLE source_targets ADD COLUMN selected_generation INTEGER CHECK (
+                    selected_generation IS NULL OR
+                    (selected IS NOT NULL AND selected_generation > 0 AND selected_generation <= generation)
+                 );
+                 UPDATE source_targets SET selected_generation = generation WHERE selected IS NOT NULL;
+                 PRAGMA main.user_version = 4;",
+            )?;
         }
         tx.commit()?;
         Ok(Self { project, db, limits })
@@ -215,10 +231,18 @@ impl SqliteSourceState {
     pub fn replay_acknowledged_source(
         &mut self, captured: &wosy_protocol::BuildSourceSelection,
     ) -> Result<Option<SourceReplay>> {
+        self.replay_acknowledged_at(captured, None)
+    }
+
+    fn replay_acknowledged_at(
+        &mut self, captured: &wosy_protocol::BuildSourceSelection, epoch: Option<i64>,
+    ) -> Result<Option<SourceReplay>> {
         if self.project.to_str() != Some(captured.project.as_str()) { return Ok(None); }
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let state = read_selection(&tx, &captured.target)?;
-        if state.selected != Some(captured.root) { return Ok(None); }
+        if state.selected != Some(captured.root)
+            || epoch.is_some_and(|epoch| state.selected_generation != Some(epoch))
+        { return Ok(None); }
         if let Some(usage) = load_usage(&tx, captured.root)? { usage.admit(self.limits)?; }
         let (delta, usage) = {
             let mut read = StoredNodes::new(&tx)?;
@@ -247,7 +271,7 @@ impl SqliteSourceState {
     /// a derived Build/Check result, cache hit, or artifact.
     pub fn acknowledge(&self, target: &str, attempt: SourceAttempt) -> Result<bool> {
         Ok(self.db.execute(
-            "UPDATE source_targets SET selected = ?2, pending = NULL
+            "UPDATE source_targets SET selected = ?2, selected_generation = ?3, pending = NULL
              WHERE target = ?1 AND pending = ?2 AND generation = ?3",
             params![target, attempt.root.0, attempt.generation],
         )? == 1)
@@ -417,13 +441,14 @@ fn load_usage(db: &Connection, root: NodeId) -> Result<Option<ClientSourceUsage>
 
 fn read_selection(sql: &Connection, target: &str) -> Result<SourceSelection> {
     Ok(sql.query_row(
-        "SELECT selected, pending, generation FROM source_targets WHERE target = ?1", [target], |row| {
+        "SELECT selected, pending, generation, selected_generation FROM source_targets WHERE target = ?1", [target], |row| {
             let generation = row.get(2)?;
             Ok(SourceSelection {
                 selected: row.get::<_, Option<[u8; 32]>>(0)?.map(NodeId),
                 pending: row.get::<_, Option<[u8; 32]>>(1)?
                     .map(|root| SourceAttempt::new(NodeId(root), generation)),
                 generation,
+                selected_generation: row.get(3)?,
             })
         },
     ).optional()?.unwrap_or_default())

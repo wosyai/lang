@@ -128,6 +128,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert stale["result"]["stale_refused"] and stale["result"]["deadline_closed"]
     assert stale["result"]["initial"] == root and stale["result"]["current"] == fresh["pending"] == stale["selected"]
     assert not state(replacement, "replay-acknowledged-for", root, project)["result"]["matches"]
+    generation = state(directory / "framed-advanced", "reconcile-framed-generation", "dev",
+                       main.read_text().replace("= 17", "= 19"))["result"]
+    assert generation["root"] == stale["selected"]
+    assert generation["final_generation"] == generation["initial_generation"] + 2
+    assert generation["pending_retained_selection"] and generation["delayed_reply_refused"]
+    assert generation["old_terminal_replay_refused"]
     print(json.dumps({
         "require_replay_ms": restored["probe_ms"], "sqlite_replay_ms": restored["replay_ms"],
         "daemon_restore_ms": restored["recover_ms"], "reopened_known_probe_ms": restarted["probe_ms"],
@@ -137,4 +143,5 @@ with tempfile.TemporaryDirectory() as tmp:
         "warm_lease_open_ms": warm_session["probe_ms"], "scoped_lease_quota": quota["lease_quota_and_scope"],
         "framed_challenge_pair_ms": framed["challenge_pair_ms"], "framed_recovery_ms": framed["framed_recovery_ms"],
         "framed_warm_diagnostics_ms": framed["framed_warm_ms"], "terminal_and_stale_resume_checks": True,
+        "same_root_epoch_checked_after_real_reply": True,
     }))

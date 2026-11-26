@@ -17,6 +17,8 @@ pub use build_diagnostics::{
     BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse,
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
+mod session_frame;
+pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NodeId(pub [u8; 32]);

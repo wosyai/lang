@@ -1836,13 +1836,11 @@ name = "wosy-daemon"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "bytes",
  "rowan",
  "serde",
  "serde_json",
  "surrealkv",
  "tokio",
- "tokio-util",
  "wosy-compiler",
  "wosy-project",
  "wosy-protocol",
@@ -1866,8 +1864,11 @@ name = "wosy-protocol"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
  "wosy-project",
  "wosy-syntax",
 ]

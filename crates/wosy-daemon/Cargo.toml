@@ -18,5 +18,3 @@ wosy-project.workspace = true
 wosy-compiler.workspace = true
 serde.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
-tokio-util = { version = "=0.7.20", default-features = false, features = ["codec"] }
-bytes = "1"
