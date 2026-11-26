@@ -309,6 +309,7 @@ impl<'a> InitializerCallNodes<'a> {
             }
         }
         let places = nodes.places.into_iter().map(|(place, ordinal)| (ordinal, place)).collect::<HashMap<_, _>>();
+        let mut scalar_assignment_groups = HashMap::new();
         let mut candidates = Vec::new();
         for (&base, &root) in &topology.identities.roots {
             let InitializationStorage::Lexical(local) = root else { continue };
@@ -326,13 +327,45 @@ impl<'a> InitializerCallNodes<'a> {
                 let mut stored_holder = None;
                 let mut writes = false;
                 let immediate_address = match (parent, edge) {
-                    (Parent::Block(block), Edge::AssignmentDestination { item, destination: 0 }) => {
+                    (Parent::Block(block), Edge::AssignmentDestination { item, destination }) => {
                         let group = topology.assignments.get(&(block, item))?;
-                        let destinations = group.destinations();
-                        let [target] = destinations.as_slice() else { return None };
-                        if target.destination != index || group.rhs_evaluations().len() != 1
+                        let destinations = group.destinations().as_slice();
+                        if destinations.get(destination)?.destination != index
                             || group.projected_outputs().len() != 0
                         { return None; }
+                        if destinations.len() == 1 {
+                            if group.rhs_evaluations().len() != 1 { return None; }
+                        } else if !*scalar_assignment_groups.entry((block, item)).or_insert_with(|| {
+                            let evaluations = group.rhs_evaluations().as_slice();
+                            evaluations.len() == destinations.len()
+                                && destinations.iter().zip(evaluations).enumerate().all(|(lane, (slot, input))| {
+                                    let AssignmentReplacement::Resolved(ty) = &slot.replacement else { return false };
+                                    slot.position == lane && input.position == lane
+                                        && ordinary_value(ty)
+                                        && structure.checked_types.places.get(&slot.destination) == Some(ty)
+                                        && structure.checked_types.expressions.get(&input.expression) == Some(ty)
+                                        && structure.edges.get(&(parent, Edge::AssignmentRhs { item, output: lane }))
+                                            == Some(&Node::Expression(input.expression))
+                                        && structure.edges.get(&(parent, Edge::AssignmentDestination { item, destination: lane }))
+                                            == Some(&Node::Place(slot.destination))
+                                        && (matches!(
+                                            topology.identities.destinations.get(&slot.destination),
+                                            Some(InitializationDestination::Existing(InitializationStorage::Lexical(_)))
+                                        ) || {
+                                            let place = Parent::Place(slot.destination);
+                                            matches!(
+                                                structure.edges.get(&(place, Edge::PlaceBase)),
+                                                Some(Node::Place(base)) if matches!(
+                                                    topology.identities.roots.get(base),
+                                                    Some(InitializationStorage::Lexical(_))
+                                                )
+                                            ) && matches!(
+                                                structure.edges.get(&(place, Edge::PlaceIndex)),
+                                                Some(Node::Expression(_))
+                                            )
+                                        })
+                                })
+                        }) { return None; }
                         writes = true;
                         None
                     }

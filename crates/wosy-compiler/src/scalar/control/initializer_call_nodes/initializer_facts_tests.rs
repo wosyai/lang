@@ -653,3 +653,42 @@ fn initializer_indexed_shared_address_needs_only_dominated_scalar_reads() {
         }
     }
 }
+
+#[test]
+fn initializer_independent_scalar_assignment_keeps_each_indexed_destination() {
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (assignment, indexed_lanes) in [
+            ("index, data[0] = next, value;", &[1][..]),
+            ("data[0], data[1] = value, other;", &[0, 1][..]),
+        ] {
+            let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u16[count] data; u64 index = 0; u64 next = 1; u16 value = 7; u16 other = 8; {assignment} 1 }} else {{ 2 }};\n%%end");
+            let source = SourceIdentity::new("p".into(), "app".into(), "scalar-group.w".into(), "r1".into());
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&source, &text), Vec::new())],
+                vec![source],
+                ScalarPreparationInputs { target_layout: layout },
+            ).unwrap_or_else(|error| panic!("{layout:?}: {:?}", error.diagnostics));
+            let facts = prepared.initializer_facts(0).unwrap();
+            let nodes = InitializerCallNodes::bind(facts.region, facts.items).unwrap();
+            let ScalarItem::Binding(selected) = &facts.items[0] else { unreachable!() };
+            let ScalarExpression::If { then_branch, .. } = &selected.value else { unreachable!() };
+            let ScalarBlockItem::LocalBinding(data) = &then_branch.items[1] else { unreachable!() };
+            let ScalarBlockItem::Assignment(group) = &then_branch.items[6] else { unreachable!() };
+            assert!(nodes.checked_local_array(data));
+            for &lane in indexed_lanes {
+                let place = &group.targets[lane].place;
+                let ScalarPlace::Index { base, .. } = place else { unreachable!() };
+                assert_eq!(nodes.checked_local_index(place, base), Some(data.receivers[0].name_span));
+                assert_eq!(nodes.checked_local_index(&place.clone(), base), None);
+            }
+            // The group is not an authority if any retained RHS type is missing.
+            let mut region = facts.region.clone();
+            let ModuleInitializationDetail::Occurrences(topology) = &mut region.detail else { unreachable!() };
+            let group = topology.assignments.values().find(|group| group.destinations().len() == 2).unwrap();
+            let rhs = group.rhs_evaluations().next().unwrap().expression;
+            assert!(topology.structure.checked_types.expressions.remove(&rhs).is_some());
+            let incomplete = InitializerCallNodes::bind(&region, facts.items).unwrap();
+            assert!(!incomplete.checked_local_array(data));
+        }
+    }
+}
