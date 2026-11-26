@@ -1384,6 +1384,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fresh_recommit_leaf: Option<RecommittedArrayExtent>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId, OccurrenceOrdinal)>,
     pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
+    retained_array_null_endpoints: HashMap<BlockOrdinal, CfgPointId>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
@@ -2041,6 +2042,7 @@ impl AggregateFlowFacts {
                 _ => {}
             }
             if let Some(&arm) = self.local_array_failure_arms.get(&id) {
+                result.retained_array_null_endpoints.insert(arm, id);
                 let witness = (local.live && !local.invalid && !local.viewed
                     && local.pending.is_none() && local.has_rebind)
                     .then_some(allocation);
@@ -10252,6 +10254,122 @@ struct PrivateRuntimeReadPlan {
     calls: HashMap<usize, PrivateRuntimePairCall>,
     relay_target: Option<BodyKey>,
     owners: HashSet<ByteSpan>,
+    retained_array_failure: Option<ClosedLocalArrayRelease>,
+}
+
+fn retained_failure_cone(
+    points: &[ReferenceFlowPoint], origin: CfgPointId, endpoint: CfgPointId,
+) -> Option<Vec<bool>> {
+    let mut predecessors = vec![false; endpoint.0 + 1];
+    predecessors[endpoint.0] = true;
+    for point in points.get(..=endpoint.0)?.iter().rev().skip(1) {
+        if point.successors.iter().any(|successor| *successor <= point.id) { return None; }
+        predecessors[point.id.0] = point.successors.iter().any(|successor|
+            predecessors.get(successor.0) == Some(&true));
+    }
+    let reaches_endpoint = |point: CfgPointId| predecessors.get(point.0) == Some(&true);
+    if !reaches_endpoint(origin) { return None; }
+
+    // Reject any alternate entry path which has not executed the allocation.
+    let mut bypass = vec![false; predecessors.len()];
+    bypass[0] = true;
+    for point in points.get(..=endpoint.0)? {
+        if point.id == origin || !reaches_endpoint(point.id) || !bypass[point.id.0] { continue; }
+        for successor in &point.successors {
+            if reaches_endpoint(*successor) { bypass[successor.0] = true; }
+        }
+    }
+    (!bypass[endpoint.0]).then_some(predecessors)
+
+}
+
+// Reuse the canonical projected-null endpoint and the sealed access
+// cohort. A borrow may leave the owner live; it does not require a move and
+// recommit. Only predecessors of this endpoint participate, so neither a
+// sibling's explicit release nor its returned view proves anything here.
+fn retained_array_failure_receipt(
+    result: &FunctionReferenceResult,
+    plan: &PrivateRuntimeReadPlan,
+) -> Option<ClosedLocalArrayRelease> {
+    let cfg = &result.cfg;
+    let facts = &result.aggregate;
+    let mut endpoints = facts.retained_array_null_endpoints.iter();
+    let (&arm, &endpoint) = endpoints.next()?;
+    if endpoints.next().is_some() || plan.formal.is_some() { return None; }
+    let mut owners = plan.calls.values().filter(|site| !site.inherited && site.phase_root);
+    let owner_span = owners.next()?.owner;
+    if owners.any(|site| site.owner != owner_span) { return None; }
+    let mut allocations = facts.allocation_slots.iter().filter_map(|(&origin, &position)| {
+        let point = cfg.points.get(origin.0)?;
+        let CfgPointKind::Bind { binding } = &point.kind else { return None };
+        (binding.declaration_span == owner_span && point.scope == ReferenceScopeId(0)
+            && cfg.allocations.contains(binding)).then_some((origin, position, binding))
+    });
+    let (origin, allocation, owner) = allocations.next()?;
+    if allocations.next().is_some() || origin >= endpoint { return None; }
+    let predecessors = retained_failure_cone(&cfg.points, origin, endpoint)?;
+    let reaches_endpoint = |point: CfgPointId| predecessors.get(point.0) == Some(&true);
+    // The sibling's checked release certifies that the ordinary emitter has a
+    // managed backing and live slot for this owner. It is not an endpoint
+    // liveness witness and must not be reachable on the selected failure path.
+    if !cfg.points.iter().any(|point| !reaches_endpoint(point.id)
+        && matches!(&point.kind, CfgPointKind::Release {
+            target: ReleaseTarget::Checked { candidates, .. }
+        } if matches!(candidates.as_slice(), [candidate]
+            if &candidate.place.binding == owner && candidate.place.projections.is_empty())))
+    { return None; }
+
+    let mut proved_loans = HashSet::new();
+    let mut borrower_calls = HashSet::new();
+    for (&ordinal, site) in &plan.calls {
+        if site.inherited || site.owner != owner_span || !site.phase_root { continue; }
+        let call = cfg.primary_call_point(OccurrenceOrdinal(ordinal))?;
+        if !reaches_endpoint(call) { continue; }
+        let CfgPointKind::Call { output: 0, argument_points, .. } = &cfg.points.get(call.0)?.kind else { return None };
+        let &borrow = argument_points.first()?;
+        let CfgPointKind::Borrow { place, loan } = &cfg.points.get(borrow.0)?.kind else { return None };
+        if borrow <= origin || !reaches_endpoint(borrow) || &place.binding != owner
+            || !place.projections.is_empty() || loan.parent.is_some() || &loan.origin_place.binding != owner
+            || loan.mode != ScalarReferenceMutability::Mutable
+        { return None; }
+        proved_loans.insert(borrow);
+        borrower_calls.insert(call);
+    }
+    if proved_loans.is_empty() || result.proof_points.raw_address_exposures.iter().any(|(point, actual)| {
+        reaches_endpoint(*point) && actual.as_ref().is_none_or(|actual| actual == owner)
+    }) { return None; }
+
+    let owner_origin = |point: CfgPointId| {
+        cfg.points.get(point.0).and_then(|point| point.possible_origins.as_ref()).is_some_and(|origins|
+            origins.iter().any(|origin| match cfg.facts.get(origin.0) {
+                Some(ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. }) =>
+                    &loan.origin_place.binding == owner,
+                _ => false,
+            }))
+    };
+    for point in cfg.points.get(origin.0 + 1..=endpoint.0)?.iter().filter(|point| reaches_endpoint(point.id)) {
+        let stays_local = match &point.kind {
+            CfgPointKind::Borrow { place, .. } if &place.binding == owner => proved_loans.contains(&point.id),
+            CfgPointKind::Read { binding } if binding == owner => false,
+            CfgPointKind::Assign { target, .. } if &target.binding == owner =>
+                matches!(target.projections.as_slice(), [ReferencePlaceProjection::Index(_)]),
+            CfgPointKind::ReadPlace { candidates, pointer_point, .. } =>
+                !pointer_point.is_some_and(owner_origin) && candidates.iter().all(|candidate|
+                    &candidate.binding != owner || matches!(candidate.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
+            CfgPointKind::Move { owner: actual, place, .. } | CfgPointKind::DeferredMove { owner: actual, place, .. } =>
+                actual != owner && &place.binding != owner,
+            CfgPointKind::Invalidate { .. } | CfgPointKind::Release { .. }
+            | CfgPointKind::AssignThrough { .. } | CfgPointKind::MoveThrough { .. }
+            | CfgPointKind::DeferredMoveThrough { .. } | CfgPointKind::ReborrowThrough { .. }
+            | CfgPointKind::DeferredArrayElement { .. } => false,
+            CfgPointKind::Call { argument_points, .. } =>
+                borrower_calls.contains(&point.id) || !argument_points.iter().copied().any(owner_origin),
+            CfgPointKind::ReturnOutput { value_point, .. } => !owner_origin(*value_point),
+            _ => !owner_origin(point.id),
+        };
+        if !stays_local { return None; }
+    }
+    Some(ClosedLocalArrayRelease { receipt: OriginalArrayReceipt { origin, allocation }, arm: arm.0 })
 }
 
 impl ClosedAggregates {
@@ -10320,6 +10438,12 @@ impl ClosedAggregates {
             body.private_runtime_access_owners.clone_from(&plan.owners);
             body.private_runtime_phase_owners = plan.calls.values().filter(|site| site.phase_root)
                 .map(|site| (site.owner.start, site.owner.end)).collect();
+            if let Some(failure) = plan.retained_array_failure {
+                if body.local_array_failure.is_some_and(|legacy| legacy != failure) {
+                    return Err("retained owner release conflicts with existing exact endpoint".into());
+                }
+                body.local_array_failure = Some(failure);
+            }
             self.private_runtime_pair_members.push(key);
         }
         Ok(())
@@ -11421,6 +11545,11 @@ impl ProjectReferenceResults {
                 }
             }
         }
+        for (&(module, item, arm), plan) in &mut plans.bodies {
+            if let Some(result) = self.function_result(module, item, arm) {
+                plan.retained_array_failure = retained_array_failure_receipt(result, plan);
+            }
+        }
         let mut errors = Vec::new();
         for ((module, item, arm), mut reads) in pending {
             if plans.bodies.get(&(module, item, arm)).is_some_and(|plan| plan.formal.is_some()) { continue; }
@@ -11498,6 +11627,24 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_failure_endpoint_requires_original_allocation_on_every_path() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "flow".into(), "r1".into());
+        let graph = |next: &[&[usize]]| next.iter().enumerate().map(|(id, successors)| ReferenceFlowPoint {
+            id: CfgPointId(id),
+            kind: CfgPointKind::Join,
+            source_span: SourceSpan::new(source.clone(), ByteSpan::new(0, 0)),
+            scope: ReferenceScopeId(0),
+            possible_origins: None,
+            successors: successors.iter().copied().map(CfgPointId).collect(),
+        }).collect::<Vec<_>>();
+        let actual = graph(&[&[1], &[2, 3], &[], &[4], &[]]);
+        assert_eq!(retained_failure_cone(&actual, CfgPointId(1), CfgPointId(4)),
+            Some(vec![true, true, false, true, true]));
+        let bypass = graph(&[&[1, 3], &[2, 3], &[], &[4], &[]]);
+        assert_eq!(retained_failure_cone(&bypass, CfgPointId(1), CfgPointId(4)), None);
+    }
 
     #[test]
     fn private_runtime_tail_projection_accepts_only_primitive_scalar_pairs() {
