@@ -203,7 +203,18 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
+        Self::new_observing_types(project, |_| {})
+    }
+
+    pub(super) fn new_observing_types(
+        project: ScalarProject, observe: impl FnOnce(&ResolvedScalarProjectTypes),
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
+        Self::from_checked_types(observe_scalar_project_resolution(project, observe))
+    }
+
+    pub(super) fn from_checked_types(
+        (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
         if !validation.diagnostics.is_empty() {
             return Err(ScalarProjectPreparationRejection::extraction_or_typing(
                 validation,

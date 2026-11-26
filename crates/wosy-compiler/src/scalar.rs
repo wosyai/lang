@@ -2646,8 +2646,49 @@ fn typecheck_scalar_project(project: ScalarProject) -> ScalarProjectValidation {
     typecheck_scalar_project_with_occurrences(project).0
 }
 
+/// Compiler-owned declaration/type/layout state before occurrence-local
+/// inference. No serialization, public constructor or replacement data can
+/// confer this authority. Occurrence, call and ownership facts come later.
+pub struct ResolvedScalarProjectTypes(ScalarProject);
+
+impl ResolvedScalarProjectTypes {
+    /// Admit a process-local copy by a logical input weight; no encoded bytes
+    /// are retained, and this is not an estimate of allocator size or RSS.
+    pub fn copy_within(&self, max_logical_bytes: usize) -> Option<Self> {
+        struct Meter(usize);
+        impl std::io::Write for Meter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.checked_sub(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("typed resolution exceeds logical admission"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        serde_json::to_writer(Meter(max_logical_bytes), &self.0).ok()?;
+        Some(Self(self.0.clone()))
+    }
+
+    /// Continue ordinary occurrence inference and static call preparation.
+    /// Only the exact compiler-owned pre-occurrence resolution is reused.
+    pub fn prepare(&self) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+        let project = self.0.clone();
+        // The environment is indexed by source identities, named struct/enum
+        // declarations and namespace bindings. Resolving types changes none
+        // of those headers. No address-based occurrence facts are retained.
+        let declarations = declarations::ScalarDeclarationEnvironment::new(&project.modules);
+        PreparedScalarProject::from_checked_types(infer_scalar_project_occurrences(project, declarations, Vec::new()))
+    }
+}
+
+#[cfg(test)]
 fn typecheck_scalar_project_with_occurrences(
     project: ScalarProject,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    observe_scalar_project_resolution(project, |_| {})
+}
+
+fn observe_scalar_project_resolution(
+    project: ScalarProject, observe: impl FnOnce(&ResolvedScalarProjectTypes),
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
@@ -2687,6 +2728,15 @@ fn typecheck_scalar_project_with_occurrences(
     {
         enumeration.copy_policy = policy;
     }
+    let resolved = ResolvedScalarProjectTypes(project);
+    if diagnostics.is_empty() { observe(&resolved); }
+    infer_scalar_project_occurrences(resolved.0, declarations, diagnostics)
+}
+
+fn infer_scalar_project_occurrences(
+    mut project: ScalarProject, declarations: declarations::ScalarDeclarationEnvironment,
+    mut diagnostics: Vec<Diagnostic>,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let overloads = ScalarOverloadEnvironment::project(&project.modules);
     let owners = project
         .modules
@@ -3137,6 +3187,17 @@ pub fn prepare_scalar_project(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+    prepare_scalar_project_observing_types(declarations, initialization_order, inputs, |_| {})
+}
+
+/// Expose the ordinary, diagnostics-free resolution/layout stage without
+/// changing how the remainder of this preparation succeeds or fails.
+pub fn prepare_scalar_project_observing_types(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    observe: impl FnOnce(&ResolvedScalarProjectTypes),
+) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -3164,7 +3225,7 @@ pub fn prepare_scalar_project(
             },
         ));
     }
-    PreparedScalarProject::new(project)
+    PreparedScalarProject::new_observing_types(project, observe)
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {

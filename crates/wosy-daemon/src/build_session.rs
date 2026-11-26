@@ -1,8 +1,8 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::{LeaseGrant, SourceLease}, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
-    PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedLlvmIdentity, RootedLlvmProjection,
+    PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
     SavedBuildDiagnostic, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
@@ -141,7 +141,8 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
-        self.dispatch_analysis(request, None).await
+        let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
+        self.dispatch_analysis(request, Some(cancellation)).await
     }
 
     /// Explicit local projection through a separate fresh ordinary Build
@@ -173,8 +174,7 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
-        let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
-        self.dispatch_analysis(request, Some(cancellation)).await
+        self.dispatch(request).await
     }
 
     /// Save the actual ordinary Build diagnostic outcome for this exact
@@ -215,9 +215,9 @@ impl BuildDiagnosticSession<'_> {
         if version != BUILD_DIAGNOSTIC_VERSION { return Err(BuildRequestRejection::Version.into()); }
         if let Some(signal) = &cancellation { signal.check_cutoff()?; }
         let slot = self.worker.try_slot()?;
-        let grant = self.lease.grant();
+        let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved_query(slot, cancellation, move |worker| async move {
-            let analysis = analyze_leased(&worker, grant, &profile).await?;
+            let analysis = analyze_leased(&worker, &lease, &profile).await?;
             Ok(BuildDiagnosticResponse::BuildDiagnostics {
                 version, source_root: analysis.source_root, profile,
                 preparation: analysis.preparation, receipt: analysis.key.digest(),
@@ -227,14 +227,20 @@ impl BuildDiagnosticSession<'_> {
     }
 }
 
-async fn analyze_leased(worker: &QueryWorker, grant: LeaseGrant, profile: &str) -> Result<RootedBuildAnalysis> {
+async fn analyze_leased(worker: &QueryWorker, lease: &SourceLease, profile: &str) -> Result<RootedBuildAnalysis> {
+    prepare_leased(worker, lease, profile).await?.build_analysis_with(Some(worker)).await
+}
+
+async fn prepare_leased<'a>(
+    worker: &'a QueryWorker, lease: &SourceLease, profile: &str,
+) -> Result<RootedPreparedProject<'a>> {
+    let grant = lease.grant();
     let snapshot = worker.phase(None, move |store| {
         store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
     }).await?;
     let Some(snapshot) = snapshot else { return Err(BuildRequestRejection::Expired.into()); };
     // SurrealKV commits can schedule blocking work; await on the async task.
-    let prepared = worker.store.prepare_configured(snapshot, profile, Some(worker)).await?;
-    prepared.build_analysis_with(Some(worker)).await
+    worker.store.prepare_configured(snapshot, profile, Some(worker), Some(lease)).await
 }
 
 #[cfg(test)]
@@ -247,6 +253,106 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc};
     use std::task::Poll;
+
+    #[test]
+    #[ignore = "requires two published revisions of a small legitimate workspace"]
+    fn leased_resolution_reuses_only_compiler_owned_exact_positive_state() {
+        use wosy_compiler::{analyze_scalar_build, ScalarProject};
+        let project = PathBuf::from(std::env::var_os("WOSY_RESOLUTION_PROJECT").unwrap());
+        let store_path = PathBuf::from(std::env::var_os("WOSY_RESOLUTION_STORE").unwrap());
+        let root = |field| NodeId::parse_hex(&std::env::var(field).unwrap()).unwrap();
+        let first = root("WOSY_RESOLUTION_FIRST");
+        let second = root("WOSY_RESOLUTION_ANNOTATED");
+        assert_ne!(first, second);
+        let fresh: Vec<_> = std::env::var("WOSY_RESOLUTION_PRESSURE").unwrap().split(',')
+            .map(|hex| NodeId::parse_hex(hex).unwrap()).collect();
+        assert_eq!(fresh.len(), 5);
+        let oversized = root("WOSY_RESOLUTION_OVERSIZED");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            for reopen in [false, true] {
+                let store = Arc::new(SourceStore::open(&store_path, 8 << 20).unwrap());
+                let one = NonZeroUsize::new(1).unwrap();
+                let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+                let selection = |root| BuildSourceSelection { root, project: project.to_str().unwrap().into(), target: "app".into() };
+                let open = |root| worker.open_build_diagnostics(selection(root), Duration::from_secs(60));
+
+                async fn query(session: &BuildDiagnosticSession<'_>, profile: &'static str)
+                    -> Result<(bool, bool, ScalarProject, Vec<Diagnostic>, Duration)> {
+                    let slot = session.worker.try_slot()?;
+                    let lease = Arc::clone(&session.lease);
+                    let (_observer, signal) = QueryCancellation::observe_before(session.hard_deadline());
+                    session.worker.spawn_reserved_query(slot, Some(signal), move |worker| async move {
+                        let view = prepare_leased(&worker, &lease, profile).await?;
+                        let prepared = view.prepared().ok_or("expected a positively prepared compiler project")?;
+                        Ok((view.report.reused_live_resolution, view.report.reused_live_preparation,
+                            prepared.project().clone(), analyze_scalar_build(prepared).diagnostics().to_vec(),
+                            view.report.compiler_preparation + view.report.materialized_bodies))
+                    }).await?
+                }
+
+                let a = open(first).await.unwrap().unwrap();
+                let b = open(second).await.unwrap().unwrap();
+                for profile in ["dev", "native"] {
+                    let (hit, live, project, diagnostics, cold_time) = query(&a, profile).await.unwrap();
+                    assert!(!hit && !live && diagnostics.is_empty());
+                    let (hit, live, same, repeated, warm_time) = query(&a, profile).await.unwrap();
+                    assert!(hit && !live);
+                    assert_eq!((same, repeated), (project.clone(), diagnostics.clone()));
+                    let plain = store.rooted_prepared_project(first, profile).await.unwrap().unwrap();
+                    assert!(!plain.report.reused_live_resolution);
+                    let ordinary = plain.prepared().unwrap();
+                    assert_eq!(ordinary.project(), &project);
+                    assert_eq!(analyze_scalar_build(ordinary).diagnostics(), diagnostics);
+                    drop(plain);
+                    let (hit, live, changed, rederived, _) = query(&b, profile).await.unwrap();
+                    // The exact authored root changed. Its executable semantics
+                    // match, but no previous-root positive was consulted.
+                    assert!(!hit && !live);
+                    assert_eq!((changed, rederived), (project, diagnostics));
+                    let another = open(first).await.unwrap().unwrap();
+                    let (hit, live, _, _, _) = query(&another, profile).await.unwrap();
+                    assert!(hit && !live);
+                    another.lease.release();
+                    let error = query(&another, profile).await.unwrap_err();
+                    assert!(matches!(error.downcast_ref::<BuildRequestRejection>(), Some(BuildRequestRejection::Expired)));
+                    println!("{profile} reopen={reopen}: fresh={}µs handoff={}µs",
+                        cold_time.as_micros(), warm_time.as_micros());
+                }
+                for &root in &fresh {
+                    let extra = open(root).await.unwrap().unwrap();
+                    let (hit, live, _, diagnostics, _) = query(&extra, "dev").await.unwrap();
+                    assert!(!hit && !live && diagnostics.is_empty());
+                }
+                // Initial slots were A.dev, B.dev, A.native, B.native.
+                // Five later inserts evict only A.dev despite its warm reads.
+                assert!(query(&a, "native").await.unwrap().0);
+                assert!(!query(&a, "dev").await.unwrap().0);
+                let big = open(oversized).await.unwrap().unwrap();
+                for _ in 0..2 {
+                    let (hit, live, _, diagnostics, _) = query(&big, "dev").await.unwrap();
+                    assert!(!hit && !live && diagnostics.is_empty());
+                }
+                big.release();
+                let slot = a.worker.try_slot().unwrap();
+                let (observer, signal) = QueryCancellation::observe();
+                drop(observer);
+                let open_lease = Arc::clone(&a.lease);
+                let stopped = a.worker.spawn_reserved_query(slot, Some(signal), move |worker| async move {
+                    // A detached observer cannot warm-access another valid
+                    // session's already-retained project preparation.
+                    prepare_leased(&worker, &open_lease, "native").await.map(|_| ())
+                }).await.unwrap();
+                assert!(stopped.is_err());
+                assert!(query(&a, "native").await.unwrap().0);
+                println!("genuine eighth/ninth FIFO, oversize bypass and observer refusal; reopen={reopen}");
+                a.release();
+                b.release();
+                drop(worker);
+                Arc::into_inner(store).ok_or("worker still held").unwrap().close().await.unwrap();
+            }
+        });
+    }
 
     #[test]
     #[ignore = "requires a disposable store with a published source root"]

@@ -897,7 +897,7 @@ mod lease_tests {
             assert!(!lease.renew());
             drop(lease);
             assert_eq!((census().candidate_roots, census().active_read_roots), (0, 1));
-            let prepared = store.prepare_configured(in_flight.configured().unwrap(), "dev", None).await.unwrap();
+            let prepared = store.prepare_configured(in_flight.configured().unwrap(), "dev", None, None).await.unwrap();
             let response = prepared.build_analysis().await.unwrap();
             assert_eq!(response.source_root, old);
             assert_eq!(census().candidate_roots, 0);

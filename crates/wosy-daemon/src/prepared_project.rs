@@ -1,17 +1,18 @@
 //! Real compiler preparation and separately requested Build analysis.
 use super::{
-    base_declarations::Flights, build_receipt::{BuildInputs, Lookup}, read_comments,
+    base_declarations::Flights, build_receipt::{BuildInputs, Lookup}, build_session::BuildRequestRejection, read_comments,
+    retention_plan::SourceLease,
     storage_worker::{QueryPhases, QueryWorker},
     BuildAnalysisOrigin, BuildAnalysisPhase, ConfiguredSourceView, ProjectDeclarationModule,
     ProjectDeclarationsView, Result, SourceStore,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
 use tokio::sync::Mutex as AsyncMutex;
 use wosy_compiler::{
-    analyze_scalar_build, prepare_scalar_project, Diagnostic, PreparedScalarProject,
+    analyze_scalar_build, prepare_scalar_project_observing_types, Diagnostic, PreparedScalarProject, ResolvedScalarProjectTypes,
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
     ScalarTargetLayout, COMPILER_IDENTITY,
 };
@@ -21,15 +22,53 @@ use wosy_syntax::{AuthoredSpanMap, SourceIdentity};
 
 const PREPARED_PROJECT_ABI: &str = "wosy rooted typed project preparation v2";
 
+const RESOLUTION_ENTRIES: usize = 8;
+const RESOLUTION_LOGICAL_BYTES: usize = 64 << 10;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ResolvedKey {
+    root: NodeId,
+    preparation: NodeId,
+    image: NodeId,
+}
+
+type Resolutions = VecDeque<(ResolvedKey, Arc<ResolvedScalarProjectTypes>)>;
+
 #[derive(Default)]
 pub(super) struct PreparationCache {
     flights: Flights<NodeId>,
     live: Mutex<HashMap<NodeId, Weak<CanonicalPreparation>>>,
+    resolutions: Mutex<Resolutions>,
 }
 
 impl PreparationCache {
     fn get(&self, key: NodeId) -> Option<Arc<CanonicalPreparation>> {
         self.live.lock().expect("typed project registry").get(&key)?.upgrade()
+    }
+
+    fn resolved(&self, key: ResolvedKey) -> Option<Arc<ResolvedScalarProjectTypes>> {
+        self.resolutions.lock().expect("resolved project registry").iter()
+            .find(|(stored, _)| *stored == key).map(|(_, value)| Arc::clone(value))
+    }
+
+    fn remember_resolved(
+        &self, lease: &SourceLease, phases: QueryPhases<'_>, key: ResolvedKey, value: Arc<ResolvedScalarProjectTypes>,
+    ) -> Result<()> {
+        let mut retained = self.resolutions.lock().expect("resolved project registry");
+        if retained.len() < RESOLUTION_ENTRIES { retained.reserve(1); }
+        let mut pending = Some(value);
+        // The existing exact preparation flight serializes equal keys. Check
+        // current live session and observer at this short insertion cut.
+        let retired = lease.finish_current(|| {
+            phases.check_active()?;
+            let prior = if retained.len() == RESOLUTION_ENTRIES { retained.pop_front() } else { None };
+            retained.push_back((key, pending.take().expect("one staged handoff")));
+            Ok::<_, super::Error>(prior)
+        });
+        drop(retained);
+        drop(pending);
+        drop(retired.ok_or(BuildRequestRejection::Expired)??);
+        Ok(())
     }
 
     fn remember(&self, key: NodeId, result: &Arc<CanonicalPreparation>) {
@@ -60,8 +99,10 @@ pub struct ProjectPreparationReport {
     pub projected_declarations: Duration,
     pub materialized_bodies: Duration,
     pub compiler_preparation: Duration,
-    /// No typed state survives after all users of the exact handle drop it.
+    /// The full prepared handle remains weakly held, independent of the
+    /// optional short, positively observed type-resolution handoff.
     pub reused_live_preparation: bool,
+    pub reused_live_resolution: bool,
 }
 
 /// Identity of the diagnostic-only Build query for a canonical preparation.
@@ -284,11 +325,12 @@ impl SourceStore {
         &self, root: NodeId, profile: &str,
     ) -> Result<Option<RootedPreparedProject<'_>>> {
         let Some(snapshot) = self.snapshot(root)? else { return Ok(None); };
-        self.prepare_configured(snapshot.configured()?, profile, None).await.map(Some)
+        self.prepare_configured(snapshot.configured()?, profile, None, None).await.map(Some)
     }
 
     pub(super) async fn prepare_configured(
         &self, snapshot: ConfiguredSourceView, profile: &str, worker: Option<&QueryWorker>,
+        lease: Option<&SourceLease>,
     ) -> Result<RootedPreparedProject<'_>> {
         let start = Instant::now();
         let selected_profile = SelectedBuildProfile::configured(profile, snapshot.config.profiles.get(profile)
@@ -313,36 +355,69 @@ impl SourceStore {
             report.reused_live_preparation = true;
             canonical
         } else {
+            let key = lease.and_then(|lease| {
+                let image = declarations.image?;
+                let root = declarations.snapshot;
+                (lease.grant().root == root).then_some(ResolvedKey { root, preparation: identity, image })
+            });
             let start = Instant::now();
-            let files: Vec<_> = declarations.modules().iter()
-                .map(|module| (module.file.executable, module.body)).collect();
-            let bodies = self.projected_bodies(phases, declarations.image, &files).await?;
-            report.materialized_bodies = start.elapsed();
-            let start = Instant::now();
-            let modules = Arc::clone(&declarations.modules);
-            let (outcome, owners) = phases.run(move |_| {
-                let owners: Vec<_> = modules.iter().map(executable_owner).collect();
-                let mut input = Vec::with_capacity(owners.len());
-                for ((module, owner), body) in modules.iter().zip(&owners).zip(bodies) {
-                    let body = body.with_executable_owner(owner.clone());
-                    // Publication already paired exact typed namespace
-                    // occurrences in declaration order.
-                    let bindings = body.namespaces().zip(&module.imports).map(|(site, link)| {
-                        ScalarNamespaceBinding {
-                            binding: site.binding.clone(),
-                            target: owners[link.target.0].clone(),
-                            span: site.span,
+            let (outcome, owners) = if let Some(cached) = key.and_then(|key| self.prepared_projects.resolved(key)) {
+                let modules = Arc::clone(&declarations.modules);
+                let (prepared, owners) = phases.run(move |_| {
+                    let owners: Vec<_> = modules.iter().map(executable_owner).collect();
+                    Ok((cached.prepare(), owners))
+                }).await?;
+                // A handoff contains no final inference, call or Build
+                // result. Re-enter the ordinary preparation from that cut.
+                report.reused_live_resolution = true;
+                let outcome = prepared.map_or_else(PreparationOutcome::Rejected, PreparationOutcome::Ready);
+                report.compiler_preparation = start.elapsed();
+                (outcome, owners)
+            } else {
+                let files: Vec<_> = declarations.modules().iter()
+                    .map(|module| (module.file.executable, module.body)).collect();
+                let bodies = self.projected_bodies(phases, declarations.image, &files).await?;
+                report.materialized_bodies = start.elapsed();
+                let start = Instant::now();
+                let modules = Arc::clone(&declarations.modules);
+                let (outcome, owners, retained) = phases.run(move |_| {
+                    let owners: Vec<_> = modules.iter().map(executable_owner).collect();
+                    let mut input = Vec::with_capacity(owners.len());
+                    for ((module, owner), body) in modules.iter().zip(&owners).zip(bodies) {
+                        let body = body.with_executable_owner(owner.clone());
+                        // Publication paired exact typed namespace
+                        // occurrences in declaration order.
+                        let bindings = body.namespaces().zip(&module.imports).map(|(site, link)| {
+                            ScalarNamespaceBinding {
+                                binding: site.binding.clone(), target: owners[link.target.0].clone(), span: site.span,
+                            }
+                        }).collect();
+                        input.push((body, bindings));
+                    }
+                    let mut retained = None;
+                    let outcome = match prepare_scalar_project_observing_types(
+                        input, owners.clone(), ScalarPreparationInputs { target_layout },
+                        |resolved| {
+                            if key.is_some() { retained = resolved.copy_within(RESOLUTION_LOGICAL_BYTES).map(Arc::new); }
+                        },
+                    ) {
+                        Ok(prepared) => PreparationOutcome::Ready(prepared),
+                        Err(rejected) => {
+                            retained = None;
+                            PreparationOutcome::Rejected(rejected)
                         }
-                    }).collect();
-                    input.push((body, bindings));
+                    };
+                    Ok((outcome, owners, retained))
+                }).await?;
+                report.compiler_preparation = start.elapsed();
+                if let (Some(key), Some(lease), Some(retained)) = (key, lease, retained) {
+                    let grant = lease.grant();
+                    let _still_admitted = phases.run(move |store| Ok(store.begin_leased_source(grant, Mode::ReadOnly)?
+                        .map(|(_, read)| read))).await?.ok_or(BuildRequestRejection::Expired)?;
+                    self.prepared_projects.remember_resolved(lease, phases, key, retained)?;
                 }
-                let outcome = match prepare_scalar_project(input, owners.clone(), ScalarPreparationInputs { target_layout }) {
-                    Ok(prepared) => PreparationOutcome::Ready(prepared),
-                    Err(rejected) => PreparationOutcome::Rejected(rejected),
-                };
-                Ok((outcome, owners))
-            }).await?;
-            report.compiler_preparation = start.elapsed();
+                (outcome, owners)
+            };
             let owners = owners.into_iter().enumerate()
                 .map(|(ordinal, identity)| (identity, SourceNodeId(ordinal))).collect();
             let canonical = Arc::new(CanonicalPreparation {
@@ -354,6 +429,9 @@ impl SourceStore {
             self.prepared_projects.remember(identity, &canonical);
             canonical
         };
+        if let Some(lease) = lease {
+            lease.finish_current(|| phases.check_active()).ok_or(BuildRequestRejection::Expired)??;
+        }
         Ok(RootedPreparedProject { store: self, declarations, canonical, report })
     }
 }

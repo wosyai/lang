@@ -283,6 +283,10 @@ impl<'a> QueryPhases<'a> {
         }
     }
 
+    pub(super) fn check_active(self) -> Result<()> {
+        self.worker.map_or(Ok(()), QueryWorker::check_active)
+    }
+
     pub async fn run<T: Send + 'static>(
         self, job: impl FnOnce(&SourceStore) -> Result<T> + Send + 'static,
     ) -> Result<T> {
