@@ -22,6 +22,7 @@ pub use diagnostic_report::{
     AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryBuilderInputs, AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer,
     ProjectDiagnosticExchange, RootedDiagnosticReport,
 };
+pub use current_view::PinnedEntryCst;
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 pub use pin_reconciliation::{PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 
@@ -357,8 +358,7 @@ impl SqliteSourceState {
         let config = record(parts.config)?;
         if config.kind != Kind::Config { return Err("expected persisted source configuration".into()); }
         let config: SourceConfig = serde_json::from_slice(&config.data)?;
-        if config.target != target || top.data != config.schema()
-            || config.parser.schema.0 != *wosy_syntax::base_cst_schema()
+        if config.target != target || !parts.envelope.matches_config(&config)
             || config.namespaces.get(&config.entry.package).is_none_or(|ns| {
                 ns.git.is_some() || Path::new(&ns.project) != project
             })

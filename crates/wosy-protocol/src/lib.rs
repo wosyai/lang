@@ -252,6 +252,7 @@ pub fn installed_git_source_schema() -> &'static [u8; 32] {
 /// The root layout shared by the local CST store and the daemon. File
 /// provenance is indexed by these exact children, not by directory contents.
 pub struct SourcePreparationParts<'a> {
+    pub envelope: SourcePreparationEnvelope,
     pub config: NodeId,
     pub executable: NodeId,
     pub annotation: NodeId,
@@ -259,17 +260,44 @@ pub struct SourcePreparationParts<'a> {
     pub files: &'a [NodeId],
 }
 
-pub fn source_preparation_parts(node: &Node) -> Option<SourcePreparationParts<'_>> {
-    if node.kind != Kind::SourcePreparation
-        || (node.data != source_preparation_schema() && node.data != installed_git_source_schema())
-    {
-        return None;
+/// The two published source envelopes for the current Base CST grammar.
+/// A decoded envelope identifies a layout, not a validated source scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourcePreparationEnvelope {
+    NamespaceAuthority,
+    InstalledGit,
+}
+
+impl SourcePreparationEnvelope {
+    fn from_current_digest(data: &[u8]) -> Option<Self> {
+        if data == source_preparation_schema() { Some(Self::NamespaceAuthority) }
+        else if data == installed_git_source_schema() { Some(Self::InstalledGit) }
+        else { None }
     }
+
+    fn digest(self) -> &'static [u8; 32] {
+        match self {
+            Self::NamespaceAuthority => source_preparation_schema(),
+            Self::InstalledGit => installed_git_source_schema(),
+        }
+    }
+
+    /// Match this exact root layout to the already decoded configuration.
+    /// Owner, target and per-file provenance still require rooted checks.
+    pub fn matches_config(self, config: &SourceConfig) -> bool {
+        self == config.envelope() && config.parser.schema.0 == *wosy_syntax::base_cst_schema()
+    }
+}
+
+pub fn source_preparation_parts(node: &Node) -> Option<SourcePreparationParts<'_>> {
+    if node.kind != Kind::SourcePreparation { return None; }
+    let envelope = SourcePreparationEnvelope::from_current_digest(&node.data)?;
     let [config, executable, annotation, dependencies, files @ ..] = node.children.as_slice() else {
         return None;
     };
     if files.is_empty() { return None; }
     Some(SourcePreparationParts {
+        envelope,
         config: *config, executable: *executable, annotation: *annotation,
         dependencies: *dependencies, files,
     })
@@ -320,12 +348,60 @@ pub struct SourceConfig {
 }
 
 impl SourceConfig {
-    pub fn schema(&self) -> &'static [u8; 32] {
+    fn envelope(&self) -> SourcePreparationEnvelope {
         if self.namespaces.values().any(|ns| ns.git.is_some()) {
-            installed_git_source_schema()
+            SourcePreparationEnvelope::InstalledGit
         } else {
-            source_preparation_schema()
+            SourcePreparationEnvelope::NamespaceAuthority
         }
+    }
+
+    pub fn schema(&self) -> &'static [u8; 32] { self.envelope().digest() }
+}
+
+#[cfg(test)]
+mod source_envelope_tests {
+    use super::*;
+
+    #[test]
+    fn exact_current_envelope_matches_its_parser_and_namespace_family() {
+        let mut config = SourceConfig {
+            entry: FileKey { package: "app".into(), path: PackageRelativePath::new("src/main.w".into()).unwrap() },
+            namespaces: BTreeMap::from([("app".into(), Namespace {
+                project: "/workspace/app".into(), source_root: None, git: None,
+            })]),
+            target: "app".into(),
+            inputs: NodeId([2; 32]),
+            parser: ParserPolicy { schema: NodeId(*wosy_syntax::base_cst_schema()), categories: vec!["WHY".into()] },
+            profiles: BTreeMap::new(),
+        };
+        let top = |data: &[u8; 32]| Node {
+            kind: Kind::SourcePreparation, data: data.to_vec(), children: (1..=5).map(|byte| NodeId([byte; 32])).collect(),
+        };
+        let ordinary_root = top(source_preparation_schema());
+        let git_root = top(installed_git_source_schema());
+        let ordinary = source_preparation_parts(&ordinary_root).unwrap();
+        let git = source_preparation_parts(&git_root).unwrap();
+        assert_eq!(ordinary.envelope, SourcePreparationEnvelope::NamespaceAuthority);
+        assert_eq!(git.envelope, SourcePreparationEnvelope::InstalledGit);
+        assert_eq!(ordinary.files, &[NodeId([5; 32])]);
+        assert_eq!(config.schema(), source_preparation_schema());
+        assert!(ordinary.envelope.matches_config(&config));
+        assert!(!git.envelope.matches_config(&config));
+
+        config.namespaces.insert("fixture".into(), Namespace {
+            project: "/workspace/fixture".into(),
+            source_root: None,
+            git: Some(serde_json::from_value(serde_json::json!({
+                "locked": vec![3; 32], "patches": vec![4; 32],
+            })).unwrap()),
+        });
+        assert_eq!(config.schema(), installed_git_source_schema());
+        assert!(git.envelope.matches_config(&config));
+        assert!(!ordinary.envelope.matches_config(&config));
+        config.parser.schema = NodeId([0; 32]);
+        assert!(!git.envelope.matches_config(&config));
+        assert!(source_preparation_parts(&top(&[0; 32])).is_none());
     }
 }
 

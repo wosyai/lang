@@ -127,6 +127,20 @@ pub(super) async fn run(
             serde_json::json!({ "root": current.selection().root.hex(), "generation": current.generation(),
                 "prior_generation": captured.generation(), "json": String::from_utf8(json)?, "view_ms": milliseconds(started) })
         }
+        "pinned-entry-cst" => {
+            let name = args.next().ok_or("expected fixture pin name")?;
+            let encoding = args.next().ok_or("expected fixture JSON byte limit")?.parse()?;
+            let expanded = args.next().ok_or("expected fixture record byte limit")?.parse()?;
+            let authored = args.next().ok_or("expected fixture authored byte limit")?.parse()?;
+            let budget = wosy_protocol::CstExpansionBudget::new(expanded, 20_000, 128, authored);
+            let started = Instant::now();
+            match client.pinned_entry_cst_json(&name, budget, encoding)? {
+                Some(view) => serde_json::json!({
+                    "pin": local_pin(view.pin()), "json": std::str::from_utf8(view.json())?, "view_ms": milliseconds(started),
+                }),
+                None => serde_json::Value::Null,
+            }
+        }
         "reconcile-acknowledged" | "reconcile-acknowledged-limited" => {
             super::source_reconciliation::run(&mut client, dir, &target, mode.ends_with("-limited")).await?
         }

@@ -1,13 +1,43 @@
-//! Project the selected entry through the ordinary tooling schema.
+//! Project the selected or locally retained entry through the ordinary tooling schema.
 use super::{
-    checked_file_key, load_usage, read_selection, AcknowledgedSourceGeneration, Result,
+    checked_file_key, load_usage, pins::read_retained_pin, read_selection,
+    AcknowledgedSourceGeneration, ClientSourceLimits, LocalSourcePin, Result,
     SqliteSourceState, StoredNodes,
 };
 use rowan::GreenNodeBuilder;
-use rusqlite::TransactionBehavior;
-use std::io::{self, Write};
-use wosy_protocol::{walk_cst, CstEvent, CstExpansionBudget, FileEntry, Kind};
+use rusqlite::{Connection, TransactionBehavior};
+use std::{io::{self, Write}, path::Path};
+use wosy_protocol::{walk_cst, CstEvent, CstExpansionBudget, FileEntry, Kind, NodeId};
 use wosy_syntax::{typed_comment_from_token, CstNode, SourceIdentity, SyntaxKind, TypedComment};
+
+/// A local named pin and its authored entry view. Neither the bytes nor the
+/// pin returned here can confer compiler, replay, or daemon authority.
+pub struct PinnedEntryCst {
+    pin: LocalSourcePin,
+    json: Vec<u8>,
+}
+
+impl PinnedEntryCst {
+    pub fn pin(&self) -> &LocalSourcePin { &self.pin }
+    pub fn json(&self) -> &[u8] { &self.json }
+}
+
+impl SqliteSourceState {
+    /// Read the entry of the exact current local pin, not the current
+    /// target, worktree contents, or a caller-supplied digest. Use the
+    /// same expansion and JSON bounds as the acknowledged tooling view.
+    /// No source replay, writes, or lock on future pin changes.
+    pub fn pinned_entry_cst_json(
+        &mut self, name: &str, budget: CstExpansionBudget, json_bytes: usize,
+    ) -> Result<Option<PinnedEntryCst>> {
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let Some(pin) = read_retained_pin(&tx, name)? else { return Ok(None); };
+        let entry = load_entry(&tx, &self.project, &pin.target, pin.root, self.limits, budget, json_bytes)?;
+        tx.commit()?;
+        let json = entry.encode(json_bytes)?;
+        Ok((read_retained_pin(&self.db, name)?.as_ref() == Some(&pin)).then_some(PinnedEntryCst { pin, json }))
+    }
+}
 
 impl AcknowledgedSourceGeneration {
     /// Return the exact `wosy parse` current.json bytes for this selected,
@@ -16,43 +46,62 @@ impl AcknowledgedSourceGeneration {
     /// Bound authored graph expansion and the JSON separately; this is
     /// neither a total allocator bound nor a lock on future selection.
     pub fn entry_cst_current_json(
-        &self, local: &mut SqliteSourceState, mut budget: CstExpansionBudget, json_bytes: usize,
+        &self, local: &mut SqliteSourceState, budget: CstExpansionBudget, json_bytes: usize,
     ) -> Result<Option<Vec<u8>>> {
         let selected = self.selection();
         if local.project.to_str() != Some(selected.project.as_str()) { return Ok(None); }
         let tx = local.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         if !self.matches(read_selection(&tx, &selected.target)?) { return Ok(None); }
-        if let Some(usage) = load_usage(&tx, selected.root)? { usage.admit(local.limits)?; }
-        let mut read = StoredNodes::new(&tx)?;
-        let (config, files) = SqliteSourceState::header_using(&local.project, &selected.target, selected.root,
-            |id| read.charged_record(id, false, |bytes| budget.read(bytes)))?;
-        if files.len() > local.limits.nodes { return Err("CST view file index exceeds the node budget".into()); }
-        let policy = config.parser.id();
-        let mut entry = None;
-        for id in files {
-            let record = read.charged_record(id, false, |bytes| budget.read(bytes))?;
-            let file = FileEntry::from_node(id, record)?;
-            if checked_file_key(&config, policy, &file)? == config.entry && entry.replace(file).is_some() {
-                return Err("duplicate selected CST entry".into());
-            }
-        }
-        let entry = entry.ok_or("persisted entry file is missing")?;
-        let path = entry.metadata.source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
-        // Only the legacy tool view uses display separators; the rooted
-        // lookup above compares the actual typed package-relative path.
-        let display_source = SourceIdentity::new(
-            selected.project.clone(), config.entry.package, path.replace('\\', "/"), entry.metadata.revision.hex(),
-        );
-        let (tree, comments) = read_authored_entry(&mut read, &mut budget, &entry, &config.parser.categories, json_bytes)?;
-        drop(read);
+        let entry = load_entry(&tx, &local.project, &selected.target, selected.root, local.limits, budget, json_bytes)?;
         tx.commit()?;
+        let bytes = entry.encode(json_bytes)?;
+        Ok(self.is_current(local)?.then_some(bytes))
+    }
+}
 
-        let projected = wosy_compiler::publication_from_cst(&display_source, &tree, &comments, &[]);
+struct AuthoredEntry {
+    display_source: SourceIdentity,
+    tree: CstNode,
+    comments: Vec<TypedComment>,
+}
+
+impl AuthoredEntry {
+    fn encode(self, json_bytes: usize) -> Result<Vec<u8>> {
+        let projected = wosy_compiler::publication_from_cst(&self.display_source, &self.tree, &self.comments, &[]);
         let mut encoded = BoundedJson { bytes: Vec::new(), limit: json_bytes };
         serde_json::to_writer_pretty(&mut encoded, &projected)?;
         encoded.write_all(b"\n")?;
-        Ok(self.is_current(local)?.then_some(encoded.bytes))
+        Ok(encoded.bytes)
     }
+}
+
+fn load_entry(
+    sql: &Connection, project: &Path, target: &str, root: NodeId, limits: ClientSourceLimits,
+    mut budget: CstExpansionBudget, json_bytes: usize,
+) -> Result<AuthoredEntry> {
+    if let Some(usage) = load_usage(sql, root)? { usage.admit(limits)?; }
+    let mut read = StoredNodes::new(sql)?;
+    let (config, files) = SqliteSourceState::header_using(project, target, root,
+        |id| read.charged_record(id, false, |bytes| budget.read(bytes)))?;
+    if files.len() > limits.nodes { return Err("CST view file index exceeds the node budget".into()); }
+    let policy = config.parser.id();
+    let mut entry = None;
+    for id in files {
+        let record = read.charged_record(id, false, |bytes| budget.read(bytes))?;
+        let file = FileEntry::from_node(id, record)?;
+        if checked_file_key(&config, policy, &file)? == config.entry && entry.replace(file).is_some() {
+            return Err("duplicate selected CST entry".into());
+        }
+    }
+    let entry = entry.ok_or("persisted entry file is missing")?;
+    let path = entry.metadata.source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
+    // Only the legacy tool view uses display separators; the rooted
+    // lookup above compares the actual typed package-relative path.
+    let display_source = SourceIdentity::new(
+        entry.metadata.source.project.clone(), config.entry.package, path.replace('\\', "/"), entry.metadata.revision.hex(),
+    );
+    let (tree, comments) = read_authored_entry(&mut read, &mut budget, &entry, &config.parser.categories, json_bytes)?;
+    Ok(AuthoredEntry { display_source, tree, comments })
 }
 
 fn read_authored_entry(

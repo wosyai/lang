@@ -7,7 +7,7 @@ use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
     imports_from_cst, source_preparation_parts, source_preparation_schema, syntax_kind, token_text, walk_cst, CstEvent,
     Delta, FileEntry,
-    FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourceUpdate,
+    FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourcePreparationEnvelope, SourceUpdate,
 };
 use wosy_syntax::{
     typed_comment_from_token, AuthoredSpanMap, CanonicalCstRoot, CstNode, SourceIdentity, SyntaxKind,
@@ -424,6 +424,7 @@ fn read_verified_node_with(tx: &Transaction, id: NodeId, charge: impl FnOnce(usi
 }
 
 struct Index {
+    envelope: SourcePreparationEnvelope,
     config: NodeId,
     executable: NodeId,
     dependencies: NodeId,
@@ -501,6 +502,7 @@ fn read_index_using(
         module_edges.insert(key.clone(), imports.to_vec());
     }
     Ok(Index {
+        envelope: parts.envelope,
         config: parts.config, executable: parts.executable, dependencies: parts.dependencies, annotation: parts.annotation,
         files: entries, modules, executable_paths, annotation_paths, module_edges,
     })
@@ -523,12 +525,10 @@ fn validate_snapshot_with(
 ) -> Result<(Index, SourceConfig)> {
     // The root's closure has already passed the schema boundary.
     let top = read_node(tx, root)?;
-    let schema = top.data.as_slice().try_into().map(|array: &[u8; 32]| *array)?;
     let index = read_index(tx, top)?;
     let config: SourceConfig = serde_json::from_slice(&read_node(tx, index.config)?.data)?;
-    if &schema != config.schema()
+    if !index.envelope.matches_config(&config)
         || config.namespaces.get(&config.entry.package).is_none_or(|ns| ns.git.is_some())
-        || config.parser.schema.0 != *wosy_syntax::base_cst_schema()
         || !index.files.contains_key(&config.entry)
         || index.files.len() != index.modules.len()
         || index.files.len() != index.executable_paths.len()

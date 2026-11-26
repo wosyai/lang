@@ -105,7 +105,7 @@ pub(super) fn checked_source_header_using(
     if config.kind != Kind::Config { return Err("invalid acknowledged source configuration kind".into()); }
     super::validate_shape(&config)?;
     let config: SourceConfig = serde_json::from_slice(&config.data)?;
-    if source.data != config.schema() || config.parser.schema.0 != *wosy_syntax::base_cst_schema() {
+    if !parts.envelope.matches_config(&config) {
         return Err("invalid acknowledged source configuration schema".into());
     }
     Ok((source, config))

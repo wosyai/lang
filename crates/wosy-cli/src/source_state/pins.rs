@@ -70,10 +70,7 @@ impl SqliteSourceState {
     /// Rebuild one named pin from immutable local bytes, using that pin's own
     /// target, even if the edit selected in this target or its manifest changed.
     pub fn replay_local_source_pin(&self, name: &str) -> Result<Option<PinnedSourceReplay>> {
-        let pin = self.db.query_row(
-            "SELECT name, target, root, generation FROM source_pins WHERE name = ?1 AND root IS NOT NULL",
-            [name], read_pin,
-        ).optional()?;
+        let pin = read_retained_pin(&self.db, name)?;
         pin.map(|pin| {
             let replay = self.load_root(&pin.target, pin.root, None)?;
             Ok(PinnedSourceReplay { pin, replay })
@@ -130,6 +127,13 @@ impl SqliteSourceState {
         let SourcePinReflection::Durable(reflected) = outcome else { return Ok(false); };
         Ok(self.source_pin_intent(&reflected.name)?.as_ref() == Some(reflected))
     }
+}
+
+pub(super) fn read_retained_pin(sql: &Connection, name: &str) -> Result<Option<LocalSourcePin>> {
+    Ok(sql.query_row(
+        "SELECT name, target, root, generation FROM source_pins WHERE name = ?1 AND root IS NOT NULL",
+        [name], read_pin,
+    ).optional()?)
 }
 
 fn read_intent(sql: &Connection, project: &str, name: &str) -> Result<Option<SourcePinIntent>> {
