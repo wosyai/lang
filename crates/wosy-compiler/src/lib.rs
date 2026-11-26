@@ -39,8 +39,9 @@ pub use scalar::{
     derive_pair_startup_call_graph_comptime_plan, inspect_direct_function_comptime,
     DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
-    PairStartupBranchSelection, PairStartupCallGraphComptimePlan, PairStartupCallHop, PairStartupCallPath,
-    PairStartupForwarding, PairStartupHopInput, PairStartupSelector,
+    PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
+    PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput, PairStartupOccurrence,
+    PairStartupSelector,
 };
 
 mod llvm;

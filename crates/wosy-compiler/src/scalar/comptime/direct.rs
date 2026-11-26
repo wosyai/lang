@@ -7,7 +7,7 @@ use super::{
     ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use super::super::{
-    control::{CallableBodyCallNodes, CallablePointFacts, ModuleInitializationStepKind, PlainNameIdentity},
+    control::{CallableBodyCallNodes, CallablePointFacts, InitializerFacts, ModuleInitializationStepKind, PlainNameIdentity},
     derive_scalar_declarations_with_embedding, ConcreteCallSelection, EmbeddedComptimeExpression,
     PreparedScalarProject, ResolvedCallTarget, ScalarBuildValidation, ScalarFunction,
 };
@@ -48,6 +48,7 @@ pub struct InspectedDirectComptimeCall<const ARITY: usize = 1> {
     site: SourceSpan,
     function: SourceSpan,
     call: SourceSpan,
+    destination: SourceSpan,
     inputs: [DirectComptimeInput; ARITY],
     result: ScalarType,
 }
@@ -56,6 +57,7 @@ impl<const ARITY: usize> InspectedDirectComptimeCall<ARITY> {
     pub fn site(&self) -> &SourceSpan { &self.site }
     pub fn function(&self) -> &SourceSpan { &self.function }
     pub fn call(&self) -> &SourceSpan { &self.call }
+    pub fn destination(&self) -> &SourceSpan { &self.destination }
     pub fn inputs(&self) -> &[DirectComptimeInput; ARITY] { &self.inputs }
     pub fn result(&self) -> &ScalarType { &self.result }
 
@@ -210,8 +212,9 @@ pub fn derive_forwarded_pair_startup_comptime_plan(
         })
 }
 
-/// An authored argument read at a checked tail-call edge. The array order
-/// is the callee's formal order; this position names the caller's formal.
+/// An authored read of one exact checked formal at a tail. On a call edge,
+/// the array order is the callee's formal order; this position names the
+/// caller's formal.
 #[derive(Debug)]
 pub struct PairStartupHopInput {
     caller_position: usize,
@@ -243,23 +246,36 @@ impl PairStartupCallHop {
     fn positions(&self) -> [usize; 2] { self.inputs.each_ref().map(PairStartupHopInput::caller_position) }
 }
 
-/// Authored selector and both independently checked forwarding edges.
-/// Edge indices address the same table as the selected paths.
+/// Independently verified branch tail: either a forwarding edge in this
+/// plan's hop table or an ordinary direct return of one exact data formal.
+#[derive(Debug)]
+pub enum PairStartupBranch {
+    Forward(usize),
+    ReturnFormal(PairStartupHopInput),
+}
+
+impl PairStartupBranch {
+    pub fn hop_index(&self) -> Option<usize> {
+        match self { Self::Forward(index) => Some(*index), Self::ReturnFormal(_) => None }
+    }
+}
+
+/// Authored selector and both independently checked alternatives.
 #[derive(Debug)]
 pub struct PairStartupSelector {
     declaration: SourceSpan,
     formal: SourceSpan,
     condition: SourceSpan,
-    when_true: usize,
-    when_false: usize,
+    when_true: PairStartupBranch,
+    when_false: PairStartupBranch,
 }
 
 impl PairStartupSelector {
     pub fn declaration(&self) -> &SourceSpan { &self.declaration }
     pub fn formal(&self) -> &SourceSpan { &self.formal }
     pub fn condition(&self) -> &SourceSpan { &self.condition }
-    pub fn true_hop_index(&self) -> usize { self.when_true }
-    pub fn false_hop_index(&self) -> usize { self.when_false }
+    pub fn when_true(&self) -> &PairStartupBranch { &self.when_true }
+    pub fn when_false(&self) -> &PairStartupBranch { &self.when_false }
 }
 
 /// The checked authored Boolean literal that selected an actual branch of
@@ -292,18 +308,61 @@ impl PairStartupCallPath {
     pub fn branch_selection(&self) -> Option<&PairStartupBranchSelection> { self.branch.as_ref() }
 }
 
+/// An ordinary startup slot proven not to reach the comptime site. The
+/// original call still returns its selected data argument to its checked
+/// destination. These are authored facts, not emitted or substituted code.
+#[derive(Debug)]
+pub struct PairStartupBypass {
+    call: SourceSpan,
+    destination: SourceSpan,
+    branch: PairStartupBranchSelection,
+    argument: SourceSpan,
+    value: DirectComptimeArgument,
+}
+
+impl PairStartupBypass {
+    pub fn call(&self) -> &SourceSpan { &self.call }
+    pub fn destination(&self) -> &SourceSpan { &self.destination }
+    pub fn branch_selection(&self) -> &PairStartupBranchSelection { &self.branch }
+    pub fn returned_argument(&self) -> &SourceSpan { &self.argument }
+    pub fn returned_value(&self) -> DirectComptimeArgument { self.value }
+}
+
+/// One startup occurrence in the ordinary initialization order. A bypass
+/// has no evaluator or evaluator index.
+#[derive(Debug)]
+pub enum PairStartupOccurrence<'a> {
+    Specialization(&'a DirectStartupComptimeUse<2>, &'a PairStartupCallPath),
+    Bypass(&'a PairStartupBypass),
+}
+
+enum PairStartupOrder {
+    Specialization(usize),
+    Bypass(PairStartupBypass),
+}
+
 pub struct PairStartupCallGraphComptimePlan {
     plan: DirectStartupComptimePlan<2>,
     hops: Vec<PairStartupCallHop>,
     selectors: Vec<PairStartupSelector>,
     paths: Vec<PairStartupCallPath>,
+    order: Vec<PairStartupOrder>,
 }
 
 impl PairStartupCallGraphComptimePlan {
     pub fn hops(&self) -> &[PairStartupCallHop] { &self.hops }
     pub fn selectors(&self) -> &[PairStartupSelector] { &self.selectors }
+    /// Only calls that actually reach the comptime site.
     pub fn calls(&self) -> impl ExactSizeIterator<Item = (&DirectStartupComptimeUse<2>, &PairStartupCallPath)> {
         self.plan.calls().iter().zip(&self.paths)
+    }
+    /// All ordinary startup slots, including proven bypasses, in order.
+    pub fn occurrences(&self) -> impl ExactSizeIterator<Item = PairStartupOccurrence<'_>> {
+        self.order.iter().map(|slot| match slot {
+            PairStartupOrder::Specialization(index) =>
+                PairStartupOccurrence::Specialization(&self.plan.calls()[*index], &self.paths[*index]),
+            PairStartupOrder::Bypass(slot) => PairStartupOccurrence::Bypass(slot),
+        })
     }
     pub fn evaluators(&self) -> &[ClosedComptimeFragment] { self.plan.evaluators() }
 }
@@ -313,9 +372,10 @@ impl PairStartupCallGraphComptimePlan {
 /// binding may call the comptime function directly or enter any checked
 /// acyclic forwarding path through complete tail calls. A startup may
 /// enter a selector whose first formal is a checked Boolean literal at
-/// that call and whose other two formals are forwarded by each checked
-/// branch. Selectors are not intermediate hops. Equal final ordered
-/// tuples share one evaluator across different paths, not by equal IR.
+/// that call. Each branch must forward the two data formals or return one
+/// of them directly. The latter preserves the ordinary observable result
+/// but adds no specialization. Selectors are not intermediate hops. Equal
+/// final tuples share one evaluator across paths, not by equal IR.
 /// The caller still authenticates the selected target entry. No execution,
 /// durable key/result, arbitrary branch control, or cross-module claim.
 pub fn derive_pair_startup_call_graph_comptime_plan(
@@ -323,11 +383,11 @@ pub fn derive_pair_startup_call_graph_comptime_plan(
 ) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
     with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
         StartupEntry::PairCallGraph, |calls, body, name_span, proof| {
-            let VerifiedStartupPaths::Graph { hops, selectors, paths } = proof else {
+            let VerifiedStartupPaths::Graph { hops, selectors, paths, order } = proof else {
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
             };
             let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
-            Ok(PairStartupCallGraphComptimePlan { plan, hops, selectors, paths })
+            Ok(PairStartupCallGraphComptimePlan { plan, hops, selectors, paths, order })
         })
 }
 
@@ -416,7 +476,12 @@ enum StartupEntry {
 enum VerifiedStartupPaths {
     Direct,
     OneForwarder(PairStartupForwarding),
-    Graph { hops: Vec<PairStartupCallHop>, selectors: Vec<PairStartupSelector>, paths: Vec<PairStartupCallPath> },
+    Graph {
+        hops: Vec<PairStartupCallHop>,
+        selectors: Vec<PairStartupSelector>,
+        paths: Vec<PairStartupCallPath>,
+        order: Vec<PairStartupOrder>,
+    },
 }
 
 // The analytical project stays private. The continuation is called only
@@ -615,12 +680,17 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             }
             CheckedPairForwarder::Select { formal, condition, when_true, when_false } => {
                 graph.push(PairGraphNode::Selector(selectors.len()));
-                let true_index = hops.len();
-                hops.push(when_true);
-                let false_index = hops.len();
-                hops.push(when_false);
+                let mut register = |branch| match branch {
+                    CheckedPairAlternative::Forward(hop) => {
+                        let index = hops.len();
+                        hops.push(hop);
+                        PairStartupBranch::Forward(index)
+                    }
+                    CheckedPairAlternative::ReturnFormal(formal) => PairStartupBranch::ReturnFormal(formal),
+                };
                 selectors.push(PairStartupSelector {
-                    declaration: declarations[index].clone(), formal, condition, when_true: true_index, when_false: false_index,
+                    declaration: declarations[index].clone(), formal, condition,
+                    when_true: register(when_true), when_false: register(when_false),
                 });
             }
         }
@@ -630,6 +700,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
     } else { Vec::new() };
     let mut selected = Vec::with_capacity(count);
     let mut paths = Vec::new();
+    let mut order = Vec::new();
     for item in bindings {
         let ScalarItem::Binding(binding) = item else {
             return Err(unsupported("expected one argument binding at each startup step"));
@@ -659,7 +730,15 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         if target.concrete != &ConcreteCallSelection::Declaration {
             return Err(unsupported("initializer did not select the authored function"));
         }
-        let selection = match routes.get(chosen) {
+        let route = routes.get(chosen);
+        let expected_arguments = if matches!(route, Some(ResolvedPairRoute::Select { .. })) { 3 } else { ARITY };
+        let [result] = target.outputs else {
+            return Err(unsupported("one contextual scalar result is required"));
+        };
+        if target.parameters.len() != expected_arguments || destination.ty != &result.ty || &result.ty != result_type {
+            return Err(unsupported("the declared result must match the exact read formals' scalar type"));
+        }
+        let path = match route {
             Some(ResolvedPairRoute::Select { selector, when_true, when_false }) => {
                 let [argument, _, _] = arguments.as_slice() else {
                     return Err(unsupported("conditional startup requires a literal selector and two data arguments"));
@@ -672,22 +751,45 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
                 {
                     return Err(unsupported("conditional startup requires an exact checked Boolean literal"));
                 }
-                let mut path = if *value { when_true.clone() } else { when_false.clone() };
-                path.branch = Some(PairStartupBranchSelection {
+                let choice = PairStartupBranchSelection {
                     selector: *selector, literal: scope(span_of(argument)), value: *value,
-                });
-                Some((path, 3))
+                };
+                match if *value { when_true } else { when_false } {
+                    ResolvedPairAlternative::Forward(path) => {
+                        let mut path = path.clone();
+                        path.branch = Some(choice);
+                        Some(path)
+                    }
+                    ResolvedPairAlternative::ReturnFormal(formal) => {
+                        // The bypass excludes this comptime site, not the ordinary
+                        // argument evaluations. Require both data literals even
+                        // when the returned formal only reads one of them.
+                        let values = [
+                            checked_startup_literal(&facts, &arguments[1], &target.parameters[1], result_type, &unsupported)?,
+                            checked_startup_literal(&facts, &arguments[2], &target.parameters[2], result_type, &unsupported)?,
+                        ];
+                        let position = formal.caller_position();
+                        order.push(PairStartupOrder::Bypass(PairStartupBypass {
+                            call: scope(span_of(call)),
+                            destination: destination.destination,
+                            branch: choice,
+                            argument: scope(span_of(&arguments[position])),
+                            value: values[position - 1],
+                        }));
+                        continue;
+                    }
+                }
             }
             Some(ResolvedPairRoute::Plain(path)) => {
                 if arguments.len() != ARITY { return Err(unsupported("the exact literal tuple arity is required")); }
-                Some((path.clone(), ARITY))
+                Some(path.clone())
             }
             None => None,
         };
-        let expected_arguments = selection.as_ref().map_or(ARITY, |(_, count)| *count);
-        let positions = if let Some((path, _)) = selection {
+        let positions = if let Some(path) = path {
             let positions = path.positions;
             paths.push(path);
+            order.push(PairStartupOrder::Specialization(selected.len()));
             Some(positions)
         } else if chosen == 1 {
             Some(hops[0].edge.positions())
@@ -695,29 +797,11 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         let argument_positions: [usize; ARITY] = if let Some(positions) = positions {
             positions.as_slice().try_into().map_err(|_| unsupported("forwarding requires the exact pair arity"))?
         } else { std::array::from_fn(|ordinal| ordinal) };
-        let [result] = target.outputs else {
-            return Err(unsupported("one contextual scalar result is required"));
-        };
-        if target.parameters.len() != expected_arguments || destination.ty != &result.ty || &result.ty != result_type {
-            return Err(unsupported("the declared result must match the exact read formals' scalar type"));
-        }
         let mut inputs = Vec::with_capacity(ARITY);
         for (argument_position, &(operand, read, formal)) in argument_positions.into_iter().zip(&formal_reads) {
             let argument = &arguments[argument_position];
             let parameter = &target.parameters[argument_position];
-            let argument_ty = facts.checked_expression_type(argument)
-                .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
-            if argument_ty != parameter || parameter != result_type {
-                return Err(unsupported("literal argument does not have the selected formal type"));
-            }
-            let value = match (argument, parameter) {
-                (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
-                    i32::try_from(value).ok().map(DirectComptimeArgument::I32),
-                (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
-                    u32::try_from(value).ok().map(DirectComptimeArgument::U32),
-                (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
-                _ => None,
-            }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))?;
+            let value = checked_startup_literal(&facts, argument, parameter, result_type, &unsupported)?;
             inputs.push(DirectComptimeInput {
                 argument: scope(span_of(argument)), formal: scope(formal), read: scope(read), operand, value,
             });
@@ -726,7 +810,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             .map_err(|_| unsupported("ordinary literal tuple did not preserve every formal"))?;
         selected.push(InspectedDirectComptimeCall {
             site: scope(site.span), function: declarations[0].clone(), call: scope(span_of(call)),
-            inputs, result: result.ty.clone(),
+            destination: destination.destination, inputs, result: result.ty.clone(),
         });
     }
     let proof = match entry {
@@ -739,10 +823,29 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             })
         }
         StartupEntry::PairCallGraph => VerifiedStartupPaths::Graph {
-            hops: hops.into_iter().map(|hop| hop.edge).collect(), selectors, paths,
+            hops: hops.into_iter().map(|hop| hop.edge).collect(), selectors, paths, order,
         },
     };
     observe(selected, body, super::super::token_span(&site.id), proof)
+}
+
+fn checked_startup_literal(
+    facts: &InitializerFacts<'_>, argument: &ScalarExpression, parameter: &ScalarType, result_type: &ScalarType,
+    unsupported: &impl Fn(&'static str) -> ClosedComptimeRejection,
+) -> Result<DirectComptimeArgument, ClosedComptimeRejection> {
+    let argument_ty = facts.checked_expression_type(argument)
+        .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
+    if argument_ty != parameter || parameter != result_type {
+        return Err(unsupported("literal argument does not have the selected formal type"));
+    }
+    match (argument, parameter) {
+        (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
+            i32::try_from(value).ok().map(DirectComptimeArgument::I32),
+        (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
+            u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+        (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
+        _ => None,
+    }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))
 }
 
 struct IndexedPairHop {
@@ -760,22 +863,32 @@ enum PairGraphNode {
 enum CheckedPairForwarder {
     Plain(IndexedPairHop),
     Select {
-        formal: SourceSpan, condition: SourceSpan, when_true: IndexedPairHop, when_false: IndexedPairHop,
+        formal: SourceSpan, condition: SourceSpan, when_true: CheckedPairAlternative, when_false: CheckedPairAlternative,
     },
 }
 
-enum ResolvedPairRoute {
-    Plain(PairStartupCallPath),
-    Select { selector: usize, when_true: PairStartupCallPath, when_false: PairStartupCallPath },
+enum CheckedPairAlternative {
+    Forward(IndexedPairHop),
+    ReturnFormal(PairStartupHopInput),
 }
 
-fn verified_pair_paths(
-    graph: &[PairGraphNode], hops: &[IndexedPairHop], selectors: &[PairStartupSelector],
+enum ResolvedPairRoute<'a> {
+    Plain(PairStartupCallPath),
+    Select { selector: usize, when_true: ResolvedPairAlternative<'a>, when_false: ResolvedPairAlternative<'a> },
+}
+
+enum ResolvedPairAlternative<'a> {
+    Forward(PairStartupCallPath),
+    ReturnFormal(&'a PairStartupHopInput),
+}
+
+fn verified_pair_paths<'a>(
+    graph: &[PairGraphNode], hops: &[IndexedPairHop], selectors: &'a [PairStartupSelector],
     unsupported: &impl Fn(&'static str) -> ClosedComptimeRejection,
-) -> Result<Vec<ResolvedPairRoute>, ClosedComptimeRejection> {
-    // A selector is admitted only as an initial call. Both branches must
-    // reach the target through the same memoized, bounded pure forwarding
-    // DAG; neither branch can consume an implicit or speculative value.
+) -> Result<Vec<ResolvedPairRoute<'a>>, ClosedComptimeRejection> {
+    // Both branches are independently checked. A forwarding alternative
+    // must reach the target through the memoized pure DAG; a direct return
+    // stops there without interpreting arbitrary ordinary expressions.
     struct Proof<'a> {
         graph: &'a [PairGraphNode],
         hops: &'a [IndexedPairHop],
@@ -801,6 +914,13 @@ fn verified_pair_paths(
             Ok(path)
         }
 
+        fn alternative<'a>(&mut self, branch: &'a PairStartupBranch) -> Result<ResolvedPairAlternative<'a>, ClosedComptimeRejection> {
+            match branch {
+                PairStartupBranch::Forward(index) => self.through(*index).map(ResolvedPairAlternative::Forward),
+                PairStartupBranch::ReturnFormal(formal) => Ok(ResolvedPairAlternative::ReturnFormal(formal)),
+            }
+        }
+
         fn through(&mut self, index: usize) -> Result<PairStartupCallPath, ClosedComptimeRejection> {
             let hop = &self.hops[index];
             let target = hop.target;
@@ -821,7 +941,7 @@ fn verified_pair_paths(
         PairGraphNode::Selector(selector) => {
             let selection = &selectors[selector];
             Ok(ResolvedPairRoute::Select {
-                selector, when_true: proof.through(selection.when_true)?, when_false: proof.through(selection.when_false)?,
+                selector, when_true: proof.alternative(selection.when_true())?, when_false: proof.alternative(selection.when_false())?,
             })
         }
         _ => proof.visit(index).map(ResolvedPairRoute::Plain),
@@ -878,7 +998,12 @@ fn check_pair_forwarding(
             {
                 return Err(unsupported("each conditional branch must be one complete tail call"));
             }
-            facts.edge(call, [1, 2])
+            match call {
+                ScalarExpression::Call { .. } => facts.edge(call, [1, 2]).map(CheckedPairAlternative::Forward),
+                output => facts.formal_read(output, [1, 2])
+                    .map(CheckedPairAlternative::ReturnFormal)
+                    .ok_or_else(|| unsupported("a nonforwarding branch must return one exact checked data formal")),
+            }
         };
         return Ok(CheckedPairForwarder::Select {
             formal: scope(formal.declaration_span), condition: scope(span_of(condition)),
@@ -921,17 +1046,7 @@ impl PairEdgeFacts<'_> {
                 return Err(unsupported("forwarding call did not select a verified local declaration")),
             _ => return Err(unsupported("forwarding call did not select the authored comptime function")),
         };
-        let formals = data_formals.map(|ordinal| self.nodes.formal(self.points, ordinal));
-        let forwarded_input = |argument| {
-            let Some(PlainNameIdentity::Lexical(binding)) = self.nodes.plain_name(argument) else { return None; };
-            if self.nodes.checked_expression_type(argument) != Some(self.result_type) { return None; }
-            let matched = formals.iter().position(|formal| formal.is_some_and(|(id, ty)| id == binding && ty == self.result_type))?;
-            Some(PairStartupHopInput {
-                caller_position: data_formals[matched],
-                caller_formal: (self.scope)(binding.declaration_span), read: (self.scope)(span_of(argument)),
-            })
-        };
-        let (Some(left), Some(right)) = (forwarded_input(left), forwarded_input(right)) else {
+        let (Some(left), Some(right)) = (self.formal_read(left, data_formals), self.formal_read(right, data_formals)) else {
             return Err(unsupported("forwarding must pass each exact formal without intervening computation"));
         };
         if left.caller_position == right.caller_position {
@@ -943,6 +1058,16 @@ impl PairEdgeFacts<'_> {
                 caller: self.declarations[self.index].clone(), callee: self.declarations[target].clone(),
                 tail_call: (self.scope)(span_of(call)), inputs: [left, right],
             },
+        })
+    }
+
+    fn formal_read(&self, expression: &ScalarExpression, data_formals: [usize; 2]) -> Option<PairStartupHopInput> {
+        let Some(PlainNameIdentity::Lexical(binding)) = self.nodes.plain_name(expression) else { return None; };
+        if self.nodes.checked_expression_type(expression) != Some(self.result_type) { return None; }
+        let caller_position = data_formals.into_iter().find(|ordinal| self.nodes.formal(self.points, *ordinal)
+            .is_some_and(|(id, ty)| id == binding && ty == self.result_type))?;
+        Some(PairStartupHopInput {
+            caller_position, caller_formal: (self.scope)(binding.declaration_span), read: (self.scope)(span_of(expression)),
         })
     }
 }
@@ -1345,10 +1470,10 @@ mod tests {
             assert_eq!(spelling(&source, selector.formal()), "select_path");
             assert_eq!(spelling(&source, selector.condition()), "select_path");
             assert_ne!(selector.condition(), selector.formal());
-            assert_eq!((selector.true_hop_index(), selector.false_hop_index()), (2, 3));
+            assert_eq!((selector.when_true().hop_index(), selector.when_false().hop_index()), (Some(2), Some(3)));
             for (index, target, tail) in [
-                (selector.true_hop_index(), "upper_hop", "upper_hop(data_left, data_right)"),
-                (selector.false_hop_index(), "solve", "solve(data_left, data_right)"),
+                (selector.when_true().hop_index().unwrap(), "upper_hop", "upper_hop(data_left, data_right)"),
+                (selector.when_false().hop_index().unwrap(), "solve", "solve(data_left, data_right)"),
             ] {
                 let hop = &plan.hops()[index];
                 assert_eq!(selector.declaration(), hop.caller());
@@ -1392,6 +1517,122 @@ mod tests {
             }
             assert_eq!(swapped.llvm().to_text(), unchanged.llvm().to_text());
             assert_ne!(swapped.llvm().to_text(), changed.llvm().to_text());
+        }
+    }
+
+    fn selectors_with_bypass() -> String {
+        format!(
+            "{PAIRED_FUNCTION}\n\
+             u32(u32, u32) swap_data = fn(swap_left, swap_right) {{ solve(swap_right, swap_left) }};\n\
+             u32(bool, u32, u32) choose = fn(select_path, data_left, data_right) {{\n\
+                 if (select_path) {{ swap_data(data_left, data_right) }} else {{ data_right }}\n\
+             }};\n\
+             u32(bool, u32, u32) mirror = fn(select_mirror, other_left, other_right) {{\n\
+                 if (select_mirror) {{ other_left }} else {{ solve(other_left, other_right) }}\n\
+             }};"
+        )
+    }
+
+    #[test]
+    fn pair_call_graph_keeps_ordinary_bypass_results_and_specializations_in_startup_order() {
+        let source = fresh(&format!(
+            "{}\n\
+             u32 skip_early = choose(false, 7, 91);\n\
+             u32 hit_early = choose(true, 7, 9);\n\
+             u32 skip_late = mirror(true, 112, 8);\n\
+             u32 hit_late = mirror(false, 9, 7);\n\
+             u32 hit_direct = solve(9, 7);",
+            selectors_with_bypass(),
+        ));
+        assert!(source.result().is_valid());
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let plan = derive_pair_startup_call_graph_comptime_plan(&source, "value", layout)
+                .unwrap_or_else(|error| panic!("checked bypass on {layout:?}: {error:?}"));
+            let [selector, mirror] = plan.selectors() else { panic!("two authored selectors"); };
+            for (branch, position, name) in [(selector.when_false(), 2, "data_right"), (mirror.when_true(), 1, "other_left")] {
+                let PairStartupBranch::ReturnFormal(formal) = branch else { panic!("bypass branch must retain the authored output read"); };
+                assert_eq!(formal.caller_position(), position);
+                assert_eq!(spelling(&source, formal.caller_formal()), name);
+                assert_eq!(spelling(&source, formal.read()), name);
+                assert_ne!(formal.caller_formal(), formal.read());
+                assert_eq!(branch.hop_index(), None);
+            }
+            let [early, hit, late, hit_again, direct] = plan.occurrences().collect::<Vec<_>>().try_into().unwrap_or_else(|slots: Vec<_>| {
+                panic!("expected all five startup slots, got {}", slots.len());
+            });
+            for (slot, call, name, selector, truth, result) in [
+                (early, "choose(false, 7, 91)", "skip_early", 0, false, 91u32),
+                (late, "mirror(true, 112, 8)", "skip_late", 1, true, 112u32),
+            ] {
+                let PairStartupOccurrence::Bypass(slot) = slot else { panic!("ordinary slot may not be silently dropped or specialized"); };
+                assert_eq!(spelling(&source, slot.call()), call);
+                assert_eq!(spelling(&source, slot.destination()), name);
+                assert_eq!(slot.branch_selection().selector_index(), selector);
+                assert_eq!(slot.branch_selection().value(), truth);
+                assert_eq!(spelling(&source, slot.branch_selection().literal()), if truth { "true" } else { "false" });
+                assert_eq!(spelling(&source, slot.returned_argument()), result.to_string());
+                assert_eq!(slot.returned_value(), DirectComptimeArgument::U32(result));
+            }
+            for (slot, destination, expected_path) in [
+                (hit, "hit_early", &[1usize, 0][..]), (hit_again, "hit_late", &[2usize][..]),
+                (direct, "hit_direct", &[][..]),
+            ] {
+                let PairStartupOccurrence::Specialization(call, path) = slot else { panic!("ordinary reached slot lost its specialization"); };
+                assert_eq!(spelling(&source, call.facts().destination()), destination);
+                assert_eq!(call.facts().tuple(), [DirectComptimeArgument::U32(9), DirectComptimeArgument::U32(7)]);
+                assert_eq!(path.hop_indices(), expected_path);
+                assert_eq!(call.evaluator_index(), 0);
+            }
+            assert_eq!(plan.calls().len(), 3);
+            let [only] = plan.evaluators() else { panic!("only reached identical tuples evaluate"); };
+            let ordinary = fresh("u32 answer = comptime value { 7 ^ 9 };");
+            let oracle = super::super::derive_closed_comptime_fragment(&ordinary, "value", layout, |_| None).unwrap();
+            assert_eq!(only.llvm().to_text(), oracle.llvm().to_text());
+        }
+    }
+
+    #[test]
+    fn pair_call_graph_proves_zero_evaluators_when_all_checked_slots_bypass_the_site() {
+        let mut text = selectors_with_bypass();
+        for slot in 0..MAX_DIRECT_STARTUP_CALLS {
+            text.push_str(&format!("\nu32 skip_{slot} = choose(false, 1, {slot});"));
+        }
+        let source = fresh(&text);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let plan = derive_pair_startup_call_graph_comptime_plan(&source, "value", layout)
+                .unwrap_or_else(|error| panic!("empty evaluation plan on {layout:?}: {error:?}"));
+            assert_eq!(plan.calls().len(), 0);
+            assert!(plan.evaluators().is_empty());
+            assert_eq!(plan.occurrences().len(), MAX_DIRECT_STARTUP_CALLS);
+            for (index, slot) in plan.occurrences().enumerate() {
+                let PairStartupOccurrence::Bypass(slot) = slot else { panic!("only ordinary returns"); };
+                assert_eq!(spelling(&source, slot.destination()), format!("skip_{index}"));
+                assert_eq!(slot.returned_value(), DirectComptimeArgument::U32(u32::try_from(index).unwrap()));
+            }
+        }
+        text.push_str("\nu32 skip_over_limit = choose(false, 1, 17);");
+        assert!(matches!(
+            derive_pair_startup_call_graph_comptime_plan(&fresh(&text), "value", ScalarTargetLayout::NATIVE64),
+            Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. }),
+        ));
+    }
+
+    #[test]
+    fn pair_call_graph_refuses_unproved_bypass_alternatives_and_discarded_computed_arguments() {
+        let prefix = selectors_with_bypass();
+        for (text, feature) in [
+            (format!("{}\nu32 hit = choose(true, 7, 9);", prefix.replace("else { data_right }", "else { data_left ^ data_right }")),
+                "a nonforwarding branch must return one exact checked data formal"),
+            (format!("{}\nu32 skip = choose(false, 7, 9);", prefix.replace("swap_data(data_left, data_right)", "swap_data(data_left ^ data_right, data_right)")),
+                "forwarding must pass each exact formal without intervening computation"),
+            (format!("{prefix}\nu32 skip = choose(false, 3 ^ 1, 9);"),
+                "argument must be an exact scalar literal"),
+        ] {
+            let source = fresh(&text);
+            assert!(source.result().is_valid());
+            let outcome = derive_pair_startup_call_graph_comptime_plan(&source, "value", ScalarTargetLayout::WASM32);
+            assert!(matches!(&outcome, Err(ClosedComptimeRejection::Unsupported { feature: actual, .. }) if *actual == feature),
+                "expected {feature}, got {:?}", outcome.err());
         }
     }
 
