@@ -1653,6 +1653,9 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures)
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
+                && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
+                    .and_then(|effects| effects.startup_search.as_ref())
+                    .is_some_and(|search| search.borrow().named_target.is_some()))
                 && concrete_integer_literal(&binding.value).is_none()
             {
                 return Err(ProjectCheck::Unsupported);
@@ -2074,6 +2077,7 @@ fn run_scalar_initializer_call(
     #[cfg(feature = "internal-checker")]
     let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
         scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
+        startup_site: (passive_binding && failures.borrow().startup_search.is_some()).then_some(OrderedInitializerCall { topology, occurrence }),
         ..OrderedCallCollection::new(failures, Some(visits))
     }));
     #[cfg(not(feature = "internal-checker"))]
@@ -3172,7 +3176,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if let Some((site, trace)) = authored_site {
             if trace.borrow().invalid() { return Err(ProjectCheck::Unsupported); }
             if trace.borrow().remaining() == 0 { return Err(ProjectCheck::StartupAuthoredLimitReached); }
-            if matches!(result, Ok(ActualCallResult::Unit)) {
+            if matches!(result, Ok(ActualCallResult::Unit | ActualCallResult::Integer(_))) {
                 trace.borrow_mut().append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
             }
         }
@@ -3902,8 +3906,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
         #[cfg(feature = "internal-checker")]
-        if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
-            if !ACTUAL_STARTUP || *expected != ScalarType::Unit || caller != &owner.source
+        let startup_named = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
+            let effects = ordered.failures.borrow();
+            let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
+            let matches_named = search.named_target == Some(target)
+                && search.named_observation.is_none() && is_integer_type(expected)
+                && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
+            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named) || caller != &owner.source
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
                 || !body.checker_named_route_frame() || !body.call_occurrences.is_empty()
@@ -3914,7 +3923,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                 || !signature.parameters.iter().all(is_integer_type)
             { return Err(ProjectCheck::Unsupported); }
-        }
+            matches_named
+        } else { false };
         #[cfg(feature = "internal-checker")]
         if body.contextual_formal().is_some() {
             // Only the exact child activation path can install a formal.
@@ -4140,7 +4150,32 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         });
         #[cfg(not(feature = "internal-checker"))]
         let exact_literal = None;
-        let result = if fixed_array {
+        #[cfg(feature = "internal-checker")]
+        let startup_named_result = startup_named.then(|| {
+            let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
+            let site = ordered.scalar_initializer.ok_or(ProjectCheck::Unsupported)?;
+            let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+            let ([parameter], [argument]) = (signature.parameters.as_slice(), exact) else { return Err(ProjectCheck::Unsupported); };
+            let ActualCallResult::Integer(value) = self.run_exact_calls::<false>(
+                body, &owner.source, exact, expected, collection, None,
+            )? else { return Err(ProjectCheck::Unsupported); };
+            let effects = ordered.failures.borrow();
+            let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
+            if trace.named_target != Some(target) || trace.named_observation.is_some() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            trace.named_observation = Some(failure_search::StartupNamedObservation {
+                site: wosy_syntax::SourceSpan::new(owner.source.clone(), at),
+                directive_position: effects.records.len(), parameter: parameter.clone(),
+                argument: (*argument).clone(), returned: value.clone(),
+            });
+            Ok(ActualCallResult::Integer(value))
+        });
+        #[cfg(not(feature = "internal-checker"))]
+        let startup_named_result = None;
+        let result = if let Some(result) = startup_named_result {
+            result
+        } else if fixed_array {
             #[cfg(feature = "internal-checker")]
             {
                 proof_call.ok_or(ProjectCheck::Unsupported).and_then(|(caller, span)| {
@@ -9839,7 +9874,17 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_independent_named_after_startup(&owner, self.scope, cap).map_err(configured_ordered_error)
+        run_independent_named_after_startup(&owner, self.scope, cap, false).map_err(configured_ordered_error)
+    }
+
+    /// Private exact single direct returning named activation before cap.
+    #[doc(hidden)]
+    pub fn search_startup_with_invoked_named(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_independent_named_after_startup(&owner, self.scope, cap, true).map_err(configured_ordered_error)
     }
 
     /// Accepts only a proof-free owner and never drops possible dormant
@@ -9881,24 +9926,26 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        run_startup_authored_path(&self.owner, cap)
+        run_startup_authored_path(&self.owner, cap, None)
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize,
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, _) = owner.parts();
     let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
-    let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(failure_search::StartUpSearch::new(root, cap)))), ..OrderedFailures::default() };
+    let mut search = failure_search::StartUpSearch::new(root, cap);
+    search.named_target = named_target;
+    let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
     );
     let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() { return Err(ProjectCheck::Unsupported); }
+    if search.invalid() || named_target.is_some() != search.named_observation.is_some() { return Err(ProjectCheck::Unsupported); }
     let (completion, active) = match outcome {
         Ok((initialization, _)) if search.remaining() > 0 => (StartupAuthoredCompletion::Exhausted, initialization.had_obligations),
         Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
@@ -9915,7 +9962,7 @@ fn run_startup_authored_path(
 
 #[cfg(feature = "internal-checker")]
 fn run_independent_named_after_startup(
-    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, invoked: bool,
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
     let (project, calls) = owner.prepared.parts();
     let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -9939,14 +9986,29 @@ fn run_independent_named_after_startup(
         || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
         || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
         || !plan.function.overload_arms.is_empty()
-        || !calls.owns_no_incoming_callable_use(proof_source, plan.function.name_span).unwrap_or(false)
+        || calls.owned_direct_startup_callable_uses(proof_source, plan.function.name_span) != Some(usize::from(invoked))
+        || (invoked && !matches!(body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty)))
     { return Err(ProjectCheck::Unsupported); }
     let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, 1, &owner.source)?;
     if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
     let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, &plan)?;
     observer.finish_plans(&owner.prepared, scope)?;
-    let (records, end, _, mut active) = run_startup_authored_path(&owner.prepared, cap)?;
+    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked.then_some(plan.target))?;
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
+    if let Some(observed) = trace.named_observation {
+        if &observed.site.source != proof_source { return Err(ProjectCheck::Unsupported); }
+        observer.observe_initializer(plan.target, Some(InitializerProofSite {
+            source: proof_source,
+            call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
+        }), &[observed.parameter], &[&observed.argument], &observed.returned);
+        if !observer.complete(&HashSet::from([plan.target])) { return Err(ProjectCheck::Unsupported); }
+        active |= observer.active;
+        return Ok((MainFlowProofReceipt {
+            active, directives: effects.records, diagnostics: observer.diagnostics, contextual_diagnostic: None,
+            additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
+            aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+        }, end));
+    }
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
         let evidence = NamedOrderedEvidence { observed: observer };
         let mut proof = evidence.symbolic();
@@ -14874,6 +14936,52 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_invoked_named_proof_uses_same_actual_initializer_return() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-actual-named");
+        let program = format!(r#"%%start
+            u8(u8) echo = fn(value) {{ if (value < 4) {{ value }} else {{ 7 }} }};
+            proof named for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {{}}
+            u8 actual = echo(3);
+            core.require(actual == 4, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout },
+                        scope, Vec::new()).ok().unwrap()
+                };
+                let old = prepare(&program).run().unwrap();
+                let at = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+                for cap in [1, 3] {
+                    let (report, end) = prepare(&program).search_startup_with_invoked_named(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(report.directives.len(), cap.min(2));
+                    let [failure] = report.diagnostics.as_slice() else { panic!("one actual formal diagnostic"); };
+                    assert_eq!(failure.invocation.call, old.diagnostics[0].invocation.call);
+                    assert_eq!(at(failure.invocation.call.range), "echo(3)");
+                    assert_eq!(failure.invocation.returned, 3.into());
+                    assert_eq!(failure.invocation.arguments, [(ScalarType::U8, 3.into())]);
+                    assert_eq!(report.directives[0].directive, old.directives[0].directive);
+                    assert_eq!(at(report.directives[0].condition), "actual == 4");
+                    assert!(report.symbolic_diagnostic.is_none());
+                }
+                let late = program.replace("u8 actual = echo(3);",
+                    &format!("core.require(false, {OUTPUT}); u8 actual = echo(3);"));
+                assert!(matches!(prepare(&late).search_startup_with_invoked_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                let duplicate = program.replace("%%end", "u8 second = echo(3); %%end");
+                assert!(matches!(prepare(&duplicate).search_startup_with_invoked_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

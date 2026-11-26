@@ -1,12 +1,15 @@
 //! Run-local authored path budget. No values form part of structural identity.
 use std::{collections::HashSet, num::NonZeroUsize};
 use wosy_syntax::{SourceIdentity, SourceSpan};
+use num_bigint::BigInt;
+use super::{PreparedCallable, ScalarType};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(in super::super) enum PathStep {
     Startup(SourceIdentity),
     Call(SourceSpan),
     Return(SourceSpan),
+    Output(SourceSpan),
     Branch { condition: SourceSpan, accepted: bool },
 }
 
@@ -18,17 +21,27 @@ struct FailurePath {
 
 pub(super) enum Admission { Duplicate, Selected, SelectedAndStop }
 
+pub(super) struct StartupNamedObservation {
+    pub(super) site: SourceSpan,
+    pub(super) directive_position: usize,
+    pub(super) parameter: ScalarType,
+    pub(super) argument: BigInt,
+    pub(super) returned: BigInt,
+}
+
 pub(in super::super) struct StartUpSearch {
     remaining: usize,
     prefix: Vec<PathStep>,
     selected: HashSet<FailurePath>,
     work: usize,
     invalid: bool,
+    pub(super) named_target: Option<PreparedCallable>,
+    pub(super) named_observation: Option<StartupNamedObservation>,
 }
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false }
+        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, named_target: None, named_observation: None }
     }
 
     pub(in super::super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {

@@ -7561,6 +7561,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         #[cfg(not(feature = "internal-checker"))]
                         return None;
                     };
+                    #[cfg(feature = "internal-checker")]
+                    if let Some((source, trace)) = &roots.startup_trace {
+                        if evaluated_guard.1.is_some() || !matches!(structure.checker_branches.get(condition),
+                            Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                            || yes.is_unreachable() == no.is_unreachable()
+                        { return None; }
+                        let at = calls.occurrences.get(condition.0)?.span;
+                        trace.try_borrow_mut().ok()?.branch(wosy_syntax::SourceSpan::new((*source).clone(), at), !yes.is_unreachable())?;
+                    }
                     if SUSPEND_CALL {
                         if !branches.is_empty() {
                             return None;
@@ -7688,6 +7697,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     return None;
                 };
                 if tail.is_some() {
+                    #[cfg(feature = "internal-checker")]
+                    if let Some((source, trace)) = &roots.startup_trace {
+                        let [_] = path.0.as_slice() else { return None; };
+                        trace.try_borrow_mut().ok()?.append(super::checker_project::failure_search::PathStep::Output(
+                            wosy_syntax::SourceSpan::new((*source).clone(), slot.span)))?;
+                    }
                     if let Some(complete) = discarded_return.as_deref_mut() { *complete = true; }
                     #[cfg(feature = "internal-checker")]
                     if Authored::OBSERVE_RETURN {
@@ -8771,7 +8786,7 @@ impl<'a> ExactCallCursor<'a> {
         &mut self, source: &'a wosy_syntax::SourceIdentity,
         trace: Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>,
     ) -> Option<()> {
-        if self.roots.startup_trace.is_some() || self.tail.is_some()
+        if self.roots.startup_trace.is_some() || self.tail.is_some_and(|ty| !is_integer_type(ty))
             || self.projected_slot.is_some() || self.projected_pair.is_some()
         { return None; }
         self.roots.startup_trace = Some((source, trace));

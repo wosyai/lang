@@ -7049,10 +7049,10 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owns_no_incoming_callable_use(&self, source: &SourceIdentity, declaration: ByteSpan) -> Option<bool> {
-        let [module] = self.modules.as_slice() else { return Some(false); };
+    pub(super) fn owned_direct_startup_callable_uses(&self, source: &SourceIdentity, declaration: ByteSpan) -> Option<usize> {
+        let [module] = self.modules.as_slice() else { return None; };
         let module = module.as_ref().ok()?;
-        if &module.initialization.source != source { return Some(false); }
+        if &module.initialization.source != source { return None; }
         let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
         let target = SourceSpan::new(source.clone(), declaration);
         let resolved = |call: &ResolvedCallTarget| matches!(call, ResolvedCallTarget::ModuleCallable {
@@ -7061,11 +7061,19 @@ impl ProjectCallSiteResults {
         let mut work = 0;
         use super::checker_flow::charge_call_work;
         charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
-        if startup.callable_escapes.contains(&target) || startup.call_targets.values().any(|call| match call {
-            ModuleInitializationCallTarget::Direct { declaration, .. } | ModuleInitializationCallTarget::Generic { declaration, .. }
-                | ModuleInitializationCallTarget::CallableBinding(declaration) => declaration == &target,
-            _ => false,
-        }) { return Some(false); }
+        if startup.callable_escapes.contains(&target) { return None; }
+        let mut startup_uses = 0usize;
+        for call in startup.call_targets.values() {
+            match call {
+                ModuleInitializationCallTarget::Direct { declaration, concrete } if declaration == &target => {
+                    if *concrete != ConcreteCallSelection::Declaration { return None; }
+                    startup_uses = startup_uses.checked_add(1)?;
+                }
+                ModuleInitializationCallTarget::Generic { declaration, .. }
+                    | ModuleInitializationCallTarget::CallableBinding(declaration) if declaration == &target => return None,
+                _ => {},
+            }
+        }
         charge_call_work(&mut work, module.functions.len())?;
         for function in module.functions.values() {
             charge_call_work(&mut work, function.arms.len())?;
@@ -7075,10 +7083,10 @@ impl ProjectCallSiteResults {
                 if body.callable_escapes.contains(&target)
                     || body.sites.iter().any(|site| resolved(&site.target))
                     || body.allocation_length_call_targets.values().any(resolved)
-                { return Some(false); }
+                { return None; }
             }
         }
-        Some(true)
+        Some(startup_uses)
     }
 
     #[cfg(feature = "internal-checker")]
