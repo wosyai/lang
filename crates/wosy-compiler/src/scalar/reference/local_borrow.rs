@@ -92,8 +92,11 @@ struct PendingFork {
 #[derive(Default)]
 pub(crate) struct Author {
     pending_loan: Option<Loan>,
+    pending_rhs: Option<CfgPointId>,
+    identity_calls: Vec<(CfgPointId, CfgPointId)>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
+    authored_roots: HashSet<ReferenceBindingId>,
     forks: Forks,
     open_forks: Vec<PendingFork>,
     nested: bool,
@@ -110,11 +113,14 @@ impl Author {
         types: &ReferenceBindingTypes,
     ) -> bool {
         if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
-            && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. }))
+            && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. })
+            && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id)))
         {
             return false;
         }
         match kind {
+            CfgPointKind::Call { argument_points, output: 0, .. } => self.identity_calls.last()
+                .is_some_and(|&(call, argument)| call == id && argument_points.as_slice() == [argument]),
             CfgPointKind::Branch { .. } => {
                 if self.open_forks.last().is_some_and(|top| top.join.is_some())
                     || (self.open_forks.is_empty() && scope != ReferenceScopeId(0))
@@ -135,7 +141,19 @@ impl Author {
             CfgPointKind::Bind { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { inner, .. }) =>
                     scope == ReferenceScopeId(0) && aggregate::ordinary_value(inner),
-                Some(ty) => aggregate::ordinary_value(ty) && self.pending_loan.is_none(),
+                Some(ty) => {
+                    if !aggregate::ordinary_value(ty) || self.pending_loan.is_some() { return false; }
+                    // Deferred reborrow enrollment intentionally excludes bodies
+                    // with calls. This sealed author independently sees the
+                    // actual typed root declaration and scope at its Bind.
+                    if scope == ReferenceScopeId(0)
+                        && matches!(binding.kind, ReferenceBindingKind::Declared)
+                        && types.0.get(binding).is_some_and(|entry| entry.local_reborrow_scope.is_none())
+                    {
+                        self.authored_roots.insert(binding.clone());
+                    }
+                    true
+                }
                 None => false,
             },
             CfgPointKind::Assign { target, .. } => target.projections.is_empty()
@@ -158,8 +176,9 @@ impl Author {
                     && place.projections.is_empty()
                     && matches!(&place.place, ScalarPlace::Name { .. })
                     && types.0.get(&place.binding).is_some_and(|binding|
-                        binding.local_reborrow_scope == Some(ReferenceScopeId(0))
-                        && aggregate::ordinary_value(&binding.ty)) =>
+                        aggregate::ordinary_value(&binding.ty)
+                        && (binding.local_reborrow_scope == Some(ReferenceScopeId(0))
+                            || self.authored_roots.contains(&place.binding))) =>
             {
                 let owner = match self.owners.get(&place.binding) {
                     Some(&owner) => owner,
@@ -169,6 +188,7 @@ impl Author {
                         owner
                     }
                 };
+                self.pending_rhs = Some(id);
                 self.pending_loan = Some(Loan {
                     owner, issued: id,
                     mutable: loan.mode == ScalarReferenceMutability::Mutable,
@@ -179,11 +199,23 @@ impl Author {
         }
     }
 
+    pub(super) fn prepare_shared_identity(
+        &mut self, call: CfgPointId, argument: CfgPointId,
+    ) {
+        if self.pending_rhs == Some(argument) && argument.0.checked_add(1) == Some(call.0)
+            && self.pending_loan.is_some_and(|loan| !loan.mutable && loan.issued == argument)
+        {
+            self.pending_rhs = Some(call);
+            self.identity_calls.push((call, argument));
+        }
+    }
+
     pub(super) fn bind(
         &mut self, binding: &ReferenceBindingId, version: CfgPointId, rhs: Option<CfgPointId>,
     ) -> bool {
         let Some(loan) = self.pending_loan.take() else { return false };
-        if rhs != Some(loan.issued) || loan.issued.0 + 1 != version.0 || self.holders.contains_key(binding) {
+        let Some(producer) = self.pending_rhs.take() else { return false };
+        if rhs != Some(producer) || producer.0 + 1 != version.0 || self.holders.contains_key(binding) {
             return false;
         }
         self.holders.insert(binding.clone(), Holder {
@@ -196,7 +228,8 @@ impl Author {
         let Some(loan) = self.pending_loan.take() else { return false };
         let arm = self.arm();
         let Some(holder) = self.holders.get_mut(binding) else { return false };
-        if rhs != loan.issued || loan.issued.0 + 1 != version.0 {
+        let Some(producer) = self.pending_rhs.take() else { return false };
+        if rhs != producer || producer.0 + 1 != version.0 {
             return false;
         }
         holder.record_install(Install { version, loan }, arm);
@@ -325,7 +358,8 @@ impl Author {
             for active in &mut owner.active { compact(active); }
         }
         let nested = if self.nested { Some(NestedGraph::seal(points, &self.forks, exit)?) } else { None };
-        Some(Box::new(Sealed { exit, forks: self.forks, nested, holders, owner_index: self.owners, owners }))
+        Some(Box::new(Sealed { exit, forks: self.forks, nested, identity_calls: self.identity_calls,
+            holders, owner_index: self.owners, owners }))
     }
 }
 
@@ -738,12 +772,27 @@ pub(crate) struct Sealed {
     exit: CfgPointId,
     forks: Forks,
     nested: Option<NestedGraph>,
+    identity_calls: Vec<(CfgPointId, CfgPointId)>,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
 }
 
 impl Sealed {
+    pub(super) fn admits_contracts(
+        &self, contract_count: usize,
+        edges: &HashMap<CfgPointId, CheckedReturnArgumentEdge>,
+    ) -> bool {
+        let admitted = self.identity_calls.len() == contract_count
+            && self.identity_calls.iter().all(|&(call, argument)| {
+                edges.get(&call).is_some_and(|edge| edge.argument == argument
+                    && edge.mode == ScalarReferenceMutability::Shared)
+            });
+        #[cfg(test)]
+        if admitted && !self.identity_calls.is_empty() { tests::observe_identity_replay(); }
+        admitted
+    }
+
     pub(super) fn matches_edge_shape(&self, index: usize, point: &ReferenceFlowPoint, fork_index: &mut usize) -> bool {
         let CfgPointId(id) = point.id;
         if id != index {
@@ -843,6 +892,11 @@ pub(super) mod tests {
 
     thread_local! {
         static COUNTS: std::cell::Cell<[usize; 9]> = const { std::cell::Cell::new([0; 9]) };
+        static ADMITTED_IDENTITY_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(in crate::scalar::reference) fn observe_identity_replay() {
+        ADMITTED_IDENTITY_REPLAYS.with(|count| count.set(count.get() + 1));
     }
 
     pub(in crate::scalar::reference) fn observe(stage: usize) {
@@ -1455,6 +1509,89 @@ pub(super) mod tests {
                 assert!(actual.iter().any(|diagnostic| matches!(diagnostic,
                     ReferenceAnalysisError::ConflictingPlace { .. })) != overwrite_bypass);
             }
+        }
+    }
+
+    #[test]
+    fn authored_nested_shared_identity_call_keeps_actual_issue_and_requires_resolved_edge() {
+        let text = "%%start
+*u8(*u8) forward = fn(input) { input };
+unit(bool, bool) examine = fn(a, b) {
+    u8 value = 7;
+    u8 other = 9;
+    *u8 held = forward(&value);
+    if (a) { if (b) { held = forward(&other); } else { held = &other; }; }
+    else { held = &other; };
+    value = 8;
+    held;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "nested-identity.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let (results, errors) = derive_module_reference_origins(
+                &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+            );
+            assert!(errors.is_empty(), "{errors:?}");
+            let callee = &results[0].1.cfg;
+            let ret = callee.points.iter().find(|point| matches!(point.kind,
+                CfgPointKind::ReturnOutput { output: 0, checked: true, .. })).unwrap();
+            let origin = &callee.facts[ret.possible_origins.as_ref().unwrap().first().unwrap().0];
+            let caller = &results[1].1;
+            let points = &caller.cfg.initial_points;
+            let sealed = caller.proof_points.local_borrow.as_ref().expect("sealed direct identity calls");
+            assert!(sealed.nested.is_some());
+            let [(first, old_loan), (second, new_loan)] = sealed.identity_calls.as_slice() else {
+                panic!("two authored immediate shared identity calls");
+            };
+            assert_eq!(sealed.holders.len(), 1);
+            assert_eq!(sealed.holders[0].holder.writes[0].loan.issued, *old_loan);
+            assert_eq!(sealed.holders[0].holder.writes[1].loan.issued, *new_loan);
+            assert!(!sealed.admits_contracts(0, &HashMap::new()));
+            let transfer = CallOriginTransfer::Explicit(std::slice::from_ref(origin));
+            let contracts = HashMap::from([(*first, transfer), (*second, transfer)]);
+            let edges = checked_return_argument_edges(points, &contracts, &caller.proof_points.resolved_checked_call_outputs);
+            assert!(sealed.admits_contracts(contracts.len(), &edges));
+            let mut mismatched = edges.clone();
+            mismatched.get_mut(first).unwrap().argument = *new_loan;
+            assert!(!sealed.admits_contracts(contracts.len(), &mismatched));
+            ADMITTED_IDENTITY_REPLAYS.with(|count| count.set(0));
+            let validated = derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+            assert!(ADMITTED_IDENTITY_REPLAYS.with(|count| count.get()) > 0, "definitive compiler replay used actual solved contracts");
+
+            let CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { declaration_span, .. }, .. }
+                = &points[first.0].kind else { unreachable!() };
+            let mut mismatched_origin = origin.clone();
+            let ReferenceOrigin::BorrowedFrom { loan, .. } = &mut mismatched_origin else { unreachable!() };
+            loan.mode = ScalarReferenceMutability::Mutable;
+            let mismatched_contracts = ReferenceOutputContracts::new(vec![ReferenceOutputContract {
+                source: &program.source, declaration_span: *declaration_span,
+                body: ReferenceCallableBody::Declaration, output: 0,
+                origins: ReferenceOutputOrigins::Explicit(vec![mismatched_origin]), independent_static: false,
+            }]);
+            let mut caller = results.into_iter().nth(1).unwrap().1;
+            ADMITTED_IDENTITY_REPLAYS.with(|count| count.set(0));
+            transfer_function_output_contracts(&mut caller, &ReferenceOutputContracts::default(), &mismatched_contracts,
+                &mut HashMap::new(), &mut Vec::new(), &mut 0);
+            assert_eq!(ADMITTED_IDENTITY_REPLAYS.with(|count| count.get()), 0, "mismatched solved contract cannot use the candidate");
+            let _ = definitive(&mut caller);
+            assert_eq!(ADMITTED_IDENTITY_REPLAYS.with(|count| count.get()), 0, "unresolved replay cannot use the candidate");
+
+            let wrapper = text.replace("*u8(*u8) forward = fn(input) { input };",
+                "*u8(*u8) leaf = fn(input) { input };\n*u8(*u8) forward = fn(input) { leaf(input) };");
+            let wrapper = crate::parse_source(program.source.clone(), wrapper.into(), &[]);
+            assert!(wrapper.diagnostics.is_empty(), "{:?}", wrapper.diagnostics);
+            ADMITTED_IDENTITY_REPLAYS.with(|count| count.set(0));
+            let validated = derive_scalar_program_with_layout(&wrapper.result, layout);
+            assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+            assert_eq!(ADMITTED_IDENTITY_REPLAYS.with(|count| count.get()), 0, "forwarding wrapper is not an authored pure leaf");
         }
     }
 

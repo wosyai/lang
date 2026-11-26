@@ -570,8 +570,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))))
                 && call_sites.boundary.root_outputs.is_empty()
                 && call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
-                && function.generic_parameters.is_empty() && call_sites.call_occurrences.is_empty()
-                && call_sites.structure.module_storage_uses.is_empty())
+                && function.generic_parameters.is_empty() && call_sites.structure.module_storage_uses.is_empty())
                 .then(local_borrow::Author::default),
             aggregate_facts: aggregate::AggregateFlowFacts::default(),
             aggregate_result: aggregate::AggregateFlowResult::default(),
@@ -2480,6 +2479,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         ).then_some((moved, *argument))
                     })()
                 } else { None };
+                if let (Some(author), CfgPointKind::Call {
+                    target: target @ ResolvedCallTarget::ModuleCallable { source, .. },
+                    argument_points, output: 0, ..
+                }) = (&mut self.local_borrow, &call) {
+                    // An exact effect body and the later checked output edge
+                    // are both needed. A return contract alone grants no call effects.
+                    if source == &self.source && !calls.declared_unsafe_calls.contains(&ordinal.0)
+                        && checked_call_output
+                        && shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects)
+                            .is_some_and(|effect| effect.returns_formal && !effect.joined_only && effect.parameter == 0)
+                    {
+                        if let [argument] = argument_points.as_slice() {
+                            author.prepare_shared_identity(CfgPointId(self.cfg.points.len()), *argument);
+                        }
+                    }
+                }
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
                 if let Some(owner) = widened_borrow {
                     self.aggregate_result.widened_borrowed_extent_calls.push((id, ordinal, owner));
@@ -11373,7 +11388,11 @@ fn transfer_reference_facts(
     )>,
     mut descriptor: Option<&mut ScalarDescriptorReplay<'_>>,
 ) -> Vec<ReferenceAnalysisError> {
-    if !deferred_policies.is_empty() || !contracts.is_empty() || cfg.pending_named_reborrow.is_some() {
+    let original_points = cfg.initial_points;
+    let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
+    if !deferred_policies.is_empty() || cfg.pending_named_reborrow.is_some()
+        || cfg.local_borrow.is_some_and(|sealed| !sealed.admits_contracts(contracts.len(), &return_edges))
+    {
         cfg.local_borrow = None;
     }
     if let Some(sites) = cfg.runtime_array_read_sites.as_deref_mut() {
@@ -11381,7 +11400,6 @@ fn transfer_reference_facts(
             site.origin = RuntimeArrayReadOrigin::Unseen;
         }
     }
-    let original_points = cfg.initial_points;
     // Actual runtime child issuance is sparse. Index its exact owner and
     // holder identities; fold representation mutations into the graph's
     // existing topology and resolved-point staging.
@@ -11769,7 +11787,6 @@ fn transfer_reference_facts(
             std::collections::VecDeque::from([CfgPointId(0)]),
         )
     });
-    let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
     let mut liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
     if !checked_installs.is_empty() { liveness.checked_installs = Some(&checked_installs); }
     if strictly_forward && !checked_installs.is_empty() {
@@ -18481,9 +18498,9 @@ fn transfer_function_output_contracts<'a>(
         });
         let mut transfer = ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points));
         transfer.forward_initial_graph = topology;
-        if replay.module_calls.is_empty() {
-            transfer.local_borrow = result.proof_points.local_borrow.as_deref();
-        }
+        // Sealing admits only authored exact calls. Definitive transfer checks
+        // each of their resolved contracts before it can use this candidate.
+        transfer.local_borrow = result.proof_points.local_borrow.as_deref();
         let transferred = transfer_reference_facts(
             transfer,
             &BTreeMap::new(),
