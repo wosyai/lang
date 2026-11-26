@@ -36,7 +36,7 @@ fn parameters_in(authored: &toml_edit::Table) -> Result<BTreeMap<String, Declare
 }
 
 /// A real profile/pair observed in a single loaded project configuration
-/// with no applicable watches, mounts or permissions. No command authority.
+/// with no build mounts or permissions. No command authority.
 pub struct ObservedClosedComptimeProfile {
     tools: SelectedComptimeTools,
     parameters: BTreeMap<String, DeclaredComptimeParameter>,
@@ -47,6 +47,23 @@ impl ObservedClosedComptimeProfile {
         configuration: &ProjectConfiguration, document: &ImDocument<String>,
         target: &str, profile: &str, package: &str, id: &str,
     ) -> Result<Self, String> {
+        Self::select_with(configuration, document, target, profile, || reject_applicable_watches(document, package, id))
+    }
+
+    /// Select declarations for read-only input evidence. This does not
+    /// resolve watches: the source assembler resolves them for the exact
+    /// authored site separately. It is not a launch or staging permission.
+    pub fn observe_input_declarations(
+        configuration: &ProjectConfiguration, document: &ImDocument<String>,
+        target: &str, profile: &str,
+    ) -> Result<Self, String> {
+        Self::select_with(configuration, document, target, profile, || Ok(()))
+    }
+
+    fn select_with(
+        configuration: &ProjectConfiguration, document: &ImDocument<String>, target: &str, profile: &str,
+        watches: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Self, String> {
         configuration.target_profile(target, profile)?;
         let authored = authored_profile(document, target, profile)?;
         let tools = SelectedComptimeTools::from_authored(configuration, authored, target, profile)?
@@ -56,7 +73,7 @@ impl ObservedClosedComptimeProfile {
         {
             return Err("closed comptime staging does not resolve build permissions or mounts".into());
         }
-        reject_applicable_watches(document, package, id)?;
+        watches()?;
         let parameters = parameters_in(authored)?;
         Ok(Self { tools, parameters })
     }
@@ -97,7 +114,7 @@ fn authored_profile<'a>(
 /// The consuming profile's evaluator tools and build declarations from one
 /// ordinary manifest read. Not an executable identity, a capability grant,
 /// or a full build configuration.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SelectedComptimeTools {
     target: String,
     profile: String,
@@ -110,7 +127,7 @@ pub struct SelectedComptimeTools {
 }
 
 /// An authored mount declaration, not a resolved or authorized host path.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ComptimeBuildMountDeclaration {
     host_path: String,
     guest_path: String,

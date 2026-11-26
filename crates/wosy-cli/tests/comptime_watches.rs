@@ -5,12 +5,16 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use wosy_cli::source_preparation::{prepare, prepare_comptime_watches, PreparedComptimeWatches};
+use wosy_cli::source_preparation::{
+    prepare, prepare_closed_comptime_input_facts, prepare_comptime_watches, ClosedComptimeInputFacts,
+    ClosedComptimeInputSelection, PreparedComptimeWatches, PreparedSources,
+};
+use wosy_compiler::{ComptimeParameterOrigin, ComptimeParameterValue, ScalarTargetLayout, ScalarType};
 use wosy_project::{
     packages::{ComptimeWatchLimits, WatchRoot},
     ProjectConfiguration,
 };
-use wosy_protocol::NodeId;
+use wosy_protocol::{FileMetadata, Kind, Node, NodeId};
 
 const APP_SOURCE: &str = r#"%%start
 payload = namespace assets "main.w";
@@ -187,6 +191,149 @@ fn checks_selected_site_glob_dialect_and_shared_budget_without_ordinary_side_eff
     fixture.put("assets/src/main.w",
         PACKAGE_SOURCE.replace("%%end", "i32 second = comptime prepare { 43 };\n%%end"));
     assert!(refusal("assets", "prepare", ComptimeWatchLimits::default()).contains("id is repeated"));
+    assert!(!app.join(".wosy").exists());
+}
+
+const CLOSED_ASSET: &str = r#"%%start
+# WHY: parâmetro real da aplicação ☕
+i32 asset = comptime prepare {
+    i32 value = core.comp_param("wanted", 41);
+    value
+};
+%%end
+"#;
+
+fn with_evaluator_tools() -> String {
+    let tools = r#"
+[builders.compile]
+command = ["unresolved fixture compiler", "literal *"]
+args = ["--strict"]
+toolchain_identity = "declared toolchain only"
+
+[runners.evaluate]
+command = ["unresolved fixture runner", "$literal"]
+args = ["--typed"]
+"#;
+    let selected = "[targets.app.profiles.dev]\ncomptime_builder = \"compile\"\ncomptime_runner = \"evaluate\"\nbuild_permissions = []\nbuild_mounts = []";
+    APP.replace(", \"recordings/./unsupported.txt\"", "")
+        .replace("[targets.app.profiles.dev]", selected) + tools
+}
+
+fn closed_scope() -> ClosedComptimeInputSelection<'static> {
+    ClosedComptimeInputSelection {
+        target: "app", profile: "dev", owner: "assets", id: "prepare",
+        evaluator_layout: ScalarTargetLayout::NATIVE64,
+        watch_limits: ComptimeWatchLimits::default(),
+        max_ir_bytes: 1 << 16,
+    }
+}
+
+fn observe_closed(root: &Path) -> (PreparedSources, ClosedComptimeInputFacts) {
+    prepare_closed_comptime_input_facts(root, closed_scope()).unwrap()
+}
+
+#[test]
+fn closed_facts_capture_the_exact_authored_file_and_evaluator_without_replacing_the_source_root() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let manifest = with_evaluator_tools();
+    fixture.put("app/wosy.toml", &manifest);
+    fixture.put("assets/src/main.w", CLOSED_ASSET);
+    let (prepared, baseline) = observe_closed(&app);
+    assert_eq!((prepared.parsed, prepared.reused), (2, 0));
+    assert_eq!(baseline.source_root(), prepared.root);
+    let (ordinary, watch_only) = prepare_comptime_watches(
+        &app, "app", "dev", "assets", "prepare", ComptimeWatchLimits::default(),
+    ).unwrap();
+    assert_eq!(prepared.root, ordinary.root);
+    assert_eq!(baseline.watches(), &watch_only);
+
+    let source = &watch_only.site.source;
+    assert_eq!((&source.package[..], &source.path[..]), ("assets", "src/main.w"));
+    let root = Node::decode(&prepared.delta.nodes[&prepared.root]).unwrap();
+    let dependency = root.children.into_iter().find_map(|id| {
+        let node = Node::decode(&prepared.delta.nodes[&id]).unwrap();
+        if node.kind != Kind::File { return None; }
+        let metadata: FileMetadata = serde_json::from_slice(&node.data).unwrap();
+        (metadata.source.package == "assets").then_some((node, metadata))
+    }).expect("rooted authored file of selected package");
+    assert_eq!(dependency.0.children[0], baseline.authored_cst());
+    assert_eq!(dependency.1.revision.hex(), source.revision);
+    assert_eq!(Node::id(&prepared.delta.nodes[&baseline.authored_cst()]), baseline.authored_cst());
+
+    let [read] = baseline.parameters() else { panic!("exactly one consumed parameter") };
+    assert_eq!((&read.name[..], &read.context, read.resolved),
+        ("wanted", &ScalarType::I32, ComptimeParameterValue::Integer(41)));
+    assert!(matches!(read.origin, ComptimeParameterOrigin::Default { .. }));
+    assert_eq!(baseline.result_type(), &ScalarType::I32);
+    assert_eq!(baseline.evaluator_layout(), ScalarTargetLayout::NATIVE64);
+    let (fresh, diagnostics) = wosy_compiler::parse_source_with_snapshot(
+        source.clone(), CLOSED_ASSET.into(), &["WHY".into()],
+    );
+    assert!(diagnostics.is_empty());
+    let oracle = wosy_compiler::derive_closed_comptime_fragment(
+        &fresh, "prepare", ScalarTargetLayout::NATIVE64, |_| None,
+    ).unwrap();
+    let ir = oracle.llvm().to_text();
+    assert_eq!(baseline.evaluator_ir().bytes, ir.len());
+    assert_eq!(baseline.evaluator_ir().blake3, blake3::hash(ir.as_bytes()));
+
+    let tools = baseline.declared_tools();
+    assert_eq!((tools.target(), tools.profile()), ("app", "dev"));
+    assert_eq!(tools.builder().1.command, ["unresolved fixture compiler", "literal *"]);
+    assert_eq!(tools.builder().1.args, ["--strict"]);
+    assert_eq!(tools.builder().1.toolchain_identity, "declared toolchain only");
+    assert_eq!(tools.runner().1.command, ["unresolved fixture runner", "$literal"]);
+    assert_eq!(tools.runner().1.args, ["--typed"]);
+    assert!(tools.build_permissions().unwrap().is_empty() && tools.build_mounts().unwrap().is_empty());
+    assert_eq!(observe_closed(&app).1, baseline);
+
+    fixture.put("assets/not-a-watch", "irrelevant");
+    assert_eq!(observe_closed(&app).1, baseline);
+    fixture.put("app/recordings/extra.json", "changed consumer watch");
+    fixture.put("assets/schemas/root.json", "changed owner watch");
+    let (after, changed) = observe_closed(&app);
+    assert_eq!(after.root, prepared.root);
+    assert_eq!(changed.authored_cst(), baseline.authored_cst());
+    assert_eq!(changed.evaluator_ir(), baseline.evaluator_ir());
+    assert_eq!(changed.declared_tools(), baseline.declared_tools());
+    assert_eq!(changed.parameters(), baseline.parameters());
+    assert_ne!(changed.watches(), baseline.watches());
+
+    fixture.put("app/wosy.toml", manifest.replace("--typed", "--selected-argv-changed"));
+    let (_, argv) = observe_closed(&app);
+    assert_ne!(argv.configuration_identity(), changed.configuration_identity());
+    assert_ne!(argv.declared_tools(), changed.declared_tools());
+    assert_eq!(argv.evaluator_ir(), changed.evaluator_ir());
+    assert_eq!(argv.watches(), changed.watches());
+
+    fixture.put("app/wosy.toml", manifest + "\n[targets.app.profiles.dev.params]\nwanted = 42\n");
+    let (_, overridden) = observe_closed(&app);
+    assert_eq!(overridden.authored_cst(), baseline.authored_cst());
+    assert_ne!(overridden.evaluator_ir(), baseline.evaluator_ir());
+    assert_eq!(overridden.watches(), changed.watches());
+    assert_eq!(overridden.parameters()[0].origin, ComptimeParameterOrigin::Profile);
+    assert_eq!(overridden.parameters()[0].resolved, ComptimeParameterValue::Integer(42));
+    assert!(!app.join(".wosy").exists());
+}
+
+#[test]
+fn closed_facts_refuse_missing_declarations_unresolved_capabilities_and_unsupported_bodies() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let error = || prepare_closed_comptime_input_facts(&app, closed_scope()).err().unwrap();
+    assert!(error().contains("explicit comptime builder and runner"));
+    let manifest = with_evaluator_tools();
+    fixture.put("app/wosy.toml", manifest.replace("build_permissions = []", "build_permissions = [\"network\"]"));
+    assert!(error().contains("does not resolve build permissions or mounts"));
+    fixture.put("app/wosy.toml", &manifest);
+    fixture.put("assets/src/main.w", CLOSED_ASSET.replace("    value\n", "    value + 1\n"));
+    assert!(error().contains("not a closed scalar expression"));
+    fixture.put("assets/src/main.w", CLOSED_ASSET);
+    let mut scope = closed_scope();
+    scope.max_ir_bytes = 0;
+    assert!(prepare_closed_comptime_input_facts(&app, scope).err().unwrap().contains("exceeds byte budget"));
+    assert!(prepare(&app, Some("app"), None).is_ok());
     assert!(!app.join(".wosy").exists());
 }
 

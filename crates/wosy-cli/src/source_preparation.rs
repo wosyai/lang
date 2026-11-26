@@ -6,13 +6,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use wosy_project::{
     packages::{observe_comptime_watches, ComptimeWatchLimits, WatchedComptimeFile},
-    ProjectConfiguration, ProjectContext, SourceGraph,
+    ObservedClosedComptimeProfile, ProjectConfiguration, ProjectContext, SourceGraph,
 };
+use wosy_compiler::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection, ScalarTargetLayout};
 use wosy_protocol::{
     imports_from_cst, Delta, FileEntry, FileKey, FileMetadata, InstalledGitSelection, Kind,
     Namespace, NodeId, ParserPolicy, SourceConfig,
 };
-use wosy_syntax::{ComptimeCst, CstNode, SourceSpan, SyntaxKind};
+use wosy_syntax::{ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
+
+mod comptime_inputs;
+pub use comptime_inputs::{ClosedComptimeInputFacts, ClosedComptimeInputSelection};
 
 pub type Files = BTreeMap<FileKey, FileEntry>;
 
@@ -67,7 +71,7 @@ fn parse_file(
     text: String,
     categories: &[String],
     delta: &mut Delta,
-    observe: impl FnOnce(&wosy_syntax::ParseResult) -> Result<(), String>,
+    observe: impl FnOnce(&FreshParseResult) -> Result<(), String>,
 ) -> Result<FileEntry, String> {
     let path = metadata.source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
     let source = wosy_syntax::SourceIdentity::new(
@@ -81,7 +85,7 @@ fn parse_file(
     if !diagnostics.is_empty() {
         return Err(format!("{}:{}: {diagnostics:?}", result.source.package, result.source.path));
     }
-    observe(result)?;
+    observe(&fresh)?;
     let metadata = FileMetadata {
         imports: imports_from_cst(&result.canonical_cst().root)?,
         ..metadata
@@ -136,21 +140,50 @@ struct WatchSelection<'a> {
     owner: &'a str,
     id: &'a str,
     limits: ComptimeWatchLimits,
-    site: Option<SourceSpan>,
+    site: Option<(SourceSpan, FileKey)>,
+    closed: Option<ClosedInputCapture>,
+}
+
+struct ClosedInputCapture {
+    layout: ScalarTargetLayout,
+    ir_limit: usize,
+    selected_profile: Option<ObservedClosedComptimeProfile>,
+    fragment: Option<ClosedComptimeFragment>,
 }
 
 impl WatchSelection<'_> {
-    fn observe(&mut self, parsed: &wosy_syntax::ParseResult) -> Result<(), String> {
+    fn observe(&mut self, fresh: &FreshParseResult, file: &FileKey) -> Result<(), String> {
+        let parsed = fresh.result();
         if parsed.source.package != self.owner { return Ok(()); }
+        if let Some(closed) = &mut self.closed {
+            let profile = closed.selected_profile.as_ref().expect("observed selected profile");
+            return match derive_closed_comptime_fragment(fresh, self.id, closed.layout, |name| {
+                profile.parameters().get(name).copied().map(crate::comptime_fragment::compiler_parameter)
+            }) {
+                Ok(fragment) if self.site.is_none() => {
+                    self.site = Some((fragment.site().clone(), file.clone()));
+                    closed.fragment = Some(fragment);
+                    Ok(())
+                }
+                Ok(_) => Err("comptime watch id is repeated in the reachable owning package".into()),
+                Err(ClosedComptimeRejection::SiteNotFound) => Ok(()),
+                Err(error) => Err(format!("closed comptime input was not prepared: {error:?}")),
+            };
+        }
         for occurrence in parsed.root.descendants().filter_map(|node| ComptimeCst::from_node(&node)) {
             if occurrence.id.text() != self.id { continue; }
             if self.site.is_some() {
                 return Err("comptime watch id is repeated in the reachable owning package".into());
             }
-            self.site = Some(SourceSpan::new(parsed.source.clone(), occurrence.span));
+            self.site = Some((SourceSpan::new(parsed.source.clone(), occurrence.span), file.clone()));
         }
         Ok(())
     }
+}
+
+enum ComptimeAttachment {
+    Watches(PreparedComptimeWatches),
+    Closed(ClosedComptimeInputFacts),
 }
 
 /// Reuse the ordinary resolver and its actual fresh authored CST; no
@@ -158,13 +191,34 @@ impl WatchSelection<'_> {
 pub fn prepare_comptime_watches(
     root: &Path, target: &str, profile: &str, owner: &str, id: &str, limits: ComptimeWatchLimits,
 ) -> Result<(PreparedSources, PreparedComptimeWatches), String> {
-    let selected = WatchSelection { profile, owner, id, limits, site: None };
+    let selected = WatchSelection { profile, owner, id, limits, site: None, closed: None };
     match prepare_from_observation(root, Some(target), None, None, None, Some(selected)) {
-        Ok((prepared, _, _, Some(watches))) => Ok((prepared, watches)),
+        Ok((prepared, _, _, Some(ComptimeAttachment::Watches(watches)))) => Ok((prepared, watches)),
         Ok(_) => unreachable!("successful selection produces watch observation"),
         Err(ObservationError::Source(error)) => Err(error),
         Err(ObservationError::LiveRead(_) | ObservationError::Changed) =>
             unreachable!("watch observation takes the fresh source path"),
+    }
+}
+
+/// Observe one closed candidate and its selected source/configuration in the
+/// same authored graph assembly. No result, tool execution, reuse key, or
+/// proof that this candidate is reached during compile-time control flow.
+pub fn prepare_closed_comptime_input_facts(
+    root: &Path, scope: ClosedComptimeInputSelection<'_>,
+) -> Result<(PreparedSources, ClosedComptimeInputFacts), String> {
+    let selected = WatchSelection {
+        profile: scope.profile, owner: scope.owner, id: scope.id, limits: scope.watch_limits, site: None,
+        closed: Some(ClosedInputCapture {
+            layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes, selected_profile: None, fragment: None,
+        }),
+    };
+    match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected)) {
+        Ok((prepared, _, _, Some(ComptimeAttachment::Closed(facts)))) => Ok((prepared, facts)),
+        Ok(_) => unreachable!("successful attachment produces closed input facts"),
+        Err(ObservationError::Source(error)) => Err(error),
+        Err(ObservationError::LiveRead(_) | ObservationError::Changed) =>
+            unreachable!("closed comptime observation takes the fresh source path"),
     }
 }
 
@@ -214,7 +268,7 @@ impl From<&str> for ObservationError {
 fn prepare_from_observation(
     root: &Path, target: Option<&str>, base: Option<&Files>, mut live: Option<LiveSourceReader>,
     builder_source: Option<NodeId>, mut watch: Option<WatchSelection<'_>>,
-) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>, Option<PreparedComptimeWatches>), ObservationError> {
+) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>, Option<ComptimeAttachment>), ObservationError> {
     let check_time = |live: &Option<LiveSourceReader>| {
         live.as_ref().map_or(Ok(()), LiveSourceReader::check_time).map_err(ObservationError::LiveRead)
     };
@@ -226,10 +280,15 @@ fn prepare_from_observation(
     let (cfg, manifest) = configuration?;
     let target = cfg.resolve_target(target)?;
     let ctx = ProjectContext::from_manifest(&project, &target, manifest.as_table())?;
-    if let Some(watch) = &watch {
+    if let Some(watch) = &mut watch {
         cfg.artifact_profile(&target, watch.profile)?;
         if watch.owner != ctx.package && !cfg.resolved_packages.contains_key(watch.owner) {
             return Err("comptime watch owner is not in the resolved project".into());
+        }
+        if let Some(closed) = &mut watch.closed {
+            closed.selected_profile = Some(ObservedClosedComptimeProfile::observe_input_declarations(
+                &cfg, &manifest, &target, watch.profile,
+            )?);
         }
     }
 
@@ -282,7 +341,7 @@ fn prepare_from_observation(
                 source: source.clone(), revision, policy, imports: Vec::new(), bytes: text.len() as u32,
             };
             parse_file(metadata, text, &ctx.comment_categories, &mut delta, |parsed| {
-                watch.as_mut().map_or(Ok(()), |watch| watch.observe(parsed))
+                watch.as_mut().map_or(Ok(()), |watch| watch.observe(parsed, &key))
             })?
         } else {
             return Err(ObservationError::Changed);
@@ -297,9 +356,9 @@ fn prepare_from_observation(
         crate::project_sources::Error::Graph(error) => ObservationError::Source(format!("{error:?}")),
     })?;
     let watches = if let Some(watch) = watch {
-        let site = watch.site.ok_or("comptime watch id does not name a reachable authored site")?;
+        let (site, file) = watch.site.ok_or("comptime watch id does not name a reachable authored site")?;
         let files = observe_comptime_watches(&project, &ctx.package, &cfg, &manifest, watch.owner, watch.id, watch.limits)?;
-        Some(PreparedComptimeWatches { target: target.clone(), profile: watch.profile.into(), id: watch.id.into(), site, files })
+        Some((PreparedComptimeWatches { target: target.clone(), profile: watch.profile.into(), id: watch.id.into(), site, files }, file, watch.closed))
     } else { None };
     let profiles = cfg.targets[&target].profiles.keys().filter_map(|profile| {
         cfg.artifact_profile(&target, profile).ok().map(|(_, _, artifact, _)| {
@@ -327,6 +386,16 @@ fn prepare_from_observation(
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
     let root = delta.add(Kind::SourcePreparation, schema.to_vec(), roots);
+    let comptime = if let Some((watches, captured, closed)) = watches {
+        if let Some(closed) = closed {
+            let authored = files.get(&captured).expect("compiler observed this exact file in the source assembly").authored;
+            Some(ComptimeAttachment::Closed(ClosedComptimeInputFacts::observe(
+                root, authored, project_configuration_identity(manifest.raw().as_bytes(), &cfg)?,
+                watches, closed.selected_profile.expect("selected consumer").into_tools(),
+                closed.fragment.expect("observed site with closed fragment"), closed.ir_limit,
+            )?))
+        } else { Some(ComptimeAttachment::Watches(watches)) }
+    } else { None };
     let builder = if builder_source == Some(root) {
         Some(ObservedBuilderBasis {
             project,
@@ -335,5 +404,5 @@ fn prepare_from_observation(
             source: project_sources::observations(graph),
         })
     } else { None };
-    Ok((PreparedSources { root, delta, parsed, reused }, files, builder, watches))
+    Ok((PreparedSources { root, delta, parsed, reused }, files, builder, comptime))
 }

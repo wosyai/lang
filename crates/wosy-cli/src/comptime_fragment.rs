@@ -104,17 +104,21 @@ fn observe(
     })?;
     let entry = entry.ok_or_else(|| ClosedComptimePlanError::Project("target has no entry".into()))?;
     let fragment = derive_closed_comptime_fragment(&entry, id, evaluator_layout, |name| {
-        parameters.get(name).map(|value| match value {
-            DeclaredComptimeParameter::Integer(value) => ComptimeParameter::Integer(*value),
-            DeclaredComptimeParameter::Boolean(value) => ComptimeParameter::Boolean(*value),
-            DeclaredComptimeParameter::Other => ComptimeParameter::UnsupportedValue,
-        })
+        parameters.get(name).copied().map(compiler_parameter)
     }).map_err(ClosedComptimePlanError::Fragment)?;
     let staging = if let Some(profile) = stage_profile {
         let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
         Some(StagingSelection { workspace: root, configuration_identity, tools: profile.into_tools() })
     } else { None };
     Ok(FragmentObservation { fragment, staging })
+}
+
+pub(crate) fn compiler_parameter(value: DeclaredComptimeParameter) -> ComptimeParameter {
+    match value {
+        DeclaredComptimeParameter::Integer(value) => ComptimeParameter::Integer(value),
+        DeclaredComptimeParameter::Boolean(value) => ComptimeParameter::Boolean(value),
+        DeclaredComptimeParameter::Other => ComptimeParameter::UnsupportedValue,
+    }
 }
 
 /// Paths describe the caller-owned staging area and are never opened here.
@@ -167,12 +171,18 @@ impl ClosedComptimeStaging {
     /// Failed writes have no receipt; the caller owns any partial scratch
     /// output. The byte bound is egress only, not total compiler memory.
     pub fn write_evaluator_ir(&self, output: &mut impl Write, max_bytes: usize) -> io::Result<StagedEvaluatorIr> {
-        let limit = max_bytes.min(1 << 20);
-        let mut writer = EvaluatorWriter { output, remaining: limit, digest: blake3::Hasher::new() };
-        self.fragment.llvm().write_text(&mut writer)?;
-        writer.flush()?;
-        Ok(StagedEvaluatorIr { bytes: limit - writer.remaining, blake3: writer.digest.finalize() })
+        write_compiler_evaluator_ir(&self.fragment, output, max_bytes)
     }
+}
+
+pub(crate) fn write_compiler_evaluator_ir(
+    fragment: &ClosedComptimeFragment, output: &mut impl Write, max_bytes: usize,
+) -> io::Result<StagedEvaluatorIr> {
+    let limit = max_bytes.min(1 << 20);
+    let mut writer = EvaluatorWriter { output, remaining: limit, digest: blake3::Hasher::new() };
+    fragment.llvm().write_text(&mut writer)?;
+    writer.flush()?;
+    Ok(StagedEvaluatorIr { bytes: limit - writer.remaining, blake3: writer.digest.finalize() })
 }
 
 struct EvaluatorWriter<'a, W> {
