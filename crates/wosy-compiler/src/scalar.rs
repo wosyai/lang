@@ -2534,7 +2534,8 @@ pub use comptime::{derive_closed_comptime_fragment, derive_first_source_initiali
     CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 pub use comptime::{
     derive_direct_function_comptime_fragment, inspect_direct_function_comptime, DirectComptimeArgument,
-    DirectFunctionComptimeFragment, InspectedDirectComptimeCall,
+    DirectFunctionComptimeFragment, DirectStartupComptimePlan, DirectStartupComptimeUse,
+    InspectedDirectComptimeCall, derive_direct_startup_comptime_plan,
 };
 use declarations::ScalarDeclarationEnvironment;
 mod inference;

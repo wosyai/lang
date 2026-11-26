@@ -12,6 +12,8 @@ use super::super::{
 use rowan::NodeOrToken;
 use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
+const MAX_DIRECT_STARTUP_CALLS: usize = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectComptimeArgument {
     I32(i32),
@@ -77,35 +79,104 @@ impl DirectFunctionComptimeFragment {
 pub fn derive_direct_function_comptime_fragment(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<DirectFunctionComptimeFragment, ClosedComptimeRejection> {
-    with_verified_direct_call(fresh, id, layout, |facts, authored_body, name_span| {
-        let mut body = authored_body.clone();
-        let ([ScalarBlockItem::Expression(item)], [expression], [output]) = (
-            body.items.as_mut_slice(), body.expressions.as_mut_slice(), body.final_output_values.as_mut_slice(),
-        ) else {
-            return Err(ClosedComptimeRejection::Emitter("verified evaluator body lost its sole output".into()));
-        };
-        let span = facts.read.range;
-        let value = match facts.value {
-            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
-            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
-            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
-        };
-        *item = value.clone();
-        *expression = value.clone();
-        output.value = value;
-        output.ty = facts.result.clone();
-        let evaluator = emit_closed_evaluator(
-            id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body,
-        )?;
-        Ok(DirectFunctionComptimeFragment { facts, evaluator })
+    with_verified_direct_call(fresh, id, layout, |facts, body, name_span| {
+        emit_bound_evaluator(id, layout, body, name_span, &facts)
+            .map(|evaluator| DirectFunctionComptimeFragment { facts, evaluator })
     })
 }
 
-// No prepared project or caller-supplied value can escape this boundary.
-// The private continuation sees only the authenticated detached body.
+/// An exact canonical startup occurrence and its index into this plan's
+/// evaluator list. The index has no meaning outside its owning plan.
+pub struct DirectStartupComptimeUse {
+    facts: InspectedDirectComptimeCall,
+    evaluator: usize,
+}
+
+impl DirectStartupComptimeUse {
+    pub fn facts(&self) -> &InspectedDirectComptimeCall { &self.facts }
+    pub fn evaluator_index(&self) -> usize { self.evaluator }
+}
+
+/// Detached evaluator IR for a bounded startup list in one authored module.
+/// Call sites retain their order and provenance. Nothing runs or persists.
+pub struct DirectStartupComptimePlan {
+    calls: Vec<DirectStartupComptimeUse>,
+    evaluators: Vec<ClosedComptimeFragment>,
+}
+
+impl DirectStartupComptimePlan {
+    pub fn calls(&self) -> &[DirectStartupComptimeUse] { &self.calls }
+    pub fn evaluators(&self) -> &[ClosedComptimeFragment] { &self.evaluators }
+}
+
+/// One formal-only tail and at most sixteen direct literal startup calls to
+/// that same declaration. Authenticate the entire ordinary startup list
+/// before emitting anything. Equal tuples share one evaluator only within
+/// this exact analysis; this does not define a reusable ComptimeKey.
+pub fn derive_direct_startup_comptime_plan(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<DirectStartupComptimePlan, ClosedComptimeRejection> {
+    with_verified_direct_calls(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS, |calls, body, name_span| {
+        let mut plan = DirectStartupComptimePlan {
+            calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
+        };
+        let mut values = Vec::new();
+        for facts in calls {
+            // The rooted function, its only formal read, and layout are
+            // identical in this analysis. The tagged literal is all that varies.
+            let evaluator = match values.iter().position(|value| *value == facts.value) {
+                Some(index) => index,
+                None => {
+                    let index = plan.evaluators.len();
+                    plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts)?);
+                    values.push(facts.value);
+                    index
+                }
+            };
+            plan.calls.push(DirectStartupComptimeUse { facts, evaluator });
+        }
+        Ok(plan)
+    })
+}
+
+fn emit_bound_evaluator(
+    id: &str, layout: ScalarTargetLayout, authored_body: &ScalarBlock, name_span: ByteSpan,
+    facts: &InspectedDirectComptimeCall,
+) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
+    let mut body = authored_body.clone();
+    let ([ScalarBlockItem::Expression(item)], [expression], [output]) = (
+        body.items.as_mut_slice(), body.expressions.as_mut_slice(), body.final_output_values.as_mut_slice(),
+    ) else {
+        return Err(ClosedComptimeRejection::Emitter("verified evaluator body lost its sole output".into()));
+    };
+    let span = facts.read.range;
+    let value = match facts.value {
+        DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+        DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+        DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
+    };
+    *item = value.clone();
+    *expression = value.clone();
+    output.value = value;
+    output.ty = facts.result.clone();
+    emit_closed_evaluator(id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body)
+}
+
 fn with_verified_direct_call<T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     observe: impl FnOnce(InspectedDirectComptimeCall, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
+) -> Result<T, ClosedComptimeRejection> {
+    with_verified_direct_calls(fresh, id, layout, 1, |mut calls, body, name_span| {
+        let call = calls.pop().ok_or_else(|| ClosedComptimeRejection::Emitter("verified single call disappeared".into()))?;
+        observe(call, body, name_span)
+    })
+}
+
+// The analytical project stays private. The continuation is called only
+// after every startup occurrence and the sole formal read were verified.
+fn with_verified_direct_calls<T>(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize,
+    observe: impl FnOnce(Vec<InspectedDirectComptimeCall>, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     let parsed = fresh.result();
@@ -122,8 +193,24 @@ fn with_verified_direct_call<T>(
     let (node, site) = sites.next().ok_or(Error::SiteNotFound)?;
     if let Some((_, repeated)) = sites.next() { return Err(Error::RepeatedSite(scope(repeated.span))); }
     let unsupported = |feature| Error::Unsupported { site: scope(site.span), feature };
-    let tail = function_tail(&node)
+    let (tail, declaration_item, source) = function_tail(&node)
         .ok_or_else(|| unsupported("expected the only tail of one ordinary function"))?;
+    let mut authored_items = source.children()
+        .filter(|child| !matches!(child.kind(), SyntaxKind::BoundaryStart | SyntaxKind::BoundaryEnd));
+    if authored_items.next().as_ref() != Some(&declaration_item) {
+        return Err(unsupported("expected the only tail of one ordinary function"));
+    }
+    let mut count = 0;
+    for item in authored_items {
+        if only(item.children()).is_none_or(|child| child.kind() != SyntaxKind::BindingDecl) {
+            return Err(unsupported("each authored startup item must be one ordinary binding"));
+        }
+        count += 1;
+        if count > limit {
+            return Err(unsupported("direct comptime startup call limit exceeded"));
+        }
+    }
+    if count == 0 { return Err(unsupported("no direct startup call was authored")); }
     let name = sole_final_value(&site.block)
         .and_then(|expression| only(expression.children()))
         .filter(|value| value.kind() == SyntaxKind::Primary && value.children().next().is_none())
@@ -145,55 +232,18 @@ fn with_verified_direct_call<T>(
         ScalarPreparationInputs { target_layout: layout },
     ).map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
     let [module] = prepared.project().modules.as_slice() else { unreachable!("one supplied module"); };
-    let [ScalarItem::Function(function), ScalarItem::Binding(binding)] = module.items.as_slice() else {
-        return Err(unsupported("expected one ordinary function and one entry binding"));
+    let [ScalarItem::Function(function), bindings @ ..] = module.items.as_slice() else {
+        return Err(unsupported("expected one ordinary function before startup"));
     };
     let Some(region) = prepared.initialization_region(0) else {
         return Err(unsupported("ordinary entry initialization was not prepared"));
     };
-    if !matches!(region.steps.as_slice(), [step] if step.item == 1
-        && step.kind == ModuleInitializationStepKind::BindingInitialization) {
-        return Err(unsupported("direct call is not the only ordinary entry initialization"));
+    if bindings.len() != count || region.steps.len() != count
+        || region.steps.iter().enumerate().any(|(offset, step)| step.item != offset + 1
+            || step.kind != ModuleInitializationStepKind::BindingInitialization)
+    {
+        return Err(unsupported("ordinary entry initialization order does not match the authored list"));
     }
-    if binding.receivers.len() != 1 {
-        return Err(unsupported("expected one direct initializer destination"));
-    }
-    let call = &binding.value;
-    let ScalarExpression::Call { receiver: None, type_arguments, arguments, .. } = call else {
-        return Err(unsupported("expected a direct ordinary initializer call"));
-    };
-    let [argument] = arguments.as_slice() else { return Err(unsupported("one literal argument is required")); };
-    if !type_arguments.is_empty() { return Err(unsupported("generic arguments are not admitted")); }
-
-    let facts = prepared.initializer_facts(0)
-        .map_err(|_| unsupported("ordinary initializer occurrence facts are unavailable"))?;
-    let destination = facts.binding_output(binding, 0, call)
-        .map_err(|_| unsupported("call is not the entire ordinary initializer"))?;
-    let target = facts.checked_direct_call(call)
-        .map_err(|_| unsupported("no exact direct declaration was selected"))?;
-    let declaration = scope(function.name_span);
-    if target.declaration != &declaration || target.concrete != &ConcreteCallSelection::Declaration {
-        return Err(unsupported("initializer did not select the authored function"));
-    }
-    let ([parameter], [result]) = (target.parameters, target.outputs) else {
-        return Err(unsupported("one contextual scalar parameter and result are required"));
-    };
-    if destination.ty != &result.ty || parameter != &result.ty {
-        return Err(unsupported("the declared result must be the formal's scalar type"));
-    }
-    let argument_ty = facts.checked_expression_type(argument)
-        .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
-    if argument_ty != parameter {
-        return Err(unsupported("literal argument does not have the selected formal type"));
-    }
-    let value = match (argument, parameter) {
-        (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
-            i32::try_from(value).ok().map(DirectComptimeArgument::I32),
-        (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
-            u32::try_from(value).ok().map(DirectComptimeArgument::U32),
-        (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
-        _ => None,
-    }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))?;
 
     let build = analyze_scalar_build(&prepared);
     if !build.diagnostics().is_empty() { return Err(Error::OrdinaryDiagnostics(build.diagnostics().to_vec())); }
@@ -209,16 +259,63 @@ fn with_verified_direct_call<T>(
         .map_err(|_| unsupported("ordinary callable occurrences are unavailable"))?;
     let (formal, formal_type) = nodes.formal(points, 0)
         .ok_or_else(|| unsupported("no ordinary formal binding was prepared"))?;
-    if formal_type != parameter || nodes.checked_expression_type(read) != Some(parameter)
+    if nodes.checked_expression_type(read) != Some(formal_type)
         || !matches!(nodes.plain_name(read), Some(PlainNameIdentity::Lexical(binding)) if binding == formal)
         || span_of(read) != super::super::token_span(&name)
     {
         return Err(unsupported("authored read does not select the exact ordinary formal"));
     }
-    observe(InspectedDirectComptimeCall {
-        site: scope(site.span), function: declaration, call: scope(span_of(call)), argument: scope(span_of(argument)),
-        formal: scope(formal.declaration_span), read: scope(span_of(read)), value, result: result.ty.clone(),
-    }, body, super::super::token_span(&site.id))
+
+    let facts = prepared.initializer_facts(0)
+        .map_err(|_| unsupported("ordinary initializer occurrence facts are unavailable"))?;
+    let declaration = scope(function.name_span);
+    let mut selected = Vec::with_capacity(count);
+    for item in bindings {
+        let ScalarItem::Binding(binding) = item else {
+            return Err(unsupported("expected one argument binding at each startup step"));
+        };
+        if binding.receivers.len() != 1 {
+            return Err(unsupported("expected one direct initializer destination"));
+        }
+        let call = &binding.value;
+        let ScalarExpression::Call { receiver: None, type_arguments, arguments, .. } = call else {
+            return Err(unsupported("expected a direct ordinary initializer call"));
+        };
+        let [argument] = arguments.as_slice() else { return Err(unsupported("one literal argument is required")); };
+        if !type_arguments.is_empty() { return Err(unsupported("generic arguments are not admitted")); }
+        let destination = facts.binding_output(binding, 0, call)
+            .map_err(|_| unsupported("call is not the entire ordinary initializer"))?;
+        let target = facts.checked_direct_call(call)
+            .map_err(|_| unsupported("no exact direct declaration was selected"))?;
+        if target.declaration != &declaration || target.concrete != &ConcreteCallSelection::Declaration {
+            return Err(unsupported("initializer did not select the authored function"));
+        }
+        let ([parameter], [result]) = (target.parameters, target.outputs) else {
+            return Err(unsupported("one contextual scalar parameter and result are required"));
+        };
+        if destination.ty != &result.ty || parameter != &result.ty || parameter != formal_type {
+            return Err(unsupported("the declared result must be the exact read formal's scalar type"));
+        }
+        let argument_ty = facts.checked_expression_type(argument)
+            .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
+        if argument_ty != parameter {
+            return Err(unsupported("literal argument does not have the selected formal type"));
+        }
+        let value = match (argument, parameter) {
+            (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
+                i32::try_from(value).ok().map(DirectComptimeArgument::I32),
+            (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
+                u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+            (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
+            _ => None,
+        }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))?;
+        selected.push(InspectedDirectComptimeCall {
+            site: scope(site.span), function: declaration.clone(), call: scope(span_of(call)),
+            argument: scope(span_of(argument)), formal: scope(formal.declaration_span),
+            read: scope(span_of(read)), value, result: result.ty.clone(),
+        });
+    }
+    observe(selected, body, super::super::token_span(&site.id))
 }
 
 fn only<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -232,7 +329,7 @@ fn sole_final_value(block: &CstNode) -> Option<CstNode> {
     only(output.children()).filter(|child| child.kind() == SyntaxKind::Expression)
 }
 
-fn function_tail(node: &CstNode) -> Option<CstNode> {
+fn function_tail(node: &CstNode) -> Option<(CstNode, CstNode, CstNode)> {
     let primary = node.parent().filter(|p| p.kind() == SyntaxKind::Primary)?;
     let expression = primary.parent().filter(|p| p.kind() == SyntaxKind::Expression)?;
     let output = expression.parent().filter(|p| p.kind() == SyntaxKind::OutputList)?;
@@ -243,14 +340,7 @@ fn function_tail(node: &CstNode) -> Option<CstNode> {
     if function.children_with_tokens().any(|child| child.kind() == SyntaxKind::Unsafe) { return None; }
     let item = function.parent().filter(|p| p.kind() == SyntaxKind::Item)?;
     let source = item.parent().filter(|p| p.kind() == SyntaxKind::Root)?;
-    let mut items = source.children()
-        .filter(|child| !matches!(child.kind(), SyntaxKind::BoundaryStart | SyntaxKind::BoundaryEnd));
-    if items.next().as_ref() != Some(&item) {
-        return None;
-    }
-    only(items).and_then(|next| only(next.children()))
-        .filter(|next| next.kind() == SyntaxKind::BindingDecl)?;
-    Some(expression)
+    Some((expression, item, source))
 }
 
 #[cfg(test)]
@@ -342,6 +432,76 @@ mod tests {
             assert!(matches!(derive_direct_function_comptime_fragment(&unbound, "value", layout),
                 Err(ClosedComptimeRejection::Unsupported { feature: "argument must be an exact scalar literal", .. })));
         }
+    }
+
+    const STARTUP_FUNCTION: &str = "i32(i32) solve = fn(input) { comptime value { input } };";
+
+    #[test]
+    fn direct_startup_plan_preserves_order_and_shares_only_identical_typed_tuples() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let authored = fresh(&format!(
+                "{STARTUP_FUNCTION}\ni32 first = solve(7);\ni32 second = solve(9);\ni32 third = solve(7);"
+            ));
+            let plan = derive_direct_startup_comptime_plan(&authored, "value", layout)
+                .unwrap_or_else(|error| panic!("finite startup plan: {error:?}"));
+            let [a, b, c] = plan.calls() else { panic!("three canonical startup occurrences"); };
+            assert_eq!([a.evaluator_index(), b.evaluator_index(), c.evaluator_index()], [0, 1, 0]);
+            for (call, literal, value) in [(a, "7", 7), (b, "9", 9), (c, "7", 7)] {
+                let facts = call.facts();
+                assert_eq!(facts.value(), DirectComptimeArgument::I32(value));
+                assert_eq!(facts.result(), &ScalarType::I32);
+                assert_eq!(facts.function(), a.facts().function());
+                assert_eq!(facts.formal(), a.facts().formal());
+                assert_eq!(facts.read(), a.facts().read());
+                assert_eq!(facts.site(), a.facts().site());
+                assert_eq!(spelling(&authored, facts.argument()), literal);
+                assert_eq!(spelling(&authored, facts.call()), format!("solve({literal})"));
+            }
+            assert!(a.facts().call().range.end < b.facts().call().range.start);
+            assert!(b.facts().call().range.end < c.facts().call().range.start);
+            let [seven, nine] = plan.evaluators() else { panic!("two exact evaluator tuples"); };
+            for (evaluator, literal) in [(seven, "7"), (nine, "9")] {
+                let ordinary = fresh(&format!("i32 answer = comptime value {{ {literal} }};"));
+                let expected = super::super::derive_closed_comptime_fragment(&ordinary, "value", layout, |_| None).unwrap();
+                assert_eq!(evaluator.llvm().to_text(), expected.llvm().to_text());
+                assert_eq!(evaluator.site(), a.facts().site());
+                assert_eq!(evaluator.layout(), layout);
+            }
+            assert_ne!(seven.llvm().to_text(), nine.llvm().to_text());
+            assert!(matches!(inspect_direct_function_comptime(&authored, "value", layout),
+                Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. })));
+        }
+    }
+
+    #[test]
+    fn direct_startup_plan_refuses_a_late_unproven_call_and_caps_the_entire_list() {
+        let layout = ScalarTargetLayout::WASM32;
+        let computed = fresh(&format!(
+            "{STARTUP_FUNCTION}\ni32 first = solve(7);\ni32 second = solve(first);"
+        ));
+        assert!(computed.result().is_valid());
+        assert!(matches!(derive_direct_startup_comptime_plan(&computed, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported { feature: "argument must be an exact scalar literal", .. })));
+        let unrelated = fresh(&format!(
+            "{STARTUP_FUNCTION}\ni32 first = solve(7);\ni32 unrelated = 9;"
+        ));
+        assert!(unrelated.result().is_valid());
+        assert!(matches!(derive_direct_startup_comptime_plan(&unrelated, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported { feature: "expected a direct ordinary initializer call", .. })));
+
+        let mut full = STARTUP_FUNCTION.to_owned();
+        for index in 0..MAX_DIRECT_STARTUP_CALLS {
+            full.push_str(&format!("\ni32 result_{index} = solve(7);"));
+        }
+        let at_limit = derive_direct_startup_comptime_plan(&fresh(&full), "value", layout).unwrap();
+        assert_eq!(at_limit.calls().len(), MAX_DIRECT_STARTUP_CALLS);
+        assert_eq!(at_limit.evaluators().len(), 1);
+        assert!(at_limit.calls().iter().all(|call| call.evaluator_index() == 0));
+        full.push_str("\ni32 last = solve(7);");
+        let over = fresh(&full);
+        assert!(over.result().is_valid());
+        assert!(matches!(derive_direct_startup_comptime_plan(&over, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. })));
     }
 
     #[test]
