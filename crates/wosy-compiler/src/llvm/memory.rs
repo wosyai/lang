@@ -1366,8 +1366,17 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     let storage = context.i8_type().array_type(
         u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?,
     );
-    let destination = entry_alloca(state, storage.into(), "struct_literal")?;
-    align_storage_alloca(destination, Some(layout.alignment))?;
+    let direct_record = state.aggregate.as_ref().is_some_and(|frame| matches!(
+        frame.plan().fixed_view_backing, Some(crate::scalar::FixedViewBacking::Origin { record, .. })
+            if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) == Some(record),
+    ));
+    let destination = if direct_record {
+        super::aggregate_transfer::fixed_view_result_destination(state)?
+    } else {
+        let destination = entry_alloca(state, storage.into(), "struct_literal")?;
+        align_storage_alloca(destination, Some(layout.alignment))?;
+        destination
+    };
     if state.aggregate.as_ref().is_some_and(|aggregate| {
         let roots = &aggregate.plan().ordinary_fallible_inline_roots;
         !roots.is_empty() && state.body_call_nodes

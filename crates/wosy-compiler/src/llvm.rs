@@ -2371,6 +2371,9 @@ fn emit_binding_value<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = emit_fixed_view_origin_binding(context, state, binding)? {
+        return Ok(value);
+    }
     if let Some(value) = local_callable::binding_value(context, state, binding, None)? {
         return Ok(value);
     }
@@ -2397,6 +2400,43 @@ fn emit_binding_value<'ctx, 'module>(
             build_aggregate(context, state, &binding.output_sequence, values)
         }
     }
+}
+
+fn fixed_view_backing_parameter<'ctx>(state: &EmitState<'ctx, '_>) -> Result<PointerValue<'ctx>, String> {
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("fixed view has no active callable")?;
+    let last = function.count_params().checked_sub(1)
+        .filter(|_| function.get_linkage() == Linkage::Internal)
+        .and_then(|slot| function.get_nth_param(slot));
+    match last {
+        Some(BasicValueEnum::PointerValue(pointer)) => Ok(pointer),
+        _ => Err("fixed view did not receive its exact caller backing".into()),
+    }
+}
+
+fn fixed_view_origin_slot<'ctx>(
+    state: &EmitState<'ctx, '_>, local: &crate::ScalarBinding,
+) -> Result<Option<PointerValue<'ctx>>, String> {
+    let Some(crate::scalar::FixedViewBacking::Origin { binding, array, .. }) = state.aggregate.as_ref()
+        .and_then(|frame| frame.plan().fixed_view_backing.as_ref()) else { return Ok(None); };
+    let [output] = local.receivers.as_slice() else { return Ok(None); };
+    if output.name_span != *binding { return Ok(None); }
+    if output.ty != *array || !state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(local).is_some()) {
+        return Err("fixed view producer changed its exact local backing".into());
+    }
+    fixed_view_backing_parameter(state).map(Some)
+}
+
+fn emit_fixed_view_origin_binding<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, binding: &crate::ScalarBinding,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(destination) = fixed_view_origin_slot(state, binding)? else { return Ok(None); };
+    let (ScalarType::Array { element, .. }, ScalarExpression::ArrayLiteral { elements, .. }) =
+        (&binding.declared_type, &binding.value) else { return Err("fixed view lost its literal initializer".into()); };
+    let values = elements.iter().map(|expression| emit_typed_expression(context, state, expression, element))
+        .collect::<Result<Vec<_>, _>>()?;
+    memory::write_fixed_array_literal(context, state, &binding.declared_type, values, destination)?;
+    Ok(Some(EmitValue::Basic(destination.into())))
 }
 
 fn store_binding_outputs<'ctx, 'module>(
@@ -2447,8 +2487,25 @@ fn store_binding_outputs<'ctx, 'module>(
             state.values.insert(name.clone(), EmitValue::Unit);
             continue;
         }
-        let slot = entry_storage_alloca(context, state, ty, name)?;
-        store_value(context, state, slot, ty, value)?;
+        let sink = state.aggregate.as_ref().and_then(|frame| frame.plan().fixed_view_sink.as_ref())
+            .is_some_and(|(call, _)| state.body_call_nodes
+                .and_then(|nodes| nodes.expression_ordinal(&binding.value)) == Some(*call));
+        let slot = if let Some(destination) = fixed_view_origin_slot(state, binding)? {
+            if !matches!(value, EmitValue::Basic(BasicValueEnum::PointerValue(value)) if value == destination) {
+                return Err("fixed view literal did not initialize its caller backing".into());
+            }
+            destination
+        } else if sink {
+            match value {
+                EmitValue::Basic(BasicValueEnum::PointerValue(record))
+                    if position == 0 && receivers.len() == 1 && matches!(ty, ScalarType::Struct(_)) => record,
+                _ => return Err("fixed view lost its caller-owned result binding".into()),
+            }
+        } else {
+            let slot = entry_storage_alloca(context, state, ty, name)?;
+            store_value(context, state, slot, ty, value)?;
+            slot
+        };
         state.storage.insert(name.clone(), (slot, ty.clone()));
         transition_runtime_array_binding_initialization(state, name, ty, &binding.value)?;
         transition_automatic_return_result_binding_initialization(
@@ -3117,6 +3174,9 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = emit_fixed_view_origin_binding(context, state, binding)? {
+        return Ok(value);
+    }
     if let Some(value) = local_callable::binding_value(context, state, binding, Some(ProjectCallScope { module, modules }))? {
         return Ok(value);
     }

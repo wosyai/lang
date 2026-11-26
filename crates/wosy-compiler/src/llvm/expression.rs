@@ -829,6 +829,49 @@ fn emit_prepared_call<'ctx, 'module>(
     )? {
         return Ok(value);
     }
+    let backing_route = state.aggregate.as_ref().and_then(|frame| {
+        let ordinal = state.body_call_nodes?.expression_ordinal(expression)?;
+        let plan = frame.plan();
+        if matches!(plan.fixed_view_backing, Some(crate::scalar::FixedViewBacking::Forward { call }) if call == ordinal) {
+            Some(None)
+        } else {
+            plan.fixed_view_sink.as_ref().filter(|(call, _)| *call == ordinal).map(|(_, array)| Some(array.clone()))
+        }
+    });
+    if let Some(backing) = backing_route {
+        if !arguments.is_empty() || !parameters.is_empty() {
+            return Err("closed fixed view call gained arguments".into());
+        }
+        let ScalarType::Callable { outputs, .. } = &state.signatures[target] else {
+            return Err("fixed view callable lost ordinary signature".into());
+        };
+        let [output] = outputs.outputs.as_slice() else {
+            return Err("fixed view callable changed ordinary result arity".into());
+        };
+        if !matches!(output.ty, ScalarType::Struct(_)) {
+            return Err("fixed view callable changed its ordinary result type".into());
+        }
+        let (record, bytes) = match backing {
+            Some(array) => (
+                entry_storage_alloca(context, state, &output.ty, "fixed_view.result")?,
+                entry_storage_alloca(context, state, &array, "fixed_view.backing")?,
+            ),
+            None => (
+                aggregate_transfer::fixed_view_result_destination(state)?,
+                super::fixed_view_backing_parameter(state)?,
+            ),
+        };
+        let callee = state.functions[target];
+        let kind = callee.get_type();
+        if callee.get_linkage() != Linkage::Internal || kind.get_return_type().is_some()
+            || !matches!(kind.get_param_types().as_slice(), [first, second]
+                if first.is_pointer_type() && second.is_pointer_type())
+        {
+            return Err("closed fixed view callable changed its destination lanes".into());
+        }
+        state.builder.build_call(callee, &[record.into(), bytes.into()], "").map_err(builder_error)?;
+        return Ok(EmitValue::Basic(record.into()));
+    }
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
     let ordinary_fallible = aggregate_transfer::ordinary_fallible_allocation_call_at(state, expression);
     if ordinary_fallible || aggregate_transfer::fallible_allocation_call_at(state, expression) {

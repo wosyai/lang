@@ -3051,8 +3051,187 @@ pub(crate) struct ClosedWidenedRebind {
     pub(crate) target: ByteSpan,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum FixedViewBacking {
+    Origin { binding: ByteSpan, record: usize, array: ScalarType },
+    Forward { call: usize },
+}
+
+fn seal_fixed_view_backing<'a>(
+    reservations: &AggregateReservations,
+    module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    result: &mut ClosedAggregates,
+) -> Result<(), String> {
+    let function = |(module, item, arm): BodyKey| {
+        let input = module_at(module)?;
+        let ScalarItem::Function(definition) = input.items.get(item)? else { return None; };
+        let selected = arm.map_or(Some(definition), |index| definition.overload_arms.get(index))?;
+        Some((definition, selected))
+    };
+    let expression = |sites: &FunctionCallSites, parent, edge| match sites.structure.edges.get(&(parent, edge)) {
+        Some(OccurrenceNode::Expression(expression)) => Some(*expression),
+        _ => None,
+    };
+    let block_output = |sites: &FunctionCallSites, block: BlockOrdinal, item| {
+        expression(sites, OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput { item, output: 0 })
+    };
+    let block_child = |sites: &FunctionCallSites, ordinal| match sites.structure.edges.get(&(
+        OccurrenceParent::Expression(ordinal), OccurrenceEdge::BlockBody,
+    )) {
+        Some(OccurrenceNode::Block(block)) => Some(*block),
+        _ => None,
+    };
+    let place_edge = |sites: &FunctionCallSites, parent, edge| match sites.structure.edges.get(&(parent, edge)) {
+        Some(OccurrenceNode::Place(place)) => Some(*place),
+        _ => None,
+    };
+    let incoming = |target: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal)> {
+        let (declaration, _) = function(target)?;
+        let source = bodies.get(&target)?.source;
+        let mut user = None;
+        for &module in &reservations.modules {
+            let input = module_at(module)?;
+            let ModuleInitializationDetail::Occurrences(topology) = &input.calls.initialization.detail else { continue; };
+            if topology.callable_escapes.iter().any(|escape| &escape.source == source && escape.range == declaration.name_span) {
+                return None;
+            }
+            for &ordinal in &topology.calls {
+                if matches!(input.calls.initialization.call_target(ordinal),
+                    Some(ModuleInitializationCallTarget::Direct { declaration: selected, .. } | ModuleInitializationCallTarget::Generic { declaration: selected, .. })
+                        if &selected.source == source && selected.range == declaration.name_span)
+                { return None; }
+            }
+        }
+        for (&caller, &monomorphic) in &reservations.bodies {
+            let input = module_at(caller.0)?;
+            let sites = input.calls.function_body(caller.1, caller.2)?;
+            if sites.callable_escapes.iter().any(|escape| &escape.source == source && escape.range == declaration.name_span)
+                || sites.allocation_length_call_targets.values().any(|part| matches!(part, ResolvedCallTarget::ModuleCallable {
+                    source: selected, declaration_span, ..
+                } if selected == source && *declaration_span == declaration.name_span))
+            { return None; }
+            for occurrence in &sites.call_occurrences {
+                let site = sites.sites.get(occurrence.site)?;
+                let ResolvedCallTarget::ModuleCallable { source: selected, declaration_span, concrete } = &site.target else { continue; };
+                if selected != source || *declaration_span != declaration.name_span { continue; }
+                let arm = match concrete {
+                    ConcreteCallSelection::Declaration => None,
+                    ConcreteCallSelection::Overload(selection) => Some(selection.arm_index),
+                };
+                if arm != target.2 { continue; }
+                if !monomorphic || caller == target || user.replace((caller, occurrence.ordinal)).is_some() { return None; }
+                let body = bodies.get(&caller)?;
+                let call = body.cfg.primary_call_point(occurrence.ordinal)?;
+                if target_body(declarations, body.cfg, call) != Some(target) { return None; }
+            }
+        }
+        user
+    };
+
+    for (&key, origin) in bodies {
+        let prove_origin = || {
+            let (declaration, producer) = function(key)?;
+            if !origin.is_monomorphic || key.2.is_some()
+                || !crate::scalar::typecheck::is_module_private_name(&declaration.name)
+                || !producer.generic_parameters.is_empty() { return None; }
+            let ScalarType::Callable { parameters, outputs } = &producer.signature else { return None; };
+            let [returned] = outputs.outputs.as_slice() else { return None; };
+            let ScalarType::Struct(structure) = &returned.ty else { return None; };
+            if !parameters.is_empty() { return None; }
+            let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::StructLiteral { fields, .. })]
+                = producer.body.items.as_slice() else { return None; };
+            let [local] = binding.receivers.as_slice() else { return None; };
+            let ScalarType::Array { element, length, .. } = &local.ty else { return None; };
+            if **element != ScalarType::U8 || *length == 0 || *length > 256 || binding.is_allocation
+                || !matches!(&binding.value, ScalarExpression::ArrayLiteral { elements, .. }
+                    if elements.len() as u64 == *length && elements.iter().all(|value| matches!(value, ScalarExpression::Integer { .. })))
+            { return None; }
+            let sites = origin.sites;
+            let root = block_output(sites, sites.structure.root, 1)?;
+            if sites.structure.checked_types.expressions.get(&root) != Some(&returned.ty) { return None; }
+            let mut field_id = None;
+            for (slot, field) in fields.iter().enumerate() {
+                let occurrence = expression(sites, OccurrenceParent::Expression(root), OccurrenceEdge::AggregateField(slot))?;
+                let id = sites.structure.literal_fields.get(&occurrence)?;
+                if &id.structure != structure { return None; }
+                let field_type = sites.structure.checked_types.expressions.get(&occurrence)?;
+                if ordinary_value(field_type) && matches!(field.value, ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. }) {
+                    continue;
+                }
+                if !matches!(field_type, ScalarType::RawPointer(inner) if **inner == ScalarType::U8)
+                    || field_id.replace(id).is_some() { return None; }
+                let ScalarExpression::Block(raw) = &field.value else { return None; };
+                let [ScalarBlockItem::Expression(ScalarExpression::RawAddress { place, .. })] = raw.items.as_slice()
+                    else { return None; };
+                if !raw.unsafe_context { return None; }
+                let ScalarPlace::Index { index, .. } = place else { return None; };
+                if !matches!(index.as_ref(), ScalarExpression::Integer { value, .. } if value == &0.into()) { return None; }
+                let raw_ordinal = block_output(sites, block_child(sites, occurrence)?, 0)?;
+                let place = place_edge(sites, OccurrenceParent::Expression(raw_ordinal), OccurrenceEdge::ExpressionPlace)?;
+                let backing = place_edge(sites, OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase)?;
+                if sites.structure.checked_types.places.get(&backing) != Some(&local.ty)
+                    || !matches!(sites.prepared_named_place_root(backing), Some(NamedPlaceRootIdentity::Lexical(id))
+                        if &id.source == origin.source && id.function_span == producer.span && id.declaration_span == local.name_span)
+                { return None; }
+            }
+            Some((field_id?, local, root.0, &returned.ty))
+        };
+        let Some((returned_field, local, record, returned_ty)) = prove_origin() else { continue; };
+        let prove_uses = || {
+            let (wrapper, forwarded) = incoming(key)?;
+            let (wrapper_decl, wrapper_fn) = function(wrapper)?;
+            if wrapper.2.is_none() || !crate::scalar::typecheck::is_module_private_name(&wrapper_decl.name) { return None; }
+            let wrapper_sites = bodies.get(&wrapper)?.sites;
+            if !matches!(wrapper_fn.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] if arguments.is_empty())
+                || block_output(wrapper_sites, wrapper_sites.structure.root, 0) != Some(forwarded)
+                || wrapper_sites.structure.checked_types.expressions.get(&forwarded) != Some(returned_ty)
+            { return None; }
+            let (sink, obtain) = incoming(wrapper)?;
+            let (_, sink_fn) = function(sink)?;
+            let sink_body = bodies.get(&sink)?;
+            let sites = sink_body.sites;
+            let [ScalarBlockItem::LocalBinding(receiver), ScalarBlockItem::Expression(ScalarExpression::Block(read))]
+                = sink_fn.body.items.as_slice() else { return None; };
+            let [local_result] = receiver.receivers.as_slice() else { return None; };
+            if &local_result.ty != returned_ty || receiver.is_allocation
+                || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.is_empty())
+                || expression(sites, OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 }) != Some(obtain)
+            { return None; }
+            let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] = read.items.as_slice() else { return None; };
+            if !read.unsafe_context || arguments.len() != 1 { return None; }
+            let read = block_output(sites, block_child(sites, block_output(sites, sites.structure.root, 1)?)?, 0)?;
+            let read_site = sink_body.cfg.primary_call_point(read)?;
+            if !matches!(sink_body.cfg.points.get(read_site.0)?.kind, CfgPointKind::Call {
+                output: 0, target: ResolvedCallTarget::Core(CoreOperationId::Load), ..
+            }) || sites.structure.checked_types.expressions.get(&read) != Some(&ScalarType::U8) { return None; }
+            let view = expression(sites, OccurrenceParent::Expression(read), OccurrenceEdge::CallArgument(0))?;
+            let (read_binding, read_field) = sites.prepared_lexical_member(view)?;
+            if read_field != returned_field || &read_binding.source != sink_body.source
+                || read_binding.function_span != sink_fn.span || read_binding.declaration_span != local_result.name_span { return None; }
+            Some((wrapper, forwarded, sink, obtain, local.name_span, local.ty.clone()))
+        };
+        let (wrapper, forwarded, sink, obtain, binding, array) = prove_uses()
+            .ok_or_else(|| format!("returned fixed view has no sealed lexical destination in {:?}", origin.source))?;
+        if [key, wrapper, sink].into_iter().any(|id| result.bodies.contains_key(&id)) {
+            return Err("returned fixed view overlaps another aggregate storage plan".into());
+        }
+        let origin_plan = result.bodies.entry(key).or_default();
+        origin_plan.ordinary_result = true;
+        origin_plan.fixed_view_backing = Some(FixedViewBacking::Origin { binding, record, array: array.clone() });
+        let wrapper_plan = result.bodies.entry(wrapper).or_default();
+        wrapper_plan.ordinary_result = true;
+        wrapper_plan.fixed_view_backing = Some(FixedViewBacking::Forward { call: forwarded.0 });
+        result.bodies.entry(sink).or_default().fixed_view_sink = Some((obtain.0, array));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
+    pub(crate) fixed_view_backing: Option<FixedViewBacking>,
+    pub(crate) fixed_view_sink: Option<(usize, ScalarType)>,
     pub(crate) fallible_allocation_leaf: bool,
     pub(crate) fallible_allocation_payload: Option<ScalarType>,
     pub(crate) fallible_allocation_relay: bool,
@@ -7163,6 +7342,7 @@ fn closed_aggregates<'a>(
 ) -> Result<ClosedAggregates, String> {
     let mut ordinary = OrdinaryCohorts::default();
     let mut bodies = BTreeMap::new();
+    let mut fixed_view_bodies = BTreeMap::new();
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
     let mut array_descriptor_identities = BTreeMap::new();
@@ -7229,6 +7409,21 @@ fn closed_aggregates<'a>(
         );
         for (storage, uses) in &sites.structure.module_storage_uses {
             *storage_uses.entry(storage).or_default() += uses.len();
+        }
+        // This path proves ordinary record/backing transport, not an
+        // owning-reference flow. It must see its prepared producer, selected
+        // wrapper and lexical sink even when there is no legacy observation.
+        let fixed_view_candidate = match (arm, body.body.items.as_slice()) {
+            (None, [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(
+                ScalarExpression::StructLiteral { .. } | ScalarExpression::Block(_),
+            )])
+            | (Some(_), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })]) => true,
+            _ => false,
+        };
+        if is_monomorphic && fixed_view_candidate {
+            fixed_view_bodies.insert(key, Body {
+                facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result: false,
+            });
         }
         if facts.is_some_and(AggregateFlowResult::has_observations)
             || !sites.callable_escapes.is_empty() {
@@ -8385,6 +8580,7 @@ fn closed_aggregates<'a>(
         });
     }
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
+        seal_fixed_view_backing(reservations, &module_at, &fixed_view_bodies, &declarations, &mut result)?;
         for (&target, sites) in &fallible_allocating_targets {
             let body = result.bodies.entry(target).or_default();
             body.fallible_allocation_relay = fallible_allocation_relays.contains(&target);

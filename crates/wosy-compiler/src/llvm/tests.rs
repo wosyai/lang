@@ -19862,3 +19862,84 @@ if (examine(true) != {true_value} || examine(false) != 8) {{ core.system_panic()
         }
     }
 }
+
+#[test]
+fn fixed_backing_uses_exact_caller_slots_without_aggregate_copies() {
+    let source_text = "%%start
+struct View {
+    *?u8 bytes;
+    u64 length;
+}
+View() _produce = fn {
+    u8[2] payload = [65, 66];
+    { .bytes = unsafe { &?payload[0] }; .length = 2; }
+};
+_choose = overload { View() => fn { _produce() }; };
+u8() observe = fn {
+    View record = _choose();
+    unsafe { core.load<u8>(record.bytes) }
+};
+u8 observed = observe();
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(),
+            "src/fixed-view-positive.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), source_text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let mut reservations = crate::scalar::AggregateReservations {
+            snapshot_struct: None, bodies: BTreeMap::new(), checked_access: true,
+            target_layout: Some(target), modules: Vec::new(),
+        };
+        for (module, row) in prepared.project().modules.iter().enumerate() {
+            reservations.modules.push(module);
+            for (item, declaration) in row.items.iter().enumerate() {
+                if let ScalarItem::Function(function) = declaration {
+                    if function.overload_arms.is_empty() {
+                        reservations.bodies.insert((module, item, None), true);
+                    } else {
+                        for arm in 0..function.overload_arms.len() {
+                            reservations.bodies.insert((module, item, Some(arm)), true);
+                        }
+                    }
+                }
+            }
+        }
+        let plan = checked.aggregate(&reservations).unwrap();
+        assert!(reservations.bodies.keys().any(|&(module, item, arm)| plan.body(module, item, arm)
+            .is_some_and(|body| body.fixed_view_sink.is_some())), "missing closed typed route");
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let origin = project_function_name(&source, "_produce");
+        let entry = project_function_name(&source, "observe");
+        assert!(ir.contains(&format!("define internal void @{origin}(ptr %0, ptr %1)")), "V3 did not lower sealed producer");
+        let producer = self_tail_test_body(&ir, "internal void", &origin);
+        let consumer = self_tail_test_body(&ir, "i8", &entry);
+        let call = consumer.lines().find(|line| line.contains("call void @")).expect("sealed overload call");
+        let overload = call.trim().strip_prefix("call void @").unwrap().split('(').next().unwrap();
+        let wrapper = self_tail_test_body(&ir, "internal void", overload);
+        assert!(call.ends_with("(ptr %fixed_view.result, ptr %fixed_view.backing)"), "{call}");
+        assert!(wrapper.contains(&format!("call void @{origin}(ptr %0, ptr %1)")), "{wrapper}");
+        assert!(producer.contains("getelementptr inbounds [2 x i8], ptr %1")
+            && producer.contains("store i8 65") && producer.contains("store i8 66")
+            && producer.contains("getelementptr inbounds i8, ptr %0")
+            && producer.contains("ret void"), "{producer}");
+        let bits = target.pointer_size * 8;
+        assert!(producer.contains(&format!("to i{bits}"))
+            && consumer.contains(&format!("load i{bits}"))
+            && consumer.contains("getelementptr inbounds i8, ptr %fixed_view.result")
+            && consumer.contains("load i8")
+            && consumer.contains("ret i8"), "{consumer}");
+        assert_eq!(consumer.matches("alloca").count(), 2, "{consumer}");
+        for function in [producer, wrapper, consumer] {
+            assert!(!function.contains("llvm.memmove") && !function.contains("llvm.memcpy"), "{function}");
+        }
+        assert!(!producer.contains("alloca"), "{producer}");
+        eprintln!("fixed backing target {target:?}\n{ir}");
+    }
+}

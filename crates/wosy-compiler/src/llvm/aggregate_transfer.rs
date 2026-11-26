@@ -191,7 +191,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             return Err("overlapping ordinary and checked aggregate conventions".into());
         }
         let ordinary_destination = if plan.ordinary_result {
-            if destination.is_some() || !plan.inputs.is_empty() || definition.count_params() as usize != parameter_count + 1 {
+            let sidecars = 1 + usize::from(plan.fixed_view_backing.is_some());
+            if destination.is_some() || !plan.inputs.is_empty() || definition.count_params() as usize != parameter_count + sidecars {
                 return Err("overlapping ordinary aggregate destination".into());
             }
             Some(
@@ -284,8 +285,13 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
     }
 }
 
+pub(super) fn fixed_view_result_destination<'ctx>(state: &EmitState<'ctx, '_>) -> Result<PointerValue<'ctx>, String> {
+    state.aggregate.as_ref().and_then(|aggregate| aggregate.ordinary_destination)
+        .ok_or_else(|| "fixed view wrapper lacks its caller-owned record".into())
+}
+
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
-    plan.filter(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
+    plan.filter(|body| body.fixed_view_backing.is_some() || body.fallible_allocation_leaf || body.fallible_allocation_relay || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
         || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.grouped_owning_extent.is_some() || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some() || body.private_runtime_access_formal.is_some())
         .map(|_| Linkage::Internal)
 }
@@ -998,6 +1004,9 @@ pub(super) fn definition_type<'ctx>(
             .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
         let pointer = context.ptr_type(AddressSpace::default());
         arguments.push(pointer.into());
+        if plan.is_some_and(|body| body.fixed_view_backing.is_some()) {
+            arguments.push(pointer.into());
+        }
         return Ok(context.void_type().fn_type(&arguments, false));
     }
     if plan.and_then(|body| body.returning).is_none() {
@@ -1764,7 +1773,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 }
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
-    plan.is_some_and(|plan| plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+    plan.is_some_and(|plan| plan.fixed_view_backing.is_some() || plan.fixed_view_sink.is_some() || plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
         || plan.array_descriptor_observer.is_some() || plan.private_runtime_exclusive_relay || plan.grouped_owning_extent.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
@@ -2841,7 +2850,13 @@ pub(super) fn commit_return<'ctx>(
         {
             return Err("overlapping ordinary aggregate result materialization".into());
         }
-        store_value(context, state, destination, &output.ty, result.clone())?;
+        if aggregate.plan.fixed_view_backing.is_some() {
+            if !matches!(result, EmitValue::Basic(BasicValueEnum::PointerValue(value)) if *value == destination) {
+                return Err("fixed view did not place its record in the ordinary destination".into());
+            }
+        } else {
+            store_value(context, state, destination, &output.ty, result.clone())?;
+        }
         state.aggregate.as_mut().expect("ordinary aggregate frame").ordinary_committed = true;
         return Ok(());
     }
