@@ -27,9 +27,9 @@ const BLOB: u8 = 1;
 
 type QueryKey = [u8; 33];
 
-pub(super) struct Flights<K = QueryKey>(Mutex<HashMap<K, Weak<AsyncMutex<()>>>>);
+pub(super) struct Flights<K = QueryKey, T = ()>(Mutex<HashMap<K, Weak<AsyncMutex<T>>>>);
 
-impl<K> Default for Flights<K> {
+impl<K, T> Default for Flights<K, T> {
     fn default() -> Self {
         Self(Mutex::new(HashMap::new()))
     }
@@ -37,14 +37,29 @@ impl<K> Default for Flights<K> {
 
 impl<K: Eq + Hash> Flights<K> {
     pub(super) fn acquire(&self, key: K) -> Arc<AsyncMutex<()>> {
+        self.try_acquire_with(key, || Some(())).expect("unbounded existing query flight")
+    }
+}
+
+impl<K: Eq + Hash, T> Flights<K, T> {
+    pub(super) fn try_acquire_with(&self, key: K, new: impl FnOnce() -> Option<T>) -> Option<Arc<AsyncMutex<T>>> {
         let mut flights = self.0.lock().expect("declaration query registry");
         if let Some(gate) = flights.get(&key).and_then(Weak::upgrade) {
-            return gate;
+            return Some(gate);
         }
         flights.retain(|_, gate| gate.strong_count() != 0);
-        let gate = Arc::new(AsyncMutex::new(()));
+        let gate = Arc::new(AsyncMutex::new(new()?));
         flights.insert(key, Arc::downgrade(&gate));
-        gate
+        Some(gate)
+    }
+
+    /// Completed state remains reachable only from callers registered before
+    /// this cut. A newer generation of the same key is never removed.
+    pub(super) fn detach(&self, key: &K, gate: &Arc<AsyncMutex<T>>) {
+        let mut flights = self.0.lock().expect("declaration query registry");
+        if flights.get(key).is_some_and(|current| current.ptr_eq(&Arc::downgrade(gate))) {
+            flights.remove(key);
+        }
     }
 }
 

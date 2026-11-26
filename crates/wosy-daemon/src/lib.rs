@@ -93,6 +93,7 @@ pub struct SourceStore {
     source_reads: retention_plan::SourceReads,
     grammar_receipts: grammar_receipts::GrammarReceipts,
     llvm_receipts: rooted_llvm_receipts::ExecutableLlvmReceipts,
+    llvm_flights: base_declarations::Flights<rooted_llvm_receipts::ExecutableLlvmKey, rooted_llvm_receipts::ExecutableLlvmFlight>,
     #[cfg(test)]
     test_without_derivation_image: bool,
 }
@@ -138,6 +139,7 @@ impl SourceStore {
             prepared_projects: Default::default(), source_reads: Default::default(),
             grammar_receipts: Default::default(),
             llvm_receipts: Default::default(),
+            llvm_flights: Default::default(),
             #[cfg(test)]
             test_without_derivation_image: false,
         })

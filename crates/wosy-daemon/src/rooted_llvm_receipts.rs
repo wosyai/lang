@@ -1,12 +1,14 @@
 //! Positive, process-local executable LLVM receipts. Never an artifact key.
 use super::project_declarations::RootedOrder;
 use std::{collections::VecDeque, sync::{Arc, Mutex, MutexGuard}};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wosy_protocol::NodeId;
 
 const MAX_ENTRIES: usize = 4;
 const MAX_BYTES: usize = 4 << 20;
+const MAX_FLIGHT_RESULTS: usize = 2;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ExecutableLlvmKey(NodeId);
 
 impl ExecutableLlvmKey {
@@ -42,8 +44,30 @@ pub(super) struct ExecutableLlvmReceipt {
     pub bytes: Box<[u8]>,
 }
 
-#[derive(Default)]
-pub(super) struct ExecutableLlvmReceipts(Mutex<Receipts>);
+pub(super) struct ExecutableLlvmReceipts {
+    memo: Mutex<Receipts>,
+    flight_space: Arc<Semaphore>,
+}
+
+impl Default for ExecutableLlvmReceipts {
+    fn default() -> Self {
+        Self { memo: Default::default(), flight_space: Arc::new(Semaphore::new(MAX_FLIGHT_RESULTS)) }
+    }
+}
+
+/// One bounded reservation for an eligible immutable positive result until
+/// the last already registered waiter has taken or abandoned it. This caps
+/// flight-owned payload at MAX_FLIGHT_RESULTS * MAX_BYTES, not caller output.
+pub(super) struct ExecutableLlvmFlight {
+    _reservation: OwnedSemaphorePermit,
+    pub state: FlightState,
+}
+
+pub(super) enum FlightState {
+    Producing,
+    Complete(Arc<ExecutableLlvmReceipt>),
+    Bypass,
+}
 
 pub(super) struct StagedExecutableLlvmReceipt(ExecutableLlvmKey, Arc<ExecutableLlvmReceipt>);
 
@@ -63,22 +87,31 @@ struct Receipts {
 
 impl ExecutableLlvmReceipts {
     pub fn get(&self, key: ExecutableLlvmKey) -> Option<Arc<ExecutableLlvmReceipt>> {
-        let receipts = self.0.lock().expect("executable LLVM receipt memo");
+        let receipts = self.memo.lock().expect("executable LLVM receipt memo");
         receipts.fifo.iter().find(|(stored, _)| *stored == key).map(|(_, receipt)| Arc::clone(receipt))
     }
 
     pub fn admission(&self) -> ExecutableLlvmReceiptAdmission<'_> {
-        ExecutableLlvmReceiptAdmission(self.0.lock().expect("executable LLVM receipt memo"))
+        ExecutableLlvmReceiptAdmission(self.memo.lock().expect("executable LLVM receipt memo"))
+    }
+
+    pub fn reserve_flight(&self) -> Option<ExecutableLlvmFlight> {
+        let reservation = Arc::clone(&self.flight_space).try_acquire_owned().ok()?;
+        Some(ExecutableLlvmFlight { _reservation: reservation, state: FlightState::Producing })
     }
 }
 
 impl ExecutableLlvmReceiptAdmission<'_> {
-    /// Count only payload retained by the memo. Return retired payloads
-    /// so freeing their possibly large allocations happens without locks.
-    pub fn accept(&mut self, staged: StagedExecutableLlvmReceipt) -> Vec<Arc<ExecutableLlvmReceipt>> {
+    /// Return the memo's exact accepted Arc for an eligible flight and any
+    /// retired payloads to be freed after leaving all gates.
+    pub fn accept(&mut self, staged: StagedExecutableLlvmReceipt) -> (
+        Option<Arc<ExecutableLlvmReceipt>>, Vec<Arc<ExecutableLlvmReceipt>>,
+    ) {
         let StagedExecutableLlvmReceipt(key, receipt) = staged;
         let memo = &mut self.0;
-        if memo.fifo.iter().any(|(stored, _)| *stored == key) { return vec![receipt]; }
+        if let Some((_, same)) = memo.fifo.iter().find(|(stored, _)| *stored == key) {
+            return ((same.digest == receipt.digest).then(|| Arc::clone(same)), vec![receipt]);
+        }
         let mut retired = Vec::new();
         let bytes = receipt.bytes.len();
         while memo.fifo.len() == MAX_ENTRIES || memo.bytes > MAX_BYTES - bytes {
@@ -87,8 +120,8 @@ impl ExecutableLlvmReceiptAdmission<'_> {
             retired.push(oldest);
         }
         memo.bytes += bytes;
-        memo.fifo.push_back((key, receipt));
-        retired
+        memo.fifo.push_back((key, Arc::clone(&receipt)));
+        (Some(receipt), retired)
     }
 }
 
@@ -116,7 +149,16 @@ mod tests {
         assert!(memo.get(key(2)).is_none());
         accept(3, NodeId([8; 32]), &[2]);
         assert_eq!(memo.get(key(3)).unwrap().digest, digest);
-        assert_eq!(memo.0.lock().unwrap().bytes, MAX_ENTRIES);
+        assert_eq!(memo.memo.lock().unwrap().bytes, MAX_ENTRIES);
         assert!(StagedExecutableLlvmReceipt::new(key(7), digest, &vec![0; MAX_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn flight_result_reservations_are_bounded_and_reusable() {
+        let memo = ExecutableLlvmReceipts::default();
+        let mut flights: Vec<_> = (0..MAX_FLIGHT_RESULTS).map(|_| memo.reserve_flight().unwrap()).collect();
+        assert!(memo.reserve_flight().is_none());
+        drop(flights.pop());
+        assert!(memo.reserve_flight().is_some());
     }
 }

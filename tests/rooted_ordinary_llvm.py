@@ -217,6 +217,11 @@ with tempfile.TemporaryDirectory() as temporary:
     root_b = memo["root"]
     assert root_b == b["pending"] and memo["files"] == files
     assert memo["hot_admission_reparsed"] == 1
+    if daemon_tests:
+        subprocess.run([daemon_tests, "rooted_llvm::tests::executable_llvm_waiters_share_flight_and_release_slots",
+                        "--exact", "--ignored"], env={**os.environ, "WOSY_TEST_IMAGE_STORE": str(catalog),
+                          "WOSY_TEST_LLVM_PROJECT": str(project), "WOSY_TEST_IMAGE_ROOT": root_a,
+                          "WOSY_TEST_IMAGE_OTHER_ROOT": root_b}, check=True, timeout=30)
     after = {profile: require_parity(root_b, profile) for profile in profiles}
     assert memo["wasi_digest"] == after["dev"][0]["digest"]
     assert memo["native_digest"] == after["native"][0]["digest"]
@@ -239,7 +244,14 @@ with tempfile.TemporaryDirectory() as temporary:
     # Same executable source and layout, different selected WASI export.
     # Verify C needed fresh derivation from just the dependency edit first.
     (project / "wosy.toml").write_text(manifest.replace('fixture_answer = "answer"', 'fixture_alternate = "answer"'))
-    assert acknowledge(state("stage")) != root_c
+    root_d = acknowledge(state("stage"))
+    assert root_d != root_c
+    if daemon_tests:
+        subprocess.run([daemon_tests, "rooted_llvm::tests::registered_executable_waiter_reuses_after_eviction_and_failed_producer",
+                        "--exact", "--ignored"], env={**os.environ, "WOSY_TEST_IMAGE_STORE": str(catalog),
+                          "WOSY_TEST_LLVM_PROJECT": str(project), "WOSY_TEST_IMAGE_ROOT": root_a,
+                          "WOSY_TEST_IMAGE_OTHER_ROOT": root_b, "WOSY_TEST_LLVM_EXECUTABLE_ROOT": root_c,
+                          "WOSY_TEST_LLVM_CONFIGURED_ROOT": root_d}, check=True, timeout=30)
     receipts = state("leased-executable-llvm-receipts", root_a, root_b, root_c)["result"]
     assert receipts["files"] == files and receipts["annotated_reparsed"] == 1
     assert receipts["profile_dependency_export_and_reopen_distinct"] and receipts["hit_source_and_output_budgets"]

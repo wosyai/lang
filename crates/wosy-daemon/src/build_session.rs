@@ -149,14 +149,21 @@ impl BuildDiagnosticSession<'_> {
         self.project_llvm(profile, source_limits, output_bytes, RootedLlvmIdentity::Authored).await
     }
 
-    /// Explicit local experiment using executable CST identity for internal
-    /// LLVM names. The ordinary CLI, exported labels and wire stay unchanged.
+    /// Explicit local projection; Executable uses verified executable CST
+    /// identity and the worker's Tokio time driver for shared-flight waiting.
+    /// The ordinary CLI, exported labels and wire stay unchanged.
     pub async fn project_llvm(
         &self, profile: String, source_limits: BaseCstAdmissionLimits, output_bytes: usize,
         identity: RootedLlvmIdentity,
     ) -> Result<RootedLlvmProjection> {
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
+        if identity == RootedLlvmIdentity::Executable {
+            let (_observer, cancellation) = QueryCancellation::observe();
+            return self.worker.spawn_reserved_query(slot, Some(cancellation), move |worker| {
+                super::rooted_llvm::project_executable_on_worker(worker, lease, profile, source_limits, output_bytes)
+            }).await?;
+        }
         self.worker.spawn_reserved(slot, move |store| {
             store.project_ll_for_lease(&lease, profile, source_limits, output_bytes, identity)
         }).await?
