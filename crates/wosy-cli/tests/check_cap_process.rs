@@ -867,3 +867,39 @@ fn check_cap_process_initializes_prepared_passive_float_array_but_refuses_unknow
         }
     }
 }
+
+#[test]
+fn check_cap_process_initializes_exact_passive_part_and_nested_literals() {
+    let declaration = "struct copy Part { i32 section; i32 axis; i32 finish; f32 x; f32 y; f32 z; f32 l; f32 u; f32 v; f32 taper; }";
+    let literal = "{.section=0;.axis=0;.finish=0;.x=0.0;.y=0.0;.z=0.0;.l=0.0;.u=0.0;.v=0.0;.taper=1.0;}";
+    let authored = require("reachable", 13, "selected.txt");
+    for layout in ["native", "wasm-wasip1"] {
+        let project = Fixture::new();
+        let bindings = format!("Part empty={literal}; Part[1][1] nested=[[{literal}]];");
+        project.package("", layout, "dev", "", &format!("%%start {declaration} {bindings} {authored} %%end"));
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for mode in [&[][..], &["--all-errors"][..]] {
+                let mut flags = vec![scope];
+                flags.extend(mode);
+                assert_terminal(&project.run(&flags), 13, b"reachable", b"[reachable]");
+                assert_eq!(fs::read(project.output().join("selected.txt")).unwrap(), b"reachable");
+                project.clear();
+            }
+        }
+        let source = project.0.join("src/main.w");
+        for change in [
+            format!("Part empty={literal}; Part[1] row=[empty];"),
+            format!("Part empty={literal}; f32 sample=empty.x;"),
+            format!("Part empty={};", literal.replace(".taper=1.0;", ".taper=0.75+0.25;")),
+        ] {
+            fs::write(&source, format!("%%start {declaration} {change} {authored} %%end")).unwrap();
+            for mode in [&[][..], &["--all-errors"][..]] {
+                let mut flags = vec!["--main-flow-only"];
+                flags.extend(mode);
+                assert_terminal(&project.run(&flags), 2, b"",
+                    b"wosy: check: unsupported analysis; no result published\n");
+                assert!(!project.output().exists());
+            }
+        }
+    }
+}
