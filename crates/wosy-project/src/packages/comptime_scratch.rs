@@ -56,8 +56,16 @@ impl ComptimeScratch {
     pub fn manifest_path(&self) -> PathBuf { self.path.join(MANIFEST) }
 
     pub fn create_ir(&self) -> io::Result<File> {
+        self.create_stage_file(IR)
+    }
+
+    pub fn create_manifest(&self) -> io::Result<File> {
+        self.create_stage_file(MANIFEST)
+    }
+
+    fn create_stage_file(&self, name: &str) -> io::Result<File> {
         OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW).open(self.descriptor.join(IR))
+            .custom_flags(libc::O_NOFOLLOW).open(self.descriptor.join(name))
     }
 
     pub fn open_module(&self) -> io::Result<(File, fs::Metadata)> {

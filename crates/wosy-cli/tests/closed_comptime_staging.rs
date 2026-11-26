@@ -902,3 +902,82 @@ fn owned_retained_wasip1_handoff_uses_the_selected_preparation_and_tool_paths() 
     drop(staged);
     assert!(!output.exists() && !project.join(".wosy").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_wasip1_pair_stages_the_actual_inspected_evaluator_and_resolved_manifest() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use wosy_cli::source_preparation::{prepare_wasip1_comptime_inputs, Wasip1ComptimeInputSelection};
+    use wosy_project::packages::ComptimeWatchLimits;
+
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let scratch = fixture.0.join("compiler scratch");
+    fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+    let driver = fixture.0.join("known_wasip1_pair.py");
+    fs::write(&driver, include_str!("fixtures/known_wasip1_pair.py")).unwrap();
+    fs::write(fixture.0.join("wasip1_pair_template.py"), include_str!("fixtures/wasip1_pair_template.py")).unwrap();
+    let toolchain = fixture.0.join("known host image");
+    // A dry plan needs no external executables and does not run Python.
+    assert!(!toolchain.exists());
+    let std = fixture.0.join("std");
+    fs::create_dir_all(std.join("src/wasi")).unwrap();
+    for (path, content) in [
+        ("wosy.toml", include_str!("../../../stdlib/wosy.toml")),
+        ("src/bootstrap.w", include_str!("../../../stdlib/src/bootstrap.w")),
+        ("src/wasi/preview1.w", include_str!("../../../stdlib/src/wasi/preview1.w")),
+    ] { fs::write(std.join(path), content).unwrap(); }
+    const AUTHORED: &str = r#"%%start
+std = namespace std "bootstrap.w";
+struct Report { std.utf8 label; u32[2] buckets; }
+Report result = comptime prepare {
+    std.utf8 text = "olá\n\t\r\"ok\\\0";
+    u32 base = 7;
+    { .buckets = [base, base ^ 9]; .label = text; }
+};
+%%end
+"#;
+    let source = project.join("src/main.w");
+    fs::write(&source, AUTHORED).unwrap();
+    let manifest = format!("{}\n[dependencies.std]\npath=\"../std\"\n",
+        MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+            .replace("command = [\"path to declared comptime builder\", \"literal *\", \"$WORD\"]\nargs = [\"--label=two words\"]",
+                &format!("command = {:?}", ["/usr/bin/python3", "-I", driver.to_str().unwrap(), "build", toolchain.to_str().unwrap()]))
+            .replace("selected evaluator toolchain", "private pinned fixture toolchain")
+            .replace("command = [\"path to declared comptime runner\", \"literal runner\"]\nargs = [\"--literal=${VAR}\"]",
+                &format!("command = {:?}", ["/usr/bin/python3", "-I", driver.to_str().unwrap(), "run", toolchain.to_str().unwrap()])));
+    fixture.manifest(&manifest);
+    let selection = |profile| Wasip1ComptimeInputSelection {
+        target: "app", profile, id: "prepare", max_authored_source_bytes: 1 << 17,
+        max_stdout_bytes: 256, watch_limits: ComptimeWatchLimits::default(),
+    };
+    let stage = |profile| {
+        let (_, inputs) = prepare_wasip1_comptime_inputs(&project, selection(profile)).unwrap();
+        inputs.provision(&scratch, 1 << 16).unwrap()
+    };
+    let error = stage("override").stage_tool_pair().err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+
+    let pending = stage("defaults");
+    // The known artifact hash selects this test only. The library path
+    // admits any supported preparation without a fixture allowlist.
+    assert_eq!(pending.evaluator_ir().bytes, 13981);
+    assert_eq!(pending.evaluator_ir().blake3.to_hex().as_str(),
+        "3b6bb4bdd9a842a20ce21b205e3250c40150922b119bd9970328ecc041aa3d61");
+    let staged = pending.stage_tool_pair().unwrap();
+    let p = staged.provision();
+    let manifest = p.manifest_path();
+    let output = manifest.parent().unwrap();
+    let ir = output.join("evaluator.ll");
+    assert_eq!(fs::metadata(manifest).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(manifest).unwrap()).unwrap(),
+        serde_json::json!({"executable": p.expected_module_path(), "parameters": {}, "permissions": [], "mounts": []}));
+    assert_eq!(staged.builder().arguments, [OsStr::new("-I"), driver.as_os_str(), OsStr::new("build"),
+        toolchain.as_os_str(), ir.as_os_str(), output.as_os_str(), manifest.as_os_str()]);
+    assert_eq!(staged.runner().arguments, [OsStr::new("-I"), driver.as_os_str(), OsStr::new("run"),
+        toolchain.as_os_str(), manifest.as_os_str()]);
+    assert!(!p.expected_module_path().exists() && !project.join(".wosy").exists());
+    drop(staged);
+    assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
+}

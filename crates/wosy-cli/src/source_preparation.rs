@@ -401,14 +401,14 @@ fn prepare_from_observation(
         }
     }
 
-    let wasm_tools = wasip1.map(|selection| {
+    let wasm_profile = wasip1.map(|selection| {
         let (_, _, artifact, _) = cfg.artifact_profile(&target, selection.profile)?;
         if artifact.backend != "llvm" || artifact.output != "wasm-wasip1" {
             return Err("computed stdout stage requires an explicit llvm/wasm-wasip1 profile".to_owned());
         }
         ObservedClosedComptimeProfile::observe_input_declarations(
             &cfg, &manifest, &target, selection.profile,
-        ).map(ObservedClosedComptimeProfile::into_tools)
+        )
     }).transpose()?;
 
     // A source preparation is not an artifact key or a completed SnapshotRoot.
@@ -539,7 +539,7 @@ fn prepare_from_observation(
         let authored_cst = files[&FileKey::from(&graph.nodes[0].source)].authored;
         let inputs = Wasip1InputsBasis::assemble(
             project, cfg, manifest, ctx.package, root, authored_cst, graph, wasm_fresh.expect("fresh WASI graph"),
-            wasm_tools.expect("selected WASI profile"), selection,
+            wasm_profile.expect("selected WASI profile"), selection,
         )?;
         return Ok((PreparedSources { root, delta, parsed, reused }, files, None, Some(ComptimeAttachment::Wasip1(inputs))));
     }

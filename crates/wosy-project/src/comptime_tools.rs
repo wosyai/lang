@@ -80,6 +80,8 @@ impl ObservedClosedComptimeProfile {
 
     pub fn parameters(&self) -> &BTreeMap<String, DeclaredComptimeParameter> { &self.parameters }
 
+    pub fn tools(&self) -> &SelectedComptimeTools { &self.tools }
+
     pub fn into_tools(self) -> SelectedComptimeTools { self.tools }
 }
 

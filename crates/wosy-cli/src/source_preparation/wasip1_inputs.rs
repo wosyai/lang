@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, io, path::{Path, PathBuf}};
 use tokio::time::Instant;
 use wosy_compiler::{prepare_wasip1_comptime_continuation, PreparedWasip1ComptimeContinuation, ScalarNamespaceBinding};
 use wosy_project::{packages::{observe_comptime_watches, ComptimeWatchLimits}, ParsedProjectManifest, ProjectConfiguration,
-    SelectedComptimeTools, SourceGraph};
+    ObservedClosedComptimeProfile, SelectedComptimeTools, SourceGraph};
 use wosy_protocol::{FileKey, NodeId};
 use wosy_syntax::{ByteSpan, FreshParseResult};
 
@@ -43,7 +43,7 @@ pub(super) struct Wasip1InputsBasis {
     root: NodeId,
     authored_cst: NodeId,
     watches: PreparedComptimeWatches,
-    tools: SelectedComptimeTools,
+    profile: ObservedClosedComptimeProfile,
     continuation: PreparedWasip1ComptimeContinuation,
     max_authored_source_bytes: usize,
     watch_limits: ComptimeWatchLimits,
@@ -67,7 +67,7 @@ impl Wasip1InputsBasis {
     pub(super) fn assemble(
         project: PathBuf, configuration: ProjectConfiguration, manifest: ParsedProjectManifest,
         package: String, root: NodeId, authored_cst: NodeId, graph: SourceGraph,
-        mut fresh: BTreeMap<FileKey, FreshParseResult>, tools: SelectedComptimeTools,
+        mut fresh: BTreeMap<FileKey, FreshParseResult>, profile: ObservedClosedComptimeProfile,
         selection: Wasip1ComptimeInputSelection<'_>,
     ) -> Result<Self, String> {
         let mut ordered = Vec::with_capacity(graph.nodes.len());
@@ -84,10 +84,11 @@ impl Wasip1InputsBasis {
             .map_err(|error| format!("WASI comptime continuation: {error:?}"))?;
         let files = observe_comptime_watches(&project, &package, &configuration, &manifest,
             &package, selection.id, selection.watch_limits)?;
+        let tools = profile.tools();
         let watches = PreparedComptimeWatches { target: tools.target().to_owned(),
             profile: tools.profile().to_owned(), id: selection.id.to_owned(),
             site: continuation.evaluator().output().site().clone(), files };
-        Ok(Self { project, configuration, manifest, package, root, authored_cst, watches, tools, continuation,
+        Ok(Self { project, configuration, manifest, package, root, authored_cst, watches, profile, continuation,
             max_authored_source_bytes: selection.max_authored_source_bytes, watch_limits: selection.watch_limits })
     }
 }
@@ -98,7 +99,9 @@ impl PreparedWasip1ComptimeInputs {
     pub fn source_root(&self) -> NodeId { self.basis.root }
     pub fn authored_cst(&self) -> NodeId { self.basis.authored_cst }
     pub fn watches(&self) -> &PreparedComptimeWatches { &self.basis.watches }
-    pub fn declared_tools(&self) -> &SelectedComptimeTools { &self.basis.tools }
+    pub fn declared_tools(&self) -> &SelectedComptimeTools { self.basis.profile.tools() }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn has_declared_parameters(&self) -> bool { !self.basis.profile.parameters().is_empty() }
     pub fn continuation(&self) -> &PreparedWasip1ComptimeContinuation { &self.basis.continuation }
     pub fn write_evaluator_ir(&self, out: &mut impl io::Write, cap: usize) -> io::Result<crate::comptime_fragment::StagedEvaluatorIr> {
         write_comptime_partition_ir(self.basis.continuation.evaluator().llvm(), out, cap)

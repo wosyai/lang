@@ -93,6 +93,13 @@ impl ProvisionedWasip1Comptime {
     }
 }
 
+impl ProvisionedWasip1Comptime {
+    // The held directory already owns cleanup of the reserved manifest slot.
+    pub(super) fn create_private_manifest(&self) -> io::Result<std::fs::File> {
+        self.files.scratch.create_manifest()
+    }
+}
+
 impl EvaluatorFiles {
     fn create(private_parent: &Path, write_ir: impl FnOnce(&mut std::fs::File) -> io::Result<StagedEvaluatorIr>)
         -> io::Result<Self>
