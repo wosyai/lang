@@ -3288,6 +3288,29 @@ main_artifact = "main"
                     assert!(!state.exists());
                 }
 
+                let nested_projected = projected.replace("choose(value);", "forward(value);").replace(
+                    "unit(u8) open", "u8(u8) forward = fn(input) { u8 original = choose(input); original }; unit(u8) open");
+                assert!(nested_projected.contains("forward(value)") && nested_projected.contains("choose(input)"));
+                fs::write(&source, &nested_projected).unwrap();
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert!(report.directives[0].witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                    assert_eq!(terminal(&limited, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    let full = selected(2);
+                    let report = full[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 2);
+                    assert!(report.directives[1].witness.intervals_at(0, 0).unwrap().eq([(&128.into(), &255.into())]));
+                    let refused = terminal(&full, scope, false);
+                    assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty());
+                    assert!(!state.exists());
+                } else {
+                    assert!(selected(1)[0].outcome.as_ref().unwrap().directives.is_empty());
+                    assert!(!state.exists());
+                }
+
                 let qualified_projected = projected
                     .replace("u8(u8) choose = fn(input) { if (input < 128) { 7 } else { 7 } };",
                         r#"lib = namespace app "shared.w";"#)
