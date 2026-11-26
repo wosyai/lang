@@ -570,8 +570,11 @@ fn assert_graph_facts(facts: &PairCallGraphComptimeInputFacts, text: &str, layou
     // invoking the project builder/runner or compiling the evaluator module.
     for (observed, literal) in [(a, seed), (b, 13)] {
         let oracle_source = format!("%%start\nu32 answer = comptime prepare {{ 7 ^ {literal} }};\n%%end\n");
+        // LLVM uses the logical source path in the module header. Use
+        // the same path for whole-IR comparison, but keep the oracle's
+        // own project, package and digest for its different source bytes.
         let identity = wosy_syntax::SourceIdentity::new(
-            "test oracle".into(), "oracle".into(), "oracle.w".into(),
+            "test oracle".into(), "oracle".into(), facts.watches().site.source.path.clone(),
             blake3::hash(oracle_source.as_bytes()).to_hex().to_string(),
         );
         let (fresh, diagnostics) = wosy_compiler::parse_source_with_snapshot(identity, oracle_source, &[]);
