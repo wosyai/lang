@@ -17557,26 +17557,45 @@ u8(u64) sample = fn(count) {
 };
 if (sample(3) != 13) { core.system_panic(); };
 %%end";
-    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let source = SourceIdentity::new(
-            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
-        );
-        let parsed = parse_source(source.clone(), text.into(), &[]);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let prepared = crate::prepare_scalar_project_with_access(
-            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
-            vec![source], ScalarPreparationInputs { target_layout: layout },
-            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
-        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
-        let checked = analyze_scalar_build(&prepared);
-        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
-        let fill = project_function_name(&prepared.project().modules[0].source, "_fill");
-        let body = self_tail_test_body(&ir, "internal { i64, i32 }", &fill);
-        assert!(body.contains(&format!("call {{ i64, i32 }} @{fill}("))
-            && body.contains("extractvalue { i64, i32 }")
-            && body.contains("i64 %borrowed_array_extent")
-            && !body.contains("llvm.memcpy") && !body.contains("__wosy_core_alloc"), "{body}");
+    let with_late_effect = text.replace(
+        "    bytes[index]",
+        "    u8 observed = bytes[index];
+    unsafe { *?u8 data = &?bytes[0]; data; core.free(&bytes); };
+    observed",
+    );
+    let with_prior_exposure = text.replace(
+        "    u64 completed, Progress progress =",
+        "    unsafe { *?u8 data = &?bytes[0]; data; };
+    u64 completed, Progress progress =",
+    );
+    for (text, admitted) in [(text, true), (with_late_effect.as_str(), true), (with_prior_exposure.as_str(), false)] {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new(
+                "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+            );
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            if !admitted {
+                assert!(checked.diagnostics().iter().any(|error| error.code == "B0003"
+                    && error.message == "checked runtime array write requires the extent of the dereferenced backing"),
+                    "{:?}", checked.diagnostics());
+                continue;
+            }
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let fill = project_function_name(&prepared.project().modules[0].source, "_fill");
+            let body = self_tail_test_body(&ir, "internal { i64, i32 }", &fill);
+            assert!(body.contains(&format!("call {{ i64, i32 }} @{fill}("))
+                && body.contains("extractvalue { i64, i32 }")
+                && body.contains("i64 %borrowed_array_extent")
+                && !body.contains("llvm.memcpy") && !body.contains("__wosy_core_alloc"), "{body}");
+        }
     }
 }
 

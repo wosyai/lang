@@ -450,18 +450,30 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         memory::private_runtime_copy_row(state, id)?;
     }
     let pointer = memory::place_pointer(context, state, place, project)?;
-    let Some(&(owner, extent, true)) = state.local_runtime_extents.get(&pointer)
-        else { return Err("private runtime array call lacks its original checked backing and extent".into()); };
-    let length = match extent {
-        LocalRuntimeExtent::PortableConstruction { length, domain }
-            if portable && domain.matches_consumer(state.target_layout, element) => length,
-        LocalRuntimeExtent::Construction { length, signed: Some(domain) }
-            if !portable && domain.matches_consumer(state.target_layout, element) => length,
-        _ => return Err("private runtime array call changed its prepared extent domain".into()),
+    let direct = state.local_runtime_extents.get(&pointer).copied();
+    let length = match (direct, place) {
+        (Some((owner, LocalRuntimeExtent::PortableConstruction { length, domain }, true)), _)
+            if owner == declaration && portable && domain.matches_consumer(state.target_layout, element) => length,
+        (Some((owner, LocalRuntimeExtent::Construction { length, signed: Some(domain) }, true)), _)
+            if owner == declaration && !portable && domain.matches_consumer(state.target_layout, element) => length,
+        (None, ScalarPlace::Name { name, .. }) if site.phase_root && !portable => {
+            let Some((storage, ScalarType::RuntimeArray { element: actual, .. })) = state.storage.get(name)
+                else { return Err("private runtime phase call lacks its exact backing slot".into()); };
+            let Some((owner, LocalRuntimeExtent::SealedPhaseConstruction { length, signed, length_slot }, true)) =
+                state.local_runtime_extents.get(storage)
+                else { return Err("private runtime phase call lacks signed construction".into()); };
+            if owner != &declaration || actual != element
+                || !signed.matches_consumer(state.target_layout, element)
+                || state.runtime_array_allocations.get(name) != Some(&false)
+                || state.runtime_array_lengths.get(name) != Some(length_slot)
+                || !memory::loaded_from_slot(pointer, *storage)
+            {
+                return Err("private runtime phase call lost its original backing and extent".into());
+            }
+            *length
+        }
+        _ => return Err("private runtime array call lacks its original checked backing and extent".into()),
     };
-    if owner != declaration {
-        return Err("private runtime array call changed its original backing".into());
-    }
     let address = state.builder.build_ptr_to_int(pointer, memory::pointer_integer_type(context, state.target_layout),
         "private_runtime_address").map_err(builder_error)?;
     let descriptor = borrowed_extent_type(context, state.target_layout);

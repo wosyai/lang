@@ -155,6 +155,11 @@ enum LocalRuntimeExtent<'ctx> {
     },
     OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),
+    SealedPhaseConstruction {
+        length: inkwell::values::IntValue<'ctx>,
+        signed: memory::SignedRuntimeAddressDomain,
+        length_slot: PointerValue<'ctx>,
+    },
 }
 
 #[derive(Default)]
@@ -498,8 +503,8 @@ fn runtime_allocation_access<'ctx>(
     }
     // The grouped root plan keeps addressing in the proven prefix; a later
     // terminal release does not erase the checked constructor's extent.
-    indexed.retain(|id| !unproved_writes.contains(id)
-        || plan.is_some_and(|plan| plan.grouped_owning_extent_roots.contains(id)));
+    indexed.retain(|id| !unproved_writes.contains(id) || plan.is_some_and(|plan|
+        plan.grouped_owning_extent_roots.contains(id) || plan.private_runtime_phase_owners.contains(id)));
     let mut borrowed = RuntimeBorrowIndex::default();
     if checked_access {
         for (&point, site) in &reference_cfg.runtime_array_field_sites {
@@ -2723,7 +2728,17 @@ fn store_runtime_allocation<'ctx, 'module>(
         state.runtime_array_owners.insert(receiver.name.clone(), true);
     }
     if tracked_extent {
-        state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot), checked_extent));
+        let phase_root = state.aggregate.as_ref().is_some_and(|aggregate|
+            aggregate.plan().private_runtime_phase_owners.contains(&declaration));
+        let extent = if phase_root {
+            let signed = allocation.signed.filter(|signed| checked_extent
+                && signed.matches_consumer(state.target_layout, element))
+                .ok_or("sealed private phase root lacks signed construction")?;
+            LocalRuntimeExtent::SealedPhaseConstruction { length: allocation.length, signed, length_slot }
+        } else {
+            LocalRuntimeExtent::ManagedLengthSlot(length_slot)
+        };
+        state.local_runtime_extents.insert(backing, (receiver.name_span, extent, checked_extent));
     }
     state
         .storage

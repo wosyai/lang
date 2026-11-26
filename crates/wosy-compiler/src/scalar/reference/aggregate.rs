@@ -3128,6 +3128,7 @@ pub(crate) struct ClosedBody {
     pub(crate) private_runtime_portable_calls: HashSet<usize>,
     pub(crate) private_runtime_portable_formal: bool,
     pub(crate) private_runtime_access_owners: HashSet<ByteSpan>,
+    pub(crate) private_runtime_phase_owners: BTreeSet<(u32, u32)>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
@@ -3187,6 +3188,7 @@ pub(crate) struct PrivateRuntimePairCall {
     pub(crate) owner: ByteSpan,
     pub(crate) target: BodyKey,
     pub(crate) inherited: bool,
+    pub(crate) phase_root: bool,
     pub(crate) portable_birth: Option<(CfgPointId, CfgPointId)>, // exact (call, first borrow)
 }
 
@@ -6284,6 +6286,67 @@ fn record_grouped_root_effect(
             }
         }
     }
+}
+
+fn private_runtime_exclusive_root_windows(
+    cfg: &ScalarReferenceCfg, facts: &CallablePointFacts,
+) -> (BTreeMap<ReferenceBindingId, GroupedRootWindow>, Option<CfgPointId>, bool) {
+    let guarded: HashSet<_> = cfg.guarded_scalar_allocations().iter().map(|site| &site.binding).collect();
+    let mut roots: BTreeMap<_, _> = cfg.allocations.iter().filter(|binding| !guarded.contains(binding))
+        .cloned().map(|binding| (binding, GroupedRootWindow::default())).collect();
+    let mut opaque = None;
+    let mut ordered = true;
+    for point in &cfg.points {
+        ordered &= point.successors.iter().all(|next| point.id < *next);
+        if let CfgPointKind::Invalidate {
+            operation: CoreOperationId::Rebind, candidates, ..
+        } = &point.kind {
+            if candidates.is_empty() {
+                return (BTreeMap::new(), None, false);
+            }
+            for candidate in candidates {
+                roots.remove(&candidate.place.binding);
+            }
+            continue;
+        }
+        record_grouped_root_effect(&mut roots, &mut opaque, point);
+        // Keep the original construction's backing/count pair. Later
+        // terminal activity may retire it; whole-value replacements do not
+        // use this route and are not recast as the original pair.
+        let destroyed = match &point.kind {
+            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => Some(&target.binding),
+            CfgPointKind::Move { owner, place, .. } | CfgPointKind::DeferredMove { owner, place, .. }
+                if place.projections.is_empty() => Some(owner),
+            _ => None,
+        };
+        if let Some(owner) = destroyed {
+            roots.remove(owner);
+        }
+        if let CfgPointKind::AssignThrough { candidates, .. } | CfgPointKind::MoveThrough { candidates, .. }
+            | CfgPointKind::DeferredMoveThrough { candidates, .. } = &point.kind
+        {
+            if candidates.is_empty() {
+                return (BTreeMap::new(), None, false);
+            }
+            for candidate in candidates {
+                if candidate.place.projections.is_empty() {
+                    roots.remove(&candidate.place.binding);
+                }
+            }
+        }
+    }
+    for (point, binding) in &facts.raw_address_exposures {
+        if let Some(binding) = binding {
+            if let Some(window) = roots.get_mut(binding) {
+                window.invalidate(*point);
+            }
+        } else {
+            // An unclassified exposure is not evidence of disjointness,
+            // regardless of position in the body.
+            return (BTreeMap::new(), None, false);
+        }
+    }
+    (roots, opaque, ordered)
 }
 
 fn grouped_owner_root_windows(
@@ -9791,6 +9854,8 @@ impl ClosedAggregates {
             body.private_runtime_access_calls.clone_from(&plan.calls);
             body.private_runtime_access_relay_target = plan.relay_target;
             body.private_runtime_access_owners.clone_from(&plan.owners);
+            body.private_runtime_phase_owners = plan.calls.values().filter(|site| site.phase_root)
+                .map(|site| (site.owner.start, site.owner.end)).collect();
             self.private_runtime_pair_members.push(key);
         }
         Ok(())
@@ -10208,7 +10273,7 @@ fn exact_exclusive_runtime_relay(
             _ => return None,
         };
         exact.extend([call, first, read]);
-        calls.push((ordinal.0, PrivateRuntimePairCall { owner: formal, target, inherited: true, portable_birth: None }));
+        calls.push((ordinal.0, PrivateRuntimePairCall { owner: formal, target, inherited: true, phase_root: false, portable_birth: None }));
     }
     let scalar_locals: HashSet<_> = sites.structure.blocks.iter().flat_map(|block| &block.items)
         .filter_map(|item| match &item.kind {
@@ -10455,6 +10520,7 @@ impl ProjectReferenceResults {
                 census.census(&reservations, &module_at, &declarations);
             }
         }
+        let mut exclusive_root_windows = HashMap::<BodyKey, _>::new();
         let mut immutable_owners = HashMap::<BodyKey, HashSet<ReferenceBindingId>>::new();
         let mut raw_exposures = HashMap::<BodyKey, (bool, HashSet<ReferenceBindingId>)>::new();
         // Indexed once, only after an actual closed-use candidate has been
@@ -10526,32 +10592,41 @@ impl ProjectReferenceResults {
                     || &loan.origin_place.binding != &place.binding || !place.projections.is_empty()
                     || !matches!(place.place, ScalarPlace::Name { .. })
                 { return None; }
-                let immutable = owners.entry(caller).or_insert_with(|| {
-                    let mut remaining: HashSet<_> = cfg.allocations.iter().cloned().collect();
-                    for guarded in cfg.guarded_scalar_allocations() { remaining.remove(&guarded.binding); }
-                    for point in &cfg.points {
-                        match &point.kind {
-                            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
-                                remaining.remove(&target.binding);
-                            }
-                            CfgPointKind::AssignThrough { candidates, .. } => {
-                                for target in candidates {
-                                    if target.place.projections.is_empty() { remaining.remove(&target.place.binding); }
+                let (eligible_root, phase_root) = if exclusive_relay {
+                    let facts = self.callable_point_facts(caller.0, caller.1, caller.2)?;
+                    let (windows, opaque, ordered) = exclusive_root_windows.entry(caller)
+                        .or_insert_with(|| private_runtime_exclusive_root_windows(cfg, facts));
+                    let window = windows.get(&place.binding)?;
+                    (window.admits(call, *opaque, *ordered), window.first_effect.is_some() || opaque.is_some())
+                } else {
+                    let immutable = owners.entry(caller).or_insert_with(|| {
+                        let mut remaining: HashSet<_> = cfg.allocations.iter().cloned().collect();
+                        for guarded in cfg.guarded_scalar_allocations() { remaining.remove(&guarded.binding); }
+                        for point in &cfg.points {
+                            match &point.kind {
+                                CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
+                                    remaining.remove(&target.binding);
                                 }
+                                CfgPointKind::AssignThrough { candidates, .. } => {
+                                    for target in candidates {
+                                        if target.place.projections.is_empty() { remaining.remove(&target.place.binding); }
+                                    }
+                                }
+                                CfgPointKind::Move { owner, place, .. } if place.projections.is_empty() => {
+                                    remaining.remove(owner);
+                                }
+                                CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
+                                | CfgPointKind::Invalidate { candidates, .. } => {
+                                    for target in candidates { remaining.remove(&target.place.binding); }
+                                }
+                                _ => {}
                             }
-                            CfgPointKind::Move { owner, place, .. } if place.projections.is_empty() => {
-                                remaining.remove(owner);
-                            }
-                            CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
-                            | CfgPointKind::Invalidate { candidates, .. } => {
-                                for target in candidates { remaining.remove(&target.place.binding); }
-                            }
-                            _ => {}
                         }
-                    }
-                    remaining
-                });
-                if mutable || copy_fields {
+                        remaining
+                    });
+                    (immutable.contains(&place.binding), false)
+                };
+                if !exclusive_relay && (mutable || copy_fields) {
                     let facts = self.callable_point_facts(caller.0, caller.1, caller.2)?;
                     let (unknown, exposed) = raw_exposures.entry(caller).or_insert_with(|| {
                         let mut unknown = false;
@@ -10563,7 +10638,7 @@ impl ProjectReferenceResults {
                     });
                     if *unknown || exposed.contains(&place.binding) { return None; }
                 }
-                let portable_birth = (project.modules[caller.0].target_layout == ScalarTargetLayout::WASM32
+                let portable_birth = (!phase_root && project.modules[caller.0].target_layout == ScalarTargetLayout::WASM32
                     && ordinary_births.entry(caller).or_insert_with(|| {
                         let Some(facts) = self.callable_point_facts(caller.0, caller.1, caller.2)
                             else { return HashSet::new(); };
@@ -10580,8 +10655,8 @@ impl ProjectReferenceResults {
                                 .then(|| owner.clone())
                         }).collect()
                     }).contains(&place.binding)).then_some((call, borrow));
-                immutable.contains(&place.binding).then_some(PrivateRuntimePairCall {
-                    owner: place.binding.declaration_span, target, inherited: false, portable_birth,
+                eligible_root.then_some(PrivateRuntimePairCall {
+                    owner: place.binding.declaration_span, target, inherited: false, phase_root, portable_birth,
                 })
             };
             for &(caller, occurrence) in uses {

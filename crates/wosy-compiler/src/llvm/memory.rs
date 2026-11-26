@@ -876,7 +876,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
         || state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base)))
 }
 
-fn loaded_from_slot<'ctx>(value: PointerValue<'ctx>, slot: PointerValue<'ctx>) -> bool {
+pub(super) fn loaded_from_slot<'ctx>(value: PointerValue<'ctx>, slot: PointerValue<'ctx>) -> bool {
     value.as_instruction_value().is_some_and(|instruction|
         instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
             && instruction.get_operand(0).and_then(|operand| operand.value()) == Some(slot.into()))
@@ -957,7 +957,8 @@ fn capture_paired_runtime_extent<'ctx>(
                 Err("owning formal index lost its descriptor backing".into())
             }
         }
-        LocalRuntimeExtent::ManagedLengthSlot(length_slot)
+        LocalRuntimeExtent::SealedPhaseConstruction { length_slot, .. }
+        | LocalRuntimeExtent::ManagedLengthSlot(length_slot)
             if state.runtime_array_allocations.get(name) == Some(&false)
                 && state.runtime_array_lengths.get(name) == Some(length_slot) =>
             state.builder.build_load(context.i64_type(), *length_slot, "runtime_extent")
