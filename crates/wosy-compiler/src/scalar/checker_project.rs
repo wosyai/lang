@@ -11244,7 +11244,7 @@ fn collect_unreached_authored_paths(
 fn prepare_private_contextual_roster(
     project: &ScalarProject, calls: &ProjectCallSiteResults, entry: PreparedCallable,
     root_site: OccurrenceOrdinal, proofs: &ContextualProofCohort,
-) -> Result<failure_search::ContextualStartupRoster, ProjectCheck> {
+) -> Result<(failure_search::ContextualStartupRoster, HashSet<PreparedCallable>), ProjectCheck> {
     use super::checker_flow::charge_call_work;
     let mut pending = HashMap::<_, (PreparedCallable, usize)>::new();
     let mut seen_proofs = HashSet::new();
@@ -11314,8 +11314,8 @@ fn prepare_private_contextual_roster(
             return Err(ProjectCheck::Unsupported);
         }
     }
-    if seen_proofs.is_empty() || seen_proofs.len() != proofs.entries.len() { return Err(ProjectCheck::Unsupported); }
-    Ok(failure_search::ContextualStartupRoster { root_site, entry, pending })
+    if seen_proofs.is_empty() { return Err(ProjectCheck::Unsupported); }
+    Ok((failure_search::ContextualStartupRoster { root_site, entry, pending }, seen_proofs))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11360,7 +11360,26 @@ fn run_private_contextual_startup(
         Some(cap) => failure_search::StartUpSearch::new(root, cap),
         None => failure_search::StartUpSearch::formal_only(root),
     };
-    search.contextual_roster = Some(prepare_private_contextual_roster(project, calls, entry, root_site, &effects.contextual_proofs)?);
+    let (roster, reached_proofs) = prepare_private_contextual_roster(project, calls, entry, root_site, &effects.contextual_proofs)?;
+    let mut dormant = HashMap::<usize, HashSet<usize>>::new();
+    if reached_proofs.len() != effects.contextual_proofs.entries.len() {
+        let callers = ordered_symbolic_callers(project, calls, root, None)?;
+        for (&target, proof) in &effects.contextual_proofs.entries {
+            if reached_proofs.contains(&target) { continue; }
+            // Only zero-incoming theorem leaves can be specialized
+            // independently of the real invocation roster. A guarded
+            // theorem is not admitted to the incumbent unguarded observer.
+            let body = calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?;
+            if target == entry || callers.contains_key(&target) || !body.call_occurrences.is_empty()
+                || !body.structure.checker_directives.is_empty() || proof.typed_where.is_some()
+                || body.contextual_formal() != Some((&proof.formal, &proof.ty))
+            { return Err(ProjectCheck::Unsupported); }
+            if scope == ScalarCheckerScope::CurrentPackage {
+                dormant.entry(target.0).or_default().insert(target.1);
+            }
+        }
+    }
+    search.contextual_roster = Some(roster);
     effects.startup_search = Some(Rc::new(RefCell::new(search)));
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
@@ -11369,13 +11388,35 @@ fn run_private_contextual_startup(
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
     if search.invalid() || search.contextual_roster.as_ref().is_none_or(|roster| !roster.pending.is_empty())
         || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-        || effects.contextual_proofs.entries.values().any(|proof|
-            !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none())
+        || reached_proofs.iter().any(|target| effects.contextual_proofs.entries.get(target).is_none_or(|proof|
+            !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none()))
+    { return Err(ProjectCheck::Unsupported); }
+    // No symbolic observer may turn malformed or unsupported actual
+    // initialization into a completed transaction.
+    let outcome = match outcome {
+        Ok(initialization) => Some(initialization),
+        Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => None,
+        Err(error) => return Err(error),
+    };
+    for source in &project.initialization_order {
+        let ordinal = project.modules.iter().position(|module| &module.source == source)
+            .ok_or(ProjectCheck::MissingRoot)?;
+        let Some(targets) = dormant.remove(&ordinal) else { continue; };
+        let prior = effects.records.len();
+        check_unused_module::<true, false, _>(
+            project, calls, &project.modules[ordinal], ordinal, &reached_proofs, targets,
+            &HashSet::new(), Some(&mut effects), None, &mut (),
+        )?;
+        if effects.records.len() != prior { return Err(ProjectCheck::Unsupported); }
+    }
+    if !dormant.is_empty() || (scope == ScalarCheckerScope::CurrentPackage
+        && effects.contextual_proofs.entries.iter().any(|(target, proof)|
+            !reached_proofs.contains(target) && !proof.examined_symbolic_root))
     { return Err(ProjectCheck::Unsupported); }
     let refuted = effects.contextual_proofs.entries.values().any(|proof| proof.refutation.is_some());
     let completion = match outcome {
-        Ok(_) if cap.is_none() => StartupAuthoredCompletion::LimitReached,
-        Ok((initialization, _)) if search.remaining() > 0 => {
+        Some(_) if cap.is_none() => StartupAuthoredCompletion::LimitReached,
+        Some((initialization, _)) if search.remaining() > 0 => {
             if refuted || callable_roots.is_empty() {
                 StartupAuthoredCompletion::Exhausted
             } else {
@@ -11383,8 +11424,7 @@ fn run_private_contextual_startup(
                     &mut search, &mut effects)?.0
             }
         }
-        Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
-        Err(error) => return Err(error),
+        None => StartupAuthoredCompletion::LimitReached,
         _ => return Err(ProjectCheck::Unsupported),
     };
     if cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len()) {
@@ -29026,6 +29066,50 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     assert_eq!(completion, Some(if cap <= 2 { StartupAuthoredCompletion::LimitReached }
                         else { StartupAuthoredCompletion::Exhausted }));
                 }
+                let theorem = child.replace("%%end", r#"
+                    unit(u8) examine = fn(selector) {
+                        if (selector == 7) {
+                            if (core.context.credit == 11) { core.context.credit = 11; };
+                        };
+                    };
+                    proof preserve for examine(choice) -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) + 0) {}
+                    %%end"#);
+                let old_theorem = prepare(&theorem).unwrap().run().unwrap();
+                assert!(old_theorem.contextual_diagnostic.is_none());
+                let (passes, completion) = prepare(&theorem).unwrap()
+                    .run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(passes.directives, old_theorem.directives[..1]);
+                assert!(passes.contextual_diagnostic.is_none());
+                assert_eq!(completion, Some(StartupAuthoredCompletion::LimitReached));
+                let broken = theorem.replace("credit = 11", "credit = 2");
+                let old_broken = prepare(&broken).unwrap().run().unwrap();
+                for cap in [1, 3] {
+                    let (failed, completion) = prepare(&broken).unwrap()
+                        .run_private_authored_root(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        assert!(completion.is_none() && failed.directives.is_empty());
+                        let failure = failed.contextual_diagnostic.unwrap();
+                        let old = old_broken.contextual_diagnostic.as_ref().unwrap();
+                        assert_eq!((&failure.proof, &failure.goal, &failure.binding, &failure.supplying_call, &failure.call),
+                            (&old.proof, &old.goal, &old.binding, &old.supplying_call, &old.call));
+                        assert_eq!((failure.symbolic, &failure.entry, &failure.exit, &failure.explicit_entry),
+                            (old.symbolic, &old.entry, &old.exit, &old.explicit_entry));
+                        assert!(failure.symbolic);
+                        assert_eq!((failure.entry, failure.exit), (11.into(), 2.into()));
+                        assert_eq!(failure.explicit_entry, Some(("choice".into(), 7.into())));
+                        assert_eq!((&failure.goal.source, &failure.call.source), (&leaf, &leaf));
+                        assert_eq!(&broken[failure.call.range.start as usize..failure.call.range.end as usize], "examine");
+                    } else {
+                        assert_eq!(failed.directives, old_broken.directives[..cap.min(2)]);
+                        assert!(failed.contextual_diagnostic.is_none() && old_broken.contextual_diagnostic.is_none());
+                    }
+                }
+                // A dormant theorem called by another unused callable
+                // is not a zero-incoming leaf of this admitted profile.
+                let incoming = theorem.replace("%%end", "unit() unused = fn { examine(7); }; %%end");
+                assert!(matches!(prepare(&incoming).and_then(|owner| owner.run_private_authored_root(NonZeroUsize::MIN)),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 let with_dormant = child.replace("%%end", &format!(r#"
                     unit(u8) deferred = fn(value) {{ core.require(value == 0, {}); }};
                     unit(u8) later = fn(value) {{ core.require(value < 3, {}); }};
