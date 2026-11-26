@@ -11600,8 +11600,16 @@ fn run_private_named_after_startup(
             arrays.extend(array_quantifier::ArrayProof::prepare(proof_source, selected, &mut array_work)?);
             continue;
         }
+        // Ordered configured Check uses this owner-bound typing mode
+        // to retain quantified coordinates and infer existing sparse
+        // existential goals. Reuse it for the new exact local profile,
+        // without enrolling ordinary or foreign targets into that mode.
+        let local_quantifier = !qualified && expected.is_none() && proof_source == root
+            && selected.node.children().any(|header| header.kind() == SyntaxKind::ProofForall
+                || (header.kind() == SyntaxKind::ProofEnsures
+                    && header.children().any(|goal| goal.kind() == SyntaxKind::ProofExists)));
         let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
-            proof_source, name.text(), selected, *is_provider,
+            proof_source, name.text(), selected, *is_provider || local_quantifier,
         )?;
         let body = plan.typed.body;
         if project.modules.get(plan.target.0).map(|module| &module.source) != Some(proof_source)
@@ -16943,6 +16951,7 @@ mod tests {
                             (&baseline.proof, &baseline.goal, &baseline.invocation.call));
                         assert_eq!(observed.invocation.directive_position, position);
                         assert_eq!(observed.invocation.returned, returned.into());
+                        assert_eq!(observed.quantified_witness, baseline.quantified_witness);
                         let text = |span: &wosy_syntax::SourceSpan| &actual_source[span.range.start as usize..span.range.end as usize];
                         assert_eq!(text(&observed.invocation.call), call);
                         assert_eq!(observed.failed_step.as_ref().map(text), failing_step);
@@ -16970,6 +16979,27 @@ mod tests {
                         assert_eq!(observed.directive_position, 1);
                     }
                 }
+                // At a genuine zero budget, activity must come from
+                // verifying the explicit sparse witness, not authored work.
+                let proved = format!(r#"%%start
+                    u8(u8) check = fn(entry) {{ entry }};
+                    proof q for check(entry) -> (out) where (entry == 4)
+                        ensures (exists (u8 chosen where chosen == 2 || chosen == 4) {{ out <= chosen }})
+                        {{ core.witness(4); }}
+                    core.require(false, {OUTPUT});
+                    u8 value = check(4);
+                    core.require(value == 4, {OUTPUT});
+                    core.require(false, {OUTPUT});
+                %%end"#);
+                let incumbent = prepare(&proved).run().unwrap();
+                assert!(incumbent.active && incumbent.diagnostics.is_empty());
+                assert_eq!(incumbent.directives.len(), 2);
+                let formal = prepare(&proved).run_private_proofs_after_command_cap().unwrap();
+                assert!(formal.active && formal.directives.is_empty() && formal.diagnostics.is_empty());
+                let (capped, end) = prepare(&proved).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(end, Some(StartupAuthoredCompletion::LimitReached));
+                assert_eq!(capped.directives, incumbent.directives[..1]);
+                assert!(capped.diagnostics.is_empty());
             }
         }
     }
