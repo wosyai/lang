@@ -24,6 +24,18 @@ Each diagnostic carries a code, a message, and labeled spans.
 - `B0010 invalid integer literal | invalid finite floating-point literal | integer literal is outside the resolved target type range`.
 - `B0012 raw address requires an unsafe block | core.alloc/free requires an unsafe block`: address and allocation operations must appear inside `unsafe`.
 
+## Memory and ownership
+
+`wosy build` rejects these cases before producing an executable:
+
+- `B0003 read or move of unavailable place`: the value or a field was moved, or the access conflicts with a live borrow. If shown, check the secondary span labeled `origin of conflicting place or loan`. Read from the binding that received the move, or finish using the overlapping borrow before moving or writing to its owner.
+- `B0003 array elements cannot be moved individually`: the element is not a Copy value. Borrow the element instead of moving it, or move the whole array.
+- `B0003 fallible allocation requires an exact proven null guard for its local binding`: guard the original fallible binding against `null` before reading it.
+
+A checked null dereference or out-of-bounds access can instead fail **at
+runtime** through `core.system_panic()`, not with a `B0003` diagnostic. See
+[checked access](types.md#checked-access).
+
 ## Modules and projects
 
 - `M0001 missing module <package>::<path>`: the imported file does not exist.
