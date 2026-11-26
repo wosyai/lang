@@ -20,6 +20,10 @@ use wosy_syntax::{FreshParseResult, SourceIdentity};
 mod provision;
 #[cfg(target_os = "linux")]
 pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime};
+#[cfg(target_os = "linux")]
+mod stdout;
+#[cfg(target_os = "linux")]
+pub use stdout::{prepare_project_comptime_stdout, ComptimeReadbackError, ProjectComptimeStdout};
 
 #[derive(Debug)]
 pub enum ClosedComptimePlanError {

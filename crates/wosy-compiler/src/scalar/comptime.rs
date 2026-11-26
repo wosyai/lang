@@ -14,6 +14,8 @@ pub const CLOSED_COMPTIME_MAX_SOURCE_BYTES: usize = 1 << 16;
 const FUNCTION: &str = "evaluate";
 
 mod direct;
+mod stdout;
+pub use stdout::{prepare_comptime_stdout, ComptimeStdoutError, PreparedComptimeStdout};
 pub use direct::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,
     derive_direct_startup_comptime_plan, derive_forwarded_pair_startup_comptime_plan,

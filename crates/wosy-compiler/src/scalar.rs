@@ -2528,6 +2528,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 
 mod declarations;
 mod comptime;
+pub use comptime::{prepare_comptime_stdout, ComptimeStdoutError, PreparedComptimeStdout};
 pub use comptime::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,

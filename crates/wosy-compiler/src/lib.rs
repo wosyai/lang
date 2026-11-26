@@ -29,6 +29,7 @@ pub use scalar::{
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
     ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
+pub use scalar::{prepare_comptime_stdout, ComptimeStdoutError, PreparedComptimeStdout};
 pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,

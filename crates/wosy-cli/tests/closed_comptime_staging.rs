@@ -321,3 +321,121 @@ fn declined_provision_has_no_staging_files() {
     assert_eq!(error.to_string(), "closed comptime evaluator IR exceeds byte budget");
     assert!(fs::read_dir(&scratch).unwrap().next().is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_comptime_stdout_materializes_resolved_structs_arrays_and_utf8() {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    use wosy_cli::comptime_fragment::{prepare_project_comptime_stdout, ComptimeReadbackError as Error};
+    use wosy_compiler::{ComptimeStdoutError as Format, ScalarExpression as Expr};
+
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let standard = fixture.0.join("std");
+    fs::create_dir_all(standard.join("src")).unwrap();
+    fs::write(standard.join("wosy.toml"), "[package]\nname = \"std\"\nsource_root = \"src\"\n[comments]\ncategories = []\n").unwrap();
+    fs::write(standard.join("src/utf8.w"), "%%start\nstruct utf8 { *?u8 data; u64 length; }\n%%end\n").unwrap();
+    fixture.manifest(&format!("{MANIFEST}\n[dependencies.std]\npath = \"../std\"\n"));
+    let source = project.join("src/main.w");
+    let authored = r#"%%start
+# WHY: inspeção de retorno com café ☕
+std = namespace std "utf8.w";
+struct Cell { bool enabled; i32 offset; }
+struct Report { std.utf8 label; u32[2] numbers; Cell[2] cells; }
+Report result = comptime prepare {
+    { .cells = [{ .offset = -7; .enabled = true; }, { .offset = 0; .enabled = false; }];
+      .numbers = [10, 20]; .label = "fonte"; }
+};
+%%end
+"#;
+    let ok = ExitStatus::from_raw(0);
+    let exit_9 = ExitStatus::from_raw(9 << 8);
+    let signal = ExitStatus::from_raw(15);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        fs::write(&source, authored).unwrap();
+        let prepared = prepare_project_comptime_stdout(&project, "app", "override", "prepare", layout)
+            .unwrap_or_else(|error| panic!("ordinary aggregate result on {layout:?}: {error:?}"));
+        let example = "[\"olá\\n\\\"ok\\\\x\",[4294967295,20],[[true,-2147483648],[false,0]]]\n".as_bytes();
+        let Expr::StructLiteral { fields, span } = prepared.read_stdout(ok, example, example.len()).unwrap()
+        else { panic!("one ordinary struct value"); };
+        assert_eq!(span, prepared.site().range);
+        assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["label", "numbers", "cells"]);
+        assert!(matches!(&fields[0].value, Expr::Utf8 { value, .. } if value == "olá\n\"ok\\x".as_bytes()));
+        let check_int = |actual: &Expr, expected: i64| {
+            assert!(matches!(actual, Expr::Integer { value, .. } if i64::try_from(value) == Ok(expected)));
+        };
+        let Expr::ArrayLiteral { elements, .. } = &fields[1].value else { panic!("u32 array"); };
+        assert_eq!(elements.len(), 2);
+        check_int(&elements[0], u32::MAX.into());
+        check_int(&elements[1], 20);
+        let Expr::ArrayLiteral { elements, .. } = &fields[2].value else { panic!("Cell array"); };
+        assert_eq!(elements.len(), 2);
+        for (index, record) in elements.iter().enumerate() {
+            let Expr::StructLiteral { fields, .. } = record else { panic!("Cell"); };
+            assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["enabled", "offset"]);
+            assert!(matches!(&fields[0].value, Expr::Boolean { value, .. } if *value == (index == 0)));
+            check_int(&fields[1].value, if index == 0 { i32::MIN.into() } else { 0 });
+        }
+        assert_eq!(prepared.read_stdout(exit_9, example, example.len()).err(), Some(Error::Exit(Some(9))));
+        assert_eq!(prepared.read_stdout(signal, example, example.len()).err(), Some(Error::Exit(None)));
+        assert_eq!(prepared.read_stdout(ok, example, example.len() - 1).err(), Some(Error::Output(Format::ByteLimit)));
+        for (framing, reason) in [
+            (b"[\"x\",[1,2],[[true,0],[false,0]]]\n\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2],[[true,0],[false,0]]]".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2,3],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1, 2],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2],[[true,0],[false,0]],0]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2],[[true,00],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2],[[true,-0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[1,2],[[true,+1],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\",[4294967296,2],[[true,0],[false,0]]]\n".as_slice(), Format::OutOfRange),
+            (b"[\"x\",[1,2],[[true,-2147483649],[false,0]]]\n".as_slice(), Format::OutOfRange),
+            (b"[\"\\u000a\",[1,2],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"x\n\",[1,2],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+            (b"[\"\xff\",[1,2],[[true,0],[false,0]]]\n".as_slice(), Format::NonCanonical),
+        ] {
+            assert_eq!(prepared.read_stdout(ok, framing, 256).err(), Some(Error::Output(reason)), "{framing:?}");
+        }
+
+        // Independent result, same id but a different source revision and
+        // type. The earlier prepared result owns its original shape.
+        fs::write(&source, "%%start\nbool answer = comptime prepare { true };\n%%end\n").unwrap();
+        let scalar = prepare_project_comptime_stdout(&project, "app", "override", "prepare", layout).unwrap();
+        assert_ne!(scalar.site().source.revision, prepared.site().source.revision);
+        assert!(matches!(scalar.read_stdout(ok, b"true\n", 5).unwrap(), Expr::Boolean { value: true, .. }));
+        assert_eq!(scalar.read_stdout(ok, example, 256).err(), Some(Error::Output(Format::NonCanonical)));
+        assert!(prepared.read_stdout(ok, example, 256).is_ok());
+    }
+    assert!(!project.join(".wosy").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provisioned_scalar_stdout_uses_the_same_typed_format_without_a_runner() {
+    use std::{os::unix::{fs::DirBuilderExt, process::ExitStatusExt}, process::ExitStatus};
+    use wosy_cli::comptime_fragment::ComptimeReadbackError as Error;
+    use wosy_compiler::{ComptimeStdoutError as Format, ScalarExpression as Expr};
+
+    let fixture = Fixture::new();
+    let scratch = fixture.0.join("private scalar stdout");
+    fs::DirBuilder::new().mode(0o700).create(&scratch).unwrap();
+    let success = ExitStatus::from_raw(0);
+    let project = fixture.project();
+    for (ty, accepted, expected) in [
+        ("i32", b"-2147483648\n".as_slice(), i64::from(i32::MIN)),
+        ("u32", b"4294967295\n".as_slice(), i64::from(u32::MAX)),
+    ] {
+        fs::write(project.join("src/main.w"), format!("%%start\n{ty} answer = comptime prepare {{ 7 }};\n%%end\n")).unwrap();
+        let pending = plan_closed_comptime_staging(&project, "app", "override", "prepare", ScalarTargetLayout::NATIVE64)
+            .unwrap().provision(&scratch, 1 << 16).unwrap();
+        fs::write(pending.expected_module_path(), b"inert test bytes, no runner").unwrap();
+        let module = pending.observe_module(64).unwrap();
+        assert!(matches!(module.read_stdout(success, accepted, accepted.len()).unwrap(),
+            Expr::Integer { value, .. } if i64::try_from(&value) == Ok(expected)));
+        assert_eq!(module.read_stdout(success, b"007\n", 12).err(), Some(Error::Output(Format::NonCanonical)));
+        assert_eq!(module.read_stdout(success, b"{\"value\":7}\n", 12).err(), Some(Error::Output(Format::NonCanonical)));
+        assert!(!pending.manifest_path().exists());
+    }
+    assert!(fs::read_dir(scratch).unwrap().next().is_none());
+}
