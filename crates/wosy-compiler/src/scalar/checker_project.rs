@@ -11987,7 +11987,6 @@ fn run_private_named_after_startup(
             || !plan.has_no_authored_steps()
             || !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if &entry.ty == plan.typed.result_type)
             || !qualified_integer_proof_leaf(plan.typed.body, plan.typed.result_type)
-            || ordered_symbolic_callers(project, calls, root, None)?.contains_key(&plan.target)
         { return Err(ProjectCheck::Unsupported); }
         dormant_target = Some(plan.target);
     }

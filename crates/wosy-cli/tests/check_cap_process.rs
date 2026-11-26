@@ -669,12 +669,22 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 1, b"", &old.stderr);
                         assert!(!project.output().exists());
 
-                        // A valid lexical caller is not the inspected
-                        // initializer exception and remains refused.
+                        // A lexical reference in the same inspected source
+                        // does not execute without a selected caller root.
                         fs::write(&deferred_owner, dormant.replace("%%end", "u8() caller = fn { fallback(8) }; %%end")).unwrap();
                         let old = project.run(&[scope, "--all-errors"]);
                         assert_eq!(old.status.code(), Some(1), "{old:?}");
                         assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));
+                        assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 1, b"", &old.stderr);
+                        assert_terminal(&project.run(&["--main-flow-only", "--max-errors", "1"]), 0, b"", b"");
+                        assert!(!project.output().exists());
+
+                        // A different dormant callable owns an authored
+                        // directive and can reach the lexical caller.
+                        // The inspection-only exception must now refuse.
+                        let rooted = format!("u8() caller = fn {{ fallback(8) }}; u8() independent = fn {{ {} caller() }}; %%end",
+                            require("independent", 73, "independent.txt"));
+                        fs::write(&deferred_owner, dormant.replace("%%end", &rooted)).unwrap();
                         assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 2, b"",
                             b"wosy: check: unsupported analysis; no result published
 ");

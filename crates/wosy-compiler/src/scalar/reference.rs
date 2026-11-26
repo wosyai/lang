@@ -7117,6 +7117,8 @@ impl ProjectCallSiteResults {
         let mut work = 0;
         use super::checker_flow::charge_call_work;
         let mut saw_dormant = false;
+        let mut dormant_has_authored_callable = false;
+        let mut omitted_dormant_lexical_edge = false;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
             let is_dormant = !source_set.contains(&module.initialization.source);
@@ -7134,8 +7136,7 @@ impl ProjectCallSiteResults {
                         // This typed local site belongs to the separately
                         // inspected owner, so its initializer cannot run
                         // in this plan. It does not enroll or authenticate
-                        // an actual invocation. Lexical references below
-                        // remain subject to the independent proof fence.
+                        // an actual invocation.
                         if is_dormant && declaration.source == module.initialization.source
                             && *concrete == ConcreteCallSelection::Declaration
                         { continue; }
@@ -7153,9 +7154,23 @@ impl ProjectCallSiteResults {
                 for body in std::iter::once(function).chain(&function.arms) {
                     charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
                         .checked_add(body.callable_escapes.len())?)?;
+                    dormant_has_authored_callable |= is_dormant && !body.structure.checker_directives.is_empty();
                     if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
                         || body.sites.iter().any(|site| {
                             if !resolved(&site.target, &startup_uses) { return false; }
+                            // This separately inspected source has no namespace edge to
+                            // or from startup. Its sole selected proof body is a closed
+                            // leaf. A local concrete call is not an actual invocation
+                            // unless a separate authored callable could seed symbolic
+                            // analysis elsewhere in this module (checked after the census).
+                            if is_dormant && std::ptr::eq(body, function)
+                                && matches!(&site.target, ResolvedCallTarget::ModuleCallable {
+                                    source, concrete: ConcreteCallSelection::Declaration, ..
+                                } if source == &module.initialization.source)
+                            {
+                                omitted_dormant_lexical_edge = true;
+                                return false;
+                            }
                             let (ResolvedCallTarget::ModuleCallable {
                                 source, declaration_span, concrete: ConcreteCallSelection::Declaration,
                             }, Some((self_owner, self_item, self_span))) = (&site.target, rank_self)
@@ -7174,7 +7189,9 @@ impl ProjectCallSiteResults {
                 }
             }
         }
-        if saw_dormant != dormant.is_some() { return None; }
+        if saw_dormant != dormant.is_some()
+            || (omitted_dormant_lexical_edge && dormant_has_authored_callable)
+        { return None; }
         Some(startup_uses)
     }
 
