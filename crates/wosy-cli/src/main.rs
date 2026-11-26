@@ -3318,8 +3318,57 @@ main_artifact = "main"
                             }
                             _ => None,
                         };
+                        // A known first authored path explains the terminal
+                        // difference only if the formal diagnostics are also
+                        // retained exactly and the omitted suffix is real.
+                        let first_condition = match *name {
+                            "typed-bool-startup" => Some("entry != 3"),
+                            "configured-transitive-dependencies" | "mixed-contextual-named" | "mixed-contextual-refutation" => Some("false"),
+                            "checked-loan-effects" => Some("local == 0"),
+                            "branching-array-proof" | "array-rank-mixed" => Some("head == 8"),
+                            _ => None,
+                        };
+                        let verified_cap1 = if cap == 1 && observed != baseline
+                            && !incumbent_refused && !candidate_refused
+                            && first_condition.is_some()
+                        {
+                            let report_records = |reports: &[configured_check::ConfiguredCheckReceipt]| {
+                                reports.iter().map(|row| row.outcome.as_ref().unwrap().directives.len()).sum::<usize>()
+                            };
+                            let first = &candidate[0].outcome.as_ref().unwrap().directives;
+                            let initial = &incumbent[0].outcome.as_ref().unwrap().directives;
+                            let diagnostic_signature = |reports: &[configured_check::ConfiguredCheckReceipt]| {
+                                reports.iter().flat_map(|row|
+                                    ordered_check_diagnostics(row.outcome.as_ref().unwrap(), &row.texts).unwrap()
+                                ).collect::<Vec<_>>()
+                            };
+                            let [selected] = first.as_slice() else { panic!("{name} cap1 must select one real path"); };
+                            let expected_condition = first_condition.unwrap();
+                            assert_eq!(selected.source.path, "src/main.w", "{name}");
+                            assert_eq!(&program[selected.condition.start as usize..selected.condition.end as usize],
+                                expected_condition, "{name}");
+                            assert_eq!(selected, &initial[0], "{name} original typed witness/first output");
+                            assert_eq!((selected.stdout(), selected.stderr(), selected.code()),
+                                (b"startup".as_slice(), b"".as_slice(), &0.into()), "{name}");
+                            assert_eq!(report_records(&candidate), 1, "{name}");
+                            assert!(report_records(&incumbent) > 1, "{name} must have real omitted records");
+                            let prior_diagnostics = diagnostic_signature(&incumbent);
+                            assert_eq!(diagnostic_signature(&candidate), prior_diagnostics, "{name} formal proof diagnostics");
+                            assert_eq!(observed.0, Ok(u8::from(!prior_diagnostics.is_empty())), "{name} authored zero and proof status");
+                            assert_eq!(observed.1, b"startup", "{name} actual selected output");
+                            assert!(observed.3.is_empty(), "{name} unselected files");
+                            if dependencies {
+                                assert_eq!(baseline.3, BTreeMap::from([
+                                    (".wosy/outputs/check/dep.txt".into(), b"dep".to_vec()),
+                                    (".wosy/outputs/check/leaf.txt".into(), b"leaf".to_vec()),
+                                ]));
+                            }
+                            true
+                        } else { false };
                         let label = if let Some(contract) = structural_contract {
                             contract
+                        } else if verified_cap1 {
+                            "verified-first-authored-cap1"
                         } else if incumbent_refused && candidate_refused {
                             "both-refused"
                         } else if incumbent_refused {
