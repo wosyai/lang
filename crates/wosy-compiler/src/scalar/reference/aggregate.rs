@@ -10283,6 +10283,19 @@ fn retained_failure_cone(
 
 }
 
+fn retained_owner_scalar_projection(
+    points: &[ReferenceFlowPoint], projection: &ReferenceFlowPoint, borrower_calls: &HashSet<CfgPointId>,
+    owners: &HashMap<CfgPointId, CfgPointId>,
+) -> bool {
+    let CfgPointKind::Call { output, target, argument_points, .. } = &projection.kind else { return false; };
+    *output > 0 && projection.possible_origins.as_ref().is_none_or(BTreeSet::is_empty)
+        && owners.get(&projection.id).is_some_and(|primary|
+            borrower_calls.contains(primary) && *primary < projection.id
+            && matches!(points.get(primary.0).map(|point| &point.kind), Some(CfgPointKind::Call {
+                output: 0, target: original, argument_points: original_arguments, ..
+            }) if original == target && original_arguments == argument_points))
+}
+
 // Reuse the canonical projected-null endpoint and the sealed access
 // cohort. A borrow may leave the owner live; it does not require a move and
 // recommit. Only predecessors of this endpoint participate, so neither a
@@ -10363,7 +10376,9 @@ fn retained_array_failure_receipt(
             | CfgPointKind::DeferredMoveThrough { .. } | CfgPointKind::ReborrowThrough { .. }
             | CfgPointKind::DeferredArrayElement { .. } => false,
             CfgPointKind::Call { argument_points, .. } =>
-                borrower_calls.contains(&point.id) || !argument_points.iter().copied().any(owner_origin),
+                borrower_calls.contains(&point.id) || !argument_points.iter().copied().any(owner_origin)
+                    || retained_owner_scalar_projection(&cfg.points, point, &borrower_calls,
+                        &result.proof_points.private_runtime_relay_projections),
             CfgPointKind::ReturnOutput { value_point, .. } => !owner_origin(*value_point),
             _ => !owner_origin(point.id),
         };
@@ -11627,6 +11642,34 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_owner_scalar_projection_is_the_same_authenticated_dispatch() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "flow".into(), "r1".into());
+        let span = ByteSpan::new(0, 0);
+        let point = |id, output, argument| ReferenceFlowPoint {
+            id: CfgPointId(id),
+            kind: CfgPointKind::Call {
+                expression: ScalarExpression::Boolean { value: true, span },
+                output, target: ResolvedCallTarget::Core(CoreOperationId::IntExtend),
+                argument_points: vec![CfgPointId(argument)],
+            },
+            source_span: SourceSpan::new(source.clone(), span),
+            scope: ReferenceScopeId(0),
+            possible_origins: None,
+            successors: Vec::new(),
+        };
+        let primary = CfgPointId(0);
+        let result = CfgPointId(2);
+        let actual = [point(0, 0, 8), point(1, 0, 9), point(2, 1, 8)];
+        let allowed = HashSet::from([primary]);
+        let prepared = HashMap::from([(result, primary)]);
+        assert!(retained_owner_scalar_projection(&actual, &actual[2], &allowed, &prepared));
+        assert!(!retained_owner_scalar_projection(&actual, &point(2, 1, 9), &allowed, &prepared));
+        assert!(!retained_owner_scalar_projection(&actual, &actual[2], &allowed, &HashMap::new()));
+        assert!(!retained_owner_scalar_projection(&actual, &actual[2], &allowed,
+            &HashMap::from([(result, CfgPointId(1))])));
+    }
 
     #[test]
     fn retained_failure_endpoint_requires_original_allocation_on_every_path() {

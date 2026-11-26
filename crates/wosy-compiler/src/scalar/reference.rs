@@ -5032,7 +5032,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
             target: target.clone(),
             argument_points: argument_points.clone(),
         };
+        let runtime_relay_projection = self.call_sites.checked_call_signatures.get(&ordinal)
+            .is_some_and(|signature| signature.outputs.outputs.get(output).is_some()
+                && aggregate::exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs));
         let projection = self.point_with_origins(kind, point.source_span.range, point.scope, None);
+        if runtime_relay_projection {
+            self.proof_points.private_runtime_relay_projections.insert(projection, producer);
+        }
         if checked_call_output {
             self.proof_points.resolved_checked_call_outputs.push(projection);
         }
