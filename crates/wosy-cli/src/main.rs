@@ -1093,17 +1093,16 @@ fn check_command(
         })?;
     let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
     let primary = receipts.first().ok_or_else(unsupported_output)?;
-    let mut checked = Vec::with_capacity(receipts.len());
-    for receipt in &receipts {
-        match &receipt.outcome {
-            Ok(report) => checked.push(report),
+    let checked = match checked_publication_reports(&receipts) {
+        Ok(checked) => checked,
+        Err(receipt) => match &receipt.outcome {
             Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
                 render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
                 return Ok(2);
             }
-            Err(_) => return Err("check: unsupported analysis; no result published".to_owned()),
-        }
-    }
+            _ => return Err("check: unsupported analysis; no result published".to_owned()),
+        },
+    };
     let publication = if receipts.len() == 1 {
         primary.plan_publication()
     } else {
@@ -1135,6 +1134,13 @@ fn check_command(
         render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
     }
     Ok(if authored_status != 0 { authored_status } else { u8::from(has_failure) })
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_publication_reports(
+    receipts: &[configured_check::ConfiguredCheckReceipt],
+) -> Result<Vec<&wosy_compiler::MainFlowProofReceipt>, &configured_check::ConfiguredCheckReceipt> {
+    receipts.iter().map(|receipt| receipt.outcome.as_ref().map_err(|_| receipt)).collect()
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2316,6 +2322,32 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
             fs::write(directory.join("wosy.toml"), content).unwrap();
             fs::write(directory.join("src/primary.w"), body(if package.is_empty() { "app" } else { package }, code)).unwrap();
         }
+        use std::num::NonZeroUsize;
+        let private = |cap| configured_check::check_targets_with_private_authored_limit(
+            root, None, "dev", ScalarCheckerScope::MainFlowOnly, NonZeroUsize::new(cap).unwrap(),
+        ).ok().unwrap();
+        fs::write(root.join("src/primary.w"), body("app", 0)).unwrap();
+        for (cap, expected, status) in [(1, &b"app"[..], 0), (2, &b"appa"[..], 4), (8, &b"appableaf"[..], 4)] {
+            let receipts = private(cap);
+            let checked = checked_publication_reports(&receipts).ok().unwrap();
+            let planned = plan_publication_for(checked[0], &receipts[0].texts, checked.iter().copied()).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(planned.prepare(root).ok().unwrap().publish(&mut out, &mut err).unwrap(), status);
+            assert_eq!(out, expected);
+            assert!(err.is_empty());
+            assert!(!root.join(".wosy").exists());
+        }
+        let leaf_source = root.join("leaf/src/primary.w");
+        fs::write(&leaf_source, "%%start u8 bad = true; %%end").unwrap();
+        let blocked = private(1);
+        let [failure] = blocked.as_slice() else { panic!("later static failure preempts cap"); };
+        assert_eq!(failure.root, root.join("leaf"));
+        assert!(matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_))));
+        assert!(checked_publication_reports(&blocked).is_err());
+        assert!(!root.join(".wosy").exists());
+        fs::write(&leaf_source, body("leaf", 6)).unwrap();
+        fs::write(root.join("src/primary.w"), body("app", 3)).unwrap();
+
         fs::write(root.join("leaf/src/dormant.w"), r#"%%start
 unit(u8) unseen = fn(value) {
     core.require(value < 1, { .stdout = "dormant"; .stderr = ""; .code = 7; .files = []; });

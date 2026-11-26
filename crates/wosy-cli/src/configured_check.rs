@@ -249,13 +249,14 @@ fn configured_target(
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (configuration, manifest) =
         ProjectConfiguration::load_with_manifest(&root).map_err(LoadError::Manifest)?;
-    configured_target_from_manifest(&root, &configuration, &manifest, target, profile, scope, dormant_paths)
+    prepare_target_from_manifest(&root, &configuration, &manifest, target, profile, scope, dormant_paths)
+        .map(PreparedConfiguredCheckReceipt::run)
 }
 
-fn configured_target_from_manifest(
+fn prepare_target_from_manifest(
     root: &Path, configuration: &ProjectConfiguration, manifest: &toml_edit::ImDocument<String>,
     target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
-) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let target = configuration.resolve_target(target).map_err(|_| LoadError::Target)?;
     let project = ProjectContext::from_manifest(root, &target, manifest.as_table())
@@ -269,23 +270,77 @@ fn configured_target_from_manifest(
             ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
         ),
     };
-    check_configured_proof_scope(&project, configuration, layout, scope, selection, None)
+    prepare_configured_proof_scope(&project, configuration, layout, scope, selection, None)
 }
 
 pub(crate) fn check_target_with_dependencies(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    map_dependency_owners(root, target, profile, scope, PreparedConfiguredCheckReceipt::run)
+}
+
+fn map_dependency_owners<T>(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    mut visit: impl FnMut(PreparedConfiguredCheckReceipt) -> T,
+) -> Result<Vec<T>, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (configuration, manifest, dependencies) = ProjectConfiguration::load_with_dependency_check_targets(&root)
         .map_err(LoadError::Dependency)?;
     let mut receipts = Vec::with_capacity(1 + dependencies.len());
-    receipts.push(configured_target_from_manifest(&root, &configuration, &manifest, target, profile, scope,
-        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?);
+    receipts.push(visit(prepare_target_from_manifest(&root, &configuration, &manifest, target, profile, scope,
+        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?));
     for dependency in dependencies {
-        receipts.push(check_resolved_dependency_primary(&dependency)?);
+        receipts.push(visit(prepare_resolved_dependency_primary(&dependency)?));
     }
     Ok(receipts)
+}
+
+/// Private configured proof-free dependency tranche. The default command
+/// still uses the legacy operation; no fallback from a failed bounded owner.
+#[cfg(test)]
+pub(crate) fn check_targets_with_private_authored_limit(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    let prepared = map_dependency_owners(root, target, profile, scope, std::convert::identity)?;
+    // Input failures precede selection and any staged output, even if a
+    // previous package would exhaust the shared authored quota.
+    if let Some(index) = prepared.iter().position(|receipt| receipt.check.is_err()) {
+        let receipt = prepared.into_iter().nth(index).expect("found prepared failure");
+        return Ok(vec![receipt.run()]);
+    }
+    let mut owners = Vec::with_capacity(prepared.len());
+    for PreparedConfiguredCheckReceipt { root, texts, check } in prepared {
+        let owner = match check.and_then(PreparedScalarOrderedCheck::into_startup_authored_owner) {
+            Ok(owner) => owner,
+            Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
+        };
+        owners.push((root, texts, owner));
+    }
+    let mut remaining = limit.get();
+    let mut selected = Vec::new();
+    for (root, texts, owner) in owners {
+        let Some(cap) = std::num::NonZeroUsize::new(remaining) else { break; };
+        let (directives, completion, active) = match owner.run(cap) {
+            Ok(report) => report,
+            Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
+        };
+        let Some(next) = remaining.checked_sub(directives.len()).filter(|next|
+            (*next == 0) == (completion == wosy_compiler::StartupAuthoredCompletion::LimitReached))
+        else {
+            return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }]);
+        };
+        remaining = next;
+        let report = MainFlowProofReceipt {
+            active, mixed_context_after_scalar: None, directives, diagnostics: Vec::new(),
+            contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
+            aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
+            entry_evidence: None,
+        };
+        selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
+    }
+    Ok(selected)
 }
 
 pub(crate) fn check_direct_dependency_primary(
@@ -295,25 +350,16 @@ pub(crate) fn check_direct_dependency_primary(
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (_, _, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(&root, dependency, None, None)
         .map_err(LoadError::Dependency)?;
-    check_resolved_dependency_primary(&selection)
+    prepare_resolved_dependency_primary(&selection).map(PreparedConfiguredCheckReceipt::run)
 }
 
-fn check_resolved_dependency_primary(
+fn prepare_resolved_dependency_primary(
     selection: &wosy_project::DirectDependencyCheckTarget,
-) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
-    check_configured_proof_scope(
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    prepare_configured_proof_scope(
         &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
         DormantSelection::DeclaredPackage(selection.source_directory.clone()), selection.git_checkout.as_ref(),
     )
-}
-
-fn check_configured_proof_scope(
-    project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
-    scope: ScalarCheckerScope, selection: DormantSelection<'_>,
-    checkout: Option<&wosy_project::packages::GitDirectory>,
-) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
-    prepare_configured_proof_scope(project, configuration, layout, scope, selection, checkout)
-        .map(PreparedConfiguredCheckReceipt::run)
 }
 
 fn prepare_configured_proof_scope(

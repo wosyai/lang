@@ -9820,16 +9820,56 @@ impl PreparedScalarOrderedCheck {
     pub fn search_startup_authored(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
-        self.search_startup_authored_path(cap).map(|(records, completion, _)| (records, completion))
+        self.search_startup_authored_path(cap).map(|(records, completion, _, _)| (records, completion))
             .map_err(configured_ordered_error)
     }
 
     fn search_startup_authored_path(
         self, cap: std::num::NonZeroUsize,
-    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch), ProjectCheck> {
-        let PreparedConfiguredCheck::Plain { owner, startup_count: 1 } = self.owner
-            else { return Err(ProjectCheck::Unsupported); };
-        if self.scope != ScalarCheckerScope::MainFlowOnly { return Err(ProjectCheck::Unsupported); }
+    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
+        self.into_startup_authored_owner().map_err(|_| ProjectCheck::Unsupported)?.run_path(cap)
+    }
+
+    /// Accepts only a proof-free owner and never drops possible dormant
+    /// package obligations. Call once before sharing a command budget.
+    #[doc(hidden)]
+    pub fn into_startup_authored_owner(self) -> Result<PreparedStartupAuthoredCheck, ScalarOrderedCheckerOutcome> {
+        let owner = match self.owner {
+            PreparedConfiguredCheck::Plain { owner, startup_count: 1 } => owner,
+            // Configured extraction assigns even an empty catalog a named
+            // preparation. Exactly the same empty/no-context disposition as
+            // the legacy path can use the proof-free authored lane.
+            PreparedConfiguredCheck::Named { owner, startup_count: 1 }
+                if owner.context.is_none() && owner.proofs.values().all(|catalog| catalog.definitions.is_empty())
+                => owner.prepared,
+            _ => return Err(ScalarOrderedCheckerOutcome::Unsupported),
+        };
+        let (project, _) = owner.parts();
+        let [module] = project.modules.as_slice() else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        if self.scope == ScalarCheckerScope::CurrentPackage {
+            let (_, deferred) = package_obligation_roots(&owner, self.scope, 1, &module.source).map_err(configured_ordered_error)?;
+            if !deferred.is_empty() { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
+        }
+        Ok(PreparedStartupAuthoredCheck { owner })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct PreparedStartupAuthoredCheck { owner: PreparedCheckerProject }
+
+#[cfg(feature = "internal-checker")]
+impl PreparedStartupAuthoredCheck {
+    pub fn run(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, bool), ScalarOrderedCheckerOutcome> {
+        self.run_path(cap).map(|(records, completion, _, active)| (records, completion, active)).map_err(configured_ordered_error)
+    }
+
+    fn run_path(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
+        let owner = self.owner;
         let (project, _) = owner.parts();
         let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
@@ -9840,9 +9880,9 @@ impl PreparedScalarOrderedCheck {
         let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
             .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
         if search.invalid() { return Err(ProjectCheck::Unsupported); }
-        let completion = match outcome {
-            Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
-            Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+        let (completion, active) = match outcome {
+            Ok((initialization, _)) if search.remaining() > 0 => (StartupAuthoredCompletion::Exhausted, initialization.had_obligations),
+            Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
             Err(error) => return Err(error),
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -9851,7 +9891,7 @@ impl PreparedScalarOrderedCheck {
         if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
             || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
         { return Err(ProjectCheck::Unsupported); }
-        Ok((effects.records, completion, search))
+        Ok((effects.records, completion, search, active))
     }
 }
 
@@ -14790,7 +14830,8 @@ mod tests {
                 ).ok().unwrap()
             };
             for cap in [1, 3] {
-                let (records, end, search) = prepare().search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                let (records, end, search, active) = prepare().search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert!(active);
                 assert_eq!(records.len(), cap.min(2));
                 assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
                 assert!(records.iter().all(|record| record.directive == records[0].directive));
@@ -14833,7 +14874,8 @@ mod tests {
             };
             let site = ByteSpan::new(program.find("if (selected)").unwrap() as u32 + 4,
                 program.find("if (selected)").unwrap() as u32 + 12);
-            let (records, completion, search) = prepare(&program).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            let (records, completion, search, active) = prepare(&program).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert!(active);
             assert_eq!(completion, StartupAuthoredCompletion::LimitReached);
             assert_eq!(records.iter().map(|record| record.code()).collect::<Vec<_>>(), [&BigInt::from(0)]);
             assert!(search.contains_branch(wosy_syntax::SourceSpan::new(app.clone(), site), true));
