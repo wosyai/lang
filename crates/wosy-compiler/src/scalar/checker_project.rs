@@ -1717,7 +1717,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     || first.contextual_storage.is_some() || second.contextual_storage.is_some()
                 { return Err(ProjectCheck::Unsupported); }
                 let ActualCallResult::ResultPair(pair) = run_scalar_initializer_call(
-                    topology, actual, source, outputs.primary, &first.ty, Some(checked.receivers()), &storage, failures, visits, false,
+                    topology, actual, source, outputs.primary, &first.ty, Some(checked.receivers()), &storage, failures, visits, false, None,
                 )? else { return Err(ProjectCheck::Unsupported); };
                 for (receiver, value) in [first, second].into_iter().zip(pair) {
                     let typed = initialized_proof_atom(&receiver.ty, value).ok_or(ProjectCheck::Unsupported)?;
@@ -1771,7 +1771,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                             wosy_syntax::SourceSpan::new(source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
                     }
                     let ActualCallResult::FixedArray(cells) = run_scalar_initializer_call(
-                        topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, false,
+                        topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, false, None,
                     )? else { return Err(ProjectCheck::Unsupported); };
                     if let Some(trace) = &trace {
                         let mut trace = trace.borrow_mut();
@@ -1814,7 +1814,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
                         match run_scalar_initializer_call(
-                            topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, receiver.contextual_storage.is_none(),
+                            topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, receiver.contextual_storage.is_none(), Some(expression),
                         )? {
                             ActualCallResult::Integer(value) => Cow::Owned(value),
                             #[cfg(feature = "internal-checker")]
@@ -1978,7 +1978,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         } else {
             None
         }
-    }, collection, #[cfg(feature = "internal-checker")] proof_site)? {
+    }, collection, None, #[cfg(feature = "internal-checker")] proof_site)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
         _ => Err(ProjectCheck::Unsupported),
@@ -2051,7 +2051,7 @@ fn reached_startup_condition(
         && topology.call_targets.contains_key(&condition)
     {
         return match run_scalar_initializer_call(
-            topology, actual, source, condition, &ScalarType::Bool, None, storage, failures, visits, false,
+            topology, actual, source, condition, &ScalarType::Bool, None, storage, failures, visits, false, None,
         )? {
             ActualCallResult::Integer(value) => super::checker_flow::bool_result_lane(&value)
                 .map(|lane| Some(lane == 1)).ok_or(ProjectCheck::Unsupported),
@@ -2128,7 +2128,7 @@ fn selected_startup_scalar<'a>(
         }
         ScalarExpression::Call { .. } => {
             let value = match run_scalar_initializer_call(
-                topology, actual, source, occurrence, expected, None, storage, failures, visits, false,
+                topology, actual, source, occurrence, expected, None, storage, failures, visits, false, None,
             )? {
                 ActualCallResult::Integer(value) => value,
                 ActualCallResult::EmptyScalar => return Ok(None),
@@ -2163,6 +2163,7 @@ fn run_scalar_initializer_call(
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] failures: &mut Option<&mut OrderedFailures>,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] visits: &[InitializationVisit],
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] passive_binding: bool,
+    binding_expression: Option<&ScalarExpression>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     #[cfg(feature = "internal-checker")]
     let proof_site = actual.initializer_proof_site(topology, source, occurrence, failures.as_deref());
@@ -2185,7 +2186,7 @@ fn run_scalar_initializer_call(
     run_initializer_call(
         topology, actual, occurrence, expected, pair_receivers,
         |argument, ty| initialized_scalar_initializer_argument(topology, storage, argument, ty),
-        collection,
+        collection, binding_expression,
         #[cfg(feature = "internal-checker")]
         proof_site,
     )
@@ -2199,6 +2200,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     pair_receivers: Option<&[BindingReceiverSlot]>,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
     collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] binding_expression: Option<&'a ScalarExpression>,
     #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
@@ -2260,13 +2262,37 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
                 search.owns_initialization(caller) && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == *target || recipe.forwarder.is_some_and(|(wrapper, _)| wrapper == *target))
                     && search.required_sites.get(&occurrence) == Some(&(*target, failure_search::StartupProofRole::Ranked))
             })));
+    #[cfg(feature = "internal-checker")]
+    let prepared_forwarder = wide_rank && collection.is_some_and(|(_, ordered)|
+        topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|target|
+            ordered.failures.borrow().startup_search.as_ref().is_some_and(|trace|
+                trace.borrow().wide_rank_recipe.as_ref().and_then(|recipe| recipe.forwarder)
+                    .is_some_and(|(wrapper, _)| wrapper == *target))));
     #[cfg(not(feature = "internal-checker"))]
     let wide_rank = false;
     let arguments = if wide_rank {
         if !(3..=MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len()) { return Err(ProjectCheck::Unsupported); }
         let tuple = signature.parameters.iter().enumerate().map(|(slot, parameter)| {
-            let (ty, value) = exact_typed_call_argument_at(&topology.structure, occurrence, slot, false, &initialized_argument)
-                .ok_or(ProjectCheck::Unsupported)?;
+            let actual = exact_typed_call_argument_at(&topology.structure, occurrence, slot, false, &initialized_argument);
+            #[cfg(feature = "internal-checker")]
+            let actual = actual.or_else(|| {
+                use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
+                if !prepared_forwarder { return None; }
+                let original = binding_expression?;
+                let ScalarExpression::Call { arguments, .. } = original else { return None; };
+                let argument = arguments.get(slot)?;
+                let ScalarExpression::Integer { value, .. } = argument else { return None; };
+                let OccurrenceNode::Expression(at) = topology.structure.edges.get(&(
+                    OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(slot),
+                ))? else { return None; };
+                let expressions = &topology.structure.checked_types.expressions;
+                let ty = expressions.get(at)?;
+                if topology.occurrences.get(occurrence.0)?.span != super::typecheck::expression_span(original)
+                    || topology.occurrences.get(at.0)?.span != super::typecheck::expression_span(argument)
+                { return None; }
+                Some((ty, value))
+            });
+            let (ty, value) = actual.ok_or(ProjectCheck::Unsupported)?;
             if ty != parameter || !integer_literal_fits_type(value, ty) { return Err(ProjectCheck::Unsupported); }
             Ok((ty, value))
         }).collect::<Result<Vec<_>, ProjectCheck>>()?;
@@ -30344,7 +30370,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let mut failures = OrderedFailures::default();
             let sink = RefCell::new(&mut failures);
             let result = run_initializer_call(topology, &mut actual, occurrence, &ScalarType::Bool, None, |_, _| None,
-                Some((caller, OrderedCallCollection::new(&sink, Some(&visits)))), None);
+                Some((caller, OrderedCallCollection::new(&sink, Some(&visits)))), None, None);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(sink.borrow().records.is_empty());
         }
@@ -30427,7 +30453,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let mut failures = OrderedFailures::default();
             let sink = RefCell::new(&mut failures);
             let result = run_initializer_call(topology, &mut actual, occurrence, &ScalarType::I8, None, |_, _| None,
-                Some((caller, OrderedCallCollection::new(&sink, Some(&visits)))), None);
+                Some((caller, OrderedCallCollection::new(&sink, Some(&visits)))), None, None);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(sink.borrow().records.is_empty());
             assert!(actual.active.is_empty());
