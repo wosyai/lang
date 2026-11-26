@@ -306,6 +306,8 @@ fn map_dependency_owners<T>(
 pub(crate) enum PrivateAuthoredPrimary {
     ProofFree,
     QualifiedNamed,
+    ReachedRanked,
+    GuardedContext,
 }
 
 /// Private configured fixture routes, never legacy fallback. The named
@@ -323,11 +325,11 @@ pub(crate) fn check_targets_with_private_authored_limit(
 #[cfg(test)]
 pub(crate) fn check_target_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
-    limit: std::num::NonZeroUsize,
+    limit: std::num::NonZeroUsize, primary: PrivateAuthoredPrimary,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
     let prepared = prepare_configured_target(root, target, profile, scope,
         (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?;
-    Ok(run_private_prepared_owners(vec![prepared], limit, PrivateAuthoredPrimary::ProofFree))
+    Ok(run_private_prepared_owners(vec![prepared], limit, primary))
 }
 
 #[cfg(test)]
@@ -344,14 +346,22 @@ fn run_private_prepared_owners(
     enum Owner {
         ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
         QualifiedNamed(PreparedScalarOrderedCheck),
+        ReachedRanked(PreparedScalarOrderedCheck),
+        GuardedContext(PreparedScalarOrderedCheck),
         DependencyProofOnly(PreparedScalarOrderedCheck),
     }
     let mut owners = Vec::with_capacity(prepared.len());
     for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
         let classified = check.and_then(|check| {
-            if index == 0 && matches!(primary, PrivateAuthoredPrimary::QualifiedNamed) {
-                Ok(Owner::QualifiedNamed(check))
-            } else if index != 0 && check.is_private_named_without_authored_paths()? {
+            if index == 0 {
+                return match primary {
+                    PrivateAuthoredPrimary::ProofFree => check.into_startup_authored_owner().map(Owner::ProofFree),
+                    PrivateAuthoredPrimary::QualifiedNamed => Ok(Owner::QualifiedNamed(check)),
+                    PrivateAuthoredPrimary::ReachedRanked => Ok(Owner::ReachedRanked(check)),
+                    PrivateAuthoredPrimary::GuardedContext => Ok(Owner::GuardedContext(check)),
+                };
+            }
+            if check.is_private_named_without_authored_paths()? {
                 Ok(Owner::DependencyProofOnly(check))
             } else {
                 check.into_startup_authored_owner().map(Owner::ProofFree)
@@ -386,13 +396,25 @@ fn run_private_prepared_owners(
                     contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
                     aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
                     entry_evidence: None,
-                }, completion,
+                }, Some(completion),
             )),
-            Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap),
+            Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap)
+                .map(|(report, completion)| (report, Some(completion))),
+            Owner::ReachedRanked(owner) => owner.search_startup_with_invoked_bare_and_reached_rank(cap)
+                .map(|(report, completion)| (report, Some(completion))),
+            Owner::GuardedContext(owner) => owner.search_startup_with_guarded_context(cap),
             Owner::DependencyProofOnly(_) => unreachable!("formal owners do not use the authored quota"),
         } {
             Ok(report) => report,
             Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
+        };
+        let Some(completion) = completion else {
+            // A verified contextual veto does not select or spend a path.
+            if report.contextual_diagnostic.is_none() || !report.directives.is_empty() {
+                return vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }];
+            }
+            selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
+            continue;
         };
         let Some(next) = remaining.checked_sub(report.directives.len()).filter(|next|
             (*next == 0) == (completion == wosy_compiler::StartupAuthoredCompletion::LimitReached))

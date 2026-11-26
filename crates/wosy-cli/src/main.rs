@@ -1021,6 +1021,14 @@ fn render_project_diagnostics(
 fn render_project_diagnostics_with_packages(
     diagnostics: &[wosy_compiler::Diagnostic], texts: &BTreeMap<ProjectSourceIdentity, String>, packages: bool,
 ) {
+    let stream = StandardStream::stderr(ColorChoice::Auto);
+    render_project_diagnostics_to(&mut stream.lock(), diagnostics, texts, packages);
+}
+
+fn render_project_diagnostics_to(
+    stderr: &mut impl codespan_reporting::term::termcolor::WriteColor,
+    diagnostics: &[wosy_compiler::Diagnostic], texts: &BTreeMap<ProjectSourceIdentity, String>, packages: bool,
+) {
     for diagnostic in diagnostics {
         let mut files = SimpleFiles::new();
         let labels = diagnostic
@@ -1058,9 +1066,7 @@ fn render_project_diagnostics_with_packages(
             report = report.with_code(diagnostic.code.clone());
         }
         let config = term::Config::default();
-        let stream = StandardStream::stderr(ColorChoice::Auto);
-        let mut stream_lock = stream.lock();
-        let _ = term::emit(&mut stream_lock, &config, &files, &report);
+        let _ = term::emit(stderr, &config, &files, &report);
     }
 }
 
@@ -1068,8 +1074,7 @@ fn render_project_diagnostics_with_packages(
 fn check_command(
     target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dependencies: bool,
 ) -> Result<u8, String> {
-    use configured_check::{CheckPublicationError, CheckPublicationPreflightError, ConfiguredCheckLoadError as LoadError};
-    use wosy_compiler::ScalarOrderedCheckerOutcome;
+    use configured_check::ConfiguredCheckLoadError as LoadError;
 
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
@@ -1091,13 +1096,27 @@ fn check_command(
             LoadError::PackageSourceRoot(error) => format!("check: {error}"),
             LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
+    let stream = StandardStream::stderr(ColorChoice::Auto);
+    let mut stderr = stream.lock();
+    publish_configured_check_receipts(&receipts, scope, dependencies,
+        &mut std::io::stdout().lock(), &mut stderr)
+}
+
+#[cfg(feature = "internal-checker")]
+fn publish_configured_check_receipts(
+    receipts: &[configured_check::ConfiguredCheckReceipt], scope: ScalarCheckerScope, dependencies: bool,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl codespan_reporting::term::termcolor::WriteColor,
+) -> Result<u8, String> {
+    use configured_check::{CheckPublicationError, CheckPublicationPreflightError};
+    use wosy_compiler::ScalarOrderedCheckerOutcome;
     let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
     let primary = receipts.first().ok_or_else(unsupported_output)?;
-    let checked = match checked_publication_reports(&receipts) {
+    let checked = match checked_publication_reports(receipts) {
         Ok(checked) => checked,
         Err(receipt) => match &receipt.outcome {
             Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
-                render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
+                render_project_diagnostics_to(stderr, diagnostics, &receipt.texts, dependencies);
                 return Ok(2);
             }
             _ => return Err("check: unsupported analysis; no result published".to_owned()),
@@ -1116,7 +1135,7 @@ fn check_command(
     {
         return Err(unsupported_output());
     }
-    let diagnostics = checked.iter().zip(&receipts)
+    let diagnostics = checked.iter().zip(receipts)
         .map(|(report, receipt)| ordered_check_diagnostics(report, &receipt.texts))
         .collect::<Result<Vec<_>, _>>()?;
     let authored = publication.prepare(&primary.root).map_err(|error| match error {
@@ -1126,12 +1145,12 @@ fn check_command(
         CheckPublicationPreflightError::ExitStatusOutsideByteRange =>
             "check: selected exit code is outside 0..=255; no result published".to_owned(),
     })?;
-    let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+    let authored_status = authored.publish(stdout, stderr)
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     let mut has_failure = false;
-    for (diagnostics, receipt) in diagnostics.iter().zip(&receipts) {
+    for (diagnostics, receipt) in diagnostics.iter().zip(receipts) {
         has_failure |= !diagnostics.is_empty();
-        render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
+        render_project_diagnostics_to(stderr, diagnostics, &receipt.texts, dependencies);
     }
     Ok(if authored_status != 0 { authored_status } else { u8::from(has_failure) })
 }
@@ -2494,6 +2513,7 @@ proof leaf_contract for echo(entry) -> (out) where (entry == 3) ensures (out == 
         fs::write(&root_dormant, &dormant_program).unwrap();
         let root_only = |scope, cap| configured_check::check_target_with_private_authored_limit(
             root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+            configured_check::PrivateAuthoredPrimary::ProofFree,
         ).ok().unwrap();
         for layout in ["native", "wasm-wasip1"] {
             let configured = app.replace("output = \"native\"", &format!("output = \"{layout}\""));
@@ -2555,6 +2575,181 @@ core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
         assert!(matches!(check_target_with_dependencies(root, None, "dev", ScalarCheckerScope::CurrentPackage),
             Err(ConfiguredCheckLoadError::Dependency(error)) if error.contains("Git dependencies require wosy.lock; dep sync does not select revisions")));
         assert!(!root.join(".wosy").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(feature = "internal-checker", target_os = "linux"))]
+    #[test]
+    fn private_configured_terminal_preserves_proofs_files_status_and_atomicity() {
+        use std::num::NonZeroUsize;
+        use codespan_reporting::term::termcolor::Buffer;
+        use configured_check::PrivateAuthoredPrimary::{GuardedContext, ProofFree, ReachedRanked};
+        let (fixture, _) = routing_test_project("private-configured-terminal", &[]);
+        let root = &fixture.root;
+        let manifest = |package: &str, output: &str| format!(r#"
+[package]
+name = "{package}"
+default_target = "main"
+source_root = "src"
+[comments]
+categories = []
+[builders]
+[runners]
+[targets.main]
+root = "src/main.w"
+default_profile = "dev"
+[targets.main.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.main.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "{output}"
+builder = "never"
+run_runner = "never"
+[targets.main.profiles.dev]
+main_artifact = "main"
+"#);
+        let authored = |code: u8, packet: &str| format!(r#"{{ .stdout = "{packet}"; .stderr = "[{packet}]"; .code = {code};
+            .files = [{{ .path = "{packet}.txt"; .text = "file:{packet}"; }}]; }}"#);
+        let first = authored(0, "first");
+        let second = authored(19, "second");
+        let ranked = format!(r#"%%start
+            u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+            u8(u8) echo = fn(value) {{ value }};
+            proof live for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {{
+                if (entry < 3) {{ core.show(out == 4); }} else {{ core.use(rank(entry - 3)); }}
+            }}
+            u8 recursed = descend(8);
+            u8 actual = echo(7);
+            core.require(recursed == 5, {first});
+            core.require(actual == 8, {second});
+        %%end"#);
+        let context = format!(r#"%%start
+            unit(u8) consume = fn(charged) {{
+                if (charged == 1) {{ core.context.credit = core.context.credit - 1; }}
+                else {{ core.context.credit = core.context.credit - 1; }};
+            }};
+            unit() entry = fn {{
+                u8 core.context.credit = 3;
+                consume(1);
+                core.require(false, {first});
+                core.require(false, {second});
+            }};
+            proof debit for consume(cost) -> (null) where (cost <= 1)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {{}}
+            entry();
+        %%end"#);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source = root.join("src/main.w");
+        let state = root.join(".wosy");
+        let reports_path = state.join("outputs/check");
+        let terminal = |receipts: &[configured_check::ConfiguredCheckReceipt], scope, dependencies| {
+            let (mut out, mut err) = (Vec::new(), Buffer::no_color());
+            let code = publish_configured_check_receipts(receipts, scope, dependencies, &mut out, &mut err);
+            (code, out, err.as_slice().to_vec())
+        };
+        let clean = || {
+            if state.exists() { fs::remove_dir_all(&state).unwrap(); }
+        };
+        let files = || {
+            let mut result = BTreeMap::new();
+            if reports_path.exists() {
+                for entry in fs::read_dir(&reports_path).unwrap() {
+                    let entry = entry.unwrap();
+                    result.insert(entry.file_name().into_string().unwrap(), fs::read(entry.path()).unwrap());
+                }
+            }
+            result
+        };
+        let first_file = BTreeMap::from([("first.txt".to_owned(), b"file:first".to_vec())]);
+        let both_files = BTreeMap::from([
+            ("first.txt".to_owned(), b"file:first".to_vec()), ("second.txt".to_owned(), b"file:second".to_vec()),
+        ]);
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(root.join("wosy.toml"), manifest("app", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let selected = |cap, route| configured_check::check_target_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(), route,
+                ).ok().unwrap();
+                let legacy = || match scope {
+                    ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, None, "dev"),
+                    ScalarCheckerScope::MainFlowOnly => configured_check::check_target(root, None, "dev", scope, Vec::new()),
+                }.ok().unwrap();
+                fs::write(&source, &ranked).unwrap();
+                let legacy_render = terminal(&[legacy()], scope, false);
+                assert_eq!(legacy_render.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                let cap_one = terminal(&selected(1, ReachedRanked), scope, false);
+                assert_eq!(cap_one.0, Ok(1)); // code zero selected; independent formal error remains
+                assert_eq!(cap_one.1, b"first");
+                assert_eq!(files(), first_file);
+                let suffix = legacy_render.2.strip_prefix(b"[first][second]").unwrap();
+                assert!(String::from_utf8_lossy(suffix).contains("call returned 7"));
+                assert_eq!(cap_one.2.strip_prefix(b"[first]"), Some(suffix));
+                clean();
+                assert_eq!(terminal(&selected(3, ReachedRanked), scope, false), legacy_render);
+                assert_eq!(files(), both_files);
+                clean();
+
+                fs::write(&source, context.replace(" where (cost <= 1)", "")).unwrap();
+                let legacy_context = terminal(&[legacy()], scope, false);
+                assert_eq!(legacy_context.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                fs::write(&source, &context).unwrap();
+                assert_eq!(terminal(&selected(3, GuardedContext), scope, false), legacy_context);
+                assert_eq!(files(), both_files);
+                clean();
+                let wrong = context.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+                fs::write(&source, &wrong).unwrap();
+                let refuted = terminal(&selected(1, GuardedContext), scope, false);
+                assert_eq!(refuted.0, Ok(1));
+                assert!(refuted.1.is_empty() && files().is_empty() && !state.exists());
+                let diagnostic = String::from_utf8_lossy(&refuted.2);
+                assert!(diagnostic.contains("proof obligation failed") && diagnostic.contains("explicit call entry: cost = 1")
+                    && diagnostic.contains("contextual value at entry: 3; at exit: 3") && diagnostic.contains("consume(1)")
+                    && !diagnostic.contains("[first]"));
+                assert_eq!(terminal(&selected(3, GuardedContext), scope, false), refuted);
+                fs::write(&source, wrong.replace("consume(1)", "consume(2)")).unwrap();
+                let excluded = terminal(&selected(1, GuardedContext), scope, false);
+                assert_eq!(excluded, (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+            }
+        }
+
+        // Real sibling dependency publications: only selected filenames
+        // conflict, but later selected-input typing is always completed.
+        let package = |name: &str, output: &str| {
+            let child = root.join(name);
+            fs::create_dir_all(child.join("src")).unwrap();
+            fs::write(child.join("wosy.toml"), manifest(name, output)).unwrap();
+            child.join("src/main.w")
+        };
+        let a = package("a", "native");
+        let b = package("b", "wasm-wasip1");
+        let same_file = |mark: &str, code: u8| format!(r#"%%start
+core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files = [{{ .path = "same.txt"; .text = "{mark}"; }}]; }});
+%%end"#);
+        fs::write(&a, same_file("a", 7)).unwrap();
+        fs::write(&b, same_file("b", 8)).unwrap();
+        fs::write(root.join("wosy.toml"), manifest("app", "native") + "\n[dependencies.a]\npath = \"a\"\n[dependencies.b]\npath = \"b\"\n").unwrap();
+        fs::write(&source, "%%start core.require(true, { .stdout = \"\"; .stderr = \"\"; .code = 0; .files = []; }); %%end").unwrap();
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let batch = |cap| configured_check::check_targets_with_private_authored_limit(
+            root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(), ProofFree,
+        ).ok().unwrap();
+        assert_eq!(terminal(&batch(1), scope, true), (Ok(7), b"a".to_vec(), Vec::new()));
+        assert_eq!(files(), BTreeMap::from([("same.txt".to_owned(), b"a".to_vec())]));
+        clean();
+        let duplicate = terminal(&batch(2), scope, true);
+        assert!(duplicate.0.unwrap_err().contains("no result published"));
+        assert!(duplicate.1.is_empty() && duplicate.2.is_empty() && !state.exists());
+        fs::write(&b, "%%start u8 bad = true; %%end").unwrap();
+        let invalid = terminal(&batch(1), scope, true);
+        assert_eq!(invalid.0, Ok(2));
+        assert!(invalid.1.is_empty() && String::from_utf8_lossy(&invalid.2).contains("b::src/main.w") && !state.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
