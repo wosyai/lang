@@ -1666,7 +1666,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     .and_then(|effects| effects.startup_search.as_ref())
                     .is_some_and(|search| {
                         let search = search.borrow();
-                        search.named_target.is_some() || search.proof_free_scalar_initializers
+                        search.named_target.is_some() || search.ranked_target.is_some() || search.proof_free_scalar_initializers
                     }))
                 && concrete_integer_literal(&binding.value).is_none()
             {
@@ -3170,6 +3170,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let at = wosy_syntax::SourceSpan::new(site_source.clone(), at);
             let trace = ordered.failures.borrow().startup_search.clone().ok_or(ProjectCheck::Unsupported)?;
             trace.borrow_mut().append(failure_search::PathStep::Call(at.clone())).ok_or(ProjectCheck::Unsupported)?;
+            #[cfg(test)]
+            if trace.borrow().ranked_target.is_some_and(|target|
+                self.calls.function_body(target.0, target.1, None).is_some_and(|rank| std::ptr::eq(rank, body))) {
+                trace.borrow_mut().ranked_entries.push(entry.clone().ok_or(ProjectCheck::Unsupported)?);
+            }
             cursor.track_startup_path(source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
             Some((at, trace))
         } else { None };
@@ -3326,7 +3331,22 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     };
                     #[cfg(not(feature = "internal-checker"))]
                     let routed_unit = false;
-                    let child = self.prepare_exact_child::<NAMED>(frame, call, active_collection, routed_unit)?;
+                    #[allow(unused_mut)]
+                    let mut child = self.prepare_exact_child::<NAMED>(frame, call, active_collection, routed_unit)?;
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(trace) = active_collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
+                        let traced_rank = trace.borrow().ranked_target;
+                        if traced_rank.is_none() || child.target.map(|target| target.0) != traced_rank
+                            || !std::ptr::eq(frame.body, child.body) || frame.source != child.source
+                        { return Err(ProjectCheck::Unsupported); }
+                        let span = frame.body.occurrences.get(call.occurrence().0)
+                            .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        trace.borrow_mut().append(failure_search::PathStep::Call(
+                            wosy_syntax::SourceSpan::new(frame.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                        child.cursor.track_startup_path(child.source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
+                        #[cfg(test)]
+                        trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?);
+                    }
                     frames.push(child);
                 }
                 ExactCallProgress::Failed(failure) => return Err(project_failure(body, source, failure)),
@@ -3419,6 +3439,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         // retain its ordinary witness, never manufacture an
                         // exit, summary, or postcondition for this occurrence.
                         proof.saw_guarded_nonreturn = true;
+                    }
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
+                        if trace.borrow().ranked_target != Some(target) || !matches!(&result, ActualCallResult::Integer(_)) {
+                            return Err(ProjectCheck::Unsupported);
+                        }
+                        let span = parent.body.occurrences.get(effect.occurrence().0)
+                            .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        trace.borrow_mut().append(failure_search::PathStep::Return(
+                            wosy_syntax::SourceSpan::new(parent.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
                     }
                     parent.cursor.resume(effect, caller_axis, result).ok_or(ProjectCheck::Unsupported)?;
                 }
@@ -3632,7 +3662,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         #[cfg(feature = "internal-checker")]
         if matches!(effect, ExactCallEffect::TailInteger { .. }) {
-            if collection.is_none() || parent.source != &owner.source || self.active.contains(&target) {
+            // The generic tail-call corridor still rejects active targets.
+            // Only the enrolled original typed self-tail site may proceed to
+            // the existing checked-decrement/strict-descent admission below.
+            let traced_self = ACTUAL_STARTUP && !NAMED && std::ptr::eq(caller, body)
+                && caller.self_tail_candidates.contains(&call) && !parent.followed_self_edge
+                && parent.entry.is_some()
+                && collection.is_some_and(|ordered| ordered.failures.borrow().startup_search.as_ref()
+                    .is_some_and(|trace| trace.borrow().ranked_target == Some(target)));
+            if collection.is_none() || parent.source != &owner.source || (self.active.contains(&target) && !traced_self) {
                 return Err(ProjectCheck::Unsupported);
             }
             if !ACTUAL_STARTUP {
@@ -3926,7 +3964,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
         #[cfg(feature = "internal-checker")]
-        let (startup_named, startup_plain_scalar) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
+        let (startup_named, startup_plain_scalar, startup_ranked) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
             let effects = ordered.failures.borrow();
             let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
             let matches_named = search.named_target == Some(target)
@@ -3935,23 +3973,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let matches_plain_scalar = search.proof_free_scalar_initializers && caller == &owner.source
                 && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
                 && is_integer_type(expected) && closed_startup_scalar_history(body);
+            let matches_ranked = search.ranked_target == Some(target) && search.ranked_observation.is_none()
+                && caller == &owner.source && ordered.scalar_initializer.is_some()
+                && signature.parameters.len() == 1 && is_integer_type(expected);
             let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
                 && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
-            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar)
+            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked)
                 || (caller != &owner.source && !cross_authorized)
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !body.checker_named_route_frame()) || !body.call_occurrences.is_empty()
-                || !body.structure.checker_direct_targets.is_empty()
+                || (!matches_plain_scalar && !body.checker_named_route_frame()) || (!matches_ranked && (!body.call_occurrences.is_empty()
+                    || !body.structure.checker_direct_targets.is_empty()))
                 || !body.structure.checker_selected_snapshots.is_empty()
                 || !body.structure.module_storage_uses.is_empty()
                 || !body.callable_escapes.is_empty()
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                 || !signature.parameters.iter().all(is_integer_type)
             { return Err(ProjectCheck::Unsupported); }
-            (matches_named, matches_plain_scalar)
-        } else { (false, false) };
+            (matches_named, matches_plain_scalar, matches_ranked)
+        } else { (false, false, false) };
         #[cfg(feature = "internal-checker")]
         if body.contextual_formal().is_some() {
             // Only the exact child activation path can install a formal.
@@ -4178,7 +4219,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(not(feature = "internal-checker"))]
         let exact_literal = None;
         #[cfg(feature = "internal-checker")]
-        let startup_named_result = (startup_named || startup_plain_scalar).then(|| {
+        let startup_named_result = (startup_named || startup_plain_scalar || startup_ranked).then(|| {
             let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
             let site = ordered.scalar_initializer.ok_or(ProjectCheck::Unsupported)?;
             let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -4188,10 +4229,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ActualCallResult::Integer(value) = result else { return Err(ProjectCheck::Unsupported); };
             let effects = ordered.failures.borrow();
             let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
-            if trace.named_target != Some(target) || trace.named_observation.is_some() {
-                return Err(ProjectCheck::Unsupported);
-            }
-            trace.named_observation = Some(failure_search::StartupNamedObservation {
+            let observation = if startup_ranked && trace.ranked_target == Some(target) {
+                &mut trace.ranked_observation
+            } else if startup_named && trace.named_target == Some(target) {
+                &mut trace.named_observation
+            } else { return Err(ProjectCheck::Unsupported); };
+            if observation.is_some() { return Err(ProjectCheck::Unsupported); }
+            *observation = Some(failure_search::StartupNamedObservation {
                 site: wosy_syntax::SourceSpan::new(ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?.clone(), at),
                 directive_position: effects.records.len(), parameter: parameter.clone(),
                 argument: (*argument).clone(), returned: value.clone(),
@@ -9937,6 +9981,18 @@ impl PreparedScalarOrderedCheck {
             .map_err(configured_ordered_error)
     }
 
+    /// Private proof checking and actual execution remain distinct: the
+    /// ranked conclusion is checked against the real traced return.
+    #[doc(hidden)]
+    pub fn search_startup_with_invoked_bare_and_reached_rank(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::InvokedAndReachedRank)
+            .map_err(configured_ordered_error)
+    }
+
     /// Private actual root call to a completed same-package namespace owner.
     #[doc(hidden)]
     pub fn search_startup_with_qualified_named(
@@ -10121,13 +10177,13 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        run_startup_authored_path(&self.owner, cap, None, false, &self.callable_roots, Some(&self.mandatory_startup_scalars))
+        run_startup_authored_path(&self.owner, cap, None, false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None)
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>,
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked_target: Option<PreparedCallable>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if qualified { 2 } else { 1 };
@@ -10138,13 +10194,15 @@ fn run_startup_authored_path(
     search.proof_free_scalar_initializers = proof_free_scalars.is_some();
     search.named_target = named_target;
     search.named_cross_source = qualified;
+    search.ranked_target = ranked_target;
     let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
     );
     let mut search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || named_target.is_some() != search.named_observation.is_some() { return Err(ProjectCheck::Unsupported); }
+    if search.invalid() || named_target.is_some() != search.named_observation.is_some()
+        || ranked_target.is_some() != search.ranked_observation.is_some() { return Err(ProjectCheck::Unsupported); }
     let (completion, active) = match outcome {
         Ok((initialization, _)) if search.remaining() > 0 => {
             if proof_free_scalars.is_some_and(|required| required.iter().any(|target| !initialization.reached.contains(target))) {
@@ -10237,7 +10295,7 @@ fn run_startup_authored_path(
 }
 
 #[cfg(feature = "internal-checker")]
-enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified, InvokedAndDormantRank }
+enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
 
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
@@ -10252,7 +10310,8 @@ fn run_private_named_after_startup(
         Some(project.modules.iter().find(|module| module.source != owner.source)
             .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
     } else { None };
-    let mixed_rank = matches!(mode, StartupNamedMode::InvokedAndDormantRank);
+    let reached_rank = matches!(mode, StartupNamedMode::InvokedAndReachedRank);
+    let mixed_rank = reached_rank || matches!(mode, StartupNamedMode::InvokedAndDormantRank);
     let count = if mixed_rank || matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
     let mut named_definitions = Vec::new();
     for (proof_source, catalog) in catalogs {
@@ -10306,7 +10365,8 @@ fn run_private_named_after_startup(
     let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
         plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
         ranked.as_ref().map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
-    if ranked.as_ref().is_some_and(|plan| incoming.get(&(plan.proof_source, plan.function.name_span)) != Some(&0)) {
+    if ranked.as_ref().is_some_and(|plan|
+        incoming.get(&(plan.proof_source, plan.function.name_span)) != Some(&usize::from(reached_rank))) {
         return Err(ProjectCheck::Unsupported);
     }
     let mut invoked = None;
@@ -10332,7 +10392,28 @@ fn run_private_named_after_startup(
         observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
     }
     observer.finish_plans(&owner.prepared, scope)?;
-    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified, &[], None)?;
+    let mut verified_rank = if reached_rank {
+        let plan = ranked.as_ref().ok_or(ProjectCheck::Unsupported)?;
+        let body = plan.typed.body;
+        let [call] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if !matches!(body.boundary.parameters.as_slice(), [parameter] if is_integer_type(&parameter.ty) && &parameter.ty == plan.typed.result_type)
+            || !body.self_tail_candidates.contains(&call.ordinal)
+            || body.structure.checker_direct_targets.get(&call.ordinal) != Some(&plan.target)
+        { return Err(ProjectCheck::Unsupported); }
+        Some(VerifiedInductionExactReturn::verify(plan, plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)
+            .1.ok_or(ProjectCheck::Unsupported)?)
+    } else { None };
+    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified,
+        &[], None, verified_rank.as_ref().map(|rank| rank.target))?;
+    if let Some(rank) = &mut verified_rank {
+        let reached = trace.ranked_observation.as_ref().ok_or(ProjectCheck::Unsupported)?;
+        // A checked theorem is comparison evidence only; the existing
+        // authoritative cursor computed and returned these actual bytes.
+        if reached.site.source != owner.source
+            || rank.consume(rank.target, &[&reached.argument], &reached.parameter).as_ref() != Some(&reached.returned)
+        { return Err(ProjectCheck::Unsupported); }
+        active = true;
+    }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
     if let Some(observed) = trace.named_observation {
         if observed.site.source != owner.source { return Err(ProjectCheck::Unsupported); }
@@ -10354,7 +10435,7 @@ fn run_private_named_after_startup(
         }
         proof.complete()?;
         let result = NamedOrderedEvidence::finish_symbolic(proof);
-        if let Some(plan) = &ranked {
+        if let Some(plan) = ranked.as_ref().filter(|_| !reached_rank) {
             // The original typed proof runs independently; no startup reach,
             // no imported equality, no fake call/return or authored quota use.
             let ranked = closed_ranked_evidence::<false>(&owner.source, startup_count, plan,
@@ -15334,6 +15415,66 @@ mod tests {
                 let early = main.replace("lib = namespace", &format!("core.require(false, {OUTPUT}); lib = namespace"));
                 assert!(matches!(prepare(&early, library).search_startup_with_qualified_named(NonZeroUsize::MIN),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_reached_rank_descends_actual_typed_frames_before_authored_cap() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-actual-rank");
+        let zero = OUTPUT.replace(".code = 1", ".code = 0");
+        let later = OUTPUT.replace(".code = 1", ".code = 19");
+        let program = format!(r#"%%start
+            u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+            u8(u8) echo = fn(value) {{ value }};
+            proof live for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {{
+                if (entry < 3) {{ core.show(out == 4); }} else {{ core.use(rank(entry - 3)); }}
+            }}
+            u8 recursed = descend(8);
+            u8 actual = echo(7);
+            core.require(recursed == 5, {zero});
+            core.require(actual == 8, {later});
+        %%end"#);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout: layout }, scope, Vec::new(),
+                    ).ok().unwrap()
+                };
+                let old = prepare(&program).run().unwrap();
+                for cap in [1, 3] {
+                    let limit = NonZeroUsize::new(cap).unwrap();
+                    let (report, end) = prepare(&program).search_startup_with_invoked_bare_and_reached_rank(limit).unwrap();
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(report.directives, old.directives[..cap.min(2)]);
+                    assert_eq!(report.directives[0].code(), &BigInt::from(0));
+                    let [actual] = report.diagnostics.as_slice() else { panic!("ordinary cap must not lose independently observed bare proof"); };
+                    assert_eq!(actual.invocation.call, old.diagnostics[0].invocation.call);
+                    assert!(report.symbolic_diagnostic.is_none());
+                    let PreparedConfiguredCheck::Named { owner, .. } = prepare(&program).owner else { panic!("named catalog"); };
+                    let (project, _) = owner.prepared.parts();
+                    let target = |name: &str| (0, project.modules[0].items.iter().position(|item|
+                        matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap());
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, limit, Some(target("echo")), false,
+                        &[], None, Some(target("descend"))).unwrap();
+                    assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
+                    assert_eq!(trace.ranked_observation.as_ref().unwrap().returned, BigInt::from(4));
+                    assert!(trace.call_paths().iter().all(|path| {
+                        path.iter().map(|site| &program[site.range.start as usize..site.range.end as usize]).collect::<Vec<_>>()
+                            == ["descend(8)", "descend(value - 3)", "descend(value - 3)", "echo(7)"]
+                    }));
+                }
+                let bad_rank = program.replace("ensures (out == 4)", "ensures (out == 5)").replace("core.show(out == 4)", "core.show(out == 5)");
+                let outside_guard = program.replace("where (entry <= 8)", "where (entry <= 7)");
+                for rejected in [bad_rank, outside_guard] {
+                    assert!(matches!(prepare(&rejected).search_startup_with_invoked_bare_and_reached_rank(NonZeroUsize::MIN),
+                        Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
             }
         }
     }
