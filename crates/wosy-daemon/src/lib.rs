@@ -41,6 +41,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
+mod derivation_image;
 mod pins;
 mod project_declarations;
 mod prepared_project;
@@ -66,6 +67,8 @@ pub struct SourceStore {
     project_commit: tokio::sync::Mutex<()>,
     prepared_projects: prepared_project::PreparationCache,
     source_reads: retention_plan::SourceReads,
+    #[cfg(test)]
+    test_without_derivation_image: bool,
 }
 
 #[derive(Default)]
@@ -107,6 +110,8 @@ impl SourceStore {
             tree, blobs: dir.join("cas"), base_flights: Default::default(),
             project_commit: Default::default(),
             prepared_projects: Default::default(), source_reads: Default::default(),
+            #[cfg(test)]
+            test_without_derivation_image: false,
         })
     }
 

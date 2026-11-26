@@ -118,15 +118,15 @@ impl RootedOrder {
     }
 }
 
-pub(super) fn projection_key(module: NodeId) -> [u8; 33] {
+pub(super) fn projection_key(image: NodeId, module: NodeId) -> [u8; 33] {
     let mut hasher = blake3::Hasher::new_derive_key(MODULE_DECLARATION_ABI);
     hasher.update(BASE_DECLARATION_ABI.as_bytes())
-        .update(wosy_syntax::base_cst_schema()).update(&module.0);
+        .update(wosy_syntax::base_cst_schema()).update(&image.0).update(&module.0);
     key(MODULE_DECLARATION_QUERIES, NodeId(*hasher.finalize().as_bytes()))
 }
 
-fn read_projection(tx: &Transaction, module: &ModuleInput) -> Result<Option<Projection>> {
-    let Some(id) = tx.get(&projection_key(module.id))? else { return Ok(None); };
+fn read_projection(tx: &Transaction, image: NodeId, module: &ModuleInput) -> Result<Option<Projection>> {
+    let Some(id) = tx.get(&projection_key(image, module.id))? else { return Ok(None); };
     let id = NodeId(id.as_slice().try_into()?);
     let node = read_node(tx, id)?;
     let [source, body, imports @ ..] = node.children.as_slice() else {
@@ -141,6 +141,17 @@ fn read_projection(tx: &Transaction, module: &ModuleInput) -> Result<Option<Proj
     Ok(Some(Projection { id, body: *body }))
 }
 
+fn compose_projection(
+    module: &ModuleInput, body: NodeId, projections: &[Option<Projection>],
+) -> (Projection, Node, Vec<u8>) {
+    let mut children = Vec::with_capacity(2 + module.imports.len());
+    children.extend([module.id, body]);
+    children.extend(module.imports.iter().map(|id| projections[id.0].expect("child projected").id));
+    let node = Node { kind: Kind::ModuleDeclarations, data: MODULE_DECLARATION_ABI.as_bytes().to_vec(), children };
+    let bytes = node.encode();
+    (Projection { id: Node::id(&bytes), body }, node, bytes)
+}
+
 impl SourceStore {
     pub async fn project_declarations(&self, root: NodeId) -> Result<Option<ProjectDeclarationsView<'_>>> {
         let Some(view) = self.snapshot(root)? else { return Ok(None); };
@@ -153,10 +164,13 @@ impl SourceStore {
         let root = snapshot.source.root;
         let (RootedOrder { modules, postorder }, source_read) =
             RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
-        let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        let cached: Vec<_> = modules.iter().map(|module| read_projection(&read, module))
-            .collect::<Result<_>>()?;
-        drop(read);
+        let image = self.derivation_image();
+        let cached: Vec<_> = if let Some(image) = image {
+            let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
+            modules.iter().map(|module| read_projection(&read, image, module)).collect::<Result<_>>()?
+        } else {
+            vec![None; modules.len()]
+        };
 
         let mut report = ProjectDeclarationReport::default();
         let mut bodies = Vec::new();
@@ -170,10 +184,19 @@ impl SourceStore {
         let projections = if bodies.is_empty() {
             report.modules_reused = cached.len();
             cached
-        } else {
-            let (projections, derived) = self.publish_projections(&modules, &postorder, &cached, &bodies).await?;
+        } else if let Some(image) = image {
+            let (projections, derived) = self.publish_projections(image, &modules, &postorder, &cached, &bodies).await?;
             report.modules_derived = derived;
             report.modules_reused = projections.len() - derived;
+            projections
+        } else {
+            let mut projections = cached;
+            // Every module derived a body above; without a verified image
+            // the exact same projection is composed only in memory.
+            for ordinal in postorder {
+                projections[ordinal] = Some(compose_projection(&modules[ordinal], bodies[ordinal].1, &projections).0);
+            }
+            report.modules_derived = projections.len();
             projections
         };
         let entry_projection = projections[0].expect("entry projection").id;
@@ -194,7 +217,7 @@ impl SourceStore {
     }
 
     async fn publish_projections(
-        &self, modules: &[ModuleInput], postorder: &[usize], cached: &[Option<Projection>],
+        &self, image: NodeId, modules: &[ModuleInput], postorder: &[usize], cached: &[Option<Projection>],
         bodies: &[(usize, NodeId)],
     ) -> Result<(Vec<Option<Projection>>, usize)> {
         // Do not hold this gate during CST extraction. Concurrent roots can
@@ -211,25 +234,20 @@ impl SourceStore {
                     continue;
                 }
                 let module = &modules[ordinal];
-                if let Some(existing) = read_projection(&tx, module)? {
+                if let Some(existing) = read_projection(&tx, image, module)? {
                     projections[ordinal] = Some(existing);
                     continue;
                 }
                 let body = bodies[&ordinal];
-                let mut children = Vec::with_capacity(2 + module.imports.len());
-                children.extend([module.id, body]);
-                children.extend(module.imports.iter().map(|id| projections[id.0].expect("child projected").id));
-                let node = Node { kind: Kind::ModuleDeclarations, data: MODULE_DECLARATION_ABI.as_bytes().to_vec(), children };
-                let bytes = node.encode();
-                let id = Node::id(&bytes);
-                if tx.get(&key(INTERN, id))?.is_none() {
-                    write_node(&mut tx, id, &bytes)?;
+                let (projection, node, bytes) = compose_projection(module, body, &projections);
+                if tx.get(&key(INTERN, projection.id))?.is_none() {
+                    write_node(&mut tx, projection.id, &bytes)?;
                     for (index, &child) in node.children.iter().enumerate() {
-                        write_edge(&mut tx, id, child_edge(node.kind, index).0, child)?;
+                        write_edge(&mut tx, projection.id, child_edge(node.kind, index).0, child)?;
                     }
                 }
-                tx.set(&projection_key(module.id), &id.0)?;
-                projections[ordinal] = Some(Projection { id, body });
+                tx.set(&projection_key(image, module.id), &projection.id.0)?;
+                projections[ordinal] = Some(projection);
                 derived += 1;
             }
             if derived == 0 {

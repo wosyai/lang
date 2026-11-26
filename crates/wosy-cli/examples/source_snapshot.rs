@@ -184,6 +184,13 @@ async fn main() -> Result<()> {
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
+    if selection.as_deref() == Some("--fixture-compiler-image") {
+        println!("{}", serde_json::json!({
+            "compiler_version": wosy_compiler::COMPILER_IDENTITY,
+            "fixture_image": option_env!("WOSY_TEST_COMPILER_IMAGE_LABEL"),
+        }));
+        return Ok(());
+    }
     if selection.as_deref() == Some("--persistent-source") {
         return source_state::run(&project, &dir, &mut args).await;
     }

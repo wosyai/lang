@@ -81,7 +81,7 @@ struct Marks {
 }
 
 fn walk(
-    tx: &Transaction, roots: impl IntoIterator<Item = NodeId>, class: u8,
+    tx: &Transaction, roots: impl IntoIterator<Item = NodeId>, image: Option<NodeId>, class: u8,
     limit: usize, marks: &mut Marks,
 ) -> Result<()> {
     let mut todo: Vec<_> = roots.into_iter().collect();
@@ -105,13 +105,17 @@ fn walk(
                 let authority = tx.get(&authority_key(FILE_AUTHORITY, id))?
                     .ok_or("missing namespace authority for source retention")?;
                 todo.push(decode_id(authority.as_ref())?);
-                if let Some(body) = tx.get(&base_declarations::query_key(node.children[1]))? {
-                    todo.push(decode_id(body.as_ref())?);
+                if let Some(image) = image {
+                    if let Some(body) = tx.get(&base_declarations::query_key(image, node.children[1]))? {
+                        todo.push(decode_id(body.as_ref())?);
+                    }
                 }
             }
             Kind::Module => {
-                if let Some(context) = tx.get(&project_declarations::projection_key(id))? {
-                    todo.push(decode_id(context.as_ref())?);
+                if let Some(image) = image {
+                    if let Some(context) = tx.get(&project_declarations::projection_key(image, id))? {
+                        todo.push(decode_id(context.as_ref())?);
+                    }
                 }
             }
             Kind::BaseDeclarations => {
@@ -217,8 +221,11 @@ impl SourceStore {
         let nominated: BTreeSet<_> = nominated.iter().copied().collect();
         let keep: BTreeSet<_> = keep.iter().copied().chain([scope]).collect();
 
-        let mut epoch = blake3::Hasher::new_derive_key("wosy source protection census v2");
+        let mut epoch = blake3::Hasher::new_derive_key("wosy source protection census v3");
         epoch.update(&scope.0);
+        let image = self.derivation_image();
+        if let Some(image) = image { framed_hash(&mut epoch, &image.0); }
+        else { framed_hash(&mut epoch, &[]); }
         for selection in [&nominated, &keep, &active] {
             epoch.update(&(selection.len() as u64).to_be_bytes());
             for id in selection { epoch.update(&id.0); }
@@ -263,8 +270,8 @@ impl SourceStore {
         }
 
         let mut marks = Marks::default();
-        walk(&tx, published.difference(&candidates).copied(), PROTECTED, limit, &mut marks)?;
-        walk(&tx, candidates.iter().copied(), CANDIDATE, limit, &mut marks)?;
+        walk(&tx, published.difference(&candidates).copied(), image, PROTECTED, limit, &mut marks)?;
+        walk(&tx, candidates.iter().copied(), image, CANDIDATE, limit, &mut marks)?;
 
         let mut report = SourceRetentionPlan {
             protection_epoch: NodeId(*epoch.finalize().as_bytes()),

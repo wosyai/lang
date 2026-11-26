@@ -83,9 +83,9 @@ impl BaseDeclarationsView {
     }
 }
 
-pub(super) fn query_key(executable: NodeId) -> [u8; 33] {
+pub(super) fn query_key(image: NodeId, executable: NodeId) -> [u8; 33] {
     let mut hasher = blake3::Hasher::new_derive_key(BASE_DECLARATION_ABI);
-    hasher.update(wosy_syntax::base_cst_schema()).update(&executable.0);
+    hasher.update(wosy_syntax::base_cst_schema()).update(&image.0).update(&executable.0);
     key(BASE_DECLARATION_QUERIES, NodeId(*hasher.finalize().as_bytes()))
 }
 
@@ -164,13 +164,14 @@ impl SourceStore {
     }
 
     async fn projected_base(&self, executable: NodeId, id: NodeId) -> Result<BaseOutput> {
-        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        if let Some(declarations) = self.read_base_declarations(&tx, id, executable)? {
-            return Ok(BaseOutput {
-                id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
-            });
+        if self.derivation_image().is_some() {
+            let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+            if let Some(declarations) = self.read_base_declarations(&tx, id, executable)? {
+                return Ok(BaseOutput {
+                    id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
+                });
+            }
         }
-        drop(tx);
         let output = self.query_base(executable, true).await?;
         if output.id != id {
             return Err("recomputed declarations differ from the rooted projection".into());
@@ -187,14 +188,15 @@ impl SourceStore {
     }
 
     async fn query_base(&self, executable: NodeId, load: bool) -> Result<BaseOutput> {
-        let query = query_key(executable);
+        let query = self.derivation_image().map(|image| query_key(image, executable));
 
         // The admitted file stays immutable; start the query transaction after
         // joining its flight so waiters see an already committed result.
-        let gate = self.base_flights.acquire(query);
-        let _permit = gate.lock().await;
+        let gate = query.map(|key| self.base_flights.acquire(key));
+        let _permit = if let Some(gate) = &gate { Some(gate.lock().await) } else { None };
         let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        if let Some(id) = read.get(&query)? {
+        let cached = query.map(|query| read.get(&query)).transpose()?.flatten();
+        if let Some(id) = cached {
             let id = NodeId(id.as_slice().try_into()?);
             let disposition = QueryDisposition::Reused;
             if !load {
@@ -209,10 +211,13 @@ impl SourceStore {
         drop(cst);
         drop(read);
         let bytes = serde_json::to_vec(&declarations)?;
-        let payload = self.pack_payload(bytes)?;
+        let payload = self.pack_payload(bytes, query.is_some())?;
         let node = Node { kind: Kind::BaseDeclarations, data: payload, children: vec![executable] };
         let encoded = node.encode();
         let id = Node::id(&encoded);
+        let Some(query) = query else {
+            return Ok(BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived });
+        };
         loop {
             let mut tx = self.tree.begin()?;
             tx.set_durability(Durability::Eventual);
@@ -266,7 +271,7 @@ impl SourceStore {
         Ok(Some(declarations))
     }
 
-    fn pack_payload(&self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+    fn pack_payload(&self, bytes: Vec<u8>, persist: bool) -> Result<Vec<u8>> {
         if bytes.len() <= INLINE_BYTES {
             let mut payload = Vec::with_capacity(1 + bytes.len());
             payload.push(INLINE);
@@ -274,9 +279,11 @@ impl SourceStore {
             return Ok(payload);
         }
         let digest = blake3::hash(&bytes);
-        fs::create_dir_all(&self.blobs)?;
-        let destination = self.blob_path(NodeId(*digest.as_bytes()));
-        write_blob(&self.blobs, &destination, &bytes)?;
+        if persist {
+            fs::create_dir_all(&self.blobs)?;
+            let destination = self.blob_path(NodeId(*digest.as_bytes()));
+            write_blob(&self.blobs, &destination, &bytes)?;
+        }
         let mut payload = vec![BLOB];
         payload.extend_from_slice(digest.as_bytes());
         Ok(payload)
