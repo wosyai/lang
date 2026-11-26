@@ -10968,6 +10968,73 @@ fn run_private_mixed_root_context(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
 
+/// Cited callable roots are never substitutes for ordinary call histories.
+/// With a complete zero-incoming census, the existing authored catalogue may
+/// check their original symbolic bodies after the ordinary startup caps out.
+#[cfg(feature = "internal-checker")]
+fn run_private_dormant_citation_catalog(
+    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>,
+    plans: &[PlannedModuleProof<'_>],
+) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+    let (project, calls) = owner.prepared.parts();
+    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let root = &owner.source;
+    if &module.source != root { return Err(ProjectCheck::Unsupported); }
+
+    let mut targets = Vec::with_capacity(plans.len());
+    let mut names = HashSet::with_capacity(plans.len());
+    let mut unique = HashSet::with_capacity(plans.len());
+    for plan in plans {
+        if plan.target.0 != 0 || plan.proof_source != root || !names.insert(plan.name)
+            || !(plan.has_no_authored_steps() || plan.public_calling_citation().is_some())
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            || !matches!(plan.typed.body.boundary.parameters.as_slice(), [input] if is_integer_type(&input.ty))
+            || !is_integer_type(plan.typed.result_type)
+        { return Err(ProjectCheck::Unsupported); }
+        if unique.insert(plan.target) { targets.push(plan); }
+    }
+    let incoming = calls.owned_direct_startup_callable_uses(root, None,
+        targets.iter().map(|plan| (root, plan.function.name_span)), None).ok_or(ProjectCheck::Unsupported)?;
+    if !incoming.values().all(Vec::is_empty) { return Err(ProjectCheck::Unsupported); }
+    let (_, authored) = package_obligation_roots(&owner.prepared, scope, 1, root)?;
+    if !authored.is_empty() { return Err(ProjectCheck::Unsupported); }
+
+    let [first, rest @ ..] = plans else { return Err(ProjectCheck::MissingRoot); };
+    let catalog = PublicProofCatalog { first, rest, index: std::cell::OnceCell::new() };
+    let mut observer = MainFlowProofObserver::from_prepared_plan(
+        scope, root, first, prepare_ordered_public_observation(first, Some(&catalog))?,
+    );
+    observer.first.1.issuer = None;
+    for plan in rest {
+        observer.insert(scope, false, plan, prepare_ordered_public_observation(plan, Some(&catalog))?);
+    }
+    observer.finish_plans(&owner.prepared, scope)?;
+    let evidence = NamedOrderedEvidence { observed: observer };
+    let (records, end, _, mut active) = run_startup_authored_path(&owner.prepared, cap, None, false, &[], None, None)?;
+    let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
+    let startup_records = effects.records.len();
+    let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
+        let mut symbolic = evidence.symbolic();
+        // Clause order stays intact in each group; symbolic callable roots
+        // are visited in their canonical declaration order.
+        targets.sort_unstable_by_key(|plan| plan.target);
+        for plan in targets {
+            active |= symbolic.try_collect(plan.target, plan.typed.body, plan.function, root, &mut effects,
+                SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+        }
+        symbolic.complete()?;
+        if effects.records.len() != startup_records || effects.has_authored_state || effects.has_selected_code
+            || !effects.snapshot_records.is_empty()
+        { return Err(ProjectCheck::Unsupported); }
+        NamedOrderedEvidence::finish_symbolic(symbolic)
+    } else { (None, Vec::new()) };
+    Ok((MainFlowProofReceipt {
+        active, mixed_context_after_scalar: None, directives: effects.records, diagnostics: Vec::new(),
+        contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
+        aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
+    }, end))
+}
+
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
     owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>, expected: Option<StartupNamedMode>,
@@ -11024,27 +11091,36 @@ fn run_private_named_after_startup(
         let body = plan.typed.body;
         if project.modules.get(plan.target.0).map(|module| &module.source) != Some(proof_source)
             || &plan.typed.target.source != proof_source
-            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
             || !is_integer_type(plan.typed.result_type) || !body.checker_pure_calling_frame()
             || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
             || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
             || !plan.function.overload_arms.is_empty()
-            || plans.iter().any(|previous: &PlannedModuleProof<'_>| previous.target == plan.target
-                || (previous.proof_source == plan.proof_source && previous.name == plan.name))
         { return Err(ProjectCheck::Unsupported); }
         if plan.typed.measure.is_some() {
-            if qualified || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0 {
-                return Err(ProjectCheck::Unsupported);
-            }
+            if qualified || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0
+                || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            { return Err(ProjectCheck::Unsupported); }
             ranked = Some(plan);
         } else {
-            if (!qualified && plans.len() >= 2) || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
-                || !body.structure.checker_direct_targets.is_empty()
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
             plans.push(plan);
         }
+    }
+    if plans.iter().any(|plan| plan.public_calling_citation().is_some()) {
+        if qualified || expected.is_some() || !arrays.is_empty() || ranked.is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        return run_private_dormant_citation_catalog(owner, scope, cap, &plans);
+    }
+    if !qualified && plans.len() > 2 { return Err(ProjectCheck::Unsupported); }
+    let mut targets = HashSet::with_capacity(plans.len());
+    let mut names = HashSet::with_capacity(plans.len());
+    for plan in &plans {
+        let body = plan.typed.body;
+        if !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
+            || !body.structure.checker_direct_targets.is_empty()
+            || !targets.insert(plan.target) || !names.insert((plan.proof_source, plan.name))
+        { return Err(ProjectCheck::Unsupported); }
     }
     if !arrays.is_empty() {
         if plans.len() > 1 { return Err(ProjectCheck::Unsupported); }

@@ -3153,6 +3153,74 @@ main_artifact = "main"
                     clean();
                 }
                 fs::remove_file(&shared_source).unwrap();
+                // A capped ordinary search cannot suppress an independent
+                // authenticated authored citation graph.
+                let cited = format!(r#"%%start
+                    i8(i8) execute = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
+                    i8(i8) producer = fn(input) {{ i8 result = execute(input); result }};
+                    proof top for producer(arg) -> (out) where (arg >= 0) ensures (out <= 8) {{ core.use(middle(arg)); }}
+                    proof middle for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {{ core.use(issued(arg)); }}
+                    proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {{}}
+                    core.require(false, {first});
+                    core.require(false, {second});
+                %%end"#);
+                let show = cited.replace("core.use(middle(arg));", "core.use(issued(arg)); core.show(out > 7);");
+                assert_ne!(show, cited);
+                for (program, bad) in [(&cited, false), (&show, true)] {
+                    fs::write(&source, program).unwrap();
+                    let historical = legacy();
+                    let historical_position = historical.outcome.as_ref().unwrap().symbolic_diagnostic.as_ref().map(|proof| proof.directive_position);
+                    let old = terminal(&[historical], scope, false);
+                    assert_eq!(old.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 1);
+                    assert!(report.diagnostics.is_empty());
+                    if bad && scope == ScalarCheckerScope::CurrentPackage {
+                        let proof = report.symbolic_diagnostic.as_ref().expect("required original cited show");
+                        assert_eq!(proof.directive_position, 1);
+                        assert_eq!(proof.returned, 7.into());
+                        let step = proof.failed_step.as_ref().unwrap();
+                        assert_eq!(step.source.path, "src/main.w");
+                        let range = step.range;
+                        assert!(program[range.start as usize..range.end as usize].contains("out > 7"));
+                        assert!(proof.witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                    } else {
+                        assert!(report.symbolic_diagnostic.is_none());
+                    }
+                    let clipped = terminal(&limited, scope, false);
+                    assert_eq!((clipped.0, clipped.1), (Ok(if bad && scope == ScalarCheckerScope::CurrentPackage { 1 } else { 0 }), b"first".to_vec()));
+                    assert_eq!(clipped.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    let exhausted = selected(8);
+                    let position = exhausted[0].outcome.as_ref().unwrap().symbolic_diagnostic.as_ref().map(|proof| proof.directive_position);
+                    let expected = (bad && scope == ScalarCheckerScope::CurrentPackage).then_some(2);
+                    assert_eq!((position, historical_position), (expected, expected));
+                    assert_eq!(terminal(&exhausted, scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+                }
+                let reached_citation = cited.replace("%%end", &format!(
+                    "i8 called = producer(3); core.require(called == 7, {unused_output}); %%end"));
+                fs::write(&source, reached_citation).unwrap();
+                assert!(matches!(selected(1)[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    for denied in [
+                        cited.replace("core.use(issued(arg));", "core.use(top(arg));"),
+                        cited.replace("ensures (out == 7)", "ensures (out == 6)"),
+                        cited.replacen("arg >= 0", "arg >= -1", 1),
+                    ] {
+                        assert_ne!(denied, cited);
+                        fs::write(&source, &denied).unwrap();
+                        assert!(matches!(selected(1)[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                        assert!(!state.exists());
+                    }
+                }
+
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
