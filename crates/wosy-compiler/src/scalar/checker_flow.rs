@@ -24,7 +24,11 @@ pub(super) enum CheckerPredicate {
     ProofReflexiveBranch(bool),
     Integer(IntegerPredicate),
     EntryDomain { binding: ReferenceBindingId, values: IntegerSet },
-    DirectiveDisjunction { binding: ReferenceBindingId, ty: ScalarType, atoms: [(IntegerRelation, BigInt); 2] },
+    DirectiveDisjunction {
+        binding: ReferenceBindingId, ty: ScalarType, atoms: [(IntegerRelation, BigInt); 2],
+        #[cfg(feature = "internal-checker")]
+        operands: [super::ByteSpan; 2],
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +153,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = false;
     #[cfg(feature = "internal-checker")]
     fn allows_extended_scalar_locals(self) -> bool { false }
+    #[cfg(feature = "internal-checker")]
+    fn allows_snapshot_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
@@ -319,12 +325,13 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>);
+struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>, bool);
 
 #[cfg(feature = "internal-checker")]
 impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     const ENABLED: bool = false;
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
+    fn allows_snapshot_history(self) -> bool { self.1 }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
 }
@@ -2027,6 +2034,8 @@ struct IntegerRoots<'a> {
     allow_real_integer_tail_call: bool,
     #[cfg(feature = "internal-checker")]
     allow_extended_scalar_locals: bool,
+    #[cfg(feature = "internal-checker")]
+    allow_snapshot_history: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
@@ -3748,13 +3757,13 @@ pub(super) fn search_closed_callable_histories(
     nested: Option<&mut CallableHistoryCallHandler<'_>>,
     select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<CallableHistoryCompletion> {
-    search_callable_history_frame(calls, entry, work, None, false, nested, select).map(|(end, _)| end)
+    search_callable_history_frame(calls, entry, work, None, false, false, nested, select).map(|(end, _)| end)
 }
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn search_callable_history_frame(
     calls: &FunctionCallSites, entry: IntegerRequirementEntry<'_>, work: &std::cell::Cell<usize>,
-    step_owner: Option<usize>, capture_unit: bool, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
+    step_owner: Option<usize>, capture_unit: bool, snapshot: bool, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
     mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<(CallableHistoryCompletion, Vec<UnitHistoryPiece>)> {
     if capture_unit && (!calls.checker_returns_unit() || !(1..=2).contains(&calls.boundary.parameters.len())) { return None; }
@@ -3790,7 +3799,7 @@ pub(super) fn search_callable_history_frame(
         accept_callable_history_return(&histories, returned, expected)
     };
     let result = collect_integer_requirement_failures_in_scope(calls, entry,
-        if allow_calls { Some(&mut call) } else { None }, allow_calls, false, &mut sink, TrackCallableHistory(&histories));
+        if allow_calls { Some(&mut call) } else { None }, allow_calls, false, &mut sink, TrackCallableHistory(&histories, snapshot));
     if unsupported { return None; }
     if histories.borrow().stopped { return Some((CallableHistoryCompletion::LimitReached, Vec::new())); }
     let (active, _) = result?;
@@ -3834,7 +3843,7 @@ pub(super) fn test_first_complete_history_packet(
     let mut failures = collection.as_mut();
     let mut imports: &mut [Option<ImportedLocal<'_>>] = &mut [];
     let _ = walk_integer_block::<false, true, _>(calls, &mut roots, calls.structure.root, inputs, None,
-        None, &mut None, &mut failures, &mut imports, TrackCallableHistory(&tracker));
+        None, &mut None, &mut failures, &mut imports, TrackCallableHistory(&tracker, false));
     selected.then_some(())
 }
 
@@ -6917,7 +6926,9 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         allow_symbolic_contextual_bool: COLLECT && !USE_IMPORTED_BOUND
             && authored_return.allows_extended_scalar_locals() && calls.structure.checker_has_bool_contextual_declaration,
         #[cfg(feature = "internal-checker")]
-        allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
+        allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS || authored_return.allows_snapshot_history(),
+        #[cfg(feature = "internal-checker")]
+        allow_snapshot_history: authored_return.allows_snapshot_history(),
         #[cfg(feature = "internal-checker")]
         allow_ordinary_contextual_places: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
             && calls.structure.has_ordinary_contextual_places(),
@@ -7517,16 +7528,38 @@ fn group_callable_rows<T>(
     Some(groups)
 }
 
+// Use the same typed numeric partition as the ordinary Boolean walker,
+// but keep the two authored operand decisions lost by its compact union.
+#[cfg(feature = "internal-checker")]
+fn partition_snapshot_disjunction(
+    roots: &IntegerRoots<'_>, before: &IntegerInputs, predicate: &CheckerPredicate, work: &mut usize,
+    mut event: impl FnMut(&mut IntegerInputs, super::ByteSpan, bool, &mut usize) -> Option<()>,
+) -> Option<[IntegerInputs; 2]> {
+    let CheckerPredicate::DirectiveDisjunction {
+        binding, ty, atoms: [(left, first), (right, second)], operands: [lhs, rhs],
+    } = predicate else { return None; };
+    let (axis, checked) = roots.lookup(binding)?;
+    if ty != checked { return None; }
+    let [mut remainder, mut first_pass] = before.ordinary_atom(
+        OrdinaryIntegerAtom::Literal(axis, *left, first), [true, true], work)?;
+    event(&mut first_pass, *lhs, true, work)?;
+    event(&mut remainder, *lhs, false, work)?;
+    let [mut rejecting, mut second_pass] = remainder.ordinary_atom(
+        OrdinaryIntegerAtom::Literal(axis, *right, second), [true, true], work)?;
+    event(&mut second_pass, *rhs, true, work)?;
+    event(&mut rejecting, *rhs, false, work)?;
+    charge_call_work(work, first_pass.0.len().checked_add(second_pass.0.len())?)?;
+    first_pass.0.append(&mut second_pass.0);
+    Some([rejecting, first_pass])
+}
+
 #[cfg(feature = "internal-checker")]
 fn project_callable_compound_directive<'a>(
     calls: &'a FunctionCallSites, roots: &mut IntegerRoots<'a>, path: &mut IntegerInputs,
-    site: OccurrenceOrdinal, tree: &super::reference::CheckerOrdinaryBoolean,
+    site: OccurrenceOrdinal, tree: Option<&super::reference::CheckerOrdinaryBoolean>,
     operation: CheckerOperation, failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
 ) -> Option<()> {
     let tracker = roots.callable_history?;
-    let OccurrenceNode::Expression(condition) = calls.structure.edges.get(&(
-        OccurrenceParent::Expression(site), OccurrenceEdge::CallArgument(0),
-    ))? else { return None; };
     let require = operation == CheckerOperation::Require;
     // Group the pre-directive structural histories before evaluating any
     // predicate. A Narrow can fail only when *all* its group's rows fail.
@@ -7537,8 +7570,27 @@ fn project_callable_compound_directive<'a>(
             charge_call_work(&mut work, row.len().checked_add(1)?)?;
             Some(row.clone())
         }).collect::<Option<Vec<_>>>()?);
-        let [rejecting, passing] = before.ordinary_boolean(tree, roots, [require, !require],
-            &mut work, Some((calls, *condition, tracker)))?;
+        let [rejecting, passing] = if let Some(tree) = tree {
+            let OccurrenceNode::Expression(condition) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(site), OccurrenceEdge::CallArgument(0),
+            ))? else { return None; };
+            before.ordinary_boolean(tree, roots, [require, !require],
+                &mut work, Some((calls, *condition, tracker)))?
+        } else {
+            if require || !roots.allow_snapshot_history { return None; }
+            let predicate = calls.structure.checker_directives.get(&site)?.predicate.as_ref()?;
+            // The existing shared history meter also covers each retained
+            // original operand event; no other domain operation intervenes.
+            let tracker_work = tracker.borrow().work;
+            let [rejecting, passing] = partition_snapshot_disjunction(roots, &before, predicate, &mut work,
+                |lane, span, yes, shared| {
+                    tracker_work.set(*shared);
+                    tracker.borrow_mut().append_rows(lane, span, yes)?;
+                    *shared = tracker_work.get();
+                    Some(())
+                })?;
+            [rejecting, passing]
+        };
         tracker.borrow().work.set(work);
         let rejected = if require {
             // The assertion must not affect subsequent flow. Only its
@@ -7913,6 +7965,47 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     #[cfg(feature = "internal-checker")]
+                    if COLLECT && roots.allow_snapshot_history && directive.operation == CheckerOperation::Narrow
+                        && matches!(directive.predicate, Some(CheckerPredicate::DirectiveDisjunction { .. }))
+                    {
+                        let predicate = directive.predicate.as_ref()?;
+                        if roots.callable_history.is_some() {
+                            project_callable_compound_directive(calls, roots, &mut path, expression, None, directive.operation, failures)?;
+                            continue;
+                        }
+                        if let Some((source, trace)) = roots.startup_trace.as_ref() {
+                            let [row] = path.0.as_slice() else { return None; };
+                            if row.iter().any(|domain| domain.singleton_value().is_none()) { return None; }
+                            let work = roots.ordinary_comparison_work.get_or_insert(0);
+                            let mut budget = *work;
+                            let mut events = Vec::with_capacity(2);
+                            let [rejecting, passing] = partition_snapshot_disjunction(roots, &path, predicate, &mut budget,
+                                |lane, span, taken, shared| {
+                                    if !lane.is_unreachable() {
+                                        charge_call_work(shared, 1)?;
+                                        events.push((span, taken));
+                                    }
+                                    Some(())
+                                })?;
+                            roots.ordinary_comparison_work = Some(budget);
+                            roots.reached_obligation = true;
+                            if passing.is_unreachable() == rejecting.is_unreachable() { return None; }
+                            if passing.is_unreachable() {
+                                let witness = std::mem::take(&mut path);
+                                (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                    directive: expression, equal_axes: witness.common_equal_axes(), state: witness, axes: roots.axes.clone(),
+                                });
+                                roots.after_startup_candidate()?;
+                            } else {
+                                for (span, taken) in events {
+                                    trace.borrow_mut().branch(wosy_syntax::SourceSpan::new((*source).clone(), span), taken)?;
+                                }
+                                path = passing;
+                            }
+                            continue;
+                        }
+                    }
+                    #[cfg(feature = "internal-checker")]
                     if roots.startup_trace.is_some() && (evaluated_guard.1.is_some()
                         || !matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))))
                     { return None; }
@@ -7974,7 +8067,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         if let Some(tree) = structure.checker_ordinary_booleans.get(&expression).filter(|tree|
                             call_free_history_boolean(tree))
                         {
-                            project_callable_compound_directive(calls, roots, &mut path, expression, tree, directive.operation, failures)?;
+                            project_callable_compound_directive(calls, roots, &mut path, expression, Some(tree), directive.operation, failures)?;
                             continue;
                         }
                     }
@@ -7988,7 +8081,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     if matches!(predicate, CheckerPredicate::Integer(_) | CheckerPredicate::DirectiveDisjunction { .. }) {
                         path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                     }
-                    if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
+                    if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms, .. }) = (COLLECT, predicate) {
                         let (axis, actual_type) = roots.lookup(binding)?;
                         if ty != actual_type {
                             return None;
@@ -9073,7 +9166,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     // construction captures. They add no witness columns.
                     if structure.checker_snapshot_copies.contains_key(&(block, item.position)) { continue; }
                     let shape = structure.checker_snapshot_locals.get(&(block, item.position))?;
-                    if shape.has_affine_leaf && !roots.allow_extended_scalar_locals { return None; }
+                    if shape.has_affine_leaf && !roots.allow_extended_scalar_locals && !roots.allow_snapshot_history { return None; }
                     use super::checker_directive::CheckerSnapshotOperand;
                     for field in shape.leaves.iter() {
                         match &field.operand {
@@ -9107,7 +9200,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     && structure.checker_ordinary_scalar_locals.get(&(block, item.position)).is_some_and(|origin|
                         matches!(&origin.kind, super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch { qualified_prefix: false, .. }));
                 #[cfg(feature = "internal-checker")]
-                if roots.allow_ordinary_integer_locals || exact_imported_match || history_match {
+                let history_snapshot_read = roots.allow_snapshot_history
+                    && structure.checker_ordinary_scalar_locals.get(&(block, item.position)).is_some_and(|origin|
+                        matches!(&origin.kind, super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead {
+                            index: super::reference::CheckerSnapshotReadIndex::Leaf(_), .. }));
+                #[cfg(feature = "internal-checker")]
+                if roots.allow_ordinary_integer_locals || exact_imported_match || history_match || history_snapshot_read {
                     if let Some(origin) = structure.checker_ordinary_scalar_locals.get(&(block, item.position)) {
                         let [receiver] = binding.receivers() else { return None; };
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
@@ -9132,7 +9230,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index } => {
                                 use super::reference::{CheckerSnapshotArrayOffset, CheckerSnapshotReadIndex};
-                                if !roots.allow_extended_scalar_locals { return None; }
+                                if !roots.allow_extended_scalar_locals && !history_snapshot_read { return None; }
                                 match index {
                                     CheckerSnapshotReadIndex::Leaf(leaf) => {
                                         let field = shape.leaves.get(*leaf)?;
@@ -9654,6 +9752,11 @@ pub(super) struct ExactCallCursor<'a> {
 }
 
 impl<'a> ExactCallCursor<'a> {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_snapshot_history(&mut self) {
+        self.roots.allow_snapshot_history = true;
+    }
+
     #[cfg(feature = "internal-checker")]
     pub(super) fn returns_startup_bool(&self) -> bool { self.tail == Some(&ScalarType::Bool) }
 

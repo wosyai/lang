@@ -7762,6 +7762,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = expression else {
             return self.checker_predicate(expression, names);
         };
+        #[cfg(feature = "internal-checker")]
+        let operands = [expression_span(left), expression_span(right)];
         let left = self.checker_integer_predicate(left, names)?;
         let right = self.checker_integer_predicate(right, names)?;
         if left.binding != right.binding || left.ty != right.ty {
@@ -7771,6 +7773,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         let rhs = IntegerRelation::from_operator(&right.operator)?;
         Some(CheckerPredicate::DirectiveDisjunction {
             binding: left.binding, ty: left.ty, atoms: [(lhs, left.bound), (rhs, right.bound)],
+            #[cfg(feature = "internal-checker")]
+            operands,
         })
     }
 

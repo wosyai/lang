@@ -3287,6 +3287,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             // may begin and finish this original source history.
             let exact_bool = ACTUAL_STARTUP && !NAMED && cursor.returns_startup_bool()
                 && trace.borrow().proof_free_scalar_initializers;
+            let snapshot = ACTUAL_STARTUP && !NAMED && trace.borrow().proof_free_scalar_initializers
+                && !body.structure.checker_selected_snapshots.is_empty();
+            if snapshot {
+                trace.borrow_mut().charge_formal_replay(1, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
+                cursor.allow_snapshot_history();
+            }
             cursor.track_startup_path(source, Rc::clone(&trace), exact_bool).ok_or(ProjectCheck::Unsupported)?;
             Some((at, trace, exact_bool))
         } else { None };
@@ -4269,6 +4275,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             if search.proof_only_continuation() && search.pending_named_startup_observation()
                 && !(matches_named || matches_ranked || matches_aggregate || matches_context_entry || matches_cited)
             { return Err(ProjectCheck::Unsupported); }
+            let snapshot_candidate = search.proof_free_scalar_initializers && caller == &owner.source
+                && *expected == ScalarType::Unit && !body.structure.checker_selected_snapshots.is_empty();
+            let matches_plain_snapshot = snapshot_candidate && closed_affine_snapshot_history(body);
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
                     && body.checker_named_route_frame() && literal_history_directives(body)));
@@ -4287,9 +4296,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_cited && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_plain_snapshot && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_cited && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
-                || !body.structure.checker_selected_snapshots.is_empty()
+                || (!matches_plain_snapshot && !body.structure.checker_selected_snapshots.is_empty())
                 || !body.structure.module_storage_uses.is_empty()
                 || !body.callable_escapes.is_empty()
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
@@ -10621,6 +10630,52 @@ fn witness_history_directives(body: &FunctionCallSites, compound: bool) -> bool 
 }
 
 #[cfg(feature = "internal-checker")]
+fn closed_affine_snapshot_history(body: &FunctionCallSites) -> bool {
+    use super::checker_directive::{CheckerSnapshotNode, CheckerStateSelection, CheckerStateType};
+    use super::reference::{CheckerOrdinaryScalarLocalKind, CheckerSnapshotReadIndex};
+    let structure = &body.structure;
+    body.checker_returns_unit() && body.contextual_formal().is_none()
+        && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+        && body.call_occurrences.is_empty() && structure.checker_direct_targets.is_empty()
+        && body.arms.is_empty() && body.allocation_length_calls.is_empty() && body.callable_escapes.is_empty()
+        && structure.module_storage_uses.is_empty() && !structure.has_ordinary_contextual_places()
+        && !structure.checker_has_bool_contextual_declaration && structure.checker_ordinary_directive_calls.is_empty()
+        && structure.blocks.iter().all(|block| !block.unsafe_context)
+        && !structure.checker_selected_snapshots.is_empty()
+        && structure.checker_selected_snapshots.iter().all(|key|
+            structure.checker_snapshot_locals.get(key).is_some_and(|shape|
+                matches!(&shape.root, CheckerSnapshotNode::Nominal { .. })
+                && shape.leaves.iter().all(|leaf| is_integer_type(&leaf.ty))))
+        && structure.checker_selected_snapshots.iter().any(|key|
+            structure.checker_snapshot_locals.get(key).is_some_and(|shape| shape.has_affine_leaf))
+        && structure.checker_ordinary_scalar_locals.values().all(|local|
+            matches!(&local.kind, CheckerOrdinaryScalarLocalKind::SnapshotRead { index: CheckerSnapshotReadIndex::Leaf(_), .. }))
+        && body.assignments.keys().all(|&(block, item)| {
+            super::checker_flow::checked_scalar_assignment(body, super::control::BlockPosition { block, item })
+                .is_some_and(|(_, ty, rhs, destination)| is_integer_type(ty)
+                    && structure.checker_integer_literals.contains_key(&rhs)
+                    && !structure.checker_contextual_occurrences.contains(&destination))
+        })
+        && body.conditionals.iter().all(|(expression, region)| {
+            let condition = match region {
+                ConditionalRegion::Unit { condition, .. } => condition,
+                ConditionalRegion::Value { condition, .. }
+                    if structure.checked_types.expressions.get(expression) == Some(&ScalarType::Unit) => condition,
+                _ => return false,
+            };
+            matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+        })
+        && structure.checker_directives.values().all(|directive|
+            (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                || (directive.operation == CheckerOperation::Narrow
+                    && matches!(directive.predicate, Some(CheckerPredicate::DirectiveDisjunction { .. }))))
+            && !directive.output.has_module_values && matches!(directive.output.code_value, CheckerCode::Literal(_))
+            && directive.output.state_files.iter().all(|file| matches!((&file.selection, &file.ty),
+                (CheckerStateSelection::Binding(_), CheckerStateType::Scalar(_))
+                | (CheckerStateSelection::Aggregate(_), CheckerStateType::Nominal(_)))))
+}
+
+#[cfg(feature = "internal-checker")]
 fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
     body.checker_returns_unit() && body.checker_named_route_frame()
         && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter|
@@ -10760,7 +10815,7 @@ fn closed_callable_history_height(
     super::checker_flow::charge_call_work(work, body.occurrences.len()
         .checked_add(body.structure.checker_integer_call_locals.len())?
         .checked_add(body.structure.checker_direct_targets.len())?)?;
-    if !closed_callable_history_body(body) { return None; }
+    if !closed_callable_history_body(body) && !closed_affine_snapshot_history(body) { return None; }
     let scalar_sites = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
     let mut height = 1;
     for &site in body.structure.checker_direct_targets.keys() {
@@ -10833,7 +10888,7 @@ impl ClosedAuthoredHistories<'_> {
         let nested = (!body.call_occurrences.is_empty())
             .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
         search_callable_history_frame(body, entry, self.work, (target.0 != origin).then_some(target.0), depth != 0,
-            nested, |failure, steps| (self.record)(target, failure, prefix, steps))
+            !body.structure.checker_selected_snapshots.is_empty(), nested, |failure, steps| (self.record)(target, failure, prefix, steps))
     }
 }
 
@@ -19515,6 +19570,67 @@ mod tests {
             .replace("value + 2", "value + 3");
         for invalid in [overflow, text.replace("value + 2", "value * 2")] {
             assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_affine_snapshot_preserves_live_capture_and_short_circuit_paths() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-affine-snapshot-history");
+        let text = r#"%%start
+            struct Snapshot { i8 raised; i8 reflected; i8 plain; }
+            unit(i8) inspect = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                Snapshot snapshot = { .raised = value + 2; .reflected = 7 - value; .plain = value; };
+                if (value == 1) {
+                    i8 read = snapshot.raised;
+                    core.require(read == 3, { .stdout = ""; .stderr = "lost preimage"; .code = 58; .files = []; });
+                };
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = "construction"; .code = 59;
+                    .files = [{ .path = "state.json"; .state = snapshot; }]; });
+            };
+        %%end"#;
+        let lhs = text.find("value == 1").unwrap();
+        let rhs = text.find("value == 3").unwrap();
+        let at = |start: usize| wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start as u32, start as u32 + 10));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new()).unwrap();
+            let expected = [1, 3].map(|value| format!(
+                "{{\"type\":{{\"kind\":\"struct\",\"name\":\"Snapshot\"}},\"value\":{{\"raised\":{{\"type\":{{\"kind\":\"i8\"}},\"value\":{}}},\"reflected\":{{\"type\":{{\"kind\":\"i8\"}},\"value\":{}}},\"plain\":{{\"type\":{{\"kind\":\"i8\"}},\"value\":{}}}}}}}\n",
+                value + 2, 7 - value, value));
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                for (index, value) in [1, 3].into_iter().enumerate() {
+                    let actual = text.replace("%%end", &format!("inspect({value}); %%end"));
+                    let old = prepare(&actual, scope).run().unwrap();
+                    for cap in [1, 3] {
+                        let (records, end, trace, _) = prepare(&actual, scope)
+                            .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                        assert_eq!(records, old.directives);
+                        assert_eq!(records[0].files()[0].text.as_ref(), expected[index].as_bytes());
+                        assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                        assert!(trace.contains_branch(at(lhs), value == 1));
+                        assert_eq!(trace.contains_branch(at(rhs), true), value == 3);
+                    }
+                }
+            }
+            for cap in [1, 2, 3] {
+                let (records, end, trace, _) = prepare(text, ScalarCheckerScope::CurrentPackage)
+                    .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert_eq!(records.len(), cap.min(2));
+                assert_eq!(end, if cap <= 2 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                for (record, file) in records.iter().zip(&expected) {
+                    assert_eq!(record.code(), &BigInt::from(59));
+                    assert_eq!(record.files()[0].text.as_ref(), file.as_bytes());
+                    assert_eq!(record.witness.axes().len(), 1, "do not expose synthetic capture axes");
+                }
+                assert!(trace.contains_branch(at(lhs), true));
+                assert_eq!(trace.contains_branch(at(lhs), false), cap >= 2);
+                assert_eq!(trace.contains_branch(at(rhs), true), cap >= 2);
+            }
         }
     }
 
