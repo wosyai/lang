@@ -570,10 +570,14 @@ data[0] = 2;
 }
 
 #[test]
-fn initializer_local_byte_extent_requires_one_closed_qualified_block() {
+fn initializer_local_scalar_extent_follows_dominated_blocks_and_refuses_address_escape() {
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        for (extra, enrolled) in [("", true), ("if (true) { data[1] = 8; };", false)] {
-            let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u8[count] data; data[0] = 7; {extra} 1 }} else {{ 2 }};\n%%end");
+        for (extra, enrolled) in [
+            ("", true),
+            ("if (true) { if (true) { data[1] = 8; u16 observed = data[1]; }; };", true),
+            ("unsafe { *?u16 escaped = &?data[0]; };", false),
+        ] {
+            let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u16[count] data; data[0] = 7; {extra} 1 }} else {{ 2 }};\n%%end");
             let source = SourceIdentity::new("p".into(), "app".into(), "extent.w".into(), "r1".into());
             let prepared = prepare_scalar_project(
                 vec![(declarations(&source, &text), Vec::new())],
@@ -591,6 +595,19 @@ fn initializer_local_byte_extent_requires_one_closed_qualified_block() {
             assert_eq!(nodes.checked_local_array(data), enrolled);
             assert_eq!(nodes.checked_local_index(place, base), enrolled.then_some(data.receivers[0].name_span));
             assert_eq!(nodes.checked_local_index(place, &base.as_ref().clone()), None);
+            if enrolled && !extra.is_empty() {
+                let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch: outer, .. }) =
+                    &then_branch.items[3] else { unreachable!("outer descendant") };
+                let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch: inner, .. }) =
+                    &outer.items[0] else { unreachable!("inner descendant") };
+                let ScalarBlockItem::Assignment(write) = &inner.items[0] else { unreachable!() };
+                let ScalarBlockItem::LocalBinding(observed) = &inner.items[1] else { unreachable!() };
+                let ScalarExpression::IndexedRead { place: read, .. } = &observed.value else { unreachable!() };
+                for projection in [&write.targets[0].place, read] {
+                    let ScalarPlace::Index { base, .. } = projection else { unreachable!() };
+                    assert_eq!(nodes.checked_local_index(projection, base), Some(data.receivers[0].name_span));
+                }
+            }
         }
     }
 }

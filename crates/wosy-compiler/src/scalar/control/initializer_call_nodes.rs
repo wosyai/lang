@@ -4,6 +4,7 @@ use super::super::reference::{
     BlockOrdinal, FunctionCallSites, OccurrenceEdge as Edge, OccurrenceNode as Node, OccurrenceParent as Parent,
     OccurrenceRole,
 };
+use super::super::reference::aggregate::ordinary_value;
 use super::super::typecheck::expression_span;
 use super::super::{
     CoreOperationId, ResolvedCallTarget, ScalarBindingOutput, ScalarBindingOutputOrigin, ScalarBlock,
@@ -29,6 +30,49 @@ pub(crate) struct InitializerCallNodes<'a> {
 pub(crate) struct BoundInitializerMember<'a> {
     pub(crate) identity: &'a InitializationMember,
     pub(crate) ty: &'a ScalarType,
+}
+
+#[derive(Default)]
+struct InitializerLexicalSites {
+    occurrences: HashMap<OccurrenceOrdinal, (Parent, Edge)>,
+    blocks: HashMap<BlockOrdinal, (Parent, Edge)>,
+}
+
+impl InitializerLexicalSites {
+    fn containing_item(&self, mut site: (Parent, Edge)) -> Option<BlockPosition> {
+        loop {
+            let (parent, edge) = site;
+            match parent {
+                Parent::Block(block) => {
+                    let item = match edge {
+                        Edge::BindingRoot { item, .. } | Edge::BindingAllocationLength { item, .. }
+                        | Edge::QueryAllocationPlaceholder { item, .. } | Edge::ExpressionItem { item }
+                        | Edge::FinalOutput { item, .. } | Edge::AssignmentRhs { item, .. }
+                        | Edge::AssignmentDestination { item, .. } => item,
+                        _ => return None,
+                    };
+                    return Some(BlockPosition { block, item });
+                }
+                Parent::Expression(ordinal) | Parent::Place(ordinal) => {
+                    let next = *self.occurrences.get(&ordinal)?;
+                    if matches!(next.0, Parent::Expression(other) | Parent::Place(other)
+                        if other.0 >= ordinal.0)
+                    { return None; }
+                    site = next;
+                }
+            }
+        }
+    }
+
+    fn follows_allocation(&self, owner: BlockPosition, mut use_site: BlockPosition) -> bool {
+        while use_site.block != owner.block {
+            let Some(ancestor) = self.blocks.get(&use_site.block)
+                .and_then(|&entry| self.containing_item(entry)) else { return false; };
+            if ancestor.block.0 >= use_site.block.0 { return false; }
+            use_site = ancestor;
+        }
+        owner.item < use_site.item
+    }
 }
 
 impl<'a> InitializerCallNodes<'a> {
@@ -102,7 +146,18 @@ impl<'a> InitializerCallNodes<'a> {
             nodes.targets.insert(std::ptr::from_ref(expression), (ordinal.0, target));
             Ok(())
         };
+            let record_initializer_places = topology.identities.roots.iter().any(|(place, root)| {
+            matches!(root, InitializationStorage::Lexical(_))
+                && matches!(topology.structure.checked_types.places.get(place),
+                    Some(ScalarType::RuntimeArray { element, .. }) if ordinary_value(element))
+        });
+        let mut indexed_reads = HashSet::new();
         let mut bind_type = |ordinal, expression: &'a ScalarExpression| {
+            if record_initializer_places && matches!(expression, ScalarExpression::IndexedRead { place, .. }
+                if matches!(place, ScalarPlace::Index { base, .. } if matches!(base.as_ref(), ScalarPlace::Name { .. })))
+            {
+                indexed_reads.insert(ordinal);
+            }
             if matches!(expression, ScalarExpression::Float { .. }) {
                 if let Some(ty @ (ScalarType::F32 | ScalarType::F64)) =
                     topology.structure.checked_types.expressions.get(&ordinal)
@@ -111,11 +166,8 @@ impl<'a> InitializerCallNodes<'a> {
                 }
             }
         };
-        let mut initializer_places = topology.identities.roots.iter().any(|(place, root)| {
-            matches!(root, InitializationStorage::Lexical(_))
-                && matches!(topology.structure.checked_types.places.get(place),
-                    Some(ScalarType::RuntimeArray { element, .. }) if element.as_ref() == &ScalarType::U8)
-        }).then(|| CallableProofNodes { initializer_bindings: true, ..Default::default() });
+        let mut initializer_places = record_initializer_places
+            .then(|| CallableProofNodes { initializer_bindings: true, ..Default::default() });
         Binder {
             structure: &topology.structure,
             source: &region.source,
@@ -127,7 +179,7 @@ impl<'a> InitializerCallNodes<'a> {
         }
         .initializer_items(region, items)?;
         if let Some(initializer_places) = initializer_places {
-            nodes.collect_local_array_indexes(topology, initializer_places);
+            nodes.collect_local_array_indexes(topology, initializer_places, &indexed_reads);
         }
         if nodes.targets.len() != topology.calls.len() {
             return Err(format!(
@@ -142,6 +194,7 @@ impl<'a> InitializerCallNodes<'a> {
         &mut self,
         topology: &ModuleInitializationTopology,
         nodes: CallableProofNodes<'a>,
+        indexed_reads: &HashSet<OccurrenceOrdinal>,
     ) {
         let structure = &topology.structure;
         let mut rejected = HashSet::new();
@@ -160,48 +213,54 @@ impl<'a> InitializerCallNodes<'a> {
                 rejected.insert(local.declaration_span);
             }
         }
-        let write_indexes = structure.edges.iter().filter_map(|(&(parent, edge), &node)| {
-            match (parent, edge, node) {
-                (Parent::Block(block), Edge::AssignmentDestination { item, destination: 0 }, Node::Place(index)) =>
-                    Some((index, (block, item))),
-                _ => None,
+        let mut sites = InitializerLexicalSites::default();
+        let mut indexed_bases = HashMap::new();
+        for (&(parent, edge), &node) in &structure.edges {
+            match node {
+                Node::Block(block) => { sites.blocks.insert(block, (parent, edge)); }
+                Node::Expression(ordinal) | Node::Place(ordinal) => {
+                    sites.occurrences.insert(ordinal, (parent, edge));
+                }
             }
-        }).collect::<HashMap<_, _>>();
-        let indexed_bases = structure.edges.iter().filter_map(|(&(parent, edge), &node)| {
-            match (parent, edge, node) {
-                (Parent::Place(index), Edge::PlaceBase, Node::Place(base)) => Some((base, index)),
-                _ => None,
+            if let (Parent::Place(index), Edge::PlaceBase, Node::Place(base)) = (parent, edge, node) {
+                indexed_bases.insert(base, index);
             }
-        }).collect::<HashMap<_, _>>();
+        }
         let places = nodes.places.into_iter().map(|(place, ordinal)| (ordinal, place)).collect::<HashMap<_, _>>();
         let mut candidates = Vec::new();
         for (&base, &root) in &topology.identities.roots {
             let InitializationStorage::Lexical(local) = root else { continue };
             let exact = (|| {
                 let &index = indexed_bases.get(&base)?;
-                let &(block, item) = write_indexes.get(&index)?;
-                if structure.blocks.get(block.0)?.span != local.block_span { return None; }
                 let Node::Expression(selector) = *structure.edges.get(&(Parent::Place(index), Edge::PlaceIndex))?
                     else { return None };
                 let ScalarType::RuntimeArray { element, .. } = structure.checked_types.places.get(&base)?
                     else { return None };
-                if *element.as_ref() != ScalarType::U8
+                if !ordinary_value(element)
                     || structure.checked_types.places.get(&index) != Some(element.as_ref())
                     || structure.checked_types.expressions.get(&selector) != Some(&ScalarType::U64)
                 { return None; }
-                let group = topology.assignments.get(&(block, item))?;
-                let destinations = group.destinations();
-                let [target] = destinations.as_slice() else { return None };
-                if target.destination != index || group.rhs_evaluations().len() != 1
-                    || group.projected_outputs().len() != 0
-                { return None; }
-                Some((local, block, item, *places.get(&index)?, *places.get(&base)?))
+                let &(parent, edge) = sites.occurrences.get(&index)?;
+                match (parent, edge) {
+                    (Parent::Block(block), Edge::AssignmentDestination { item, destination: 0 }) => {
+                        let group = topology.assignments.get(&(block, item))?;
+                        let destinations = group.destinations();
+                        let [target] = destinations.as_slice() else { return None };
+                        if target.destination != index || group.rhs_evaluations().len() != 1
+                            || group.projected_outputs().len() != 0
+                        { return None; }
+                    }
+                    (Parent::Expression(ordinal), Edge::ExpressionPlace) if indexed_reads.contains(&ordinal)
+                        && structure.checked_types.expressions.get(&ordinal) == Some(element.as_ref()) => {}
+                    _ => return None,
+                }
+                Some((local, sites.containing_item((parent, edge))?, *places.get(&index)?, *places.get(&base)?))
             })();
             if let Some(candidate) = exact { candidates.push(candidate); }
             else { rejected.insert(local.declaration_span); }
         }
-        // The qualified owner must be the original allocation in this very
-        // block and precede its only admitted uses. Never treat a spelling or
+        // The qualified owner must be the original lexical allocation.
+        // Each use must follow it in its block or in a dominated descendant. Never treat a spelling or
         // a coincident byte capacity as authority to enroll another binding.
         let mut owners = HashMap::new();
         for binding_node in nodes.initializer_allocations {
@@ -214,18 +273,18 @@ impl<'a> InitializerCallNodes<'a> {
             if structure.checked_types.expressions.get(length) != Some(&ScalarType::U64) { continue; }
             let [receiver] = binding_node.receivers.as_slice() else { continue };
             if !binding_node.is_allocation || !matches!(&receiver.ty,
-                ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+                ScalarType::RuntimeArray { element, .. } if ordinary_value(element))
             { continue; }
             if owners.insert(receiver.name_span, (binding, position, region.span)).is_some() {
                 rejected.insert(receiver.name_span);
             }
         }
-        for &(local, block, item, _, _) in &candidates {
+        for &(local, site, _, _) in &candidates {
             if !owners.get(&local.declaration_span).is_some_and(|(_, position, span)|
-                position.block == block && position.item < item && *span == local.block_span)
+                *span == local.block_span && sites.follows_allocation(**position, site))
             { rejected.insert(local.declaration_span); }
         }
-        for (local, _, _, index, base) in candidates {
+        for (local, _, index, base) in candidates {
             if rejected.contains(&local.declaration_span) { continue; }
             self.checked_local_arrays.insert(owners[&local.declaration_span].0);
             self.checked_local_indexes.insert(index, (base, local.declaration_span));
