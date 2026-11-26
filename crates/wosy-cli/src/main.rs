@@ -4009,6 +4009,67 @@ main_artifact = "main"
                     if qualified { fs::remove_file(&shared_source).unwrap(); }
                 }
 
+                let exact_typed = r#"%%start
+                    bool(bool, i8) choose = fn(flag, entry) {
+                        core.require(entry != 3, { .stdout = "producer"; .stderr = ""; .code = 0; .files = []; });
+                        if (flag) { true } else { false }
+                    };
+                    bool initialized = true;
+                    bool ready = choose(initialized, 3);
+                    i8 status = if (ready) {
+                        core.require(false, { .stdout = "yes"; .stderr = ""; .code = 5; .files = []; });
+                        7
+                    } else {
+                        core.require(false, { .stdout = "no"; .stderr = ""; .code = 6; .files = []; });
+                        8
+                    };
+                    core.require(status < 7, { .stdout = "after"; .stderr = ""; .code = status;
+                        .files = [{ .path = "typed.json"; .state = status; }]; });
+                %%end"#;
+                for (flag, stream, status, value) in [(true, "yes", 5, 7), (false, "no", 6, 8)] {
+                    for direct in [false, true] {
+                        let mut actual = exact_typed.replace("bool initialized = true;", &format!("bool initialized = {flag};"));
+                        if direct {
+                            actual = actual.replace("bool ready = choose(initialized, 3);", "")
+                                .replace("if (ready)", "if (choose(initialized, 3))");
+                        }
+                        fs::write(&source, &actual).unwrap();
+                        let old = terminal(&[legacy()], scope, false);
+                        let full = format!("producer{stream}after").into_bytes();
+                        assert_eq!(old, (Ok(status), full, Vec::new()));
+                        let old_files = files();
+                        assert_eq!(old_files["typed.json"], format!("{{\"type\":{{\"kind\":\"i8\"}},\"value\":{value}}}\n").as_bytes());
+                        clean();
+                        assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"producer".to_vec(), Vec::new()));
+                        assert!(!state.exists());
+                        assert_eq!(terminal(&selected(2), scope, false),
+                            (Ok(status), format!("producer{stream}").into_bytes(), Vec::new()));
+                        assert!(!state.exists());
+                        assert_eq!(terminal(&selected(8), scope, false), old);
+                        assert_eq!(files(), old_files);
+                        clean();
+                    }
+                }
+                let unsupported = exact_typed.replace("if (ready)", "if (ready || false)");
+                fs::write(&source, unsupported).unwrap();
+                let refused = terminal(&selected(8), scope, false);
+                assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty() && !state.exists());
+
+                let nullary = r#"%%start
+                    i8() code = fn {
+                        core.require(false, { .stdout = "nullary"; .stderr = ""; .code = 0; .files = []; });
+                        7
+                    };
+                    i8 observed = code();
+                    core.require(observed != 7, { .stdout = "after"; .stderr = ""; .code = observed; .files = []; });
+                %%end"#;
+                fs::write(&source, nullary).unwrap();
+                let old = terminal(&[legacy()], scope, false);
+                assert_eq!(old, (Ok(7), b"nullaryafter".to_vec(), Vec::new()));
+                assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"nullary".to_vec(), Vec::new()));
+                assert_eq!(terminal(&selected(8), scope, false), old);
+                assert!(!state.exists());
+
                 let startup_witness = r#"%%start
                     i8 status = -37;
                     bool ready = true;

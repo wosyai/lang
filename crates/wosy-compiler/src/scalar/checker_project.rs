@@ -1693,6 +1693,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures)
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
+                && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
                 && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
                     .and_then(|effects| effects.startup_search.as_ref())
                     .is_some_and(|search| {
@@ -2015,6 +2016,12 @@ fn startup_trace_requested(failures: &Option<&mut OrderedFailures>) -> bool {
     failures.as_ref().is_some_and(|effects| effects.startup_search.is_some())
 }
 
+#[cfg(feature = "internal-checker")]
+fn startup_ordinary_scalars_requested(failures: &Option<&mut OrderedFailures>) -> bool {
+    failures.as_ref().and_then(|effects| effects.startup_search.as_ref())
+        .is_some_and(|trace| trace.borrow().proof_free_scalar_initializers)
+}
+
 fn reached_startup_condition(
     topology: &ModuleInitializationTopology,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
@@ -2026,7 +2033,11 @@ fn reached_startup_condition(
     allow_authored_startup: bool,
 ) -> Result<Option<bool>, ProjectCheck> {
     #[cfg(feature = "internal-checker")]
-    if startup_trace_requested(failures) && !topology.initializer_predicates.get(&condition).is_some_and(startup_trace_atomic) {
+    if startup_trace_requested(failures) && !topology.initializer_predicates.get(&condition).is_some_and(startup_trace_atomic)
+        && !(startup_ordinary_scalars_requested(failures) && !topology.initializer_predicates.contains_key(&condition)
+            && topology.structure.checked_types.expressions.get(&condition) == Some(&ScalarType::Bool)
+            && topology.call_targets.contains_key(&condition))
+    {
         return Err(ProjectCheck::Unsupported);
     }
     if let Some(predicate) = topology.initializer_predicates.get(&condition) {
@@ -2076,6 +2087,11 @@ fn selected_startup_scalar<'a>(
         }
         let Some(taken) = reached_startup_condition(topology, actual, source, *condition,
             storage, failures, visits, true)? else { return Ok(None); };
+        if let Some(trace) = failures.as_ref().and_then(|effects| effects.startup_search.as_ref()) {
+            let site = topology.occurrences.get(condition.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            trace.borrow_mut().branch(wosy_syntax::SourceSpan::new(source.clone(), site.span), taken)
+                .ok_or(ProjectCheck::Unsupported)?;
+        }
         let (ast, selected) = if taken { (then_branch, then_block) } else { (else_branch, else_block) };
         let block = topology.structure.blocks.get(selected.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let Some((item, statements)) = block.items.split_last() else { return Err(ProjectCheck::Unsupported); };
@@ -2153,7 +2169,8 @@ fn run_scalar_initializer_call(
     #[cfg(feature = "internal-checker")]
     let collection = sink.as_ref().map(|failures| {
         let traced = failures.borrow().startup_search.as_ref().is_some_and(|trace|
-            passive_binding || (matches!(expected, ScalarType::Array { .. }) && trace.borrow().has_aggregate_site(source, occurrence)));
+            passive_binding || trace.borrow().proof_free_scalar_initializers
+                || (matches!(expected, ScalarType::Array { .. }) && trace.borrow().has_aggregate_site(source, occurrence)));
         (source, OrderedCallCollection {
             scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
             startup_site: traced.then_some(OrderedInitializerCall { topology, occurrence }),
@@ -3265,8 +3282,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 self.calls.function_body(target.0, target.1, None).is_some_and(|rank| std::ptr::eq(rank, body))) {
                 trace.borrow_mut().ranked_entries.push(entry.clone().ok_or(ProjectCheck::Unsupported)?);
             }
-            cursor.track_startup_path(source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
-            Some((at, trace))
+            // Bool is represented by an exact scalar atom, not by Unit or a
+            // projected result. Only the prepared proof-free initializer route
+            // may begin and finish this original source history.
+            let exact_bool = ACTUAL_STARTUP && !NAMED && cursor.returns_startup_bool()
+                && trace.borrow().proof_free_scalar_initializers;
+            cursor.track_startup_path(source, Rc::clone(&trace), exact_bool).ok_or(ProjectCheck::Unsupported)?;
+            Some((at, trace, exact_bool))
         } else { None };
         let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
@@ -3288,10 +3310,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
         }
         #[cfg(feature = "internal-checker")]
-        if let Some((site, trace)) = authored_site {
+        if let Some((site, trace, exact_bool)) = authored_site {
             if trace.borrow().invalid() { return Err(ProjectCheck::Unsupported); }
             if trace.borrow().remaining() == 0 && trace.borrow().cannot_continue() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
-            if matches!(result, Ok(ActualCallResult::Unit | ActualCallResult::Integer(_))) {
+            let completed = match &result {
+                Ok(ActualCallResult::Unit) => !exact_bool,
+                Ok(ActualCallResult::Integer(value)) => !exact_bool || (*value == BigInt::from(0) || *value == BigInt::from(1)),
+                _ => false,
+            };
+            if exact_bool && result.is_ok() && !completed { return Err(ProjectCheck::Unsupported); }
+            if completed {
                 trace.borrow_mut().append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
             }
         }
@@ -3526,6 +3554,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             && closed_startup_qualified_scalar_wrapper(frame.body, frame.source)
                             && matches!(call, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
                             && closed_startup_scalar_history(child.body)
+                            && matches!(child.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty))
                             && child.body.structure.checker_directives.is_empty()
                             && child.body.contextual_formal().is_none();
                         let cited_helper = NAMED && frame.source == child.source
@@ -3538,7 +3567,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
                         trace.borrow_mut().append(failure_search::PathStep::Call(
                             wosy_syntax::SourceSpan::new(frame.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
-                        child.cursor.track_startup_path(child.source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
+                        child.cursor.track_startup_path(child.source, Rc::clone(&trace), false).ok_or(ProjectCheck::Unsupported)?;
                         #[cfg(test)]
                         if rank_self { trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?); }
                     }
@@ -4215,8 +4244,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let plain_scalar_wrapper = search.proof_free_scalar_initializers && caller == &owner.source
                 && closed_startup_qualified_scalar_wrapper(body, &owner.source);
             let matches_plain_scalar = search.proof_free_scalar_initializers
-                && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
-                && is_integer_type(expected) && (closed_startup_scalar_history(body) || plain_scalar_wrapper);
+                && ordered.startup_site.is_some()
+                && ((is_integer_type(expected) || (module_bool_initializer && *expected == ScalarType::Bool))
+                    && closed_startup_scalar_history(body)
+                    || (signature.parameters.len() == 1 && is_integer_type(expected) && plain_scalar_wrapper));
             let matches_ranked = pending == Some(&(target, Ranked))
                 && caller == &owner.source && ordered.scalar_initializer.is_some()
                 && signature.parameters.len() == 1 && is_integer_type(expected);
@@ -4262,7 +4293,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || !body.structure.module_storage_uses.is_empty()
                 || !body.callable_escapes.is_empty()
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
-                || !signature.parameters.iter().all(is_integer_type)
+                || (!matches_plain_scalar && !signature.parameters.iter().all(is_integer_type))
             { return Err(ProjectCheck::Unsupported); }
             (matches_named, matches_plain_scalar, matches_ranked, matches_cited)
         } else { (false, false, false, false) };
@@ -4497,6 +4528,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let exact_literal = None;
         #[cfg(feature = "internal-checker")]
         let startup_named_result = (startup_named || startup_plain_scalar || startup_ranked || startup_cited).then(|| {
+            if startup_plain_scalar {
+                // The ordinary binding retains its original complete
+                // typed signature, never the unary proof-observer shape.
+                return self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None);
+            }
             let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
             let site = ordered.scalar_initializer.ok_or(ProjectCheck::Unsupported)?;
             let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -4511,7 +4547,6 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             } else {
                 self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None)?
             };
-            if startup_plain_scalar { return Ok(result); }
             let ActualCallResult::Integer(value) = result else { return Err(ProjectCheck::Unsupported); };
             let effects = ordered.failures.borrow();
             let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
@@ -10525,8 +10560,9 @@ pub struct PreparedStartupAuthoredCheck {
 #[cfg(feature = "internal-checker")]
 fn closed_startup_scalar_history(body: &FunctionCallSites) -> bool {
     body.checker_closed_calling_frame() && body.contextual_formal().is_none()
-        && matches!(body.boundary.parameters.as_slice(), [parameter] if is_integer_type(&parameter.ty))
-        && matches!(body.boundary.results.as_slice(), [result] if is_integer_type(&result.ty))
+        && body.boundary.parameters.len() <= 2
+        && body.boundary.parameters.iter().all(|parameter| parameter.ty == ScalarType::Bool || is_integer_type(&parameter.ty))
+        && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool || is_integer_type(&result.ty))
         && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
         && witness_history_directives(body, false)
@@ -17582,6 +17618,50 @@ mod tests {
                 assert_eq!(history.call_paths(), [vec![call.clone()]]);
                 assert!(history.contains_branch(branch.clone(), true));
                 assert!(!history.contains_return(&call));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_typed_startup_records_actual_bool_call_and_selected_value_arm() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "actual-bool-value-history");
+        let program = format!(r#"%%start
+            bool(bool, i8) choose = fn(flag, value) {{
+                core.require(value != 3, {OUTPUT});
+                if (flag) {{ true }} else {{ false }}
+            }};
+            bool initialized = false;
+            i8 observed = if (choose(initialized, 3)) {{ 7 }} else {{ 8 }};
+            core.require(observed != 8, {OUTPUT});
+        %%end"#);
+        let at = |snippet: &str, start: usize| {
+            let offset = program[start..].find(snippet).unwrap() + start;
+            wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset as u32, (offset + snippet.len()) as u32))
+        };
+        let body_guard = at("flag", program.find("if (flag)").unwrap());
+        let actual = at("choose(initialized, 3)", 0);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |program: &str| {
+                    let parsed = crate::parse_source(app.clone(), program.to_owned(), &[]);
+                    assert!(parsed.diagnostics.is_empty());
+                    let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                    prepare_loaded_scalar_ordered_local_proof_contexts(vec![(declarations, Vec::new())], [],
+                        vec![app.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new()).unwrap()
+                };
+                let incumbent = prepare(&program).run().unwrap();
+                let (first, _, trace, _) = prepare(&program).search_startup_authored_path(NonZeroUsize::new(1).unwrap()).unwrap();
+                assert_eq!(first, incumbent.directives[..1]);
+                assert_eq!(trace.call_paths(), [vec![actual.clone()]]);
+                assert!(!trace.contains_return(&actual));
+                let (all, end, trace, _) = prepare(&program).search_startup_authored_path(NonZeroUsize::new(3).unwrap()).unwrap();
+                assert_eq!(all, incumbent.directives);
+                assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+                assert!(trace.contains_branch(body_guard.clone(), false));
+                assert!(trace.contains_return(&actual));
+                assert!(trace.contains_branch(actual.clone(), false));
             }
         }
     }

@@ -8072,8 +8072,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     if let Some((source, trace)) = &roots.startup_trace {
-                        if evaluated_guard.1.is_some() || !matches!(structure.checker_branches.get(condition),
-                            Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                        let ordinary_bool = trace.borrow().admits_typed_ordinary_startup()
+                            && matches!(structure.checker_ordinary_booleans.get(condition),
+                                Some(super::reference::CheckerOrdinaryBoolean::Binding(_)));
+                        if evaluated_guard.1.is_some()
+                            || !(ordinary_bool || matches!(structure.checker_branches.get(condition),
+                                Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))))
                             || yes.is_unreachable() == no.is_unreachable()
                         { return None; }
                         let at = calls.occurrences.get(condition.0)?.span;
@@ -8163,8 +8167,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     if let Some((source, trace)) = &roots.startup_trace {
-                        if evaluated_guard.1.is_some() || !matches!(structure.checker_branches.get(condition),
-                            Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                        let ordinary_bool = trace.borrow().admits_typed_ordinary_startup()
+                            && matches!(structure.checker_ordinary_booleans.get(condition),
+                                Some(super::reference::CheckerOrdinaryBoolean::Binding(_)));
+                        if evaluated_guard.1.is_some()
+                            || !(ordinary_bool || matches!(structure.checker_branches.get(condition),
+                                Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))))
                             || yes.is_unreachable() == no.is_unreachable()
                         { return None; }
                         let at = calls.occurrences.get(condition.0)?.span;
@@ -9453,11 +9461,16 @@ pub(super) struct ExactCallCursor<'a> {
 
 impl<'a> ExactCallCursor<'a> {
     #[cfg(feature = "internal-checker")]
+    pub(super) fn returns_startup_bool(&self) -> bool { self.tail == Some(&ScalarType::Bool) }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn track_startup_path(
         &mut self, source: &'a wosy_syntax::SourceIdentity,
         trace: Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>,
+        allow_exact_bool: bool,
     ) -> Option<()> {
-        if self.roots.startup_trace.is_some() || self.tail.is_some_and(|ty| !is_integer_type(ty))
+        if self.roots.startup_trace.is_some()
+            || self.tail.is_some_and(|ty| !(is_integer_type(ty) || (allow_exact_bool && *ty == ScalarType::Bool)))
             || self.projected_slot.is_some() || self.projected_pair.is_some()
         { return None; }
         self.roots.startup_trace = Some((source, trace));

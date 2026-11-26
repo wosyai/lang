@@ -218,6 +218,8 @@ impl StartUpSearch {
         self.retain_after_cutoff && !self.required_sites.is_empty()
     }
 
+    pub(in super::super) fn admits_typed_ordinary_startup(&self) -> bool { self.proof_free_scalar_initializers }
+
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
             && (self.finish_dormant_startup || (self.contextual_route.is_some() && !self.contextual_observed)
