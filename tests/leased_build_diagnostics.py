@@ -66,9 +66,22 @@ with tempfile.TemporaryDirectory() as temp:
         (provider.parent / f"peer{i}.w").write_text(f"%%start\nu32 value = {100 + i};\n%%end\n")
     old_text = script("origem ☕", "next; next")
     provider.write_text(old_text)
+
+    def terminal(catalog, profile, mode, kind, streams, replay, calls=None):
+        out = call(project, store.with_name(catalog), "reconcile-terminal-report", profile, mode)
+        result = out["result"]
+        assert result["answer"]["kind"] == kind
+        assert (result["streams_opened"], result["recovery_payloads"]) == (streams, replay)
+        assert result["adapter_calls"] == (streams if calls is None else calls)
+        return result["answer"], result["elapsed_ms"]
+
+    terminal("terminal-none", "dev", "none", "none", 0, 0)
     first = call(project, store, "stage")
     old = call(project, store, "submit-pending", "app", "src/main.w")
     assert old["selected"] == first["pending"]
+    terminal("terminal-expired", "dev", "expired", "expired", 0, 0)
+    terminal("terminal-late", "dev", "late-replay", "replay-timed-out", 1, 0, 2)
+    terminal("terminal-unserved", "dev", "ignore-replay", "replay-not-accepted", 2, 1)
 
     def run(profile="dev", oracle=True, framed=True):
         options = (["--oracle"] if oracle else []) + (["--framed"] if framed else [])
@@ -129,6 +142,21 @@ with tempfile.TemporaryDirectory() as temp:
     still_old, _ = run(oracle=False)
     assert still_old["origin"] == "Stored" and still_old["diagnostics"] == orig["diagnostics"]
     assert still_old["source_root"] == orig["source_root"] and staged["pending"] != staged["selected"]
+    terminal_timings = {}
+    for profile in ("dev", "native"):
+        name = f"terminal-{profile}"
+        cold, cold_ms = terminal(name, profile, "report", "report", 2, 1)
+        hot, hot_ms = terminal(name, profile, "report", "report", 1, 0)
+        assert cold["response"]["source_root"] == hot["response"]["source_root"] == orig["source_root"]
+        assert cold["response"]["profile"] == hot["response"]["profile"] == profile
+        assert cold["response"]["diagnostics"] == hot["response"]["diagnostics"] == orig["diagnostics"]
+        assert cold["rendered"] and cold["rendered"] == hot["rendered"]
+        if ordinary_cli:
+            assert cold["rendered"] == expected_print[profile]
+        terminal_timings[profile] = {"cold_ms": round(cold_ms, 3), "warm_ms": round(hot_ms, 3)}
+    latest_stage = call(project, store, "state")
+    assert (latest_stage["selected"], latest_stage["pending"], latest_stage["attempt"]) == (
+        staged["selected"], staged["pending"], staged["attempt"])
     if ordinary_cli:
         for profile in ("dev", "native"):
             report = client_report(profile)
@@ -150,10 +178,16 @@ with tempfile.TemporaryDirectory() as temp:
     assert fixed["origin"] == "Derived" and not fixed["diagnostics"] and fixed["receipt"] != orig["receipt"]
     if ordinary_cli:
         assert client_report("dev")["rendered"] == ""
+    terminal("terminal-stale", "dev", "stale", "stale", 1, 0)
+    after_stale = call(project, store, "state")
+    assert after_stale["selected"] == bytes(fixed["source_root"]).hex() and after_stale["pending"] is None
     assert not (project / ".wosy/artifacts").exists()
     print("acknowledged SQLite root → real framed in-process leased worker → ordinary compiler diagnostics", {
         "warm_dispatch_ms": round(warm_ms, 3), "resolved_profiles": ["dev", "native"],
         "historic_UTF8": True, "newer_pending_not_selected": True, "cas_rebuilt": True,
         "rooted_files": 19, "cas_bytes": only_blob.stat().st_size,
         "ordinary_renderer_bytes_match_both_profiles": bool(ordinary_cli),
+        "terminal_client_operations_ms": terminal_timings,
+        "terminal_one_deadline_before_recovery_stream": True,
+        "terminal_same_root_generation_rejected": True,
     })

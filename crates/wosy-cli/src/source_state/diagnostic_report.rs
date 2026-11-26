@@ -1,17 +1,19 @@
 //! Render a verified diagnostic response against its immutable local source.
+use super::diagnostics::{diagnostic_deadline, require_diagnostic_time, within_diagnostic_deadline};
 use super::{
     checked_file_key, load_usage, read_selection, CapturedBuildDiagnostics, DiagnosticExchange,
-    RequiredSourceReplay, Result, SqliteSourceState, StoredNodes,
+    RequiredSourceReplay, Result, SourceReplay, SqliteSourceState, StoredNodes,
 };
 use codespan_reporting::term::termcolor::WriteColor;
 use rusqlite::TransactionBehavior;
-use std::{collections::{BTreeMap, HashMap}, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, future::{poll_fn, Future}, pin::pin, task::Poll, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 use wosy_compiler::Diagnostic;
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{
     walk_cst, BuildDiagnosticResponse, BuildSessionRefusal, CstEvent, CstExpansionBudget,
-    FileEntry, FileKey,
+    BuildSourceSelection, FileEntry, FileKey,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -20,6 +22,73 @@ pub enum ProjectDiagnosticExchange {
     ReplayRequired(RequiredSourceReplay),
     Refused(BuildSessionRefusal),
     Report(RootedDiagnosticReport),
+}
+
+pub enum AcknowledgedBuildDiagnostics {
+    NotAcknowledged,
+    StaleSelection,
+    ReplayNotAccepted,
+    Refused(BuildSessionRefusal),
+    Report(RootedDiagnosticReport),
+}
+
+impl SqliteSourceState {
+    /// Analyze the acknowledged source, using a trusted adapter to open a
+    /// fresh, exclusively owned stream for its exact project/target/root.
+    /// After a terminal replay request it may open one more stream with the
+    /// same captured SQLite generation's bounded canonical source. A later
+    /// source (even identical bytes newly acknowledged) is never substituted.
+    ///
+    /// One deadline covers both openings and framed exchanges. The adapter
+    /// must cooperate with asynchronous cancellation; a synchronous call
+    /// or a running poll cannot be preempted. Replay and authored projection
+    /// retain their separate read budgets. This neither advances the
+    /// selection nor emits artifacts.
+    pub async fn acknowledged_build_diagnostics<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, budget: CstExpansionBudget, mut open: Open,
+    ) -> Result<AcknowledgedBuildDiagnostics>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        use AcknowledgedBuildDiagnostics as Outcome;
+        let deadline = diagnostic_deadline(timeout)?;
+        let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
+            return Ok(Outcome::NotAcknowledged);
+        };
+        let answer = within_diagnostic_deadline(deadline, async {
+            let first = open_exchange(self, &captured, deadline, None, &mut open).await?;
+            let DiagnosticExchange::ReplayRequired(challenge) = first else { return Ok(first) };
+            let Some(replay) = challenge.prepare(self)? else { return Ok(DiagnosticExchange::StaleSelection) };
+            open_exchange(self, &captured, deadline, Some(replay), &mut open).await
+        }).await?;
+        Ok(match captured.finish_project_exchange(self, answer, budget)? {
+            ProjectDiagnosticExchange::StaleSelection => Outcome::StaleSelection,
+            ProjectDiagnosticExchange::ReplayRequired(_) => Outcome::ReplayNotAccepted,
+            ProjectDiagnosticExchange::Refused(reason) => Outcome::Refused(reason),
+            ProjectDiagnosticExchange::Report(report) => Outcome::Report(report),
+        })
+    }
+}
+
+async fn open_exchange<Open, Opening, Stream>(
+    local: &mut SqliteSourceState, captured: &CapturedBuildDiagnostics, deadline: Instant,
+    replay: Option<SourceReplay>, open: &mut Open,
+) -> Result<DiagnosticExchange>
+where
+    Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+    Opening: Future<Output = Result<Stream>>,
+    Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    require_diagnostic_time(deadline)?;
+    let mut opening = pin!(open(captured.selection().clone(), replay));
+    let stream = poll_fn(|cx| match require_diagnostic_time(deadline) {
+        Ok(()) => opening.as_mut().poll(cx),
+        Err(expired) => Poll::Ready(Err(expired)),
+    }).await?;
+    require_diagnostic_time(deadline)?;
+    captured.converse_current(local, stream, deadline).await
 }
 
 /// Renderable diagnostics from one opened source-only session. The owned
@@ -52,8 +121,15 @@ impl CapturedBuildDiagnostics {
     pub async fn exchange_project_diagnostics<T: AsyncRead + AsyncWrite + Unpin + 'static>(
         &self, local: &mut SqliteSourceState, stream: T, timeout: Duration, budget: CstExpansionBudget,
     ) -> Result<ProjectDiagnosticExchange> {
+        let answer = self.exchange_unprojected(local, stream, timeout).await?;
+        self.finish_project_exchange(local, answer, budget)
+    }
+
+    fn finish_project_exchange(
+        &self, local: &mut SqliteSourceState, answer: DiagnosticExchange, budget: CstExpansionBudget,
+    ) -> Result<ProjectDiagnosticExchange> {
         use ProjectDiagnosticExchange as Outcome;
-        match self.exchange_unprojected(local, stream, timeout).await? {
+        match answer {
             DiagnosticExchange::StaleSelection => Ok(Outcome::StaleSelection),
             DiagnosticExchange::Diagnostics(response) =>
                 Ok(self.project_report(local, response, budget)?.map_or(Outcome::StaleSelection, Outcome::Report)),

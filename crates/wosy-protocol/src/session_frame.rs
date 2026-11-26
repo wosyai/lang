@@ -1,8 +1,8 @@
 //! Bounded Serde frames delimited by the shared Tokio codec.
 use bytes::BytesMut;
 use serde::{de::DeserializeOwned, Serialize};
-use std::io::{self, Write};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::{future::poll_fn, io::{self, Write}, pin::Pin, task::Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::length_delimited::Builder;
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec, LengthDelimitedCodecError};
 
@@ -79,6 +79,29 @@ pub fn encode_session_frame<T: Serialize>(message: &T) -> Result<BytesMut, Sessi
     Ok(complete)
 }
 
+/// Write one already encoded frame under the caller's first-byte authority.
+/// If no byte has been accepted, reevaluate permission on every poll.
+/// A caller that cancels after any progress must discard the stream, not
+/// retry the frame. Its surrounding timer is responsible for wakeups.
+pub async fn write_encoded_session_frame<W: AsyncWrite + Unpin>(
+    output: &mut W, bytes: &[u8], may_start: impl Fn() -> bool,
+) -> Result<bool, SessionFrameError> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let progress = poll_fn(|cx| {
+            if written == 0 && !may_start() { return Poll::Ready(Ok(None)); }
+            Pin::new(&mut *output).poll_write(cx, &bytes[written..]).map_ok(Some)
+        }).await?;
+        match progress {
+            None => return Ok(false),
+            Some(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Some(count) => written += count,
+        }
+    }
+    output.flush().await?;
+    Ok(true)
+}
+
 /// The retained decoder and input buffer resume across a canceled read.
 pub struct SessionFrameReader {
     codec: LengthDelimitedCodec,
@@ -121,9 +144,8 @@ impl SessionFrameReader {
 mod tests {
     use super::*;
     use crate::{BuildSessionCommand, BuildSessionCommandId, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, NodeId};
-    use std::future::{poll_fn, Future};
-    use std::task::Poll;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use std::{cell::Cell, future::Future};
+    use tokio::io::duplex;
 
     #[test]
     fn legacy_start_and_started_wire_bytes() {
@@ -139,6 +161,39 @@ mod tests {
             expected.extend_from_slice(payload);
             assert_eq!(encoded.unwrap().as_ref(), expected);
         }
+    }
+
+    #[test]
+    fn frame_first_byte_requires_permission_after_backpressure() {
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let bytes = encode_session_frame(&"fixture").unwrap();
+            let may_start = Cell::new(true);
+            let (mut tx, mut rx) = duplex(1);
+            tx.write_all(b"x").await.unwrap();
+            {
+                let mut blocked = Box::pin(write_encoded_session_frame(&mut tx, &bytes, || may_start.get()));
+                assert!(poll_fn(|cx| Poll::Ready(blocked.as_mut().poll(cx).is_pending())).await);
+                may_start.set(false);
+                assert_eq!(rx.read_u8().await.unwrap(), b'x'); // ready again, but past admission
+                assert!(!blocked.await.unwrap());
+            }
+            drop(tx);
+            assert_eq!(rx.read(&mut [0]).await.unwrap(), 0);
+
+            let prefix_len = bytes.len() - 1;
+            let (mut tx, mut rx) = duplex(prefix_len);
+            may_start.set(true);
+            let mut sending = Box::pin(write_encoded_session_frame(&mut tx, &bytes, || may_start.get()));
+            assert!(poll_fn(|cx| Poll::Ready(sending.as_mut().poll(cx).is_pending())).await);
+            // Permission changes only after actual progress. The caller's
+            // timer controls completion, not a restarted first-byte rule.
+            may_start.set(false);
+            let mut prefix = vec![0; prefix_len];
+            rx.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix, bytes[..prefix_len]);
+            assert!(sending.await.unwrap());
+            assert_eq!(rx.read_u8().await.unwrap(), bytes[prefix_len]);
+        });
     }
 
     #[test]

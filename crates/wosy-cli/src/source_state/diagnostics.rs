@@ -1,10 +1,11 @@
 //! The client side of one recoverable, source-only diagnostic conversation.
 use super::{Result, SourceReplay, SqliteSourceState};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::{future::Future, io, time::Duration};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{
-    encode_session_frame, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSessionCommand,
+    encode_session_frame, write_encoded_session_frame, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSessionCommand,
     BuildSessionCommandId, BuildSessionRefusal, BuildSessionReply, BuildSessionRequest,
     BuildSessionResponse, BuildSourceSelection, SessionFrameReader, BUILD_DIAGNOSTIC_VERSION,
     BUILD_RECONCILIATION_VERSION,
@@ -24,6 +25,29 @@ pub enum DiagnosticExchange {
     ReplayRequired(RequiredSourceReplay),
     Refused(BuildSessionRefusal),
     Diagnostics(BuildDiagnosticResponse<Diagnostic>),
+}
+
+pub(super) fn diagnostic_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or("invalid diagnostic session deadline".into())
+}
+
+pub(super) fn require_diagnostic_time(deadline: Instant) -> Result<()> {
+    if Instant::now() < deadline { Ok(()) }
+    else { Err(diagnostic_timeout()) }
+}
+
+fn diagnostic_timeout() -> Box<dyn std::error::Error + Send + Sync> {
+    io::Error::new(io::ErrorKind::TimedOut, "diagnostic session deadline elapsed").into()
+}
+
+pub(super) async fn within_diagnostic_deadline<T>(
+    deadline: Instant, operation: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => Err(diagnostic_timeout()),
+        answer = operation => answer,
+    }
 }
 
 impl SqliteSourceState {
@@ -69,15 +93,24 @@ impl CapturedBuildDiagnostics {
     }
 
     pub(super) async fn exchange_unprojected<T: AsyncRead + AsyncWrite + Unpin + 'static>(
-        &self, local: &mut SqliteSourceState, mut stream: T, timeout: Duration,
+        &self, local: &mut SqliteSourceState, stream: T, timeout: Duration,
     ) -> Result<DiagnosticExchange> {
-        if !self.is_current(local)? { return Ok(DiagnosticExchange::StaleSelection); }
-        Ok(tokio::time::timeout(timeout, self.converse(&mut stream)).await??)
+        let deadline = diagnostic_deadline(timeout)?;
+        within_diagnostic_deadline(deadline, self.converse_current(local, stream, deadline)).await
     }
 
-    async fn converse<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut T) -> Result<DiagnosticExchange> {
+    pub(super) async fn converse_current<T: AsyncRead + AsyncWrite + Unpin + 'static>(
+        &self, local: &mut SqliteSourceState, mut stream: T, deadline: Instant,
+    ) -> Result<DiagnosticExchange> {
+        if !self.is_current(local)? { return Ok(DiagnosticExchange::StaleSelection); }
+        let answer = self.converse(&mut stream, deadline).await?;
+        require_diagnostic_time(deadline)?;
+        Ok(answer)
+    }
+
+    async fn converse<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut T, deadline: Instant) -> Result<DiagnosticExchange> {
         let mut frames = SessionFrameReader::default();
-        send(stream, 1, BuildSessionRequest::StartRecoverable { version: BUILD_RECONCILIATION_VERSION }).await?;
+        send(stream, deadline, 1, BuildSessionRequest::StartRecoverable { version: BUILD_RECONCILIATION_VERSION }).await?;
         match receive(stream, &mut frames, 1).await? {
             BuildSessionReply::ReplayRequired { version: BUILD_RECONCILIATION_VERSION, source_root }
                 if source_root == self.selected.root =>
@@ -93,7 +126,7 @@ impl CapturedBuildDiagnostics {
             }
             _ => return Err("diagnostic session did not select the captured source".into()),
         }
-        send(stream, 2, BuildSessionRequest::Analyze { request: BuildDiagnosticRequest::BuildDiagnostics {
+        send(stream, deadline, 2, BuildSessionRequest::Analyze { request: BuildDiagnosticRequest::BuildDiagnostics {
             version: BUILD_DIAGNOSTIC_VERSION, profile: self.profile.clone(),
         }}).await?;
         let result = match receive(stream, &mut frames, 2).await? {
@@ -107,7 +140,7 @@ impl CapturedBuildDiagnostics {
             BuildSessionReply::Refused { reason } => DiagnosticExchange::Refused(reason),
             _ => return Err("diagnostic request did not receive an analysis or refusal".into()),
         };
-        send(stream, 3, BuildSessionRequest::Disconnect).await?;
+        send(stream, deadline, 3, BuildSessionRequest::Disconnect).await?;
         if !matches!(receive(stream, &mut frames, 3).await?, BuildSessionReply::Closed) {
             return Err("diagnostic session did not close".into());
         }
@@ -126,10 +159,12 @@ impl RequiredSourceReplay {
     }
 }
 
-async fn send<T: AsyncWrite + Unpin>(stream: &mut T, id: u64, request: BuildSessionRequest) -> Result<()> {
-    stream.write_all(&encode_session_frame(&BuildSessionCommand { id: BuildSessionCommandId(id), request })?).await?;
-    stream.flush().await?;
-    Ok(())
+async fn send<T: AsyncWrite + Unpin>(
+    stream: &mut T, deadline: Instant, id: u64, request: BuildSessionRequest,
+) -> Result<()> {
+    let bytes = encode_session_frame(&BuildSessionCommand { id: BuildSessionCommandId(id), request })?;
+    if write_encoded_session_frame(stream, &bytes, || Instant::now() < deadline).await? { Ok(()) }
+    else { Err(diagnostic_timeout()) }
 }
 
 async fn receive<T: AsyncRead + Unpin>(

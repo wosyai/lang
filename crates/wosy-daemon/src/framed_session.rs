@@ -4,17 +4,15 @@ use super::{
     BuildDiagnosticSession, BuildSourceOpening, PreparedBaseDeclarations, Result, SessionFrameError, SessionFrameReader,
     SourceStorageWorker, StorageAdmissionError,
 };
-use std::future::poll_fn;
-use std::task::Poll;
 use std::time::{Duration, Instant};
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::time::{sleep_until, Instant as TokioInstant};
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationProjection, BuildDiagnosticRequest,
     BuildDiagnosticResponse, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
     BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
-    BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
+    write_encoded_session_frame, BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
     BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
 
@@ -324,31 +322,10 @@ async fn send<W: AsyncWrite + Unpin>(
     output: &mut W, until: Instant, id: CommandId, reply: Reply,
 ) -> std::result::Result<bool, SessionFrameError> {
     let bytes = encode_session_frame(&BuildSessionResponse { id, reply })?;
-    if Instant::now() >= until { return Ok(false); }
     tokio::select! {
         biased;
         _ = sleep_until(TokioInstant::from_std(until)) => Ok(false),
-        result = async {
-            let mut written = 0;
-            while written < bytes.len() {
-                let progress = poll_fn(|cx| {
-                    // Timer wake-up is only a bound on waiting. The actual
-                    // lease clock authorizes the first byte, including polls
-                    // after backpressure that have not written anything yet.
-                    if written == 0 && Instant::now() >= until { return Poll::Ready(Ok(None)); }
-                    std::pin::Pin::new(&mut *output).poll_write(cx, &bytes[written..]).map_ok(Some)
-                }).await?;
-                match progress {
-                    None => return Ok(false),
-                    Some(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
-                    Some(count) => written += count,
-                }
-            }
-            // An expired partial send ends the stream; those bytes are not
-            // recalled and are never retried as a new frame.
-            output.flush().await?;
-            Ok(true)
-        } => result.map_err(Into::into),
+        result = write_encoded_session_frame(output, &bytes, || Instant::now() < until) => result,
     }
 }
 
@@ -356,6 +333,7 @@ async fn send<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::{SourceStore, StorageAdmissionError};
+    use tokio::io::AsyncWriteExt;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc};

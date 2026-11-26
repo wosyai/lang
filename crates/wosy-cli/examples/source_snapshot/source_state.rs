@@ -57,6 +57,11 @@ pub(super) async fn run(
             let edited = args.next().ok_or("expected disposable fixture edit")?;
             super::framed_reconciliation::run_generation(&mut client, project, dir, &target, &profile, &edited).await?
         }
+        "reconcile-terminal-report" => {
+            let profile = args.next().ok_or("expected Build profile")?;
+            let mode = args.next().ok_or("expected terminal report control")?;
+            super::framed_reconciliation::run_terminal_report(&mut client, project, dir, &target, &profile, &mode).await?
+        }
         "replay-acknowledged-for" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected captured root")?)?;
             let owner = args.next().ok_or("expected captured workspace")?;

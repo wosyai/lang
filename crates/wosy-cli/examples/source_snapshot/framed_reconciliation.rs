@@ -235,3 +235,146 @@ async fn confirm(store: &SourceStore, writer: &SqliteSourceState, target: &str,
     assert!(writer.acknowledge(target, attempt)?);
     Ok(())
 }
+
+pub(super) async fn run_terminal_report(
+    client: &mut SqliteSourceState, project: &Path, path: &Path, target: &str, profile: &str, mode: &str,
+) -> Result<serde_json::Value> {
+    use codespan_reporting::term::termcolor::Buffer;
+    use std::cell::Cell;
+    use wosy_cli::{
+        source_recovery::ClientSourceLimits,
+        source_state::{AcknowledgedBuildDiagnostics as Outcome, SourceReplay},
+    };
+    use wosy_protocol::CstExpansionBudget;
+
+    let initial = client.capture_build_diagnostics(target, profile)?;
+    let store = Arc::new(SourceStore::open(path, 8 << 20)?);
+    let bound = |n| NonZeroUsize::new(n).unwrap();
+    let worker = SourceStorageWorker::new(
+        Arc::clone(&store), tokio::runtime::Handle::current(), bound(1), bound(2), bound(20_000),
+    )?;
+    let (open, mut peers) = tokio::sync::mpsc::channel::<(BuildSourceSelection, Option<SourceReplay>, DuplexStream)>(1);
+    let budget = CstExpansionBudget::new(16 << 20, 200_000, 1024, 8 << 20);
+    let timeout = match mode {
+        "expired" => Duration::ZERO,
+        "late-replay" => Duration::from_millis(600),
+        _ => Duration::from_secs(10),
+    };
+    let start = Instant::now();
+    let calls = Cell::new(0);
+    let open_calls = &calls;
+    let (answer, opened) = tokio::join!(
+        client.acknowledged_build_diagnostics(target, profile, timeout, budget, move |selected, replay| {
+            let ordinal = open_calls.get() + 1;
+            open_calls.set(ordinal);
+            let open = open.clone();
+            async move {
+                if mode == "late-replay" {
+                    let ready = if ordinal == 1 {
+                        assert!(replay.is_none());
+                        start + Duration::from_millis(160)
+                    } else {
+                        assert_eq!(ordinal, 2);
+                        assert!(replay.is_some());
+                        let late = start + timeout + Duration::from_millis(40);
+                        // A reset timeout would admit this retry.
+                        assert!(late < Instant::now() + timeout);
+                        late
+                    };
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(ready)).await;
+                }
+                let (stream, peer) = io::duplex(256);
+                open.send((selected, replay, peer)).await
+                    .map_err(|_| "fixture adapter closed before opening the stream")?;
+                Ok(stream)
+            }
+        }),
+        async {
+            let mut ended = Vec::new();
+            while let Some((selected, replay, mut peer)) = peers.recv().await {
+                assert!(ended.len() < 2, "one operation opened a third stream");
+                let captured = initial.as_ref().ok_or("fixture opened without an acknowledged source")?;
+                assert_eq!(&selected, captured.selection());
+                let offered = replay.is_some();
+                let replay = replay.map(|replay| {
+                    assert_eq!((replay.source.root, replay.source.parsed, replay.attempt), (selected.root, 0, None));
+                    replay.source.delta
+                });
+                let end = worker.serve_recoverable_build_session(
+                    &mut peer, selected, if mode == "ignore-replay" { None } else { replay },
+                    admission_limits(false), Duration::from_secs(30),
+                ).await?;
+                if mode == "stale" {
+                    assert_eq!(end, BuildSessionEnd::ReplayRequired);
+                    assert!(!offered);
+                    let confirmation = SourceStore::open(&path.with_extension("confirmation"), 8 << 20)?;
+                    let mut writer = SqliteSourceState::open(project, ClientSourceLimits { nodes: 25_000, encoded_bytes: 16 << 20 })?;
+                    let entry = wosy_project::ProjectContext::load_parse_target(project, Some(target))?.source_path();
+                    let a = std::fs::read(&entry)?;
+                    std::fs::write(&entry, "%%start\nu32 updated = 9;\n%%end\n")?;
+                    let b = writer.stage(target)?.pending.ok_or("fixture did not issue B")?;
+                    assert_ne!(b.root(), captured.selection().root);
+                    confirm(&confirmation, &writer, target, b).await?;
+                    std::fs::write(&entry, a)?;
+                    let fresh = writer.stage(target)?.pending.ok_or("fixture did not reissue A")?;
+                    assert_eq!(fresh.root(), captured.selection().root);
+                    assert!(fresh.generation() > captured.generation());
+                    confirm(&confirmation, &writer, target, fresh).await?;
+                    confirmation.close().await?;
+                }
+                // The real client validates terminal EOF before using the
+                // response. In the stale case a second writer has just
+                // re-acknowledged A at a different generation.
+                drop(peer);
+                ended.push((offered, end));
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(ended)
+        },
+    );
+    let elapsed = milliseconds(start);
+    let ended = opened?;
+    let offered = ended.iter().filter(|(offered, _)| *offered).count();
+    let result = match (mode, answer) {
+        ("report", Ok(Outcome::Report(report))) => {
+            assert!(matches!(ended.as_slice(), [(false, BuildSessionEnd::Disconnected)]
+                | [(false, BuildSessionEnd::ReplayRequired), (true, BuildSessionEnd::Disconnected)]));
+            let mut buffer = Buffer::no_color();
+            report.emit_to(&mut buffer)?;
+            serde_json::json!({ "kind": "report", "response": report.response(),
+                "rendered": std::str::from_utf8(buffer.as_slice())? })
+        }
+        ("stale", Ok(Outcome::StaleSelection)) => {
+            assert_eq!(ended, [(false, BuildSessionEnd::ReplayRequired)]);
+            assert!(store.snapshot(initial.unwrap().selection().root)?.is_none());
+            serde_json::json!({ "kind": "stale" })
+        }
+        ("ignore-replay", Ok(Outcome::ReplayNotAccepted)) => {
+            assert_eq!(ended, [(false, BuildSessionEnd::ReplayRequired), (true, BuildSessionEnd::ReplayRequired)]);
+            assert!(store.snapshot(initial.unwrap().selection().root)?.is_none());
+            serde_json::json!({ "kind": "replay-not-accepted" })
+        }
+        ("none", Ok(Outcome::NotAcknowledged)) => {
+            assert!(ended.is_empty());
+            serde_json::json!({ "kind": "none" })
+        }
+        ("expired", Err(error)) => {
+            assert!(ended.is_empty());
+            assert_eq!(calls.get(), 0);
+            assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::TimedOut));
+            serde_json::json!({ "kind": "expired" })
+        }
+        ("late-replay", Err(error)) => {
+            assert_eq!(ended, [(false, BuildSessionEnd::ReplayRequired)]);
+            assert_eq!(calls.get(), 2);
+            assert_eq!(error.downcast_ref::<std::io::Error>().map(std::io::Error::kind), Some(std::io::ErrorKind::TimedOut));
+            assert!(store.snapshot(initial.unwrap().selection().root)?.is_none());
+            serde_json::json!({ "kind": "replay-timed-out" })
+        }
+        (_, Err(error)) => return Err(error),
+        _ => return Err("fixture terminal report outcome did not match scope".into()),
+    };
+    drop(worker);
+    Arc::try_unwrap(store).ok().expect("fixture owns its graph").close().await?;
+    Ok(serde_json::json!({ "answer": result, "streams_opened": ended.len(),
+        "adapter_calls": calls.get(), "recovery_payloads": offered, "elapsed_ms": elapsed }))
+}

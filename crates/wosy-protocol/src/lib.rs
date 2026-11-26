@@ -18,7 +18,7 @@ pub use build_diagnostics::{
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
 mod session_frame;
-pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
+pub use session_frame::{encode_session_frame, write_encoded_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 mod cst_walk;
 pub use cst_walk::{syntax_kind, token_text, walk_cst, CstEvent, CstExpansionBudget};
 
