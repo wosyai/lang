@@ -10635,8 +10635,10 @@ fn symbolic_history_call_target(
 ) -> Option<PreparedCallable> {
     let (owner, item) = *body.structure.checker_direct_targets.get(&site)?;
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
-    if (owner == module && caller == item) || signature.parameters.len() != 1
-        || !(is_integer_type(&output.ty) || output.ty == ScalarType::Unit)
+    if (owner == module && caller == item)
+        || !(if output.ty == ScalarType::Unit { (1..=2).contains(&signature.parameters.len()) }
+            else { is_integer_type(&output.ty) && signature.parameters.len() == 1 })
+        || !signature.parameters.iter().all(is_integer_type)
     { return None; }
     let source = project.modules.get(owner)?;
     let caller_source = &project.modules.get(module)?.source;
@@ -10649,7 +10651,7 @@ fn symbolic_history_call_target(
     let leaf = calls.function_body(owner, item, None)?;
     if target_source != &source.source || *declaration_span != function.name_span
         || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
-        || !matches!(leaf.boundary.parameters.as_slice(), [parameter] if parameter.ty == signature.parameters[0])
+        || !leaf.boundary.parameters.iter().map(|parameter| &parameter.ty).eq(signature.parameters.iter())
         || !matches!(leaf.boundary.results.as_slice(), [result] if result.ty == output.ty)
     { return None; }
     Some((owner, item))
@@ -10808,17 +10810,7 @@ impl ClosedAuthoredHistories<'_> {
                 return check_projected_history_scalar_return(self.project, self.calls, child, argument, signature,
                     origin, self.visits, self.work, depth + 1);
             }
-            let [parameter] = signature.parameters.as_slice() else { return None; };
-            let exact;
-            let entry = match argument {
-                NestedIntegerArgument::Single(Some((ty, value))) | NestedIntegerArgument::RootLexical((ty, value))
-                    if ty == parameter && integer_literal_fits_type(value, ty) =>
-                { exact = [value]; IntegerRequirementEntry::Exact(&exact) }
-                NestedIntegerArgument::Projected(projection) if projection.slot == 0 && projection.ty == parameter
-                    && matches!(projection.companion, ProjectedCompanion::Unary) =>
-                { IntegerRequirementEntry::Projected { slot: 0, values: projection.materialize()?, fixed: None } }
-                _ => return None,
-            };
+            let entry = argument.unit_history_entry(&signature.parameters, self.work)?;
             let mut meter = self.work.get();
             super::checker_flow::charge_call_work(&mut meter, prefix.len().checked_add(steps.len())?)?;
             self.work.set(meter);
@@ -18248,6 +18240,104 @@ mod tests {
         let assigns = program.replace("if (tag < 0) { core.narrow",
             "tag = 0; if (tag < 0) { core.narrow");
         assert!(matches!(run("symbolic-independent-pair-write-denied", &assigns), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_binary_unit_history_keeps_each_real_swapped_return_rectangle() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-binary-unit-history");
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) classify = fn(n) {{ if (n < 0) {{ -1 }} else {{ 1 }} }};
+            unit(i8, i8) leaf = fn(n, tag) {{
+                if (tag < 0) {{ core.narrow(n != -2, {}); }};
+            }};
+            unit(i8, i8) wrapper = fn(tag, n) {{ leaf(n, tag); }};
+            unit(i8) unused = fn(n) {{
+                i8 tag = classify(n);
+                wrapper(tag, n);
+                core.require(n != -1, {});
+                if (tag < 0) {{ core.require(n < 0, {}); }};
+            }};
+        %%end"#, report(5), report(11), report(13));
+        let at = |snippet: &str| {
+            let offset = program.find(snippet).unwrap();
+            wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset as u32, (offset + snippet.len()) as u32))
+        };
+        let outer = at("wrapper(tag, n)");
+        let inner = at("leaf(n, tag)");
+        let guard = at("tag < 0");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| {
+                prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                ).unwrap()
+            };
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let incumbent = prepare(&program, scope).run().unwrap();
+                for cap in [1, 2] {
+                    let (failures, end, trace, active) = prepare(&program, scope)
+                        .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(failures, incumbent.directives);
+                    if scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(failures.is_empty() && trace.call_paths().is_empty());
+                        assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+                        continue;
+                    }
+                    assert!(active);
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    let [failure] = failures.as_slice() else { panic!("only the original surviving caller row fails"); };
+                    assert_eq!(failure.code(), &BigInt::from(11));
+                    assert_eq!(failure.witness.row_count(), 1);
+                    let minus_one = BigInt::from(-1);
+                    for axis in 0..2 {
+                        assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&minus_one, &minus_one)]));
+                    }
+                    assert!(trace.contains_branch(guard.clone(), true));
+                    assert!(trace.contains_return(&inner) && trace.contains_return(&outer));
+                    assert!(trace.call_paths().contains(&vec![at("classify(n)"), outer.clone(), inner.clone()]));
+                }
+            }
+            // Neither forwarded argument is exact in either incoming row.
+            // The selected leaf return filters the second slot only in the
+            // original first branch; the caller's two failures must not fuse.
+            let independent = format!(r#"%%start
+                unit(u8, u8) pair_leaf = fn(left, right) {{
+                    if (left < 128) {{ core.narrow(right < 64, {}); }};
+                }};
+                unit(u8, u8) pair_outer = fn(second, first) {{ pair_leaf(first, second); }};
+                unit(u8, u8) pair_root = fn(a, b) {{
+                    pair_outer(b, a);
+                    if (a < 128) {{ core.require(b < 64, {}); }};
+                    core.require(b != 3, {});
+                }};
+            %%end"#, report(21), report(22), report(23));
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let old = prepare(&independent, scope).run().unwrap();
+            assert!(!old.directives.is_empty());
+            assert!(old.directives.iter().all(|failure| failure.code() == &BigInt::from(23)));
+            for cap in [1, 2, 3] {
+                let (failures, end, trace, _) = prepare(&independent, scope)
+                    .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert_eq!(failures.len(), cap.min(2));
+                assert_eq!(end, if cap == 3 { StartupAuthoredCompletion::Exhausted } else { StartupAuthoredCompletion::LimitReached });
+                let start = independent.find("left < 128").unwrap() as u32;
+                let branch = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start + 10));
+                assert!(trace.contains_branch(branch.clone(), true));
+                assert_eq!(trace.contains_branch(branch, false), cap >= 2);
+                for (failure, (lo, hi)) in failures.iter().zip([(0, 127), (128, 255)]) {
+                    assert_eq!(failure.code(), &BigInt::from(23));
+                    assert_eq!(failure.witness.row_count(), 1);
+                    assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&lo.into(), &hi.into())]));
+                    assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&3.into(), &3.into())]));
+                }
+            }
+            let aliased = program.replace("wrapper(tag, n);", "wrapper(n, n);");
+            assert!(matches!(prepare(&aliased, ScalarCheckerScope::CurrentPackage)
+                .search_startup_authored_path(NonZeroUsize::new(2).unwrap()), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

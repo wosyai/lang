@@ -252,7 +252,7 @@ struct CallableHistories<'a> {
     work: &'a std::cell::Cell<usize>,
     outgoing_call: Option<Vec<CallableHistoryStep>>,
     scalar_return_steps: Option<Vec<Vec<CallableHistoryStep>>>,
-    unit_return_slot: Option<usize>,
+    unit_return_arity: Option<usize>,
     unit_return_paths: Option<Vec<UnitHistoryPiece>>,
     received_unit_paths: Option<Vec<UnitHistoryPiece>>,
     step_owner: Option<usize>,
@@ -3622,7 +3622,12 @@ pub(super) enum IntegerRequirementEntry<'a> {
     Arbitrary,
     Exact(&'a [&'a BigInt]),
     Projected { slot: usize, values: Rc<IntegerSet>, fixed: Option<&'a BigInt> },
+    #[cfg(feature = "internal-checker")]
+    UnitHistory(UnitHistoryEntry),
 }
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct UnitHistoryEntry(IntegerRow);
 
 pub(super) enum IntegerRequirementContinuation {
     Feasible,
@@ -3677,7 +3682,7 @@ pub(super) enum CallableHistoryCompletion {
 
 #[cfg(feature = "internal-checker")]
 pub(super) struct UnitHistoryPiece {
-    values: Rc<IntegerSet>,
+    domains: Vec<Rc<IntegerSet>>,
     steps: Vec<CallableHistoryStep>,
 }
 
@@ -3734,10 +3739,10 @@ pub(super) fn search_callable_history_frame(
     step_owner: Option<usize>, capture_unit: bool, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
     mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<(CallableHistoryCompletion, Vec<UnitHistoryPiece>)> {
-    if capture_unit && (!calls.checker_returns_unit() || calls.boundary.parameters.len() != 1) { return None; }
+    if capture_unit && (!calls.checker_returns_unit() || !(1..=2).contains(&calls.boundary.parameters.len())) { return None; }
     let histories = std::cell::RefCell::new(CallableHistories {
         work, outgoing_call: None, scalar_return_steps: None, step_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
-        unit_return_slot: capture_unit.then_some(0), unit_return_paths: None, received_unit_paths: None,
+        unit_return_arity: capture_unit.then_some(calls.boundary.parameters.len()), unit_return_paths: None, received_unit_paths: None,
     });
     let mut unsupported = false;
     let mut sink = |mut failure: IntegerCheckFailure<'_>| {
@@ -3792,7 +3797,7 @@ pub(super) fn test_first_complete_history_packet(
     let tracker = std::cell::RefCell::new(CallableHistories {
         work: &work, outgoing_call: None, scalar_return_steps: None, step_owner: None,
         stopped: false, nodes: Vec::new(), interned: HashMap::new(),
-        unit_return_slot: None, unit_return_paths: None, received_unit_paths: None,
+        unit_return_arity: None, unit_return_paths: None, received_unit_paths: None,
     });
     roots.callable_history = Some(&tracker);
     let mut selected = false;
@@ -3825,7 +3830,7 @@ pub(super) fn trace_closed_projected_scalar_return(
 ) -> Option<CallableHistoryCall> {
     let histories = std::cell::RefCell::new(CallableHistories {
         work, outgoing_call: None, scalar_return_steps: None, step_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
-        unit_return_slot: None, unit_return_paths: None, received_unit_paths: None,
+        unit_return_arity: None, unit_return_paths: None, received_unit_paths: None,
     });
     histories.borrow().charge(calls.occurrences.len().checked_add(entry.interval_count())?)?;
     let mut cursor = ExactCallCursor::projected(calls, Rc::clone(&entry), expected)?;
@@ -4184,6 +4189,15 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
     let (tail, exact, projected) = match entry {
         IntegerRequirementEntry::Arbitrary => (ordinary_tail_type(calls, ordinary), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
+        #[cfg(feature = "internal-checker")]
+        IntegerRequirementEntry::UnitHistory(UnitHistoryEntry(row)) => {
+            // No projected continuation is exported from the generic driver.
+            // The history tracker retains each full returning rectangle.
+            if scope.callable_history().is_none() || !calls.checker_returns_unit() || row.iter().any(|domain| domain.is_empty()) {
+                return None;
+            }
+            (None, None, Some((0, row)))
+        }
         IntegerRequirementEntry::Projected { slot, values, fixed } => {
             let row = match (slot, fixed) {
                 (0, None) => vec![values],
@@ -4883,6 +4897,71 @@ pub(super) enum NestedIntegerArgument<'a> {
     ContextualValue(ExactIntegerArgument<'a>),
     Pair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
     Projected(ProjectedIntegerArgument<'a>),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum UnitHistoryOperand<'a> {
+    Exact(ExactIntegerArgument<'a>),
+    Axis(&'a ScalarType, usize),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> NestedIntegerArgument<'a> {
+    fn unit_history_operands(&self) -> Option<[Option<UnitHistoryOperand<'a>>; 2]> {
+        use UnitHistoryOperand::{Axis, Exact};
+        Some(match self {
+            Self::Single(Some(arg)) | Self::RootLexical(arg) => [Some(Exact(*arg)), None],
+            Self::Pair(left, right) => [Some(Exact(*left)), Some(Exact(*right))],
+            Self::Projected(projected) => {
+                let here = Some(Axis(projected.ty, projected.caller_axis));
+                match (projected.slot, projected.companion) {
+                    (0, ProjectedCompanion::Unary) => [here, None],
+                    (0, ProjectedCompanion::Fixed(fixed)) => [here, Some(Exact(fixed))],
+                    (1, ProjectedCompanion::Fixed(fixed)) => [Some(Exact(fixed)), here],
+                    (0, ProjectedCompanion::Independent { ty, axis }) => {
+                        let [row] = projected.path.0.as_slice() else { return None; };
+                        if row.linked_axes(projected.caller_axis, axis) { return None; }
+                        [here, Some(Axis(ty, axis))]
+                    }
+                    // The caller can hold aliased/affine slots. Do not lift
+                    // those into a product of independent child domains.
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    pub(super) fn unit_history_entry(&self, parameters: &[ScalarType], work: &std::cell::Cell<usize>)
+        -> Option<IntegerRequirementEntry<'a>>
+    {
+        use UnitHistoryOperand::{Axis, Exact};
+        let operands = self.unit_history_operands()?;
+        if operands.iter().flatten().count() != parameters.len() { return None; }
+        let mut charged = work.get();
+        charge_call_work(&mut charged, parameters.len())?;
+        let mut domains = Vec::with_capacity(parameters.len());
+        for (operand, parameter) in operands.into_iter().flatten().zip(parameters) {
+            let domain = match operand {
+                Exact((ty, value)) if ty == parameter && super::typecheck::integer_literal_fits_type(value, ty) => {
+                    charge_call_work(&mut charged, 1)?;
+                    Rc::new(IntegerSet::singleton(value))
+                }
+                Axis(ty, axis) if ty == parameter => {
+                    let Self::Projected(projection) = self else { return None; };
+                    let [row] = projection.path.0.as_slice() else { return None; };
+                    let values = row.get(axis)?;
+                    charge_call_work(&mut charged, values.interval_count())?;
+                    Rc::clone(values)
+                }
+                _ => return None,
+            };
+            domains.push(domain);
+        }
+        work.set(charged);
+        Some(IntegerRequirementEntry::UnitHistory(UnitHistoryEntry(IntegerRow::new(domains))))
+    }
 }
 
 enum NestedIntegerOperand<'a> {
@@ -6879,15 +6958,16 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     if let Some(tracker) = roots.callable_history {
         let mut tracker = tracker.borrow_mut();
         if !tracker.stopped {
-            if let Some(slot) = tracker.unit_return_slot {
+            if let Some(arity) = tracker.unit_return_arity {
                 retained_unit_paths = true;
                 let IntegerControl::Continue(path) = &result else { return None; };
                 tracker.charge(path.0.len())?;
                 let mut pieces = Vec::with_capacity(path.0.len());
                 for row in &path.0 {
-                    let domain = row.get(slot)?;
-                    tracker.charge(domain.interval_count().checked_add(1)?)?;
-                    pieces.push(UnitHistoryPiece { values: Rc::clone(domain), steps: tracker.steps(row.callable_history)? });
+                    let domains = row.cells.get(..arity)?;
+                    let cost = domains.iter().try_fold(arity, |cost, domain| cost.checked_add(domain.interval_count()))?;
+                    tracker.charge(cost)?;
+                    pieces.push(UnitHistoryPiece { domains: domains.to_vec(), steps: tracker.steps(row.callable_history)? });
                 }
                 tracker.unit_return_paths = Some(pieces);
             }
@@ -7961,7 +8041,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     #[cfg(feature = "internal-checker")]
                     if let Some(histories) = roots.callable_history {
-                        if !COLLECT || signature.parameters.len() != 1 { return None; }
+                        if !COLLECT || !(1..=2).contains(&signature.parameters.len()) { return None; }
                         let span = calls.occurrences.get(expression.0)?.span;
                         let mut survivors = IntegerInputs::default();
                         for mut row in std::mem::take(&mut path.0) {
@@ -7972,34 +8052,41 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             tracker.outgoing_call = Some(tracker.steps(row.callable_history)?);
                             drop(tracker);
                             let input = IntegerInputs(vec![row]);
-                            let argument = actual_nested_argument(calls, expression, roots, &input, true, false, None);
-                            let (axis, exact) = match &argument {
-                                NestedIntegerArgument::Projected(projection) => (Some(projection.caller_axis), None),
-                                NestedIntegerArgument::Single(Some((_, value))) | NestedIntegerArgument::RootLexical((_, value)) =>
-                                    (None, Some((*value).clone())),
-                                _ => return None,
+                            let argument = if signature.parameters.len() == 2 {
+                                nested_pair_argument(calls, expression, roots, &input, true, false, true, false, None)?
+                            } else {
+                                actual_nested_argument(calls, expression, roots, &input, true, false, None)
                             };
+                            let operands = argument.unit_history_operands()?;
+                            let domains_count = operands.iter().flatten().count();
+                            let is_projected = operands.iter().flatten().any(|arg| matches!(arg, UnitHistoryOperand::Axis(..)));
                             if !matches!(handle(calls, expression, signature, argument, &ScalarType::Unit)?, ActualCallResult::Unit) {
                                 return None;
                             }
                             let mut tracker = histories.borrow_mut();
                             let pieces = tracker.received_unit_paths.take()?;
-                            if axis.is_none() && pieces.len() > 1 { return None; }
+                            if !is_projected && pieces.len() > 1 { return None; }
                             let returned = tracker.boundary(span, true);
                             for piece in pieces {
                                 let original = input.0.first()?;
-                                tracker.charge(original.len().checked_add(piece.steps.len())?
-                                    .checked_add(piece.values.interval_count())?.checked_add(1)?)?;
-                                let mut resumed = IntegerInputs(vec![original.clone()]);
-                                if let Some(axis) = axis {
-                                    let entry = original.get(axis)?;
-                                    tracker.charge(entry.interval_count())?;
-                                    if !piece.values.is_subset_of(entry) { return None; }
-                                    resumed.restrict_axis(axis, &piece.values);
-                                } else if piece.values.singleton_value() != exact.as_ref() {
-                                    return None;
+                                if piece.domains.len() != domains_count { return None; }
+                                tracker.charge(original.len().checked_add(piece.steps.len())?.checked_add(1)?)?;
+                                let mut next = original.clone();
+                                for (operand, domain) in operands.into_iter().flatten().zip(piece.domains) {
+                                    tracker.charge(domain.interval_count().checked_add(1)?)?;
+                                    match operand {
+                                        UnitHistoryOperand::Axis(_, axis) => {
+                                            let entry = original.get(axis)?;
+                                            let mut cost = entry.interval_count();
+                                            original.charge_affine_replacement(axis, domain.interval_count(), &mut cost)?;
+                                            tracker.charge(cost.checked_add(original.equal_axes().len())?)?;
+                                            if domain.is_empty() || !domain.is_subset_of(entry) { return None; }
+                                            next.replace_domain(axis, domain);
+                                        }
+                                        UnitHistoryOperand::Exact((_, value)) if domain.singleton_value() == Some(value) => {}
+                                        _ => return None,
+                                    }
                                 }
-                                let [mut next]: [IntegerRow; 1] = resumed.0.try_into().ok()?;
                                 for step in piece.steps { tracker.append(&mut next, step); }
                                 tracker.append(&mut next, returned);
                                 survivors.0.push(next);
