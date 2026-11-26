@@ -2729,6 +2729,54 @@ core.require(false, { .stdout = "rankleaf"; .stderr = ""; .code = 6; .files = []
                 }
             }
         }
+        let loan_leaf = r#"%%start
+unit(*!u32) advance = fn(cell) { *cell = *cell +@ 1; };
+proof epoch for advance(p) -> () ensures (*p == core.old(*p) +@ 1) {}
+unit() start = fn {
+    u32 local = 4294967295;
+    advance(&!local);
+    advance(&!local);
+    core.require(local == 1, { .stdout = "unexpected"; .stderr = ""; .code = 9; .files = []; });
+    core.require(local == 0, { .stdout = "loan-first"; .stderr = ""; .code = 6; .files = []; });
+    core.require(local == 2, { .stdout = "loan-second"; .stderr = ""; .code = 7; .files = []; });
+};
+start();
+%%end"#;
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                fs::write(&leaf_source, loan_leaf).unwrap();
+                let old = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                let leaf = old.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                let expected = leaf.outcome.as_ref().unwrap();
+                assert_eq!(expected.directives.len(), 2);
+                let run = |cap| configured_check::check_targets_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                ).ok().unwrap();
+                for (cap, count, stdout_expected) in [
+                    (1, 0, &b"app"[..]), (2, 0, &b"appa"[..]), (3, 0, &b"appab"[..]),
+                    (4, 1, &b"appabloan-first"[..]),
+                    (8, 2, &b"appabloan-firstloan-second"[..]),
+                ] {
+                    let selected = run(cap);
+                    let leaf = selected.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                    let report = leaf.outcome.as_ref().unwrap();
+                    assert!(report.active && report.pointer_effect_diagnostic.is_none());
+                    assert_eq!(report.directives, expected.directives[..count]);
+                    let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                    assert_eq!(publish_configured_check_receipts(&selected, scope, true, &mut stdout, &mut stderr), Ok(3));
+                    assert_eq!(stdout, stdout_expected);
+                    assert!(stderr.as_slice().is_empty() && !root.join(".wosy").exists());
+                }
+                fs::write(&leaf_source, loan_leaf.replace("core.old(*p) +@ 1", "core.old(*p) +@ 2")).unwrap();
+                let refused = run(1);
+                let leaf = refused.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                assert!(matches!(leaf.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                assert!(publish_configured_check_receipts(&refused, scope, true, &mut stdout, &mut stderr).is_err());
+                assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !root.join(".wosy").exists());
+            }
+        }
         fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();
         fs::write(&leaf_source, body("leaf", 6)).unwrap();
 

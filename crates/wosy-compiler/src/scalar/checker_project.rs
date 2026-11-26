@@ -11579,7 +11579,6 @@ fn run_private_named_after_startup(
         let proof_source = *proof_source;
         let selected = owner.resolve_selected_proof(definition, *query)?;
         if pointer_proof::is_unit_target(&selected) {
-            let Some(cap) = cap else { return Err(ProjectCheck::Unsupported); };
             if qualified || expected.is_some() || named_definitions.len() != 1 || proof_source != &owner.source {
                 return Err(ProjectCheck::Unsupported);
             }

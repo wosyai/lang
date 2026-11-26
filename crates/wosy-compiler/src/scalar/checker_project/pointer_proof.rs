@@ -143,7 +143,7 @@ impl Plan {
     }
 
     pub(super) fn run_capped(
-        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
         let prepared = &owner.prepared;
         let (project, calls) = prepared.parts();
@@ -186,7 +186,10 @@ impl Plan {
         if authored_roots.into_iter().any(|(module, items)|
             module != caller.0 || items.into_iter().any(|item| item != caller.1))
         { return Err(ProjectCheck::Unsupported); }
-        let mut trace = failure_search::StartUpSearch::new(root, cap);
+        let mut trace = match cap {
+            Some(cap) => failure_search::StartUpSearch::new(root, cap),
+            None => failure_search::StartUpSearch::formal_only(root),
+        };
         trace.pointee_route = Some(failure_search::PointeeRoute { startup_site, caller, callee: self.target, pending_calls });
         let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
         let (init, _) = walk_prepared_initialization::<_, true, true>(
@@ -197,11 +200,15 @@ impl Plan {
         if trace.invalid() || trace.pointee_route.as_ref().is_none_or(|route| !route.pending_calls.is_empty())
             || self.applied.get() != Some((caller.1, count))
             || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-            || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+            || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(trace.remaining()) != Some(effects.records.len())
         { return Err(ProjectCheck::Unsupported); }
         let completion = match init {
-            Ok(init) if trace.remaining() > 0 && self.complete_startup(&init.reached)? => StartupAuthoredCompletion::Exhausted,
-            Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+            Ok(init) if self.complete_startup(&init.reached)? => match cap {
+                None => StartupAuthoredCompletion::LimitReached,
+                Some(_) if trace.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
+                Some(_) => return Err(ProjectCheck::Unsupported),
+            },
+            Err(ProjectCheck::StartupAuthoredLimitReached) if cap.is_some() && trace.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
             Err(error) => return Err(error),
             _ => return Err(ProjectCheck::Unsupported),
         };
