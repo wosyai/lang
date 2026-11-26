@@ -59,6 +59,24 @@ pub(crate) fn read_source(
     Ok((revision(blake3::hash(text.as_bytes())), text))
 }
 
+/// Read one live regular source without admitting more than the preview's
+/// source budget. Retain one overflow sentinel only to detect growth.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_bounded_regular_source(
+    path: &Path, opened: Option<fs::File>, max_bytes: usize,
+) -> Result<(ContentRevision, String), String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
+    let file = match opened { Some(file) => file, None => wosy_project::open_live_source(path).map_err(read_error)? };
+    let info = file.metadata().map_err(read_error)?;
+    if !info.is_file() { return Err("preview source must be a regular file".into()); }
+    if info.len() > max_bytes as u64 { return Err("preview source exceeds the authored byte budget".into()); }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64).read_to_end(&mut bytes).map_err(read_error)?;
+    if bytes.len() > max_bytes { return Err("preview source exceeds the authored byte budget".into()); }
+    let text = String::from_utf8(bytes).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok((revision(blake3::hash(text.as_bytes())), text))
+}
+
 fn revision(hash: blake3::Hash) -> ContentRevision {
     ContentRevision(hash.to_hex().to_string())
 }

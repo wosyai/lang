@@ -3,16 +3,18 @@ use crate::{
     artifact_inputs::project_configuration_identity,
     project_sources::{self, Error as SourceError},
 };
-use std::{ffi::OsStr, io::{self, Write}, path::{Path, PathBuf}};
+use std::{ffi::OsStr, fs, io::{self, Write}, path::{Path, PathBuf}};
 use wosy_compiler::{
     derive_closed_comptime_fragment, parse_source_with_snapshot, ClosedComptimeFragment,
     ClosedComptimeRejection, ComptimeParameter, Diagnostic, ScalarTargetLayout,
 };
+#[cfg(target_os = "linux")]
+use wosy_compiler::{derive_forwarded_pair_startup_comptime_plan, ForwardedPairStartupComptimePlan, CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 use wosy_project::{
-    declared_comptime_parameters, DeclaredComptimeParameter, ObservedClosedComptimeProfile,
+    declared_comptime_parameters, ContentRevision, DeclaredComptimeParameter, ObservedClosedComptimeProfile,
     ProjectConfiguration, ProjectContext, SelectedComptimeTools,
 };
-use wosy_syntax::SourceIdentity;
+use wosy_syntax::{FreshParseResult, SourceIdentity};
 
 #[cfg(target_os = "linux")]
 mod provision;
@@ -39,6 +41,44 @@ pub fn plan_closed_comptime_fragment(
     root: &Path, target: &str, profile: &str, id: &str, evaluator_layout: ScalarTargetLayout,
 ) -> Result<ClosedComptimeFragment, ClosedComptimePlanError> {
     Ok(observe(root, target, profile, id, evaluator_layout, false)?.fragment)
+}
+
+/// Inspection of the current ordinary project selection. The typed source
+/// occurrences belong to the one observed source, not a retained lease.
+#[cfg(target_os = "linux")]
+pub struct ProjectForwardedPairStartupComptimePlan {
+    target: String,
+    profile: String,
+    plan: ForwardedPairStartupComptimePlan,
+}
+
+#[cfg(target_os = "linux")]
+impl ProjectForwardedPairStartupComptimePlan {
+    pub fn target(&self) -> &str { &self.target }
+    pub fn profile(&self) -> &str { &self.profile }
+    pub fn plan(&self) -> &ForwardedPairStartupComptimePlan { &self.plan }
+}
+
+/// Read the selected singleton entry and derive its exact one-hop pair
+/// forwarding plan in memory. No tool selection, output, or execution.
+/// Linux provides the bounded regular-file opener used by this preview.
+#[cfg(target_os = "linux")]
+pub fn plan_forwarded_pair_comptime_startup(
+    root: &Path, target: &str, profile: &str, id: &str, evaluator_layout: ScalarTargetLayout,
+) -> Result<ProjectForwardedPairStartupComptimePlan, ClosedComptimePlanError> {
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
+    let project = ProjectContext::from_manifest(&root, target, document.as_table())?;
+    if !configuration.targets.get(target).is_some_and(|configured| configured.profiles.contains_key(profile)) {
+        return Err(ClosedComptimePlanError::Project(format!("target {target} profile {profile} is missing")));
+    }
+    let entry = load_single_entry(&root, &project, &configuration, |path, opened| {
+        project_sources::read_bounded_regular_source(path, opened, CLOSED_COMPTIME_MAX_SOURCE_BYTES)
+            .map_err(ClosedComptimePlanError::Project)
+    })?;
+    let plan = derive_forwarded_pair_startup_comptime_plan(&entry, id, evaluator_layout)
+        .map_err(ClosedComptimePlanError::Fragment)?;
+    Ok(ProjectForwardedPairStartupComptimePlan { target: target.into(), profile: profile.into(), plan })
 }
 
 /// One explicit local observation binding selected configuration and source
@@ -74,7 +114,9 @@ fn observe(
     let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
     let project = ProjectContext::from_manifest(&root, target, document.as_table())?;
     let stage_profile = if staging {
-        Some(ObservedClosedComptimeProfile::select(&configuration, &document, target, profile, &project.package, id)?)
+        Some(ObservedClosedComptimeProfile::select(
+            &configuration, &document, target, profile, &project.package, id,
+        )?)
     } else { None };
     let preview_parameters;
     let parameters = match &stage_profile {
@@ -84,9 +126,25 @@ fn observe(
             &preview_parameters
         }
     };
+    let entry = load_single_entry(&root, &project, &configuration, |path, opened| {
+        project_sources::read_source(path, opened).map_err(ClosedComptimePlanError::Project)
+    })?;
+    let fragment = derive_closed_comptime_fragment(&entry, id, evaluator_layout, |name| {
+        parameters.get(name).copied().map(compiler_parameter)
+    }).map_err(ClosedComptimePlanError::Fragment)?;
+    let staging = if let Some(profile) = stage_profile {
+        let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
+        Some(StagingSelection { workspace: root, configuration_identity, tools: profile.into_tools() })
+    } else { None };
+    Ok(FragmentObservation { fragment, staging })
+}
+
+fn load_single_entry(
+    root: &Path, project: &ProjectContext, configuration: &ProjectConfiguration,
+    read: impl FnMut(&Path, Option<fs::File>) -> Result<(ContentRevision, String), ClosedComptimePlanError>,
+) -> Result<FreshParseResult, ClosedComptimePlanError> {
     let mut entry = None;
-    project_sources::load_with_reader(&root, &project, &configuration,
-        |path, opened| project_sources::read_source(path, opened).map_err(ClosedComptimePlanError::Project),
+    project_sources::load_with_reader(root, project, configuration, read,
         |source, revision, text| {
             let path = source.path.as_path().to_str().ok_or("source path is not UTF-8").map_err(str::to_owned)?;
             let identity = SourceIdentity::new(source.project.clone(), source.package.clone(),
@@ -102,15 +160,7 @@ fn observe(
         SourceError::Observe(error) => error,
         SourceError::Graph(error) => ClosedComptimePlanError::Project(format!("{error:?}")),
     })?;
-    let entry = entry.ok_or_else(|| ClosedComptimePlanError::Project("target has no entry".into()))?;
-    let fragment = derive_closed_comptime_fragment(&entry, id, evaluator_layout, |name| {
-        parameters.get(name).copied().map(compiler_parameter)
-    }).map_err(ClosedComptimePlanError::Fragment)?;
-    let staging = if let Some(profile) = stage_profile {
-        let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
-        Some(StagingSelection { workspace: root, configuration_identity, tools: profile.into_tools() })
-    } else { None };
-    Ok(FragmentObservation { fragment, staging })
+    entry.ok_or_else(|| ClosedComptimePlanError::Project("target has no entry".into()))
 }
 
 pub(crate) fn compiler_parameter(value: DeclaredComptimeParameter) -> ComptimeParameter {

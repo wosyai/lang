@@ -9,9 +9,10 @@ use super::{
 use surrealkv::{Mode, Transaction};
 use wosy_compiler::{
     derive_closed_comptime_fragment, derive_direct_function_comptime_fragment,
-    derive_first_source_initializer_comptime, ClosedComptimeFragment, ClosedComptimeRejection, ComptimeParameter,
-    ComptimeParameterRejection, DirectStartupComptimePlan, DirectStartupComptimeUse, InspectedDirectComptimeCall,
-    ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    derive_first_source_initializer_comptime, derive_forwarded_pair_startup_comptime_plan, ClosedComptimeFragment,
+    ClosedComptimeRejection, ComptimeParameter, ComptimeParameterRejection, DirectStartupComptimePlan,
+    DirectStartupComptimeUse, InspectedDirectComptimeCall, PairStartupForwarding, ScalarTargetLayout, ScalarType,
+    CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
 use wosy_syntax::{FreshParseResult, SourceSpan};
@@ -143,7 +144,26 @@ pub enum RootedDirectStartupComptimeProjection<const ARITY: usize = 1> {
     Emitted(RootedDirectStartupComptimePlan<ARITY>),
 }
 
-pub(super) type StartupComptimeDerivation<const ARITY: usize> =
+/// Exact retained entry/ordinary route evidence. The wrapped plan owns all
+/// admitted partitions, so no forwarding receipt exists on partial egress.
+#[derive(Debug)]
+pub struct RootedForwardedPairStartupComptimePlan {
+    plan: RootedDirectStartupComptimePlan<2>,
+    forwarding: PairStartupForwarding,
+}
+
+impl RootedForwardedPairStartupComptimePlan {
+    pub fn plan(&self) -> &RootedDirectStartupComptimePlan<2> { &self.plan }
+    pub fn forwarding(&self) -> &PairStartupForwarding { &self.forwarding }
+}
+
+#[derive(Debug)]
+pub enum RootedForwardedPairStartupComptimeProjection {
+    Refused(RootedClosedComptimeRefusal),
+    Emitted(RootedForwardedPairStartupComptimePlan),
+}
+
+type StartupComptimeDerivation<const ARITY: usize> =
     fn(&FreshParseResult, &str, ScalarTargetLayout)
         -> std::result::Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection>;
 
@@ -228,9 +248,36 @@ impl SourceStore {
     pub(super) fn project_direct_startup_comptime_for_lease<const ARITY: usize>(
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest, derive: StartupComptimeDerivation<ARITY>,
     ) -> Result<RootedDirectStartupComptimeProjection<ARITY>> {
-        let answer = self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
-            let plan = match derive(&input.fresh, &request.id, request.evaluator_layout) {
-                Ok(plan) => plan,
+        let answer = self.project_startup_comptime_for_lease(lease, request, |fresh, id, layout| {
+            derive(fresh, id, layout).map(|plan| ((), plan))
+        })?;
+        Ok(match answer {
+            Ok(((), plan)) => RootedDirectStartupComptimeProjection::Emitted(plan),
+            Err(reason) => RootedDirectStartupComptimeProjection::Refused(reason),
+        })
+    }
+
+    pub(super) fn project_forwarded_pair_startup_comptime_for_lease(
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedForwardedPairStartupComptimeProjection> {
+        let answer = self.project_startup_comptime_for_lease(lease, request, |fresh, id, layout| {
+            derive_forwarded_pair_startup_comptime_plan(fresh, id, layout).map(|plan| plan.into_parts())
+        })?;
+        Ok(match answer {
+            Ok((forwarding, plan)) => RootedForwardedPairStartupComptimeProjection::Emitted(
+                RootedForwardedPairStartupComptimePlan { plan, forwarding }),
+            Err(reason) => RootedForwardedPairStartupComptimeProjection::Refused(reason),
+        })
+    }
+
+    fn project_startup_comptime_for_lease<const ARITY: usize, Evidence>(
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
+        derive: impl FnOnce(&FreshParseResult, &str, ScalarTargetLayout)
+            -> std::result::Result<(Evidence, DirectStartupComptimePlan<ARITY>), ClosedComptimeRejection>,
+    ) -> Result<SelectedComptime<(Evidence, RootedDirectStartupComptimePlan<ARITY>)>> {
+        self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+            let (evidence, plan) = match derive(&input.fresh, &request.id, request.evaluator_layout) {
+                Ok(derived) => derived,
                 Err(reason) => return Ok(Err(compiler_refusal(reason))),
             };
             let (calls, fragments) = plan.into_parts();
@@ -241,14 +288,10 @@ impl SourceStore {
                 remaining -= bytes.len();
                 evaluators.push(RootedStartupComptimeEvaluator { bytes, digest });
             }
-            Ok(Ok(RootedDirectStartupComptimePlan {
+            Ok(Ok((evidence, RootedDirectStartupComptimePlan {
                 source: input.source, id: request.id.clone(), evaluator_layout: request.evaluator_layout,
                 calls, evaluators,
-            }))
-        })?;
-        Ok(match answer {
-            Ok(plan) => RootedDirectStartupComptimeProjection::Emitted(plan),
-            Err(reason) => RootedDirectStartupComptimeProjection::Refused(reason),
+            })))
         })
     }
 

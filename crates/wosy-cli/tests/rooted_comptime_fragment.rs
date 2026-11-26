@@ -8,7 +8,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use wosy_cli::{
-    comptime_fragment::plan_closed_comptime_fragment,
+    comptime_fragment::{
+        plan_closed_comptime_fragment, plan_forwarded_pair_comptime_startup, ClosedComptimePlanError,
+        ProjectForwardedPairStartupComptimePlan,
+    },
     source_recovery::ClientSourceLimits,
     source_state::{ReplaySource, SqliteSourceState},
 };
@@ -17,7 +20,8 @@ use wosy_daemon::{
     BaseCstAdmissionLimits, RootedClosedComptimeFragment, RootedClosedComptimeProjection,
     RootedClosedComptimeRefusal, RootedClosedComptimeRequest,
     RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection,
-    RootedDirectStartupComptimePlan, RootedDirectStartupComptimeProjection, SourceStorageWorker, SourceStore,
+    RootedDirectStartupComptimePlan, RootedDirectStartupComptimeProjection, RootedForwardedPairStartupComptimePlan,
+    RootedForwardedPairStartupComptimeProjection, SourceStorageWorker, SourceStore,
 };
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{BuildSourceSelection, FileKey, NodeId};
@@ -565,6 +569,126 @@ u32 changed = solve(7, 11);
                     feature: "comptime accepts one audited eager scalar operator with one formal read", ..
                 }))));
     }
+    assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
+    drop((retained, current));
+    drop((worker, client));
+    Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+}
+
+
+fn emitted_forwarded(projection: RootedForwardedPairStartupComptimeProjection) -> RootedForwardedPairStartupComptimePlan {
+    match projection {
+        RootedForwardedPairStartupComptimeProjection::Emitted(plan) => plan,
+        RootedForwardedPairStartupComptimeProjection::Refused(reason) => panic!("unexpected forwarding refusal: {reason:?}"),
+    }
+}
+
+fn assert_forwarding_preview(
+    live: &ProjectForwardedPairStartupComptimePlan, leased: &RootedForwardedPairStartupComptimePlan,
+    source: &str, root: NodeId, layout: ScalarTargetLayout, permutation: [usize; 2],
+) -> usize {
+    let rooted = leased.plan();
+    assert_eq!(rooted.source_root(), root);
+    assert_eq!(live.target(), "app");
+    assert_eq!(rooted.target(), live.target());
+    assert_eq!(live.profile(), "dev");
+    assert_eq!(rooted.profile(), live.profile());
+    assert_eq!(rooted.id(), "value");
+    assert_eq!(rooted.evaluator_layout(), layout);
+    let plan = live.plan();
+    assert_eq!(leased.forwarding().declaration(), plan.forwarding().declaration());
+    assert_eq!(leased.forwarding().tail_call(), plan.forwarding().tail_call());
+    assert_eq!(leased.forwarding().startup_argument_positions(), permutation);
+    assert_eq!(plan.forwarding().startup_argument_positions(), permutation);
+    let range = leased.forwarding().tail_call().range;
+    assert_eq!(&source[range.start as usize..range.end as usize], if permutation == [0, 1] {
+        "solve(upstream_left, upstream_right)"
+    } else {
+        "solve(upstream_right, upstream_left)"
+    });
+
+    let outer_tuples = [[7, 9], [9, 7], [7, 9], [7, 13]];
+    let expected = outer_tuples.map(|tuple| permutation.map(|ordinal| DirectComptimeArgument::U32(tuple[ordinal])));
+    assert_eq!(rooted.calls().len(), expected.len());
+    assert_eq!(plan.calls().len(), expected.len());
+    for (((leased, live), values), slot) in rooted.calls().iter().zip(plan.calls()).zip(expected).zip([0, 1, 0, 2]) {
+        assert_eq!(leased.facts(), live.facts());
+        assert_eq!(leased.evaluator_index(), slot);
+        assert_eq!(live.evaluator_index(), slot);
+        assert_eq!(leased.facts().inputs().each_ref().map(|input| input.value()), values);
+    }
+    assert_eq!(rooted.evaluators().len(), 3);
+    assert_eq!(plan.evaluators().len(), 3);
+    rooted.evaluators().iter().zip(plan.evaluators()).map(|(leased, live)| {
+        let mut bytes = Vec::new();
+        live.llvm().write_text(&mut bytes).unwrap();
+        assert_eq!(leased.digest(), NodeId(*blake3::hash(&bytes).as_bytes()));
+        assert_eq!(leased.bytes(), bytes);
+        bytes.len()
+    }).sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarded_pair_preview_matches_retained_typed_evidence_not_just_partition_bytes() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let original_text = r#"%%start
+# WHY: encaminhamento com café ☕
+u32(u32, u32) solve = fn(left, right) { comptime value { right ^ left } };
+u32(u32, u32) relay = fn(upstream_left, upstream_right) { solve(upstream_left, upstream_right) };
+u32 first = relay(7, 9);
+u32 reversed = relay(9, 7);
+u32 repeated = relay(7, 9);
+u32 changed = relay(7, 13);
+%%end
+"#;
+    let updated_text = original_text.replace("solve(upstream_left, upstream_right)", "solve(upstream_right, upstream_left)");
+    fs::write(project.join("src/main.w"), original_text).unwrap();
+    let layouts = [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32];
+    let live = |layout| plan_forwarded_pair_comptime_startup(&project, "app", "dev", "value", layout).unwrap();
+    let original_previews = layouts.map(live);
+    let store = Arc::new(SourceStore::open(&fixture.0.join("daemon"), 1 << 20).unwrap());
+    let mut client = client(&project);
+    let original = publish(&mut client, &store).await;
+    let worker = worker(&store);
+    let retained = worker.open_build_diagnostics(original.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+
+    fs::write(project.join("src/main.w"), &updated_text).unwrap();
+    let updated = publish(&mut client, &store).await;
+    let current = worker.open_build_diagnostics(updated.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    assert_ne!(original.root, updated.root);
+    for (layout, original_preview) in layouts.into_iter().zip(original_previews) {
+        let current_preview = live(layout);
+        let historical = emitted_forwarded(retained.project_forwarded_pair_startup_comptime(request("value", layout)).await.unwrap());
+        let fresh = emitted_forwarded(current.project_forwarded_pair_startup_comptime(request("value", layout)).await.unwrap());
+        let old_total = assert_forwarding_preview(&original_preview, &historical, original_text, original.root, layout, [0, 1]);
+        let new_total = assert_forwarding_preview(&current_preview, &fresh, &updated_text, updated.root, layout, [1, 0]);
+        assert_eq!(old_total, new_total);
+        assert_eq!(historical.plan().compiler_image(), fresh.plan().compiler_image());
+        assert_ne!(historical.plan().authored_cst(), fresh.plan().authored_cst());
+        assert!(historical.plan().evaluators().iter().zip(fresh.plan().evaluators()).all(|(previous, current)| {
+            previous.digest() == current.digest() && previous.bytes() == current.bytes()
+        }));
+        let mut tight = request("value", layout);
+        tight.output_bytes = new_total - 1;
+        assert!(fresh.plan().evaluators().iter().all(|part| part.bytes().len() <= tight.output_bytes));
+        assert!(current.project_forwarded_pair_startup_comptime(tight).await.unwrap_err().to_string().contains("output byte budget"));
+        let mut exact = request("value", layout);
+        exact.output_bytes = new_total;
+        let complete = emitted_forwarded(current.project_forwarded_pair_startup_comptime(exact).await.unwrap());
+        assert_eq!(assert_forwarding_preview(&current_preview, &complete, &updated_text, updated.root, layout, [1, 0]), new_total);
+    }
+
+    let mut missing_profile = request("value", ScalarTargetLayout::NATIVE64);
+    missing_profile.profile = "missing".into();
+    assert!(matches!(current.project_forwarded_pair_startup_comptime(missing_profile).await.unwrap(),
+        RootedForwardedPairStartupComptimeProjection::Refused(RootedClosedComptimeRefusal::ProfileNotSelected)));
+    assert!(matches!(plan_forwarded_pair_comptime_startup(&project, "app", "missing", "value", ScalarTargetLayout::NATIVE64),
+        Err(ClosedComptimePlanError::Project(message)) if message.contains("target app profile missing is missing")));
+
+    fs::write(project.join("src/main.w"), " ".repeat(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES + 1)).unwrap();
+    assert!(matches!(plan_forwarded_pair_comptime_startup(&project, "app", "dev", "value", ScalarTargetLayout::NATIVE64),
+        Err(ClosedComptimePlanError::Project(message)) if message.contains("authored byte budget")));
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
     drop((retained, current));
     drop((worker, client));

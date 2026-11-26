@@ -186,6 +186,10 @@ impl ForwardedPairStartupComptimePlan {
     pub fn forwarding(&self) -> &PairStartupForwarding { &self.forwarding }
     pub fn calls(&self) -> &[DirectStartupComptimeUse<2>] { self.plan.calls() }
     pub fn evaluators(&self) -> &[ClosedComptimeFragment] { self.plan.evaluators() }
+
+    pub fn into_parts(self) -> (PairStartupForwarding, DirectStartupComptimePlan<2>) {
+        (self.forwarding, self.plan)
+    }
 }
 
 /// Project only one unconditional, complete tail call that forwards each

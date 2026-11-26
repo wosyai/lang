@@ -1,10 +1,11 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::SourceLease, rooted_comptime::{SiteScope, StartupComptimeDerivation},
+    retention_plan::SourceLease, rooted_comptime::SiteScope,
     source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
     RootedClosedComptimeRequest, RootedDirectFunctionComptimeProjection, RootedDirectStartupComptimeProjection,
+    RootedForwardedPairStartupComptimeProjection, SourceStore,
     RootedLlvmIdentity,
     RootedLlvmProjection, RootedPreparedProject,
     SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
@@ -180,7 +181,9 @@ impl BuildDiagnosticSession<'_> {
     pub async fn project_direct_startup_comptime(
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedDirectStartupComptimeProjection> {
-        self.project_direct_startup_comptime_using(request, derive_direct_startup_comptime_plan).await
+        self.project_startup_comptime_using(request, |store, lease, request| {
+            store.project_direct_startup_comptime_for_lease(lease, request, derive_direct_startup_comptime_plan)
+        }).await
     }
 
     /// The same local leased plan projection for two literal formals. Unequal
@@ -188,18 +191,27 @@ impl BuildDiagnosticSession<'_> {
     pub async fn project_direct_pair_startup_comptime(
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedDirectStartupComptimeProjection<2>> {
-        self.project_direct_startup_comptime_using(request, derive_direct_pair_startup_comptime_plan).await
+        self.project_startup_comptime_using(request, |store, lease, request| {
+            store.project_direct_startup_comptime_for_lease(lease, request, derive_direct_pair_startup_comptime_plan)
+        }).await
     }
 
-    async fn project_direct_startup_comptime_using<const ARITY: usize>(
-        &self, request: RootedClosedComptimeRequest, derive: StartupComptimeDerivation<ARITY>,
-    ) -> Result<RootedDirectStartupComptimeProjection<ARITY>> {
+    /// Inspect the verified one-hop forwarding plan on the local singleton
+    /// lease, using the same aggregate text budget as direct startup.
+    pub async fn project_forwarded_pair_startup_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedForwardedPairStartupComptimeProjection> {
+        self.project_startup_comptime_using(request, SourceStore::project_forwarded_pair_startup_comptime_for_lease).await
+    }
+
+    async fn project_startup_comptime_using<T: Send + 'static>(
+        &self, request: RootedClosedComptimeRequest,
+        project: impl FnOnce(&SourceStore, &SourceLease, RootedClosedComptimeRequest) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         request.check_selector_bytes()?;
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
-        self.worker.spawn_reserved(slot, move |store| {
-            store.project_direct_startup_comptime_for_lease(&lease, request, derive)
-        }).await?
+        self.worker.spawn_reserved(slot, move |store| project(store, &lease, request)).await?
     }
 
     async fn project_closed_comptime_in(
