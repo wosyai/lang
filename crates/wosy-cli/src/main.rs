@@ -3510,71 +3510,77 @@ main_artifact = "main"
                 fs::remove_file(&shared_source).unwrap();
                 fs::remove_file(&additional_source).unwrap();
 
-                let scalar_relations = format!(r#"%%start
-                    i8(i8) signed = fn(value) {{ value }};
-                    u8(u8) unsigned = fn(value) {{ value }};
-                    u8(u8) advance = fn(value) {{ u8 next = value + 1; next }};
-                    u8(u8) shift = fn(value) {{ u8 next = value + 1; next }};
-                    u8(u8) unused = fn(value) {{ value }};
-                    proof sign_bound for signed(entry) -> (out) where (entry >= -4) ensures (out >= -1) {{}}
-                    proof exclusion for unsigned(entry) -> (out) where (entry == 5) ensures (out != 5) {{}}
-                    proof same_entry for advance(entry) -> (out) where (entry <= 8) ensures (out == core.old(entry)) {{}}
-                    proof increment for shift(entry) -> (out) where (entry <= 8) ensures (out == core.old(entry) + 2) {{}}
-                    proof deferred for unused(entry) -> (out) where (entry == 6) ensures (out <= 5) {{}}
-                    core.require(false, {first});
-                    i8 a = signed(-2);
-                    u8 b = unsigned(5);
-                    u8 c = advance(7);
-                    u8 d = shift(8);
-                    core.require(a < 0, {unused_output});
-                    core.require(b == 5, {unused_output});
-                    core.require(c == 8, {unused_output});
-                    core.require(d == 9, {unused_output});
-                    core.require(false, {second});
-                %%end"#);
-                fs::write(&source, &scalar_relations).unwrap();
-                let baseline = legacy();
-                let old = baseline.outcome.as_ref().unwrap();
-                assert_eq!(old.directives.len(), 2);
-                assert_eq!(old.diagnostics.len(), 4);
-                let before = terminal(std::slice::from_ref(&baseline), scope, false);
-                assert_eq!(before.0, Ok(19));
-                assert_eq!(before.1, b"firstsecond");
-                assert_eq!(files(), both_files);
-                clean();
-                for cap in [1, 2, 3] {
-                    let receipts = selected(cap);
-                    let actual = receipts[0].outcome.as_ref().unwrap();
-                    assert_eq!(actual.directives, old.directives[..cap.min(2)]);
-                    assert_eq!(actual.diagnostics.len(), 4);
-                    for ((new, prior), (call, value)) in actual.diagnostics.iter().zip(&old.diagnostics)
-                        .zip([("signed(-2)", -2), ("unsigned(5)", 5), ("advance(7)", 8), ("shift(8)", 9)])
-                    {
+                // The incumbent's observer keeps one pure-affine
+                // target at a time. Compare independently admitted
+                // profiles rather than assume their arbitrary union.
+                for (ty, implementation, contract, input, real_result, returned) in [
+                    ("i8", "value", "where (entry >= -4) ensures (out >= -1)", "-2", "actual < 0", -2),
+                    ("u8", "value", "where (entry == 5) ensures (out != 5)", "5", "actual == 5", 5),
+                    ("u8", "u8 next = value + 1; next", "where (entry >= 1 && entry <= 8) ensures (out == core.old(entry))", "7", "actual == 8", 8),
+                    ("u8", "u8 next = value + 1; next", "where (entry >= 1 && entry <= 8) ensures (out == core.old(entry) + 2)", "8", "actual == 9", 9),
+                ] {
+                    let declaration = format!(r#"
+                        {ty}({ty}) calculate = fn(value) {{ {implementation} }};
+                        proof result for calculate(entry) -> (out) {contract} {{}}
+                    "#);
+                    let scalar_relations = format!(r#"%%start
+                        {declaration}
+                        core.require(false, {first});
+                        {ty} actual = calculate({input});
+                        core.require({real_result}, {unused_output});
+                        core.require(false, {second});
+                    %%end"#);
+                    fs::write(&source, &scalar_relations).unwrap();
+                    let baseline = legacy();
+                    let old = baseline.outcome.as_ref().unwrap_or_else(|_| panic!("incumbent literal/entry profile: {contract}"));
+                    assert_eq!(old.directives.len(), 2);
+                    assert_eq!(old.diagnostics.len(), 1);
+                    let before = terminal(std::slice::from_ref(&baseline), scope, false);
+                    assert_eq!(before.0, Ok(19));
+                    assert_eq!(before.1, b"firstsecond");
+                    assert_eq!(files(), both_files);
+                    clean();
+                    for cap in [1, 2, 3] {
+                        let receipts = selected(cap);
+                        let actual = receipts[0].outcome.as_ref().unwrap_or_else(|_| panic!("private literal/entry profile: {contract}"));
+                        assert_eq!(actual.directives, old.directives[..cap.min(2)]);
+                        let [new] = actual.diagnostics.as_slice() else { panic!("actual proof after cap: {contract}"); };
+                        let prior = &old.diagnostics[0];
                         assert_eq!(new.proof, prior.proof);
                         assert_eq!(new.goal, prior.goal);
                         assert_eq!(new.invocation.call, prior.invocation.call);
-                        assert_eq!(new.invocation.returned, value.into());
+                        assert_eq!(new.invocation.returned, returned.into());
                         let span = new.invocation.call.range;
-                        assert_eq!(&scalar_relations[span.start as usize..span.end as usize], call);
+                        assert_eq!(&scalar_relations[span.start as usize..span.end as usize], format!("calculate({input})"));
+                        let printed = terminal(&receipts, scope, false);
+                        if cap == 1 {
+                            assert_eq!(printed.0, Ok(1));
+                            assert_eq!(printed.1, b"first");
+                            assert_eq!(files(), first_file);
+                        } else {
+                            assert_eq!(printed, before);
+                            assert_eq!(files(), both_files);
+                        }
+                        clean();
                     }
-                    let observed = actual.symbolic_diagnostic.as_ref();
-                    assert_eq!(observed.is_some(), scope == ScalarCheckerScope::CurrentPackage);
-                    if let Some(observed) = observed {
-                        let prior = old.symbolic_diagnostic.as_ref().unwrap();
-                        assert_eq!((&observed.proof, &observed.goal, &observed.returned),
-                            (&prior.proof, &prior.goal, &prior.returned));
-                        assert_eq!(observed.directive_position, cap.min(2));
+                    let dormant = format!("%%start {declaration} core.require(false, {first}); core.require(false, {second}); %%end");
+                    fs::write(&source, dormant).unwrap();
+                    let baseline = legacy();
+                    let old = baseline.outcome.as_ref().unwrap_or_else(|_| panic!("incumbent dormant profile: {contract}"));
+                    for cap in [1, 3] {
+                        let receipts = selected(cap);
+                        let actual = receipts[0].outcome.as_ref().unwrap_or_else(|_| panic!("private dormant profile: {contract}"));
+                        assert_eq!(actual.directives, old.directives[..cap.min(2)]);
+                        assert!(actual.diagnostics.is_empty());
+                        let observed = actual.symbolic_diagnostic.as_ref();
+                        assert_eq!(observed.is_some(), scope == ScalarCheckerScope::CurrentPackage);
+                        if let Some(observed) = observed {
+                            let prior = old.symbolic_diagnostic.as_ref().unwrap();
+                            assert_eq!((&observed.proof, &observed.goal, &observed.returned),
+                                (&prior.proof, &prior.goal, &prior.returned));
+                            assert_eq!(observed.directive_position, cap.min(2));
+                        }
                     }
-                    let printed = terminal(&receipts, scope, false);
-                    if cap == 1 {
-                        assert_eq!(printed.0, Ok(1));
-                        assert_eq!(printed.1, b"first");
-                        assert_eq!(files(), first_file);
-                    } else {
-                        assert_eq!(printed, before);
-                        assert_eq!(files(), both_files);
-                    }
-                    clean();
                 }
                 // Do not silently enable this newly enrolled goal in a provider catalog.
                 fs::write(&source, &roster_root).unwrap();
