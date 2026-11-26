@@ -918,9 +918,9 @@ mod tests {
     #[test]
     fn forwarded_pair_reaches_the_exact_typed_target_with_the_formal_permutation() {
         let outer_tuples = [[7, 9], [9, 7], [7, 9], [7, 11]];
-        for (tail, permutation) in [("solve(first, second)", [0, 1]), ("solve(second, first)", [1, 0])] {
+        for (tail, permutation) in [("solve(upstream_left, upstream_right)", [0, 1]), ("solve(upstream_right, upstream_left)", [1, 0])] {
             let source = fresh(&format!(
-                "{PAIRED_FUNCTION}\nu32(u32, u32) relay = fn(first, second) {{ {tail} }};\n\
+                "{PAIRED_FUNCTION}\nu32(u32, u32) relay = fn(upstream_left, upstream_right) {{ {tail} }};\n\
                  u32 first = relay(7, 9);\nu32 reversed = relay(9, 7);\nu32 repeated = relay(7, 9);\n\
                  u32 changed = relay(7, 11);"
             ));
