@@ -12050,7 +12050,8 @@ fn run_private_named_after_startup(
     }
     let ordinary_relations = !qualified && expected.is_none() && arrays.is_empty() && ranked.is_none();
     let mut binary_bare = Vec::new();
-    let mut targets = HashSet::with_capacity(plans.len());
+    let mut targets = HashMap::with_capacity(plans.len());
+    let mut shared_bare_targets = HashSet::new();
     let mut names = HashSet::with_capacity(plans.len());
     for plan in &plans {
         let body = plan.typed.body;
@@ -12084,9 +12085,17 @@ fn run_private_named_after_startup(
         // MainFlowProofCase::prepare, before any ordinary walk,
         // authenticates the exact typed witness and sole permitted step.
         if !goal_supported || (!typed_witness && !plan.has_no_authored_steps()) || !valid_arbitrary_proof_body(body)
-            || !body.structure.checker_direct_targets.is_empty()
-            || !targets.insert(plan.target) || !names.insert((plan.proof_source, plan.name))
+            || !body.structure.checker_direct_targets.is_empty() || !names.insert((plan.proof_source, plan.name))
         { return Err(ProjectCheck::Unsupported); }
+        // Existing observer combines independently checked bare cases on
+        // the same original body; it never issues a combined summary.
+        // Keep specialized, imported and dormant-source catalog gates.
+        let shareable = ordinary_relations && !has_dormant && plan.proof_source == root
+            && unary_bound && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. });
+        if let Some(prior) = targets.insert(plan.target, shareable) {
+            if !prior || !shareable { return Err(ProjectCheck::Unsupported); }
+            shared_bare_targets.insert(plan.target);
+        }
     }
     let ranked_requires_equality = ranked.as_ref().is_some_and(|plan|
         !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }));
@@ -12129,6 +12138,7 @@ fn run_private_named_after_startup(
     let reached_rank = !ranked_sites.is_empty();
     if reached_rank && ranked_requires_equality { return Err(ProjectCheck::Unsupported); }
     let mut invoked = Vec::new();
+    let mut enrolled = HashSet::new();
     let mut reached_scalar_relation = false;
     let mut activation_count = 0usize;
     for plan in &plans {
@@ -12139,10 +12149,13 @@ fn run_private_named_after_startup(
             && !binary_bare.contains(&plan.target) {
             return Err(ProjectCheck::Unsupported);
         }
-        activation_count = activation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
         reached_scalar_relation |= ordinary_relations
-            && !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. });
-        invoked.push((plan.target, sites.as_slice()));
+            && (shared_bare_targets.contains(&plan.target)
+                || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }));
+        if enrolled.insert(plan.target) {
+            activation_count = activation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
+            invoked.push((plan.target, sites.as_slice()));
+        }
     }
     // The old exact named adapters keep their explicit route assertions,
     // while the common automatic path can authenticate a whole bare roster.
@@ -12173,7 +12186,8 @@ fn run_private_named_after_startup(
     // order. Preserve it even when typed goals were authored in reverse.
     let owner_order = project.initialization_order.iter().chain(dormant.iter().map(|module| &module.source)).enumerate()
         .map(|(position, source)| (source, position)).collect::<HashMap<_, _>>();
-    plans.sort_unstable_by_key(|plan| (owner_order[plan.proof_source], plan.target.1));
+    // Stable for several independently authored clauses on one target.
+    plans.sort_by_key(|plan| (owner_order[plan.proof_source], plan.target.1));
     let mut observer = if let [first, rest @ ..] = plans.as_slice() {
         let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
         for plan in rest {
@@ -12218,7 +12232,31 @@ fn run_private_named_after_startup(
     if trace.named_observations.len() != activation_count { return Err(ProjectCheck::Unsupported); }
     let invoked = invoked.into_iter().map(|(target, _)| target).collect::<HashSet<_>>();
     if let Some(observer) = &mut observer {
-        if invoked.len() <= 1 && (activation_count <= 1 || plans.len() == 1) {
+        if !shared_bare_targets.is_empty() {
+            let mut costs = HashMap::with_capacity(shared_bare_targets.len());
+            for &target in shared_bare_targets.intersection(&invoked) {
+                let group = if observer.first.0 == target { &observer.first.1 }
+                    else { observer.other.get(&target).ok_or(ProjectCheck::Unsupported)? };
+                let MainFlowProofCases::Bare { first, rest } = &group.cases
+                    else { return Err(ProjectCheck::Unsupported); };
+                if rest.is_empty() || group.issuer.is_some() || group.qualified_issuer.is_some() {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let work = std::iter::once(first).chain(rest).try_fold(0usize, |work, case|
+                    work.checked_add(case.guard.activation_replay_work()?)).ok_or(ProjectCheck::Unsupported)?;
+                costs.insert(target, work);
+            }
+            for observed in std::mem::take(&mut trace.named_observations) {
+                if let Some(&cost) = costs.get(&observed.target) {
+                    if observed.site.source != owner.source { return Err(ProjectCheck::Unsupported); }
+                    trace.charge_formal_replay(1, cost).ok_or(ProjectCheck::Unsupported)?;
+                    publish_capped_bare_observation(observer, observed);
+                } else {
+                    observe_capped_bare_receipt(observer, &mut trace, &invoked, &owner.source, observed)?;
+                }
+            }
+            if !observer.complete(&invoked) { return Err(ProjectCheck::Unsupported); }
+        } else if invoked.len() <= 1 && (activation_count <= 1 || plans.len() == 1) {
             observe_capped_bare_receipts(observer, &mut trace, invoked.iter().copied().next(), &owner.source)?;
         } else {
             for observed in std::mem::take(&mut trace.named_observations) {
@@ -12232,7 +12270,8 @@ fn run_private_named_after_startup(
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
         let result = if let Some(evidence) = &evidence {
             let mut proof = evidence.symbolic();
-            for plan in plans.iter().filter(|plan| !invoked.contains(&plan.target)) {
+            let mut symbolic_targets = HashSet::new();
+            for plan in plans.iter().filter(|plan| !invoked.contains(&plan.target) && symbolic_targets.insert(plan.target)) {
                 // No invented completion/dependency access, only the original
                 // closed dormant theorem allowed by the resolved-edge census.
                 active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,

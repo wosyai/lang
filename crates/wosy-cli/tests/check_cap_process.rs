@@ -741,3 +741,57 @@ fn check_cap_process_walks_actual_nested_unit_frames_in_prepared_owners() {
         }
     }
 }
+
+#[test]
+fn check_cap_process_shares_original_bare_calls_without_multiplying_authored_paths() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--declared-package", "--main-flow-only"] {
+            for (goal_a, entry_b, goal_b, returns) in [
+                (2, 3, 3, None),
+                (4, 3, 5, Some((2, 3))),
+                (4, 2, 5, Some((2, 2))),
+            ] {
+                let project = Fixture::new();
+                let source = format!(r#"%%start
+                    u8(u8) choose = fn(value) {{ value }};
+                    proof first_case for choose(entry) -> (out) where (entry == 2) ensures (out == {goal_a}) {{}}
+                    proof second_case for choose(entry) -> (out) where (entry == {entry_b}) ensures (out == {goal_b}) {{}}
+                    u8 first = choose(2);
+                    u8 second = choose(3);
+                    if (first < second) {{ {}{} }};
+                    %%end"#, require("a", 5, "a.txt"), require("b", 7, "b.txt"));
+                project.package("", layout, "dev", "", &source);
+                let full = project.run(&[scope, "--all-errors"]);
+                assert_eq!(full.status.code(), Some(5), "{full:?}");
+                assert_eq!(full.stdout, b"ab");
+                assert!(full.stderr.starts_with(b"[a][b]"));
+                if let Some((first, second)) = returns {
+                    let text = String::from_utf8_lossy(&full.stderr);
+                    let offsets = text.match_indices("error: proof obligation failed").map(|(offset, _)| offset).collect::<Vec<_>>();
+                    assert_eq!(offsets.len(), 2);
+                    assert!(text[offsets[0]..offsets[1]].contains(&format!("call returned {first}")), "{text}");
+                    assert!(text[offsets[1]..].contains(&format!("call returned {second}")), "{text}");
+                    assert!(text[offsets[0]..offsets[1]].contains("first_case"), "{text}");
+                    assert!(text[offsets[1]..].contains("second_case"), "{text}");
+                } else {
+                    assert_eq!(full.stderr, b"[a][b]");
+                }
+                assert_eq!(fs::read(project.output().join("a.txt")).unwrap(), b"a");
+                assert_eq!(fs::read(project.output().join("b.txt")).unwrap(), b"b");
+                project.clear();
+                assert_terminal(&project.run(&[scope]), 5, b"a", b"[a]");
+                assert_eq!(fs::read(project.output().join("a.txt")).unwrap(), b"a");
+                assert!(!project.output().join("b.txt").exists());
+                project.clear();
+                let second_diag = String::from_utf8_lossy(&full.stderr)
+                    .match_indices("error: proof obligation failed").nth(1).map(|(offset, _)| offset).unwrap_or(full.stderr.len());
+                for (limit, expected) in [("2", b"[a][b]".as_slice()), ("3", &full.stderr[..second_diag]), ("4", &full.stderr)] {
+                    assert_terminal(&project.run(&[scope, "--max-errors", limit]), 5, b"ab", expected);
+                    assert_eq!(fs::read(project.output().join("a.txt")).unwrap(), b"a");
+                    assert_eq!(fs::read(project.output().join("b.txt")).unwrap(), b"b");
+                    project.clear();
+                }
+            }
+        }
+    }
+}
