@@ -2868,6 +2868,61 @@ main_artifact = "main"
                 assert_eq!(files(), both_files);
                 clean();
 
+                let mixed_catalog = format!(r#"%%start
+                    u8[2]() make = fn {{ [7, 1] }};
+                    u8(u8) echo = fn(value) {{ value }};
+                    proof cells for make() -> (items)
+                        forall (u64 i where i == 0) ensures (items[i] == 8)
+                    {{ core.show(items[i] == 8); }}
+                    proof scalar for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+                    u8[2] input = make();
+                    u8 cell = input[0];
+                    core.require(cell == 8, {first});
+                    u8 returned = echo(7);
+                    core.require(returned == 8, {second});
+                %%end"#);
+                for proof_scope in [0, 1, 2] {
+                    let both = match proof_scope {
+                        1 => mixed_catalog.replace("u8 returned = echo(7);", "u8 returned = 7;"),
+                        2 => mixed_catalog.replace("u8[2] input = make();", "").replace("u8 cell = input[0];", "u8 cell = 7;"),
+                        _ => mixed_catalog.clone(),
+                    };
+                    fs::write(&source, both).unwrap();
+                    let old_mixed = terminal(&[legacy()], scope, false);
+                    assert_eq!(old_mixed.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 1);
+                    if proof_scope == 1 {
+                        assert!(report.diagnostics.is_empty());
+                        assert_eq!(report.symbolic_diagnostic.is_some(), scope == ScalarCheckerScope::CurrentPackage);
+                    } else {
+                        assert_eq!(report.diagnostics.len(), 1);
+                    }
+                    if proof_scope == 2 && scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(report.aggregate_diagnostics.is_empty());
+                    } else {
+                        let [array] = report.aggregate_diagnostics.as_slice() else { panic!("one original aggregate claim"); };
+                        assert_eq!(array.call.is_some(), proof_scope != 2);
+                    }
+                    let clipped = terminal(&limited, scope, false);
+                    assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                    assert_eq!(clipped.2.strip_prefix(b"[first]"), old_mixed.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old_mixed);
+                    assert_eq!(files(), both_files);
+                    clean();
+                }
+                let pruned = mixed_catalog.replace("u8 returned = echo(7);", &format!(
+                    "core.narrow(false, {second}); u8 returned = echo(7);"));
+                fs::write(&source, pruned).unwrap();
+                let no_replay = selected(1);
+                assert!(matches!(no_replay[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
                 fs::write(&source, &ranked).unwrap();
                 let legacy_render = terminal(&[legacy()], scope, false);
                 assert_eq!(legacy_render.0, Ok(19));

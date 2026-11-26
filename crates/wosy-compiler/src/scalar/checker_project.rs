@@ -10711,9 +10711,9 @@ fn run_private_named_after_startup(
         }
     }
     if !arrays.is_empty() {
-        if !plans.is_empty() || ranked.is_some() { return Err(ProjectCheck::Unsupported); }
+        if plans.len() > 1 || ranked.is_some() { return Err(ProjectCheck::Unsupported); }
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
-        return cohort.run_capped(owner, scope, cap);
+        return cohort.run_capped(owner, scope, cap, plans.first());
     }
     if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
@@ -10773,18 +10773,6 @@ fn run_private_named_after_startup(
     } else { None };
     let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified,
         &[], None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)))?;
-    // Generalized recollection multiplies the guard work by the number of
-    // observed activations. Charge the full upper bound before testing any
-    // of these replayed guards or staging their proof diagnostics.
-    if trace.named_observations.len() > 1 {
-        let (target, _) = invoked.ok_or(ProjectCheck::Unsupported)?;
-        if observer.first.0 != target { return Err(ProjectCheck::Unsupported); }
-        let MainFlowProofCases::Bare { first, rest } = &observer.first.1.cases
-            else { return Err(ProjectCheck::Unsupported); };
-        if !rest.is_empty() { return Err(ProjectCheck::Unsupported); }
-        trace.charge_formal_replay(trace.named_observations.len(), first.guard.activation_replay_work()
-            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
-    }
     if let Some(rank) = &mut verified_rank {
         if trace.ranked_observations.len() > 1 {
             trace.charge_formal_replay(trace.ranked_observations.len(), rank.where_guard.activation_replay_work()
@@ -10801,14 +10789,7 @@ fn run_private_named_after_startup(
     }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
     let invoked = invoked.map(|(target, _)| target);
-    for observed in trace.named_observations {
-        if observed.site.source != owner.source { return Err(ProjectCheck::Unsupported); }
-        observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
-            source: &observed.site.source,
-            call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
-        }), &[observed.parameter], &[&observed.argument], &observed.returned);
-    }
-    if !observer.complete(&invoked.into_iter().collect()) { return Err(ProjectCheck::Unsupported); }
+    observe_capped_bare_receipts(&mut observer, &mut trace, invoked, &owner.source)?;
     active |= observer.active;
     let evidence = NamedOrderedEvidence { observed: observer };
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
@@ -10840,6 +10821,34 @@ fn run_private_named_after_startup(
         additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
     }, end))
+}
+
+#[cfg(feature = "internal-checker")]
+fn observe_capped_bare_receipts(
+    observer: &mut MainFlowProofObserver<'_>, trace: &mut failure_search::StartUpSearch,
+    invoked: Option<PreparedCallable>, root: &SourceIdentity,
+) -> Result<(), ProjectCheck> {
+    // Generalized recollection multiplies the guard work by the number of
+    // observed activations. Charge the full upper bound before testing any
+    // of these replayed guards or staging their proof diagnostics.
+    if trace.named_observations.len() > 1 {
+        let target = invoked.ok_or(ProjectCheck::Unsupported)?;
+        if observer.first.0 != target { return Err(ProjectCheck::Unsupported); }
+        let MainFlowProofCases::Bare { first, rest } = &observer.first.1.cases
+            else { return Err(ProjectCheck::Unsupported); };
+        if !rest.is_empty() { return Err(ProjectCheck::Unsupported); }
+        trace.charge_formal_replay(trace.named_observations.len(), first.guard.activation_replay_work()
+            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+    }
+    for observed in std::mem::take(&mut trace.named_observations) {
+        if &observed.site.source != root { return Err(ProjectCheck::Unsupported); }
+        observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
+            source: &observed.site.source,
+            call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
+        }), &[observed.parameter], &[&observed.argument], &observed.returned);
+    }
+    if !observer.complete(&invoked.into_iter().collect()) { return Err(ProjectCheck::Unsupported); }
+    Ok(())
 }
 
 #[cfg(feature = "internal-checker")]

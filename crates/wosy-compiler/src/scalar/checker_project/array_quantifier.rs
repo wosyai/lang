@@ -347,11 +347,13 @@ impl<'a> Cohort<'a> {
         Ok(Self { plans, groups })
     }
 
-    // The actual-only slice never infers a missing startup observation
-    // from a dormant theorem or a completed-but-different array.
+    /// Actual proof receipts and closed no-incoming-edge deferred claims use
+    /// one prepared owner and share a single metered startup walk.
     pub(super) fn run_capped(
         &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+        bare: Option<&PlannedModuleProof<'_>>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+        use failure_search::StartupProofRole::{Aggregate, Bare};
         let prepared = &owner.prepared;
         let (project, calls) = prepared.parts();
         let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -360,36 +362,62 @@ impl<'a> Cohort<'a> {
         let (_, authored_roots) = package_obligation_roots(prepared, scope, 1, root)?;
         if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
 
-        let mut targets = Vec::with_capacity(self.groups.len());
+        let mut targets = Vec::with_capacity(self.groups.len().checked_add(usize::from(bare.is_some()))
+            .ok_or(ProjectCheck::Unsupported)?);
         for (&target, group) in &self.groups {
             let plan = &self.plans[group.ids[0]];
             let Some(ScalarItem::Function(declaration)) = module.items.get(target.1) else { return Err(ProjectCheck::Unsupported); };
-            if target.0 != 0 || plan.owner != root || plan.source != root {
+            if target.0 != 0 || plan.owner != root || plan.source != root { return Err(ProjectCheck::Unsupported); }
+            targets.push((target, declaration.name_span, Aggregate));
+        }
+        if let Some(plan) = bare {
+            if plan.target.0 != 0 || plan.proof_source != root || self.groups.contains_key(&plan.target) {
                 return Err(ProjectCheck::Unsupported);
             }
-            targets.push((target, declaration.name_span));
+            targets.push((plan.target, plan.function.name_span, Bare));
         }
+        let mut scalar = bare.map(|plan| MainFlowProofObserver::from_first_plan(scope, root, plan)).transpose()?;
+        if let Some(observer) = scalar.as_mut() { observer.finish_plans(prepared, scope)?; }
         let incoming = calls.owned_direct_startup_callable_uses(root, None,
-            targets.iter().map(|(_, span)| (root, *span)), None).ok_or(ProjectCheck::Unsupported)?;
+            targets.iter().map(|(_, span, _)| (root, *span)), None).ok_or(ProjectCheck::Unsupported)?;
         let mut trace = failure_search::StartUpSearch::new(root, cap);
         trace.retain_after_cutoff = true;
-        for (target, span) in targets {
-            let sites = incoming.get(&(root, span)).filter(|sites| !sites.is_empty()).ok_or(ProjectCheck::Unsupported)?;
-            trace.enroll_proof_sites(target, failure_search::StartupProofRole::Aggregate, sites)
-                .ok_or(ProjectCheck::Unsupported)?;
+        let mut reached_arrays = HashSet::new();
+        let mut deferred_arrays = Vec::new();
+        let mut invoked_scalar = None;
+        for (target, span, role) in targets {
+            let sites = incoming.get(&(root, span)).ok_or(ProjectCheck::Unsupported)?;
+            if sites.is_empty() {
+                if role == Aggregate { deferred_arrays.push(target); }
+                continue;
+            }
+            match role {
+                Aggregate => { reached_arrays.insert(target); },
+                Bare => {
+                    let Some(plan) = bare.filter(|plan| plan.target == target) else { return Err(ProjectCheck::Unsupported); };
+                    if !matches!(plan.typed.body.boundary.parameters.as_slice(), [slot] if is_integer_type(&slot.ty)) {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    invoked_scalar = Some(target);
+                    trace.named_target = Some(target);
+                    trace.metered_frames = sites.len() > 1;
+                }
+                failure_search::StartupProofRole::Ranked => return Err(ProjectCheck::Unsupported),
+            }
+            trace.enroll_proof_sites(target, role, sites).ok_or(ProjectCheck::Unsupported)?;
         }
+        deferred_arrays.sort_unstable();
         let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
         let (init, evidence) = walk_prepared_initialization::<_, true, true>(
             prepared, root, ordinals, Evidence::new(self)?, Some(&mut effects),
         );
-        let trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+        let mut trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
             .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-        if trace.invalid() || !trace.required_sites.is_empty()
-            || self.groups.keys().any(|target| !evidence.seen.contains(target))
+        if trace.invalid() || !trace.required_sites.is_empty() || evidence.seen != reached_arrays
             || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
             || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
         { return Err(ProjectCheck::Unsupported); }
-        let (completion, active) = match init {
+        let (completion, mut active) = match init {
             Ok(init) if trace.remaining() > 0 => {
                 let applicable = evidence.complete_startup(&init.reached)?;
                 (StartupAuthoredCompletion::Exhausted, init.had_obligations || applicable)
@@ -399,11 +427,42 @@ impl<'a> Cohort<'a> {
             Err(error) => return Err(error),
             _ => return Err(ProjectCheck::Unsupported),
         };
+        let mut diagnostic = None;
+        let mut additional = Vec::new();
+        let mut actual = Vec::new();
+        if let Some(mut observer) = scalar {
+            observe_capped_bare_receipts(&mut observer, &mut trace, invoked_scalar, root)?;
+            active |= observer.active;
+            let named = NamedOrderedEvidence { observed: observer };
+            if scope == ScalarCheckerScope::CurrentPackage && invoked_scalar.is_none() {
+                let plan = bare.ok_or(ProjectCheck::Unsupported)?;
+                let mut symbolic = named.symbolic();
+                active |= symbolic.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source,
+                    &mut effects, SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+                symbolic.complete()?;
+                (diagnostic, additional) = NamedOrderedEvidence::finish_symbolic(symbolic);
+            }
+            actual = named.observed.diagnostics;
+        }
+        let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
+            let mut symbolic = evidence.symbolic();
+            // Only the original complete edge census authorizes deferred
+            // work here. No replay of a partly observed startup invocation.
+            for (ordinal, item) in deferred_arrays {
+                let Some(ScalarItem::Function(function)) = module.items.get(item) else { return Err(ProjectCheck::Unsupported); };
+                let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
+                active |= symbolic.try_collect((ordinal, item), body, function, root, &mut effects,
+                    SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+            }
+            symbolic.complete()?;
+            Evidence::finish_symbolic(symbolic)
+        } else { Vec::new() };
+        let aggregate_diagnostics = evidence.into_diagnostics(scope, symbolic)?;
         Ok((MainFlowProofReceipt {
-            active, directives: effects.records, diagnostics: Vec::new(), mixed_context_after_scalar: None,
+            active, directives: effects.records, diagnostics: actual, mixed_context_after_scalar: None,
             contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(),
-            aggregate_diagnostics: evidence.failures, pointer_effect_diagnostic: None, symbolic_diagnostic: None,
-            additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+            aggregate_diagnostics, pointer_effect_diagnostic: None, symbolic_diagnostic: diagnostic,
+            additional_symbolic_diagnostics: additional, entry_evidence: None,
         }, completion))
     }
 }
