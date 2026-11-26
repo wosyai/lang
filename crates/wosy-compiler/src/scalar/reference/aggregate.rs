@@ -60,6 +60,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) multi_formal_forward_shape: Option<Box<MultiFormalForwardShape>>,
     pub(super) array_formal: Option<ReferenceBindingId>,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
+    pub(super) grouped_array_projections: BTreeMap<CfgPointId, CfgPointId>,
     // Primary return value and the whole-place move that follows its evaluation.
     pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
     pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
@@ -1352,6 +1353,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) grouped_scratch_extent: bool,
     pub(super) widened_literal_factory: Option<(ByteSpan, OccurrenceOrdinal)>,
     pub(super) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(super) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
@@ -6118,6 +6120,101 @@ fn seal_array_descriptor_identities(
     }
 }
 
+pub(super) fn grouped_scratch_extent_proof(
+    flow: &AggregateFlowFacts,
+    cfg: &ScalarReferenceCfg,
+    sites: &FunctionCallSites,
+    source: &SourceIdentity,
+    declaration: ByteSpan,
+) -> bool {
+    let [owner, scratch, rest @ ..] = sites.boundary.parameters.as_slice() else { return false };
+    let Some(formal) = flow.array_formal.as_ref().filter(|binding| binding.declaration_span == owner.span) else {
+        return false;
+    };
+    if !matches!(&owner.ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8)
+        || !matches!(&scratch.ty, ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Mutable, inner,
+        } if **inner == ScalarType::U8)
+        || !rest.iter().all(|parameter| array_neutral_scalar(&parameter.ty))
+        || !sites.callable_escapes.is_empty() || !sites.structure.module_storage_uses.is_empty()
+        || !sites.allocation_length_call_targets.is_empty()
+    {
+        return false;
+    }
+    let resolved_scratch = |point: CfgPointId| {
+        cfg.points.get(point.0).and_then(|point| point.possible_origins.as_ref())
+            .is_some_and(|origins| !origins.is_empty() && origins.iter().all(|id| matches!(
+                cfg.facts.get(id.0), Some(ReferenceOrigin::BorrowedFrom { parameter: 1, loan })
+                    if loan.origin_place.binding.declaration_span == scratch.span
+            )))
+    };
+    cfg.points.iter().all(|point| match &point.kind {
+        CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+        | CfgPointKind::CaptureAssignmentPrevious { .. } | CfgPointKind::Bind { .. }
+        | CfgPointKind::Branch { .. } | CfgPointKind::Join | CfgPointKind::Read { .. }
+        | CfgPointKind::ReturnOutput { checked: false, .. } | CfgPointKind::Return
+        | CfgPointKind::ConditionalOutput { .. } => true,
+        CfgPointKind::Evaluate(value) => neutral_scalar_evaluation(value),
+        CfgPointKind::Borrow { place, .. } => &place.binding != formal,
+        CfgPointKind::ReborrowThrough { place: ScalarPlace::Dereference { .. }, pointer_point, .. } =>
+            resolved_scratch(*pointer_point),
+        CfgPointKind::Move { place, owner, ty } => place.projections.is_empty()
+            && ((owner == formal && &place.binding == formal) || array_neutral_scalar(ty)
+                || (place.binding.declaration_span == scratch.span && matches!(ty, ScalarType::CheckedReference { .. }))),
+        CfgPointKind::ReadPlace { pointer_point: Some(pointer), .. } => resolved_scratch(*pointer),
+        CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } =>
+            matches!(candidates.as_slice(), [place] if &place.binding != formal
+                || matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
+        CfgPointKind::Assign { target, .. } => {
+            if &target.binding == formal {
+                if target.projections.is_empty() {
+                    flow.array_installs.contains_key(&point.id)
+                } else {
+                    matches!(target.projections.as_slice(), [ReferencePlaceProjection::Index(_)])
+                }
+            } else {
+                // No scratch slot rebinding, even if the authored lane was
+                // already proven disjoint at entry.
+                target.binding.declaration_span != scratch.span
+            }
+        }
+        CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(
+            CoreOperationId::IntExtend | CoreOperationId::IntTrunc | CoreOperationId::SystemPanic
+        ), .. } => true,
+        CfgPointKind::Call { output, target: ResolvedCallTarget::ModuleCallable {
+            source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        }, .. } if callee == source && *declaration_span == declaration => {
+            // Only precise declared-safe self recursion may reuse this body
+            // effect proof. Secondary lanes borrow the primary occurrence.
+            // Same-owner signatures alone do not establish callee effects.
+            let primary = if *output == 0 { Some(point.id) } else {
+                flow.grouped_array_projections.get(&point.id).copied()
+            };
+            primary.and_then(|primary| flow.array_calls.get(&primary))
+                .is_some_and(|(ordinal, _, owner)|
+                    owner == formal && !sites.declared_unsafe_calls.contains(&ordinal.0))
+        }
+        // No independent scratch-effect summary currently admits an external
+        // use here. A typed raw conversion is not such a summary.
+        _ => false,
+    })
+}
+
+fn grouped_scratch_disjoint_actual(body: &Body<'_>, call: CfgPointId, owner: &ReferenceBindingId) -> bool {
+    let Some(CfgPointKind::Call { argument_points, .. }) = body.cfg.points.get(call.0).map(|point| &point.kind)
+    else { return false };
+    let Some(scratch) = argument_points.get(1).and_then(|id| body.cfg.points.get(id.0))
+        .and_then(|point| point.possible_origins.as_ref())
+    else { return false };
+    !scratch.is_empty() && scratch.iter().all(|id| match body.cfg.facts.get(id.0) {
+        Some(ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. }) =>
+            loan.mode == ScalarReferenceMutability::Mutable
+                && std::iter::successors(Some(loan), |loan| loan.parent.as_deref())
+                    .all(|ancestor| &ancestor.origin_place.binding != owner),
+        _ => false,
+    })
+}
+
 // Owning grouped results keep the existing result lanes. The private
 // incoming extent is valid only when every normal path returns that same
 // owner in lane zero, and every direct user can supply a proven pair.
@@ -6125,10 +6222,12 @@ fn grouped_owning_formal(body: &Body<'_>) -> Option<ByteSpan> {
     let facts = body.facts?;
     let [first, ..] = body.sites.boundary.parameters.as_slice() else { return None };
     let [returned, _, ..] = body.sites.boundary.results.as_slice() else { return None };
-    if !body.is_monomorphic || !facts.array_neutral || facts.array_invalid || facts.array_returns.is_empty()
+    if !body.is_monomorphic || !(facts.array_neutral || facts.grouped_scratch_extent)
+        || facts.array_invalid || facts.array_returns.is_empty()
         || !same_runtime_array_type(&first.ty, &returned.ty)
         || !matches!(&first.ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8)
-        || !body.sites.boundary.parameters[1..].iter().all(|slot| array_neutral_scalar(&slot.ty))
+        || !body.sites.boundary.parameters[1 + usize::from(facts.grouped_scratch_extent)..]
+            .iter().all(|slot| array_neutral_scalar(&slot.ty))
         || !body.sites.boundary.results[1..].iter().all(|slot| array_neutral_scalar(&slot.ty))
     {
         return None;
@@ -6268,6 +6367,10 @@ fn grouped_owning_extent_calls(
                 || !result.bodies.get(&caller).is_some_and(|plan| plan.same_array_rebinds.contains_key(&ordinal)) {
                 return false;
             }
+            if bodies[key].facts.is_some_and(|facts| facts.grouped_scratch_extent)
+                && !grouped_scratch_disjoint_actual(body, point, owner) {
+                return false;
+            }
             let incoming = body.sites.boundary.parameters.first().is_some_and(|formal|
                 formal.span == owner.declaration_span && matches!(formal.ty, ScalarType::RuntimeArray { .. }));
             if !incoming {
@@ -6315,6 +6418,8 @@ fn grouped_owning_extent_calls(
             CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } =>
                 matches!(candidates.as_slice(), [place] if place.binding.declaration_span == formal
                     && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
+            CfgPointKind::Assign { target, .. } => target.binding.declaration_span == formal
+                && matches!(target.projections.as_slice(), [ReferencePlaceProjection::Index(_)]),
             _ => false,
         }).then_some(key)
     }).collect();

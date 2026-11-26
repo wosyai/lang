@@ -12310,6 +12310,56 @@ if (scoped(false) != 33) { core.system_panic(); };
 }
 
 #[test]
+fn grouped_owner_dynamic_byte_write_uses_disjoint_checked_scratch() {
+    let text = "%%start
+enum Status { done; }
+(u8[], Status)(u8[], *!u8, u64, Status) ingest = fn(bytes, scratch, index, status) {
+    bytes[index] = *scratch;
+    bytes, status
+};
+u8(u64, u64) sample = fn(count, index) {
+    u8[count] bytes;
+    u8[1] scratch = [31];
+    Status status = Status::done;
+    bytes, status = ingest(bytes, &!scratch[0], index, status);
+    if (status != Status::done) { core.system_panic(); };
+    bytes[index]
+};
+if (sample(3, 1) != 31) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let symbol = self_tail_test_symbol(&prepared.project().modules[0].source, true, "ingest");
+        let (_, function) = ir.split_once(&format!("define internal {{ ptr, i32 }} @{symbol}("))
+            .expect("private grouped owner definition");
+        let function = function.split_once("\n}").unwrap().0;
+        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+        let guard = function.find(&format!("call void @{helper}(")).expect("ordinary bounds helper");
+        let address = function[guard..].lines().find(|line| line.contains("getelementptr"))
+            .expect("checked destination");
+        let destination = address.trim().split_once(" = ").unwrap().0;
+        let store = function.find(&format!(", ptr {destination}, align 1")).expect("store to checked SSA address");
+        assert!(guard < function.find(address).unwrap() && function.find(address).unwrap() < store,
+            "{function}");
+        let store = function[..store].lines().last().unwrap();
+        assert!(store.trim_start().starts_with("store i8 ") && function.contains("array_formal_extent"),
+            "{function}");
+    }
+}
+
+#[test]
 fn closed_grouped_recursive_owner_keeps_dynamic_byte_extent() {
     let text = "%%start
 enum ReadMode { skip; sample; }

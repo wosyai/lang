@@ -4971,6 +4971,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if checked_call_output {
             self.proof_points.resolved_checked_call_outputs.push(projection);
         }
+        if self.aggregate_facts.array_calls.contains_key(&producer) {
+            self.aggregate_facts.grouped_array_projections.insert(projection, producer);
+        }
         if self.aggregate_facts.neutral_array_calls.contains(&producer) {
             self.aggregate_facts.neutral_array_projections.insert(projection, producer);
         }
@@ -19371,6 +19374,10 @@ fn build_function_reference_cfg(
     aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
         .map(|(_, occurrence)| occurrence);
     aggregate.literal_array_index_required = builder.aggregate_facts.literal_array_index_output;
+    aggregate.grouped_scratch_extent = !aggregate.array_returns.is_empty() && !aggregate.array_invalid
+        && aggregate::grouped_scratch_extent_proof(
+            &builder.aggregate_facts, &builder.cfg, call_sites, &builder.source, function.name_span,
+        );
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
     if (2..=aggregate::MAX_LOCAL_CHOICE_LEAVES).contains(&builder.aggregate_facts.calls.len()) {
