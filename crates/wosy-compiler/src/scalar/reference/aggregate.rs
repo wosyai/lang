@@ -3169,11 +3169,11 @@ fn fixed_view_scalar_value(
     verify(sites, expression, ordinal, available, source, function_span, 12)
 }
 
-fn exact_fixed_view_arguments(body: &Body<'_>, function: &ScalarFunction, call: OccurrenceOrdinal, types: &[ScalarType]) -> bool {
+fn exact_fixed_view_arguments(body: &Body<'_>, function: &ScalarFunction, call: OccurrenceOrdinal, types: &[ScalarType], formal_offset: usize) -> bool {
     let Some(signature) = body.sites.checked_call_signatures.get(&call) else { return false; };
-    if signature.parameters != types || body.sites.boundary.parameters.len() != types.len() { return false; }
+    if signature.parameters != types { return false; }
     types.iter().enumerate().all(|(slot, ty)| {
-        let formal = &body.sites.boundary.parameters[slot];
+        let Some(formal) = body.sites.boundary.parameters.get(formal_offset + slot) else { return false; };
         let Some(OccurrenceNode::Expression(actual)) = body.sites.structure.edges.get(&(
             OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
         )) else { return false; };
@@ -3213,10 +3213,11 @@ fn seal_fixed_view_backing<'a>(
         Some(OccurrenceNode::Place(place)) => Some(*place),
         _ => None,
     };
-    let incoming = |target: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal)> {
+    let incoming = |target: BodyKey, limit: usize| -> Option<(BodyKey, Vec<OccurrenceOrdinal>)> {
         let (declaration, _) = function(target)?;
         let source = bodies.get(&target)?.source;
         let mut user = None;
+        let mut calls = Vec::new();
         for &module in &reservations.modules {
             let input = module_at(module)?;
             let ModuleInitializationDetail::Occurrences(topology) = &input.calls.initialization.detail else { continue; };
@@ -3247,13 +3248,16 @@ fn seal_fixed_view_backing<'a>(
                     ConcreteCallSelection::Overload(selection) => Some(selection.arm_index),
                 };
                 if arm != target.2 { continue; }
-                if !monomorphic || caller == target || user.replace((caller, occurrence.ordinal)).is_some() { return None; }
+                if !monomorphic || caller == target || user.is_some_and(|previous| previous != caller)
+                    || calls.len() == limit { return None; }
+                user = Some(caller);
+                calls.push(occurrence.ordinal);
                 let body = bodies.get(&caller)?;
                 let call = body.cfg.primary_call_point(occurrence.ordinal)?;
                 if target_body(declarations, body.cfg, call) != Some(target) { return None; }
             }
         }
-        user
+        Some((user?, calls))
     };
 
     for (&key, origin) in bodies {
@@ -3353,7 +3357,9 @@ fn seal_fixed_view_backing<'a>(
             return Err(format!("returned fixed view has no sealed scalar and index domain in {:?}", origin.source));
         }
         let prove_uses = || {
-            let (wrapper, forwarded) = incoming(key)?;
+            let (wrapper, forwarded) = incoming(key, 1)?;
+            let [forwarded] = forwarded.as_slice() else { return None; };
+            let forwarded = *forwarded;
             let (_, wrapper_fn) = function(wrapper)?;
             // A selected concrete overload symbol can be private without
             // changing the public source declaration. The complete typed
@@ -3362,33 +3368,43 @@ fn seal_fixed_view_backing<'a>(
             let wrapper_body = bodies.get(&wrapper)?;
             let wrapper_sites = wrapper_body.sites;
             if !matches!(wrapper_fn.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] if arguments.len() == parameters.len())
-                || !exact_fixed_view_arguments(wrapper_body, wrapper_fn, forwarded, parameters)
+                || wrapper_sites.boundary.parameters.len() != parameters.len()
+                || !exact_fixed_view_arguments(wrapper_body, wrapper_fn, forwarded, parameters, 0)
                 || block_output(wrapper_sites, wrapper_sites.structure.root, 0) != Some(forwarded)
                 || wrapper_sites.structure.checked_types.expressions.get(&forwarded) != Some(returned_ty)
             { return None; }
-            let (sink, obtain) = incoming(wrapper)?;
+            let (sink, mut obtains) = incoming(wrapper, 2)?;
             let (_, sink_fn) = function(sink)?;
             let sink_body = bodies.get(&sink)?;
             let sites = sink_body.sites;
-            let [ScalarBlockItem::LocalBinding(receiver), outputs @ ..]
-                = sink_fn.body.items.as_slice() else { return None; };
+            let handles = obtains.len();
+            if sites.boundary.parameters.len() != handles * parameters.len() { return None; }
+            let (bindings, outputs) = sink_fn.body.items.split_at_checked(handles)?;
             if sink_fn.body.final_output_values.len() != outputs.len() { return None; }
-            let [local_result] = receiver.receivers.as_slice() else { return None; };
-            if &local_result.ty != returned_ty || receiver.is_allocation
-                || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.len() == parameters.len())
-                || !exact_fixed_view_arguments(sink_body, sink_fn, obtain, parameters)
-                || expression(sites, OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 }) != Some(obtain)
-            { return None; }
+            let root = OccurrenceParent::Block(sites.structure.root);
+            let mut identities = Vec::new();
+            for (item, binding) in bindings.iter().enumerate() {
+                let ScalarBlockItem::LocalBinding(receiver) = binding else { return None; };
+                let [local_result] = receiver.receivers.as_slice() else { return None; };
+                let obtain = expression(sites, root, OccurrenceEdge::BindingRoot { item, output: 0 })?;
+                let selected = obtains.iter().position(|value| *value == obtain)?;
+                obtains.swap(item, selected);
+                if selected < item || &local_result.ty != returned_ty || receiver.is_allocation
+                    || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.len() == parameters.len())
+                    || !exact_fixed_view_arguments(sink_body, sink_fn, obtain, parameters, item * parameters.len())
+                    || identities.contains(&local_result.name_span)
+                { return None; }
+                identities.push(local_result.name_span);
+            }
             let ScalarType::Array { length, .. } = &local.ty else { return None; };
-            // Authorize reads against the initialized backing capacity.
-            // The first output is independent scalar metadata, not a bound
-            // or authority to read through the associated view.
-            let full_bytes = *length == 3 && outputs.len() == 4;
-            if outputs.len() != 1 && !full_bytes { return None; }
-            let checked_member = |value, pointer| {
+            // Authorize only initialized capacity reads. Scalar metadata is
+            // independent; it never grants authority to extend those reads.
+            let full_bytes = *length == 3 && outputs.len() == handles * 4;
+            if !full_bytes && (handles != 1 || outputs.len() != 1) { return None; }
+            let checked_member = |value, pointer, owner| {
                 let (binding, field) = sites.prepared_lexical_member(value)?;
                 (&binding.source == sink_body.source && binding.function_span == sink_fn.span
-                    && binding.declaration_span == local_result.name_span
+                    && binding.declaration_span == owner
                     && field.structure == returned_field.structure
                     && (field == returned_field) == pointer).then_some(())
             };
@@ -3404,14 +3420,16 @@ fn seal_fixed_view_backing<'a>(
             let mut bytes = BTreeSet::new();
             let raw_byte = ScalarType::RawPointer(Box::new(ScalarType::U8));
             for (ordinal, piece) in outputs.iter().enumerate() {
-                let root_output = expression(sites, OccurrenceParent::Block(sites.structure.root),
-                    OccurrenceEdge::FinalOutput { item: ordinal + 1, output: ordinal })?;
+                let root_output = expression(sites, root,
+                    OccurrenceEdge::FinalOutput { item: ordinal + handles, output: ordinal })?;
+                let owner = *identities.get(ordinal / 4)?;
+                if ordinal % 4 == 0 { bytes.clear(); }
                 let ScalarBlockItem::Expression(value) = piece else { return None; };
-                if full_bytes && ordinal == 0 {
+                if full_bytes && ordinal % 4 == 0 {
                     if sites.structure.checked_types.expressions.get(&root_output) != Some(&ScalarType::U64) {
                         return None;
                     }
-                    checked_member(root_output, false)?;
+                    checked_member(root_output, false, owner)?;
                     continue;
                 }
                 let ScalarExpression::Block(read) = value else { return None; };
@@ -3437,12 +3455,14 @@ fn seal_fixed_view_backing<'a>(
                     (view, 0)
                 };
                 if index >= *length || !bytes.insert(index) { return None; }
-                checked_member(member, true)?;
+                checked_member(member, true, owner)?;
+                if full_bytes && ordinal % 4 == 3 && !bytes.iter().copied().eq(0..*length) {
+                    return None;
+                }
             }
-            if full_bytes && !bytes.iter().copied().eq(0..*length) { return None; }
-            Some((wrapper, forwarded, sink, obtain, local.name_span, local.ty.clone()))
+            Some((wrapper, forwarded, sink, obtains, local.name_span, local.ty.clone()))
         };
-        let (wrapper, forwarded, sink, obtain, binding, array) = prove_uses()
+        let (wrapper, forwarded, sink, obtains, binding, array) = prove_uses()
             .ok_or_else(|| format!("returned fixed view has no sealed lexical destination in {:?}", origin.source))?;
         if [key, wrapper, sink].into_iter().any(|id| result.bodies.contains_key(&id)) {
             return Err("returned fixed view overlaps another aggregate storage plan".into());
@@ -3453,7 +3473,8 @@ fn seal_fixed_view_backing<'a>(
         let wrapper_plan = result.bodies.entry(wrapper).or_default();
         wrapper_plan.ordinary_result = true;
         wrapper_plan.fixed_view_backing = Some(FixedViewBacking::Forward { call: forwarded.0 });
-        result.bodies.entry(sink).or_default().fixed_view_sink = Some((obtain.0, array));
+        result.bodies.entry(sink).or_default().fixed_view_sinks =
+            obtains.into_iter().map(|obtain| (obtain.0, array.clone())).collect();
     }
     Ok(())
 }
@@ -3461,7 +3482,7 @@ fn seal_fixed_view_backing<'a>(
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) fixed_view_backing: Option<FixedViewBacking>,
-    pub(crate) fixed_view_sink: Option<(usize, ScalarType)>,
+    pub(crate) fixed_view_sinks: BTreeMap<usize, ScalarType>,
     pub(crate) fallible_allocation_leaf: bool,
     pub(crate) fallible_allocation_payload: Option<ScalarType>,
     pub(crate) fallible_allocation_relay: bool,
@@ -7648,6 +7669,17 @@ fn closed_aggregates<'a>(
             | (None, [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(ScalarExpression::Block(_))])
             | (None, [
                 ScalarBlockItem::LocalBinding(_),
+                ScalarBlockItem::Expression(ScalarExpression::Member { .. }),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+            ])
+            | (None, [
+                ScalarBlockItem::LocalBinding(_), ScalarBlockItem::LocalBinding(_),
+                ScalarBlockItem::Expression(ScalarExpression::Member { .. }),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
                 ScalarBlockItem::Expression(ScalarExpression::Member { .. }),
                 ScalarBlockItem::Expression(ScalarExpression::Block(_)),
                 ScalarBlockItem::Expression(ScalarExpression::Block(_)),

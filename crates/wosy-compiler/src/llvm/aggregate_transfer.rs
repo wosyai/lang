@@ -1773,7 +1773,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 }
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
-    plan.is_some_and(|plan| plan.fixed_view_backing.is_some() || plan.fixed_view_sink.is_some() || plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+    plan.is_some_and(|plan| plan.fixed_view_backing.is_some() || !plan.fixed_view_sinks.is_empty() || plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
         || plan.array_descriptor_observer.is_some() || plan.private_runtime_exclusive_relay || plan.grouped_owning_extent.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))

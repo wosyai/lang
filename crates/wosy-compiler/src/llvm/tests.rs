@@ -19913,7 +19913,7 @@ u8 observed = observe();
         }
         let plan = checked.aggregate(&reservations).unwrap();
         assert!(reservations.bodies.keys().any(|&(module, item, arm)| plan.body(module, item, arm)
-            .is_some_and(|body| body.fixed_view_sink.is_some())), "missing closed typed route");
+            .is_some_and(|body| !body.fixed_view_sinks.is_empty())), "missing closed typed route");
         let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
         let origin = project_function_name(&source, "_produce");
         let entry = project_function_name(&source, "observe");

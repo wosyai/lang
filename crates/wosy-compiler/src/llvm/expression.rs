@@ -835,7 +835,7 @@ fn emit_prepared_call<'ctx, 'module>(
         if matches!(plan.fixed_view_backing, Some(crate::scalar::FixedViewBacking::Forward { call }) if call == ordinal) {
             Some(None)
         } else {
-            plan.fixed_view_sink.as_ref().filter(|(call, _)| *call == ordinal).map(|(_, array)| Some(array.clone()))
+            plan.fixed_view_sinks.get(&ordinal).map(|array| Some(array.clone()))
         }
     });
     if let Some(backing) = backing_route {

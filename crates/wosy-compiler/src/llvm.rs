@@ -2487,9 +2487,9 @@ fn store_binding_outputs<'ctx, 'module>(
             state.values.insert(name.clone(), EmitValue::Unit);
             continue;
         }
-        let sink = state.aggregate.as_ref().and_then(|frame| frame.plan().fixed_view_sink.as_ref())
-            .is_some_and(|(call, _)| state.body_call_nodes
-                .and_then(|nodes| nodes.expression_ordinal(&binding.value)) == Some(*call));
+        let sink = state.aggregate.as_ref().is_some_and(|frame| state.body_call_nodes
+            .and_then(|nodes| nodes.expression_ordinal(&binding.value))
+            .is_some_and(|ordinal| frame.plan().fixed_view_sinks.contains_key(&ordinal)));
         let slot = if let Some(destination) = fixed_view_origin_slot(state, binding)? {
             if !matches!(value, EmitValue::Basic(BasicValueEnum::PointerValue(value)) if value == destination) {
                 return Err("fixed view literal did not initialize its caller backing".into());
