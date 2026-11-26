@@ -20,6 +20,11 @@ impl PartialEq for GitDirectory {
 impl Eq for GitDirectory {}
 
 impl GitDirectory {
+    #[cfg(target_os = "linux")]
+    pub(super) fn open_absolute(path: &Path) -> io::Result<File> {
+        platform::open_absolute_directory(path)
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn project(root: &Path) -> Result<(PathBuf, Self), String> {
         let canonical = root
@@ -184,7 +189,6 @@ mod platform {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn open_absolute_directory(path: &Path) -> io::Result<File> {
         openat2(libc::AT_FDCWD, path, FILE_FLAGS | libc::O_DIRECTORY, NO_LINKS)
     }

@@ -14,6 +14,11 @@ use wosy_project::{
 };
 use wosy_syntax::SourceIdentity;
 
+#[cfg(target_os = "linux")]
+mod provision;
+#[cfg(target_os = "linux")]
+pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime};
+
 #[derive(Debug)]
 pub enum ClosedComptimePlanError {
     Project(String),
