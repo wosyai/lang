@@ -10677,7 +10677,21 @@ fn closed_affine_snapshot_history(body: &FunctionCallSites) -> bool {
 
 #[cfg(feature = "internal-checker")]
 fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
-    body.checker_returns_unit() && body.checker_named_route_frame()
+    let scoped_context = body.structure.has_ordinary_contextual_places()
+        && body.arms.is_empty() && body.allocation_length_calls.is_empty()
+        && body.structure.checker_selected_snapshots.is_empty()
+        && body.structure.checker_ordinary_directive_calls.is_empty()
+        && body.structure.checker_ordinary_scalar_locals.is_empty()
+        && body.structure.checker_integer_call_locals.is_empty()
+        && !body.structure.checker_has_bool_contextual_declaration
+        && body.structure.blocks.iter().all(|block| !block.unsafe_context)
+        && body.assignments.keys().all(|&(block, item)| {
+            super::checker_flow::checked_scalar_assignment(body, super::control::BlockPosition { block, item })
+                .is_some_and(|(_, ty, rhs, destination)| is_integer_type(ty)
+                    && body.structure.checker_integer_literals.contains_key(&rhs)
+                    && body.structure.checker_contextual_occurrences.contains(&destination))
+        });
+    body.checker_returns_unit() && (body.checker_named_route_frame() || scoped_context)
         && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter|
             is_integer_type(&parameter.ty) || (parameter.ty == ScalarType::Bool && body.checker_has_authored_match_history()))
         && body.call_occurrences.iter().all(|call| body.structure.checker_direct_targets.contains_key(&call.ordinal))
@@ -10853,7 +10867,7 @@ impl ClosedAuthoredHistories<'_> {
         &self, target: PreparedCallable, entry: IntegerRequirementEntry<'_>, origin: usize, depth: usize,
         prefix: &[super::checker_flow::CallableHistoryStep],
     ) -> Option<(super::checker_flow::CallableHistoryCompletion, Vec<super::checker_flow::UnitHistoryPiece>)> {
-        use super::checker_flow::{search_callable_history_frame, CallableHistoryCall, CallableHistoryCompletion};
+        use super::checker_flow::{search_callable_history_frame, CallableHistoryCall, CallableHistoryCompletion, HistoryFrameEffects};
         if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
         let body = self.calls.function_body(target.0, target.1, None)?;
         let mut meter = self.work.get();
@@ -10887,8 +10901,11 @@ impl ClosedAuthoredHistories<'_> {
         };
         let nested = (!body.call_occurrences.is_empty())
             .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
+        let effects = if !body.structure.checker_selected_snapshots.is_empty() { HistoryFrameEffects::Snapshot }
+            else if body.structure.has_ordinary_contextual_places() { HistoryFrameEffects::LexicalContext }
+            else { HistoryFrameEffects::None };
         search_callable_history_frame(body, entry, self.work, (target.0 != origin).then_some(target.0), depth != 0,
-            !body.structure.checker_selected_snapshots.is_empty(), nested, |failure, steps| (self.record)(target, failure, prefix, steps))
+            effects, nested, |failure, steps| (self.record)(target, failure, prefix, steps))
     }
 }
 
@@ -18485,6 +18502,53 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn private_matrix_binary_unit_difference_is_two_original_paths_one_legacy_terminal() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "matrix-binary-unit-original-paths");
+        let program = format!(r#"%%start
+            unit(u8, u8) leaf = fn(left, right) {{
+                if (left < 128) {{ core.narrow(right < 64, {OUTPUT}); }};
+            }};
+            unit(u8, u8) inspect = fn(a, b) {{
+                leaf(a, b);
+                core.require(b != 3, {OUTPUT});
+            }};
+        %%end"#);
+        let at = |text: &str| {
+            let start = program.find(text).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start + text.len() as u32))
+        };
+        let branch = at("left < 128");
+        let call = at("leaf(a, b)");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, &program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new()).unwrap();
+            let baseline = prepare().run().unwrap();
+            let [legacy] = baseline.directives.as_slice() else { panic!("incumbent merges the terminal"); };
+            let (records, end, trace, _) = prepare().search_startup_authored_path(NonZeroUsize::new(64).unwrap()).unwrap();
+            assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+            assert_eq!(records.len(), 2);
+            assert!(trace.contains_branch(branch.clone(), true) && trace.contains_branch(branch.clone(), false));
+            assert!(trace.contains_return(&call));
+            assert_eq!(trace.call_paths(), [vec![call.clone()], vec![call.clone()]]);
+            let legacy_contains = |axis, value: &BigInt| (0..legacy.witness.row_count()).any(|row|
+                legacy.witness.intervals_at(row, axis).is_some_and(|mut domain| domain.any(|(lo, hi)| lo <= value && value <= hi)));
+            for (record, (lo, hi)) in records.iter().zip([(0,127),(128,255)]) {
+                assert_eq!(record.directive, legacy.directive);
+                assert_eq!(record.code(), legacy.code());
+                assert_eq!(record.witness.row_count(), 1);
+                assert!(record.witness.intervals_at(0, 0).unwrap().eq([(&lo.into(), &hi.into())]));
+                assert!(record.witness.intervals_at(0, 1).unwrap().eq([(&3.into(), &3.into())]));
+                for value in lo..=hi { assert!(legacy_contains(0, &value.into())); }
+            }
+            assert!(legacy_contains(1, &3.into()));
+            assert!((0..=255).filter(|value| *value != 3).all(|value| !legacy_contains(1, &value.into())));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_base_symbolic_call_transports_independent_pair_return_aliases() {
         let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
         let program = format!(r#"%%start
@@ -20273,6 +20337,35 @@ mod tests {
             }};
             keep(0);
         %%end"#);
+        let at = |snippet: &str| {
+            let start = program.find(snippet).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start + snippet.len() as u32))
+        };
+        let call = at("keep(core.context.count)");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &program), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                ).unwrap();
+                let incumbent = prepare().run().unwrap();
+                for cap in [1, 2, 3] {
+                    let (records, end, trace, _) = prepare().search_startup_authored_path(
+                        std::num::NonZeroUsize::new(cap).unwrap()).unwrap();
+                    if scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(records.is_empty() && incumbent.directives.is_empty());
+                        assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+                    } else {
+                        assert_eq!(records, incumbent.directives[..cap.min(2)]);
+                        assert_eq!(end, if cap <= 2 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                        assert!(trace.contains_return(&call));
+                        assert!(trace.call_paths().iter().all(|steps| steps == &[call.clone()]));
+                        assert_eq!(records[0].witness.axes().len(), 3);
+                        if cap > 1 { assert_eq!(records[1].witness.axes().len(), 2); }
+                    }
+                }
+            }
+        }
         let receipt = check_loaded_scalar_ordered_local_proof_contexts(
             vec![(declarations(&app, &program), Vec::new())], Vec::new(), vec![app.clone()],
             inputs(), ScalarCheckerScope::CurrentPackage, Vec::new(),

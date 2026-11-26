@@ -156,6 +156,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn allows_snapshot_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
+    fn allows_context_history(self) -> bool { false }
+    #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn imported_enum_match_position(self) -> Option<usize> { None }
@@ -325,13 +327,18 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>, bool);
+pub(super) enum HistoryFrameEffects { None, Snapshot, LexicalContext }
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>, HistoryFrameEffects);
 
 #[cfg(feature = "internal-checker")]
 impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     const ENABLED: bool = false;
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
-    fn allows_snapshot_history(self) -> bool { self.1 }
+    fn allows_snapshot_history(self) -> bool { matches!(self.1, HistoryFrameEffects::Snapshot) }
+    fn allows_context_history(self) -> bool { matches!(self.1, HistoryFrameEffects::LexicalContext) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
 }
@@ -3757,13 +3764,13 @@ pub(super) fn search_closed_callable_histories(
     nested: Option<&mut CallableHistoryCallHandler<'_>>,
     select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<CallableHistoryCompletion> {
-    search_callable_history_frame(calls, entry, work, None, false, false, nested, select).map(|(end, _)| end)
+    search_callable_history_frame(calls, entry, work, None, false, HistoryFrameEffects::None, nested, select).map(|(end, _)| end)
 }
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn search_callable_history_frame(
     calls: &FunctionCallSites, entry: IntegerRequirementEntry<'_>, work: &std::cell::Cell<usize>,
-    step_owner: Option<usize>, capture_unit: bool, snapshot: bool, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
+    step_owner: Option<usize>, capture_unit: bool, frame_effects: HistoryFrameEffects, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
     mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<(CallableHistoryCompletion, Vec<UnitHistoryPiece>)> {
     if capture_unit && (!calls.checker_returns_unit() || !(1..=2).contains(&calls.boundary.parameters.len())) { return None; }
@@ -3799,7 +3806,7 @@ pub(super) fn search_callable_history_frame(
         accept_callable_history_return(&histories, returned, expected)
     };
     let result = collect_integer_requirement_failures_in_scope(calls, entry,
-        if allow_calls { Some(&mut call) } else { None }, allow_calls, false, &mut sink, TrackCallableHistory(&histories, snapshot));
+        if allow_calls { Some(&mut call) } else { None }, allow_calls, false, &mut sink, TrackCallableHistory(&histories, frame_effects));
     if unsupported { return None; }
     if histories.borrow().stopped { return Some((CallableHistoryCompletion::LimitReached, Vec::new())); }
     let (active, _) = result?;
@@ -3843,7 +3850,7 @@ pub(super) fn test_first_complete_history_packet(
     let mut failures = collection.as_mut();
     let mut imports: &mut [Option<ImportedLocal<'_>>] = &mut [];
     let _ = walk_integer_block::<false, true, _>(calls, &mut roots, calls.structure.root, inputs, None,
-        None, &mut None, &mut failures, &mut imports, TrackCallableHistory(&tracker, false));
+        None, &mut None, &mut failures, &mut imports, TrackCallableHistory(&tracker, HistoryFrameEffects::None));
     selected.then_some(())
 }
 
@@ -6930,7 +6937,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         allow_snapshot_history: authored_return.allows_snapshot_history(),
         #[cfg(feature = "internal-checker")]
-        allow_ordinary_contextual_places: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+        allow_ordinary_contextual_places: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS || authored_return.allows_context_history())
             && calls.structure.has_ordinary_contextual_places(),
         #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: ((Authored::ALLOW_ORDINARY_INTEGER_LOCALS
