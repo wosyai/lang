@@ -100,8 +100,15 @@ impl StartUpSearch {
 
     pub(super) fn remaining(&self) -> usize { self.remaining }
     pub(super) fn invalidate(&mut self) { self.invalid = true; }
+    pub(super) fn pending_mixed_startup_observation(&self) -> bool {
+        !self.named_cross_source && self.named_target.is_some() && self.ranked_target.is_some()
+            && (self.named_observation.is_none() || self.ranked_observation.is_none())
+    }
+
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
-        !self.invalid && self.remaining == 0 && self.contextual_route.is_some() && !self.contextual_observed
+        !self.invalid && self.remaining == 0
+            && ((self.contextual_route.is_some() && !self.contextual_observed)
+                || self.pending_mixed_startup_observation())
     }
 
     pub(in super::super) fn cannot_continue(&self) -> bool {

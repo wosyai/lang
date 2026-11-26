@@ -4028,6 +4028,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && signature.parameters.len() == 1 && is_integer_type(expected);
             let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
                 && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
+            // Once the mixed route spends its ordinary quota, only the
+            // pending, top-level authenticated binding calls may run.
+            if search.proof_only_continuation() && search.pending_mixed_startup_observation()
+                && !(matches_named || matches_ranked)
+            { return Err(ProjectCheck::Unsupported); }
             let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
                 && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
             if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked)
@@ -4281,6 +4286,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ActualCallResult::Integer(value) = result else { return Err(ProjectCheck::Unsupported); };
             let effects = ordered.failures.borrow();
             let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
+            let proof_only = trace.proof_only_continuation() && trace.pending_mixed_startup_observation();
             let observation = if startup_ranked && trace.ranked_target == Some(target) {
                 &mut trace.ranked_observation
             } else if startup_named && trace.named_target == Some(target) {
@@ -4292,6 +4298,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 directive_position: effects.records.len(), parameter: parameter.clone(),
                 argument: (*argument).clone(), returned: value.clone(),
             });
+            // Capture the real typed return before stopping. Do not resume
+            // further startup items or ordinary witness selection.
+            if proof_only && !trace.proof_only_continuation() {
+                return Err(ProjectCheck::StartupAuthoredLimitReached);
+            }
             Ok(ActualCallResult::Integer(value))
         });
         #[cfg(not(feature = "internal-checker"))]
@@ -15610,6 +15621,49 @@ mod tests {
                         path.iter().map(|site| &program[site.range.start as usize..site.range.end as usize]).collect::<Vec<_>>()
                             == ["descend(8)", "descend(value - 3)", "descend(value - 3)", "echo(7)"]
                     }));
+                }
+                let first = format!("core.require(false, {zero});");
+                let decoy = format!("core.require(false, {later});");
+                let rank_call = "u8 recursed = descend(8);";
+                let bare_call = "u8 actual = echo(7);";
+                for calls in [
+                    format!("{first} {rank_call} {decoy} {bare_call}"),
+                    format!("{first} {bare_call} {decoy} {rank_call}"),
+                    format!("{rank_call} {first} {decoy} {bare_call}"),
+                    format!("{bare_call} {first} {decoy} {rank_call}"),
+                ] {
+                    let crossed = program.replace(&format!("{rank_call}\n            {bare_call}"), &calls);
+                    let (report, end) = prepare(&crossed)
+                        .search_startup_with_invoked_bare_and_reached_rank(NonZeroUsize::MIN).unwrap();
+                    assert_eq!(end, StartupAuthoredCompletion::LimitReached);
+                    assert_eq!(report.directives.len(), 1);
+                    assert_eq!(report.directives[0].code(), &BigInt::from(0));
+                    assert_eq!(report.diagnostics.len(), 1);
+                    let diagnostic = &report.diagnostics[0];
+                    assert_eq!(&crossed[diagnostic.invocation.call.range.start as usize..diagnostic.invocation.call.range.end as usize], "echo(7)");
+                    let PreparedConfiguredCheck::Named { owner, .. } = prepare(&crossed).owner else { panic!("named catalog"); };
+                    let (project, _) = owner.prepared.parts();
+                    let target = |name: &str| (0, project.modules[0].items.iter().position(|item|
+                        matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap());
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, NonZeroUsize::MIN, Some(target("echo")),
+                        false, &[], None, Some(target("descend"))).unwrap();
+                    assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
+                    let bare = trace.named_observation.unwrap();
+                    let rank = trace.ranked_observation.unwrap();
+                    let snippet = |site: wosy_syntax::SourceSpan| &crossed[site.range.start as usize..site.range.end as usize];
+                    assert_eq!((snippet(bare.site), bare.argument, bare.returned), ("echo(7)", 7.into(), 7.into()));
+                    assert_eq!((snippet(rank.site), rank.argument, rank.returned), ("descend(8)", 8.into(), 4.into()));
+                    let unsearched_suffix = crossed.replace("core.require(recursed == 5", "core.require(false || true");
+                    let (_, end) = prepare(&unsearched_suffix).search_startup_with_invoked_bare_and_reached_rank(NonZeroUsize::MIN).unwrap();
+                    assert_eq!(end, StartupAuthoredCompletion::LimitReached);
+                    let opaque = crossed.replace(&decoy, &format!("core.require(false || true, {later});"));
+                    let pruned = crossed.replace(&decoy, &format!("core.narrow(false, {later});"));
+                    let wrong_rank = crossed.replace("where (entry <= 8)", "where (entry <= 7)");
+                    let duplicate_bare = crossed.replace(bare_call, &format!("{bare_call} u8 second_actual = echo(7);"));
+                    for unsupported in [opaque, pruned, wrong_rank, duplicate_bare] {
+                        assert!(matches!(prepare(&unsupported).search_startup_with_invoked_bare_and_reached_rank(NonZeroUsize::MIN),
+                            Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                    }
                 }
                 let bad_rank = program.replace("ensures (out == 4)", "ensures (out == 5)").replace("core.show(out == 4)", "core.show(out == 5)");
                 let outside_guard = program.replace("where (entry <= 8)", "where (entry <= 7)");
