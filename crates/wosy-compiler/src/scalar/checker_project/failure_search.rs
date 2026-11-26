@@ -12,6 +12,7 @@ pub(in super::super) enum PathStep {
     Call(SourceSpan),
     Return(SourceSpan),
     Output(SourceSpan),
+    MatchArm(SourceSpan),
     Branch { condition: SourceSpan, accepted: bool },
 }
 
@@ -161,6 +162,8 @@ impl StartUpSearch {
                 CallableHistoryStep::Branch(span, accepted) => PathStep::Branch { condition: at(span), accepted },
                 CallableHistoryStep::ProviderBranch(owner, span, accepted) =>
                     PathStep::Branch { condition: provider_at(owner, span)?, accepted },
+                CallableHistoryStep::MatchArm(span) => PathStep::MatchArm(at(span)),
+                CallableHistoryStep::ProviderMatchArm(owner, span) => PathStep::MatchArm(provider_at(owner, span)?),
                 CallableHistoryStep::Call(span) => PathStep::Call(at(span)),
                 CallableHistoryStep::Return(span) => PathStep::Return(at(span)),
                 CallableHistoryStep::ProviderCall(owner, span) => PathStep::Call(provider_at(owner, span)?),
@@ -243,6 +246,11 @@ impl StartUpSearch {
             PathStep::Call(site) => Some(site.clone()),
             _ => None,
         }).collect()).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_match_arm(&self, site: &SourceSpan) -> bool {
+        self.selected.iter().any(|path| path.steps.contains(&PathStep::MatchArm(site.clone())))
     }
 
     #[cfg(test)]

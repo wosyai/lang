@@ -239,6 +239,8 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 pub(super) enum CallableHistoryStep {
     Branch(wosy_syntax::ByteSpan, bool),
     ProviderBranch(usize, wosy_syntax::ByteSpan, bool),
+    MatchArm(wosy_syntax::ByteSpan),
+    ProviderMatchArm(usize, wosy_syntax::ByteSpan),
     Call(wosy_syntax::ByteSpan),
     Return(wosy_syntax::ByteSpan),
     ProviderCall(usize, wosy_syntax::ByteSpan),
@@ -289,6 +291,15 @@ impl CallableHistories<'_> {
         self.charge(rows.0.len())?;
         let step = self.step_owner.map_or(CallableHistoryStep::Branch(span, arm),
             |owner| CallableHistoryStep::ProviderBranch(owner, span, arm));
+        for row in &mut rows.0 { self.append(row, step); }
+        Some(())
+    }
+
+    fn append_match_lane(&mut self, rows: &mut IntegerInputs, test: Option<(super::ByteSpan, bool)>, arm: super::ByteSpan) -> Option<()> {
+        if let Some((condition, taken)) = test { self.append_rows(rows, condition, taken)?; }
+        self.charge(rows.0.len())?;
+        let step = self.step_owner.map_or(CallableHistoryStep::MatchArm(arm),
+            |owner| CallableHistoryStep::ProviderMatchArm(owner, arm));
         for row in &mut rows.0 { self.append(row, step); }
         Some(())
     }
@@ -6950,7 +6961,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             exact_integer_entry_row(arguments)
         } else {
             #[cfg(feature = "internal-checker")]
-            let allow_bool = Authored::ALLOW_ORDINARY_INTEGER_LOCALS;
+            let allow_bool = Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+                || (roots.callable_history.is_some() && calls.checker_has_authored_match_history());
             #[cfg(not(feature = "internal-checker"))]
             let allow_bool = false;
             boundary.parameters.iter()
@@ -9091,7 +9103,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 let exact_imported_match = block == structure.root
                     && authored_return.imported_enum_match_position() == Some(item.position);
                 #[cfg(feature = "internal-checker")]
-                if roots.allow_ordinary_integer_locals || exact_imported_match {
+                let history_match = roots.callable_history.is_some()
+                    && structure.checker_ordinary_scalar_locals.get(&(block, item.position)).is_some_and(|origin|
+                        matches!(&origin.kind, super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch { qualified_prefix: false, .. }));
+                #[cfg(feature = "internal-checker")]
+                if roots.allow_ordinary_integer_locals || exact_imported_match || history_match {
                     if let Some(origin) = structure.checker_ordinary_scalar_locals.get(&(block, item.position)) {
                         let [receiver] = binding.receivers() else { return None; };
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
@@ -9161,7 +9177,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 }
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch { transfer, qualified_prefix } => {
-                                if if *qualified_prefix { !exact_imported_match } else { !roots.allow_extended_scalar_locals } {
+                                if if *qualified_prefix { !exact_imported_match } else { !roots.allow_extended_scalar_locals && !history_match } {
                                     return None;
                                 }
                                 path = bind_enum_match_value(roots, path, transfer, &receiver.ty)?;
@@ -10790,7 +10806,7 @@ fn bind_enum_match_value(
     roots: &mut IntegerRoots<'_>, path: IntegerInputs,
     transfer: &super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, ty: &ScalarType,
 ) -> Option<IntegerInputs> {
-    use super::runtime_enum_match::{MatchAddend, MatchCondition, MatchTransfer, MatchValue};
+    use super::runtime_enum_match::{MatchAddend, MatchCondition, MatchLane, MatchTransfer, MatchValue};
     if !is_integer_type(ty) { return None; }
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len().checked_add(1)?)?;
     if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
@@ -10826,9 +10842,15 @@ fn bind_enum_match_value(
         }
         Some(lane)
     };
+    let install_lane = |roots: &mut IntegerRoots<'_>, mut rows: IntegerInputs, lane: &MatchLane<ReferenceBindingId>, guard| {
+        if let Some(history) = roots.callable_history {
+            history.borrow_mut().append_match_lane(&mut rows, guard, lane.arm_scope)?;
+        }
+        install(roots, rows, &lane.output)
+    };
     match transfer {
-        MatchTransfer::Value(value) => install(roots, path, value),
-        MatchTransfer::Select { condition, yes, no } => {
+        MatchTransfer::Value { lane, guard } => install_lane(roots, path, lane, *guard),
+        MatchTransfer::Select { condition_span, condition, yes, no } => {
             // Keep the selector coordinate and its equalities on every cut row.
             let one = BigInt::from(1);
             let (binding, ty, relation, bound) = match condition {
@@ -10844,8 +10866,8 @@ fn bind_enum_match_value(
                 OrdinaryIntegerAtom::Literal(axis, relation, bound),
                 [true, true], roots.ordinary_local_work.get_or_insert(0),
             )?;
-            let mut joined = install(roots, yes_path, yes)?;
-            let mut no_path = install(roots, no_path, no)?;
+            let mut joined = install_lane(roots, yes_path, yes, Some((*condition_span, true)))?;
+            let mut no_path = install_lane(roots, no_path, no, Some((*condition_span, false)))?;
             append_ordinary_scalar_lane(roots, &mut joined, &mut no_path)?;
             Some(joined)
         }

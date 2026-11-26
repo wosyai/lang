@@ -10610,7 +10610,8 @@ fn witness_history_directives(body: &FunctionCallSites, compound: bool) -> bool 
 #[cfg(feature = "internal-checker")]
 fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
     body.checker_returns_unit() && body.checker_named_route_frame()
-        && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+        && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter|
+            is_integer_type(&parameter.ty) || (parameter.ty == ScalarType::Bool && body.checker_has_authored_match_history()))
         && body.call_occurrences.iter().all(|call| body.structure.checker_direct_targets.contains_key(&call.ordinal))
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
         && body.conditionals.iter().all(|(expression, region)| {
@@ -31492,6 +31493,75 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
         assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&zero, &max)]));
         assert!(only.witness.intervals_at(0, 2).unwrap().eq([(&selected, &selected)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_symbolic_enum_match_keeps_real_selector_and_arm_history() {
+        use std::num::NonZeroUsize;
+        let root = source("src/main.w", "private-symbolic-enum-source");
+        for integer in [false, true] {
+            for same_tag in [false, true] {
+                let first_ty = if integer { "i8" } else { "bool" };
+                let condition = if integer { "input < 0" } else { "input" };
+                let second = if same_tag { "Region.left(7, 513)" } else { "Region.right(513, 7)" };
+                let program = format!(r#"%%start
+                    enum copy Region {{ left(u8, u16); right(u16, u8); }}
+                    unit({first_ty}, u16) inspect = fn(input, entry) {{
+                        u16 actual = match (if ({condition}) {{ Region.left(3, entry) }} else {{ {second} }}) {{
+                            right(wide, narrow) {{ wide }}
+                            left(narrow, wide) {{ wide }}
+                        }};
+                        core.require(actual != 513, {OUTPUT});
+                    }};
+                %%end"#);
+                let at = |text: &str, offset: usize| {
+                    let start = offset + program[offset..].find(text).unwrap();
+                    wosy_syntax::SourceSpan::new(root.clone(), ByteSpan::new(start as u32, (start + text.len()) as u32))
+                };
+                let guard = at(condition, program.find("if (").unwrap());
+                let left_arm = at("{ wide }", program.find("left(narrow, wide)").unwrap());
+                let right_arm = at("{ wide }", program.find("right(wide, narrow)").unwrap());
+                for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+                    let prepare = |scope| {
+                        let parsed = parse_source(root.clone(), program.clone(), &[]);
+                        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                        let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                        prepare_loaded_scalar_ordered_local_proof_contexts(
+                            vec![(declarations, Vec::new())], [], vec![root.clone()],
+                            ScalarPreparationInputs { target_layout }, scope, Vec::new()).unwrap()
+                    };
+                    for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                        let old = prepare(scope).run().unwrap();
+                        for cap in [1, 2, 3] {
+                            let (selected, end, trace, _) = prepare(scope)
+                                .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                            if scope == ScalarCheckerScope::MainFlowOnly {
+                                assert!(old.directives.is_empty() && selected.is_empty());
+                                assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+                                continue;
+                            }
+                            assert!(old.active && !old.directives.is_empty());
+                            assert_eq!(selected.len(), cap.min(2));
+                            assert_eq!(end, if cap == 3 { StartupAuthoredCompletion::Exhausted } else { StartupAuthoredCompletion::LimitReached });
+                            assert!(trace.contains_branch(guard.clone(), true) && trace.contains_match_arm(&left_arm));
+                            assert_eq!(trace.contains_branch(guard.clone(), false), cap >= 2);
+                            assert_eq!(trace.contains_match_arm(&right_arm), !same_tag && cap >= 2);
+                            let verify = |row: &ScalarOrderedCheckerFailure, domains: [(i32,i32); 3]| {
+                                assert_eq!(row.witness.row_count(), 1);
+                                for (axis, (lo, hi)) in domains.into_iter().enumerate() {
+                                    assert!(row.witness.intervals_at(0, axis).unwrap().eq([(&lo.into(), &hi.into())]));
+                                }
+                            };
+                            verify(&selected[0], [if integer { (-128,-1) } else { (1,1) }, (513,513), (513,513)]);
+                            if cap >= 2 {
+                                verify(&selected[1], [if integer { (0,127) } else { (0,0) }, (0,65535), (513,513)]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]

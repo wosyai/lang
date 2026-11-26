@@ -35,8 +35,15 @@ pub(crate) struct PrefixInput {
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MatchTransfer<T> {
-    Value(MatchValue<T>),
-    Select { condition: MatchCondition<T>, yes: MatchValue<T>, no: MatchValue<T> },
+    Value { lane: MatchLane<T>, guard: Option<(ByteSpan, bool)> },
+    Select { condition_span: ByteSpan, condition: MatchCondition<T>, yes: MatchLane<T>, no: MatchLane<T> },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MatchLane<T> {
+    pub(super) arm_scope: ByteSpan,
+    pub(super) output: MatchValue<T>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -88,16 +95,20 @@ impl MatchTransfer<ByteSpan> {
                 offset: offset.clone(),
             },
         });
+        let lane = |lane: &MatchLane<ByteSpan>| Some(MatchLane {
+            arm_scope: lane.arm_scope, output: value(&lane.output)?,
+        });
         Some(match self {
-            Self::Value(output) => MatchTransfer::Value(value(output)?),
-            Self::Select { condition, yes, no } => MatchTransfer::Select {
+            Self::Value { lane: selected, guard } => MatchTransfer::Value { lane: lane(selected)?, guard: *guard },
+            Self::Select { condition_span, condition, yes, no } => MatchTransfer::Select {
+                condition_span: *condition_span,
                 condition: match condition {
                     MatchCondition::Boolean(binding) => MatchCondition::Boolean(resolve(*binding, &ScalarType::Bool)?),
                     MatchCondition::Integer { binding, ty, relation, bound } => MatchCondition::Integer {
                         binding: resolve(*binding, ty)?, ty: ty.clone(), relation: *relation, bound: bound.clone(),
                     },
                 },
-                yes: value(yes)?, no: value(no)?,
+                yes: lane(yes)?, no: lane(no)?,
             },
         })
     }
@@ -133,7 +144,7 @@ pub(crate) struct LexicalEnumBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TypedSelector {
     Constructor { tag: u32, span: ByteSpan, payload: Vec<(ByteSpan, Operand)> },
-    If { predicate: Predicate, yes: Box<Self>, no: Box<Self> },
+    If { #[cfg(feature = "internal-checker")] condition_span: ByteSpan, predicate: Predicate, yes: Box<Self>, no: Box<Self> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -407,7 +418,7 @@ impl Plan {
                         }
                     }
                 }
-                TypedSelector::If { predicate, yes, no } => {
+                TypedSelector::If { predicate, yes, no, .. } => {
                     match predicate {
                         Predicate::Formal { use_span, declaration } => visit(*use_span, *declaration),
                         Predicate::Compare { operands, .. } => {
@@ -440,11 +451,13 @@ impl Plan {
         let value = |selector: &TypedSelector, work: &mut usize| {
             let TypedSelector::Constructor { tag, payload, .. } = selector else { return None; };
             analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?.checked_add(1)?)?;
-            let [result] = self.arms.iter().find(|arm| arm.tag == *tag)?.results.as_slice() else { return None; };
+            let arm = self.arms.iter().find(|arm| arm.tag == *tag)?;
+            let [result] = arm.results.as_slice() else { return None; };
+            let lane = |output| Some(MatchLane { arm_scope: arm.scope, output });
             let (slot, wrapping_offset) = match result {
                 ArmResult::Literal { value, .. } => {
                     if payload.iter().any(|(_, operand)| matches!(operand, Operand::Expression(_))) { return None; }
-                    return Some(MatchValue::Literal(value.clone()));
+                    return lane(MatchValue::Literal(value.clone()));
                 }
                 ArmResult::Payload { slot, .. } => (*slot, None),
                 ArmResult::Expression(expression) => {
@@ -464,9 +477,9 @@ impl Plan {
                     Operand::Formal(span) => MatchAddend::Copy(*span),
                     Operand::Expression(_) => return None,
                 };
-                return Some(MatchValue::WrappingAdd { source, offset: offset.clone() });
+                return lane(MatchValue::WrappingAdd { source, offset: offset.clone() });
             }
-            Some(match operand {
+            lane(match operand {
                 Operand::Literal(value) => MatchValue::Literal(value.clone()),
                 Operand::Formal(span) => MatchValue::Copy(*span),
                 Operand::Expression(expression) if expression.ty == self.outputs[0] => {
@@ -477,14 +490,14 @@ impl Plan {
             })
         };
         self.check_transfer = Some(match &self.selector {
-            TypedSelector::Constructor { .. } => MatchTransfer::Value(value(&self.selector, work)?),
-            TypedSelector::If { predicate, yes, no } => {
+            TypedSelector::Constructor { .. } => MatchTransfer::Value { lane: value(&self.selector, work)?, guard: None },
+            TypedSelector::If { condition_span, predicate, yes, no } => {
                 let yes = value(yes, work)?;
                 let no = value(no, work)?;
                 match predicate {
-                    Predicate::Constant(flag) => MatchTransfer::Value(if *flag { yes } else { no }),
+                    Predicate::Constant(flag) => MatchTransfer::Value { lane: if *flag { yes } else { no }, guard: Some((*condition_span, *flag)) },
                     Predicate::Formal { declaration, .. } => MatchTransfer::Select {
-                        condition: MatchCondition::Boolean(*declaration), yes, no,
+                        condition_span: *condition_span, condition: MatchCondition::Boolean(*declaration), yes, no,
                     },
                     Predicate::Compare { operator, operands } => {
                         let mut relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
@@ -500,6 +513,7 @@ impl Plan {
                         };
                         analysis_budget::charge_call_work(work, 2)?;
                         MatchTransfer::Select {
+                            condition_span: *condition_span,
                             condition: MatchCondition::Integer { binding, ty: left.ty.clone(), relation, bound: bound.clone() },
                             yes, no,
                         }
@@ -636,7 +650,7 @@ fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: RuntimeS
                 _ => return Err(diagnostic(source, typecheck::expression_span(condition),
                     "runtime enum selector requires a Boolean literal, immutable Boolean formal, or typed integer comparison")),
             };
-            Ok(TypedSelector::If { predicate, yes: Box::new(typed_selector(source, formals, *then_branch, work)?),
+            Ok(TypedSelector::If { #[cfg(feature = "internal-checker")] condition_span: typecheck::expression_span(condition), predicate, yes: Box::new(typed_selector(source, formals, *then_branch, work)?),
                 no: Box::new(typed_selector(source, formals, *else_branch, work)?) })
         }
     }
@@ -670,7 +684,7 @@ mod tests {
         assert_eq!(plan.enumeration.index, 0);
         assert_eq!(plan.outputs, [ScalarType::U8]);
         let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
-        let TypedSelector::If { predicate: Predicate::Formal { use_span, declaration }, yes, no } = &plan.selector
+        let TypedSelector::If { predicate: Predicate::Formal { use_span, declaration }, yes, no, .. } = &plan.selector
             else { panic!("resolved runtime condition"); };
         assert_eq!(snippet(*use_span), "flag");
         assert_eq!(snippet(*declaration), "flag");

@@ -213,7 +213,7 @@ impl<'ctx> Lowering<'_, 'ctx> {
                     .map_err(builder_error)?;
                 self.builder.build_unconditional_branch(join).map_err(builder_error)?;
             }
-            TypedSelector::If { predicate, yes, no } => {
+            TypedSelector::If { predicate, yes, no, .. } => {
                 let condition = match predicate {
                     Predicate::Constant(value) => self.context.bool_type().const_int(u64::from(*value), false),
                     Predicate::Formal { declaration, .. } => self.actual(*declaration, self.context.bool_type())?,

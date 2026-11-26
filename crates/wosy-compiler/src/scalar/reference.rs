@@ -6448,6 +6448,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_extended_scalar_local: bool,
     #[cfg(feature = "internal-checker")]
+    checker_has_authored_match_history: bool,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_has_affine_scalar_local: bool,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_finite_scalar_local: bool,
@@ -6623,6 +6625,8 @@ impl OccurrenceStructure {
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_has_extended_scalar_local: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_authored_match_history: false,
             #[cfg(feature = "internal-checker")]
             checker_has_affine_scalar_local: false,
             #[cfg(feature = "internal-checker")]
@@ -6917,6 +6921,11 @@ impl FunctionCallSites {
     #[cfg(feature = "internal-checker")]
     pub(super) fn checker_pure_calling_frame(&self) -> bool {
         self.checker_closed_calling_frame() && self.structure.checker_directives.is_empty()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_has_authored_match_history(&self) -> bool {
+        self.structure.checker_has_authored_match_history
     }
 
     #[cfg(feature = "internal-checker")]
@@ -9922,6 +9931,8 @@ impl StructuralWalker<'_, '_> {
                         operator: BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder, ..
                     });
                     self.structure.checker_has_finite_scalar_local |= finite;
+                    self.structure.checker_has_authored_match_history |= matches!(kind,
+                        CheckerOrdinaryScalarLocalKind::EnumMatch { qualified_prefix: false, .. });
                     self.structure.checker_has_extended_scalar_local |= finite || matches!(kind,
                         CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
                             | CheckerOrdinaryScalarLocalKind::EnumMatch { .. });
