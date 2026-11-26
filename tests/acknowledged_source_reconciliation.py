@@ -23,7 +23,9 @@ def request(*args, refusal=None):
 
 with tempfile.TemporaryDirectory() as tmp:
     directory = Path(tmp).resolve()
-    project, before_loss, replacement = (directory / entry for entry in ("project", "storage-before-loss", "replacement"))
+    project, before_loss, replacement, session_replacement = (
+        directory / entry for entry in ("project", "storage-before-loss", "replacement", "session-replacement")
+    )
     (project / "src").mkdir(parents=True)
     (project / "stdlib/src").mkdir(parents=True)
     (project / "wosy.toml").write_text(manifest)
@@ -65,6 +67,26 @@ with tempfile.TemporaryDirectory() as tmp:
     assert known["written"] == known["daemon_validated_files"] == 0
     assert client_bytes() == frozen_client
 
+    # Recovery must restore normal lease access, without an alternate way to
+    # dispatch diagnostics or reread the modified live source.
+    expected = state(before_loss, "leased-build", "dev")["result"]["response"]
+    state(session_replacement, "leased-build", "dev", refusal="needs reconciliation")
+    state(session_replacement, "reconcile-open-build-limited", "dev", refusal="authored byte budget")
+    state(session_replacement, "leased-build", "dev", refusal="needs reconciliation")
+    recovered_session = state(session_replacement, "reconcile-open-build", "dev")["result"]
+    assert recovered_session["recovery"]["validated_files"] == 2
+    assert recovered_session["recovery"]["written"] == accepted["result"]["written"]
+    assert recovered_session["recovery"]["conflicts"] == 0
+    warm_session = state(session_replacement, "reconcile-open-build-limited", "dev")["result"]
+    assert warm_session["recovery"] is None
+    quota = state(session_replacement, "reconcile-open-build-quota", "dev")["result"]
+    assert quota["recovery"] is None and quota["lease_quota_and_scope"]
+    for output in (recovered_session, warm_session, quota):
+        assert {key: value for key, value in output["response"].items() if key != "origin"} == {
+            key: value for key, value in expected.items() if key != "origin"
+        }
+    assert client_bytes() == frozen_client
+
     # Actual new SurrealKV/CAS directory, no artificial socket or deletion.
     # The authored-byte budget refuses after provisional rows in its own txn.
     state(replacement, "reconcile-acknowledged-limited", refusal="authored byte budget")
@@ -99,4 +121,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "daemon_restore_ms": restored["recover_ms"], "reopened_known_probe_ms": restarted["probe_ms"],
         "validated_files": restored["daemon_validated_files"], "canonical_and_namespace_nodes_written": restored["written"],
         "old_source_preserved_despite_live_edit": True, "last_acknowledgement_boundary": True,
+        "restore_and_open_ms": recovered_session["recovery"]["restore_and_open_ms"],
+        "warm_lease_open_ms": warm_session["probe_ms"], "scoped_lease_quota": quota["lease_quota_and_scope"],
     }))

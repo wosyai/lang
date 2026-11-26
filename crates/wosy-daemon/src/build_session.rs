@@ -1,13 +1,14 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::SourceLease, BaseCstAdmissionLimits, PreparedBaseDeclarations, Result, SourceStorageWorker,
+    retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    PreparedBaseDeclarations, Result, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
-    BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION,
+    BuildSourceSelection, Delta, NodeId, BUILD_DIAGNOSTIC_VERSION,
 };
 
 /// Bound to one published source selected by a trusted local adapter. No
@@ -15,6 +16,11 @@ use wosy_protocol::{
 pub struct BuildDiagnosticSession<'a> {
     worker: &'a SourceStorageWorker,
     lease: Arc<SourceLease>,
+}
+
+pub enum BuildSourceOpening<'a> {
+    ReplayRequired { root: NodeId },
+    Opened { session: BuildDiagnosticSession<'a>, restored: Option<SourceReconciliation> },
 }
 
 impl Drop for BuildDiagnosticSession<'_> {
@@ -33,6 +39,46 @@ impl SourceStorageWorker {
         let lease = self.spawn_reserved(slot, move |store| store.lease_build_source(selected, lifetime))
             .await??;
         Ok(lease.map(|lease| BuildDiagnosticSession { worker: self, lease: Arc::new(lease) }))
+    }
+
+    /// Open the ordinary rooted lease, requesting replay only if the trusted
+    /// adapter's acknowledged source is absent. The adapter owns its SQLite
+    /// read, selects whether to replay, and is responsible for a fresh scope
+    /// if selection advances. No lease is created before a recovered commit.
+    /// A valid cache restoration may survive a later lease refusal or the
+    /// observer dropping the request; neither grants a session to it.
+    pub async fn open_recoverable_build_diagnostics(
+        &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
+        lifetime: Duration,
+    ) -> Result<BuildSourceOpening<'_>> {
+        let slot = self.try_slot()?;
+        let root = selected.root;
+        let outcome = self.spawn_reserved_query(slot, move |worker| async move {
+            let selected = Arc::new(selected);
+            let initial = Arc::clone(&selected);
+            if let Some(lease) = worker.phase(None, move |store| {
+                store.lease_build_source(initial.as_ref().clone(), lifetime)
+            }).await? {
+                return Ok::<_, super::Error>(Some((lease, None)));
+            }
+            let Some(replay) = replay else { return Ok(None) };
+            let restoration = reconcile_on_worker(&worker, Arc::clone(&selected), Some(replay), limits).await?;
+            let restored = match restoration {
+                SourceReconciliation::Known { .. } => None,
+                restored @ SourceReconciliation::Restored { .. } => Some(restored),
+                SourceReconciliation::ReplayRequired { .. } => return Err("acknowledged replay was not admitted".into()),
+            };
+            let lease = worker.phase(None, move |store| {
+                store.lease_build_source(selected.as_ref().clone(), lifetime)
+            }).await?.ok_or("restored source is no longer available for a lease")?;
+            Ok(Some((lease, restored)))
+        }).await??;
+        Ok(match outcome {
+            None => BuildSourceOpening::ReplayRequired { root },
+            Some((lease, restored)) => BuildSourceOpening::Opened {
+                session: BuildDiagnosticSession { worker: self, lease: Arc::new(lease) }, restored,
+            },
+        })
     }
 }
 

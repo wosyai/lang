@@ -1,6 +1,7 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, build_receipt, edge, key, pins, project_declarations, published_source, read_node, read_source_config,
+    authority_key, base_declarations, build_receipt, check_source_marker, edge, key, pins, project_declarations, published_source, read_node,
+    source_reconciliation::checked_published_source_header,
     source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
@@ -342,11 +343,12 @@ impl SourceStore {
         if lifetime.is_zero() { return Err("a Build diagnostic lease must have a positive lifetime".into()); }
         let root = selection.root;
         let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
-        let source = source_top(&tx, root)?.ok_or("unsupported Build diagnostic source root")?;
-        let config = read_source_config(&tx, source.children[0])?;
+        let config = checked_published_source_header(&tx, root)?;
         let owner = config.namespaces.get(&config.entry.package)
             .ok_or("Build diagnostic scope is missing its entry namespace")?;
-        if owner.project != selection.project { return Err("Build diagnostic selection has a different workspace".into()); }
+        if owner.git.is_some() || owner.project != selection.project {
+            return Err("Build diagnostic selection has a different workspace".into());
+        }
         if config.target != selection.target { return Err("Build diagnostic selection has a different target".into()); }
         drop(tx);
         let lease = {
@@ -383,7 +385,8 @@ impl SourceStore {
         }
         if root != grant.root { return Ok(None); }
         let tx = self.tree.begin_with_mode(mode)?;
-        if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+        let Some(marker) = tx.get(&key(SNAPSHOT_ROOTS, root))? else { return Ok(None); };
+        check_source_marker(root, &marker)?;
         *reads.active.entry(root).or_default() += 1;
         Ok(Some((tx, SourceRead::new(&self.source_reads.0, root))))
     }
@@ -398,7 +401,8 @@ impl SourceStore {
         let mut reads = self.source_reads.0.lock().expect("source reader registry");
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
         for root in roots {
-            if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+            let Some(marker) = tx.get(&key(SNAPSHOT_ROOTS, root))? else { return Ok(None); };
+            check_source_marker(root, &marker)?;
         }
         let admitted = roots.map(|root| {
             *reads.active.entry(root).or_default() += 1;

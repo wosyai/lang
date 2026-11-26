@@ -1,7 +1,8 @@
 //! Restore already-acknowledged source after loss of recomputable store data.
 use super::{
-    key,
+    check_source_marker, key,
     source_proposal::{matches_source_scope, stage_reconciled_closure},
+    storage_worker::QueryWorker,
     BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, NODES, SNAPSHOT_ROOTS,
 };
 use std::sync::Arc;
@@ -31,32 +32,37 @@ impl SourceStorageWorker {
     ) -> Result<SourceReconciliation> {
         let slot = self.try_slot()?;
         self.spawn_reserved_query(slot, move |worker| async move {
-            let root = selected.root;
-            let selected = Arc::new(selected);
-            let replay = replay.map(Arc::new);
-            // Keep the existing slot across blocking validation and async
-            // commits. A second conflict is returned instead of restarting
-            // validation indefinitely; each attempt starts in a new cut.
-            for conflicts in 0..=1 {
-                let selection = Arc::clone(&selected);
-                let payload = replay.clone();
-                let plan = worker.phase(None, move |store| {
-                    reconciliation_plan(store, &selection, payload.as_deref(), limits)
-                }).await?;
-                let (mut transaction, report, validated_files) = match plan {
-                    Plan::Known => return Ok(SourceReconciliation::Known { root }),
-                    Plan::ReplayRequired => return Ok(SourceReconciliation::ReplayRequired { root }),
-                    Plan::Write { transaction, report, validated_files } => (transaction, report, validated_files),
-                };
-                match transaction.commit().await {
-                    Ok(()) => return Ok(SourceReconciliation::Restored { root, report, validated_files, conflicts }),
-                    Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            unreachable!("a second commit conflict is returned")
+            reconcile_on_worker(&worker, Arc::new(selected), replay, limits).await
         }).await?
     }
+}
+
+pub(super) async fn reconcile_on_worker(
+    worker: &QueryWorker, selected: Arc<BuildSourceSelection>, replay: Option<Delta>,
+    limits: BaseCstAdmissionLimits,
+) -> Result<SourceReconciliation> {
+    let root = selected.root;
+    let replay = replay.map(Arc::new);
+    // Keep the existing slot across blocking validation and async commits.
+    // At most one retry; each attempt uses a new transaction cut.
+    for conflicts in 0..=1 {
+        let selection = Arc::clone(&selected);
+        let payload = replay.clone();
+        let plan = worker.phase(None, move |store| {
+            reconciliation_plan(store, &selection, payload.as_deref(), limits)
+        }).await?;
+        let (mut transaction, report, validated_files) = match plan {
+            Plan::Known => return Ok(SourceReconciliation::Known { root }),
+            Plan::ReplayRequired => return Ok(SourceReconciliation::ReplayRequired { root }),
+            Plan::Write { transaction, report, validated_files } => (transaction, report, validated_files),
+        };
+        match transaction.commit().await {
+            Ok(()) => return Ok(SourceReconciliation::Restored { root, report, validated_files, conflicts }),
+            Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("a second commit conflict is returned")
 }
 
 fn reconciliation_plan(
@@ -68,16 +74,8 @@ fn reconciliation_plan(
     let mut tx = store.tree.begin_with_mode(if replay.is_some() { Mode::ReadWrite } else { Mode::ReadOnly })?;
     let published = if replay.is_some() { tx.get_for_update(&marker)? } else { tx.get(&marker)? };
     if let Some(published) = published {
-        if published.as_slice() != root.0 { return Err("invalid acknowledged source marker".into()); }
-        let source = checked_header_node(&tx, root)?;
-        let parts = source_preparation_parts(&source).ok_or("unsupported acknowledged source schema")?;
-        let config = checked_header_node(&tx, parts.config)?;
-        if config.kind != Kind::Config { return Err("invalid acknowledged source configuration kind".into()); }
-        let config: SourceConfig = serde_json::from_slice(&config.data)?;
-        if source.data != config.schema()
-            || config.parser.schema.0 != *wosy_syntax::base_cst_schema()
-            || !matches_source_scope(&config, selected)
-        {
+        check_source_marker(root, &published)?;
+        if !matches_source_scope(&checked_published_source_header(&tx, root)?, selected) {
             return Err("published source does not match the acknowledged workspace and target".into());
         }
         return Ok(Plan::Known);
@@ -88,6 +86,18 @@ fn reconciliation_plan(
     let validated_files = stage_reconciled_closure(&mut tx, selected, replay, limits, &mut report)?;
     tx.set(&marker, &root.0)?;
     Ok(Plan::Write { transaction: tx, report, validated_files })
+}
+
+pub(super) fn checked_published_source_header(tx: &Transaction, root: NodeId) -> Result<SourceConfig> {
+    let source = checked_header_node(tx, root)?;
+    let parts = source_preparation_parts(&source).ok_or("unsupported acknowledged source schema")?;
+    let config = checked_header_node(tx, parts.config)?;
+    if config.kind != Kind::Config { return Err("invalid acknowledged source configuration kind".into()); }
+    let config: SourceConfig = serde_json::from_slice(&config.data)?;
+    if source.data != config.schema() || config.parser.schema.0 != *wosy_syntax::base_cst_schema() {
+        return Err("invalid acknowledged source configuration schema".into());
+    }
+    Ok(config)
 }
 
 fn checked_header_node(tx: &Transaction, id: NodeId) -> Result<Node> {

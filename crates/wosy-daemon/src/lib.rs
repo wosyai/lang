@@ -28,6 +28,11 @@ fn key(tag: u8, node: NodeId) -> [u8; 33] {
     key
 }
 
+fn check_source_marker(root: NodeId, marker: &[u8]) -> Result<()> {
+    if marker != root.0 { return Err("published source marker does not match its root".into()); }
+    Ok(())
+}
+
 fn edge(tag: u8, from: NodeId, kind: Edge, to: NodeId) -> [u8; 66] {
     let mut key = [0; 66];
     key[0] = tag;
@@ -55,7 +60,7 @@ mod source_proposal;
 mod source_reconciliation;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
-pub use build_session::BuildDiagnosticSession;
+pub use build_session::{BuildDiagnosticSession, BuildSourceOpening};
 pub use framed_session::BuildSessionEnd;
 pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 pub use pins::SourcePin;
