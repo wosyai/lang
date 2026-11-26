@@ -927,18 +927,8 @@ fn private_wasip1_pair_stages_the_actual_inspected_evaluator_and_resolved_manife
         ("src/bootstrap.w", include_str!("../../../stdlib/src/bootstrap.w")),
         ("src/wasi/preview1.w", include_str!("../../../stdlib/src/wasi/preview1.w")),
     ] { fs::write(std.join(path), content).unwrap(); }
-    const AUTHORED: &str = r#"%%start
-std = namespace std "bootstrap.w";
-struct Report { std.utf8 label; u32[2] buckets; }
-Report result = comptime prepare {
-    std.utf8 text = "olá\n\t\r\"ok\\\0";
-    u32 base = 7;
-    { .buckets = [base, base ^ 9]; .label = text; }
-};
-%%end
-"#;
     let source = project.join("src/main.w");
-    fs::write(&source, AUTHORED).unwrap();
+    fs::write(&source, KNOWN_WASIP1_REPORT).unwrap();
     let manifest = format!("{}\n[dependencies.std]\npath=\"../std\"\n",
         MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
             .replace("command = [\"path to declared comptime builder\", \"literal *\", \"$WORD\"]\nargs = [\"--label=two words\"]",
@@ -981,3 +971,19 @@ Report result = comptime prepare {
     drop(staged);
     assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
 }
+
+#[cfg(target_os = "linux")]
+const KNOWN_WASIP1_REPORT: &str = r#"%%start
+std = namespace std "bootstrap.w";
+struct Report { std.utf8 label; u32[2] buckets; }
+Report result = comptime prepare {
+    std.utf8 text = "olá\n\t\r\"ok\\\0";
+    u32 base = 7;
+    { .buckets = [base, base ^ 9]; .label = text; }
+};
+%%end
+"#;
+
+#[cfg(target_os = "linux")]
+#[path = "closed_comptime_staging/result_root_fixture.rs"]
+mod result_root_fixture;
