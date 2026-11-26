@@ -23,7 +23,10 @@ pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime};
 #[cfg(target_os = "linux")]
 mod stdout;
 #[cfg(target_os = "linux")]
-pub use stdout::{prepare_project_comptime_stdout, ComptimeReadbackError, ProjectComptimeStdout};
+pub use stdout::{
+    prepare_project_comptime_stdout, prepare_project_comptime_stdout_evaluator, ComptimeReadbackError,
+    ProjectComptimeStdout, ProjectComptimeStdoutEvaluator,
+};
 
 #[derive(Debug)]
 pub enum ClosedComptimePlanError {
@@ -213,12 +216,7 @@ impl ClosedComptimeStaging {
     fn invocation<'a, const N: usize>(
         &'a self, command: &'a [String], configured: &'a [String], paths: [&'a Path; N],
     ) -> ClosedComptimeInvocation<'a> {
-        ClosedComptimeInvocation {
-            executable: OsStr::new(&command[0]), // the selected declaration has an executable
-            working_directory: &self.selected.workspace,
-            arguments: command[1..].iter().chain(configured).map(OsStr::new)
-                .chain(paths.map(Path::as_os_str)).collect(),
-        }
+        literal_invocation(&self.selected.workspace, command, configured, paths)
     }
 
     /// Stream the ordinary compiler IR exactly once to a caller-owned sink.
@@ -229,12 +227,29 @@ impl ClosedComptimeStaging {
     }
 }
 
+fn literal_invocation<'a, const N: usize>(
+    workspace: &'a Path, command: &'a [String], configured: &'a [String], paths: [&'a Path; N],
+) -> ClosedComptimeInvocation<'a> {
+    ClosedComptimeInvocation {
+        executable: OsStr::new(&command[0]), // the selected declaration has an executable
+        working_directory: workspace,
+        arguments: command[1..].iter().chain(configured).map(OsStr::new)
+            .chain(paths.map(Path::as_os_str)).collect(),
+    }
+}
+
 pub(crate) fn write_compiler_evaluator_ir(
     fragment: &ClosedComptimeFragment, output: &mut impl Write, max_bytes: usize,
 ) -> io::Result<StagedEvaluatorIr> {
+    write_comptime_partition_ir(fragment.llvm(), output, max_bytes)
+}
+
+fn write_comptime_partition_ir(
+    partition: &wosy_compiler::LlvmPartition, output: &mut impl Write, max_bytes: usize,
+) -> io::Result<StagedEvaluatorIr> {
     let limit = max_bytes.min(1 << 20);
     let mut writer = EvaluatorWriter { output, remaining: limit, digest: blake3::Hasher::new() };
-    fragment.llvm().write_text(&mut writer)?;
+    partition.write_text(&mut writer)?;
     writer.flush()?;
     Ok(StagedEvaluatorIr { bytes: limit - writer.remaining, blake3: writer.digest.finalize() })
 }

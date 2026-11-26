@@ -1,13 +1,17 @@
 //! Select an ordinary compiler result shape and parse already collected stdout.
 //! Neither entry point launches a program or accepts a result into a build.
-use super::{ClosedComptimeModuleObservation, ClosedComptimePlanError};
-use crate::project_sources::{self, Error as SourceError};
-use std::{collections::BTreeMap, fmt, io::{self, Write}, path::Path, process::ExitStatus};
-use wosy_compiler::{
-    parse_source_with_snapshot, prepare_comptime_stdout, ComptimeStdoutError, PreparedComptimeStdout,
-    ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+use super::{
+    literal_invocation, write_comptime_partition_ir, ClosedComptimeInvocation, ClosedComptimeModuleObservation,
+    ClosedComptimePaths, ClosedComptimePlanError, StagedEvaluatorIr,
 };
-use wosy_project::{ObservedClosedComptimeProfile, ProjectConfiguration, ProjectContext};
+use crate::project_sources::{self, Error as SourceError};
+use std::{collections::BTreeMap, fmt, io::{self, Write}, path::{Path, PathBuf}, process::ExitStatus};
+use wosy_compiler::{
+    parse_source_with_snapshot, prepare_comptime_stdout, prepare_comptime_stdout_evaluator,
+    ClosedComptimeRejection, ComptimeStdoutError, PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
+    ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+};
+use wosy_project::{ObservedClosedComptimeProfile, ProjectConfiguration, ProjectContext, SelectedComptimeTools};
 use wosy_syntax::{FreshParseResult, SourceIdentity, SourceSpan};
 
 pub struct ProjectComptimeStdout {
@@ -20,10 +24,64 @@ pub struct ProjectComptimeStdout {
 pub fn prepare_project_comptime_stdout(
     root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ProjectComptimeStdout, ClosedComptimePlanError> {
+    let (output, _, _) = observe_project(root, target, profile, |sources, order| {
+        prepare_comptime_stdout(sources, order, id, layout)
+    })?;
+    Ok(ProjectComptimeStdout { output })
+}
+
+/// The compiler-emitted aggregate evaluator and the exact result shape.
+/// The builder/runner descriptions are inert. A stdout bridge inside the
+/// evaluator is still required before this can run as a comptime tool.
+pub struct ProjectComptimeStdoutEvaluator {
+    evaluator: PreparedComptimeStdoutEvaluator,
+    project: PathBuf,
+    tools: SelectedComptimeTools,
+}
+
+pub fn prepare_project_comptime_stdout_evaluator(
+    root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
+) -> Result<ProjectComptimeStdoutEvaluator, ClosedComptimePlanError> {
+    let (evaluator, project, tools) = observe_project(root, target, profile, |sources, order| {
+        prepare_comptime_stdout_evaluator(sources, order, id, layout)
+    })?;
+    Ok(ProjectComptimeStdoutEvaluator { evaluator, project, tools })
+}
+
+impl ProjectComptimeStdoutEvaluator {
+    pub fn site(&self) -> &SourceSpan { self.evaluator.output().site() }
+    pub fn result_type(&self) -> &ScalarType { self.evaluator.output().result_type() }
+    pub fn layout(&self) -> ScalarTargetLayout { self.evaluator.layout() }
+
+    pub fn write_evaluator_ir(&self, out: &mut impl Write, max_bytes: usize) -> io::Result<StagedEvaluatorIr> {
+        write_comptime_partition_ir(self.evaluator.llvm(), out, max_bytes)
+    }
+
+    pub fn builder<'a>(&'a self, paths: ClosedComptimePaths<'a>) -> ClosedComptimeInvocation<'a> {
+        let (_, builder) = self.tools.builder();
+        literal_invocation(&self.project, &builder.command, &builder.args, [paths.evaluator_ir, paths.output_dir, paths.manifest])
+    }
+
+    pub fn runner<'a>(&'a self, manifest: &'a Path) -> ClosedComptimeInvocation<'a> {
+        let (_, runner) = self.tools.runner();
+        literal_invocation(&self.project, &runner.command, &runner.args, [manifest])
+    }
+
+    pub fn read_stdout(&self, status: ExitStatus, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeReadbackError> {
+        after_success(status, || self.evaluator.output().parse_stdout(stdout, max_bytes))
+    }
+}
+
+fn observe_project<T>(
+    root: &Path, target: &str, profile: &str,
+    prepare: impl FnOnce(
+        Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>, Vec<SourceIdentity>,
+    ) -> Result<T, ClosedComptimeRejection>,
+) -> Result<(T, PathBuf, SelectedComptimeTools), ClosedComptimePlanError> {
     let root = root.canonicalize().map_err(|error| error.to_string())?;
     let (configuration, manifest) = ProjectConfiguration::load_with_manifest(&root)?;
     configuration.artifact_profile(target, profile)?;
-    ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
+    let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
     let mut remaining = CLOSED_COMPTIME_MAX_SOURCE_BYTES;
     let mut authored = BTreeMap::new();
@@ -58,8 +116,8 @@ pub fn prepare_project_comptime_stdout(
         (fresh, bindings)
     }).collect();
     let order = graph.initialization_order.iter().map(|id| sources[id.0].result().source.clone()).collect();
-    let output = prepare_comptime_stdout(canonical, order, id, layout).map_err(ClosedComptimePlanError::Fragment)?;
-    Ok(ProjectComptimeStdout { output })
+    let output = prepare(canonical, order).map_err(ClosedComptimePlanError::Fragment)?;
+    Ok((output, root, selection.into_tools()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

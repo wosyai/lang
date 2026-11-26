@@ -1,13 +1,18 @@
 //! Typed stdout preparation and readback. No runner, re-entry, or verdict.
 use super::{
-    analyze_scalar_build, collect_scalar_diagnostics, derive_block, prepare_scalar_project,
-    root_receiver_and_initializer, single_binding_type, span_of, ClosedComptimeFragment, ClosedComptimeRejection,
-    RootInitializer, ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs,
-    ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    analyze_scalar_build, audited_closed_eager_binary, audited_closed_unary, collect_scalar_diagnostics,
+    derive_block, prepare_scalar_project, root_receiver_and_initializer, single_binding_type, span_of,
+    ClosedComptimeFragment, ClosedComptimeRejection, RootInitializer, ScalarBlockItem, ScalarExpression,
+    ScalarItem, ScalarPreparationInputs, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    FUNCTION,
 };
 use super::super::{
     derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
     EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject, ScalarStructId, ScalarStructLiteralField,
+};
+use crate::{
+    emit_scalar_build_project_artifact_llvm, emit_scalar_build_single_module_artifact_llvm, LlvmPartition,
+    ScalarBlock, ScalarFunction, ScalarOutput, ScalarOutputSequence, UnaryOperator,
 };
 use std::{collections::HashMap, fmt, io::{self, Write}, sync::Arc};
 use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, FreshParseResult, SourceSpan, SyntaxKind};
@@ -59,6 +64,45 @@ pub fn prepare_comptime_stdout(
     id: &str,
     layout: ScalarTargetLayout,
 ) -> Result<PreparedComptimeStdout, ClosedComptimeRejection> {
+    prepare(sources, initialization_order, id, layout, false).map(|(output, _)| output)
+}
+
+/// The compiler-issued standalone evaluator and the stdout type from that
+/// same ordinary preparation. It neither serializes an evaluated value
+/// inside the module yet nor launches a builder, module, or runner.
+pub struct PreparedComptimeStdoutEvaluator {
+    output: PreparedComptimeStdout,
+    llvm: LlvmPartition,
+    layout: ScalarTargetLayout,
+}
+
+impl PreparedComptimeStdoutEvaluator {
+    pub fn output(&self) -> &PreparedComptimeStdout { &self.output }
+    pub fn llvm(&self) -> &LlvmPartition { &self.llvm }
+    pub fn layout(&self) -> ScalarTargetLayout { self.layout }
+}
+
+/// Emit the actual selected body using ordinary compiler return lowering.
+/// The detached evaluator supports a closed audited subset; unrelated
+/// initializers/functions never enter its artifact.
+pub fn prepare_comptime_stdout_evaluator(
+    sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<wosy_syntax::SourceIdentity>,
+    id: &str,
+    layout: ScalarTargetLayout,
+) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
+    let (output, llvm) = prepare(sources, initialization_order, id, layout, true)?;
+    let llvm = llvm.ok_or_else(|| ClosedComptimeRejection::Emitter("prepared evaluator is missing".into()))?;
+    Ok(PreparedComptimeStdoutEvaluator { output, llvm, layout })
+}
+
+fn prepare(
+    sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<wosy_syntax::SourceIdentity>,
+    id: &str,
+    layout: ScalarTargetLayout,
+    emit: bool,
+) -> Result<(PreparedComptimeStdout, Option<LlvmPartition>), ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     if !matches!(layout, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) {
         return Err(Error::UnsupportedLayout);
@@ -99,19 +143,58 @@ pub fn prepare_comptime_stdout(
     if block.final_expressions().count() != 1 || !matches!(block.items.last(), Some(ScalarBlockItem::Expression(_))) {
         return Err(unsupported("expected one final comptime value"));
     }
+    if emit && !closed_evaluator_body(&block) {
+        return Err(unsupported("not a closed authored scalar/aggregate evaluator body"));
+    }
     let block_span = block.span;
     let value = ScalarExpression::Block(block);
     let modules = sources.into_iter().enumerate().map(|(index, (fresh, namespaces))| {
         let source = fresh.result().canonical_cst();
-        let declarations = if index == 0 {
+        let mut declarations = if index == 0 {
             derive_scalar_declarations_with_embedding(source, Some(EmbeddedComptimeExpression {
                 site: &node, expression: &initializer, value: &value,
             }))
         } else {
             derive_scalar_declarations_from_cst(source)
         };
-        (declarations, namespaces)
-    }).collect();
+        if emit {
+            // Retain the ordinary declaration context, moving the selected
+            // body out of the exact binding rather than retaining another
+            // project/AST copy or compiling arbitrary ambient runtime code.
+            let mut root = None;
+            for item in std::mem::take(&mut declarations.items) {
+                match item {
+                    ScalarItem::Namespace(_) => declarations.items.push(item),
+                    ScalarItem::Binding(binding) if index == 0 && span_of(&binding.value) == block_span => {
+                        if root.replace(binding).is_some() {
+                            return Err(unsupported("ordinary comptime result binding is not unique"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if index == 0 {
+                let binding = root.ok_or_else(|| unsupported("ordinary comptime result binding was not preserved"))?;
+                let ScalarExpression::Block(body) = binding.value else {
+                    return Err(unsupported("ordinary comptime evaluator body was not preserved"));
+                };
+                let (result, out) = (binding.declared_type, body.final_output_values[0].span);
+                declarations.items.push(ScalarItem::Function(ScalarFunction {
+                    name: FUNCTION.into(), name_span: super::super::token_span(&site.id), span: scope.range,
+                    signature: ScalarType::Callable {
+                        parameters: Vec::new(),
+                        outputs: ScalarOutputSequence {
+                            outputs: vec![ScalarOutput { ty: result, span: out }], span: out,
+                        },
+                    },
+                    parameters: Vec::new(), parameter_spans: Vec::new(), generic_parameters: Vec::new(),
+                    overload_arms: Vec::new(), body, reference_cfg: Default::default(),
+                }));
+            }
+        }
+        Ok((declarations, namespaces))
+    }).collect::<Result<Vec<_>, _>>()?;
+    drop(value);
     let prepared = prepare_scalar_project(modules, initialization_order, ScalarPreparationInputs { target_layout: layout })
         .map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
     let build = analyze_scalar_build(&prepared);
@@ -119,24 +202,74 @@ pub fn prepare_comptime_stdout(
     let project = prepared.project();
     let module = project.modules.first().filter(|module| module.source == parsed.source)
         .ok_or_else(|| unsupported("expected the selected ordinary module"))?;
-    let mut targets = module.items.iter().filter_map(|item| match item {
-        ScalarItem::Binding(binding) if span_of(&binding.value) == block_span => Some(binding),
-        _ => None,
-    });
-    let binding = targets.next().ok_or_else(|| unsupported("ordinary comptime result binding was not preserved"))?;
-    if targets.next().is_some() {
-        return Err(unsupported("ordinary comptime result binding is not unique"));
-    }
-    let (shape, _) = shape_for(project, &binding.declared_type, &mut HashMap::new(), 0)
-        .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
-    let literal = match &binding.value {
-        ScalarExpression::Block(block) => match block.items.as_slice() {
-            [ScalarBlockItem::Expression(value)] => LiteralStdout::from_checked(&shape, value),
+    let (result_type, literal_body) = if emit {
+        let function = module.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == FUNCTION && function.span == scope.range => Some(function),
             _ => None,
-        },
-        _ => None,
+        }).ok_or_else(|| unsupported("ordinary comptime evaluator signature was not preserved"))?;
+        let ScalarType::Callable { outputs, .. } = &function.signature else {
+            return Err(unsupported("ordinary comptime evaluator signature was not preserved"));
+        };
+        let [result] = outputs.outputs.as_slice() else {
+            return Err(unsupported("expected one typed comptime evaluator result"));
+        };
+        (&result.ty, None)
+    } else {
+        let mut targets = module.items.iter().filter_map(|item| match item {
+            ScalarItem::Binding(binding) if span_of(&binding.value) == block_span => Some(binding),
+            _ => None,
+        });
+        let binding = targets.next().ok_or_else(|| unsupported("ordinary comptime result binding was not preserved"))?;
+        if targets.next().is_some() {
+            return Err(unsupported("ordinary comptime result binding is not unique"));
+        }
+        let literal_body = match &binding.value {
+            ScalarExpression::Block(block) => match block.items.as_slice() {
+                [ScalarBlockItem::Expression(value)] => Some(value),
+                _ => None,
+            },
+            _ => None,
+        };
+        (&binding.declared_type, literal_body)
     };
-    Ok(PreparedComptimeStdout { site: scope, result_type: binding.declared_type.clone(), shape, literal })
+    let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), 0)
+        .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
+    let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, value));
+    let llvm = if emit {
+        let llvm = if project.modules.len() == 1 {
+            emit_scalar_build_single_module_artifact_llvm(&build)
+        } else {
+            emit_scalar_build_project_artifact_llvm(&build)
+        }.map_err(Error::Emitter)?;
+        Some(llvm)
+    } else { None };
+    Ok((PreparedComptimeStdout { site: scope, result_type: result_type.clone(), shape, literal }, llvm))
+}
+
+fn closed_evaluator_body(body: &ScalarBlock) -> bool {
+    if body.unsafe_context { return false; }
+    let Some((ScalarBlockItem::Expression(tail), locals)) = body.items.split_last() else { return false; };
+    let mut values = vec![tail];
+    for item in locals {
+        let ScalarBlockItem::LocalBinding(binding) = item else { return false; };
+        values.push(&binding.value);
+    }
+    while let Some(value) = values.pop() {
+        match value {
+            ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } |
+            ScalarExpression::Name { .. } | ScalarExpression::Utf8 { .. } => {},
+            ScalarExpression::Unary { operator, operand, .. }
+                if audited_closed_unary(operator) ||
+                   (*operator == UnaryOperator::Negate && matches!(operand.as_ref(), ScalarExpression::Integer { .. })) =>
+                values.push(operand),
+            ScalarExpression::Binary { operator, left, right, .. } if audited_closed_eager_binary(operator) =>
+                values.extend([left.as_ref(), right.as_ref()]),
+            ScalarExpression::ArrayLiteral { elements, .. } => values.extend(elements.iter()),
+            ScalarExpression::StructLiteral { fields, .. } => values.extend(fields.iter().map(|field| &field.value)),
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn shape_for(

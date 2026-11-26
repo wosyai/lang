@@ -483,3 +483,98 @@ fn provisioned_scalar_stdout_uses_the_same_typed_format_without_a_runner() {
     }
     assert!(fs::read_dir(scratch).unwrap().next().is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn emits_the_selected_computed_aggregate_using_ordinary_return_abi() {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    use wosy_cli::comptime_fragment::prepare_project_comptime_stdout_evaluator;
+    use wosy_compiler::{ClosedComptimeRejection, ScalarExpression as Expr};
+
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let source = project.join("src/main.w");
+    let text = r#"%%start
+# WHY: computed authored carrier ☕
+struct copy Pair { u32 first; u32 second; }
+struct copy Report { Pair pair; u32[2] buckets; }
+u32 ambient_value = 91;
+u32() ambient_function = fn { ambient_value };
+Report result = comptime prepare {
+    u32 base = 7;
+    u32 changed = base ^ 9;
+    { .buckets = [changed, base]; .pair = { .second = changed; .first = base; }; }
+};
+%%end
+"#;
+    let plan = |layout| prepare_project_comptime_stdout_evaluator(&project, "app", "override", "prepare", layout);
+    let ok = ExitStatus::from_raw(0);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        fs::write(&source, text).unwrap();
+        let evaluator = plan(layout).unwrap_or_else(|error| panic!("computed result {layout:?}: {error:?}"));
+        assert_eq!(evaluator.layout(), layout);
+        assert!(matches!(evaluator.result_type(), ScalarType::Struct(_)));
+        assert!(text[evaluator.site().range.start as usize..].starts_with("comptime prepare"));
+        let mut bytes = Vec::new();
+        let receipt = evaluator.write_evaluator_ir(&mut bytes, 1 << 16).unwrap();
+        assert_eq!(receipt.bytes, bytes.len());
+        assert_eq!(receipt.blake3, blake3::hash(&bytes));
+        let ir = std::str::from_utf8(&bytes).unwrap();
+        let body = ir.split_once("define [16 x i8] @evaluate(").expect("ordinary copy aggregate result")
+            .1.split_once("\n}").unwrap().0;
+        assert!(body.contains("xor i32"), "{body}");
+        assert!(body.contains("ret [16 x i8] "), "{body}");
+        assert!(!ir.contains("@ambient_function") && !ir.contains("@ambient_value"), "{ir}");
+        assert!(!ir.contains("@printf"));
+        let (ir_path, modules, manifest) =
+            (fixture.0.join("evaluator.ll"), fixture.0.join("modules"), fixture.0.join("manifest"));
+        let builder = evaluator.builder(ClosedComptimePaths { evaluator_ir: &ir_path, output_dir: &modules, manifest: &manifest });
+        let runner = evaluator.runner(&manifest);
+        assert_eq!(builder.executable, OsStr::new("path to declared comptime builder"));
+        assert_eq!(runner.executable, OsStr::new("path to declared comptime runner"));
+        assert_eq!(&builder.arguments[builder.arguments.len() - 3..], [ir_path.as_os_str(), modules.as_os_str(), manifest.as_os_str()]);
+        assert_eq!(runner.arguments.last().unwrap(), &manifest.as_os_str());
+        assert!(!manifest.exists() && !ir_path.exists() && !modules.exists());
+        // The bridge has not run. Exercise the same emitted evaluator's
+        // prepared shape with a synthetic result rather than reading ABI bytes.
+        let stdout = b"[[7,14],[14,7]]\n";
+        let Expr::StructLiteral { fields, .. } = evaluator.read_stdout(ok, stdout, 32).unwrap()
+        else { panic!("same nominal output used by readback"); };
+        assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["pair", "buckets"]);
+        assert!(matches!(&fields[1].value, Expr::ArrayLiteral { elements, .. }
+            if matches!(&elements[..], [Expr::Integer { value: first, .. }, Expr::Integer { value: second, .. }]
+                if i64::try_from(first) == Ok(14) && i64::try_from(second) == Ok(7))));
+        assert!(evaluator.read_stdout(ok, b"[[7,14],true]\n", 32).is_err());
+    }
+
+
+    // Import a genuine declaration through the ordinary source graph.
+    // Multi-module lowering uses the existing qualified LLVM name, not
+    // a duplicate hard-coded external ABI or a locally invented type.
+    let types = fixture.0.join("types");
+    fs::create_dir_all(types.join("src")).unwrap();
+    fs::write(types.join("wosy.toml"), "[package]\nname=\"types\"\nsource_root=\"src\"\n[comments]\ncategories=[]\n").unwrap();
+    fs::write(types.join("src/shape.w"),
+        "%%start\nstruct copy Pair { u32 first; u32 second; }\nu32() dependency_only = fn { 1 };\n%%end\n").unwrap();
+    fixture.manifest(&format!("{MANIFEST}\n[dependencies.types]\npath=\"../types\"\n"));
+    let imported = text.replace("struct copy Pair { u32 first; u32 second; }", "types = namespace types \"shape.w\";")
+        .replace("Pair pair;", "types.Pair pair;");
+    fs::write(&source, imported).unwrap();
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let staged = plan(layout).unwrap_or_else(|error| panic!("imported computed result {layout:?}: {error:?}"));
+        let mut text = Vec::new();
+        staged.write_evaluator_ir(&mut text, 1 << 16).unwrap();
+        let text = std::str::from_utf8(&text).unwrap();
+        let entry = text.lines().find(|line| line.starts_with("define [16 x i8] @wosy_fn__")
+            && line.contains("__6576616c75617465(")).expect("ordinary source-qualified evaluator symbol");
+        assert!(entry.ends_with(" {"), "{entry}");
+        assert!(!text.contains("__616d6269656e745f66756e6374696f6e(")
+            && !text.contains("__646570656e64656e63795f6f6e6c79("));
+    }
+
+    fs::write(&source, text.replace("u32 base = 7;", "u32 base = ambient_function();")).unwrap();
+    assert!(matches!(plan(ScalarTargetLayout::NATIVE64), Err(ClosedComptimePlanError::Fragment(
+        ClosedComptimeRejection::Unsupported { feature: "not a closed authored scalar/aggregate evaluator body", .. }
+    ))));
+    assert!(!project.join(".wosy").exists());
+}
