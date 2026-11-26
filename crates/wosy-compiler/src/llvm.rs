@@ -5724,8 +5724,12 @@ fn immediate_checked_borrow_type<'module>(
     state: &EmitState<'_, 'module>, pointer: &ScalarExpression,
 ) -> Option<&'module ScalarType> {
     if !matches!(pointer, ScalarExpression::CheckedAddress { .. }) { return None; }
-    state.body_call_nodes?.checked_expression_type(pointer)
-        .filter(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+    if let Some(nodes) = state.body_call_nodes {
+        nodes.checked_expression_type(pointer)
+            .filter(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+    } else {
+        state.initializer_nodes?.checked_immediate_element_address_type(pointer)
+    }
 }
 
 fn pointer_target_type<'ctx, 'module>(

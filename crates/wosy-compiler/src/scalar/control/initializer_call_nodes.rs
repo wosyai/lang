@@ -23,6 +23,7 @@ pub(crate) struct InitializerCallNodes<'a> {
     integer_conversion_sources: HashMap<*const ScalarExpression, &'a ScalarType>,
     checked_local_arrays: HashSet<*const ScalarBinding>,
     checked_local_indexes: HashMap<*const ScalarPlace, (*const ScalarPlace, ByteSpan)>,
+    checked_immediate_element_addresses: HashMap<*const ScalarExpression, &'a ScalarType>,
     items: PhantomData<&'a [ScalarItem]>,
 }
 
@@ -94,6 +95,7 @@ impl<'a> InitializerCallNodes<'a> {
             integer_conversion_sources: HashMap::new(),
             checked_local_arrays: HashSet::new(),
             checked_local_indexes: HashMap::new(),
+            checked_immediate_element_addresses: HashMap::new(),
             items: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -170,7 +172,7 @@ impl<'a> InitializerCallNodes<'a> {
                         let edges = &topology.structure.edges;
                         if let Some(Node::Place(deref)) = edges.get(&(Parent::Expression(ordinal), Edge::ExpressionPlace)) {
                             if let Some(Node::Expression(address)) = edges.get(&(Parent::Place(*deref), Edge::DereferencePointer)) {
-                                immediate_shared_reads.insert(*address, (*deref, ordinal));
+                                immediate_shared_reads.insert(*address, (*deref, ordinal, std::ptr::from_ref(pointer.as_ref())));
                             }
                         }
                     }
@@ -211,10 +213,10 @@ impl<'a> InitializerCallNodes<'a> {
 
     fn collect_local_array_indexes(
         &mut self,
-        topology: &ModuleInitializationTopology,
+        topology: &'a ModuleInitializationTopology,
         nodes: CallableProofNodes<'a>,
         indexed_reads: &HashSet<OccurrenceOrdinal>,
-        immediate_shared_reads: &HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, OccurrenceOrdinal)>,
+        immediate_shared_reads: &HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, OccurrenceOrdinal, *const ScalarExpression)>,
     ) {
         let structure = &topology.structure;
         let mut rejected = HashSet::new();
@@ -261,7 +263,7 @@ impl<'a> InitializerCallNodes<'a> {
                     || structure.checked_types.expressions.get(&selector) != Some(&ScalarType::U64)
                 { return None; }
                 let &(parent, edge) = sites.occurrences.get(&index)?;
-                match (parent, edge) {
+                let immediate_address = match (parent, edge) {
                     (Parent::Block(block), Edge::AssignmentDestination { item, destination: 0 }) => {
                         let group = topology.assignments.get(&(block, item))?;
                         let destinations = group.destinations();
@@ -269,25 +271,27 @@ impl<'a> InitializerCallNodes<'a> {
                         if target.destination != index || group.rhs_evaluations().len() != 1
                             || group.projected_outputs().len() != 0
                         { return None; }
+                        None
                     }
                     (Parent::Expression(ordinal), Edge::ExpressionPlace) if indexed_reads.contains(&ordinal)
-                        && structure.checked_types.expressions.get(&ordinal) == Some(element.as_ref()) => {}
+                        && structure.checked_types.expressions.get(&ordinal) == Some(element.as_ref()) => None,
                     (Parent::Expression(address), Edge::ExpressionPlace) => {
                         // The canonical address expression has only this one
                         // exact, immediate read consumer. Nothing can store,
                         // return, forward, or outlive the checked element loan.
-                        let &(deref, read) = immediate_shared_reads.get(&address)?;
+                        let &(deref, read, expression) = immediate_shared_reads.get(&address)?;
+                        let ty = structure.checked_types.expressions.get(&address)?;
                         if structure.checked_types.places.get(&deref) != Some(element.as_ref())
                             || structure.checked_types.expressions.get(&read) != Some(element.as_ref())
-                            || !matches!(structure.checked_types.expressions.get(&address),
-                                Some(ScalarType::CheckedReference {
-                                    mutability: crate::scalar::ScalarReferenceMutability::Shared, inner,
-                                }) if inner.as_ref() == element.as_ref())
+                            || !matches!(ty, ScalarType::CheckedReference {
+                                mutability: crate::scalar::ScalarReferenceMutability::Shared, inner,
+                            } if inner.as_ref() == element.as_ref())
                         { return None; }
+                        Some((expression, ty))
                     }
                     _ => return None,
-                }
-                Some((local, sites.containing_item((parent, edge))?, *places.get(&index)?, *places.get(&base)?))
+                };
+                Some((local, sites.containing_item((parent, edge))?, *places.get(&index)?, *places.get(&base)?, immediate_address))
             })();
             if let Some(candidate) = exact { candidates.push(candidate); }
             else { rejected.insert(local.declaration_span); }
@@ -312,15 +316,18 @@ impl<'a> InitializerCallNodes<'a> {
                 rejected.insert(receiver.name_span);
             }
         }
-        for &(local, site, _, _) in &candidates {
+        for &(local, site, _, _, _) in &candidates {
             if !owners.get(&local.declaration_span).is_some_and(|(_, position, span)|
                 *span == local.block_span && sites.follows_allocation(**position, site))
             { rejected.insert(local.declaration_span); }
         }
-        for (local, _, index, base) in candidates {
+        for (local, _, index, base, immediate_address) in candidates {
             if rejected.contains(&local.declaration_span) { continue; }
             self.checked_local_arrays.insert(owners[&local.declaration_span].0);
             self.checked_local_indexes.insert(index, (base, local.declaration_span));
+            if let Some((expression, ty)) = immediate_address {
+                self.checked_immediate_element_addresses.insert(expression, ty);
+            }
         }
     }
 
@@ -331,6 +338,10 @@ impl<'a> InitializerCallNodes<'a> {
     pub(crate) fn checked_local_index(&self, projection: &ScalarPlace, base: &ScalarPlace) -> Option<ByteSpan> {
         let &(expected, declaration) = self.checked_local_indexes.get(&std::ptr::from_ref(projection))?;
         (expected == std::ptr::from_ref(base)).then_some(declaration)
+    }
+
+    pub(crate) fn checked_immediate_element_address_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
+        self.checked_immediate_element_addresses.get(&std::ptr::from_ref(expression)).copied()
     }
 
     pub(crate) fn checked_float_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {

@@ -643,6 +643,11 @@ fn initializer_indexed_shared_address_needs_its_immediate_scalar_read() {
             let ScalarExpression::CheckedAddress { place, .. } = address else { unreachable!() };
             let ScalarPlace::Index { base, .. } = place else { unreachable!() };
             assert_eq!(nodes.checked_local_index(place, base), enrolled.then_some(data.receivers[0].name_span));
+            assert_eq!(nodes.checked_immediate_element_address_type(address), enrolled.then_some(&ScalarType::CheckedReference {
+                mutability: crate::scalar::ScalarReferenceMutability::Shared,
+                inner: Box::new(ScalarType::U16),
+            }));
+            assert_eq!(nodes.checked_immediate_element_address_type(&address.clone()), None);
         }
     }
 }
