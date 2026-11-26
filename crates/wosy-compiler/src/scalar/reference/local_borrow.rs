@@ -94,6 +94,8 @@ pub(crate) struct Author {
     pending_loan: Option<Loan>,
     pending_rhs: Option<CfgPointId>,
     last_holder_read: Option<CfgPointId>,
+    prepared_child: Option<(CfgPointId, CfgPointId)>,
+    child_parents: HashMap<CfgPointId, CfgPointId>,
     last_literal_aggregate: Option<CfgPointId>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
@@ -132,7 +134,9 @@ impl Author {
         kind: &CfgPointKind,
         scope: ReferenceScopeId,
         types: &ReferenceBindingTypes,
+        points: &[ReferenceFlowPoint],
     ) -> bool {
+        let child_hint = self.prepared_child.take();
         if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
             && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. })
             && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id)))
@@ -239,8 +243,46 @@ impl Author {
                 });
                 true
             }
+            CfgPointKind::Borrow { place, loan } if loan.parent.is_some() => {
+                let Some((_, parent)) = child_hint.filter(|&(child, _)| child == id) else { return false };
+                let Some(parent_loan) = loan.parent.as_deref() else { return false };
+                let Some(read) = points.get(parent.0) else { return false };
+                let CfgPointKind::Read { binding } = &read.kind else { return false };
+                let Some(holder) = self.holders.get(binding) else { return false };
+                let [installed] = holder.writes.as_slice() else { return false };
+                let Some(CfgPointKind::Borrow { place: original, loan: exact }) =
+                    points.get(installed.loan.issued.0).map(|point| &point.kind) else { return false };
+                if self.last_holder_read != Some(parent) || parent.0.checked_add(1) != Some(id.0)
+                    || !self.open_forks.is_empty() || self.forks.len() != 0
+                    || read.scope != scope || installed.version >= parent
+                    || !matches!(&place.place, ScalarPlace::Dereference { pointer, .. }
+                        if matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+                    || !matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(carried)]
+                        if carried.as_ref() == parent_loan)
+                    || exact != parent_loan || exact.parent.is_some()
+                    || exact.origin_place != *original || loan.origin_place != *place
+                    || original.binding != place.binding
+                    || (loan.mode == ScalarReferenceMutability::Mutable && !installed.loan.mutable)
+                {
+                    return false;
+                }
+                self.child_parents.insert(id, installed.loan.issued);
+                self.pending_rhs = Some(id);
+                self.pending_loan = Some(Loan {
+                    owner: installed.loan.owner, issued: id,
+                    // A live child carries the ancestor's mode as well as its
+                    // own. Do not extend a named holder that could later hold
+                    // a different version, or duplicate its diagnostic.
+                    mutable: installed.loan.mutable || loan.mode == ScalarReferenceMutability::Mutable,
+                });
+                true
+            }
             _ => false,
         }
+    }
+
+    pub(super) fn prepare_named_child(&mut self, child: CfgPointId, parent: CfgPointId) {
+        self.prepared_child = Some((child, parent));
     }
 
     pub(super) fn prepare_shared_identity(
@@ -403,7 +445,7 @@ impl Author {
         }
         let nested = if self.nested { Some(NestedGraph::seal(points, &self.forks, exit)?) } else { None };
         Some(Box::new(Sealed { exit, forks: self.forks, nested, identity_calls: self.identity_calls,
-            holders, owner_index: self.owners, owners }))
+            child_parents: self.child_parents, holders, owner_index: self.owners, owners }))
     }
 }
 
@@ -718,6 +760,13 @@ pub(super) enum AccessMode {
 }
 
 impl AccessMode {
+    fn required_mode(self) -> Option<ScalarReferenceMutability> {
+        match self {
+            Self::Shared => Some(ScalarReferenceMutability::Mutable),
+            Self::Exclusive => None,
+        }
+    }
+
     fn accepts(self, mutable: bool) -> bool {
         mutable || matches!(self, Self::Exclusive)
     }
@@ -817,6 +866,7 @@ pub(crate) struct Sealed {
     forks: Forks,
     nested: Option<NestedGraph>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
+    child_parents: HashMap<CfgPointId, CfgPointId>,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
@@ -895,8 +945,8 @@ impl Sealed {
             let Some(access) = projected else { return true };
             let Some(CfgPointKind::Borrow { place, loan }) = points.get(loan.issued.0).map(|point| &point.kind)
                 else { return true };
-            loan.parent.is_some() || loan.origin_place != *place || &place.binding != owner
-                || reference_places_overlap(access, place)
+            loan.origin_place != *place || &place.binding != owner
+                || loan_borrows_place(loan, access, mode.required_mode())
         };
         let mut conflicts = Vec::new();
         // Carrier indices were assigned by the authored BTreeMap in binding order.
@@ -926,11 +976,20 @@ impl Sealed {
             let CfgPointKind::Borrow { place, loan } = &points.get(issue.0)?.kind else {
                 return None;
             };
-            if &place.binding != owner || loan.origin_place != *place
-                || !(direct_fixed_projection(place) || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })))
-                || loan.parent.is_some() || !mode.accepts(loan.mode == ScalarReferenceMutability::Mutable)
-            {
-                return None;
+            if &place.binding != owner || loan.origin_place != *place { return None; }
+            match loan.parent.as_deref() {
+                None if (direct_fixed_projection(place)
+                    || (place.projections.is_empty() && matches!(&place.place, ScalarPlace::Name { .. })))
+                    && mode.accepts(loan.mode == ScalarReferenceMutability::Mutable) => {}
+                Some(parent) => {
+                    let parent_issue = *self.child_parents.get(&issue)?;
+                    let CfgPointKind::Borrow { loan: original, .. } = &points.get(parent_issue.0)?.kind
+                        else { return None };
+                    if original != parent || !mode.accepts(loan.mode == ScalarReferenceMutability::Mutable
+                        || parent.mode == ScalarReferenceMutability::Mutable)
+                    { return None; }
+                }
+                _ => return None,
             }
             conflicts.push(SourceSpan::new(loan.origin_place.source.clone(), loan.creation_span));
         }
@@ -1570,6 +1629,69 @@ unit() examine = fn {{
                 assert!(actual.is_empty(), "{actual:?}");
                 assert!(counts[8] > 0, "the existing transfer must use the location-sensitive stage: {counts:?}");
             }
+        }
+    }
+
+    #[test]
+    fn authored_named_child_carries_exact_parent_mode_until_its_last_use() {
+        let text = "%%start
+struct Pair { u16 left; u16 right; }
+unit() examine = fn {
+    Pair owner = { .left = 7; .right = 9; };
+    *!u16 parent = &!owner.left;
+    *u16 child = &(*parent);
+    owner.right = 3;
+    u16 observed = *child;
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "child.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = || {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().next().unwrap().1
+            };
+            let mut staged = prepared();
+            let mut incumbent = prepared();
+            incumbent.proof_points.local_borrow = None;
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("authored child graph");
+            let points = &staged.cfg.initial_points;
+            let [(&child, &parent)] = sealed.child_parents.iter().collect::<Vec<_>>().as_slice() else {
+                panic!("a single exact parent issuance");
+            };
+            let CfgPointKind::Borrow { place: borrowed, loan: parent_loan } = &points[parent.0].kind
+                else { unreachable!() };
+            let CfgPointKind::Borrow { loan: child_loan, .. } = &points[child.0].kind else { unreachable!() };
+            assert_eq!(child_loan.parent.as_deref(), Some(parent_loan));
+            assert_eq!(child_loan.mode, ScalarReferenceMutability::Shared);
+            assert_eq!(parent_loan.mode, ScalarReferenceMutability::Mutable);
+            let store = points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Assign { target, .. } if direct_fixed_projection(target) =>
+                    Some((point.id, target)),
+                _ => None,
+            }).expect("ordinary distinct sibling store");
+            assert_eq!(sealed.conflicts(&borrowed.binding, store.0, 1, points,
+                AccessMode::Exclusive, Some(store.1)), Some(Vec::new()));
+            assert_eq!(sealed.conflicts(&borrowed.binding, store.0, 1, points,
+                AccessMode::Shared, Some(borrowed)), Some(vec![points[child.0].source_span.clone()]));
+            assert_eq!(sealed.conflicts(&borrowed.binding, points.last().unwrap().id, 1, points,
+                AccessMode::Shared, Some(borrowed)), Some(Vec::new()));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[8] > 0, "actual transfer must refine the sibling store: {counts:?}");
         }
     }
 

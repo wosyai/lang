@@ -771,7 +771,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.returning_leaf_prefix = self.returning_leaf_prefix && aggregate::returning_leaf_point(&kind);
         let id = CfgPointId(self.cfg.points.len());
         if let Some(author) = &mut self.local_borrow {
-            if !author.emit(id, &kind, scope, &self.binding_types) {
+            if !author.emit(id, &kind, scope, &self.binding_types, &self.cfg.points) {
                 self.local_borrow = None;
             }
         }
@@ -3539,6 +3539,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.checked_result_origins.insert(id);
                     }
                     origins.insert(id);
+                    if let (Some(author), Some(pointer), Some(_)) =
+                        (&mut self.local_borrow, named_parent_point, parent_id)
+                    {
+                        if runtime_child.is_none() && !exact_entry_parent {
+                            author.prepare_named_child(CfgPointId(self.cfg.points.len()), pointer);
+                        }
+                    }
                     let borrow = self.point(
                         CfgPointKind::Borrow {
                             place: loan.origin_place.clone(),
