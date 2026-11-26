@@ -208,6 +208,30 @@ impl SqliteSourceState {
         Ok(Some(wosy_protocol::BuildSourceSelection { root, project: project.into(), target: target.into() }))
     }
 
+    /// Rebuild the exact acknowledged source proposal requested by recovery,
+    /// not a pending or historical root. No live paths or parser are used.
+    /// The caller carries the trusted captured scope to the daemon; this local
+    /// read does not lock a SQLite writer during the daemon commit.
+    pub fn replay_acknowledged_source(
+        &mut self, captured: &wosy_protocol::BuildSourceSelection,
+    ) -> Result<Option<SourceReplay>> {
+        if self.project.to_str() != Some(captured.project.as_str()) { return Ok(None); }
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let state = read_selection(&tx, &captured.target)?;
+        if state.selected != Some(captured.root) { return Ok(None); }
+        if let Some(usage) = load_usage(&tx, captured.root)? { usage.admit(self.limits)?; }
+        let (delta, usage) = {
+            let mut read = StoredNodes::new(&tx)?;
+            let replay = read.closure(captured.root, self.limits)?;
+            Self::header(&self.project, &mut read, &captured.target, captured.root)?;
+            replay
+        };
+        tx.commit()?;
+        Ok(Some(SourceReplay {
+            source: PreparedSources { root: captured.root, delta, parsed: 0, reused: 0 }, usage, attempt: None,
+        }))
+    }
+
     /// A complete resubmission for a reopened client and an empty or reopened
     /// daemon cache. This does not read the live workspace or invoke a parser.
     pub fn replay(&self, target: &str, which: ReplaySource) -> Result<Option<SourceReplay>> {

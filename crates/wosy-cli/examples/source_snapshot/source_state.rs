@@ -41,6 +41,15 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "reconcile-acknowledged" | "reconcile-acknowledged-limited" => {
+            super::source_reconciliation::run(&mut client, dir, &target, mode.ends_with("-limited")).await?
+        }
+        "replay-acknowledged-for" => {
+            let root = NodeId::parse_hex(&args.next().ok_or("expected captured root")?)?;
+            let owner = args.next().ok_or("expected captured workspace")?;
+            let selected = wosy_protocol::BuildSourceSelection { root, project: owner, target: target.clone() };
+            serde_json::json!({ "matches": client.replay_acknowledged_source(&selected)?.is_some() })
+        }
         "git-base-projection" | "git-base-projection-limited" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
             let generation = args.next().ok_or("expected fixture attempt")?.parse()?;

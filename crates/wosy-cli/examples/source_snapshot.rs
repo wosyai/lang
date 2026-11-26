@@ -20,6 +20,8 @@ mod recovery;
 mod storage_worker;
 #[path = "source_snapshot/source_state.rs"]
 mod source_state;
+#[path = "source_snapshot/source_reconciliation.rs"]
+mod source_reconciliation;
 #[path = "source_snapshot/prepared_proposal.rs"]
 mod prepared_proposal;
 #[path = "source_snapshot/proposal_admission.rs"]

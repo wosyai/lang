@@ -52,6 +52,7 @@ mod prepared_project;
 mod retention_plan;
 mod source_impact;
 mod source_proposal;
+mod source_reconciliation;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use build_session::BuildDiagnosticSession;
@@ -68,6 +69,7 @@ pub use prepared_project::{
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
+pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};
 
@@ -562,7 +564,24 @@ fn admit_namespace_authority(
     let query = authority_key(NAMESPACE_QUERIES, file.executable);
     let existing = tx.get(&query)?;
     let tree = if existing.is_some() { FileTree::None } else { FileTree::Executable };
-    let (executable, comments) = validate_file(tx, file, configured, tree, None)?;
+    let checked = validate_file(tx, file, configured, tree, None)?;
+    finish_namespace_authority(tx, file, provenance, query, existing, checked, report)
+}
+
+fn admit_checked_namespace_authority(
+    tx: &mut Transaction, file: &FileEntry, checked: CheckedFile, report: &mut PublishReport,
+) -> Result<()> {
+    let provenance = authority_key(FILE_AUTHORITY, file.file);
+    if tx.get(&provenance)?.is_some() { return Ok(()); }
+    let query = authority_key(NAMESPACE_QUERIES, file.executable);
+    let existing = tx.get(&query)?;
+    finish_namespace_authority(tx, file, provenance, query, existing, checked, report)
+}
+
+fn finish_namespace_authority(
+    tx: &mut Transaction, file: &FileEntry, provenance: [u8; 65], query: [u8; 65],
+    existing: Option<surrealkv::Value>, checked: CheckedFile, report: &mut PublishReport,
+) -> Result<()> {
     let (fact, mut imports) = if let Some(id) = existing {
         let id = NodeId(id.as_slice().try_into()?);
         let facts = read_node(tx, id)?;
@@ -570,7 +589,7 @@ fn admit_namespace_authority(
         report.namespace_reused += 1;
         (id, imports)
     } else {
-        let imports = imports_from_cst(&executable.expect("requested executable tree"))?;
+        let imports = imports_from_cst(&checked.executable.ok_or("missing checked executable tree")?)?;
         let facts = Node {
             kind: Kind::NamespaceFacts,
             data: serde_json::to_vec(&imports)?,
@@ -587,7 +606,7 @@ fn admit_namespace_authority(
         report.namespace_derived += 1;
         (id, imports)
     };
-    restore_authored_spans(&mut imports, &comments);
+    restore_authored_spans(&mut imports, &checked.comments);
     if imports != file.metadata.imports {
         return Err("source namespace hints differ from canonical declarations".into());
     }
@@ -612,12 +631,19 @@ enum FileTree {
     None,
     Executable,
     Authored,
+    Both,
+}
+
+struct CheckedFile {
+    authored: Option<CstNode>,
+    executable: Option<CstNode>,
+    comments: Vec<TypedComment>,
 }
 
 fn validate_file(
     tx: &Transaction, file: &FileEntry, configured: &[String], tree: FileTree,
     mut work: Option<&mut source_proposal::CstWork>,
-) -> Result<(Option<CstNode>, Vec<TypedComment>)> {
+) -> Result<CheckedFile> {
     let bounded = work.is_some();
     if let Some(work) = work.as_mut() {
         work.file(file.metadata.bytes as usize)?;
@@ -633,7 +659,10 @@ fn validate_file(
     if authored.kind != Kind::Syntax || syntax_kind(&authored)? != SyntaxKind::Root {
         return Err("invalid canonical Rowan root".into());
     }
-    let mut builder = (tree != FileTree::None).then(GreenNodeBuilder::new);
+    let same_projection = tree == FileTree::Both && comments.is_empty();
+    let mut authored_builder = matches!(tree, FileTree::Authored | FileTree::Both).then(GreenNodeBuilder::new);
+    let mut executable_builder = (matches!(tree, FileTree::Executable | FileTree::Both) && !same_projection)
+        .then(GreenNodeBuilder::new);
     enum Step {
         Enter(NodeId, Node, Option<NodeId>, usize),
         Children(std::vec::IntoIter<NodeId>, std::vec::IntoIter<NodeId>, usize),
@@ -645,7 +674,9 @@ fn validate_file(
             Step::Children(mut children, mut projected, depth) => {
                 let Some(child) = children.next() else {
                     if projected.next().is_some() { return Err("extra executable syntax nodes".into()); }
-                    if let Some(builder) = builder.as_mut() { builder.finish_node(); }
+                    for builder in [&mut authored_builder, &mut executable_builder].into_iter().flatten() {
+                        builder.finish_node();
+                    }
                     continue;
                 };
                 let record = read(child, &mut work)?;
@@ -663,8 +694,11 @@ fn validate_file(
         match node.kind {
             Kind::Syntax => {
                 if let Some(work) = work.as_mut() { work.children(depth, node.children.len())?; }
-                if let Some(builder) = builder.as_mut() {
-                    builder.start_node(rowan::SyntaxKind(syntax_kind(&node)? as u16));
+                if authored_builder.is_some() || executable_builder.is_some() {
+                    let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
+                    for builder in [&mut authored_builder, &mut executable_builder].into_iter().flatten() {
+                        builder.start_node(kind);
+                    }
                 }
                 let projected = if projection == Some(id) {
                     node.children.clone()
@@ -692,8 +726,12 @@ fn validate_file(
                 } else if projection != Some(id) {
                     return Err("executable token differs from authored source".into());
                 }
-                if let Some(builder) = builder.as_mut().filter(|_| tree == FileTree::Authored || projection.is_some()) {
-                    builder.token(rowan::SyntaxKind(syntax_kind(&node)? as u16), text);
+                if authored_builder.is_some() || (projection.is_some() && executable_builder.is_some()) {
+                    let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
+                    if let Some(builder) = authored_builder.as_mut() { builder.token(kind, text); }
+                    if let Some(builder) = executable_builder.as_mut().filter(|_| projection.is_some()) {
+                        builder.token(kind, text);
+                    }
                 }
                 hasher.update(text.as_bytes());
                 position = end;
@@ -706,7 +744,10 @@ fn validate_file(
     {
         return Err("file observation does not match its authored CST".into());
     }
-    Ok((builder.map(|tree| CstNode::new_root(tree.finish())), comments))
+    let authored = authored_builder.map(|tree| CstNode::new_root(tree.finish()));
+    let executable = if same_projection { authored.clone() }
+        else { executable_builder.map(|tree| CstNode::new_root(tree.finish())) };
+    Ok(CheckedFile { authored, executable, comments })
 }
 
 pub struct SourceView {
