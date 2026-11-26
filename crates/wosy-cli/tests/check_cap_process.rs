@@ -283,3 +283,85 @@ fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
+    for (layout, other) in [("native", "wasm-wasip1"), ("wasm-wasip1", "native")] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            let project = Fixture::new();
+            let root = format!("%%start {} %%end", require("app", 0, "app.txt"));
+            project.package("", layout, "dev", "[dependencies.lib]\npath = \"lib\"", &root);
+            let dependent = format!(
+                r#"%%start
+                    ledger = namespace lib "credit.w";
+                    unit() entry = fn {{
+                        u8 core.context.credit = 3;
+                        {}
+                        ledger.relay();
+                        {}
+                    }};
+                    entry();
+                %%end"#,
+                require("one", 76, "one.txt"),
+                require("two", 77, "two.txt"),
+            );
+            let provider = r#"%%start
+                unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                unit() relay = fn { consume(); };
+                proof debit for consume() -> (null)
+                    ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+            %%end"#;
+            project.package("lib", other, "own", "", &dependent);
+            let credit = project.0.join("lib/src/credit.w");
+            fs::write(&credit, provider).unwrap();
+            let old = project.run(&[scope, "--dependencies"]);
+            assert_terminal(&old, 76, b"apponetwo", b"[app][one][two]");
+            project.clear();
+            for (cap, status, stdout, stderr, paths) in [
+                ("1", 0, "app", "[app]", &["app"][..]),
+                ("2", 76, "appone", "[app][one]", &["app", "one"][..]),
+                ("4", 76, "apponetwo", "[app][one][two]", &["app", "one", "two"][..]),
+            ] {
+                let bounded = project.run(&[scope, "--dependencies", "--max-errors", cap]);
+                assert_terminal(&bounded, status, stdout.as_bytes(), stderr.as_bytes());
+                for name in ["app", "one", "two"] {
+                    let file = project.output().join(format!("{name}.txt"));
+                    if paths.contains(&name) {
+                        assert_eq!(fs::read(file).unwrap(), name.as_bytes());
+                    } else {
+                        assert!(!file.exists(), "unselected output {name}");
+                    }
+                }
+                assert!(!project.0.join("lib/.wosy/outputs/check").exists());
+                project.clear();
+            }
+
+            // Proof refutation stays visible at zero dependency quota,
+            // but must not erase the independent selected app path.
+            let refuted_provider = provider.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+            fs::write(&credit, refuted_provider).unwrap();
+            let legacy_refuted = project.run(&[scope, "--dependencies"]);
+            assert_eq!(legacy_refuted.status.code(), Some(1), "{legacy_refuted:?}");
+            assert_eq!(legacy_refuted.stdout, b"app");
+            project.clear();
+            for cap in ["1", "4"] {
+                let bounded = project.run(&[scope, "--dependencies", "--max-errors", cap]);
+                assert_terminal(&bounded, 1, b"app", &legacy_refuted.stderr);
+                let diagnostic = String::from_utf8_lossy(&bounded.stderr);
+                assert!(diagnostic.contains("proof obligation failed") && diagnostic.contains("lib::src/credit.w")
+                    && diagnostic.contains("ledger.relay()") && diagnostic.contains("consume()"), "{diagnostic}");
+                assert_eq!(fs::read(project.output().join("app.txt")).unwrap(), b"app");
+                assert!(!project.output().join("one.txt").exists() && !project.output().join("two.txt").exists());
+                project.clear();
+            }
+
+            // Uncovered execution must veto the whole publication, not
+            // disappear as a zero-budget dependency with no failures.
+            fs::write(&credit, provider.replace("%%end", "relay(); %%end")).unwrap();
+            let unsupported = project.run(&[scope, "--dependencies", "--max-errors", "1"]);
+            assert_terminal(&unsupported, 2, b"", b"wosy: check: unsupported analysis; no result published\n");
+            assert!(!project.output().exists());
+        }
+    }
+}

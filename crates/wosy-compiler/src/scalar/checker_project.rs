@@ -10607,7 +10607,7 @@ impl PreparedScalarOrderedCheck {
             PreparedConfiguredCheck::Named { owner, startup_count }
                 if (1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) =>
                 owner.context.is_none() && owner.proofs.values().any(|catalog| !catalog.definitions.is_empty()),
-            PreparedConfiguredCheck::Contextual { startup_count: 1, .. }
+            PreparedConfiguredCheck::Contextual { startup_count: 1 | 2, .. }
                 | PreparedConfiguredCheck::Mixed { startup_count: 2 | 3, .. } => true,
             _ => false,
         }
@@ -10624,7 +10624,7 @@ impl PreparedScalarOrderedCheck {
             PreparedConfiguredCheck::Named { owner, .. } =>
                 run_private_named_after_startup(&owner, self.scope, None, None)
                     .map(|(report, completion)| (report, Some(completion))),
-            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
+            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 | 2 } =>
                 run_private_contextual_startup(&owner, effects, self.scope, None),
             PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
                 run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, None, configured_root)
