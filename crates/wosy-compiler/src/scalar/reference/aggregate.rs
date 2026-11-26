@@ -10617,11 +10617,11 @@ pub(crate) fn exclusive_runtime_relay_signature(parameters: &[ScalarType], outpu
 fn exact_exclusive_runtime_relay(
     cfg: &ScalarReferenceCfg, sites: &FunctionCallSites, function: &ScalarFunction,
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
-    raw_exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
+    facts: &CallablePointFacts,
 ) -> Option<(ByteSpan, Vec<(usize, PrivateRuntimePairCall)>)> {
     let ScalarType::Callable { parameters, outputs } = &function.signature else { return None };
     if !exclusive_runtime_relay_signature(parameters, &outputs.outputs)
-        || function.body.unsafe_context || !raw_exposures.is_empty()
+        || function.body.unsafe_context || !facts.raw_address_exposures.is_empty()
         || !sites.declared_unsafe_calls.is_empty() || !sites.callable_escapes.is_empty()
         || !sites.allocation_length_call_targets.is_empty() || !sites.structure.module_storage_uses.is_empty()
         || !cfg.allocations.is_empty()
@@ -10652,34 +10652,126 @@ fn exact_exclusive_runtime_relay(
                 .or_insert(Some(point.id));
         }
     }
+    let mut scalar_locals = HashSet::new();
+    let mut binding_outputs = HashMap::new();
+    for (block, region) in sites.structure.blocks.iter().enumerate() {
+        for item in &region.items {
+            let BlockItemKind::Binding(binding) = &item.kind else { continue; };
+            scalar_locals.extend(binding.receivers().iter().filter(|receiver| exclusive_relay_scalar(&receiver.ty))
+                .map(|receiver| receiver.span));
+            if let BindingInitialization::Outputs(outputs) = &binding.initialization {
+                if !outputs.secondary.is_empty() && binding_outputs.insert(outputs.primary,
+                    (BlockOrdinal(block), item.position, binding, outputs)).is_some()
+                { return None; }
+            }
+        }
+    }
     let mut exact = HashSet::from([*entry_bind]);
     let mut calls = Vec::new();
     for occurrence in &sites.call_occurrences {
         let ordinal = occurrence.ordinal;
         let call = cfg.primary_call_point(ordinal)?;
+        let call_point = cfg.points.get(call.0)?;
+        let no_origin = |point: &ReferenceFlowPoint| point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty);
+        // This checked integral conversion cannot receive or expose the
+        // backing. Its lowering stays the ordinary Core operation.
+        if let CfgPointKind::Call {
+            target: ResolvedCallTarget::Core(CoreOperationId::IntExtend | CoreOperationId::IntTrunc),
+            expression: ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
+        } = &call_point.kind {
+            let [argument] = argument_points.as_slice() else { return None; };
+            let actual = cfg.points.get(argument.0)?;
+            let OccurrenceNode::Expression(input) = *sites.structure.edges.get(&(
+                OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(0),
+            ))? else { return None; };
+            let types = &sites.structure.checked_types.expressions;
+            let integer = crate::scalar::typecheck::is_integer_type;
+            if arguments.len() != 1 || !no_origin(call_point) || !no_origin(actual)
+                || actual.scope != call_point.scope || actual.source_span.range != sites.occurrences.get(input.0)?.span
+                || !integer(types.get(&input)?) || !integer(types.get(&ordinal)?)
+            { return None; }
+            exact.insert(call);
+            continue;
+        }
         let target = target_body(declarations, cfg, call)?;
         let signature = sites.checked_call_signatures.get(&ordinal)?;
-        if !exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs)
-            || scalar_type_identity(signature.parameters.first()?) != scalar_type_identity(parameters.first()?)
-        { return None; }
-        let call_point = cfg.points.get(call.0)?;
+        let shared_reader = private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
+            && matches!((signature.parameters.first(), parameters.first()),
+                (Some(ScalarType::CheckedReference { inner: child, .. }),
+                    Some(ScalarType::CheckedReference { inner: parent, .. }))
+                if same_runtime_array_type(child, parent));
+        let owns_argument = shared_reader
+            || (exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs)
+                && signature.parameters.first().zip(parameters.first()).is_some_and(|(callee, caller)|
+                    scalar_type_identity(callee) == scalar_type_identity(caller)));
         let CfgPointKind::Call {
-            target: target_kind @ ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. },
+            target: target_kind @ ResolvedCallTarget::ModuleCallable {
+                source: callee, concrete: ConcreteCallSelection::Declaration, ..
+            },
             expression: expression @ ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
         } = &call_point.kind else { return None; };
-        // A grouped call is one runtime invocation. Its additional CFG
-        // projections must follow the same exact producer, not add call edges.
+        if arguments.len() != argument_points.len() || argument_points.len() != signature.parameters.len() {
+            return None;
+        }
+        // A checked direct same-module scalar call receives no original
+        // owner or derivative reference, and needs no private pair ABI.
+        let scalar_companion = !owns_argument && callee == &formal_binding.source
+            && signature.parameters.iter().all(exclusive_relay_scalar)
+            && signature.outputs.outputs.iter().all(|output|
+                output.ty == ScalarType::Unit || exclusive_relay_scalar(&output.ty));
+        if !owns_argument && (!scalar_companion || !no_origin(call_point)) { return None; }
+        let arity = signature.outputs.outputs.len();
+        let scalar_declaration = scalar_companion.then(|| binding_outputs.get(&ordinal)).flatten();
+        if let Some((_, _, binding, outputs)) = scalar_declaration {
+            if binding.receivers().len() != arity || outputs.secondary.len() + 1 != arity
+                || !outputs.secondary.iter().enumerate().all(|(lane, output)|
+                    matches!(output, BindingOutput::ProjectPrimary { output } if *output == lane + 1))
+            { return None; }
+        }
+        let bound_projection = |lane: usize, producer: &ReferenceFlowPoint| {
+            let &(block, item, binding, _) = scalar_declaration?;
+            let receiver = binding.receivers().get(lane)?;
+            let result = signature.outputs.outputs.get(lane)?;
+            let BindingDefinition::Initialized { bind, value } =
+                *facts.definitions.get(&(block, item, lane))? else { return None; };
+            let install = cfg.points.get(bind.0)?;
+            let CfgPointKind::Bind { binding } = &install.kind else { return None; };
+            (receiver.position == lane && receiver.ty == result.ty && value == producer.id
+                && producer.successors.as_slice() == [bind] && install.scope == producer.scope
+                && binding.source == formal_binding.source && binding.function_span == original
+                && binding.declaration_span == receiver.span && matches!(binding.kind, ReferenceBindingKind::Declared)
+                && install.source_span.range == receiver.span && no_origin(install)).then_some(install)
+        };
         let mut producer = call_point;
-        for lane in 1..signature.outputs.outputs.len() {
-            let [next] = producer.successors.as_slice() else { return None; };
+        for lane in 1..arity {
+            let predecessor = if scalar_declaration.is_some() {
+                bound_projection(lane - 1, producer)?
+            } else { producer };
+            let [next] = predecessor.successors.as_slice() else { return None; };
             let projection = cfg.points.get(next.0)?;
-            if projection.scope != call_point.scope || projection.source_span != call_point.source_span
+            if (scalar_companion && !no_origin(projection))
+                || projection.scope != call_point.scope || projection.source_span != call_point.source_span
                 || !matches!(&projection.kind, CfgPointKind::Call {
                     target, expression: source, argument_points: inputs, output,
                 } if target == target_kind && source == expression && inputs == argument_points && *output == lane)
             { return None; }
             exact.insert(*next);
             producer = projection;
+        }
+        if scalar_companion {
+            if scalar_declaration.is_some() { bound_projection(arity.checked_sub(1)?, producer)?; }
+            for (slot, (&point, ty)) in argument_points.iter().zip(&signature.parameters).enumerate() {
+                let actual = cfg.points.get(point.0)?;
+                let OccurrenceNode::Expression(argument) = *sites.structure.edges.get(&(
+                    OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(slot),
+                ))? else { return None; };
+                if actual.scope != call_point.scope || !no_origin(actual)
+                    || actual.source_span.range != sites.occurrences.get(argument.0)?.span
+                    || sites.structure.checked_types.expressions.get(&argument) != Some(ty)
+                { return None; }
+            }
+            exact.insert(call);
+            continue;
         }
         let first = *argument_points.first()?;
         let actual = cfg.points.get(first.0)?;
@@ -10694,11 +10786,8 @@ fn exact_exclusive_runtime_relay(
             || scalar_type_identity(checked_type) != scalar_type_identity(&signature.parameters[0])
         { return None; }
         let plain = sites.prepared_plain_name(argument);
-        if argument_points.len() != signature.parameters.len() || arguments.len() != argument_points.len() {
-            return None;
-        }
         let read = match (&actual.kind, arguments.first()?) {
-            (CfgPointKind::Read { binding }, ScalarExpression::Name { .. }) if binding == formal_binding
+            (CfgPointKind::Read { binding }, ScalarExpression::Name { .. }) if !shared_reader && binding == formal_binding
                 && matches!(plain, Some(PlainNameIdentity::Lexical(lexical)) if lexical == binding) => {
                 singleton_formal_loan(actual)?;
                 let [moved] = actual.successors.as_slice() else { return None; };
@@ -10709,13 +10798,14 @@ fn exact_exclusive_runtime_relay(
                 first
             }
             (CfgPointKind::Borrow { place, loan }, ScalarExpression::CheckedAddress {
-                mutability: ScalarReferenceMutability::Mutable, place: authored @ ScalarPlace::Dereference {
+                mutability, place: authored @ ScalarPlace::Dereference {
                     pointer, ..
                 }, ..
             }) => {
                 let ScalarExpression::Name { span: pointer_span, .. } = pointer.as_ref() else { return None; };
+                let mode = if shared_reader { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable };
                 if plain.is_some() || authored != &place.place
-                    || loan.mode != ScalarReferenceMutability::Mutable || &place.binding != formal_binding
+                    || *mutability != mode || loan.mode != mode || &place.binding != formal_binding
                     || loan.origin_place != *place
                 { return None; }
                 let predecessor = predecessors.get(&first).copied().flatten()?;
@@ -10739,12 +10829,6 @@ fn exact_exclusive_runtime_relay(
         exact.extend([call, first, read]);
         calls.push((ordinal.0, PrivateRuntimePairCall { owner: formal, target, inherited: true, phase_root: false, portable_birth: None }));
     }
-    let scalar_locals: HashSet<_> = sites.structure.blocks.iter().flat_map(|block| &block.items)
-        .filter_map(|item| match &item.kind {
-            BlockItemKind::Binding(binding) => Some(binding.receivers()),
-            _ => None,
-        }).flatten().filter(|receiver| exclusive_relay_scalar(&receiver.ty))
-        .map(|receiver| receiver.span).collect();
     let mut scalar_groups = HashMap::new();
     let mut scalar_destinations = HashMap::new();
     for group in sites.assignments.values() {
@@ -10975,7 +11059,7 @@ impl ProjectReferenceResults {
                     let Some(result) = self.function_result(module, item, arm) else { continue };
                     let Some(sites) = module_at(module).and_then(|input| input.calls.function_body(item, arm)) else { continue };
                     let Some((formal, calls)) = exact_exclusive_runtime_relay(
-                        &result.cfg, sites, function, &declarations, &result.proof_points.raw_address_exposures,
+                        &result.cfg, sites, function, &declarations, &result.proof_points,
                     ) else { continue };
                     routes.insert(key, PrivateRuntimeAccessRoute::ExclusiveRelay(formal));
                     exclusive_edges.insert(key, calls);
@@ -11043,11 +11127,23 @@ impl ProjectReferenceResults {
                     }
                     for (slot, &argument) in argument_points.iter().enumerate().skip(1) {
                         let point = points.get(argument.0)?;
-                        let plain = exact_call_argument_head(sites, ordinal, slot,
-                            signature.parameters.get(slot)?, point, call_site.scope)?;
+                        let parameter = signature.parameters.get(slot)?;
+                        let plain = exact_call_argument_head(sites, ordinal, slot, parameter, point, call_site.scope)?;
                         let next = argument_points.get(slot + 1).copied().unwrap_or(call);
-                        if !exact_pure_call_companion(&point.kind, plain) || point.successors.as_slice() != [next] {
-                            return None;
+                        if !exact_pure_call_companion(&point.kind, plain) { return None; }
+                        if point.successors.as_slice() != [next] {
+                            // A scalar enum actual can consume its own exact
+                            // lexical binding between the read and next actual.
+                            let Some(PlainNameIdentity::Lexical(holder)) = plain else { return None; };
+                            let [moved] = point.successors.as_slice() else { return None; };
+                            let moved = cfg.points.get(moved.0)?;
+                            let read = cfg.points.get(argument.0)?;
+                            if !matches!(parameter, ScalarType::Enum(_)) || !exclusive_relay
+                                || !exact_call_argument_move(read, moved, holder, parameter)
+                                || moved.successors.as_slice() != [next]
+                                || [read, moved].into_iter().any(|point|
+                                    point.possible_origins.as_ref().is_some_and(|origins| !origins.is_empty()))
+                            { return None; }
                         }
                     }
                 }
@@ -11149,13 +11245,14 @@ impl ProjectReferenceResults {
             let mut component = Vec::new();
             let mut eligible = true;
             let mut roots = Vec::new();
-            let mut writer = false;
+            let mut checked_leaf = false;
             while let Some(key) = pending.pop() {
                 if !seen.insert(key) { continue; }
                 component.push(key);
                 match routes.get(&key) {
                     Some(PrivateRuntimeAccessRoute::ExclusiveRelay(_)) => {}
-                    Some(PrivateRuntimeAccessRoute::Write(_)) => writer = true,
+                    Some(PrivateRuntimeAccessRoute::Write(_) | PrivateRuntimeAccessRoute::Read(_)) =>
+                        checked_leaf = true,
                     _ => eligible = false,
                 }
                 if let Some(Some(users)) = census.transport_uses.get(&key) {
@@ -11173,7 +11270,7 @@ impl ProjectReferenceResults {
                 } else { eligible = false; }
                 pending.extend(linked.get(&key).into_iter().flatten().copied());
             }
-            if !eligible || !writer { continue; }
+            if !eligible || !checked_leaf { continue; }
             let mut reached = HashSet::new();
             while let Some(key) = roots.pop() {
                 if !reached.insert(key) { continue; }

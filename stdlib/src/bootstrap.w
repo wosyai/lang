@@ -100,9 +100,13 @@ ReadLineStatus(u64, u64, ReadLineStatus) _read_line_capacity_status = fn(length,
 	if (length >= maximum) { ReadLineStatus::limit_exceeded } else { status }
 };
 
-(u8[], u64, u8, u8, ReadLineStatus)(u8[], u64, ReadLineStatus, u64, u8, u8) _read_line_utf8_step = fn(bytes, index, result, remaining, next_minimum, next_maximum) {
-	u64 zero = core.int_extend<u64>(0);
-	u64 one = core.int_extend<u64>(1);
+u8(*(u8[]), u64) _read_line_load_byte = fn(bytes, index) {
+	(*bytes)[index]
+};
+
+(u64, u8, u8, ReadLineStatus)(*!(u8[]), u64, ReadLineStatus, u64, u8, u8) _read_line_utf8_step = fn(bytes, index, result, remaining, next_minimum, next_maximum) {
+	u64 zero = 0;
+	u64 one = 1;
 	u8 continuation_minimum = 128;
 	u8 continuation_maximum = 191;
 	u8 two_byte_minimum = 194;
@@ -113,7 +117,7 @@ ReadLineStatus(u64, u64, ReadLineStatus) _read_line_capacity_status = fn(length,
 	u8 ed = 237;
 	u8 f0 = 240;
 	u8 f4 = 244;
-	u8 byte = bytes[index];
+	u8 byte = _read_line_load_byte(&(*bytes), index);
 	if (remaining != zero) {
 		if (byte < next_minimum || byte > next_maximum) { result = ReadLineStatus::invalid_utf8; };
 		remaining = remaining - one;
@@ -123,86 +127,86 @@ ReadLineStatus(u64, u64, ReadLineStatus) _read_line_capacity_status = fn(length,
 		if (byte >= continuation_minimum && byte < two_byte_minimum) { result = ReadLineStatus::invalid_utf8; };
 		if (byte >= two_byte_minimum && byte < three_byte_minimum) { remaining = one; };
 		if (byte >= three_byte_minimum && byte < four_byte_minimum) {
-			remaining = core.int_extend<u64>(2);
+			remaining = 2;
 			if (byte == e0) { next_minimum = 160; };
 			if (byte == ed) { next_maximum = 159; };
 		};
 		if (byte >= four_byte_minimum && byte <= four_byte_limit) {
-			remaining = core.int_extend<u64>(3);
+			remaining = 3;
 			if (byte == f0) { next_minimum = 144; };
 			if (byte == f4) { next_maximum = 143; };
 		};
 		if (byte > four_byte_limit) { result = ReadLineStatus::invalid_utf8; };
 	};
-	bytes, remaining, next_minimum, next_maximum, result
+	remaining, next_minimum, next_maximum, result
 };
 
-(u8[], u64, u8, u8, ReadLineStatus)(u8[], u64, u64, u64, u8, u8, ReadLineStatus) _read_line_utf8_range = fn(bytes, low, high, remaining, minimum, maximum, status) {
-	u64 one = core.int_extend<u64>(1);
+(u64, u8, u8, ReadLineStatus)(*!(u8[]), u64, u64, u64, u8, u8, ReadLineStatus) _read_line_utf8_range = fn(bytes, low, high, remaining, minimum, maximum, status) {
+	u64 one = 1;
 	if (low < high) {
 		u64 count = high - low;
 		if (count == one) {
-			bytes, remaining, minimum, maximum, status = _read_line_utf8_step(bytes, low, status, remaining, minimum, maximum);
+			remaining, minimum, maximum, status = _read_line_utf8_step(bytes, low, status, remaining, minimum, maximum);
 		} else {
-			u64 two = core.int_extend<u64>(2);
+			u64 two = 2;
 			u64 middle = low + count / two;
-			bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, low, middle, remaining, minimum, maximum, status);
-			bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, middle, high, remaining, minimum, maximum, status);
+			remaining, minimum, maximum, status = _read_line_utf8_range(&!(*bytes), low, middle, remaining, minimum, maximum, status);
+			remaining, minimum, maximum, status = _read_line_utf8_range(bytes, middle, high, remaining, minimum, maximum, status);
 		};
 	};
-	bytes, remaining, minimum, maximum, status
+	remaining, minimum, maximum, status
 };
 
-i32(*!u8) _read_line_discard_step = fn(view) {
-	u64 zero = core.int_extend<u64>(0);
-	u64 one = core.int_extend<u64>(1);
-	u64 count = zero;
+(u8, u64, bool)() _read_line_read_byte = fn {
+	u8[1] scratch = [0];
+	u64 count = 0;
 	bool complete = false;
-	unsafe { count, complete = read_into(&?*view, one); };
+	unsafe { count, complete = read_into(&?scratch[0], 1); };
+	scratch[0], count, complete
+};
+
+i32() _read_line_discard_step = fn {
+	u8 byte, u64 count, bool complete = _read_line_read_byte();
 	if (!complete) { 2 } else {
-		if (count == zero) { 1 } else {
-			if (*view == 10) { 1 } else { 0 }
+		if (count == 0) { 1 } else {
+			if (byte == 10) { 1 } else { 0 }
 		}
 	}
 };
 
-i32(i32, *!u8) _read_line_discard_continue = fn(outcome, view) {
+i32(i32) _read_line_discard_continue = fn(outcome) {
 	if (outcome == 0) {
-		_read_line_discard_continue(_read_line_discard_step(&!(*view)), view)
+		_read_line_discard_continue(_read_line_discard_step())
 	} else { outcome }
 };
 
 ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
-	u8[1] scratch = [0];
-	*!u8 view = &!scratch[0];
 	ReadLineStatus status = ReadLineStatus::limit_exceeded;
 	bool discard = true;
 	if (first == 13) {
-		u64 zero = core.int_extend<u64>(0);
-		u64 one = core.int_extend<u64>(1);
-		u64 count = zero;
-		bool complete = false;
-		unsafe { count, complete = read_into(&?*view, one); };
+		u8 byte, u64 count, bool complete = _read_line_read_byte();
 		if (!complete) { status = ReadLineStatus::io_error; discard = false; };
-		if (complete && count == zero) { discard = false; };
-		if (complete && count != zero && *view == 10) { status = ReadLineStatus::line; discard = false; };
+		if (complete && count == 0) { discard = false; };
+		if (complete && count != 0 && byte == 10) { status = ReadLineStatus::line; discard = false; };
 	};
 	if (discard) {
-		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
-		i32 outcome = _read_line_discard_continue(first_outcome, &!scratch[0]);
+		i32 first_outcome = _read_line_discard_step();
+		i32 outcome = _read_line_discard_continue(first_outcome);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	status
 };
 
-(u8[], u64, bool, bool, ReadLineStatus)(u8[], *!u8, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_step = fn(bytes, view, max_bytes, length, pending_cr, reading, status) {
-	u64 zero = core.int_extend<u64>(0);
-	u64 one = core.int_extend<u64>(1);
+unit(*!(u8[]), u64, u8) _read_line_store_byte = fn(bytes, index, value) {
+	(*bytes)[index] = value;
+};
+
+(u64, bool, bool, ReadLineStatus)(*!(u8[]), u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_step = fn(bytes, max_bytes, length, pending_cr, reading, status) {
+	u64 zero = 0;
+	u64 one = 1;
 	u8 lf = 10;
 	u8 cr = 13;
-	u64 count = zero;
-	bool complete = false;
-	unsafe { count, complete = read_into(&?*view, one); };
+	u8 byte, u64 count, bool complete = _read_line_read_byte();
 	if (!complete) {
 		status = ReadLineStatus::io_error;
 		reading = false;
@@ -210,59 +214,58 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 		if (count == zero) {
 			reading = false;
 		} else {
-			u8 byte = *view;
 			if (byte == lf) {
 				pending_cr = false;
 				reading = false;
 			} else {
 				if (pending_cr) {
 					status = _read_line_capacity_status(length, max_bytes, status);
-					if (length < max_bytes) { bytes[length] = cr; length = length + one; };
+					if (length < max_bytes) { _read_line_store_byte(&!(*bytes), length, cr); length = length + one; };
 				};
 				pending_cr = byte == cr;
 				if (!pending_cr) {
 					status = _read_line_capacity_status(length, max_bytes, status);
-					if (length < max_bytes) { bytes[length] = byte; length = length + one; };
+					if (length < max_bytes) { _read_line_store_byte(&!(*bytes), length, byte); length = length + one; };
 				};
 			};
 		};
 	};
 	if (status == ReadLineStatus::limit_exceeded) { reading = false; };
-	bytes, length, pending_cr, reading, status
+	length, pending_cr, reading, status
 };
 
-(u8[], u64, bool, bool, ReadLineStatus)(u8[], *!u8, u64, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_range = fn(bytes, view, max_bytes, budget, length, pending_cr, reading, status) {
-	u64 zero = core.int_extend<u64>(0);
-	u64 one = core.int_extend<u64>(1);
+(u64, bool, bool, ReadLineStatus)(*!(u8[]), u64, u64, u64, bool, bool, ReadLineStatus) _read_line_allocated_range = fn(bytes, max_bytes, budget, length, pending_cr, reading, status) {
+	u64 zero = 0;
+	u64 one = 1;
 	if (budget != zero && reading) {
 		if (budget == one) {
-			bytes, length, pending_cr, reading, status = _read_line_allocated_step(bytes, view, max_bytes, length, pending_cr, reading, status);
+			length, pending_cr, reading, status = _read_line_allocated_step(bytes, max_bytes, length, pending_cr, reading, status);
 		} else {
-			u64 two = core.int_extend<u64>(2);
+			u64 two = 2;
 			u64 left = budget / two;
-			bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, &!(*view), max_bytes, left, length, pending_cr, reading, status);
+			length, pending_cr, reading, status = _read_line_allocated_range(&!(*bytes), max_bytes, left, length, pending_cr, reading, status);
 			if (reading) {
-				bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, view, max_bytes, budget - left, length, pending_cr, reading, status);
+				length, pending_cr, reading, status = _read_line_allocated_range(bytes, max_bytes, budget - left, length, pending_cr, reading, status);
 			};
 		};
 	};
-	bytes, length, pending_cr, reading, status
+	length, pending_cr, reading, status
 };
 
 (*utf8, ReadLineStatus)(u64, u8, bool) _read_line_allocated = fn(max_bytes, first, pending_cr) {
-	u64 zero = core.int_extend<u64>(0);
-	u64 one = core.int_extend<u64>(1);
-	u8[1] scratch = [0];
+	u64 zero = 0;
+	u64 one = 1;
 	u8[max_bytes] bytes;
 	u64 length = zero;
 	bool reading = true;
 	ReadLineStatus status = ReadLineStatus::line;
 	if (!pending_cr) { bytes[length] = first; length = length + one; };
-	u64 two = core.int_extend<u64>(2);
-	bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, &!scratch[0], max_bytes, max_bytes + two, length, pending_cr, reading, status);
+	u64 two = 2;
+	u64 budget = max_bytes + two;
+	length, pending_cr, reading, status = _read_line_allocated_range(&!bytes, max_bytes, budget, length, pending_cr, reading, status);
 	if (status == ReadLineStatus::limit_exceeded) {
-		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
-		i32 outcome = _read_line_discard_continue(first_outcome, &!scratch[0]);
+		i32 first_outcome = _read_line_discard_step();
+		i32 outcome = _read_line_discard_continue(first_outcome);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	if (status == ReadLineStatus::line && pending_cr) {
@@ -273,7 +276,7 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 		u64 remaining = zero;
 		u8 minimum = 128;
 		u8 maximum = 191;
-		bytes, remaining, minimum, maximum, status = _read_line_utf8_range(bytes, zero, length, remaining, minimum, maximum, status);
+		remaining, minimum, maximum, status = _read_line_utf8_range(&!bytes, zero, length, remaining, minimum, maximum, status);
 		if (remaining != zero) { status = ReadLineStatus::invalid_utf8; };
 	};
 	if (status == ReadLineStatus::line) {
@@ -1379,17 +1382,33 @@ utf8(char) _format_char = fn(value) {
 	text
 };
 
-u64(u8[], u64, i8, bool, u64) _format_digits_i8 = fn(scratch, index, remaining, negative, capacity) {
+unit(*!(u8[]), u64, u8) _format_store_byte = fn(bytes, index, value) {
+	(*bytes)[index] = value;
+};
+
+u8(*(u8[]), u64) _format_load_byte = fn(bytes, index) {
+	(*bytes)[index]
+};
+
+unit(*!(u8[]), u64, u64, u64) _format_compact_checked_bytes = fn(bytes, target, source, capacity) {
+	if (source < capacity) {
+		u8 value = _format_load_byte(&(*bytes), source);
+		_format_store_byte(&!(*bytes), target, value);
+		_format_compact_checked_bytes(bytes, target + 1, source + 1, capacity);
+	};
+};
+
+u64(*!(u8[]), u64, i8, bool, u64) _format_digits_i8 = fn(scratch, index, remaining, negative, capacity) {
 	i8 zero = 0;
 	if (remaining == zero) {
 		if (negative) {
 			u64 one = core.int_extend<u64>(1);
 			u8 minus = 45;
 			index = index - one;
-			scratch[index] = minus;
+			_format_store_byte(&!(*scratch), index, minus);
 		};
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		i8 ten = 10;
@@ -1400,22 +1419,23 @@ u64(u8[], u64, i8, bool, u64) _format_digits_i8 = fn(scratch, index, remaining, 
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_i8(scratch, index, remaining / ten, negative, capacity)
 	}
 };
 
-u64(u8[], u64, i16, bool, u64) _format_digits_i16 = fn(scratch, index, remaining, negative, capacity) {
+u64(*!(u8[]), u64, i16, bool, u64) _format_digits_i16 = fn(scratch, index, remaining, negative, capacity) {
 	i16 zero = 0;
 	if (remaining == zero) {
 		if (negative) {
 			u64 one = core.int_extend<u64>(1);
 			u8 minus = 45;
 			index = index - one;
-			scratch[index] = minus;
+			_format_store_byte(&!(*scratch), index, minus);
 		};
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		i16 ten = 10;
@@ -1425,22 +1445,23 @@ u64(u8[], u64, i16, bool, u64) _format_digits_i16 = fn(scratch, index, remaining
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_i16(scratch, index, remaining / ten, negative, capacity)
 	}
 };
 
-u64(u8[], u64, i32, bool, u64) _format_digits_i32 = fn(scratch, index, remaining, negative, capacity) {
+u64(*!(u8[]), u64, i32, bool, u64) _format_digits_i32 = fn(scratch, index, remaining, negative, capacity) {
 	i32 zero = 0;
 	if (remaining == zero) {
 		if (negative) {
 			u64 one = core.int_extend<u64>(1);
 			u8 minus = 45;
 			index = index - one;
-			scratch[index] = minus;
+			_format_store_byte(&!(*scratch), index, minus);
 		};
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		i32 ten = 10;
@@ -1450,22 +1471,23 @@ u64(u8[], u64, i32, bool, u64) _format_digits_i32 = fn(scratch, index, remaining
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_i32(scratch, index, remaining / ten, negative, capacity)
 	}
 };
 
-u64(u8[], u64, i64, bool, u64) _format_digits_i64 = fn(scratch, index, remaining, negative, capacity) {
+u64(*!(u8[]), u64, i64, bool, u64) _format_digits_i64 = fn(scratch, index, remaining, negative, capacity) {
 	i64 zero = 0;
 	if (remaining == zero) {
 		if (negative) {
 			u64 one = core.int_extend<u64>(1);
 			u8 minus = 45;
 			index = index - one;
-			scratch[index] = minus;
+			_format_store_byte(&!(*scratch), index, minus);
 		};
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		i64 ten = 10;
@@ -1475,16 +1497,17 @@ u64(u8[], u64, i64, bool, u64) _format_digits_i64 = fn(scratch, index, remaining
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_i64(scratch, index, remaining / ten, negative, capacity)
 	}
 };
 
-u64(u8[], u64, u8, u64) _format_digits_u8 = fn(scratch, index, remaining, capacity) {
+u64(*!(u8[]), u64, u8, u64) _format_digits_u8 = fn(scratch, index, remaining, capacity) {
 	u8 zero = 0;
 	if (remaining == zero) {
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		u8 ten = 10;
@@ -1492,16 +1515,17 @@ u64(u8[], u64, u8, u64) _format_digits_u8 = fn(scratch, index, remaining, capaci
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_u8(scratch, index, remaining / ten, capacity)
 	}
 };
 
-u64(u8[], u64, u16, u64) _format_digits_u16 = fn(scratch, index, remaining, capacity) {
+u64(*!(u8[]), u64, u16, u64) _format_digits_u16 = fn(scratch, index, remaining, capacity) {
 	u16 zero = 0;
 	if (remaining == zero) {
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		u16 ten = 10;
@@ -1510,16 +1534,17 @@ u64(u8[], u64, u16, u64) _format_digits_u16 = fn(scratch, index, remaining, capa
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_u16(scratch, index, remaining / ten, capacity)
 	}
 };
 
-u64(u8[], u64, u32, u64) _format_digits_u32 = fn(scratch, index, remaining, capacity) {
+u64(*!(u8[]), u64, u32, u64) _format_digits_u32 = fn(scratch, index, remaining, capacity) {
 	u32 zero = 0;
 	if (remaining == zero) {
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		u32 ten = 10;
@@ -1528,16 +1553,17 @@ u64(u8[], u64, u32, u64) _format_digits_u32 = fn(scratch, index, remaining, capa
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_u32(scratch, index, remaining / ten, capacity)
 	}
 };
 
-u64(u8[], u64, u64, u64) _format_digits_u64 = fn(scratch, index, remaining, capacity) {
+u64(*!(u8[]), u64, u64, u64) _format_digits_u64 = fn(scratch, index, remaining, capacity) {
 	u64 zero = 0;
 	if (remaining == zero) {
 		u64 length = capacity - index;
-		_format_compact_bytes(scratch, 0, index, capacity);
+		_format_compact_checked_bytes(scratch, 0, index, capacity);
 		length
 	} else {
 		u64 ten = 10;
@@ -1546,17 +1572,10 @@ u64(u8[], u64, u64, u64) _format_digits_u64 = fn(scratch, index, remaining, capa
 		u64 one = core.int_extend<u64>(1);
 		u8 zero_digit = 48;
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		_format_digits_u64(scratch, index, remaining / ten, capacity)
 	}
-};
-
-unit(u8[], u64, u64, u64) _format_compact_bytes = fn(scratch, target, source, capacity) {
-	if (source < capacity) {
-		scratch[target] = scratch[source];
-		u64 one = core.int_extend<u64>(1);
-		_format_compact_bytes(scratch, target + one, source + one, capacity);
-	};
 };
 
 utf8(i8) _format_i8 = fn(value) {
@@ -1572,7 +1591,7 @@ utf8(i8) _format_i8 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_i8(scratch, index, remaining, negative, capacity);
+	u64 length = _format_digits_i8(&!scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1592,7 +1611,7 @@ utf8(i16) _format_i16 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_i16(scratch, index, remaining, negative, capacity);
+	u64 length = _format_digits_i16(&!scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1612,7 +1631,7 @@ utf8(i32) _format_i32 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_i32(scratch, index, remaining, negative, capacity);
+	u64 length = _format_digits_i32(&!scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1632,7 +1651,7 @@ utf8(i64) _format_i64 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_i64(scratch, index, remaining, negative, capacity);
+	u64 length = _format_digits_i64(&!scratch, index, remaining, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1650,7 +1669,7 @@ utf8(i128) _format_i128 = fn(value) {
 	} else {
 		core.bitcast<u128>(value)
 	};
-	u64 length = _format_wide_decimal(scratch, magnitude, negative, capacity);
+	u64 length = _format_wide_decimal(&!scratch, magnitude, negative, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1669,7 +1688,7 @@ utf8(u8) _format_u8 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_u8(scratch, index, remaining, capacity);
+	u64 length = _format_digits_u8(&!scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1688,7 +1707,7 @@ utf8(u16) _format_u16 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_u16(scratch, index, remaining, capacity);
+	u64 length = _format_digits_u16(&!scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1707,7 +1726,7 @@ utf8(u32) _format_u32 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_u32(scratch, index, remaining, capacity);
+	u64 length = _format_digits_u32(&!scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1726,7 +1745,7 @@ utf8(u64) _format_u64 = fn(value) {
 		index = index - one;
 		scratch[index] = zero_digit;
 	};
-	u64 length = _format_digits_u64(scratch, index, remaining, capacity);
+	u64 length = _format_digits_u64(&!scratch, index, remaining, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };
@@ -1743,7 +1762,7 @@ utf8(u64) _format_u64 = fn(value) {
 	}
 };
 
-u64(u8[], u64, u64, u64, u64, u8, bool, bool, u64) _format_decimal_chunks = fn(scratch, index, remaining, upper, width, leading, has_upper, negative, capacity) {
+u64(*!(u8[]), u64, u64, u64, u64, u8, bool, bool, u64) _format_decimal_chunks = fn(scratch, index, remaining, upper, width, leading, has_upper, negative, capacity) {
 	u64 zero = 0;
 	u64 one = core.int_extend<u64>(1);
 	u8 zero_digit = 48;
@@ -1753,7 +1772,8 @@ u64(u8[], u64, u64, u64, u64, u8, bool, bool, u64) _format_decimal_chunks = fn(s
 		u64 remainder = remaining - quotient * ten;
 		u8 digit = core.int_trunc<u8>(remainder);
 		index = index - one;
-		scratch[index] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), index, rendered_byte);
 		if (width != zero) { width = width - one; };
 		_format_decimal_chunks(scratch, index, quotient, upper, width, leading, has_upper, negative, capacity)
 	} else {
@@ -1763,20 +1783,21 @@ u64(u8[], u64, u64, u64, u64, u8, bool, bool, u64) _format_decimal_chunks = fn(s
 		} else {
 			if (leading != 0) {
 				index = index - one;
-				scratch[index] = zero_digit + leading;
+				u8 rendered_byte = zero_digit + leading;
+				_format_store_byte(&!(*scratch), index, rendered_byte);
 			};
 			if (negative) {
 				index = index - one;
-				scratch[index] = 45;
+				_format_store_byte(&!(*scratch), index, 45);
 			};
 			u64 length = capacity - index;
-			_format_compact_bytes(scratch, zero, index, capacity);
+			_format_compact_checked_bytes(scratch, zero, index, capacity);
 			length
 		}
 	}
 };
 
-u64(u8[], u128, bool, u64) _format_wide_decimal = fn(scratch, value, negative, capacity) {
+u64(*!(u8[]), u128, bool, u64) _format_wide_decimal = fn(scratch, value, negative, capacity) {
 	u128 chunk_base = 10000000000000000000;
 	u64 remaining = 0;
 	u64 upper = 0;
@@ -1799,7 +1820,7 @@ u64(u8[], u128, bool, u64) _format_wide_decimal = fn(scratch, value, negative, c
 utf8(u128) _format_u128 = fn(value) {
 	u8[39] scratch;
 	u64 capacity = core.int_extend<u64>(39);
-	u64 length = _format_wide_decimal(scratch, value, false, capacity);
+	u64 length = _format_wide_decimal(&!scratch, value, false, capacity);
 	*?u8 data = null;
 	unsafe { data = &?scratch[0]; };
 	utf8 text = { .data = data; .length = length; };

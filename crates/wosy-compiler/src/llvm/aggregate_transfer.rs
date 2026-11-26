@@ -385,12 +385,15 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         let Some((first, tail)) = arguments.split_first() else {
             return Err("missing exclusive forwarding argument".into());
         };
+        let Some(ScalarType::CheckedReference { mutability, .. }) = parameters.first() else {
+            return Err("exclusive runtime relay lost its exact reference formal".into());
+        };
+        let shared = *mutability == crate::scalar::ScalarReferenceMutability::Shared;
         let formal = match first {
-            place @ ScalarExpression::Name { .. } => place,
+            place @ ScalarExpression::Name { .. } if !shared => place,
             ScalarExpression::CheckedAddress {
-                mutability: crate::scalar::ScalarReferenceMutability::Mutable,
-                place: ScalarPlace::Dereference { pointer, .. }, ..
-            } => pointer.as_ref(),
+                mutability: actual, place: ScalarPlace::Dereference { pointer, .. }, ..
+            } if actual == mutability => pointer.as_ref(),
             _ => return Err("exclusive runtime relay changed its exact formal use".into()),
         };
         if nodes.lexical_expression_declaration(formal) != Some(site.owner)
@@ -414,9 +417,14 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         let Some(signature @ ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
             return Err("exclusive runtime relay lost its exact output".into());
         };
-        if function.get_linkage() != Linkage::Internal
-            || function.get_type() != private_runtime_relay_type(context, state.target_layout, signature)?
-        {
+        let exact_abi = if shared {
+            crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs)
+                && function.get_type().get_param_types().as_slice() == [descriptor.into(), context.i64_type().into()]
+                && function.get_type().get_return_type() == Some(basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
+        } else {
+            function.get_type() == private_runtime_relay_type(context, state.target_layout, signature)?
+        };
+        if function.get_linkage() != Linkage::Internal || !exact_abi {
             return Err("exclusive runtime relay changed its sealed ABI".into());
         }
         let values = super::expression::emit_contextual_arguments(context, state, tail, &parameters[1..], project)?;
