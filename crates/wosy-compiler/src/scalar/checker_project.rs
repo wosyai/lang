@@ -9943,17 +9943,26 @@ impl PreparedScalarOrderedCheck {
             _ => return Err(ScalarOrderedCheckerOutcome::Unsupported),
         };
         let (project, calls) = owner.parts();
-        let [module] = project.modules.as_slice() else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        let root = project.modules.first().ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
+        if project.initialization_order.as_slice() != std::slice::from_ref(&root.source)
+            || (self.scope != ScalarCheckerScope::CurrentPackage && project.modules.len() != 1)
+        { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
         let mut callable_roots = Vec::new();
         if self.scope == ScalarCheckerScope::CurrentPackage {
-            let (_, deferred) = package_obligation_roots(&owner, self.scope, 1, &module.source).map_err(configured_ordered_error)?;
-            if let Some(items) = deferred.get(&0) {
-                for &item in items {
-                    let body = calls.function_body(0, item, None).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
+            let (_, mut deferred) = package_obligation_roots(&owner, self.scope, 1, &root.source).map_err(configured_ordered_error)?;
+            // Same prepared order as the legacy symbolic phase: startup
+            // owner's declarations first, then selected dormant source order.
+            for (module, source) in project.modules.iter().enumerate() {
+                if source.source.project != root.source.project || source.source.package != root.source.package {
+                    return Err(ScalarOrderedCheckerOutcome::Unsupported);
+                }
+                for item in deferred.remove(&module).into_iter().flatten() {
+                    let body = calls.function_body(module, item, None).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
                     if !closed_callable_history_body(body) { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
-                    callable_roots.push(item);
+                    callable_roots.push((module, item));
                 }
             }
+            if !deferred.is_empty() { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
         }
         Ok(PreparedStartupAuthoredCheck { owner, callable_roots })
     }
@@ -9963,7 +9972,7 @@ impl PreparedScalarOrderedCheck {
 #[doc(hidden)]
 pub struct PreparedStartupAuthoredCheck {
     owner: PreparedCheckerProject,
-    callable_roots: Vec<usize>,
+    callable_roots: Vec<PreparedCallable>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10005,12 +10014,13 @@ impl PreparedStartupAuthoredCheck {
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool, callable_roots: &[usize],
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool, callable_roots: &[PreparedCallable],
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if qualified { 2 } else { 1 };
-    if project.modules.len() != count { return Err(ProjectCheck::Unsupported); }
-    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    if named_target.is_some() && project.modules.len() != count { return Err(ProjectCheck::Unsupported); }
+    let startup = project.modules.get(..count).ok_or(ProjectCheck::Unsupported)?;
+    let (root, ordinals) = package_startup_order(project, startup)?;
     let mut search = failure_search::StartUpSearch::new(root, cap);
     search.named_target = named_target;
     search.named_cross_source = qualified;
@@ -10026,14 +10036,15 @@ fn run_startup_authored_path(
             let mut active = initialization.had_obligations;
             let mut completion = StartupAuthoredCompletion::Exhausted;
             let mut work = 0;
-            let module = &project.modules[0];
             use super::checker_flow::{search_closed_callable_histories, CallableHistoryCompletion};
-            for &item in callable_roots {
-                if initialization.reached.contains(&(0, item)) { continue; }
-                if initialization.visits.first() != Some(&InitializationVisit::Completed) {
+            for &(ordinal, item) in callable_roots {
+                if initialization.reached.contains(&(ordinal, item)) { continue; }
+                let expected = if ordinal < count { InitializationVisit::Completed } else { InitializationVisit::Unseen };
+                if initialization.visits.get(ordinal) != Some(&expected) {
                     return Err(ProjectCheck::Unsupported);
                 }
-                let body = calls.function_body(0, item, None).ok_or(ProjectCheck::Unsupported)?;
+                let module = project.modules.get(ordinal).ok_or(ProjectCheck::Unsupported)?;
+                let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
                 let ScalarItem::Function(function) = module.items.get(item).ok_or(ProjectCheck::Unsupported)? else {
                     return Err(ProjectCheck::Unsupported);
                 };

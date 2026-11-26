@@ -2435,6 +2435,56 @@ unit(u8) unseen = fn(value) {
             assert!(!root.join(".wosy").exists());
         }
 
+        let root_dormant = root.join("src/more.w");
+        let dormant_program = fs::read_to_string(root.join("leaf/src/dormant.w")).unwrap();
+        fs::write(&root_dormant, &dormant_program).unwrap();
+        let root_only = |scope, cap| configured_check::check_target_with_private_authored_limit(
+            root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+        ).ok().unwrap();
+        for layout in ["native", "wasm-wasip1"] {
+            let configured = app.replace("output = \"native\"", &format!("output = \"{layout}\""));
+            fs::write(root.join("wosy.toml"), configured).unwrap();
+            for (scope, cap, expected) in [
+                (ScalarCheckerScope::CurrentPackage, 1, &b"app"[..]),
+                (ScalarCheckerScope::CurrentPackage, 2, &b"appdormant"[..]),
+                (ScalarCheckerScope::CurrentPackage, 8, &b"appdormant"[..]),
+                (ScalarCheckerScope::MainFlowOnly, 8, &b"app"[..]),
+            ] {
+                let receipts = root_only(scope, cap);
+                let [receipt] = receipts.as_slice() else { panic!("only primary owner selected"); };
+                let report = receipt.outcome.as_ref().ok().unwrap();
+                if cap >= 2 && scope == ScalarCheckerScope::CurrentPackage {
+                    assert_eq!(report.directives[1].source.path, "src/more.w");
+                }
+                if cap == 8 {
+                    let legacy = match scope {
+                        ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, None, "dev"),
+                        ScalarCheckerScope::MainFlowOnly => configured_check::check_target(root, None, "dev", scope, Vec::new()),
+                    }.ok().unwrap();
+                    let prior = legacy.outcome.as_ref().ok().unwrap();
+                    assert_eq!(report.directives.len(), prior.directives.len());
+                    for (current, prior) in report.directives.iter().zip(&prior.directives) {
+                        assert_eq!((&current.source, current.directive, current.condition, current.code(), current.stdout(), &current.witness),
+                            (&prior.source, prior.directive, prior.condition, prior.code(), prior.stdout(), &prior.witness));
+                    }
+                }
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let plan = receipt.plan_publication().ok().unwrap();
+                assert_eq!(plan.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), 3);
+                assert_eq!(stdout, expected);
+                assert!(stderr.is_empty() && !root.join(".wosy").exists());
+            }
+            fs::write(&root_dormant, "%%start u8 bad = true; %%end").unwrap();
+            let blocked = root_only(ScalarCheckerScope::CurrentPackage, 1);
+            assert!(matches!(blocked[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_))));
+            assert!(root_only(ScalarCheckerScope::MainFlowOnly, 1)[0].outcome.is_ok());
+            assert!(!root.join(".wosy").exists());
+            fs::write(&root_dormant, &dormant_program).unwrap();
+        }
+        fs::remove_file(&root_dormant).unwrap();
+        fs::write(root.join("wosy.toml"), &app).unwrap();
+
         let sponsored_file = |packet: &str| format!(r#"%%start
 core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
     .files = [{{ .path = "same.txt"; .text = "{packet}"; }}]; }});

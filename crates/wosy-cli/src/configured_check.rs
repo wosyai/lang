@@ -245,12 +245,18 @@ fn configured_target(
     root: &Path, target: Option<&str>, profile: &str,
     scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    prepare_configured_target(root, target, profile, scope, dormant_paths).map(PreparedConfiguredCheckReceipt::run)
+}
+
+fn prepare_configured_target(
+    root: &Path, target: Option<&str>, profile: &str,
+    scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (configuration, manifest) =
         ProjectConfiguration::load_with_manifest(&root).map_err(LoadError::Manifest)?;
     prepare_target_from_manifest(&root, &configuration, &manifest, target, profile, scope, dormant_paths)
-        .map(PreparedConfiguredCheckReceipt::run)
 }
 
 fn prepare_target_from_manifest(
@@ -311,11 +317,29 @@ pub(crate) fn check_targets_with_private_authored_limit(
     limit: std::num::NonZeroUsize, primary: PrivateAuthoredPrimary,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
     let prepared = map_dependency_owners(root, target, profile, scope, std::convert::identity)?;
+    Ok(run_private_prepared_owners(prepared, limit, primary))
+}
+
+#[cfg(test)]
+pub(crate) fn check_target_with_private_authored_limit(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    let prepared = prepare_configured_target(root, target, profile, scope,
+        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?;
+    Ok(run_private_prepared_owners(vec![prepared], limit, PrivateAuthoredPrimary::ProofFree))
+}
+
+#[cfg(test)]
+fn run_private_prepared_owners(
+    prepared: Vec<PreparedConfiguredCheckReceipt>, limit: std::num::NonZeroUsize,
+    primary: PrivateAuthoredPrimary,
+) -> Vec<ConfiguredCheckReceipt> {
     // Input failures precede selection and any staged output, even if a
     // previous package would exhaust the shared authored quota.
     if let Some(index) = prepared.iter().position(|receipt| receipt.check.is_err()) {
         let receipt = prepared.into_iter().nth(index).expect("found prepared failure");
-        return Ok(vec![receipt.run()]);
+        return vec![receipt.run()];
     }
     enum Owner {
         ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
@@ -329,7 +353,7 @@ pub(crate) fn check_targets_with_private_authored_limit(
             check.and_then(PreparedScalarOrderedCheck::into_startup_authored_owner).map(Owner::ProofFree)
         } {
             Ok(owner) => owner,
-            Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
+            Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
         };
         owners.push((root, texts, owner));
     }
@@ -349,17 +373,17 @@ pub(crate) fn check_targets_with_private_authored_limit(
             Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap),
         } {
             Ok(report) => report,
-            Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
+            Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
         };
         let Some(next) = remaining.checked_sub(report.directives.len()).filter(|next|
             (*next == 0) == (completion == wosy_compiler::StartupAuthoredCompletion::LimitReached))
         else {
-            return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }]);
+            return vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }];
         };
         remaining = next;
         selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
     }
-    Ok(selected)
+    selected
 }
 
 pub(crate) fn check_direct_dependency_primary(
