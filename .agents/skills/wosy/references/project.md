@@ -72,6 +72,9 @@ Each label names a concrete function with `i32`, `u32`, `i64`, `u64`, `f32`,
 or `f64` parameters and one such result or `unit`. The builder must still
 export the label, for example with `wasm-ld --export=demo_score`.
 
+Declare browser entry points in `.exports` rather than relying on the LLVM
+names of unconfigured functions.
+
 ## `wosy.lock`
 
 Commit the lock; ignore managed `deps/` checkouts. Version 1 records the origin, package path, exact commit, and original source hash of each reachable Git package. Local packages are not locked. Build and run use the installed graph without fetching.

@@ -10,7 +10,7 @@ description: Write, build, or debug Wosy programs and packages.
 3. Run `wosy build <target> --profile <profile>`, then `wosy run <target> --profile <profile>`. Finish when the build succeeds and the program produces the expected result.
 
 - New Wosy project? Read [getting started](references/getting-started.md).
-- Editing `.w`? Read [syntax](references/syntax.md) and [types](references/types.md). For `core.*` operations, read [core](references/core.md).
+- Editing `.w`? Read [syntax](references/syntax.md) and [types](references/types.md). For `core.*` operations, read [core](references/core.md). For checked reads, writes, or borrows, see [checked access](references/types.md#checked-access).
 - Configuring a package, namespace, or Wasm output? Read [project layout](references/project.md).
 - Initializing or changing dependencies? Read the [CLI reference](references/cli.md).
 - Using `std`? Read the [standard library reference](references/stdlib.md).

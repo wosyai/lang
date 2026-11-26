@@ -61,6 +61,33 @@ if (text != null) {
 };
 ```
 
+### Checked access
+
+Borrow an element or field with `&` for reading or `&!` for writing. Pass an
+array by checked reference when the callee needs its elements:
+
+```wosy
+struct copy Cell { u8 tag; u64 value; }
+u64(*(Cell[]),u64) _read_field = fn(view,index) {
+    *u64 child = &(*view)[index].value;
+    *child
+};
+u64(u64,u64) observe = fn(count,index) {
+    Cell[count] rows;
+    rows[index].tag = 7;
+    rows[index].value = 202;
+    _read_field(&rows,index)
+};
+```
+
+`observe(2,1)` returns `202`. Use `*!(Cell[])` with `&!rows` for a mutable
+view, and use `&!(*view)[index].value` to write through a mutable field reference.
+
+On supported checked accesses, a null dereference or an out-of-bounds index
+terminates through `core.system_panic()`. The compiler checks the full `u64`
+index against the array's actual length before computing its address. No
+explicit helper import is needed. This does not apply to raw pointer operations.
+
 ### Foreign buffers
 
 `extern` signatures reject array values and checked references. Use `*?u8` for
