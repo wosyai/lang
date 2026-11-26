@@ -6,10 +6,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use wosy_cli::source_preparation::{
-    prepare, prepare_closed_comptime_input_facts, prepare_comptime_watches, ClosedComptimeInputFacts,
-    ClosedComptimeInputSelection, PreparedComptimeWatches, PreparedSources,
+    prepare, prepare_closed_comptime_input_facts, prepare_comptime_watches, prepare_forwarded_pair_comptime_input_facts,
+    ClosedComptimeInputFacts, ClosedComptimeInputSelection, ForwardedPairComptimeInputFacts,
+    ForwardedPairComptimeInputSelection, PreparedComptimeWatches, PreparedSources,
 };
-use wosy_compiler::{ComptimeParameterOrigin, ComptimeParameterValue, ScalarTargetLayout, ScalarType};
+use wosy_compiler::{ComptimeParameterOrigin, ComptimeParameterValue, DirectComptimeArgument, ScalarTargetLayout, ScalarType};
 use wosy_project::{
     packages::{ComptimeWatchLimits, WatchRoot},
     ProjectConfiguration,
@@ -334,6 +335,163 @@ fn closed_facts_refuse_missing_declarations_unresolved_capabilities_and_unsuppor
     scope.max_ir_bytes = 0;
     assert!(prepare_closed_comptime_input_facts(&app, scope).err().unwrap().contains("exceeds byte budget"));
     assert!(prepare(&app, Some("app"), None).is_ok());
+    assert!(!app.join(".wosy").exists());
+}
+
+const FORWARDED_APP: &str = r#"%%start
+# WHY: argumentos com café ☕
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32(u32, u32) relay = fn(upstream_left, upstream_right) { solve(upstream_left, upstream_right) };
+u32 first = relay(7, 9);
+u32 reversed = relay(9, 7);
+u32 repeated = relay(7, 9);
+u32 changed = relay(7, 13);
+%%end
+"#;
+
+fn forwarded_manifest() -> String {
+    with_evaluator_tools().replace("[dependencies.assets]\npath = \"../assets\"\n\n", "")
+}
+
+fn forwarded_scope(layout: ScalarTargetLayout) -> ForwardedPairComptimeInputSelection<'static> {
+    ForwardedPairComptimeInputSelection {
+        target: "app", profile: "dev", id: "prepare", evaluator_layout: layout,
+        watch_limits: ComptimeWatchLimits::default(), max_ir_bytes: 1 << 16,
+    }
+}
+
+fn observe_forwarded(root: &Path, layout: ScalarTargetLayout) -> (PreparedSources, ForwardedPairComptimeInputFacts) {
+    prepare_forwarded_pair_comptime_input_facts(root, forwarded_scope(layout)).unwrap()
+}
+
+fn assert_forwarded_tuples(facts: &ForwardedPairComptimeInputFacts, permutation: [usize; 2]) {
+    assert_eq!(facts.forwarding().startup_argument_positions(), permutation);
+    let tuples = [[7, 9], [9, 7], [7, 9], [7, 13]];
+    assert_eq!(facts.calls().len(), tuples.len());
+    for ((call, values), slot) in facts.calls().iter().zip(tuples).zip([0, 1, 0, 2]) {
+        let expected = permutation.map(|position| DirectComptimeArgument::U32(values[position]));
+        assert_eq!(call.facts().inputs().each_ref().map(|input| input.value()), expected);
+        assert_eq!(call.facts().result(), &ScalarType::U32);
+        assert_eq!(call.facts().site(), &facts.watches().site);
+        assert_eq!(call.evaluator_index(), slot);
+    }
+    let [first, second, changed] = facts.evaluator_irs() else { panic!("three distinct evaluator slots"); };
+    assert_eq!(first, second);
+    assert_ne!(first, changed);
+}
+
+#[test]
+fn forwarded_facts_authenticate_watched_bytes_and_literal_tuple_sites_separately() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let manifest = forwarded_manifest();
+    let swapped = FORWARDED_APP.replace("solve(upstream_left, upstream_right)", "solve(upstream_right, upstream_left)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        fixture.put("app/wosy.toml", &manifest);
+        fixture.put("app/src/main.w", FORWARDED_APP);
+        fixture.put("app/local/value.txt", "local");
+        let (source, baseline) = observe_forwarded(&app, layout);
+        assert_eq!((source.parsed, source.reused), (1, 0));
+        assert_eq!(source.root, baseline.source_root());
+        let ordinary = prepare(&app, Some("app"), None).unwrap();
+        assert_eq!(source.root, ordinary.root);
+        assert_eq!(source.delta.nodes, ordinary.delta.nodes);
+        let (_, watch_only) = prepare_comptime_watches(
+            &app, "app", "dev", "app", "prepare", ComptimeWatchLimits::default(),
+        ).unwrap();
+        assert_eq!(baseline.watches(), &watch_only);
+        assert_eq!(rows(baseline.watches()), [content(WatchRoot::OwningPackage, "local/value.txt", "local")]);
+        let rooted = Node::decode(&source.delta.nodes[&source.root]).unwrap();
+        let (file, metadata) = rooted.children.into_iter().find_map(|id| {
+            let node = Node::decode(&source.delta.nodes[&id]).unwrap();
+            (node.kind == Kind::File)
+                .then(|| (serde_json::from_slice::<FileMetadata>(&node.data).unwrap(), node))
+                .map(|(metadata, node)| (node, metadata))
+        }).expect("the actual singleton source record");
+        assert_eq!(file.children[0], baseline.authored_cst());
+        assert_eq!(metadata.revision.hex(), baseline.watches().site.source.revision);
+        assert_eq!(baseline.evaluator_layout(), layout);
+        assert_forwarded_tuples(&baseline, [0, 1]);
+
+        let preview = wosy_cli::comptime_fragment::plan_forwarded_pair_comptime_startup(&app, "app", "dev", "prepare", layout).unwrap();
+        assert_eq!(preview.plan().calls().len(), baseline.calls().len());
+        assert_eq!(preview.plan().evaluators().len(), baseline.evaluator_irs().len());
+        for (call, actual) in preview.plan().calls().iter().zip(baseline.calls()) {
+            assert_eq!(call.facts(), actual.facts());
+            assert_eq!(call.evaluator_index(), actual.evaluator_index());
+        }
+        for (expected, actual) in preview.plan().evaluators().iter().zip(baseline.evaluator_irs()) {
+            let text = expected.llvm().to_text();
+            assert_eq!(actual.bytes, text.len());
+            assert_eq!(actual.blake3, blake3::hash(text.as_bytes()));
+        }
+        assert_eq!(baseline.declared_tools().builder().1.toolchain_identity, "declared toolchain only");
+        assert_eq!(baseline.declared_tools().runner().1.args, ["--typed"]);
+
+        fixture.put("app/ignored/not-selected.tsv", "unrelated");
+        fixture.put("app/local/value.txt", "LOCAL"); // same-length watched edit
+        let (_, watched) = observe_forwarded(&app, layout);
+        assert_eq!(watched.source_root(), baseline.source_root());
+        assert_eq!(watched.authored_cst(), baseline.authored_cst());
+        assert_eq!(watched.configuration_identity(), baseline.configuration_identity());
+        assert_eq!(watched.declared_tools(), baseline.declared_tools());
+        assert_eq!(watched.evaluator_irs(), baseline.evaluator_irs());
+        assert_eq!(watched.watches().site, baseline.watches().site);
+        assert_eq!(rows(watched.watches()), [content(WatchRoot::OwningPackage, "local/value.txt", "LOCAL")]);
+        assert_forwarded_tuples(&watched, [0, 1]);
+
+        fixture.put("app/src/main.w", &swapped);
+        let (_, now_swapped) = observe_forwarded(&app, layout);
+        assert_ne!(now_swapped.source_root(), baseline.source_root());
+        assert_ne!(now_swapped.authored_cst(), baseline.authored_cst());
+        assert_eq!(now_swapped.evaluator_irs(), watched.evaluator_irs());
+        assert_eq!(now_swapped.watches().files, watched.watches().files);
+        assert_forwarded_tuples(&now_swapped, [1, 0]);
+
+        fixture.put("app/wosy.toml", manifest.replace("--typed", "--selected-literal-changed"));
+        let (_, changed_tools) = observe_forwarded(&app, layout);
+        assert_ne!(changed_tools.source_root(), now_swapped.source_root());
+        assert_ne!(changed_tools.configuration_identity(), now_swapped.configuration_identity());
+        assert_ne!(changed_tools.declared_tools(), now_swapped.declared_tools());
+        assert_eq!(changed_tools.authored_cst(), now_swapped.authored_cst());
+        assert_eq!(changed_tools.evaluator_irs(), now_swapped.evaluator_irs());
+        assert_eq!(changed_tools.watches(), now_swapped.watches());
+        assert!(!app.join(".wosy").exists());
+    }
+}
+
+#[test]
+fn forwarded_input_observation_refuses_out_of_scope_inputs_and_cumulative_budgets() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let layout = ScalarTargetLayout::NATIVE64;
+    let manifest = forwarded_manifest();
+    fixture.put("app/src/main.w", FORWARDED_APP);
+    let refuse = |scope| prepare_forwarded_pair_comptime_input_facts(&app, scope).err().unwrap();
+    fixture.put("app/wosy.toml", manifest.replace("build_permissions = []", "build_permissions = [\"network\"]"));
+    assert!(refuse(forwarded_scope(layout)).contains("does not resolve build permissions or mounts"));
+    fixture.put("app/wosy.toml", &manifest);
+    let mut scope = forwarded_scope(layout);
+    scope.watch_limits.content_bytes = 4; // real five-byte selected watch
+    assert!(refuse(scope).contains("file byte limit"));
+    let (_, full) = observe_forwarded(&app, layout);
+    let total: usize = full.evaluator_irs().iter().map(|item| item.bytes).sum();
+    let mut scope = forwarded_scope(layout);
+    scope.max_ir_bytes = total - 1;
+    assert!(full.evaluator_irs().iter().all(|item| item.bytes <= scope.max_ir_bytes));
+    assert!(refuse(scope).contains("evaluator IR exceeds byte budget"));
+    let mut scope = forwarded_scope(layout);
+    scope.max_ir_bytes = total;
+    let (_, exact) = prepare_forwarded_pair_comptime_input_facts(&app, scope).unwrap();
+    assert_eq!(exact.evaluator_irs(), full.evaluator_irs());
+
+    fixture.put("app/src/main.w", " ".repeat(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES + 1));
+    assert!(refuse(forwarded_scope(layout)).contains("authored byte budget"));
+    // A real declared local namespace may not cause its source to be opened
+    // when this exact consumer-singleton route is requested.
+    fixture.put("app/wosy.toml", with_evaluator_tools());
+    fixture.put("app/src/main.w", FORWARDED_APP.replace("u32 first =", "more = namespace assets \"must-not-open.w\";\nu32 first ="));
+    assert_eq!(refuse(forwarded_scope(layout)), "forwarded comptime input requires the selected singleton entry");
     assert!(!app.join(".wosy").exists());
 }
 
