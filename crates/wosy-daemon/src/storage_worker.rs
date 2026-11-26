@@ -1,5 +1,5 @@
 //! Opt-in blocking I/O admission for the rooted source inventory.
-use super::{Result, SourceRetentionInventory, SourceStore};
+use super::{retention_plan::SourceRead, Result, SourceRetentionInventory, SourceStore};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -100,16 +100,114 @@ impl SourceStorageWorker {
     }
 
     pub(super) fn spawn_reserved_query<T, F>(
-        &self, slot: OwnedSemaphorePermit, query: impl FnOnce(Arc<SourceStore>, Handle) -> F + Send + 'static,
+        &self, slot: OwnedSemaphorePermit, query: impl FnOnce(QueryWorker) -> F + Send + 'static,
     ) -> JoinHandle<T>
     where T: Send + 'static, F: Future<Output = T> + Send + 'static {
+        let worker = QueryWorker {
+            store: Arc::clone(&self.store), runtime: self.runtime.clone(), slot: Arc::new(slot),
+        };
+        self.runtime.spawn(query(worker))
+    }
+}
+
+/// One admitted query. Blocking phases never await a commit, and keep the
+/// same slot and admitted source alive even if the awaiting task is dropped.
+pub(super) struct QueryWorker {
+    pub store: Arc<SourceStore>,
+    runtime: Handle,
+    slot: Arc<OwnedSemaphorePermit>,
+}
+
+impl QueryWorker {
+    pub async fn phase<T: Send + 'static>(
+        &self, source: Option<&SourceRead>, job: impl FnOnce(&SourceStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let store = Arc::clone(&self.store);
-        let runtime = self.runtime.clone();
-        self.runtime.spawn(async move {
-            let result = query(store, runtime).await;
-            drop(slot);
-            result
-        })
+        let ownership = (Arc::clone(&self.slot), source.cloned());
+        self.runtime.spawn_blocking(move || {
+            let _ownership = ownership;
+            job(&store)
+        }).await?
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct QueryPhases<'a> {
+    store: &'a SourceStore,
+    worker: Option<&'a QueryWorker>,
+    source: Option<&'a SourceRead>,
+}
+
+impl<'a> QueryPhases<'a> {
+    pub fn new(store: &'a SourceStore, worker: Option<&'a QueryWorker>, source: Option<&'a SourceRead>) -> Self {
+        Self { store, worker, source }
     }
 
+    pub fn direct(store: &'a SourceStore) -> Self {
+        Self::new(store, None, None)
+    }
+
+    pub async fn run<T: Send + 'static>(
+        self, job: impl FnOnce(&SourceStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        match self.worker {
+            Some(worker) => worker.phase(self.source, job).await,
+            None => job(self.store),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    #[test]
+    #[ignore = "requires a disposable store with two admitted source fixture roots"]
+    fn detached_phase_retains_original_slot_and_root() {
+        let path = PathBuf::from(std::env::var_os("WOSY_TEST_IMAGE_STORE").unwrap());
+        let source = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_ROOT").unwrap()).unwrap();
+        let scope = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_OTHER_ROOT").unwrap()).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().max_blocking_threads(1).build().unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(SourceStore::open(&path, 8 << 20).unwrap());
+            let bound = |value| NonZeroUsize::new(value).unwrap();
+            let worker = SourceStorageWorker::new(
+                Arc::clone(&store), Handle::current(), bound(1), bound(1), bound(20_000),
+            ).unwrap();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = mpsc::channel();
+            let job = worker.spawn_reserved_query(worker.try_slot().unwrap(), move |worker| async move {
+                let read = worker.phase(None, move |store| {
+                    let (tx, read) = store.begin_source_read(source)?.ok_or("expected admitted source")?;
+                    drop(tx);
+                    Ok(read)
+                }).await?;
+                worker.phase(Some(&read), move |store| {
+                    entered.send(()).map_err(|_| "fixture observer missing")?;
+                    blocked.recv()?;
+                    assert!(store.snapshot(source)?.is_some());
+                    Ok(())
+                }).await
+            });
+            waiting.await.unwrap();
+            job.abort();
+            assert!(job.await.unwrap_err().is_cancelled());
+            assert!(matches!(worker.try_inspect(scope, &[source], &[]), Err(StorageAdmissionError::Busy)));
+            let held = store.plan_source_retention(scope, &[source], &[], 20_000).unwrap();
+            assert_eq!((held.active_read_roots, held.candidate_roots), (1, 0));
+            release.send(()).unwrap();
+            let done = loop {
+                match worker.try_inspect(scope, &[source], &[]) {
+                    Ok(census) => break census.finish().await.unwrap().inventory.plan,
+                    Err(StorageAdmissionError::Busy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected worker refusal: {error}"),
+                }
+            };
+            assert_eq!((done.active_read_roots, done.candidate_roots), (0, 1));
+            drop(worker);
+            Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+        });
+    }
 }

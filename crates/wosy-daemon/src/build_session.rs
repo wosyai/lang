@@ -36,16 +36,15 @@ impl BuildDiagnosticSession<'_> {
         if version != BUILD_DIAGNOSTIC_VERSION { return Err("unsupported Build diagnostic protocol version".into()); }
         let slot = self.worker.try_slot()?;
         let grant = self.lease.grant();
-        self.worker.spawn_reserved_query(slot, move |store, runtime| async move {
-            let reader = std::sync::Arc::clone(&store);
-            let snapshot = runtime.spawn_blocking(move || {
-                reader.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
-            }).await??;
+        self.worker.spawn_reserved_query(slot, move |worker| async move {
+            let snapshot = worker.phase(None, move |store| {
+                store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
+            }).await?;
             let Some(snapshot) = snapshot else { return Err("Build diagnostic session lease expired".into()); };
             // SurrealKV commits may schedule their own blocking work. Keep
             // all awaited queries on the async task, never on a pool thread.
-            let prepared = store.prepare_configured(snapshot, &profile, Some(&runtime)).await?;
-            let analysis = prepared.build_analysis_with(Some(&runtime)).await?;
+            let prepared = worker.store.prepare_configured(snapshot, &profile, Some(&worker)).await?;
+            let analysis = prepared.build_analysis_with(Some(&worker)).await?;
             Ok(BuildDiagnosticResponse::BuildDiagnostics {
                 version, source_root: analysis.source_root, profile,
                 preparation: analysis.preparation, receipt: analysis.key.digest(),

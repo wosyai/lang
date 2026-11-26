@@ -1,6 +1,7 @@
 //! Real compiler preparation and separately requested Build analysis.
 use super::{
     base_declarations::Flights, build_receipt::{BuildInputs, Lookup}, read_comments,
+    storage_worker::{QueryPhases, QueryWorker},
     BuildAnalysisOrigin, BuildAnalysisPhase, ConfiguredSourceView, ProjectDeclarationModule,
     ProjectDeclarationsView, Result, SourceStore,
 };
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
-use tokio::{runtime::Handle, sync::OnceCell};
+use tokio::sync::OnceCell;
 use wosy_compiler::{
     analyze_scalar_build, prepare_scalar_project, Diagnostic, PreparedScalarProject,
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
@@ -41,15 +42,6 @@ impl PreparationCache {
 enum PreparationOutcome {
     Ready(PreparedScalarProject),
     Rejected(ScalarProjectPreparationRejection),
-}
-
-async fn compiler_cpu<T: Send + 'static>(
-    runtime: Option<&Handle>, derive: impl FnOnce() -> T + Send + 'static,
-) -> Result<T> {
-    match runtime {
-        Some(runtime) => Ok(runtime.spawn_blocking(derive).await?),
-        None => Ok(derive()),
-    }
 }
 
 struct CanonicalPreparation {
@@ -85,7 +77,7 @@ impl BuildAnalysisKey {
 
 struct CanonicalBuildAnalysis {
     phase: BuildAnalysisPhase,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Arc<[Diagnostic]>,
 }
 
 /// Ordinary Build analysis diagnostics, without an emitter or artifact result.
@@ -144,7 +136,7 @@ impl RootedPreparedProject<'_> {
         let PreparationOutcome::Rejected(rejection) = &self.canonical.outcome else {
             return Ok(Vec::new());
         };
-        self.project_diagnostics(rejection.diagnostics.clone())
+        project_diagnostics(self.store, &self.canonical, self.declarations.modules(), rejection.diagnostics.clone())
     }
 
     /// Opt in explicitly after ordinary typed preparation. Only diagnostics
@@ -154,7 +146,8 @@ impl RootedPreparedProject<'_> {
         self.build_analysis_with(None).await
     }
 
-    pub(super) async fn build_analysis_with(&self, runtime: Option<&Handle>) -> Result<RootedBuildAnalysis> {
+    pub(super) async fn build_analysis_with(&self, worker: Option<&QueryWorker>) -> Result<RootedBuildAnalysis> {
+        let phases = QueryPhases::new(self.store, worker, Some(&self.declarations.read));
         let start = Instant::now();
         let mut origin = BuildAnalysisOrigin::Live;
         let mut receipt_written = false;
@@ -163,58 +156,69 @@ impl RootedPreparedProject<'_> {
                 PreparationOutcome::Ready(_) => BuildAnalysisPhase::Analyzed,
                 PreparationOutcome::Rejected(_) => BuildAnalysisPhase::PreparationRejected,
             };
-            let lookup = &self.canonical.build_lookup;
+            let lookup = self.canonical.build_lookup;
             // Only this optional derivation record can fail open to ordinary
             // analysis. Source admission, preparation and projection still
             // follow their original error paths.
-            if let Ok(Some(diagnostics)) = self.store.read_build_receipt(lookup, phase) {
+            if let Ok(Some(diagnostics)) = phases.run(move |store| store.read_build_receipt(&lookup, phase)).await {
                 if diagnostics.iter().flat_map(|diagnostic| &diagnostic.labels)
                     .all(|label| self.canonical.owners.contains_key(&label.span.source))
                 {
                     origin = BuildAnalysisOrigin::Stored;
-                    return Ok(CanonicalBuildAnalysis { phase, diagnostics });
+                    return Ok(CanonicalBuildAnalysis { phase, diagnostics: diagnostics.into() });
                 }
             }
             origin = BuildAnalysisOrigin::Derived;
             let preparation = Arc::clone(&self.canonical);
-            let diagnostics = compiler_cpu(runtime, move || match &preparation.outcome {
+            let diagnostics: Arc<[_]> = phases.run(move |_| Ok(match &preparation.outcome {
                 PreparationOutcome::Ready(prepared) => analyze_scalar_build(prepared).diagnostics().to_vec(),
                 PreparationOutcome::Rejected(rejection) => rejection.ordered_build_diagnostics(),
-            }).await?;
-            receipt_written = self.store.persist_build_receipt(lookup, phase, &diagnostics).await.unwrap_or(false);
+            }.into())).await?;
+            receipt_written = self.store.persist_build_receipt(phases, lookup, phase, Arc::clone(&diagnostics))
+                .await.unwrap_or(false);
             Ok::<_, super::Error>(CanonicalBuildAnalysis { phase, diagnostics })
         }).await?;
         let analysis_elapsed = start.elapsed();
         let start = Instant::now();
-        let diagnostics = self.project_diagnostics(canonical.diagnostics.clone())?;
+        let diagnostics = if canonical.diagnostics.is_empty() {
+            Vec::new()
+        } else {
+            let diagnostics = Arc::clone(&canonical.diagnostics);
+            let preparation = Arc::clone(&self.canonical);
+            let modules = Arc::clone(&self.declarations.modules);
+            phases.run(move |store| project_diagnostics(store, &preparation, &modules, diagnostics.to_vec())).await?
+        };
         Ok(RootedBuildAnalysis {
             source_root: self.declarations.snapshot, preparation: self.identity(),
             key: BuildAnalysisKey(self.canonical.build_lookup.digest), phase: canonical.phase,
             origin, receipt_written, diagnostics, analysis_elapsed, authored_projection_elapsed: start.elapsed(),
         })
     }
+}
 
-    fn project_diagnostics(&self, mut diagnostics: Vec<Diagnostic>) -> Result<Vec<Diagnostic>> {
-        if diagnostics.is_empty() { return Ok(diagnostics); }
-        let mut maps = HashMap::new();
-        let tx = self.store.tree.begin_with_mode(Mode::ReadOnly)?;
-        for diagnostic in &mut diagnostics {
-            for label in &mut diagnostic.labels {
-                let ordinal = *self.canonical.owners.get(&label.span.source)
-                    .ok_or("compiler diagnostic outside selected project")?;
-                let module = &self.declarations.modules()[ordinal.0];
-                let spans = match maps.entry(ordinal) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
-                        AuthoredSpanMap::from_comments(&read_comments(&tx, module.file.annotation)?)
-                    ),
-                };
-                label.span.source = module.source.clone();
-                label.span.range = spans.project(label.span.range);
-            }
+fn project_diagnostics(
+    store: &SourceStore, preparation: &CanonicalPreparation, modules: &[ProjectDeclarationModule],
+    mut diagnostics: Vec<Diagnostic>,
+) -> Result<Vec<Diagnostic>> {
+    if diagnostics.is_empty() { return Ok(diagnostics); }
+    let mut maps = HashMap::new();
+    let tx = store.tree.begin_with_mode(Mode::ReadOnly)?;
+    for diagnostic in &mut diagnostics {
+        for label in &mut diagnostic.labels {
+            let ordinal = *preparation.owners.get(&label.span.source)
+                .ok_or("compiler diagnostic outside selected project")?;
+            let module = &modules[ordinal.0];
+            let spans = match maps.entry(ordinal) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    AuthoredSpanMap::from_comments(&read_comments(&tx, module.file.annotation)?)
+                ),
+            };
+            label.span.source = module.source.clone();
+            label.span.range = spans.project(label.span.range);
         }
-        Ok(diagnostics)
     }
+    Ok(diagnostics)
 }
 
 fn executable_owner(module: &ProjectDeclarationModule) -> SourceIdentity {
@@ -242,7 +246,7 @@ impl SourceStore {
     }
 
     pub(super) async fn prepare_configured(
-        &self, snapshot: ConfiguredSourceView, profile: &str, runtime: Option<&Handle>,
+        &self, snapshot: ConfiguredSourceView, profile: &str, worker: Option<&QueryWorker>,
     ) -> Result<RootedPreparedProject<'_>> {
         let start = Instant::now();
         let layout = snapshot.config.profiles.get(profile)
@@ -257,7 +261,8 @@ impl SourceStore {
             executable: snapshot.source.executable,
             dependencies: snapshot.source.dependencies,
         };
-        let declarations = self.project_declarations_for_snapshot(snapshot).await?;
+        let declarations = self.project_declarations_for_snapshot(snapshot, worker).await?;
+        let phases = QueryPhases::new(self, worker, Some(&declarations.read));
         let mut report = ProjectPreparationReport {
             projected_declarations: start.elapsed(),
             ..Default::default()
@@ -271,40 +276,40 @@ impl SourceStore {
             canonical
         } else {
             let start = Instant::now();
-            let modules = declarations.modules();
-            let owners: Vec<_> = modules.iter().map(executable_owner).collect();
-            let mut inputs = Vec::with_capacity(owners.len());
-            for (module, owner) in modules.iter().zip(&owners) {
-                let body = self.projected_body(module.file.executable, module.body)
-                    .await?.with_executable_owner(owner.clone());
-                // Source publication already paired these exact namespace CST
-                // occurrences to targets in declaration order. An extraction
-                // rejection has diagnostics that stop ordinary preparation
-                // before it can consume namespace/type inputs.
-                let bindings = body.namespaces().zip(&module.imports).map(|(site, link)| {
-                    ScalarNamespaceBinding {
-                        binding: site.binding.clone(),
-                        target: owners[link.target.0].clone(),
-                        span: site.span,
-                    }
-                }).collect();
-                inputs.push((body, bindings));
-            }
+            let files: Vec<_> = declarations.modules().iter()
+                .map(|module| (module.file.executable, module.body)).collect();
+            let bodies = self.projected_bodies(phases, declarations.image, &files).await?;
             report.materialized_bodies = start.elapsed();
             let start = Instant::now();
-            let order = owners.clone();
-            let outcome = match compiler_cpu(runtime, move ||
-                prepare_scalar_project(inputs, order, ScalarPreparationInputs { target_layout })
-            ).await? {
-                Ok(prepared) => PreparationOutcome::Ready(prepared),
-                Err(rejected) => PreparationOutcome::Rejected(rejected),
-            };
+            let modules = Arc::clone(&declarations.modules);
+            let (outcome, owners) = phases.run(move |_| {
+                let owners: Vec<_> = modules.iter().map(executable_owner).collect();
+                let mut input = Vec::with_capacity(owners.len());
+                for ((module, owner), body) in modules.iter().zip(&owners).zip(bodies) {
+                    let body = body.with_executable_owner(owner.clone());
+                    // Publication already paired exact typed namespace
+                    // occurrences in declaration order.
+                    let bindings = body.namespaces().zip(&module.imports).map(|(site, link)| {
+                        ScalarNamespaceBinding {
+                            binding: site.binding.clone(),
+                            target: owners[link.target.0].clone(),
+                            span: site.span,
+                        }
+                    }).collect();
+                    input.push((body, bindings));
+                }
+                let outcome = match prepare_scalar_project(input, owners.clone(), ScalarPreparationInputs { target_layout }) {
+                    Ok(prepared) => PreparationOutcome::Ready(prepared),
+                    Err(rejected) => PreparationOutcome::Rejected(rejected),
+                };
+                Ok((outcome, owners))
+            }).await?;
             report.compiler_preparation = start.elapsed();
             let owners = owners.into_iter().enumerate()
                 .map(|(ordinal, identity)| (identity, SourceNodeId(ordinal))).collect();
             let canonical = Arc::new(CanonicalPreparation {
                 identity, target_layout, owners, outcome,
-                build_lookup: Lookup::new(self.derivation_image(), build_inputs, declarations.entry_projection, identity),
+                build_lookup: Lookup::new(declarations.image, build_inputs, declarations.entry_projection, identity),
                 build_analysis: OnceCell::new(),
             });
             self.prepared_projects.remember(identity, &canonical);

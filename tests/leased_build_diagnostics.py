@@ -1,4 +1,5 @@
 """A selected SQLite root uses the actual leased diagnostic dispatcher, not an emitter."""
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -42,11 +43,12 @@ def response(result):
 
 
 def script(note, result):
+    bindings = "".join(f"u32 fact{i} = {i};\n" for i in range(180))
     return f"""%%start
 # WHY: {note}
 struct Item {{ u8 value; }}
 Item(Item) take = fn(input) {{ next = input; {result} }};
-%%end
+{bindings}%%end
 """
 
 
@@ -57,7 +59,10 @@ with tempfile.TemporaryDirectory() as temp:
     (project / "wosy.toml").write_text(manifest)
     (project / "stdlib/wosy.toml").write_text('[package]\nname="std"\nsource_root="src"\n')
     entry, provider = project / "src/main.w", project / "stdlib/src/item.w"
-    entry.write_text('%%start\nlocal = namespace std "item.w";\n%%end\n')
+    peers = "".join(f'peer{i} = namespace std "peer{i}.w";\n' for i in range(17))
+    entry.write_text(f'%%start\nlocal = namespace std "item.w";\n{peers}%%end\n')
+    for i in range(17):
+        (provider.parent / f"peer{i}.w").write_text(f"%%start\nu32 value = {100 + i};\n%%end\n")
     old_text = script("origem ☕", "next; next")
     provider.write_text(old_text)
     first = call(project, store, "stage")
@@ -76,6 +81,15 @@ with tempfile.TemporaryDirectory() as temp:
     assert orig["origin"] == native["origin"] == "Derived"
     assert orig["receipt"] != native["receipt"]
     assert orig["diagnostics"] == native["diagnostics"]
+    only_blob, = (store / "cas").iterdir()
+    assert only_blob.stat().st_size > 64 * 1024
+    digest = hashlib.sha256(only_blob.read_bytes()).digest()
+    # Lost recomputable fixture CAS: the next real leased Build restores the
+    # same artifact bytes and keeps the stored canonical diagnostics.
+    only_blob.unlink()
+    repaired, _ = run()
+    assert repaired["origin"] == "Stored" and repaired["diagnostics"] == orig["diagnostics"]
+    assert hashlib.sha256(only_blob.read_bytes()).digest() == digest
     old_labels = orig["diagnostics"][0]["labels"]
     assert [label["kind"] for label in old_labels] == ["Primary", "Secondary"]
     for label in old_labels:
@@ -106,5 +120,6 @@ with tempfile.TemporaryDirectory() as temp:
     assert not (project / ".wosy/artifacts").exists()
     print("acknowledged SQLite root → leased opt-in worker → normal compiler diagnostic response", {
         "warm_dispatch_ms": round(warm_ms, 3), "resolved_profiles": ["dev", "native"],
-        "historic_UTF8": True, "newer_pending_not_selected": True,
+        "historic_UTF8": True, "newer_pending_not_selected": True, "cas_rebuilt": True,
+        "rooted_files": 19, "cas_bytes": only_blob.stat().st_size,
     })

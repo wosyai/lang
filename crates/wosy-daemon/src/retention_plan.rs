@@ -64,12 +64,21 @@ impl Drop for SourceLease {
     }
 }
 
-pub(super) struct SourceRead {
+#[derive(Clone)]
+pub(super) struct SourceRead { _guard: Arc<SourceReadGuard> }
+
+struct SourceReadGuard {
     reads: Arc<Mutex<ReadRegistry>>,
     root: NodeId,
 }
 
-impl Drop for SourceRead {
+impl SourceRead {
+    fn new(reads: &Arc<Mutex<ReadRegistry>>, root: NodeId) -> Self {
+        Self { _guard: Arc::new(SourceReadGuard { reads: Arc::clone(reads), root }) }
+    }
+}
+
+impl Drop for SourceReadGuard {
     fn drop(&mut self) {
         let mut reads = self.reads.lock().expect("source reader registry");
         let count = reads.active.get_mut(&self.root).expect("admitted source reader");
@@ -320,7 +329,7 @@ impl SourceStore {
             let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
             if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
             *reads.active.entry(root).or_default() += 1;
-            (tx, SourceRead { reads: Arc::clone(&self.source_reads.0), root })
+            (tx, SourceRead::new(&self.source_reads.0, root))
         };
         self.snapshot_with_read(grant.root, tx, read)
     }
@@ -339,7 +348,7 @@ impl SourceStore {
         }
         let admitted = roots.map(|root| {
             *reads.active.entry(root).or_default() += 1;
-            SourceRead { reads: Arc::clone(&self.source_reads.0), root }
+            SourceRead::new(&self.source_reads.0, root)
         });
         Ok(Some((tx, admitted)))
     }

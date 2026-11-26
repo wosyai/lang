@@ -1,9 +1,11 @@
 //! Ordered base declarations over the admitted executable import graph.
 use super::{
-    child_edge, file_source, key, read_node, write_edge, write_node, BaseDeclarationsView,
+    child_edge, file_source, key, read_node, retention_plan::SourceRead,
+    storage_worker::{QueryPhases, QueryWorker}, write_edge, write_node, BaseDeclarationsView,
     ConfiguredSourceView, QueryDisposition, Result, SourceStore, SourceView, INTERN,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use surrealkv::{Durability, Mode, Transaction};
 use wosy_compiler::BASE_DECLARATION_ABI;
 use wosy_project::SourceNodeId;
@@ -49,8 +51,9 @@ pub struct ProjectDeclarationsView<'a> {
     pub snapshot: NodeId,
     pub entry_projection: NodeId,
     pub report: ProjectDeclarationReport,
-    modules: Vec<ProjectDeclarationModule>,
-    _read: super::retention_plan::SourceRead,
+    pub(super) modules: Arc<[ProjectDeclarationModule]>,
+    pub(super) image: Option<NodeId>,
+    pub(super) read: SourceRead,
 }
 
 impl ProjectDeclarationsView<'_> {
@@ -82,7 +85,7 @@ struct RootedOrder {
 }
 
 impl RootedOrder {
-    fn from_snapshot(view: SourceView, entry: &FileKey) -> (Self, super::retention_plan::SourceRead) {
+    fn from_snapshot(view: SourceView, entry: &FileKey) -> (Self, SourceRead) {
         let entry = view.modules[entry];
         let SourceView { tx, modules, mut files, mut module_edges, read, .. } = view;
         drop(tx);
@@ -152,55 +155,82 @@ fn compose_projection(
     (Projection { id: Node::id(&bytes), body }, node, bytes)
 }
 
+struct ProjectionPlan {
+    order: RootedOrder,
+    cached: Vec<Option<Projection>>,
+    bodies: HashMap<usize, NodeId>,
+}
+
+impl ProjectionPlan {
+    fn in_memory(&self) -> Vec<Option<Projection>> {
+        let mut projections = self.cached.clone();
+        for &index in &self.order.postorder {
+            projections[index] = Some(compose_projection(
+                &self.order.modules[index], self.bodies[&index], &projections,
+            ).0);
+        }
+        projections
+    }
+}
+
 impl SourceStore {
     pub async fn project_declarations(&self, root: NodeId) -> Result<Option<ProjectDeclarationsView<'_>>> {
         let Some(view) = self.snapshot(root)? else { return Ok(None); };
-        self.project_declarations_for_snapshot(view.configured()?).await.map(Some)
+        self.project_declarations_for_snapshot(view.configured()?, None).await.map(Some)
     }
 
     pub(super) async fn project_declarations_for_snapshot(
-        &self, snapshot: ConfiguredSourceView,
+        &self, snapshot: ConfiguredSourceView, worker: Option<&QueryWorker>,
     ) -> Result<ProjectDeclarationsView<'_>> {
-        let root = snapshot.source.root;
-        let (RootedOrder { modules, postorder }, source_read) =
-            RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
-        let image = self.derivation_image();
-        let cached: Vec<_> = if let Some(image) = image {
-            let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
-            modules.iter().map(|module| read_projection(&read, image, module)).collect::<Result<_>>()?
-        } else {
-            vec![None; modules.len()]
-        };
+        // The configured input carries the root guard while the initial
+        // project-wide index read takes place on the blocking executor.
+        let (root, order, read, image, cached) = QueryPhases::new(self, worker, None).run(move |store| {
+            let root = snapshot.source.root;
+            let (order, source_read) = RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
+            let image = store.derivation_image();
+            let cached = if let Some(image) = image {
+                let read = store.tree.begin_with_mode(Mode::ReadOnly)?;
+                order.modules.iter().map(|module| read_projection(&read, image, module)).collect::<Result<Vec<_>>>()?
+            } else {
+                vec![None; order.modules.len()]
+            };
+            Ok((root, order, source_read, image, cached))
+        }).await?;
+        let phases = QueryPhases::new(self, worker, Some(&read));
 
+        let missing: BTreeSet<_> = order.modules.iter().zip(&cached)
+            .filter_map(|(module, found)| found.is_none().then_some(module.file.executable)).collect();
+        let inputs: Vec<_> = missing.into_iter().collect();
         let mut report = ProjectDeclarationReport::default();
-        let mut bodies = Vec::new();
-        for (index, (module, projection)) in modules.iter().zip(&cached).enumerate() {
-            if projection.is_none() {
-                let (id, disposition) = self.ensure_base_declaration_id(module.file.executable).await?;
-                report.bodies_derived += usize::from(disposition == QueryDisposition::Derived);
-                bodies.push((index, id));
-            }
-        }
-        let projections = if bodies.is_empty() {
+        let (order, projections) = if inputs.is_empty() {
             report.modules_reused = cached.len();
-            cached
-        } else if let Some(image) = image {
-            let (projections, derived) = self.publish_projections(image, &modules, &postorder, &cached, &bodies).await?;
-            report.modules_derived = derived;
-            report.modules_reused = projections.len() - derived;
-            projections
+            (order, cached)
         } else {
-            let mut projections = cached;
-            // Every module derived a body above; without a verified image
-            // the exact same projection is composed only in memory.
-            for ordinal in postorder {
-                projections[ordinal] = Some(compose_projection(&modules[ordinal], bodies[ordinal].1, &projections).0);
-            }
-            report.modules_derived = projections.len();
-            projections
+            let output = self.ensure_base_ids(phases, image, &inputs).await?;
+            let bodies: HashMap<_, _> = inputs.into_iter().zip(output).map(|(executable, (id, disposition))| {
+                report.bodies_derived += usize::from(disposition == QueryDisposition::Derived);
+                (executable, id)
+            }).collect();
+            let bodies = order.modules.iter().zip(&cached).enumerate().filter_map(|(index, (module, hit))| {
+                hit.is_none().then(|| (index, bodies[&module.file.executable]))
+            }).collect();
+            let plan = Arc::new(ProjectionPlan { order, cached, bodies });
+            let projections = if let Some(image) = image {
+                let (projections, derived) = self.publish_projections(phases, image, &plan).await?;
+                report.modules_derived = derived;
+                report.modules_reused = projections.len() - derived;
+                projections
+            } else {
+                let memory = Arc::clone(&plan);
+                let projections = phases.run(move |_| Ok(memory.in_memory())).await?;
+                report.modules_derived = projections.len();
+                projections
+            };
+            let owned = Arc::try_unwrap(plan).ok().expect("projection phases completed");
+            (owned.order, projections)
         };
         let entry_projection = projections[0].expect("entry projection").id;
-        let modules = modules.into_iter().zip(projections).map(|(module, projection)| {
+        let modules = order.modules.into_iter().zip(projections).map(|(module, projection)| {
             let projection = projection.expect("published module projection");
             let source = file_source(&module.file)?;
             let imports = module.file.metadata.imports.iter().cloned().zip(module.imports)
@@ -210,54 +240,56 @@ impl SourceStore {
                 key: module.key, source, module: module.id, projection: projection.id,
                 body: projection.body, imports, file: module.file,
             })
-        }).collect::<Result<_>>()?;
-        Ok(ProjectDeclarationsView {
-            store: self, snapshot: root, entry_projection, report, modules, _read: source_read,
-        })
+        }).collect::<Result<Arc<[_]>>>()?;
+        Ok(ProjectDeclarationsView { store: self, snapshot: root, entry_projection, report, modules, image, read })
     }
 
     async fn publish_projections(
-        &self, image: NodeId, modules: &[ModuleInput], postorder: &[usize], cached: &[Option<Projection>],
-        bodies: &[(usize, NodeId)],
+        &self, phases: QueryPhases<'_>, image: NodeId, plan: &Arc<ProjectionPlan>,
     ) -> Result<(Vec<Option<Projection>>, usize)> {
         // Do not hold this gate during CST extraction. Concurrent roots can
         // share AST flights; the short commit phase linearizes shared links.
         let _publication = self.project_commit.lock().await;
-        let bodies: HashMap<_, _> = bodies.iter().copied().collect();
         loop {
-            let mut tx = self.tree.begin()?;
-            tx.set_durability(Durability::Eventual);
-            let mut projections = cached.to_vec();
-            let mut derived = 0;
-            for &ordinal in postorder {
-                if projections[ordinal].is_some() {
-                    continue;
-                }
-                let module = &modules[ordinal];
-                if let Some(existing) = read_projection(&tx, image, module)? {
-                    projections[ordinal] = Some(existing);
-                    continue;
-                }
-                let body = bodies[&ordinal];
-                let (projection, node, bytes) = compose_projection(module, body, &projections);
-                if tx.get(&key(INTERN, projection.id))?.is_none() {
-                    write_node(&mut tx, projection.id, &bytes)?;
-                    for (index, &child) in node.children.iter().enumerate() {
-                        write_edge(&mut tx, projection.id, child_edge(node.kind, index).0, child)?;
-                    }
-                }
-                tx.set(&projection_key(image, module.id), &projection.id.0)?;
-                projections[ordinal] = Some(projection);
-                derived += 1;
-            }
-            if derived == 0 {
-                return Ok((projections, 0));
-            }
+            let step = Arc::clone(plan);
+            let (tx, projections, derived) = phases.run(move |store|
+                store.projection_transaction(image, &step)
+            ).await?;
+            let Some(mut tx) = tx else { return Ok((projections, derived)); };
             match tx.commit().await {
                 Ok(()) => return Ok((projections, derived)),
                 Err(surrealkv::Error::TransactionWriteConflict) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    fn projection_transaction(
+        &self, image: NodeId, plan: &ProjectionPlan,
+    ) -> Result<(Option<Transaction>, Vec<Option<Projection>>, usize)> {
+        let mut tx = self.tree.begin()?;
+        tx.set_durability(Durability::Eventual);
+        let mut projections = plan.cached.clone();
+        let mut derived = 0;
+        for &ordinal in &plan.order.postorder {
+            if projections[ordinal].is_some() { continue; }
+            let module = &plan.order.modules[ordinal];
+            if let Some(existing) = read_projection(&tx, image, module)? {
+                projections[ordinal] = Some(existing);
+                continue;
+            }
+            let body = plan.bodies[&ordinal];
+            let (projection, node, bytes) = compose_projection(module, body, &projections);
+            if tx.get(&key(INTERN, projection.id))?.is_none() {
+                write_node(&mut tx, projection.id, &bytes)?;
+                for (index, &child) in node.children.iter().enumerate() {
+                    write_edge(&mut tx, projection.id, child_edge(node.kind, index).0, child)?;
+                }
+            }
+            tx.set(&projection_key(image, module.id), &projection.id.0)?;
+            projections[ordinal] = Some(projection);
+            derived += 1;
+        }
+        Ok(((derived != 0).then_some(tx), projections, derived))
     }
 }

@@ -1,7 +1,8 @@
 //! Optional storage for ordinary Build diagnostics, never a Build result.
-use super::{child_edge, key, write_edge, write_node, BuildAnalysisPhase, Result, SourceStore, NODES};
+use super::{child_edge, key, storage_worker::QueryPhases, write_edge, write_node, BuildAnalysisPhase, Result, SourceStore, NODES};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use std::sync::Arc;
 use surrealkv::{Durability, LSMIterator, Mode, Transaction};
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{Kind, Node, NodeId};
@@ -30,6 +31,7 @@ impl BuildInputs {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Lookup {
     pub digest: NodeId,
     scope: Option<NodeId>,
@@ -93,36 +95,60 @@ impl SourceStore {
     }
 
     pub(super) async fn persist_build_receipt(
-        &self, lookup: &Lookup, phase: BuildAnalysisPhase, diagnostics: &[Diagnostic],
+        &self, phases: QueryPhases<'_>, lookup: Lookup, phase: BuildAnalysisPhase,
+        diagnostics: Arc<[Diagnostic]>,
     ) -> Result<bool> {
         let Some(index) = lookup.index_key() else { return Ok(false); };
-        let mut data = BoundedPayload(lookup.digest.0.to_vec());
-        if serde_json::to_writer(&mut data, &Payload { phase, diagnostics }).is_err() { return Ok(false); }
-        let node = Node {
-            kind: Kind::BuildDiagnosticReceipt, data: data.0, children: lookup.children.to_vec(),
-        };
-        let bytes = node.encode();
-        let id = Node::id(&bytes);
-        loop {
-            let mut tx = self.tree.begin()?;
-            tx.set_durability(Durability::Eventual);
-            if tx.get(&index)?.is_some_and(|old| old.as_slice() == id.0)
-                && tx.get(&key(NODES, id))?.is_some_and(|old| old.as_slice() == bytes)
-            {
-                return Ok(false);
+        let encoded = phases.run(move |store| {
+            let mut data = BoundedPayload(lookup.digest.0.to_vec());
+            if serde_json::to_writer(&mut data, &Payload { phase, diagnostics: diagnostics.as_ref() }).is_err() {
+                return Ok(None);
             }
-            write_node(&mut tx, id, &bytes)?;
-            for (i, &child) in node.children.iter().enumerate() {
-                write_edge(&mut tx, id, child_edge(node.kind, i).0, child)?;
-            }
-            tx.set(&index, &id.0)?;
-            match tx.commit().await {
+            let node = Node {
+                kind: Kind::BuildDiagnosticReceipt, data: data.0, children: lookup.children.to_vec(),
+            };
+            let bytes = node.encode();
+            let plan = Arc::new(ReceiptWrite { index, id: Node::id(&bytes), node, bytes });
+            let tx = store.receipt_transaction(&plan)?;
+            Ok(Some((plan, tx)))
+        }).await?;
+        let Some((plan, mut tx)) = encoded else { return Ok(false); };
+        while let Some(mut pending) = tx {
+            match pending.commit().await {
                 Ok(()) => return Ok(true),
-                Err(surrealkv::Error::TransactionWriteConflict) => continue,
+                Err(surrealkv::Error::TransactionWriteConflict) => {
+                    let write = Arc::clone(&plan);
+                    tx = phases.run(move |store| store.receipt_transaction(&write)).await?;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
+        Ok(false)
     }
+
+    fn receipt_transaction(&self, plan: &ReceiptWrite) -> Result<Option<Transaction>> {
+        let ReceiptWrite { index, id, node, bytes } = plan;
+        let mut tx = self.tree.begin()?;
+        tx.set_durability(Durability::Eventual);
+        if tx.get(index)?.is_some_and(|old| old.as_slice() == id.0)
+            && tx.get(&key(NODES, *id))?.is_some_and(|old| old.as_slice() == bytes)
+        {
+            return Ok(None);
+        }
+        write_node(&mut tx, *id, bytes)?;
+        for (i, &child) in node.children.iter().enumerate() {
+            write_edge(&mut tx, *id, child_edge(node.kind, i).0, child)?;
+        }
+        tx.set(index, &id.0)?;
+        Ok(Some(tx))
+    }
+}
+
+struct ReceiptWrite {
+    index: [u8; 65],
+    id: NodeId,
+    node: Node,
+    bytes: Vec<u8>,
 }
 
 pub(super) fn attached(

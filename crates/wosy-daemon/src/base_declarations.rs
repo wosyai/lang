@@ -1,5 +1,8 @@
 //! Rooted, lazy canonical base declarations. No semantic Build/Check query.
-use super::{file_source, key, read_comments, read_cst, read_node, write_edge, write_node, Edge, Result, SourceStore, INTERN};
+use super::{
+    file_source, key, read_comments, read_cst, read_node, storage_worker::QueryPhases,
+    write_edge, write_node, Edge, Result, SourceStore, INTERN,
+};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::hash::Hash;
@@ -17,6 +20,7 @@ use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, SourceIdentity};
 
 const BASE_DECLARATION_QUERIES: u8 = 13;
 const INLINE_BYTES: usize = 64 * 1024;
+const FILES_PER_PHASE: usize = 16;
 const INLINE: u8 = 0;
 const BLOB: u8 = 1;
 
@@ -122,6 +126,14 @@ struct BaseOutput {
     disposition: QueryDisposition,
 }
 
+struct BaseAddition {
+    query: QueryKey,
+    id: NodeId,
+    executable: NodeId,
+    encoded: Vec<u8>,
+}
+
+
 impl SourceStore {
     /// Resolve only a file inside a currently supported published source
     /// snapshot. Derived queries are optional: snapshot reads never need CAS.
@@ -147,101 +159,164 @@ impl SourceStore {
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
         let spans = AuthoredSpanMap::from_comments(&read_comments(&tx, file.annotation)?);
         drop(tx);
+        let phases = QueryPhases::direct(self);
+        let image = self.derivation_image();
         let output = match projected {
-            Some(id) => self.projected_base(executable, id).await?,
-            None => self.query_base(executable, true).await?,
-        };
+            Some(id) => self.projected_bases(phases, image, &[(executable, id)]).await?,
+            None => self.query_bases(phases, image, &[executable], true).await?,
+        }.pop().expect("one requested declaration body");
         Ok(BaseDeclarationsView {
             id: output.id, executable, module, source, disposition: output.disposition,
             declarations: output.declarations.expect("requested declaration payload"), spans,
         })
     }
 
-    pub(super) async fn projected_body(
-        &self, executable: NodeId, id: NodeId,
-    ) -> Result<ScalarSourceDeclarations> {
-        Ok(self.projected_base(executable, id).await?.declarations.expect("requested declaration payload"))
+    pub(super) async fn projected_bodies(
+        &self, phases: QueryPhases<'_>, image: Option<NodeId>, files: &[(NodeId, NodeId)],
+    ) -> Result<Vec<ScalarSourceDeclarations>> {
+        Ok(self.projected_bases(phases, image, files).await?.into_iter()
+            .map(|output| output.declarations.expect("requested declaration payload")).collect())
     }
 
-    async fn projected_base(&self, executable: NodeId, id: NodeId) -> Result<BaseOutput> {
-        if self.derivation_image().is_some() {
-            let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-            if let Some(declarations) = self.read_base_declarations(&tx, id, executable)? {
-                return Ok(BaseOutput {
-                    id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
-                });
+    async fn projected_bases(
+        &self, phases: QueryPhases<'_>, image: Option<NodeId>, files: &[(NodeId, NodeId)],
+    ) -> Result<Vec<BaseOutput>> {
+        let mut result = Vec::with_capacity(files.len());
+        for chunk in files.chunks(FILES_PER_PHASE) {
+            let cached = if image.is_some() {
+                let files = chunk.to_vec();
+                phases.run(move |store| {
+                    let read = store.tree.begin_with_mode(Mode::ReadOnly)?;
+                    files.into_iter().map(|(executable, id)| store.read_base_declarations(&read, id, executable)
+                        .map(|body| body.map(|declarations| BaseOutput {
+                            id, declarations: Some(declarations), disposition: QueryDisposition::Reused,
+                        }))).collect::<Result<Vec<_>>>()
+                }).await?
+            } else {
+                (0..chunk.len()).map(|_| None).collect()
+            };
+            let missing: Vec<_> = chunk.iter().zip(&cached)
+                .filter_map(|(&(executable, _), hit)| hit.is_none().then_some(executable)).collect();
+            let mut repaired = self.query_bases(phases, image, &missing, true).await?.into_iter();
+            for ((_, expected), hit) in chunk.iter().zip(cached) {
+                let output = hit.unwrap_or_else(|| repaired.next().expect("requested missing declaration"));
+                if output.id != *expected {
+                    return Err("recomputed declarations differ from the rooted projection".into());
+                }
+                result.push(output);
             }
         }
-        let output = self.query_base(executable, true).await?;
-        if output.id != id {
-            return Err("recomputed declarations differ from the rooted projection".into());
+        Ok(result)
+    }
+
+    /// Compose a graph using IDs, without decoding already derived bodies.
+    pub(super) async fn ensure_base_ids(
+        &self, phases: QueryPhases<'_>, image: Option<NodeId>, executables: &[NodeId],
+    ) -> Result<Vec<(NodeId, QueryDisposition)>> {
+        Ok(self.query_bases(phases, image, executables, false).await?.into_iter()
+            .map(|output| (output.id, output.disposition)).collect())
+    }
+
+    async fn query_bases(
+        &self, phases: QueryPhases<'_>, image: Option<NodeId>, executables: &[NodeId], load: bool,
+    ) -> Result<Vec<BaseOutput>> {
+        let mut results = Vec::with_capacity(executables.len());
+        for chunk in executables.chunks(FILES_PER_PHASE) {
+            let tagged: Vec<_> = chunk.iter().map(|&executable| {
+                (executable, image.map(|image| query_key(image, executable)))
+            }).collect();
+            let mut keys: Vec<_> = tagged.iter().filter_map(|(_, query)| *query).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            // All multi-file queries acquire the same per-executable flights
+            // in key order; store reads and both publication phases stay inside
+            // those flights. Holding one never blocks a Tokio worker thread.
+            let mut permits = Vec::with_capacity(keys.len());
+            for key in keys {
+                permits.push(self.base_flights.acquire(key).lock_owned().await);
+            }
+            let permits = Arc::new(permits);
+            let active = Arc::clone(&permits);
+            let (outputs, additions) = phases.run(move |store| {
+                let _active = active;
+                let read = store.tree.begin_with_mode(Mode::ReadOnly)?;
+                let mut output = Vec::with_capacity(tagged.len());
+                let mut additions = Vec::new();
+                for (executable, query) in tagged {
+                    let (value, added) = store.plan_base(&read, executable, query, load)?;
+                    output.push(value);
+                    if let Some(added) = added { additions.push(added); }
+                }
+                Ok((output, additions))
+            }).await?;
+            if !additions.is_empty() {
+                let additions = Arc::new(additions);
+                loop {
+                    let batch = Arc::clone(&additions);
+                    let active = Arc::clone(&permits);
+                    let Some(mut tx) = phases.run(move |store| {
+                        let _active = active;
+                        store.base_transaction(&batch)
+                    }).await? else { break; };
+                    match tx.commit().await {
+                        Ok(()) => break,
+                        Err(surrealkv::Error::TransactionWriteConflict) => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            results.extend(outputs);
+            drop(permits);
         }
-        Ok(output)
+        Ok(results)
     }
 
-    /// Composing a graph needs IDs, not decoded ASTs from already derived files.
-    pub(super) async fn ensure_base_declaration_id(
-        &self, executable: NodeId,
-    ) -> Result<(NodeId, QueryDisposition)> {
-        let output = self.query_base(executable, false).await?;
-        Ok((output.id, output.disposition))
-    }
-
-    async fn query_base(&self, executable: NodeId, load: bool) -> Result<BaseOutput> {
-        let query = self.derivation_image().map(|image| query_key(image, executable));
-
-        // The admitted file stays immutable; start the query transaction after
-        // joining its flight so waiters see an already committed result.
-        let gate = query.map(|key| self.base_flights.acquire(key));
-        let _permit = if let Some(gate) = &gate { Some(gate.lock().await) } else { None };
-        let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
+    fn plan_base(
+        &self, read: &Transaction, executable: NodeId, query: Option<QueryKey>, load: bool,
+    ) -> Result<(BaseOutput, Option<BaseAddition>)> {
         let cached = query.map(|query| read.get(&query)).transpose()?.flatten();
         if let Some(id) = cached {
             let id = NodeId(id.as_slice().try_into()?);
-            let disposition = QueryDisposition::Reused;
             if !load {
-                return Ok(BaseOutput { id, declarations: None, disposition });
+                return Ok((BaseOutput { id, declarations: None, disposition: QueryDisposition::Reused }, None));
             }
-            if let Some(declarations) = self.read_base_declarations(&read, id, executable)? {
-                return Ok(BaseOutput { id, declarations: Some(declarations), disposition });
+            if let Some(declarations) = self.read_base_declarations(read, id, executable)? {
+                return Ok((BaseOutput { id, declarations: Some(declarations), disposition: QueryDisposition::Reused }, None));
             }
         }
-        let declarations = {
-            let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(&read, executable)?);
-            derive_scalar_declarations_from_cst(&cst)
-        };
-        drop(read);
+        let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(read, executable)?);
+        let declarations = derive_scalar_declarations_from_cst(&cst);
         let bytes = serde_json::to_vec(&declarations)?;
         let payload = self.pack_payload(bytes, query.is_some())?;
         let node = Node { kind: Kind::BaseDeclarations, data: payload, children: vec![executable] };
         let encoded = node.encode();
         let id = Node::id(&encoded);
-        let Some(query) = query else {
-            return Ok(BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived });
-        };
-        loop {
-            let mut tx = self.tree.begin()?;
-            tx.set_durability(Durability::Eventual);
-            if let Some(existing) = tx.get(&query)? {
-                // A prior query may point at a lost CAS blob. The identical
-                // interned record now resolves again after pack_payload.
+        let addition = query.map(|query| BaseAddition { query, id, executable, encoded });
+        Ok((BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived }, addition))
+    }
+
+    fn base_transaction(&self, additions: &[BaseAddition]) -> Result<Option<Transaction>> {
+        let mut tx = self.tree.begin()?;
+        tx.set_durability(Durability::Eventual);
+        let mut changed = false;
+        for addition in additions {
+            let BaseAddition { query, id, executable, encoded } = addition;
+            if let Some(existing) = tx.get(query)? {
+                // A previously indexed body may have needed only its lost
+                // CAS file restored by plan_base, under the same flight.
                 if existing.as_slice() != id.0 {
                     return Err("base declaration query changed for an immutable input".into());
                 }
-                break;
+                continue;
             }
-            if tx.get(&super::key(INTERN, id))?.is_none() {
-                write_node(&mut tx, id, &encoded)?;
-                write_edge(&mut tx, id, Edge::DeclarationSource, executable)?;
+            if tx.get(&key(INTERN, *id))?.is_none() {
+                write_node(&mut tx, *id, encoded)?;
+                write_edge(&mut tx, *id, Edge::DeclarationSource, *executable)?;
             }
-            tx.set(&query, &id.0)?;
-            match tx.commit().await {
-                Ok(()) => break,
-                Err(surrealkv::Error::TransactionWriteConflict) => continue,
-                Err(error) => return Err(error.into()),
-            }
+            tx.set(query, &id.0)?;
+            changed = true;
         }
-        Ok(BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived })
+        Ok(changed.then_some(tx))
     }
 
     fn read_base_declarations(
