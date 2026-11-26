@@ -72,10 +72,6 @@ struct Forks {
 impl Forks {
     fn len(&self) -> usize { usize::from(self.first.is_some()) + self.later.len() }
 
-    fn last(&self) -> Option<&Fork> {
-        self.later.last().or(self.first.as_ref())
-    }
-
     fn push(&mut self, fork: Fork) {
         if self.first.is_none() { self.first = Some(fork); }
         else { self.later.push(fork); }
@@ -86,15 +82,21 @@ impl Forks {
     }
 }
 
+struct PendingFork {
+    branch: CfgPointId,
+    scope: ReferenceScopeId,
+    second: Option<CfgPointId>,
+    join: Option<CfgPointId>,
+}
+
 #[derive(Default)]
 pub(crate) struct Author {
     pending_loan: Option<Loan>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
     forks: Forks,
-    branch: Option<CfgPointId>,
-    second: Option<CfgPointId>,
-    join: Option<CfgPointId>,
+    open_forks: Vec<PendingFork>,
+    nested: bool,
     root_exit: Option<CfgPointId>,
     pending_exit: Option<(CfgPointId, ReferenceScopeId)>,
 }
@@ -113,8 +115,16 @@ impl Author {
             return false;
         }
         match kind {
-            CfgPointKind::Branch { .. } => scope == ReferenceScopeId(0) && self.branch.replace(id).is_none(),
-            CfgPointKind::Join => scope == ReferenceScopeId(0) && self.join.replace(id).is_none(),
+            CfgPointKind::Branch { .. } => {
+                if self.open_forks.last().is_some_and(|top| top.join.is_some())
+                    || (self.open_forks.is_empty() && scope != ReferenceScopeId(0))
+                { return false; }
+                self.nested |= !self.open_forks.is_empty();
+                self.open_forks.push(PendingFork { branch: id, scope, second: None, join: None });
+                true
+            }
+            CfgPointKind::Join => self.open_forks.last_mut()
+                .is_some_and(|top| top.scope == scope && top.join.replace(id).is_none()),
             CfgPointKind::ScopeExit => {
                 self.pending_exit = Some((id, scope));
                 true
@@ -216,20 +226,22 @@ impl Author {
     }
 
     fn arm(&self) -> Option<Arm> {
-        self.branch.map(|_| Arm::new(self.forks.len(), self.second.is_some()))
+        self.open_forks.last().map(|top| Arm::new(self.forks.len(), top.second.is_some()))
     }
 
     pub(super) fn second_arm(&mut self, entry: CfgPointId) -> bool {
-        self.branch.is_some() && self.join.is_none() && self.pending_loan.is_none()
-            && self.pending_exit.is_none() && self.second.replace(entry).is_none()
+        self.pending_loan.is_none() && self.pending_exit.is_none()
+            && self.open_forks.last_mut().is_some_and(|top|
+                top.join.is_none() && top.second.replace(entry).is_none())
     }
 
     pub(super) fn fork(
         &mut self, edges: &ReferenceConditionalEdges, points: &[ReferenceFlowPoint], explicit: bool,
     ) -> bool {
-        if explicit != self.second.is_some()
-            || self.branch != Some(edges.branch) || self.join != Some(edges.join)
-            || self.forks.last().is_some_and(|prior| prior.join >= edges.branch)
+        let Some(top) = self.open_forks.pop() else { return false };
+        if explicit != top.second.is_some()
+            || top.branch != edges.branch || top.join != Some(edges.join)
+            || self.open_forks.last().is_some_and(|outer| outer.scope == top.scope)
         {
             return false;
         }
@@ -243,21 +255,19 @@ impl Author {
         if then.0 != edges.branch.0 + 1
             || !arm(*then, edges.terminals[0], *alternative)
             || !matches!(points[edges.join.0].kind, CfgPointKind::Join)
-            || match self.second {
+            || match top.second {
                 Some(entry) => entry != *alternative || !arm(entry, edges.terminals[1], edges.join),
                 None => *alternative != edges.join || edges.terminals[1] != edges.branch,
             }
         {
             return false;
         }
-        self.forks.push(Fork { branch: edges.branch, join: edges.join, second: self.second.take() });
-        self.branch = None;
-        self.join = None;
+        self.forks.push(Fork { branch: edges.branch, join: edges.join, second: top.second });
         true
     }
 
     pub(super) fn seal(self, points: &[ReferenceFlowPoint]) -> Option<Box<Sealed>> {
-        if self.branch.is_some() || self.join.is_some() || self.second.is_some() {
+        if !self.open_forks.is_empty() {
             return None;
         }
         let exit = self.root_exit?;
@@ -314,7 +324,8 @@ impl Author {
         for owner in &mut owners {
             for active in &mut owner.active { compact(active); }
         }
-        Some(Box::new(Sealed { exit, forks: self.forks, holders, owner_index: self.owners, owners }))
+        let nested = if self.nested { Some(NestedGraph::seal(points, &self.forks, exit)?) } else { None };
+        Some(Box::new(Sealed { exit, forks: self.forks, nested, holders, owner_index: self.owners, owners }))
     }
 }
 
@@ -634,9 +645,99 @@ impl AccessMode {
     }
 }
 
+// Nested ownership uses the exact structured edge inventory: no statement
+// that can transfer a checked holder outside Author's census is admitted.
+struct NestedGraph {
+    exceptions: HashMap<CfgPointId, [Option<CfgPointId>; 2]>,
+    predecessors: Vec<Vec<CfgPointId>>,
+}
+
+impl NestedGraph {
+    fn seal(points: &[ReferenceFlowPoint], forks: &Forks, exit: CfgPointId) -> Option<Self> {
+        let mut exceptions = HashMap::new();
+        for index in 0..forks.len() {
+            let fork = forks.get(index)?;
+            let first = CfgPointId(fork.branch.0 + 1);
+            let alternative = fork.second.unwrap_or(fork.join);
+            if exceptions.insert(fork.branch, [Some(first), Some(alternative)]).is_some() {
+                return None;
+            }
+            if fork.second.is_some() {
+                let then_end = CfgPointId(alternative.0.checked_sub(1)?);
+                if exceptions.insert(then_end, [Some(fork.join), None]).is_some() {
+                    return None;
+                }
+            }
+        }
+        let mut graph = Self { exceptions, predecessors: vec![Vec::new(); points.len()] };
+        for (index, point) in points.iter().enumerate() {
+            if point.id.0 != index || !graph.matches(point, exit) { return None; }
+            for &successor in &point.successors {
+                if successor <= point.id { return None; }
+                graph.predecessors.get_mut(successor.0)?.push(point.id);
+            }
+        }
+        Some(graph)
+    }
+
+    fn matches(&self, point: &ReferenceFlowPoint, exit: CfgPointId) -> bool {
+        match self.exceptions.get(&point.id) {
+            Some([Some(then), Some(alternative)]) => matches!(point.kind, CfgPointKind::Branch { .. })
+                && point.successors.as_slice() == [*then, *alternative],
+            Some([Some(join), None]) => matches!(point.kind, CfgPointKind::ScopeExit)
+                && point.successors.as_slice() == [*join],
+            Some(_) => false,
+            None => !matches!(point.kind, CfgPointKind::Branch { .. }) && if point.id == exit {
+                point.successors.is_empty()
+            } else {
+                point.successors.as_slice() == [CfgPointId(point.id.0 + 1)]
+            },
+        }
+    }
+
+    fn excludes(&self, holder: &Holder, access: CfgPointId, owner: usize, mode: AccessMode,
+        points: &[ReferenceFlowPoint],
+    ) -> bool {
+        let install = |point| holder.writes.binary_search_by_key(&point, |install| install.version)
+            .ok().map(|index| holder.writes[index].loan);
+        let mut budget = 256usize;
+        // A value arriving here survives only if it has a relevant later read
+        // on a path on which it has not first been replaced.
+        let mut pending = points[access.0].successors.clone();
+        let mut seen = HashSet::new();
+        let mut live = false;
+        while let Some(point) = pending.pop() {
+            if !seen.insert(point) { continue; }
+            let Some(remaining) = budget.checked_sub(1) else { return false };
+            budget = remaining;
+            if holder.reads.binary_search(&point).is_ok() {
+                live = true;
+                break;
+            }
+            if install(point).is_none() { pending.extend(&points[point.0].successors); }
+        }
+        if !live { return true; }
+        seen.clear();
+        pending.clear();
+        pending.extend_from_slice(&self.predecessors[access.0]);
+        while let Some(point) = pending.pop() {
+            if !seen.insert(point) { continue; }
+            let Some(remaining) = budget.checked_sub(1) else { return false };
+            budget = remaining;
+            if let Some(loan) = install(point) {
+                if loan.owner == owner && mode.accepts(loan.mutable) { return false; }
+            } else {
+                pending.extend_from_slice(&self.predecessors[point.0]);
+            }
+        }
+        true
+    }
+}
+
 pub(crate) struct Sealed {
     exit: CfgPointId,
     forks: Forks,
+    nested: Option<NestedGraph>,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
@@ -648,6 +749,7 @@ impl Sealed {
         if id != index {
             return false;
         }
+        if let Some(graph) = &self.nested { return graph.matches(point, self.exit); }
         let next = CfgPointId(index + 1);
         let fork = self.forks.get(*fork_index);
         if let Some(fork) = fork.filter(|fork| fork.branch == point.id) {
@@ -699,6 +801,10 @@ impl Sealed {
         // Carrier indices were assigned by the authored BTreeMap in binding order.
         for holder in carriers {
             let entry = &self.holders[holder];
+            if let Some(graph) = &self.nested {
+                if graph.excludes(&entry.holder, access, owner_index, mode, points) { continue; }
+                return None; // Preserve exact incoming-edge diagnostics on any matching path.
+            }
             let Some(precise) = entry.refined.get_or_init(|| {
                 #[cfg(test)]
                 tests::observe(2);
@@ -1298,6 +1404,58 @@ pub(super) mod tests {
         assert!(!staged.iter().any(|error| matches!(error,
             ReferenceAnalysisError::ConflictingPlace { source_span, .. }
                 if source_span.range == ByteSpan::new(8, 9))));
+    }
+
+    #[test]
+    fn authored_nested_branch_graph_keeps_bypass_and_exact_incumbent_labels() {
+        for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            for overwrite_bypass in [true, false] {
+                let fallback = if overwrite_bypass { "held = &other;" } else { "" };
+                let text = format!("%%start\nunit(bool, bool) examine = fn(a, b) {{
+                    u8 value = 7;
+                    u8 other = 9;
+                    *u8 held = &value;
+                    if (a) {{ if (b) {{ held = &other; }} else {{ held = &other; }}; }}
+                    else {{ {fallback} }};
+                    value = 8;
+                    held;
+                }};\n%%end");
+                let source = SourceIdentity::new("project".into(), "package".into(), "nested.w".into(), "r1".into());
+                let parsed = crate::parse_source(source, text.into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+                let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
+                assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+                let program = typed.program;
+                let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+                let prepared = || {
+                    let (results, errors) = derive_module_reference_origins(
+                        &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                    );
+                    assert!(errors.is_empty(), "{errors:?}");
+                    results.into_iter().next().unwrap().1
+                };
+                let mut staged = prepared();
+                let mut incumbent = prepared();
+                incumbent.proof_points.local_borrow = None;
+                let sealed = staged.proof_points.local_borrow.as_ref().expect("authored nested graph");
+                let graph = sealed.nested.as_ref().expect("nested shape");
+                assert_eq!(graph.exceptions.len(), 4, "two explicit forks");
+                let points = &staged.cfg.initial_points;
+                let store = points.iter().find(|point| matches!(&point.kind, CfgPointKind::Assign {
+                    target, rhs_point, ..
+                } if matches!(&target.place, ScalarPlace::Name { name, .. } if name == "value")
+                    && matches!(points[rhs_point.0].kind, CfgPointKind::Evaluate(_))))
+                    .expect("ordinary root store after nested join");
+                let CfgPointKind::Assign { target, .. } = &store.kind else { unreachable!() };
+                let verdict = sealed.conflicts(&target.binding, store.id, 1, points, AccessMode::Exclusive);
+                assert_eq!(verdict, overwrite_bypass.then(Vec::new));
+                let actual = definitive(&mut staged);
+                assert_eq!(actual, definitive(&mut incumbent));
+                assert!(actual.iter().any(|diagnostic| matches!(diagnostic,
+                    ReferenceAnalysisError::ConflictingPlace { .. })) != overwrite_bypass);
+            }
+        }
     }
 
     #[test]
