@@ -11,6 +11,8 @@ mod case_splits;
 #[cfg(feature = "internal-checker")]
 mod catalog_composition;
 #[cfg(feature = "internal-checker")]
+mod failure_search;
+#[cfg(feature = "internal-checker")]
 mod qualified_demand;
 #[cfg(feature = "internal-checker")]
 mod pointer_proof;
@@ -336,6 +338,8 @@ enum ProjectCheck {
     RootSourceOutsideInitOrder,
     MissingRootOccurrences,
     Unsupported,
+    #[cfg(feature = "internal-checker")]
+    StartupAuthoredLimitReached,
     #[cfg(test)]
     NoChecks,
     NoApplicableInputs,
@@ -1647,6 +1651,13 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             let BindingInitialization::Outputs(outputs) = &checked.initialization
                 else { return Err(ProjectCheck::Unsupported); };
             #[cfg(feature = "internal-checker")]
+            if startup_trace_requested(failures)
+                && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
+                && concrete_integer_literal(&binding.value).is_none()
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            #[cfg(feature = "internal-checker")]
             if let [first, second] = checked.receivers() {
                 if !COLLECT || !matches!(binding.value, ScalarExpression::Call { .. })
                     || !matches!(outputs.secondary.as_slice(), [super::control::BindingOutput::ProjectPrimary { output: 1 }])
@@ -1785,6 +1796,8 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
     let allow_authored_startup = false;
     if let Some(directive) = structure.checker_directives.get(&expression) {
         let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
+        #[cfg(feature = "internal-checker")]
+        if startup_trace_requested(failures) && !startup_trace_atomic(predicate) { return Err(ProjectCheck::Unsupported); }
         let value = evaluate_initializer_predicate(predicate, storage, allow_authored_startup).ok_or(ProjectCheck::Unsupported)?;
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
@@ -1800,6 +1813,15 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             }
             let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
             #[cfg(feature = "internal-checker")]
+            let capped = if let Some(search) = &mut effects.startup_search {
+                use failure_search::Admission::*;
+                match search.admit(wosy_syntax::SourceSpan::new(source.clone(), span)).ok_or(ProjectCheck::Unsupported)? {
+                    Duplicate => return Ok(if directive.operation == CheckerOperation::Narrow { StartupLane::Empty } else { StartupLane::Feasible }),
+                    Selected => false,
+                    SelectedAndStop => true,
+                }
+            } else { false };
+            #[cfg(feature = "internal-checker")]
             if startup_values {
                 // Resolve before recording, so a rejected/missing startup
                 // value neither clones an unchecked payload nor leaves a
@@ -1813,6 +1835,8 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             }
             #[cfg(not(feature = "internal-checker"))]
             effects.push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
+            #[cfg(feature = "internal-checker")]
+            if capped { return Err(ProjectCheck::StartupAuthoredLimitReached); }
             if directive.operation == CheckerOperation::Narrow {
                 return Ok(StartupLane::Empty);
             }
@@ -1832,6 +1856,11 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         let Some(value) = reached_startup_condition(
             topology, actual, source, *condition, storage, failures, visits, allow_authored_startup,
         )? else { return Ok(StartupLane::Empty); };
+        #[cfg(feature = "internal-checker")]
+        if let Some(search) = failures.as_deref_mut().and_then(|effects| effects.startup_search.as_mut()) {
+            let site = topology.occurrences.get(condition.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            search.branch(wosy_syntax::SourceSpan::new(source.clone(), site.span), value).ok_or(ProjectCheck::Unsupported)?;
+        }
         let selected = if value { Some(then_block) } else { else_block };
         if let Some(selected) = selected {
             if depth == MAX_INITIALIZER_BRANCH_DEPTH {
@@ -1844,6 +1873,8 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         }
         return Ok(StartupLane::Feasible);
     }
+    #[cfg(feature = "internal-checker")]
+    if startup_trace_requested(failures) { return Err(ProjectCheck::Unsupported); }
     #[cfg(feature = "internal-checker")]
     let proof_site = actual.initializer_proof_site(topology, source, expression, failures.as_deref());
     let sink;
@@ -1892,6 +1923,17 @@ fn check_initializer_statements<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
 }
 
 // None is a reached call that pruned the startup lane, not an opaque condition.
+#[cfg(feature = "internal-checker")]
+fn startup_trace_atomic(predicate: &InitializerPredicate) -> bool {
+    matches!(predicate, InitializerPredicate::Boolean(_) | InitializerPredicate::BooleanStorage(_)
+        | InitializerPredicate::IntegerComparison { .. })
+}
+
+#[cfg(feature = "internal-checker")]
+fn startup_trace_requested(failures: &Option<&mut OrderedFailures>) -> bool {
+    failures.as_ref().is_some_and(|effects| effects.startup_search.is_some())
+}
+
 fn reached_startup_condition(
     topology: &ModuleInitializationTopology,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
@@ -1902,6 +1944,10 @@ fn reached_startup_condition(
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] visits: &[InitializationVisit],
     allow_authored_startup: bool,
 ) -> Result<Option<bool>, ProjectCheck> {
+    #[cfg(feature = "internal-checker")]
+    if startup_trace_requested(failures) && !topology.initializer_predicates.get(&condition).is_some_and(startup_trace_atomic) {
+        return Err(ProjectCheck::Unsupported);
+    }
     if let Some(predicate) = topology.initializer_predicates.get(&condition) {
         return evaluate_initializer_predicate(predicate, storage, allow_authored_startup)
             .map(Some).ok_or(ProjectCheck::Unsupported);
@@ -4494,6 +4540,8 @@ fn select_checked_root<'a>(
 #[derive(Default)]
 struct OrderedFailures {
     records: Vec<ScalarOrderedCheckerFailure>,
+    #[cfg(feature = "internal-checker")]
+    startup_search: Option<failure_search::StartUpSearch>,
     payloads: OrderedFailurePayloads,
     #[cfg(feature = "internal-checker")]
     has_authored_state: bool,
@@ -9712,6 +9760,51 @@ impl PreparedScalarOrderedCheck {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Debug, Eq, PartialEq)]
+pub enum StartupAuthoredCompletion { Exhausted, LimitReached }
+
+#[cfg(feature = "internal-checker")]
+impl PreparedScalarOrderedCheck {
+    /// Private reconstructed lane: exact proof-free one-owner startup only.
+    /// No semantic fallback and not used by the CLI.
+    #[doc(hidden)]
+    pub fn search_startup_authored(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        self.search_startup_authored_path(cap).map(|(records, completion, _)| (records, completion))
+            .map_err(configured_ordered_error)
+    }
+
+    fn search_startup_authored_path(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch), ProjectCheck> {
+        let PreparedConfiguredCheck::Plain { owner, startup_count: 1 } = self.owner
+            else { return Err(ProjectCheck::Unsupported); };
+        if self.scope != ScalarCheckerScope::MainFlowOnly { return Err(ProjectCheck::Unsupported); }
+        let (project, _) = owner.parts();
+        let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
+        let mut effects = OrderedFailures { startup_search: Some(failure_search::StartUpSearch::new(root, cap)), ..OrderedFailures::default() };
+        let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
+            &owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+        );
+        let search = effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?;
+        let completion = match outcome {
+            Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
+            Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+            Err(error) => return Err(error),
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        // Only concrete already-rendered startup records cross this private
+        // boundary until the full selected output finalizer is shared.
+        if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+            || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
+        { return Err(ProjectCheck::Unsupported); }
+        Ok((effects.records, completion, search))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn configured_ordered_error(error: ProjectCheck) -> ScalarOrderedCheckerOutcome {
     match error {
         ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
@@ -14621,6 +14714,51 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_startup_budget_stops_at_real_branch_and_zero_code() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "startup-budget-recovery");
+        let first = OUTPUT.replace(".code = 1", ".code = 0");
+        let second = OUTPUT.replace(".code = 1", ".code = 43");
+        let program = format!(r#"%%start
+            bool selected = true;
+            if (selected) {{ core.require(false, {first}); }};
+            core.require(false, {second});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| {
+                let parsed = crate::parse_source(app.clone(), text.to_owned(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let checked = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(checked, Vec::new())],
+                    [], vec![app.clone()], ScalarPreparationInputs { target_layout },
+                    ScalarCheckerScope::MainFlowOnly, Vec::new(),
+                ).ok().unwrap()
+            };
+            let site = ByteSpan::new(program.find("if (selected)").unwrap() as u32 + 4,
+                program.find("if (selected)").unwrap() as u32 + 12);
+            let (records, completion, search) = prepare(&program).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(completion, StartupAuthoredCompletion::LimitReached);
+            assert_eq!(records.iter().map(|record| record.code()).collect::<Vec<_>>(), [&BigInt::from(0)]);
+            assert!(search.contains_branch(wosy_syntax::SourceSpan::new(app.clone(), site), true));
+            let (records, completion) = prepare(&program).search_startup_authored(NonZeroUsize::new(3).unwrap()).unwrap();
+            assert_eq!(completion, StartupAuthoredCompletion::Exhausted);
+            assert_eq!(records.iter().map(|record| record.code()).collect::<Vec<_>>(), [&BigInt::from(0), &BigInt::from(43)]);
+            // This canonical reached call requires path capture that the first
+            // tranche does not have. It must not be visited past the first cap,
+            // and must not silently be treated as traced with quota still open.
+            let reached_later = program.replace("%%end", &format!(
+                "unit() later = fn {{ core.require(false, {second}); }}; later(); %%end"));
+            assert!(prepare(&reached_later).run().unwrap().directives.len() > 2);
+            assert_eq!(prepare(&reached_later).search_startup_authored(NonZeroUsize::MIN).unwrap().1,
+                StartupAuthoredCompletion::LimitReached);
+            assert!(matches!(prepare(&reached_later).search_startup_authored(NonZeroUsize::new(3).unwrap()),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]
