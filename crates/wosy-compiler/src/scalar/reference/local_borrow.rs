@@ -399,7 +399,7 @@ struct LinearLease {
 
 enum Refinement {
     Linear(Vec<LinearLease>),
-    Branching(Vec<Boundary>),
+    Branching { events: Vec<Boundary>, unions: Vec<[Reaching; 2]> },
 }
 
 impl Refinement {
@@ -412,8 +412,31 @@ impl Refinement {
                     _ => (Reaching::Absent, false),
                 }
             }
-            Self::Branching(events) => access_facts(events, point),
+            Self::Branching { events, .. } => access_facts(events, point),
         }
+    }
+
+    fn excludes_owner(&self, reaching: Reaching, owner: usize, mode: AccessMode) -> bool {
+        let Self::Branching { unions, .. } = self else { return false };
+        let mut pending = vec![reaching];
+        // A chain of unions is represented once. Limit work per disputed
+        // candidate; an incomplete proof must not clear a conflict.
+        let mut seen = HashSet::new();
+        while let Some(reaching) = pending.pop() {
+            match reaching {
+                Reaching::Absent => {}
+                Reaching::One(loan) if loan.owner == owner && mode.accepts(loan.mutable) => return false,
+                Reaching::One(_) => {}
+                Reaching::Diverse(index) => {
+                    if seen.insert(index) {
+                        if seen.len() > 64 { return false; }
+                        let Some(arms) = unions.get(index) else { return false };
+                        pending.extend(arms);
+                    }
+                }
+            }
+        }
+        true
     }
 }
 
@@ -421,7 +444,7 @@ impl Refinement {
 enum Reaching {
     Absent,
     One(Loan),
-    Diverse,
+    Diverse(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -459,10 +482,10 @@ impl Holder {
             self.live_linear_leases(exit, |loan, interval| leases.push(LinearLease { interval, loan }));
             return Some(Refinement::Linear(leases));
         }
-        self.branch_boundaries(forks).map(Refinement::Branching)
+        self.branch_boundaries(forks)
     }
 
-    fn branch_boundaries(&self, forks: &Forks) -> Option<Vec<Boundary>> {
+    fn branch_boundaries(&self, forks: &Forks) -> Option<Refinement> {
         let mut writes = self.writes.iter().enumerate().peekable();
         let mut reads = self.reads.iter().copied().enumerate().peekable();
         let (mut read_arms, mut write_arms) = self.arm_runs();
@@ -512,12 +535,18 @@ impl Holder {
             Self::close_boundary(&mut events, forks.get(last.fork())?, last.second())?;
         }
 
+        let mut unions = Vec::new();
         let mut reaching = Reaching::Absent;
         let mut sibling = None;
         for boundary in &mut events {
             match boundary.event {
                 Event::Join => {
-                    if sibling.take()? != reaching { reaching = Reaching::Diverse; }
+                    let other = sibling.take()?;
+                    if other != reaching {
+                        let index = unions.len();
+                        unions.push([other, reaching]);
+                        reaching = Reaching::Diverse(index);
+                    }
                 }
                 Event::Branch => {
                     if sibling.replace(reaching).is_some() { return None; }
@@ -553,7 +582,7 @@ impl Holder {
             boundary.live_before = live;
         }
         if sibling.is_some() { return None; }
-        Some(events)
+        Some(Refinement::Branching { events, unions })
     }
 
     fn push_boundary(events: &mut Vec<Boundary>, point: CfgPointId, event: Event) -> Option<()> {
@@ -679,7 +708,8 @@ impl Sealed {
             if !live { continue; }
             let issue = match reaching {
                 Reaching::One(loan) if loan.owner == owner_index && mode.accepts(loan.mutable) => loan.issued,
-                Reaching::Diverse => {
+                Reaching::Diverse(_) => {
+                    if precise.excludes_owner(reaching, owner_index, mode) { continue; }
                     #[cfg(test)]
                     tests::observe(3);
                     return None;
@@ -1289,7 +1319,7 @@ pub(super) mod tests {
         let mut forks = Forks::default();
         forks.push(Fork { branch: at(4), join: at(10), second: None });
         let facts = holder.refine(&forks, at(20)).expect("one authored fork");
-        assert!(matches!(&facts, Refinement::Branching(_)));
+        assert!(matches!(&facts, Refinement::Branching { .. }));
         let cases = [
             (3, Reaching::One(old), true), // Bypass can reach the post-join read.
             (4, Reaching::One(old), true), // Branch query sees both successors.
@@ -1297,11 +1327,11 @@ pub(super) mod tests {
             (7, Reaching::One(old), true), // Incoming version; future read starts after install.
             (8, Reaching::One(taken), true),
             (9, Reaching::One(taken), true), // Independent post-join read; not the read at 9.
-            (10, Reaching::Diverse, true), // Bypass retains old issue.
-            (11, Reaching::Diverse, true),
-            (12, Reaching::Diverse, false), // This read does not count itself.
-            (13, Reaching::Diverse, false),
-            (16, Reaching::Diverse, true), // Root install still sees incoming alternatives.
+            (10, Reaching::Diverse(0), true), // Bypass retains old issue.
+            (11, Reaching::Diverse(0), true),
+            (12, Reaching::Diverse(0), false), // This read does not count itself.
+            (13, Reaching::Diverse(0), false),
+            (16, Reaching::Diverse(0), true), // Root install still sees incoming alternatives.
             (17, Reaching::One(later), true),
             (18, Reaching::One(later), false),
             (19, Reaching::One(later), false),
@@ -1310,6 +1340,14 @@ pub(super) mod tests {
             let actual = facts.facts_at(at(point));
             assert!(actual == (reaching, live), "point {point}");
         }
+        let (joined, live) = facts.facts_at(at(11));
+        assert!(live && matches!(joined, Reaching::Diverse(_)));
+        assert!(!facts.excludes_owner(joined, old.owner, AccessMode::Exclusive));
+        assert!(!facts.excludes_owner(joined, taken.owner, AccessMode::Exclusive));
+        assert!(facts.excludes_owner(joined, taken.owner, AccessMode::Shared));
+        assert!(facts.excludes_owner(joined, 2, AccessMode::Exclusive));
+        let (replaced, _) = facts.facts_at(at(17));
+        assert!(facts.excludes_owner(replaced, taken.owner, AccessMode::Exclusive));
         assert!(!AccessMode::Shared.accepts(taken.mutable));
         assert!(AccessMode::Exclusive.accepts(taken.mutable));
         let mut linear = Holder::default();
@@ -1353,8 +1391,8 @@ pub(super) mod tests {
         for (point, reaching, live) in [
             (5, has(incoming), false), (6, has(incoming), true), (7, has(written), true),
             (9, has(written), true), (10, has(incoming), true), (12, has(incoming), true),
-            (14, has(incoming), true), (15, Reaching::Diverse, true),
-            (17, Reaching::Diverse, false), (21, Reaching::Diverse, true),
+            (14, has(incoming), true), (15, Reaching::Diverse(0), true),
+            (17, Reaching::Diverse(0), false), (21, Reaching::Diverse(0), true),
             (22, has(reset), true), (24, has(reset), false),
         ] {
             assert!(facts.facts_at(at(point)) == (reaching, live), "point {point}");
