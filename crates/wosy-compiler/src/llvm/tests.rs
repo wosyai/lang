@@ -19281,30 +19281,7 @@ if (observe(3,2,1) != 21 || empty(0) != 0) { core.system_panic(); };
 
 #[test]
 fn direct_indexed_callable_invocation_snapshots_selection_before_arguments() {
-    let text = "%%start
-u64(u64) selector = fn(index) { index };
-u64(u64) argument = fn(value) { value + 1 };
-u64(u64) named = fn(value) { value + 10 };
-u64(u64,u64) fixed = fn(index,value) {
-    u64(u64)[2] operations = [named, fn(value) { value + 20 }];
-    operations[selector(index)](argument(value))
-};
-u64(u64) captured = fn(index) {
-    u64()[3] operations = [fn(i) { fn() { i } }; 3];
-    operations[selector(index)]()
-};
-u64(u64,u64,u64) generated = fn(count,first,second) {
-    u64()[] operations = [fn(i) { fn() { i } }; count];
-    operations[selector(first)]() * 10 + operations[selector(second)]()
-};
-u64(u64) empty = fn(count) {
-    u8()[] operations = [fn(_) { fn() { 7 } }; count];
-    core.array_len(&operations)
-};
-if (fixed(0,3) != 14 || fixed(1,3) != 24 || captured(2) != 2 || generated(3,2,1) != 21 || empty(0) != 0) {
-    core.system_panic();
-};
-%%end";
+    let text = include_str!("../../../../tests/fixtures/build/checked_access_release/project/src/callable_selection.w");
     for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let source = SourceIdentity::new("project".into(), "package".into(), "src/indexed-invoke.w".into(), "r1".into());
         let parse = |text: &str| {
@@ -19340,8 +19317,8 @@ if (fixed(0,3) != 14 || fixed(1,3) != 24 || captured(2) != 2 || generated(3,2,1)
             assert_eq!(body.matches(&bounds).count(), count, "{body}");
             assert_eq!(body.matches("extractvalue { ptr, i64 }").count(), count * 2, "{body}");
         }
-        let wrong_arity = text.replace("operations[selector(index)](argument(value))",
-            "operations[selector(index)](argument(value),1)");
+        let wrong_arity = text.replace("operations[selector(&!order,index)](argument(&!order,value))",
+            "operations[selector(&!order,index)](argument(&!order,value),1)");
         let errors = parse(&wrong_arity).err().expect("wrong indexed call arity cannot lower").diagnostics.clone();
         assert!(errors.iter().any(|error| error.message.contains("matching argument count")), "{errors:?}");
         if let Some(out) = std::env::var_os("WOSY_DEV4_INDEXED_CALL_IR_DIR") {
