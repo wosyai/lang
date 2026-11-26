@@ -10731,13 +10731,18 @@ impl PreparedScalarOrderedCheck {
         if startup.iter().any(|module| module.source.project != root.project || module.source.package != root.package)
             || (self.scope != ScalarCheckerScope::CurrentPackage && project.modules.len() != startup_count)
         { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
+        // Match the incumbent's authoritative zero-obligation outcome on
+        // this exact prepared proof-free owner. An empty deferred-root map
+        // alone is not enough: startup or callable obligations may remain.
+        let (potential_obligations, deferred) =
+            package_obligation_roots(&owner, self.scope, startup_count, root).map_err(configured_ordered_error)?;
+        let empty_root = (!potential_obligations).then(|| root.clone());
         let (callable_roots, mandatory_startup_scalars) = if self.scope == ScalarCheckerScope::CurrentPackage {
-            let (_, deferred) = package_obligation_roots(&owner, self.scope, startup_count, root).map_err(configured_ordered_error)?;
             plan_closed_authored_roots(&owner, root, startup_count, &ordinals, deferred, true).map_err(configured_ordered_error)?
         } else {
             (Vec::new(), Vec::new())
         };
-        Ok(PreparedStartupAuthoredCheck { owner, callable_roots,
+        Ok(PreparedStartupAuthoredCheck { owner, empty_root, callable_roots,
             mandatory_startup_scalars: mandatory_startup_scalars.into_iter().map(|(item, _)| (0, item)).collect() })
     }
 }
@@ -10806,6 +10811,7 @@ fn plan_closed_authored_roots(
 #[doc(hidden)]
 pub struct PreparedStartupAuthoredCheck {
     owner: PreparedCheckerProject,
+    empty_root: Option<SourceIdentity>,
     callable_roots: Vec<PreparedCallable>,
     mandatory_startup_scalars: Vec<PreparedCallable>,
 }
@@ -11173,6 +11179,9 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
+        if let Some(root) = &self.empty_root {
+            return Ok((Vec::new(), StartupAuthoredCompletion::Exhausted, failure_search::StartUpSearch::new(root, cap), false));
+        }
         run_startup_authored_path(&self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None, false, None)
     }
 }

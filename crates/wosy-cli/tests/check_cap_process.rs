@@ -795,3 +795,37 @@ fn check_cap_process_shares_original_bare_calls_without_multiplying_authored_pat
         }
     }
 }
+
+#[test]
+fn check_cap_process_preserves_prepared_zero_obligations_without_skipping_selected_work() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            let project = Fixture::new();
+            // A valid typed startup initializer that doesn't fit the
+            // bounded integer startup evaluator. It is not an obligation.
+            let original = "%%start f32 base = 1.5; %%end";
+            project.package("", layout, "dev", "", original);
+            for limit in [&["--all-errors"][..], &[][..], &["--max-errors", "1"][..]] {
+                let mut flags = vec![scope];
+                flags.extend(limit);
+                assert_terminal(&project.run(&flags), 0, b"", b"");
+                assert!(!project.output().exists());
+            }
+
+            let source = project.0.join("src/main.w");
+            let authored = format!("%%start unit() report = fn {{ {} }}; report(); %%end",
+                require("reached", 13, "reached.txt"));
+            fs::write(&source, &authored).unwrap();
+            assert_terminal(&project.run(&[scope]), 13, b"reached", b"[reached]");
+            assert_eq!(fs::read(project.output().join("reached.txt")).unwrap(), b"reached");
+            project.clear();
+
+            fs::write(&source, "%%start u8 broken = true; %%end").unwrap();
+            let incumbent = project.run(&[scope, "--all-errors"]);
+            assert_eq!(incumbent.status.code(), Some(2));
+            assert!(incumbent.stdout.is_empty() && String::from_utf8_lossy(&incumbent.stderr).contains("src/main.w"));
+            assert_terminal(&project.run(&[scope]), 2, b"", &incumbent.stderr);
+            assert!(!project.output().exists());
+        }
+    }
+}
