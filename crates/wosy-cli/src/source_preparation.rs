@@ -9,8 +9,9 @@ use wosy_project::{
     ObservedClosedComptimeProfile, ProjectConfiguration, ProjectContext, SourceGraph,
 };
 use wosy_compiler::{
-    derive_closed_comptime_fragment, derive_forwarded_pair_startup_comptime_plan, ClosedComptimeFragment,
-    ClosedComptimeRejection, ForwardedPairStartupComptimePlan, ScalarTargetLayout,
+    derive_closed_comptime_fragment, derive_forwarded_pair_startup_comptime_plan,
+    derive_pair_startup_call_graph_comptime_plan, ClosedComptimeFragment, ClosedComptimeRejection,
+    ForwardedPairStartupComptimePlan, PairStartupCallGraphComptimePlan, ScalarTargetLayout,
 };
 use wosy_protocol::{
     imports_from_cst, Delta, FileEntry, FileKey, FileMetadata, InstalledGitSelection, Kind,
@@ -21,7 +22,7 @@ use wosy_syntax::{ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind
 mod comptime_inputs;
 pub use comptime_inputs::{
     ClosedComptimeInputFacts, ClosedComptimeInputSelection, ForwardedPairComptimeInputFacts,
-    ForwardedPairComptimeInputSelection,
+    ForwardedPairComptimeInputSelection, PairCallGraphComptimeInputFacts, StartupComptimeInputSelection,
 };
 
 pub type Files = BTreeMap<FileKey, FileEntry>;
@@ -158,7 +159,17 @@ struct WatchSelection<'a> {
     input: Option<ComptimeInputCapture>,
 }
 
+#[derive(Clone, Copy)]
+enum ComptimeInputKind { Closed, Forwarded, Graph }
+
+impl ComptimeInputKind {
+    fn name(self) -> &'static str {
+        match self { Self::Closed => "closed", Self::Forwarded => "forwarded", Self::Graph => "startup graph" }
+    }
+}
+
 struct ComptimeInputCapture {
+    kind: ComptimeInputKind,
     layout: ScalarTargetLayout,
     ir_limit: usize,
     selected_profile: Option<ObservedClosedComptimeProfile>,
@@ -168,6 +179,7 @@ struct ComptimeInputCapture {
 enum ObservedComptimePlan {
     Closed(ClosedComptimeFragment),
     Forwarded(ForwardedPairStartupComptimePlan),
+    Graph(PairStartupCallGraphComptimePlan),
 }
 
 impl ObservedComptimePlan {
@@ -175,6 +187,7 @@ impl ObservedComptimePlan {
         match self {
             Self::Closed(fragment) => Some(fragment.site()),
             Self::Forwarded(plan) => plan.calls().first().map(|call| call.facts().site()),
+            Self::Graph(plan) => Some(plan.evidence().site()),
         }
     }
 }
@@ -184,25 +197,28 @@ impl WatchSelection<'_> {
         let parsed = fresh.result();
         if parsed.source.package != self.owner.unwrap_or(consumer) { return Ok(()); }
         if let Some(input) = &mut self.input {
-            let (kind, derived) = if self.owner.is_some() {
-                let profile = input.selected_profile.as_ref().expect("observed selected profile");
-                ("closed", derive_closed_comptime_fragment(fresh, self.id, input.layout, |name| {
-                    profile.parameters().get(name).copied().map(crate::comptime_fragment::compiler_parameter)
-                }).map(ObservedComptimePlan::Closed))
-            } else {
-                ("forwarded", derive_forwarded_pair_startup_comptime_plan(fresh, self.id, input.layout)
-                    .map(ObservedComptimePlan::Forwarded))
+            let derived = match input.kind {
+                ComptimeInputKind::Closed => {
+                    let profile = input.selected_profile.as_ref().expect("observed selected profile");
+                    derive_closed_comptime_fragment(fresh, self.id, input.layout, |name| {
+                        profile.parameters().get(name).copied().map(crate::comptime_fragment::compiler_parameter)
+                    }).map(ObservedComptimePlan::Closed)
+                }
+                ComptimeInputKind::Forwarded => derive_forwarded_pair_startup_comptime_plan(fresh, self.id, input.layout)
+                    .map(ObservedComptimePlan::Forwarded),
+                ComptimeInputKind::Graph => derive_pair_startup_call_graph_comptime_plan(fresh, self.id, input.layout)
+                    .map(ObservedComptimePlan::Graph),
             };
             return match derived {
                 Ok(plan) if self.site.is_none() => {
-                    let site = plan.site().ok_or("forwarded comptime plan has no observed call")?;
+                    let site = plan.site().ok_or("comptime plan has no observed authored site")?;
                     self.site = Some((site.clone(), file.clone()));
                     input.observed = Some(plan);
                     Ok(())
                 }
                 Ok(_) => Err("comptime watch id is repeated in the reachable owning package".into()),
                 Err(ClosedComptimeRejection::SiteNotFound) => Ok(()),
-                Err(error) => Err(format!("{kind} comptime input was not prepared: {error:?}")),
+                Err(error) => Err(format!("{} comptime input was not prepared: {error:?}", input.kind.name())),
             };
         }
         for occurrence in parsed.root.descendants().filter_map(|node| ComptimeCst::from_node(&node)) {
@@ -220,6 +236,7 @@ enum ComptimeAttachment {
     Watches(PreparedComptimeWatches),
     Closed(ClosedComptimeInputFacts),
     Forwarded(ForwardedPairComptimeInputFacts),
+    Graph(PairCallGraphComptimeInputFacts),
 }
 
 /// Reuse the ordinary resolver and its actual fresh authored CST; no
@@ -246,7 +263,8 @@ pub fn prepare_closed_comptime_input_facts(
     let selected = WatchSelection {
         profile: scope.profile, owner: Some(scope.owner), id: scope.id, limits: scope.watch_limits, site: None,
         input: Some(ComptimeInputCapture {
-            layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes, selected_profile: None, observed: None,
+            kind: ComptimeInputKind::Closed, layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes,
+            selected_profile: None, observed: None,
         }),
     };
     match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected)) {
@@ -264,21 +282,43 @@ pub fn prepare_closed_comptime_input_facts(
 pub fn prepare_forwarded_pair_comptime_input_facts(
     root: &Path, scope: ForwardedPairComptimeInputSelection<'_>,
 ) -> Result<(PreparedSources, ForwardedPairComptimeInputFacts), String> {
+    match prepare_startup_comptime_inputs(root, scope, ComptimeInputKind::Forwarded)? {
+        (prepared, ComptimeAttachment::Forwarded(facts)) => Ok((prepared, facts)),
+        _ => unreachable!("successful forwarding selection produces an input observation"),
+    }
+}
+
+/// Capture the compiler's bounded startup graph with the current consumer
+/// source and selected profile/watch observations. An all-bypass graph
+/// still observes its own authored site and has no evaluator egress.
+/// No tool execution, result storage, or public command is involved.
+pub fn prepare_pair_call_graph_comptime_input_facts(
+    root: &Path, scope: StartupComptimeInputSelection<'_>,
+) -> Result<(PreparedSources, PairCallGraphComptimeInputFacts), String> {
+    match prepare_startup_comptime_inputs(root, scope, ComptimeInputKind::Graph)? {
+        (prepared, ComptimeAttachment::Graph(facts)) => Ok((prepared, facts)),
+        _ => unreachable!("successful startup graph produces an input observation"),
+    }
+}
+
+fn prepare_startup_comptime_inputs(
+    root: &Path, scope: StartupComptimeInputSelection<'_>, kind: ComptimeInputKind,
+) -> Result<(PreparedSources, ComptimeAttachment), String> {
     if !cfg!(target_os = "linux") {
-        return Err("forwarded comptime input observation requires Linux regular source and watch reads".into());
+        return Err(format!("{} comptime input observation requires Linux regular source and watch reads", kind.name()));
     }
     let selected = WatchSelection {
         profile: scope.profile, owner: None, id: scope.id, limits: scope.watch_limits, site: None,
         input: Some(ComptimeInputCapture {
-            layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes, selected_profile: None, observed: None,
+            kind, layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes, selected_profile: None, observed: None,
         }),
     };
     match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected)) {
-        Ok((prepared, _, _, Some(ComptimeAttachment::Forwarded(facts)))) => Ok((prepared, facts)),
-        Ok(_) => unreachable!("successful forwarding selection produces an input observation"),
+        Ok((prepared, _, _, Some(facts))) => Ok((prepared, facts)),
+        Ok(_) => unreachable!("successful startup observation produces input facts"),
         Err(ObservationError::Source(error)) => Err(error),
         Err(ObservationError::LiveRead(_) | ObservationError::Changed) =>
-            unreachable!("forwarded comptime observation takes the fresh source path"),
+            unreachable!("startup comptime observation takes the fresh source path"),
     }
 }
 
@@ -470,6 +510,9 @@ fn prepare_from_observation(
                     root, authored, configuration, watches, tools, fragment, input.ir_limit,
                 )?),
                 ObservedComptimePlan::Forwarded(plan) => ComptimeAttachment::Forwarded(ForwardedPairComptimeInputFacts::observe(
+                    root, authored, configuration, watches, tools, plan, input.ir_limit,
+                )?),
+                ObservedComptimePlan::Graph(plan) => ComptimeAttachment::Graph(PairCallGraphComptimeInputFacts::observe(
                     root, authored, configuration, watches, tools, plan, input.ir_limit,
                 )?),
             };

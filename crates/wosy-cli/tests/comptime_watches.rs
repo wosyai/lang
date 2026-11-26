@@ -7,10 +7,14 @@ use std::{
 };
 use wosy_cli::source_preparation::{
     prepare, prepare_closed_comptime_input_facts, prepare_comptime_watches, prepare_forwarded_pair_comptime_input_facts,
-    ClosedComptimeInputFacts, ClosedComptimeInputSelection, ForwardedPairComptimeInputFacts,
-    ForwardedPairComptimeInputSelection, PreparedComptimeWatches, PreparedSources,
+    prepare_pair_call_graph_comptime_input_facts, ClosedComptimeInputFacts, ClosedComptimeInputSelection,
+    ForwardedPairComptimeInputFacts, ForwardedPairComptimeInputSelection, PairCallGraphComptimeInputFacts,
+    PreparedComptimeWatches, PreparedSources,
 };
-use wosy_compiler::{ComptimeParameterOrigin, ComptimeParameterValue, DirectComptimeArgument, ScalarTargetLayout, ScalarType};
+use wosy_compiler::{
+    ComptimeParameterOrigin, ComptimeParameterValue, DirectComptimeArgument, PairStartupOccurrence,
+    ScalarTargetLayout, ScalarType,
+};
 use wosy_project::{
     packages::{ComptimeWatchLimits, WatchRoot},
     ProjectConfiguration,
@@ -492,6 +496,200 @@ fn forwarded_input_observation_refuses_out_of_scope_inputs_and_cumulative_budget
     fixture.put("app/wosy.toml", with_evaluator_tools());
     fixture.put("app/src/main.w", FORWARDED_APP.replace("u32 first =", "more = namespace assets \"must-not-open.w\";\nu32 first ="));
     assert_eq!(refuse(forwarded_scope(layout)), "forwarded comptime input requires the selected singleton entry");
+    assert!(!app.join(".wosy").exists());
+}
+
+const GRAPH_PREFIX: &str = r#"%%start
+# WHY: startup com café ☕
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32(u32, u32) swap_data = fn(swap_left, swap_right) { solve(swap_right, swap_left) };
+u32(bool, u32, u32) choose = fn(select_path, data_left, data_right) {
+    if (select_path) { swap_data(data_left, data_right) } else { data_right }
+};
+u32 seed_value = choose(false, 1, 37);
+u32 carried = choose(false, 1, seed_value);"#;
+
+fn graph_app() -> String {
+    format!("{GRAPH_PREFIX}\nu32 reached = choose(true, 7, carried);\n\
+             u32 same = solve(carried, 7);\nu32 changed = solve(13, 7);\n%%end\n")
+}
+
+fn graph_manifest() -> String {
+    forwarded_manifest() + r#"
+[runners.audit]
+command = ["unresolved audit runner"]
+args = ["--audit"]
+
+[targets.app.artifacts.main.profiles.audit]
+backend = "llvm"
+output = "native"
+builder = "never"
+run_runner = "never"
+
+[targets.app.profiles.audit]
+main_artifact = "main"
+comptime_builder = "compile"
+comptime_runner = "audit"
+build_permissions = []
+build_mounts = []
+"#
+}
+
+fn assert_graph_facts(facts: &PairCallGraphComptimeInputFacts, text: &str, layout: ScalarTargetLayout, seed: u32) {
+    assert_eq!(facts.evidence().site(), &facts.watches().site);
+    assert_eq!(facts.evidence().layout(), layout);
+    let slots: Vec<_> = facts.evidence().occurrences().collect();
+    let [
+        PairStartupOccurrence::Bypass(seed_slot),
+        PairStartupOccurrence::Bypass(carried),
+        PairStartupOccurrence::Specialization(reached, path),
+        PairStartupOccurrence::Specialization(same, _),
+        PairStartupOccurrence::Specialization(changed, _),
+    ] = slots.as_slice() else { panic!("two bypasses and three reached calls in ordinary order"); };
+    let slice = |range: wosy_syntax::ByteSpan| &text[range.start as usize..range.end as usize];
+    assert_eq!(seed_slot.returned_value(), DirectComptimeArgument::U32(seed));
+    assert_eq!(slice(carried.returned_argument().range), "seed_value");
+    assert_eq!(carried.returned_origin().literal(), seed_slot.returned_argument());
+    assert_eq!(carried.returned_origin().prior_bypass_slot(), Some(0));
+    assert_eq!(slice(reached.facts().destination().range), "reached");
+    assert_eq!(path.startup_argument_positions(), [2, 1]);
+    assert_eq!(path.hop_indices(), &[1, 0]);
+    for (use_, expected, index) in [(reached, seed, 0), (same, seed, 0), (changed, 13, 1)] {
+        assert_eq!(use_.evaluator_index(), index);
+        assert_eq!(use_.facts().inputs().each_ref().map(|input| input.value()),
+            [DirectComptimeArgument::U32(expected), DirectComptimeArgument::U32(7)]);
+    }
+    let [argument, _] = reached.facts().inputs();
+    assert_eq!(slice(argument.argument().range), "carried");
+    assert_eq!(argument.origin().prior_bypass_slot(), Some(1));
+    assert_eq!(argument.origin().literal(), seed_slot.returned_argument());
+    let [a, b] = facts.evaluator_irs() else { panic!("two ordered concrete tuples"); };
+    assert_ne!(a, b);
+
+    // Independent direct closed scalar oracle verifies exact egress, without
+    // invoking the project builder/runner or compiling the evaluator module.
+    for (observed, literal) in [(a, seed), (b, 13)] {
+        let oracle_source = format!("%%start\nu32 answer = comptime prepare {{ 7 ^ {literal} }};\n%%end\n");
+        let identity = wosy_syntax::SourceIdentity::new(
+            "test oracle".into(), "oracle".into(), "oracle.w".into(),
+            blake3::hash(oracle_source.as_bytes()).to_hex().to_string(),
+        );
+        let (fresh, diagnostics) = wosy_compiler::parse_source_with_snapshot(identity, oracle_source, &[]);
+        assert!(diagnostics.is_empty());
+        let oracle = wosy_compiler::derive_closed_comptime_fragment(&fresh, "prepare", layout, |_| None).unwrap();
+        let text = oracle.llvm().to_text();
+        assert_eq!(observed.bytes, text.len());
+        assert_eq!(observed.blake3, blake3::hash(text.as_bytes()));
+    }
+}
+
+#[test]
+fn pair_graph_observation_binds_current_source_profile_watches_and_unchanged_mapping() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let text = graph_app();
+    fixture.put("app/wosy.toml", graph_manifest());
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        fixture.put("app/src/main.w", &text);
+        fixture.put("app/local/value.txt", "local");
+        let (source, baseline) = prepare_pair_call_graph_comptime_input_facts(&app, forwarded_scope(layout)).unwrap();
+        assert_eq!((source.parsed, source.reused), (1, 0));
+        assert_eq!(source.root, baseline.source_root());
+        let ordinary = prepare(&app, Some("app"), None).unwrap();
+        assert_eq!(ordinary.root, source.root);
+        assert_eq!(ordinary.delta.nodes, source.delta.nodes);
+        let root = Node::decode(&source.delta.nodes[&source.root]).unwrap();
+        let (file, metadata) = root.children.iter().find_map(|id| {
+            let node = Node::decode(&source.delta.nodes[id]).unwrap();
+            if node.kind != Kind::File { return None; }
+            let metadata: FileMetadata = serde_json::from_slice(&node.data).unwrap();
+            Some((node, metadata))
+        }).expect("singleton file record");
+        assert_eq!(file.children[0], baseline.authored_cst());
+        assert_eq!(metadata.revision.hex(), baseline.evidence().site().source.revision);
+        let (_, watch_only) = prepare_comptime_watches(
+            &app, "app", "dev", "app", "prepare", ComptimeWatchLimits::default(),
+        ).unwrap();
+        assert_eq!(baseline.watches(), &watch_only);
+        assert_eq!(rows(baseline.watches()), [content(WatchRoot::OwningPackage, "local/value.txt", "local")]);
+        assert_eq!(baseline.declared_tools().builder().1.toolchain_identity, "declared toolchain only");
+        assert_eq!(baseline.declared_tools().runner().1.args, ["--typed"]);
+        assert_graph_facts(&baseline, &text, layout, 37);
+
+        let mut scope = forwarded_scope(layout);
+        scope.profile = "audit";
+        let (_, audit) = prepare_pair_call_graph_comptime_input_facts(&app, scope).unwrap();
+        assert_eq!(audit.source_root(), baseline.source_root());
+        assert_eq!(audit.authored_cst(), baseline.authored_cst());
+        assert_eq!(audit.configuration_identity(), baseline.configuration_identity());
+        assert_eq!(audit.evaluator_irs(), baseline.evaluator_irs());
+        assert_eq!(audit.watches().profile, "audit");
+        assert_eq!(audit.watches().files, baseline.watches().files);
+        assert_eq!(audit.declared_tools().runner().1.args, ["--audit"]);
+        assert_graph_facts(&audit, &text, layout, 37);
+
+        fixture.put("app/ignored/other.tsv", "unselected");
+        let (_, unchanged) = prepare_pair_call_graph_comptime_input_facts(&app, forwarded_scope(layout)).unwrap();
+        assert_eq!(unchanged.watches(), baseline.watches());
+        fixture.put("app/local/value.txt", "LOCAL");
+        let (_, watched) = prepare_pair_call_graph_comptime_input_facts(&app, forwarded_scope(layout)).unwrap();
+        assert_eq!(watched.source_root(), baseline.source_root());
+        assert_eq!(watched.authored_cst(), baseline.authored_cst());
+        assert_eq!(watched.evaluator_irs(), baseline.evaluator_irs());
+        assert_eq!(watched.watches().site, baseline.watches().site);
+        assert_eq!(rows(watched.watches()), [content(WatchRoot::OwningPackage, "local/value.txt", "LOCAL")]);
+        assert_graph_facts(&watched, &text, layout, 37);
+
+        let edited = text.replace("1, 37", "1, 45");
+        fixture.put("app/src/main.w", &edited);
+        let (_, changed) = prepare_pair_call_graph_comptime_input_facts(&app, forwarded_scope(layout)).unwrap();
+        assert_ne!(changed.source_root(), baseline.source_root());
+        assert_ne!(changed.authored_cst(), baseline.authored_cst());
+        assert_eq!(changed.watches().files, watched.watches().files);
+        assert_ne!(changed.evaluator_irs()[0], baseline.evaluator_irs()[0]);
+        assert_eq!(changed.evaluator_irs()[1], baseline.evaluator_irs()[1]);
+        assert_graph_facts(&changed, &edited, layout, 45);
+        assert!(!app.join(".wosy").exists());
+    }
+}
+
+#[test]
+fn pair_graph_observation_keeps_all_bypass_site_and_refuses_budget_or_scope_limits() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let manifest = graph_manifest();
+    fixture.put("app/wosy.toml", &manifest);
+    let layout = ScalarTargetLayout::NATIVE64;
+    let run = |scope| prepare_pair_call_graph_comptime_input_facts(&app, scope);
+    let mut scope = forwarded_scope(layout);
+    scope.max_ir_bytes = 0;
+    fixture.put("app/src/main.w", format!("{GRAPH_PREFIX}\n%%end\n"));
+    let (prepared, zero) = run(scope).unwrap();
+    assert_eq!(prepared.root, prepare(&app, Some("app"), None).unwrap().root);
+    let evidence = zero.evidence();
+    assert_eq!(evidence.calls().len(), 0);
+    assert_eq!(evidence.occurrences().len(), 2);
+    assert!(evidence.occurrences().all(|item| matches!(item, PairStartupOccurrence::Bypass(_))));
+    assert_eq!(evidence.site(), &zero.watches().site);
+    assert_eq!(evidence.layout(), layout);
+    assert!(zero.evaluator_irs().is_empty());
+    assert_eq!(rows(zero.watches()), [content(WatchRoot::OwningPackage, "local/value.txt", "local")]);
+    fixture.put("app/src/main.w", graph_app());
+    let (_, full) = run(forwarded_scope(layout)).unwrap();
+    let total: usize = full.evaluator_irs().iter().map(|ir| ir.bytes).sum();
+    let mut scope = forwarded_scope(layout);
+    scope.max_ir_bytes = total - 1;
+    assert!(full.evaluator_irs().iter().all(|ir| ir.bytes <= scope.max_ir_bytes));
+    assert!(run(scope).err().unwrap().contains("evaluator IR exceeds byte budget"));
+    let mut scope = forwarded_scope(layout);
+    scope.max_ir_bytes = total;
+    assert_eq!(run(scope).unwrap().1.evaluator_irs(), full.evaluator_irs());
+
+    let mut scope = forwarded_scope(layout);
+    scope.watch_limits.content_bytes = 4;
+    assert!(run(scope).err().unwrap().contains("file byte limit"));
+    fixture.put("app/wosy.toml", manifest.replace("build_permissions = []", "build_permissions = [\"network\"]"));
+    assert!(run(forwarded_scope(layout)).err().unwrap().contains("does not resolve build permissions or mounts"));
     assert!(!app.join(".wosy").exists());
 }
 

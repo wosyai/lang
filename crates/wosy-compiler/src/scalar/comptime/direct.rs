@@ -358,35 +358,64 @@ pub enum PairStartupOccurrence<'a> {
     Bypass(&'a PairStartupBypass),
 }
 
+#[derive(Debug)]
 enum PairStartupOrder {
     Specialization(usize),
     Bypass(PairStartupBypass),
 }
 
-pub struct PairStartupCallGraphComptimePlan {
-    plan: DirectStartupComptimePlan<2>,
+/// Typed startup proof without retained evaluator modules or result authority.
+#[derive(Debug)]
+pub struct PairStartupCallGraphEvidence {
+    site: SourceSpan,
+    layout: ScalarTargetLayout,
+    calls: Vec<DirectStartupComptimeUse<2>>,
     hops: Vec<PairStartupCallHop>,
     selectors: Vec<PairStartupSelector>,
     paths: Vec<PairStartupCallPath>,
     order: Vec<PairStartupOrder>,
 }
 
-impl PairStartupCallGraphComptimePlan {
+impl PairStartupCallGraphEvidence {
+    /// The authored site still exists when no startup occurrence reaches it.
+    pub fn site(&self) -> &SourceSpan { &self.site }
+    pub fn layout(&self) -> ScalarTargetLayout { self.layout }
     pub fn hops(&self) -> &[PairStartupCallHop] { &self.hops }
     pub fn selectors(&self) -> &[PairStartupSelector] { &self.selectors }
     /// Only calls that actually reach the comptime site.
     pub fn calls(&self) -> impl ExactSizeIterator<Item = (&DirectStartupComptimeUse<2>, &PairStartupCallPath)> {
-        self.plan.calls().iter().zip(&self.paths)
+        self.calls.iter().zip(&self.paths)
     }
     /// All ordinary startup slots, including proven bypasses, in order.
     pub fn occurrences(&self) -> impl ExactSizeIterator<Item = PairStartupOccurrence<'_>> {
         self.order.iter().map(|slot| match slot {
             PairStartupOrder::Specialization(index) =>
-                PairStartupOccurrence::Specialization(&self.plan.calls()[*index], &self.paths[*index]),
+                PairStartupOccurrence::Specialization(&self.calls[*index], &self.paths[*index]),
             PairStartupOrder::Bypass(slot) => PairStartupOccurrence::Bypass(slot),
         })
     }
-    pub fn evaluators(&self) -> &[ClosedComptimeFragment] { self.plan.evaluators() }
+}
+
+pub struct PairStartupCallGraphComptimePlan {
+    evidence: PairStartupCallGraphEvidence,
+    evaluators: Vec<ClosedComptimeFragment>,
+}
+
+impl PairStartupCallGraphComptimePlan {
+    pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    pub fn hops(&self) -> &[PairStartupCallHop] { self.evidence.hops() }
+    pub fn selectors(&self) -> &[PairStartupSelector] { self.evidence.selectors() }
+    pub fn calls(&self) -> impl ExactSizeIterator<Item = (&DirectStartupComptimeUse<2>, &PairStartupCallPath)> {
+        self.evidence.calls()
+    }
+    pub fn occurrences(&self) -> impl ExactSizeIterator<Item = PairStartupOccurrence<'_>> {
+        self.evidence.occurrences()
+    }
+    pub fn evaluators(&self) -> &[ClosedComptimeFragment] { &self.evaluators }
+
+    pub fn into_parts(self) -> (PairStartupCallGraphEvidence, Vec<ClosedComptimeFragment>) {
+        (self.evidence, self.evaluators)
+    }
 }
 
 /// Inspect the selected comptime function and up to eight safe local
@@ -407,11 +436,12 @@ pub fn derive_pair_startup_call_graph_comptime_plan(
 ) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
     with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
         StartupEntry::PairCallGraph, |calls, body, name_span, proof| {
-            let VerifiedStartupPaths::Graph { hops, selectors, paths, order } = proof else {
+            let VerifiedStartupPaths::Graph { site, hops, selectors, paths, order } = proof else {
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
             };
-            let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
-            Ok(PairStartupCallGraphComptimePlan { plan, hops, selectors, paths, order })
+            let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls)?.into_parts();
+            let evidence = PairStartupCallGraphEvidence { site, layout, calls, hops, selectors, paths, order };
+            Ok(PairStartupCallGraphComptimePlan { evidence, evaluators })
         })
 }
 
@@ -501,6 +531,7 @@ enum VerifiedStartupPaths {
     Direct,
     OneForwarder(PairStartupForwarding),
     Graph {
+        site: SourceSpan,
         hops: Vec<PairStartupCallHop>,
         selectors: Vec<PairStartupSelector>,
         paths: Vec<PairStartupCallPath>,
@@ -863,7 +894,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             })
         }
         StartupEntry::PairCallGraph => VerifiedStartupPaths::Graph {
-            hops: hops.into_iter().map(|hop| hop.edge).collect(), selectors, paths, order,
+            site: scope(site.span), hops: hops.into_iter().map(|hop| hop.edge).collect(), selectors, paths, order,
         },
     };
     observe(selected, body, super::super::token_span(&site.id), proof)

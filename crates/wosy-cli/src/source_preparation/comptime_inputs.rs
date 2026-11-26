@@ -3,7 +3,7 @@ use crate::comptime_fragment::{write_compiler_evaluator_ir, StagedEvaluatorIr};
 use std::io;
 use wosy_compiler::{
     ClosedComptimeFragment, ComptimeParameterUse, DirectStartupComptimeUse, ForwardedPairStartupComptimePlan,
-    PairStartupForwarding, ScalarTargetLayout, ScalarType,
+    PairStartupCallGraphComptimePlan, PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
 };
 use wosy_project::{packages::ComptimeWatchLimits, SelectedComptimeTools};
 use wosy_protocol::NodeId;
@@ -63,7 +63,7 @@ impl ClosedComptimeInputFacts {
 }
 
 
-pub struct ForwardedPairComptimeInputSelection<'a> {
+pub struct StartupComptimeInputSelection<'a> {
     pub target: &'a str,
     pub profile: &'a str,
     pub id: &'a str,
@@ -71,6 +71,8 @@ pub struct ForwardedPairComptimeInputSelection<'a> {
     pub watch_limits: ComptimeWatchLimits,
     pub max_ir_bytes: usize,
 }
+
+pub type ForwardedPairComptimeInputSelection<'a> = StartupComptimeInputSelection<'a>;
 
 /// One ordinary consumer-owned startup observation, with authored positional
 /// evidence and separate evaluator slots. No result/key, launcher permission,
@@ -97,14 +99,7 @@ impl ForwardedPairComptimeInputFacts {
         let (forwarding, plan) = plan.into_parts();
         let (calls, fragments) = plan.into_parts();
         let evaluator_layout = fragments.first().ok_or("forwarded comptime plan has no evaluator")?.layout();
-        let mut evaluator_irs = Vec::with_capacity(fragments.len());
-        let mut remaining = max_ir_bytes.min(1 << 20);
-        for fragment in fragments {
-            let ir = write_compiler_evaluator_ir(&fragment, &mut io::sink(), remaining)
-                .map_err(|error| error.to_string())?;
-            remaining -= ir.bytes;
-            evaluator_irs.push(ir);
-        }
+        let evaluator_irs = observe_evaluator_irs(&fragments, max_ir_bytes)?;
         Ok(Self {
             source_root, authored_cst, configuration, watches, declared_tools, evaluator_layout,
             forwarding, calls, evaluator_irs,
@@ -120,4 +115,50 @@ impl ForwardedPairComptimeInputFacts {
     pub fn forwarding(&self) -> &PairStartupForwarding { &self.forwarding }
     pub fn calls(&self) -> &[DirectStartupComptimeUse<2>] { &self.calls }
     pub fn evaluator_irs(&self) -> &[StagedEvaluatorIr] { &self.evaluator_irs }
+}
+
+/// Read-only attachment to the current consumer singleton source. The
+/// compiler's proof keeps every ordinary slot, including all-bypass plans.
+/// It authenticates separate IR egress digests, not result/key/launch authority.
+#[derive(Debug)]
+pub struct PairCallGraphComptimeInputFacts {
+    source_root: NodeId,
+    authored_cst: NodeId,
+    configuration: String,
+    watches: PreparedComptimeWatches,
+    declared_tools: SelectedComptimeTools,
+    evidence: PairStartupCallGraphEvidence,
+    evaluator_irs: Vec<StagedEvaluatorIr>,
+}
+
+impl PairCallGraphComptimeInputFacts {
+    pub(super) fn observe(
+        source_root: NodeId, authored_cst: NodeId, configuration: String, watches: PreparedComptimeWatches,
+        declared_tools: SelectedComptimeTools, plan: PairStartupCallGraphComptimePlan,
+        max_ir_bytes: usize,
+    ) -> Result<Self, String> {
+        let (evidence, fragments) = plan.into_parts();
+        let evaluator_irs = observe_evaluator_irs(&fragments, max_ir_bytes)?;
+        Ok(Self { source_root, authored_cst, configuration, watches, declared_tools, evidence, evaluator_irs })
+    }
+
+    pub fn source_root(&self) -> NodeId { self.source_root }
+    pub fn authored_cst(&self) -> NodeId { self.authored_cst }
+    pub fn configuration_identity(&self) -> &str { &self.configuration }
+    pub fn watches(&self) -> &PreparedComptimeWatches { &self.watches }
+    pub fn declared_tools(&self) -> &SelectedComptimeTools { &self.declared_tools }
+    pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    pub fn evaluator_irs(&self) -> &[StagedEvaluatorIr] { &self.evaluator_irs }
+}
+
+fn observe_evaluator_irs(fragments: &[ClosedComptimeFragment], max_ir_bytes: usize) -> Result<Vec<StagedEvaluatorIr>, String> {
+    let mut observed = Vec::with_capacity(fragments.len());
+    let mut remaining = max_ir_bytes.min(1 << 20);
+    for fragment in fragments {
+        let ir = write_compiler_evaluator_ir(fragment, &mut io::sink(), remaining)
+            .map_err(|error| error.to_string())?;
+        remaining -= ir.bytes;
+        observed.push(ir);
+    }
+    Ok(observed)
 }

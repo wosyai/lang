@@ -2539,8 +2539,8 @@ pub use comptime::{
     DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
-    PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput, PairStartupOccurrence,
-    PairStartupSelector, StartupArgumentOrigin,
+    PairStartupCallGraphEvidence, PairStartupCallHop, PairStartupCallPath, PairStartupForwarding,
+    PairStartupHopInput, PairStartupOccurrence, PairStartupSelector, StartupArgumentOrigin,
 };
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
