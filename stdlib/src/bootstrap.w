@@ -1876,14 +1876,14 @@ utf8(u128) _format_u128 = fn(value) {
 	}
 };
 
-i32(u8[], u64, u64, i32, bool) _format_carry_f32 = fn(scratch, round_position, digit_start, exponent, rounding) {
+i32(*!(u8[]), u64, u64, i32, bool) _format_carry_f32 = fn(scratch, round_position, digit_start, exponent, rounding) {
 	u8 zero_digit = 48;
 	if (rounding) {
 		u64 one = core.int_extend<u64>(1);
 		u8 point = 46;
 		u8 nine_digit = 57;
 		u8 one_digit = 1;
-		u8 current = scratch[round_position];
+		u8 current = _format_load_byte(&(*scratch), round_position);
 		bool is_point = current == point;
 		bool is_nine = current == nine_digit;
 		bool at_start = round_position == digit_start;
@@ -1892,31 +1892,32 @@ i32(u8[], u64, u64, i32, bool) _format_carry_f32 = fn(scratch, round_position, d
 		bool carry_stop = !is_point && is_nine && at_start;
 		bool carry_done = !is_point && !is_nine;
 		if (carry_back) {
-			scratch[round_position] = zero_digit;
+			_format_store_byte(&!(*scratch), round_position, zero_digit);
 			round_position = round_position - one;
 		};
 		if (carry_stop) {
-			scratch[round_position] = zero_digit;
+			_format_store_byte(&!(*scratch), round_position, zero_digit);
 			rounding = false;
 		};
 		if (carry_done) {
-			scratch[round_position] = current + one_digit;
+			u8 rendered_byte = current + one_digit;
+			_format_store_byte(&!(*scratch), round_position, rendered_byte);
 			rounding = false;
 		};
 		_format_carry_f32(scratch, round_position, digit_start, exponent, rounding)
 	} else {
-		u8 leading = scratch[digit_start];
+		u8 leading = _format_load_byte(&(*scratch), digit_start);
 		if (leading == zero_digit) {
 			u8 one_char = 49;
 			i32 one_count = 1;
-			scratch[digit_start] = one_char;
+			_format_store_byte(&!(*scratch), digit_start, one_char);
 			exponent = exponent + one_count;
 		};
 		exponent
 	}
 };
 
-(u64, i32)(u8[], u64, u64, u64, f64, i32) _format_digits_f32 = fn(scratch, digit_start, emit, produced, scaled, exponent) {
+(u64, i32)(*!(u8[]), u64, u64, u64, f64, i32) _format_digits_f32 = fn(scratch, digit_start, emit, produced, scaled, exponent) {
 	u64 nine = core.int_extend<u64>(9);
 	u64 one = core.int_extend<u64>(1);
 	if (produced < nine) {
@@ -1926,10 +1927,11 @@ i32(u8[], u64, u64, i32, bool) _format_carry_f32 = fn(scratch, round_position, d
 		f64 ten_value = 10.0;
 		i32 digit_value = core.float_to_sint_trunc<i32>(scaled);
 		u8 digit = core.int_trunc<u8>(digit_value);
-		scratch[emit] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), emit, rendered_byte);
 		emit = emit + one;
 		if (produced == zero) {
-			scratch[emit] = point;
+			_format_store_byte(&!(*scratch), emit, point);
 			emit = emit + one;
 		};
 		f64 whole = core.sint_to_float<f64>(digit_value);
@@ -1977,7 +1979,7 @@ utf8(f32) _format_f32 = fn(value) {
 		u64 budget = 50;
 		f64 down, i32 down_exponent = _format_normalize_float_down(magnitude, zero_count, budget);
 		f64 scaled, i32 normalized_exponent = _format_normalize_float_up(down, down_exponent, budget);
-		u64 digit_emit, i32 exponent = _format_digits_f32(scratch, emit, emit, zero, scaled, normalized_exponent);
+		u64 digit_emit, i32 exponent = _format_digits_f32(&!scratch, emit, emit, zero, scaled, normalized_exponent);
 		emit = digit_emit;
 		scratch[emit] = exponent_mark;
 		emit = emit + one;
@@ -2016,14 +2018,14 @@ utf8(f32) _format_f32 = fn(value) {
 	text
 };
 
-i32(u8[], u64, u64, i32, bool) _format_carry_f64 = fn(scratch, round_position, digit_start, exponent, rounding) {
+i32(*!(u8[]), u64, u64, i32, bool) _format_carry_f64 = fn(scratch, round_position, digit_start, exponent, rounding) {
 	u8 zero_digit = 48;
 	if (rounding) {
 		u64 one = core.int_extend<u64>(1);
 		u8 point = 46;
 		u8 nine_digit = 57;
 		u8 one_digit = 1;
-		u8 current = scratch[round_position];
+		u8 current = _format_load_byte(&(*scratch), round_position);
 		bool is_point = current == point;
 		bool is_nine = current == nine_digit;
 		bool at_start = round_position == digit_start;
@@ -2032,31 +2034,32 @@ i32(u8[], u64, u64, i32, bool) _format_carry_f64 = fn(scratch, round_position, d
 		bool carry_stop = !is_point && is_nine && at_start;
 		bool carry_done = !is_point && !is_nine;
 		if (carry_back) {
-			scratch[round_position] = zero_digit;
+			_format_store_byte(&!(*scratch), round_position, zero_digit);
 			round_position = round_position - one;
 		};
 		if (carry_stop) {
-			scratch[round_position] = zero_digit;
+			_format_store_byte(&!(*scratch), round_position, zero_digit);
 			rounding = false;
 		};
 		if (carry_done) {
-			scratch[round_position] = current + one_digit;
+			u8 rendered_byte = current + one_digit;
+			_format_store_byte(&!(*scratch), round_position, rendered_byte);
 			rounding = false;
 		};
 		_format_carry_f64(scratch, round_position, digit_start, exponent, rounding)
 	} else {
-		u8 leading = scratch[digit_start];
+		u8 leading = _format_load_byte(&(*scratch), digit_start);
 		if (leading == zero_digit) {
 			u8 one_char = 49;
 			i32 one_count = 1;
-			scratch[digit_start] = one_char;
+			_format_store_byte(&!(*scratch), digit_start, one_char);
 			exponent = exponent + one_count;
 		};
 		exponent
 	}
 };
 
-(u64, i32)(u8[], u64, u64, u64, f64, i32) _format_digits_f64 = fn(scratch, digit_start, emit, produced, scaled, exponent) {
+(u64, i32)(*!(u8[]), u64, u64, u64, f64, i32) _format_digits_f64 = fn(scratch, digit_start, emit, produced, scaled, exponent) {
 	u64 seventeen = core.int_extend<u64>(17);
 	u64 one = core.int_extend<u64>(1);
 	if (produced < seventeen) {
@@ -2066,10 +2069,11 @@ i32(u8[], u64, u64, i32, bool) _format_carry_f64 = fn(scratch, round_position, d
 		f64 ten_value = 10.0;
 		i32 digit_value = core.float_to_sint_trunc<i32>(scaled);
 		u8 digit = core.int_trunc<u8>(digit_value);
-		scratch[emit] = zero_digit + digit;
+		u8 rendered_byte = zero_digit + digit;
+		_format_store_byte(&!(*scratch), emit, rendered_byte);
 		emit = emit + one;
 		if (produced == zero) {
-			scratch[emit] = point;
+			_format_store_byte(&!(*scratch), emit, point);
 			emit = emit + one;
 		};
 		f64 whole = core.sint_to_float<f64>(digit_value);
@@ -2116,7 +2120,7 @@ utf8(f64) _format_f64 = fn(value) {
 		u64 budget = 400;
 		f64 down, i32 down_exponent = _format_normalize_float_down(magnitude, zero_count, budget);
 		f64 scaled, i32 normalized_exponent = _format_normalize_float_up(down, down_exponent, budget);
-		u64 digit_emit, i32 exponent = _format_digits_f64(scratch, emit, emit, zero, scaled, normalized_exponent);
+		u64 digit_emit, i32 exponent = _format_digits_f64(&!scratch, emit, emit, zero, scaled, normalized_exponent);
 		emit = digit_emit;
 		scratch[emit] = exponent_mark;
 		emit = emit + one;

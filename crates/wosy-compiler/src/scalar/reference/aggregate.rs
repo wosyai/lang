@@ -10614,10 +10614,14 @@ pub(crate) fn exclusive_runtime_relay_signature(parameters: &[ScalarType], outpu
             || outputs.iter().all(|output| exclusive_relay_scalar(&output.ty)))
 }
 
+fn ordinary_scalar_tail_pair(types: &[ScalarType]) -> bool {
+    matches!(types, [first, second] if ordinary_value(first) && ordinary_value(second))
+}
+
 fn exact_exclusive_runtime_relay(
     cfg: &ScalarReferenceCfg, sites: &FunctionCallSites, function: &ScalarFunction,
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
-    facts: &CallablePointFacts,
+    facts: &CallablePointFacts, conditional_inputs: &BTreeMap<CfgPointId, ConditionalInputRegion>,
 ) -> Option<(ByteSpan, Vec<(usize, PrivateRuntimePairCall)>)> {
     let ScalarType::Callable { parameters, outputs } = &function.signature else { return None };
     if !exclusive_runtime_relay_signature(parameters, &outputs.outputs)
@@ -10667,16 +10671,84 @@ fn exact_exclusive_runtime_relay(
         }
     }
     let mut exact = HashSet::from([*entry_bind]);
+    // Recognize only the prepared scalar pair at the terminal conditional.
+    // Its merged points carry no ownership and do not add a call edge.
+    let scalar_tail = (|| {
+        let structure = &sites.structure;
+        let slots: Vec<_> = structure.blocks.get(structure.root.0)?.final_outputs().collect();
+        let primary = slots.first()?;
+        let projection = structure.conditional_output_projections.get(&primary.expression)?;
+        if !ordinary_scalar_tail_pair(&projection.types) || slots.len() != projection.types.len()
+            || slots.len() != outputs.outputs.len() || slots.iter().enumerate().any(|(index, slot)|
+                slot.output != index || slot.expression != primary.expression
+                    || slot.item != primary.item || slot.span != primary.span
+                    || projection.types[index] != outputs.outputs[index].ty)
+        { return None; }
+        let mut regions = conditional_inputs.values().filter(|region| region.expression == primary.expression);
+        let region = regions.next()?;
+        if regions.next().is_some() { return None; }
+        let ConditionalRegion::Value { then_block, else_block, .. } = sites.conditionals.get(&primary.expression)?
+            else { return None; };
+        let points = &cfg.points;
+        let branch = points.get(region.branch.0)?;
+        if !matches!(branch.kind, CfgPointKind::Branch { .. }) || branch.scope != entry.scope
+            || branch.successors.as_slice() != region.entries
+        { return None; }
+        let mut arms = Vec::new();
+        for (side, block) in [then_block, else_block].into_iter().enumerate() {
+            let terminal = points.get(region.terminals[side].0)?;
+            let start = points.get(region.entries[side].0)?;
+            if !matches!(start.kind, CfgPointKind::ScopeEnter) || !matches!(terminal.kind, CfgPointKind::ScopeExit)
+                || start.scope != terminal.scope || terminal.scope == entry.scope
+                || terminal.successors.as_slice() != [region.join]
+            { return None; }
+            let values: Vec<_> = structure.blocks.get(block.0)?.final_outputs().collect();
+            if values.len() != slots.len() { return None; }
+            arms.push((start, terminal, values));
+        }
+        let no_origin = |point: &ReferenceFlowPoint| point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty);
+        let mut next = region.join;
+        let mut projections = Vec::new();
+        for (lane, ty) in projection.types.iter().enumerate() {
+            let point = points.get(next.0)?;
+            let CfgPointKind::ConditionalOutput { then_point, else_point } = point.kind else { return None; };
+            if point.scope != entry.scope || point.source_span.range != primary.span || !no_origin(point) {
+                return None;
+            }
+            for ((start, terminal, values), value) in arms.iter().zip([then_point, else_point]) {
+                let output = points.get(value.0)?;
+                let slot = values.get(lane)?;
+                if slot.output != lane || structure.checked_types.expressions.get(&slot.expression) != Some(ty)
+                    || !(start.id < value && value < terminal.id) || output.scope != terminal.scope
+                    || output.source_span.range != sites.occurrences.get(slot.expression.0)?.span
+                    || !no_origin(output)
+                { return None; }
+            }
+            projections.push(point.id);
+            next = linear_successor(points, point.id)?;
+        }
+        for (lane, value) in projections.iter().copied().enumerate() {
+            let point = points.get(next.0)?;
+            if point.scope != entry.scope || point.source_span.range != primary.span || !no_origin(point)
+                || !matches!(point.kind, CfgPointKind::ReturnOutput { output, value_point, checked: false }
+                    if output == lane && value_point == value)
+            { return None; }
+            next = linear_successor(points, point.id)?;
+        }
+        Some(projections)
+    })();
+    exact.extend(scalar_tail.into_iter().flatten());
     let mut calls = Vec::new();
     for occurrence in &sites.call_occurrences {
         let ordinal = occurrence.ordinal;
         let call = cfg.primary_call_point(ordinal)?;
         let call_point = cfg.points.get(call.0)?;
         let no_origin = |point: &ReferenceFlowPoint| point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty);
-        // This checked integral conversion cannot receive or expose the
-        // backing. Its lowering stays the ordinary Core operation.
+        // These checked scalar conversions cannot receive or expose the
+        // backing. Lowering remains the ordinary Core operation.
         if let CfgPointKind::Call {
-            target: ResolvedCallTarget::Core(CoreOperationId::IntExtend | CoreOperationId::IntTrunc),
+            target: ResolvedCallTarget::Core(operation @ (CoreOperationId::IntExtend | CoreOperationId::IntTrunc
+                | CoreOperationId::FloatToSintTrunc | CoreOperationId::SintToFloat)),
             expression: ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
         } = &call_point.kind {
             let [argument] = argument_points.as_slice() else { return None; };
@@ -10685,10 +10757,21 @@ fn exact_exclusive_runtime_relay(
                 OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(0),
             ))? else { return None; };
             let types = &sites.structure.checked_types.expressions;
+            let input_ty = types.get(&input)?;
+            let output_ty = types.get(&ordinal)?;
             let integer = crate::scalar::typecheck::is_integer_type;
+            let float = |ty: &ScalarType| matches!(ty, ScalarType::F32 | ScalarType::F64);
+            let signed = |ty: &ScalarType| matches!(ty,
+                ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128);
+            let typed = match operation {
+                CoreOperationId::IntExtend | CoreOperationId::IntTrunc => integer(input_ty) && integer(output_ty),
+                CoreOperationId::FloatToSintTrunc => float(input_ty) && signed(output_ty),
+                CoreOperationId::SintToFloat => signed(input_ty) && float(output_ty),
+                _ => false,
+            };
             if arguments.len() != 1 || !no_origin(call_point) || !no_origin(actual)
                 || actual.scope != call_point.scope || actual.source_span.range != sites.occurrences.get(input.0)?.span
-                || !integer(types.get(&input)?) || !integer(types.get(&ordinal)?)
+                || !typed
             { return None; }
             exact.insert(call);
             continue;
@@ -10721,15 +10804,15 @@ fn exact_exclusive_runtime_relay(
                 output.ty == ScalarType::Unit || exclusive_relay_scalar(&output.ty));
         if !owns_argument && (!scalar_companion || !no_origin(call_point)) { return None; }
         let arity = signature.outputs.outputs.len();
-        let scalar_declaration = scalar_companion.then(|| binding_outputs.get(&ordinal)).flatten();
-        if let Some((_, _, binding, outputs)) = scalar_declaration {
+        let grouped_declaration = binding_outputs.get(&ordinal);
+        if let Some((_, _, binding, outputs)) = grouped_declaration {
             if binding.receivers().len() != arity || outputs.secondary.len() + 1 != arity
                 || !outputs.secondary.iter().enumerate().all(|(lane, output)|
                     matches!(output, BindingOutput::ProjectPrimary { output } if *output == lane + 1))
             { return None; }
         }
         let bound_projection = |lane: usize, producer: &ReferenceFlowPoint| {
-            let &(block, item, binding, _) = scalar_declaration?;
+            let &(block, item, binding, _) = grouped_declaration?;
             let receiver = binding.receivers().get(lane)?;
             let result = signature.outputs.outputs.get(lane)?;
             let BindingDefinition::Initialized { bind, value } =
@@ -10744,12 +10827,12 @@ fn exact_exclusive_runtime_relay(
         };
         let mut producer = call_point;
         for lane in 1..arity {
-            let predecessor = if scalar_declaration.is_some() {
+            let predecessor = if grouped_declaration.is_some() {
                 bound_projection(lane - 1, producer)?
             } else { producer };
             let [next] = predecessor.successors.as_slice() else { return None; };
             let projection = cfg.points.get(next.0)?;
-            if (scalar_companion && !no_origin(projection))
+            if ((scalar_companion || grouped_declaration.is_some()) && !no_origin(projection))
                 || projection.scope != call_point.scope || projection.source_span != call_point.source_span
                 || !matches!(&projection.kind, CfgPointKind::Call {
                     target, expression: source, argument_points: inputs, output,
@@ -10758,8 +10841,11 @@ fn exact_exclusive_runtime_relay(
             exact.insert(*next);
             producer = projection;
         }
+        if grouped_declaration.is_some() {
+            if !no_origin(call_point) { return None; }
+            bound_projection(arity.checked_sub(1)?, producer)?;
+        }
         if scalar_companion {
-            if scalar_declaration.is_some() { bound_projection(arity.checked_sub(1)?, producer)?; }
             for (slot, (&point, ty)) in argument_points.iter().zip(&signature.parameters).enumerate() {
                 let actual = cfg.points.get(point.0)?;
                 let OccurrenceNode::Expression(argument) = *sites.structure.edges.get(&(
@@ -11060,6 +11146,7 @@ impl ProjectReferenceResults {
                     let Some(sites) = module_at(module).and_then(|input| input.calls.function_body(item, arm)) else { continue };
                     let Some((formal, calls)) = exact_exclusive_runtime_relay(
                         &result.cfg, sites, function, &declarations, &result.proof_points,
+                        &result.aggregate.conditional_input_regions,
                     ) else { continue };
                     routes.insert(key, PrivateRuntimeAccessRoute::ExclusiveRelay(formal));
                     exclusive_edges.insert(key, calls);
@@ -11411,6 +11498,19 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_runtime_tail_projection_accepts_only_primitive_scalar_pairs() {
+        let tag = ScalarType::Enum(crate::ScalarEnumId {
+            source: SourceIdentity::new("project".into(), "package".into(), "typed".into(), "r1".into()),
+            index: 0,
+        });
+        assert!(ordinary_scalar_tail_pair(&[ScalarType::U64, ScalarType::I32]));
+        assert!(!ordinary_scalar_tail_pair(&[ScalarType::U64]));
+        assert!(!ordinary_scalar_tail_pair(&[ScalarType::U64, ScalarType::I32, ScalarType::U8]));
+        assert!(exclusive_relay_scalar(&tag));
+        assert!(!ordinary_scalar_tail_pair(&[ScalarType::U64, tag]));
+    }
 
     #[test]
     fn grouped_extent_excludes_resolved_and_opaque_destructive_effects() {
