@@ -395,7 +395,7 @@ impl<'a> Cohort<'a> {
             Some(observer)
         } else { None };
         let incoming = calls.owned_direct_startup_callable_uses(root, provider,
-            targets.iter().map(|(_, source, span, _)| (*source, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
+            targets.iter().map(|(_, source, span, _)| (*source, *span)), rank.map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
         let mut trace = match cap {
             Some(cap) => failure_search::StartUpSearch::new(root, cap),
             None => failure_search::StartUpSearch::formal_only(root),

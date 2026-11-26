@@ -3343,6 +3343,51 @@ main_artifact = "main"
                 assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
                 assert!(!state.exists());
 
+                let qualified_rank = format!(r#"%%start
+                    lib = namespace app "shared.w";
+                    u8 base = lib.descend(2);
+                    u8 recursed = lib.descend(8);
+                    core.require(base == 4, {unused_output});
+                    core.require(recursed == 4, {unused_output});
+                    core.require(false, {second});
+                %%end"#);
+                let ranked_provider = format!(r#"%%start
+                    u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+                    proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {{
+                        if (entry < 3) {{ core.show(out == 4); }} else {{ core.use(rank(entry - 3)); }}
+                    }}
+                    core.require(false, {first});
+                %%end"#);
+                fs::write(&source, &qualified_rank).unwrap();
+                fs::write(&shared_source, ranked_provider).unwrap();
+                let incumbent = terminal(&[legacy()], scope, false);
+                assert_eq!(incumbent, (Ok(19), b"firstsecond".to_vec(), b"[first][second]".to_vec()));
+                assert_eq!(files(), both_files);
+                clean();
+                for cap in [1, 2, 3] {
+                    let receipts = selected(cap);
+                    let report = receipts[0].outcome.as_ref().unwrap();
+                    assert!(report.active && report.symbolic_diagnostic.is_none() && report.diagnostics.is_empty());
+                    let paths = report.directives.iter().map(|record| record.source.path.as_str()).collect::<Vec<_>>();
+                    assert_eq!(paths, ["src/shared.w", "src/main.w"][..cap.min(2)]);
+                    if cap == 1 {
+                        assert_eq!(terminal(&receipts, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                        assert_eq!(files(), first_file);
+                    } else {
+                        assert_eq!(terminal(&receipts, scope, false), incumbent);
+                        assert_eq!(files(), both_files);
+                    }
+                    clean();
+                }
+                fs::write(&source, qualified_rank.replace("descend(8)", "descend(9)")).unwrap();
+                let out_of_guard = selected(1);
+                assert!(matches!(out_of_guard[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                let mut stdout = Vec::new();
+                let mut stderr = Buffer::no_color();
+                assert!(publish_configured_check_receipts(&out_of_guard, scope, false, &mut stdout, &mut stderr).is_err());
+                assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !state.exists());
+                fs::remove_file(&shared_source).unwrap();
+
                 let aggregate = format!(r#"%%start
                     u8[2]() make = fn {{ [7, 1] }};
                     proof cells for make() -> (items)

@@ -207,9 +207,10 @@ impl StartUpSearch {
         super::super::checker_flow::charge_call_work(&mut self.work, activations.checked_mul(per_activation)?)
     }
 
-    pub(super) fn allows_qualified_bare(&self, caller: &SourceIdentity, site: OccurrenceOrdinal, target: (usize, usize)) -> bool {
+    pub(super) fn allows_qualified_scalar_proof(&self, caller: &SourceIdentity, site: OccurrenceOrdinal, target: (usize, usize)) -> bool {
         self.named_cross_source && self.owns_initialization(caller)
-            && self.required_sites.get(&site) == Some(&(target, StartupProofRole::Bare))
+            && matches!(self.required_sites.get(&site),
+                Some((prepared, StartupProofRole::Bare | StartupProofRole::Ranked)) if *prepared == target)
     }
 
     pub(super) fn has_aggregate_site(&self, caller: &SourceIdentity, site: OccurrenceOrdinal) -> bool {

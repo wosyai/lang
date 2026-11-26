@@ -7058,28 +7058,30 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
-        if (provider.is_some() && dormant_self.is_some())
-            || self.modules.len() != if provider.is_some() { 2 } else { 1 }
+    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
+        if self.modules.len() != if provider.is_some() { 2 } else { 1 }
             || provider.is_some_and(|source| source == caller || source.project != caller.project || source.package != caller.package)
         { return None; }
         let mut sources = [caller, caller];
         if let Some(provider) = provider { sources[1] = provider; }
-        self.owned_direct_startup_callable_uses_in(caller, &sources[..1 + usize::from(provider.is_some())], declarations, dormant_self)
+        self.owned_direct_startup_callable_uses_in(caller, &sources[..1 + usize::from(provider.is_some())], declarations, rank_self)
     }
 
     #[cfg(feature = "internal-checker")]
     pub(super) fn owned_direct_startup_callable_uses_in<'a>(
         &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
-        declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>,
+        declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
     ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
         if !(1..=3).contains(&sources.len()) || self.modules.len() != sources.len()
-            || sources.first().copied() != Some(caller) || (sources.len() != 1 && dormant_self.is_some())
+            || sources.first().copied() != Some(caller)
             || sources.iter().any(|source| source.project != caller.project || source.package != caller.package)
             || sources.iter().copied().collect::<HashSet<_>>().len() != sources.len()
         { return None; }
         let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), Vec::new()))
             .collect::<HashMap<_, _>>();
+        if rank_self.is_some_and(|(owner, _, span)| !sources.contains(&owner) || !startup_uses.contains_key(&(owner, span))) {
+            return None;
+        }
         let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
             uses.contains_key(&(&span.source, span.range));
         let resolved = |call: &ResolvedCallTarget, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
@@ -7112,10 +7114,10 @@ impl ProjectCallSiteResults {
                         .checked_add(body.callable_escapes.len())?)?;
                     if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
                         || body.sites.iter().any(|site| resolved(&site.target, &startup_uses)
-                            && !matches!((&site.target, dormant_self),
+                            && !matches!((&site.target, rank_self),
                                 (ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration },
-                                    Some((self_item, self_span)))
-                                    if source == caller && &module.initialization.source == caller
+                                    Some((self_owner, self_item, self_span)))
+                                    if source == self_owner && &module.initialization.source == self_owner
                                         && item == self_item && *declaration_span == self_span && std::ptr::eq(body, function)))
                         || body.allocation_length_call_targets.values().any(|call| resolved(call, &startup_uses))
                     { return None; }

@@ -2220,7 +2220,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let capped_qualified = || collection.is_some_and(|(caller, ordered)|
         topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|target|
             ordered.failures.borrow().startup_search.as_ref().is_some_and(|search|
-                search.borrow().allows_qualified_bare(caller, occurrence, *target))));
+                search.borrow().allows_qualified_scalar_proof(caller, occurrence, *target))));
     #[cfg(not(feature = "internal-checker"))]
     let capped_qualified = || false;
     let collection = collection.filter(|(source, _)|
@@ -4255,8 +4255,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     && closed_startup_scalar_history(body)
                     || (signature.parameters.len() == 1 && is_integer_type(expected) && plain_scalar_wrapper));
             let matches_ranked = pending == Some(&(target, Ranked))
-                && caller == &owner.source && ordered.scalar_initializer.is_some()
-                && signature.parameters.len() == 1 && is_integer_type(expected);
+                && (caller == &owner.source || search.allows_qualified_scalar_proof(caller, call, target))
+                && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1 && is_integer_type(expected);
             let matches_cited = pending == Some(&(target, Cited)) && search.cited_routes.contains_key(&target)
                 && caller == &owner.source && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
                 && is_integer_type(expected);
@@ -4281,8 +4281,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
                     && body.checker_named_route_frame() && literal_history_directives(body)));
-            let cross_proof = matches_aggregate
-                || (matches_named && search.allows_qualified_bare(caller, call, target)
+            let cross_proof = matches_aggregate || matches_ranked
+                || (matches_named && search.allows_qualified_scalar_proof(caller, call, target)
                     && qualified_integer_proof_leaf(body, expected));
             let cross_authorized = caller != &owner.source && if cross_proof {
                 // Both exact proof routes still consume the canonical typed site
@@ -10947,7 +10947,7 @@ fn run_startup_authored_path(
         else if qualified { 2 } else { 1 };
     if (!named.is_empty() && project.modules.len() != count)
         || named.iter().any(|(_, sites)| sites.is_empty())
-        || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.len() > 1)
+        || ranked.is_some_and(|(_, sites)| sites.is_empty() || named.len() > 1 || (qualified && !named.is_empty()))
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -10966,7 +10966,7 @@ fn run_startup_authored_path(
     let bare_activations = named.iter().try_fold(0usize, |total, (_, sites)| total.checked_add(sites.len()))
         .ok_or(ProjectCheck::Unsupported)?;
     search.metered_frames = bare_activations > 1 || ranked.is_some_and(|(_, sites)| sites.len() > 1);
-    search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || (!qualified && ranked.is_some());
+    search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || ranked.is_some();
     use failure_search::StartupProofRole::{Bare, Ranked};
     for &(target, sites) in named {
         search.enroll_proof_sites(target, Bare, sites).ok_or(ProjectCheck::Unsupported)?;
@@ -11430,7 +11430,7 @@ fn run_private_mixed_root_context(
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, BareRoster, RankOnly, InvokedAndDormantRank, InvokedAndReachedRank }
+enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, BareRoster, RankOnly, QualifiedRankOnly, InvokedAndDormantRank, InvokedAndReachedRank }
 
 /// Check cited premises on real bounded startup returns, or on a genuinely
 /// zero-incoming symbolic source root. The authored graph is never used as a
@@ -11602,7 +11602,8 @@ fn run_private_named_after_startup(
             || !plan.function.overload_arms.is_empty()
         { return Err(ProjectCheck::Unsupported); }
         if plan.typed.measure.is_some() {
-            if qualified || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0
+            if ranked.is_some() || (if qualified { Some(plan.proof_source) != provider }
+                else { plan.proof_source != &owner.source || plan.target.0 != 0 })
                 || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
             { return Err(ProjectCheck::Unsupported); }
             ranked = Some(plan);
@@ -11631,6 +11632,7 @@ fn run_private_named_after_startup(
     if ranked_requires_equality && (!plans.is_empty() || !arrays.is_empty()) {
         return Err(ProjectCheck::Unsupported);
     }
+    if qualified && ranked.is_some() && (!plans.is_empty() || !arrays.is_empty()) { return Err(ProjectCheck::Unsupported); }
     if !arrays.is_empty() {
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
         return cohort.run_capped(owner, scope, cap, &plans, ranked.as_ref(), provider);
@@ -11640,7 +11642,7 @@ fn run_private_named_after_startup(
     { return Err(ProjectCheck::Unsupported); }
     let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
         plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
-        ranked.as_ref().map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
+        ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
     let ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
         .map(Vec::as_slice).ok_or(ProjectCheck::Unsupported)).transpose()?.unwrap_or_default();
     let reached_rank = !ranked_sites.is_empty();
@@ -11666,6 +11668,7 @@ fn run_private_named_after_startup(
         (false, false, false, 2.., 1) => StartupNamedMode::RepeatedInvoked,
         (false, false, false, 1, 2) => StartupNamedMode::Mixed,
         (false, true, _, 0, 0) => StartupNamedMode::RankOnly,
+        (true, true, true, 0, 0) => StartupNamedMode::QualifiedRankOnly,
         (false, true, false, 1.., 1) => StartupNamedMode::InvokedAndDormantRank,
         (false, true, true, 1.., 1) => StartupNamedMode::InvokedAndReachedRank,
         (false, false, false, _, _) | (true, false, false, 1.., _) => StartupNamedMode::BareRoster,
@@ -16873,7 +16876,7 @@ mod tests {
         let (project, calls) = owner.prepared.parts();
         let ScalarItem::Function(function) = &project.modules[0].items[target] else { panic!("original callable"); };
         calls.owned_direct_startup_callable_uses(&owner.source, None, [(&owner.source, function.name_span)],
-            recursive.then_some((target, function.name_span))).unwrap()
+            recursive.then_some((&owner.source, target, function.name_span))).unwrap()
             .remove(&(&owner.source, function.name_span)).unwrap()
     }
 
@@ -25152,6 +25155,62 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let foreign = SourceIdentity { project: "other-project".into(), ..local.clone() };
             assert!(matches!(run(main, library, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_qualified_rank_only_follows_original_provider_startup() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-qualified-rank-app");
+        let provider = source("src/lib.w", "private-qualified-rank-provider");
+        let main = r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8 base = lib.descend(2);
+            u8 recursed = lib.descend(8);
+            core.require(base == 4, { .stdout = "wrong base"; .stderr = ""; .code = 20; .files = []; });
+            core.require(recursed == 4, { .stdout = "wrong recurrence"; .stderr = ""; .code = 21; .files = []; });
+            core.require(false, { .stdout = "root only"; .stderr = ""; .code = 22; .files = []; });
+        %%end"#;
+        let library = r#"%%start
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+            core.require(false, { .stdout = "lib once"; .stderr = ""; .code = 17; .files = []; });
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |app_text: &str, lib_text: &str, owner: &SourceIdentity| {
+                    let (_, catalog) = crate::parse_proof_source(owner.clone(), lib_text.to_owned(), &[]).ok().unwrap();
+                    let import = ScalarNamespaceBinding {
+                        binding: "lib".into(), target: owner.clone(), span: ByteSpan::new(0, 0),
+                    };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&app, app_text), vec![import])], [(catalog, Vec::new())],
+                        vec![app.clone(), owner.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    )
+                };
+                let expected = prepare(main, library, &provider).unwrap().run().unwrap();
+                let [first, second] = expected.directives.as_slice() else { panic!("provider then root"); };
+                assert_eq!((&first.source, first.stdout()), (&provider, b"lib once".as_slice()));
+                assert_eq!((&second.source, second.stdout()), (&app, b"root only".as_slice()));
+                for n in [1, 2, 3] {
+                    let (observed, completion) = prepare(main, library, &provider).unwrap()
+                        .run_private_authored_root(NonZeroUsize::new(n).unwrap()).unwrap();
+                    assert_eq!(observed.directives, expected.directives[..n.min(2)]);
+                    assert_eq!(completion, Some(if n <= 2 { StartupAuthoredCompletion::LimitReached }
+                        else { StartupAuthoredCompletion::Exhausted }));
+                    assert!(observed.active && observed.diagnostics.is_empty() && observed.symbolic_diagnostic.is_none());
+                }
+                let formal = prepare(main, library, &provider).unwrap().run_private_proofs_after_command_cap().unwrap();
+                assert!(formal.active && formal.directives.is_empty());
+                let foreign = SourceIdentity { project: "other-project".into(), ..provider.clone() };
+                for (root_text, owner) in [(main.to_owned(), &foreign), (main.replace("descend(8)", "descend(9)"), &provider)] {
+                    assert!(matches!(prepare(&root_text, library, owner).and_then(|owner|
+                        owner.run_private_authored_root(NonZeroUsize::MIN)), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
         }
     }
 
