@@ -1,6 +1,6 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    retention_plan::SourceLease, rooted_comptime::SiteScope, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
     RootedClosedComptimeRequest, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
@@ -146,11 +146,27 @@ impl BuildDiagnosticSession<'_> {
     pub async fn project_closed_comptime(
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedClosedComptimeProjection> {
+        self.project_closed_comptime_in(request, SiteScope::AuthoredFile).await
+    }
+
+    /// Project just the first authored initialization of the actual target
+    /// entry. A valid program reaching implicit main enters this binding
+    /// before any authored predecessor. No general reachability or result
+    /// authority, and no new framed or native command.
+    pub async fn project_first_entry_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedClosedComptimeProjection> {
+        self.project_closed_comptime_in(request, SiteScope::FirstTargetInitializer).await
+    }
+
+    async fn project_closed_comptime_in(
+        &self, request: RootedClosedComptimeRequest, scope: SiteScope,
+    ) -> Result<RootedClosedComptimeProjection> {
         request.check_selector_bytes()?;
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved(slot, move |store| {
-            store.project_closed_comptime_for_lease(&lease, request)
+            store.project_closed_comptime_for_lease(&lease, request, scope)
         }).await?
     }
 

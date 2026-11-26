@@ -12,7 +12,7 @@ use wosy_cli::{
     source_recovery::ClientSourceLimits,
     source_state::{ReplaySource, SqliteSourceState},
 };
-use wosy_compiler::{ScalarTargetLayout, ScalarType};
+use wosy_compiler::{ClosedComptimeRejection, ScalarTargetLayout, ScalarType};
 use wosy_daemon::{
     BaseCstAdmissionLimits, RootedClosedComptimeFragment, RootedClosedComptimeProjection,
     RootedClosedComptimeRefusal, RootedClosedComptimeRequest, SourceStorageWorker, SourceStore,
@@ -232,6 +232,66 @@ async fn local_query_refuses_nonrooted_scope_parameters_and_tight_budgets() {
     assert!(session.project_closed_comptime(tight_index).await.unwrap_err().to_string().contains("record budget"));
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, source.root);
     drop(session);
+    drop((worker, client));
+    Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_entry_initializer_is_selected_only_in_exact_leased_startup_order() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let mut client = client(&project);
+    let store = Arc::new(SourceStore::open(&fixture.0.join("daemon"), 1 << 20).unwrap());
+    let initial = publish(&mut client, &store).await;
+    let worker = worker(&store);
+    let original = worker.open_build_diagnostics(initial.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let exact = emitted(original.project_first_entry_comptime(request("readback", layout)).await.unwrap());
+        assert_ordinary_parity(&project, initial.root, SOURCE, layout, &exact);
+    }
+
+    fs::write(project.join("src/helper.w"), "%%start\ni32 another = comptime helper { 3 };\n%%end\n").unwrap();
+    for (previous, has_import) in [
+        ("i32 preceding = 7;", false),
+        (r#"helper = namespace app "src/helper.w";"#, true),
+    ] {
+        let text = SOURCE.replacen("i32 answer = ", &format!("{previous}\ni32 answer = "), 1);
+        fs::write(project.join("src/main.w"), &text).unwrap();
+        let changed = publish(&mut client, &store).await;
+        assert_ne!(initial.root, changed.root);
+        let current = worker.open_build_diagnostics(changed.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let refused = current.project_first_entry_comptime(request("readback", layout)).await.unwrap();
+            let RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
+                ClosedComptimeRejection::PrecededByAuthoredItem { site, first },
+            )) = refused else { panic!("unexpected startup answer: {refused:?}") };
+            assert_eq!(site.source, first.source);
+            assert_eq!(text[first.range.start as usize..first.range.end as usize].trim(), previous);
+            assert_eq!(&text[site.range.start as usize..site.range.end as usize], "comptime readback { 42 }");
+
+            let candidate = emitted(current.project_closed_comptime(request("readback", layout)).await.unwrap());
+            assert_eq!(candidate.source_root, changed.root);
+            assert_eq!(candidate.site, site);
+            let retained = emitted(original.project_first_entry_comptime(request("readback", layout)).await.unwrap());
+            assert_eq!(retained.source_root, initial.root);
+            assert_eq!(retained.bytes, candidate.bytes);
+
+            if has_import {
+                let child = || {
+                    let mut scoped = request("helper", layout);
+                    scoped.file.path = PackageRelativePath::new("src/helper.w".into()).unwrap();
+                    scoped
+                };
+                assert!(matches!(current.project_first_entry_comptime(child()).await.unwrap(),
+                    RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::NotTargetEntry)));
+                assert_eq!(emitted(current.project_closed_comptime(child()).await.unwrap()).id, "helper");
+                assert!(matches!(original.project_first_entry_comptime(child()).await.unwrap(),
+                    RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::FileNotRooted)));
+            }
+        }
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, changed.root);
+    }
+    drop(original);
     drop((worker, client));
     Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
 }

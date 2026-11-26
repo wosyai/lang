@@ -58,6 +58,7 @@ pub enum ClosedComptimeRejection {
     UnsupportedLayout,
     SiteNotFound,
     RepeatedSite(SourceSpan),
+    PrecededByAuthoredItem { site: SourceSpan, first: SourceSpan },
     Unsupported { site: SourceSpan, feature: &'static str },
     Parameter { site: SourceSpan, name: String, reason: ComptimeParameterRejection },
     OrdinaryDiagnostics(Vec<Diagnostic>),
@@ -93,7 +94,25 @@ pub fn derive_closed_comptime_fragment(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     parameter: impl Fn(&str) -> Option<ComptimeParameter>,
 ) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
-    with_closed_comptime_occurrence(fresh, id, layout, parameter, |fragment, _, _, _| fragment)
+    with_closed_comptime_occurrence(fresh, id, layout, SiteRequirement::RootBinding,
+        parameter, |fragment, _, _, _| fragment)
+}
+
+/// Admit only the first authored item's complete initializer, for a closed
+/// body with no parameter inputs. The caller must independently authenticate
+/// this file as the actual target entry to interpret the startup placement.
+/// No claim about other initializers, function reachability, or tool launch.
+pub fn derive_first_source_initializer_comptime(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
+    with_closed_comptime_occurrence(fresh, id, layout, SiteRequirement::FirstSourceItem,
+        |_| Some(ComptimeParameter::UnsupportedValue), |fragment, _, _, _| fragment)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SiteRequirement {
+    RootBinding,
+    FirstSourceItem,
 }
 
 // Keep the exact Rowan occurrence with its authored root in this compiler
@@ -103,6 +122,7 @@ fn with_closed_comptime_occurrence<R>(
     fresh: &FreshParseResult,
     id: &str,
     layout: ScalarTargetLayout,
+    requirement: SiteRequirement,
     parameter: impl Fn(&str) -> Option<ComptimeParameter>,
     inspect: impl FnOnce(ClosedComptimeFragment, &CanonicalCstRoot, &CstNode, &CstNode) -> R,
 ) -> Result<R, ClosedComptimeRejection> {
@@ -122,8 +142,19 @@ fn with_closed_comptime_occurrence<R>(
     if let Some((_, duplicate)) = matches.next() {
         return Err(ClosedComptimeRejection::RepeatedSite(scope(duplicate.span)));
     }
-    let (declaration, initializer) = root_receiver_and_initializer(&node)
+    let RootInitializer { declaration, initializer, item, source } = root_receiver_and_initializer(&node)
         .ok_or_else(|| unsupported(site.span, "expected one explicit root binding"))?;
+    if requirement == SiteRequirement::FirstSourceItem {
+        // BoundaryStart and trivia have no authored initialization. Require
+        // the first item itself rather than deciding if any prefix is inert.
+        let first = source.children().find(|child| child.kind() != SyntaxKind::BoundaryStart)
+            .ok_or_else(|| unsupported(site.span, "expected the first authored source item"))?;
+        if first != item {
+            return Err(ClosedComptimeRejection::PrecededByAuthoredItem {
+                site: scope(site.span), first: scope(byte_span(&first)),
+            });
+        }
+    }
     let result_type = derive_type(&declaration);
     if !supported_type(&result_type) { return Err(unsupported(byte_span(&declaration), "result type")); }
     // Guard only constructs that are not in this projection and cannot
@@ -173,15 +204,26 @@ fn with_closed_comptime_occurrence<R>(
     Ok(inspect(fragment, parsed.canonical_cst(), &node, &initializer))
 }
 
-fn root_receiver_and_initializer(node: &CstNode) -> Option<(CstNode, CstNode)> {
+struct RootInitializer {
+    declaration: CstNode,
+    initializer: CstNode,
+    item: CstNode,
+    source: CstNode,
+}
+
+fn root_receiver_and_initializer(node: &CstNode) -> Option<RootInitializer> {
     let primary = node.parent().filter(|p| p.kind() == SyntaxKind::Primary)?;
     let expression = primary.parent().filter(|p| p.kind() == SyntaxKind::Expression)?;
     let outputs = expression.parent().filter(|p| p.kind() == SyntaxKind::OutputList)?;
     let binding = outputs.parent().filter(|p| p.kind() == SyntaxKind::BindingDecl)?;
     let parent = binding.parent()?;
-    let parent = if parent.kind() == SyntaxKind::Item { parent.parent()? } else { parent };
-    if parent.kind() != SyntaxKind::Root { return None; }
-    Some((single_binding_type(&binding)?, expression))
+    let (item, source) = if parent.kind() == SyntaxKind::Item {
+        (parent.clone(), parent.parent()?)
+    } else {
+        (binding.clone(), parent)
+    };
+    if source.kind() != SyntaxKind::Root { return None; }
+    Some(RootInitializer { declaration: single_binding_type(&binding)?, initializer: expression, item, source })
 }
 
 fn single_binding_type(binding: &CstNode) -> Option<CstNode> {
@@ -332,7 +374,7 @@ mod tests {
         sample: impl FnOnce(&ClosedComptimeFragment) -> FixtureReturn,
     ) -> Result<ScalarSourceDeclarations, &'static str> {
         with_closed_comptime_occurrence(
-            source, "solve", layout, |_| parameter,
+            source, "solve", layout, SiteRequirement::RootBinding, |_| parameter,
             |fragment, canonical, site, initializer| {
                 let span = fragment.site().range;
                 let value = match (fragment.result_type(), sample(&fragment)) {
@@ -361,6 +403,38 @@ mod tests {
         let build = analyze_scalar_build(&prepared);
         assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
         emit_scalar_build_single_module_artifact_llvm(&build).unwrap().to_text()
+    }
+
+    #[test]
+    fn first_source_initializer_matches_ordinary_startup_item_and_refuses_nested_path() {
+        use super::super::control::{module_initialization_region, ModuleInitializationStepKind};
+
+        let ordinary = fresh("i32 answer = 42;\ni32 following = 7;");
+        let declarations = derive_scalar_declarations_from_cst(ordinary.result().canonical_cst());
+        assert!(declarations.diagnostics().is_empty());
+        let region = module_initialization_region(declarations.source(), &declarations.items, &[]);
+        assert_eq!(region.steps.len(), 2);
+        assert!(matches!(region.steps[0].kind, ModuleInitializationStepKind::BindingInitialization));
+        let ScalarItem::Binding(first) = &declarations.items[region.steps[0].item] else {
+            panic!("ordinary initialization begins with the first binding");
+        };
+        assert_eq!(first.name, "answer");
+
+        let direct = fresh("i32 answer = comptime solve { 42 };\ni32 following = 7;");
+        let nested = fresh("i32 answer = if (true) { comptime solve { 42 } } else { 0 };");
+        let parameter = fresh(r#"i32 answer = comptime solve { core.comp_param("limit", 41) };"#);
+        assert!(direct.result().is_valid());
+        assert!(nested.result().is_valid());
+        assert!(parameter.result().is_valid());
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let fragment = derive_first_source_initializer_comptime(&direct, "solve", layout).unwrap();
+            assert_eq!(fragment.result_type(), &ScalarType::I32);
+            assert!(fragment.parameter_uses().is_empty());
+            assert!(matches!(derive_first_source_initializer_comptime(&nested, "solve", layout),
+                Err(ClosedComptimeRejection::Unsupported { feature: "expected one explicit root binding", .. })));
+            assert!(matches!(derive_first_source_initializer_comptime(&parameter, "solve", layout),
+                Err(ClosedComptimeRejection::Parameter { reason: ComptimeParameterRejection::UnsupportedProfileValue, .. })));
+        }
     }
 
     #[test]

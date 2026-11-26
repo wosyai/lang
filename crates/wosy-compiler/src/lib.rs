@@ -29,7 +29,8 @@ pub use scalar::{
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
     ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
-pub use scalar::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection,
+pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
+    ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 

@@ -8,7 +8,7 @@ use super::{
 };
 use surrealkv::{Mode, Transaction};
 use wosy_compiler::{
-    derive_closed_comptime_fragment, ClosedComptimeRejection, ComptimeParameter,
+    derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeRejection, ComptimeParameter,
     ComptimeParameterRejection, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
@@ -16,6 +16,12 @@ use wosy_syntax::SourceSpan;
 
 const MAX_SELECTOR_BYTES: usize = 4096;
 const MAX_EVALUATOR_IR_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SiteScope {
+    AuthoredFile,
+    FirstTargetInitializer,
+}
 
 pub struct RootedClosedComptimeRequest {
     pub profile: String,
@@ -48,6 +54,7 @@ pub enum RootedClosedComptimeProjection {
 pub enum RootedClosedComptimeRefusal {
     ProfileNotSelected,
     FileNotRooted,
+    NotTargetEntry,
     UnsupportedSourceEpoch,
     CompilerImageUnavailable,
     AuthoredGrammarNotVerified,
@@ -56,7 +63,8 @@ pub enum RootedClosedComptimeRefusal {
 }
 
 /// Exact evaluator IR from the leased authored file and local compiler image.
-/// No calculation of control-flow reachability, commands, result or cache.
+/// The calling route defines placement. This is not a whole-program
+/// reachability verdict, an execution command, a result, or a cache entry.
 #[derive(Debug)]
 pub struct RootedClosedComptimeFragment {
     pub source_root: NodeId,
@@ -74,18 +82,18 @@ pub struct RootedClosedComptimeFragment {
 
 impl SourceStore {
     pub(super) fn project_closed_comptime_for_lease(
-        &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest, scope: SiteScope,
     ) -> Result<RootedClosedComptimeProjection> {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let answer = self.project_closed_comptime(&tx, grant.root, request);
+        let answer = self.project_closed_comptime(&tx, grant.root, request, scope);
         lease.finish_current(|| ()).ok_or(BuildRequestRejection::Expired)?;
         answer
     }
 
     fn project_closed_comptime(
-        &self, tx: &Transaction, root: NodeId, request: RootedClosedComptimeRequest,
+        &self, tx: &Transaction, root: NodeId, request: RootedClosedComptimeRequest, scope: SiteScope,
     ) -> Result<RootedClosedComptimeProjection> {
         use RootedClosedComptimeProjection::{Emitted, Refused};
         use RootedClosedComptimeRefusal as Refusal;
@@ -108,6 +116,9 @@ impl SourceStore {
             take(&mut imports, count, "closed comptime source index exceeds the import budget")
         })?;
         let Some(file) = index.files.get(&request.file) else { return Ok(Refused(Refusal::FileNotRooted)) };
+        if scope == SiteScope::FirstTargetInitializer && request.file != config.entry {
+            return Ok(Refused(Refusal::NotTargetEntry));
+        }
         if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
             return Ok(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit)));
         }
@@ -121,8 +132,13 @@ impl SourceStore {
         };
         // SourceConfig has no authoritative consuming profile parameter
         // table. An authored default is not evidence of absence.
-        let fragment = match derive_closed_comptime_fragment(&fresh, &request.id, request.evaluator_layout,
-            |_| Some(ComptimeParameter::UnsupportedValue)) {
+        let derived = match scope {
+            SiteScope::AuthoredFile => derive_closed_comptime_fragment(&fresh, &request.id, request.evaluator_layout,
+                |_| Some(ComptimeParameter::UnsupportedValue)),
+            SiteScope::FirstTargetInitializer => derive_first_source_initializer_comptime(&fresh, &request.id,
+                request.evaluator_layout),
+        };
+        let fragment = match derived {
             Ok(fragment) => fragment,
             Err(ClosedComptimeRejection::Parameter { site, name, reason: ComptimeParameterRejection::UnsupportedProfileValue }) =>
                 return Ok(Refused(Refusal::ParameterAuthorityUnavailable { site, name })),
