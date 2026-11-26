@@ -16,9 +16,10 @@ const FUNCTION: &str = "evaluate";
 mod direct;
 pub use direct::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,
-    derive_direct_startup_comptime_plan, inspect_direct_function_comptime, DirectComptimeArgument,
-    DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
-    DirectStartupComptimeUse, InspectedDirectComptimeCall,
+    derive_direct_startup_comptime_plan, derive_forwarded_pair_startup_comptime_plan,
+    inspect_direct_function_comptime, DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment,
+    DirectStartupComptimePlan, DirectStartupComptimeUse, ForwardedPairStartupComptimePlan,
+    InspectedDirectComptimeCall, PairStartupForwarding,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

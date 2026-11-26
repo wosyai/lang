@@ -9,6 +9,7 @@ use super::{
 use super::super::{
     control::{ModuleInitializationStepKind, PlainNameIdentity},
     derive_scalar_declarations_with_embedding, ConcreteCallSelection, EmbeddedComptimeExpression,
+    PreparedScalarProject, ResolvedCallTarget, ScalarBuildValidation, ScalarFunction,
 };
 use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
@@ -158,30 +159,82 @@ pub fn derive_direct_pair_startup_comptime_plan(
     derive_direct_startup::<2>(fresh, id, layout)
 }
 
+/// An exact local startup hop into the comptime function. For each formal of
+/// that function, the mapping names the outer startup argument that reaches it.
+#[derive(Debug)]
+pub struct PairStartupForwarding {
+    declaration: SourceSpan,
+    tail_call: SourceSpan,
+    startup_argument_positions: [usize; 2],
+}
+
+impl PairStartupForwarding {
+    pub fn declaration(&self) -> &SourceSpan { &self.declaration }
+    pub fn tail_call(&self) -> &SourceSpan { &self.tail_call }
+    pub fn startup_argument_positions(&self) -> [usize; 2] { self.startup_argument_positions }
+}
+
+/// Every startup call directly selects the same ordinary forwarder; the
+/// authenticated tail hop leads to the exact comptime declaration. The
+/// evaluator slots use comptime formal order, not the forwarder's order.
+pub struct ForwardedPairStartupComptimePlan {
+    forwarding: PairStartupForwarding,
+    plan: DirectStartupComptimePlan<2>,
+}
+
+impl ForwardedPairStartupComptimePlan {
+    pub fn forwarding(&self) -> &PairStartupForwarding { &self.forwarding }
+    pub fn calls(&self) -> &[DirectStartupComptimeUse<2>] { self.plan.calls() }
+    pub fn evaluators(&self) -> &[ClosedComptimeFragment] { self.plan.evaluators() }
+}
+
+/// Project only one unconditional, complete tail call that forwards each
+/// typed formal exactly once, possibly reordered. No result, runner, startup
+/// emission, arbitrary call-graph proof or profile/builder authority. The
+/// caller must separately authenticate the module as the selected target entry.
+pub fn derive_forwarded_pair_startup_comptime_plan(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<ForwardedPairStartupComptimePlan, ClosedComptimeRejection> {
+    with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+        StartupEntry::OneForwarder, |calls, body, name_span, forwarding| {
+            let forwarding = forwarding.expect("verified exact tail hop");
+            let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
+            Ok(ForwardedPairStartupComptimePlan { forwarding, plan })
+        })
+}
+
 fn derive_direct_startup<const ARITY: usize>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
-    with_verified_direct_calls::<ARITY, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS, |calls, body, name_span| {
-        let mut plan = DirectStartupComptimePlan {
-            calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
+    with_verified_startup_calls::<ARITY, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+        StartupEntry::Direct, |calls, body, name_span, _| {
+            emit_startup_plan(id, layout, body, name_span, calls)
+        })
+}
+
+fn emit_startup_plan<const ARITY: usize>(
+    id: &str, layout: ScalarTargetLayout, body: &ScalarBlock, name_span: ByteSpan,
+    calls: Vec<InspectedDirectComptimeCall<ARITY>>,
+) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
+    let mut plan = DirectStartupComptimePlan {
+        calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
+    };
+    let mut values = Vec::new();
+    for facts in calls {
+        // Function, exact reads and layout are fixed in this analysis.
+        let tuple = facts.tuple();
+        let evaluator = match values.iter().position(|value| *value == tuple) {
+            Some(index) => index,
+            None => {
+                let index = plan.evaluators.len();
+                plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts)?);
+                values.push(tuple);
+                index
+            }
         };
-        let mut values = Vec::new();
-        for facts in calls {
-            // Function, exact reads and layout are fixed in this analysis.
-            let tuple = facts.tuple();
-            let evaluator = match values.iter().position(|value| *value == tuple) {
-                Some(index) => index,
-                None => {
-                    let index = plan.evaluators.len();
-                    plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts)?);
-                    values.push(tuple);
-                    index
-                }
-            };
-            plan.calls.push(DirectStartupComptimeUse { facts, evaluator });
-        }
-        Ok(plan)
-    })
+        plan.calls.push(DirectStartupComptimeUse { facts, evaluator });
+    }
+    Ok(plan)
 }
 
 fn emit_bound_evaluator<const ARITY: usize>(
@@ -219,17 +272,24 @@ fn with_verified_direct_call<T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     observe: impl FnOnce(InspectedDirectComptimeCall, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
-    with_verified_direct_calls::<1, _>(fresh, id, layout, 1, |mut calls, body, name_span| {
+    with_verified_startup_calls::<1, _>(fresh, id, layout, 1, StartupEntry::Direct, |mut calls, body, name_span, _| {
         let call = calls.pop().ok_or_else(|| ClosedComptimeRejection::Emitter("verified single call disappeared".into()))?;
         observe(call, body, name_span)
     })
 }
 
+enum StartupEntry {
+    Direct,
+    OneForwarder,
+}
+
 // The analytical project stays private. The continuation is called only
-// after every startup occurrence and every exact formal read were verified.
-fn with_verified_direct_calls<const ARITY: usize, T>(
-    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize,
-    observe: impl FnOnce(Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
+// after every edge, startup occurrence and exact formal read were verified.
+fn with_verified_startup_calls<const ARITY: usize, T>(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize, entry: StartupEntry,
+    observe: impl FnOnce(
+        Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan, Option<PairStartupForwarding>,
+    ) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     let parsed = fresh.result();
@@ -253,6 +313,16 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
     if authored_items.next().as_ref() != Some(&declaration_item) {
         return Err(unsupported("expected the only tail of one ordinary function"));
     }
+    let forwarder = match entry {
+        StartupEntry::Direct => None,
+        StartupEntry::OneForwarder => {
+            let declaration = authored_items.next().and_then(|item| only(item.children()))
+                .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+                .filter(|node| !node.children_with_tokens().any(|token| token.kind() == SyntaxKind::Unsafe))
+                .ok_or_else(|| unsupported("expected one safe authored forwarder before startup bindings"))?;
+            Some(wosy_syntax::byte_span(&declaration))
+        }
+    };
     let mut count = 0;
     for item in authored_items {
         if only(item.children()).is_none_or(|child| child.kind() != SyntaxKind::BindingDecl) {
@@ -312,8 +382,18 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
     let Some(region) = prepared.initialization_region(0) else {
         return Err(unsupported("ordinary entry initialization was not prepared"));
     };
+    let (forwarder, bindings) = if let Some(span) = forwarder {
+        let [ScalarItem::Function(wrapper), bindings @ ..] = bindings else {
+            return Err(unsupported("ordinary entry does not contain the authored forwarder"));
+        };
+        if wrapper.span != span {
+            return Err(unsupported("ordinary entry does not contain the authored forwarder"));
+        }
+        (Some(wrapper), bindings)
+    } else { (None, bindings) };
+    let first_binding = 1 + usize::from(forwarder.is_some());
     if bindings.len() != count || region.steps.len() != count
-        || region.steps.iter().enumerate().any(|(offset, step)| step.item != offset + 1
+        || region.steps.iter().enumerate().any(|(offset, step)| step.item != offset + first_binding
             || step.kind != ModuleInitializationStepKind::BindingInitialization)
     {
         return Err(unsupported("ordinary entry initialization order does not match the authored list"));
@@ -362,6 +442,14 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
     let facts = prepared.initializer_facts(0)
         .map_err(|_| unsupported("ordinary initializer occurrence facts are unavailable"))?;
     let declaration = scope(function.name_span);
+    let forwarding = forwarder.map(|wrapper| {
+        check_pair_forwarding(&prepared, &build, wrapper, &declaration, result_type, &scope, &unsupported)
+    }).transpose()?;
+    let (startup_declaration, argument_positions): (_, [usize; ARITY]) = match &forwarding {
+        Some(hop) => (hop.declaration(), hop.startup_argument_positions.as_slice().try_into()
+            .map_err(|_| unsupported("forwarding requires the exact pair arity"))?),
+        None => (&declaration, std::array::from_fn(|ordinal| ordinal)),
+    };
     let mut selected = Vec::with_capacity(count);
     for item in bindings {
         let ScalarItem::Binding(binding) = item else {
@@ -382,7 +470,7 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
             .map_err(|_| unsupported("call is not the entire ordinary initializer"))?;
         let target = facts.checked_direct_call(call)
             .map_err(|_| unsupported("no exact direct declaration was selected"))?;
-        if target.declaration != &declaration || target.concrete != &ConcreteCallSelection::Declaration {
+        if target.declaration != startup_declaration || target.concrete != &ConcreteCallSelection::Declaration {
             return Err(unsupported("initializer did not select the authored function"));
         }
         let [result] = target.outputs else {
@@ -392,9 +480,9 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
             return Err(unsupported("the declared result must match the exact read formals' scalar type"));
         }
         let mut inputs = Vec::with_capacity(ARITY);
-        for ((argument, parameter), &(operand, read, formal)) in
-            arguments.iter().zip(target.parameters).zip(&formal_reads)
-        {
+        for (argument_position, &(operand, read, formal)) in argument_positions.into_iter().zip(&formal_reads) {
+            let argument = &arguments[argument_position];
+            let parameter = &target.parameters[argument_position];
             let argument_ty = facts.checked_expression_type(argument)
                 .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
             if argument_ty != parameter || parameter != result_type {
@@ -419,7 +507,58 @@ fn with_verified_direct_calls<const ARITY: usize, T>(
             inputs, result: result.ty.clone(),
         });
     }
-    observe(selected, body, super::super::token_span(&site.id))
+    observe(selected, body, super::super::token_span(&site.id), forwarding)
+}
+
+fn check_pair_forwarding(
+    prepared: &PreparedScalarProject, build: &ScalarBuildValidation<'_>, wrapper: &ScalarFunction,
+    callee: &SourceSpan, result_type: &ScalarType, scope: &impl Fn(ByteSpan) -> SourceSpan,
+    unsupported: &impl Fn(&'static str) -> ClosedComptimeRejection,
+) -> Result<PairStartupForwarding, ClosedComptimeRejection> {
+    let [ScalarBlockItem::Expression(call @ ScalarExpression::Call {
+        receiver: None, type_arguments, arguments, ..
+    })] = wrapper.body.items.as_slice() else {
+        return Err(unsupported("forwarder must contain only one unconditional direct call"));
+    };
+    let [left, right] = arguments.as_slice() else {
+        return Err(unsupported("forwarding requires the exact pair arity"));
+    };
+    if !type_arguments.is_empty() || wrapper.parameters.len() != 2 {
+        return Err(unsupported("forwarding requires the exact pair arity"));
+    }
+    // Item 1 is the exact verified authored second function, not a name
+    // lookup. Resolve the call by the ordinary checked AST occurrence.
+    let nodes = prepared.bind_callable_body_call_nodes(0, 1, None, &wrapper.body)
+        .map_err(|_| unsupported("ordinary forwarding occurrences are unavailable"))?;
+    let points = build.callable_point_facts(0, 1, None)
+        .ok_or_else(|| unsupported("ordinary forwarding formal facts are unavailable"))?;
+    if nodes.final_output(call) != Some(0) || nodes.evaluation_point(points, call).is_none()
+        || nodes.checked_expression_type(call) != Some(result_type)
+    {
+        return Err(unsupported("forwarding call does not itself evaluate as the exact output"));
+    }
+    match nodes.target(call) {
+        Ok(ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration })
+            if source == &callee.source && declaration_span == &callee.range => {}
+        _ => return Err(unsupported("forwarding call did not select the authored comptime function")),
+    }
+    let formals = [nodes.formal(points, 0), nodes.formal(points, 1)];
+    let formal_position = |argument| {
+        let Some(PlainNameIdentity::Lexical(binding)) = nodes.plain_name(argument) else { return None; };
+        if nodes.checked_expression_type(argument) != Some(result_type) { return None; }
+        formals.iter().position(|formal| formal.is_some_and(|(id, ty)| id == binding && ty == result_type))
+    };
+    let (Some(left_position), Some(right_position)) = (formal_position(left), formal_position(right)) else {
+        return Err(unsupported("forwarding must pass each exact formal without intervening computation"));
+    };
+    if left_position == right_position {
+        return Err(unsupported("forwarding must pass each exact formal without intervening computation"));
+    }
+    Ok(PairStartupForwarding {
+        declaration: scope(wrapper.name_span),
+        tail_call: scope(span_of(call)),
+        startup_argument_positions: [left_position, right_position],
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -774,6 +913,81 @@ mod tests {
             assert_ne!(a.llvm().to_text(), different.llvm().to_text());
             assert!(derive_direct_startup_comptime_plan(&authored, "value", layout).is_err());
         }
+    }
+
+    #[test]
+    fn forwarded_pair_reaches_the_exact_typed_target_with_the_formal_permutation() {
+        let outer_tuples = [[7, 9], [9, 7], [7, 9], [7, 11]];
+        for (tail, permutation) in [("solve(first, second)", [0, 1]), ("solve(second, first)", [1, 0])] {
+            let source = fresh(&format!(
+                "{PAIRED_FUNCTION}\nu32(u32, u32) relay = fn(first, second) {{ {tail} }};\n\
+                 u32 first = relay(7, 9);\nu32 reversed = relay(9, 7);\nu32 repeated = relay(7, 9);\n\
+                 u32 changed = relay(7, 11);"
+            ));
+            assert!(source.result().is_valid());
+            for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+                let forwarded = derive_forwarded_pair_startup_comptime_plan(&source, "value", layout)
+                    .unwrap_or_else(|error| panic!("typed forwarding on {layout:?}: {error:?}"));
+                assert_eq!(spelling(&source, forwarded.forwarding().declaration()), "relay");
+                assert_eq!(spelling(&source, forwarded.forwarding().tail_call()), tail);
+                assert_eq!(forwarded.forwarding().startup_argument_positions(), permutation);
+                let expected = outer_tuples.map(|tuple| permutation.map(|ordinal| tuple[ordinal]));
+                assert_eq!(forwarded.calls().len(), expected.len());
+                assert_eq!(forwarded.calls().iter().map(DirectStartupComptimeUse::evaluator_index)
+                    .collect::<Vec<_>>(), [0, 1, 0, 2]);
+                for (call, values) in forwarded.calls().iter().zip(expected) {
+                    let facts = call.facts();
+                    assert!(spelling(&source, facts.call()).starts_with("relay("));
+                    assert_eq!(spelling(&source, facts.function()), "solve");
+                    assert_eq!(facts.tuple(), values.map(DirectComptimeArgument::U32));
+                    for (input, (value, formal)) in facts.inputs().iter().zip(values.into_iter().zip(["left", "right"])) {
+                        assert_eq!(spelling(&source, input.formal()), formal);
+                        assert_eq!(spelling(&source, input.read()), formal);
+                        assert_eq!(spelling(&source, input.argument()), value.to_string());
+                    }
+                    let args = facts.inputs();
+                    assert_eq!(args[0].argument().range.start < args[1].argument().range.start, permutation == [0, 1]);
+                }
+                assert_eq!(forwarded.evaluators().len(), 3);
+                for (eval, [left, right]) in forwarded.evaluators().iter().zip([expected[0], expected[1], expected[3]]) {
+                    let root = fresh(&format!("u32 answer = comptime value {{ {right} ^ {left} }};"));
+                    let ordinary = super::super::derive_closed_comptime_fragment(&root, "value", layout, |_| None).unwrap();
+                    assert_eq!(eval.llvm().to_text(), ordinary.llvm().to_text());
+                }
+                assert!(matches!(derive_direct_pair_startup_comptime_plan(&source, "value", layout),
+                    Err(ClosedComptimeRejection::Unsupported {
+                        feature: "each authored startup item must be one ordinary binding", ..
+                    })));
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_pair_refuses_preprocessing_and_a_call_that_is_not_the_whole_tail() {
+        for (body, expected) in [
+            ("solve(left ^ right, right)", "forwarding must pass each exact formal without intervening computation"),
+            ("solve(right, left) ^ left", "forwarder must contain only one unconditional direct call"),
+        ] {
+            let source = fresh(&format!(
+                "{PAIRED_FUNCTION}\nu32(u32, u32) relay = fn(left, right) {{ {body} }};\n\
+                 u32 answer = relay(7, 9);"
+            ));
+            assert!(source.result().is_valid(), "ordinary authored wrapper: {body}");
+            assert!(matches!(derive_forwarded_pair_startup_comptime_plan(&source, "value", ScalarTargetLayout::WASM32),
+                Err(ClosedComptimeRejection::Unsupported { feature, .. }) if feature == expected),
+                "did not require exact unconditional forwarding: {body}");
+        }
+    }
+
+    #[test]
+    fn forwarded_pair_refuses_a_late_initializer_with_a_different_resolved_target() {
+        let source = fresh(&format!(
+            "{PAIRED_FUNCTION}\nu32(u32, u32) relay = fn(left, right) {{ solve(right, left) }};\n\
+             u32 first = relay(7, 9);\nu32 second = solve(7, 9);"
+        ));
+        assert!(source.result().is_valid());
+        assert!(matches!(derive_forwarded_pair_startup_comptime_plan(&source, "value", ScalarTargetLayout::WASM32),
+            Err(ClosedComptimeRejection::Unsupported { feature: "initializer did not select the authored function", .. })));
     }
 
     #[test]
