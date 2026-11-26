@@ -552,3 +552,56 @@ fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_preserves_the_existing_binary_entry_comparison() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for refuted in [false, true] {
+                let project = Fixture::new();
+                // This is the original signed binary Check proof from
+                // check_main_flow.py, with an independent early authored path.
+                let invocation = if refuted {
+                    "i16 answer = choose(4, 8); i16 other = choose(3, 9);"
+                } else { "i16 answer = choose(2, -3);" };
+                let source = format!(r#"%%start
+                    i16(i16, i16) choose = fn(left, right) {{ if (right < 0) {{ left }} else {{ right }} }};
+                    proof identity for choose(entry, selector) -> (out)
+                        where (entry >= -5) ensures (out == core.old(entry)) {{}}
+                    {}
+                    {invocation}
+                    {}
+                    %%end"#,
+                    require("first", 0, "first.txt"),
+                    require("second", 19, "second.txt"));
+                project.package("", layout, "dev", "", &source);
+                let old = project.run(&[scope]);
+                assert_eq!(old.status.code(), Some(19), "{old:?}");
+                assert_eq!(old.stdout, b"firstsecond");
+                let original_diagnostics = old.stderr.strip_prefix(b"[first][second]").unwrap();
+                let diagnostic = String::from_utf8_lossy(original_diagnostics);
+                if refuted {
+                    assert_eq!(diagnostic.matches("proof obligation failed").count(), 2);
+                    assert!(diagnostic.contains("out == core.old(entry)")
+                        && diagnostic.contains("choose(4, 8)") && diagnostic.contains("choose(3, 9)"));
+                    assert!(diagnostic.find("call returned 8").unwrap() < diagnostic.find("call returned 9").unwrap());
+                } else {
+                    assert!(diagnostic.is_empty());
+                }
+                project.clear();
+
+                let mut stderr = b"[first]".to_vec();
+                stderr.extend(original_diagnostics);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+                assert!(!project.output().join("second.txt").exists());
+                project.clear();
+
+                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), b"second");
+                project.clear();
+            }
+        }
+    }
+}

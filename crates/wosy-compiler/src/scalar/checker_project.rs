@@ -4383,7 +4383,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && self.observer.watches_fixed_array(target) && proof_site.is_some()
                 && body.checker_pure_calling_frame();
             let matches_named = pending == Some(&(target, Bare)) && is_integer_type(expected)
-                && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
+                && (signature.parameters.len() == 1
+                    || (caller == &owner.source && search.binary_bare.contains(&target)
+                        && matches!(signature.parameters.as_slice(), [first, second] if is_integer_type(first) && is_integer_type(second))))
+                && ordered.scalar_initializer.is_some();
             let plain_scalar_wrapper = search.proof_free_scalar_initializers && caller == &owner.source
                 && closed_startup_qualified_scalar_wrapper(body, &owner.source);
             let matches_plain_scalar = search.proof_free_scalar_initializers
@@ -4751,11 +4754,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 if proof_only && !trace.proof_only_continuation() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
                 return Ok(ActualCallResult::Integer(value));
             }
-            let ([parameter], [argument]) = (signature.parameters.as_slice(), exact) else { return Err(ProjectCheck::Unsupported); };
+            let (parameter, argument, second) = match (signature.parameters.as_slice(), exact) {
+                ([parameter], [argument]) => (parameter, *argument, None),
+                ([first, second], [left, right]) if role == Bare && trace.binary_bare.contains(&target) =>
+                    (first, *left, Some((second.clone(), (*right).clone()))),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
             let observation = failure_search::StartupProofObservation {
                 target, site: caller_site,
                 directive_position: effects.records.len(), parameter: parameter.clone(),
-                argument: (*argument).clone(), returned: value.clone(),
+                argument: argument.clone(), second, returned: value.clone(),
             };
             match role {
                 Bare => trace.named_observations.push(observation),
@@ -11121,6 +11129,14 @@ impl PreparedStartupAuthoredCheck {
 fn run_startup_authored_path(
     owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool, wide_rank: Option<Rc<ranked::CappedTailRecipe>>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
+    run_startup_authored_path_with_binary(owner, cap, named, qualified, callable_roots, proof_free_scalars,
+        ranked, retain_single_bare, wide_rank, &[])
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_startup_authored_path_with_binary(
+    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool, wide_rank: Option<Rc<ranked::CappedTailRecipe>>, binary_bare: &[PreparedCallable],
+) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if proof_free_scalars.is_some() || qualified { project.initialization_order.len() }
         else { 1 };
@@ -11150,6 +11166,7 @@ fn run_startup_authored_path(
     search.metered_frames = bare_activations > 1 || ranked.is_some_and(|(_, sites)| sites.len() > 1);
     search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || ranked.is_some() || retain_single_bare;
     use failure_search::StartupProofRole::{Bare, Ranked};
+    search.binary_bare.extend(binary_bare.iter().copied());
     for &(target, sites) in named {
         search.enroll_proof_sites(target, Bare, sites).ok_or(ProjectCheck::Unsupported)?;
     }
@@ -11961,6 +11978,7 @@ fn run_private_named_after_startup(
         return run_private_citation_catalog(owner, scope, cap, &plans);
     }
     let ordinary_relations = !qualified && expected.is_none() && arrays.is_empty() && ranked.is_none();
+    let mut binary_bare = Vec::new();
     let mut targets = HashSet::with_capacity(plans.len());
     let mut names = HashSet::with_capacity(plans.len());
     for plan in &plans {
@@ -11968,10 +11986,16 @@ fn run_private_named_after_startup(
         let unary_bound = matches!(body.boundary.parameters.as_slice(),
             [entry] if &entry.ty == plan.typed.result_type);
         let plain_unary = ordinary_relations && unary_bound;
+        let binary_entry = ordinary_relations && plan.proof_source == root && matches!(&plan.typed.goal,
+            TypedProofGoal::EntryComparison { slot, .. } if matches!(body.boundary.parameters.as_slice(), [first, second]
+                if is_integer_type(&first.ty) && is_integer_type(&second.ty))
+                && body.boundary.parameters.get(*slot).is_some_and(|parameter| &parameter.ty == plan.typed.result_type));
+        if binary_entry { binary_bare.push(plan.target); }
         let (goal_supported, typed_witness) = match &plan.typed.goal {
             TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. } => (true, false),
+            TypedProofGoal::EntryComparison { slot: 0, .. } if plain_unary => (true, false),
+            TypedProofGoal::EntryComparison { .. } => (binary_entry, false),
             TypedProofGoal::Literal { .. }
-                | TypedProofGoal::EntryComparison { slot: 0, .. }
                 | TypedProofGoal::EntryAffine { slot: 0, .. }
                 | TypedProofGoal::Universal { .. }
                 | TypedProofGoal::UniversalConjunction(_)
@@ -12032,7 +12056,8 @@ fn run_private_named_after_startup(
     for plan in &plans {
         let sites = incoming.get(&(plan.proof_source, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
         if sites.is_empty() { continue; }
-        if !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty)) {
+        if !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty))
+            && !binary_bare.contains(&plan.target) {
             return Err(ProjectCheck::Unsupported);
         }
         activation_count = activation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
@@ -12087,8 +12112,8 @@ fn run_private_named_after_startup(
             (Some(verified), Some(Rc::new(recipe)))
         } else { (Some(prepare_capped_ranked_receipts(plan)?), None) }
     } else { (None, None) };
-    let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, &invoked, qualified,
-        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)), reached_scalar_relation, wide_rank)?;
+    let (records, end, mut trace, mut active) = run_startup_authored_path_with_binary(&owner.prepared, cap, &invoked, qualified,
+        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)), reached_scalar_relation, wide_rank, &binary_bare)?;
     if let Some(rank) = &mut verified_rank {
         if trace.wide_rank_recipe.is_some() {
             if !trace.ranked_observations.is_empty() || trace.wide_rank_observations.len() != ranked_sites.len() {
@@ -12269,12 +12294,23 @@ fn observe_capped_bare_receipt(
     }
     trace.charge_formal_replay(1, first.guard.activation_replay_work().ok_or(ProjectCheck::Unsupported)?)
         .ok_or(ProjectCheck::Unsupported)?;
-    observer.observe_initializer(observed.target, Some(InitializerProofSite {
+    publish_capped_bare_observation(observer, observed);
+    Ok(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn publish_capped_bare_observation(observer: &mut MainFlowProofObserver<'_>, observed: failure_search::StartupProofObservation) {
+    let at = Some(InitializerProofSite {
         source: &observed.site.source, call: InitializerProofOrigin::CapturedDirect {
             call: observed.site.range, directive_position: observed.directive_position,
         },
-    }), &[observed.parameter], &[&observed.argument], &observed.returned);
-    Ok(())
+    });
+    if let Some((second, value)) = observed.second {
+        observer.observe_initializer(observed.target, at, &[observed.parameter, second],
+            &[&observed.argument, &value], &observed.returned);
+    } else {
+        observer.observe_initializer(observed.target, at, &[observed.parameter], &[&observed.argument], &observed.returned);
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12296,10 +12332,8 @@ fn observe_capped_bare_receipts(
     }
     for observed in std::mem::take(&mut trace.named_observations) {
         if &observed.site.source != root { return Err(ProjectCheck::Unsupported); }
-        observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
-            source: &observed.site.source,
-            call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
-        }), &[observed.parameter], &[&observed.argument], &observed.returned);
+        if invoked != Some(observed.target) { return Err(ProjectCheck::Unsupported); }
+        publish_capped_bare_observation(observer, observed);
     }
     if !observer.complete(&invoked.into_iter().collect()) { return Err(ProjectCheck::Unsupported); }
     Ok(())

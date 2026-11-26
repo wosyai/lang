@@ -33,6 +33,7 @@ pub(super) struct StartupProofObservation {
     pub(super) directive_position: usize,
     pub(super) parameter: ScalarType,
     pub(super) argument: BigInt,
+    pub(super) second: Option<(ScalarType, BigInt)>,
     pub(super) returned: BigInt,
 }
 
@@ -100,6 +101,7 @@ pub(in super::super) struct StartUpSearch {
     invalid: bool,
     pub(super) proof_free_scalar_initializers: bool,
     pub(super) has_bare_startup: bool,
+    pub(super) binary_bare: HashSet<PreparedCallable>,
     pub(super) named_cross_source: bool,
     pub(super) named_observations: Vec<StartupProofObservation>,
     pub(super) required_sites: HashMap<OccurrenceOrdinal, (PreparedCallable, StartupProofRole)>,
@@ -128,7 +130,7 @@ impl StartUpSearch {
         Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(),
             #[cfg(test)]
             selected_in_order: Vec::new(),
-            work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
+            work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, binary_bare: HashSet::new(), named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
             pointee_route: None, contextual_roster: None, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(), wide_rank_recipe: None, wide_rank_observations: Vec::new(), pending_wide_forward: None,
             #[cfg(test)]
             ranked_entries: Vec::new(),
