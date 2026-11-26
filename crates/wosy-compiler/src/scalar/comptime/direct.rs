@@ -65,6 +65,10 @@ pub struct DirectFunctionComptimeFragment {
 impl DirectFunctionComptimeFragment {
     pub fn facts(&self) -> &InspectedDirectComptimeCall { &self.facts }
     pub fn evaluator(&self) -> &ClosedComptimeFragment { &self.evaluator }
+
+    pub fn into_parts(self) -> (InspectedDirectComptimeCall, ClosedComptimeFragment) {
+        (self.facts, self.evaluator)
+    }
 }
 
 /// Derive evaluator LLVM from the compiler-observed concrete argument. No

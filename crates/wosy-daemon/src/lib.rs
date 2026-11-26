@@ -85,7 +85,7 @@ pub use prepared_project::{
 };
 pub use rooted_comptime::{
     RootedClosedComptimeFragment, RootedClosedComptimeProjection, RootedClosedComptimeRefusal,
-    RootedClosedComptimeRequest,
+    RootedClosedComptimeRequest, RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection,
 };
 pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};

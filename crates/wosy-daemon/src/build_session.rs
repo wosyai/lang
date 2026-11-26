@@ -3,7 +3,8 @@ use super::{
     retention_plan::SourceLease, rooted_comptime::SiteScope, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
-    RootedClosedComptimeRequest, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
+    RootedClosedComptimeRequest, RootedDirectFunctionComptimeProjection, RootedLlvmIdentity,
+    RootedLlvmProjection, RootedPreparedProject,
     SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
@@ -157,6 +158,19 @@ impl BuildDiagnosticSession<'_> {
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedClosedComptimeProjection> {
         self.project_closed_comptime_in(request, SiteScope::FirstTargetInitializer).await
+    }
+
+    /// Derive one direct evaluator and its typed literal inputs from the
+    /// actual leased singleton target entry. No framed action or runner.
+    pub async fn project_direct_function_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedDirectFunctionComptimeProjection> {
+        request.check_selector_bytes()?;
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.project_direct_function_comptime_for_lease(&lease, request)
+        }).await?
     }
 
     async fn project_closed_comptime_in(

@@ -12,10 +12,11 @@ use wosy_cli::{
     source_recovery::ClientSourceLimits,
     source_state::{ReplaySource, SqliteSourceState},
 };
-use wosy_compiler::{ClosedComptimeRejection, ScalarTargetLayout, ScalarType};
+use wosy_compiler::{ClosedComptimeRejection, DirectComptimeArgument, ScalarTargetLayout, ScalarType};
 use wosy_daemon::{
     BaseCstAdmissionLimits, RootedClosedComptimeFragment, RootedClosedComptimeProjection,
-    RootedClosedComptimeRefusal, RootedClosedComptimeRequest, SourceStorageWorker, SourceStore,
+    RootedClosedComptimeRefusal, RootedClosedComptimeRequest,
+    RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection, SourceStorageWorker, SourceStore,
 };
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{BuildSourceSelection, FileKey, NodeId};
@@ -292,6 +293,100 @@ async fn first_entry_initializer_is_selected_only_in_exact_leased_startup_order(
         assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, changed.root);
     }
     drop(original);
+    drop((worker, client));
+    Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+}
+
+const DIRECT_SOURCE: &str = r#"%%start
+# WHY: chamada concreta à órbita ☕
+i32(i32) solve = fn(input) { comptime value { input } };
+i32 answer = solve(7);
+%%end
+"#;
+
+fn emitted_direct(projection: RootedDirectFunctionComptimeProjection) -> RootedDirectFunctionComptimeFragment {
+    match projection {
+        RootedDirectFunctionComptimeProjection::Emitted(fragment) => fragment,
+        RootedDirectFunctionComptimeProjection::Refused(reason) => panic!("unexpected direct refusal: {reason:?}"),
+    }
+}
+
+fn assert_direct_evidence(
+    fragment: &RootedDirectFunctionComptimeFragment, root: NodeId, layout: ScalarTargetLayout,
+    text: &str, expected: i32,
+) {
+    let rooted = fragment.rooted();
+    let call = fragment.call();
+    assert_eq!(rooted.source_root, root);
+    assert_eq!(rooted.target, "app");
+    assert_eq!(rooted.profile, "dev");
+    assert_eq!(rooted.id, "value");
+    assert_eq!(rooted.evaluator_layout, layout);
+    assert_eq!(rooted.result_type, ScalarType::I32);
+    assert_eq!(rooted.site, *call.site());
+    assert_eq!(call.value(), DirectComptimeArgument::I32(expected));
+    assert_eq!(call.result(), &ScalarType::I32);
+    let spelling = |span: &wosy_syntax::SourceSpan| {
+        assert_eq!(span.source, rooted.site.source);
+        &text[span.range.start as usize..span.range.end as usize]
+    };
+    assert_eq!(spelling(call.function()), "solve");
+    assert_eq!(spelling(call.call()), format!("solve({expected})"));
+    assert_eq!(spelling(call.argument()), expected.to_string());
+    assert_eq!(spelling(call.formal()), "input");
+    assert_eq!(spelling(call.read()), "input");
+    assert_ne!(call.formal(), call.read());
+    assert_eq!(rooted.digest, NodeId(*blake3::hash(&rooted.bytes).as_bytes()));
+    let llvm = std::str::from_utf8(&rooted.bytes).unwrap();
+    assert!(llvm.lines().any(|line| line.trim() == format!("ret i32 {expected}")));
+    assert!(!llvm.contains("@solve("));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_evaluator_binds_the_call_to_the_exact_leased_singleton_root() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    fs::write(project.join("src/main.w"), DIRECT_SOURCE).unwrap();
+    let mut client = client(&project);
+    let store = Arc::new(SourceStore::open(&fixture.0.join("daemon"), 1 << 20).unwrap());
+    let initial = publish(&mut client, &store).await;
+    let worker = worker(&store);
+    let old = worker.open_build_diagnostics(initial.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+
+    let changed_text = DIRECT_SOURCE.replace("solve(7)", "solve(9)");
+    fs::write(project.join("src/main.w"), &changed_text).unwrap();
+    let changed = publish(&mut client, &store).await;
+    let current = worker.open_build_diagnostics(changed.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    assert_ne!(initial.root, changed.root);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        // Never take the old observation before editing live source. The
+        // query must reconstruct the actual old immutable call in the lease.
+        let retained = emitted_direct(old.project_direct_function_comptime(request("value", layout)).await.unwrap());
+        assert_direct_evidence(&retained, initial.root, layout, DIRECT_SOURCE, 7);
+        let next = emitted_direct(current.project_direct_function_comptime(request("value", layout)).await.unwrap());
+        assert_direct_evidence(&next, changed.root, layout, &changed_text, 9);
+        assert_eq!(retained.rooted().compiler_image, next.rooted().compiler_image);
+        assert_ne!(retained.rooted().authored_cst, next.rooted().authored_cst);
+        assert_ne!(retained.rooted().digest, next.rooted().digest);
+    }
+    let mut capped = request("value", ScalarTargetLayout::WASM32);
+    capped.output_bytes = 1;
+    assert!(current.project_direct_function_comptime(capped).await.unwrap_err().to_string().contains("output byte budget"));
+    drop(current);
+
+    fs::write(project.join("src/helper.w"), "%%start\ni32 helper_value = 1;\n%%end\n").unwrap();
+    let multi_text = changed_text.replace("i32(i32) solve", "helper = namespace app \"src/helper.w\";\ni32(i32) solve");
+    fs::write(project.join("src/main.w"), multi_text).unwrap();
+    let multi = publish(&mut client, &store).await;
+    let session = worker.open_build_diagnostics(multi.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    assert!(matches!(session.project_direct_function_comptime(request("value", ScalarTargetLayout::WASM32)).await.unwrap(),
+        RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::DirectCallRequiresSingleModule)));
+    let mut helper = request("value", ScalarTargetLayout::NATIVE64);
+    helper.file.path = PackageRelativePath::new("src/helper.w".into()).unwrap();
+    assert!(matches!(session.project_direct_function_comptime(helper).await.unwrap(),
+        RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::NotTargetEntry)));
+    assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, multi.root);
+    drop((old, session));
     drop((worker, client));
     Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
 }
