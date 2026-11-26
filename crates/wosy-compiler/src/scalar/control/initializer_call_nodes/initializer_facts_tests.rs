@@ -611,3 +611,38 @@ fn initializer_local_scalar_extent_follows_dominated_blocks_and_refuses_address_
         }
     }
 }
+
+#[test]
+fn initializer_indexed_shared_address_needs_its_immediate_scalar_read() {
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (statement, enrolled) in [
+            ("u16 observed = *(&data[0]);", true),
+            ("*u16 held = &data[0]; u16 observed = *held;", false),
+        ] {
+            let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u16[count] data; data[0] = 7; {statement} 1 }} else {{ 2 }};\n%%end");
+            let source = SourceIdentity::new("p".into(), "app".into(), "element-reference.w".into(), "r1".into());
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&source, &text), Vec::new())],
+                vec![source],
+                ScalarPreparationInputs { target_layout: layout },
+            ).unwrap_or_else(|error| panic!("{layout:?}: {:?}", error.diagnostics));
+            let facts = prepared.initializer_facts(0).unwrap();
+            let nodes = InitializerCallNodes::bind(facts.region, facts.items).unwrap();
+            let ScalarItem::Binding(selected) = &facts.items[0] else { unreachable!() };
+            let ScalarExpression::If { then_branch, .. } = &selected.value else { unreachable!() };
+            let ScalarBlockItem::LocalBinding(data) = &then_branch.items[1] else { unreachable!() };
+            assert_eq!(nodes.checked_local_array(data), enrolled);
+            let ScalarBlockItem::LocalBinding(observed) = &then_branch.items[3] else { unreachable!() };
+            let address = if enrolled {
+                let ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. } = &observed.value
+                    else { unreachable!("exact immediate checked address consumer"); };
+                pointer.as_ref()
+            } else {
+                &observed.value
+            };
+            let ScalarExpression::CheckedAddress { place, .. } = address else { unreachable!() };
+            let ScalarPlace::Index { base, .. } = place else { unreachable!() };
+            assert_eq!(nodes.checked_local_index(place, base), enrolled.then_some(data.receivers[0].name_span));
+        }
+    }
+}

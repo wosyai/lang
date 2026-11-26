@@ -146,17 +146,36 @@ impl<'a> InitializerCallNodes<'a> {
             nodes.targets.insert(std::ptr::from_ref(expression), (ordinal.0, target));
             Ok(())
         };
-            let record_initializer_places = topology.identities.roots.iter().any(|(place, root)| {
+        let record_initializer_places = topology.identities.roots.iter().any(|(place, root)| {
             matches!(root, InitializationStorage::Lexical(_))
                 && matches!(topology.structure.checked_types.places.get(place),
                     Some(ScalarType::RuntimeArray { element, .. }) if ordinary_value(element))
         });
         let mut indexed_reads = HashSet::new();
+        let mut immediate_shared_reads = HashMap::new();
         let mut bind_type = |ordinal, expression: &'a ScalarExpression| {
-            if record_initializer_places && matches!(expression, ScalarExpression::IndexedRead { place, .. }
-                if matches!(place, ScalarPlace::Index { base, .. } if matches!(base.as_ref(), ScalarPlace::Name { .. })))
-            {
-                indexed_reads.insert(ordinal);
+            if record_initializer_places {
+                match expression {
+                    ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, .. }, .. }
+                        if matches!(base.as_ref(), ScalarPlace::Name { .. }) =>
+                    {
+                        indexed_reads.insert(ordinal);
+                    }
+                    ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. }
+                        if matches!(pointer.as_ref(), ScalarExpression::CheckedAddress {
+                            mutability: crate::scalar::ScalarReferenceMutability::Shared,
+                            place: ScalarPlace::Index { base, .. }, ..
+                        } if matches!(base.as_ref(), ScalarPlace::Name { .. })) =>
+                    {
+                        let edges = &topology.structure.edges;
+                        if let Some(Node::Place(deref)) = edges.get(&(Parent::Expression(ordinal), Edge::ExpressionPlace)) {
+                            if let Some(Node::Expression(address)) = edges.get(&(Parent::Place(*deref), Edge::DereferencePointer)) {
+                                immediate_shared_reads.insert(*address, (*deref, ordinal));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             if matches!(expression, ScalarExpression::Float { .. }) {
                 if let Some(ty @ (ScalarType::F32 | ScalarType::F64)) =
@@ -179,7 +198,7 @@ impl<'a> InitializerCallNodes<'a> {
         }
         .initializer_items(region, items)?;
         if let Some(initializer_places) = initializer_places {
-            nodes.collect_local_array_indexes(topology, initializer_places, &indexed_reads);
+            nodes.collect_local_array_indexes(topology, initializer_places, &indexed_reads, &immediate_shared_reads);
         }
         if nodes.targets.len() != topology.calls.len() {
             return Err(format!(
@@ -195,6 +214,7 @@ impl<'a> InitializerCallNodes<'a> {
         topology: &ModuleInitializationTopology,
         nodes: CallableProofNodes<'a>,
         indexed_reads: &HashSet<OccurrenceOrdinal>,
+        immediate_shared_reads: &HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, OccurrenceOrdinal)>,
     ) {
         let structure = &topology.structure;
         let mut rejected = HashSet::new();
@@ -252,6 +272,19 @@ impl<'a> InitializerCallNodes<'a> {
                     }
                     (Parent::Expression(ordinal), Edge::ExpressionPlace) if indexed_reads.contains(&ordinal)
                         && structure.checked_types.expressions.get(&ordinal) == Some(element.as_ref()) => {}
+                    (Parent::Expression(address), Edge::ExpressionPlace) => {
+                        // The canonical address expression has only this one
+                        // exact, immediate read consumer. Nothing can store,
+                        // return, forward, or outlive the checked element loan.
+                        let &(deref, read) = immediate_shared_reads.get(&address)?;
+                        if structure.checked_types.places.get(&deref) != Some(element.as_ref())
+                            || structure.checked_types.expressions.get(&read) != Some(element.as_ref())
+                            || !matches!(structure.checked_types.expressions.get(&address),
+                                Some(ScalarType::CheckedReference {
+                                    mutability: crate::scalar::ScalarReferenceMutability::Shared, inner,
+                                }) if inner.as_ref() == element.as_ref())
+                        { return None; }
+                    }
                     _ => return None,
                 }
                 Some((local, sites.containing_item((parent, edge))?, *places.get(&index)?, *places.get(&base)?))
