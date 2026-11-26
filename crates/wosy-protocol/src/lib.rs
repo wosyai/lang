@@ -6,7 +6,8 @@ use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentit
 
 mod build_diagnostics;
 pub use build_diagnostics::{
-    BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION,
+    BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
+    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, BUILD_DIAGNOSTIC_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

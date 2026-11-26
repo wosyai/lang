@@ -43,6 +43,8 @@ type Result<T> = std::result::Result<T, Error>;
 mod base_declarations;
 mod build_receipt;
 mod build_session;
+mod framed_session;
+mod session_frame;
 mod derivation_image;
 mod pins;
 mod project_declarations;
@@ -52,6 +54,8 @@ mod source_impact;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use build_session::BuildDiagnosticSession;
+pub use framed_session::BuildSessionEnd;
+pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,

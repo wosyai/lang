@@ -69,8 +69,10 @@ with tempfile.TemporaryDirectory() as temp:
     old = call(project, store, "submit-pending", "app", "src/main.w")
     assert old["selected"] == first["pending"]
 
-    def run(profile="dev", oracle=True):
-        out = call(project, store, "leased-build", profile, *(["--oracle"] if oracle else []))
+    def run(profile="dev", oracle=True, framed=True):
+        options = (["--oracle"] if oracle else []) + (["--framed"] if framed else [])
+        out = call(project, store, "leased-build", profile, *options)
+        assert out["result"]["framed"] == framed
         answer = response(out)
         assert bytes(answer["source_root"]).hex() == out["selected"]
         assert answer["phase"] == "Analyzed" and answer["version"] == 1 and answer["profile"] == profile
@@ -81,6 +83,9 @@ with tempfile.TemporaryDirectory() as temp:
     assert orig["origin"] == native["origin"] == "Derived"
     assert orig["receipt"] != native["receipt"]
     assert orig["diagnostics"] == native["diagnostics"]
+    direct, _ = run(framed=False)
+    assert direct["origin"] == "Stored"
+    assert {k: v for k, v in direct.items() if k != "origin"} == {k: v for k, v in orig.items() if k != "origin"}
     only_blob, = (store / "cas").iterdir()
     assert only_blob.stat().st_size > 64 * 1024
     digest = hashlib.sha256(only_blob.read_bytes()).digest()
@@ -118,7 +123,7 @@ with tempfile.TemporaryDirectory() as temp:
     fixed, _ = run()
     assert fixed["origin"] == "Derived" and not fixed["diagnostics"] and fixed["receipt"] != orig["receipt"]
     assert not (project / ".wosy/artifacts").exists()
-    print("acknowledged SQLite root → leased opt-in worker → normal compiler diagnostic response", {
+    print("acknowledged SQLite root → real framed in-process leased worker → ordinary compiler diagnostics", {
         "warm_dispatch_ms": round(warm_ms, 3), "resolved_profiles": ["dev", "native"],
         "historic_UTF8": True, "newer_pending_not_selected": True, "cas_rebuilt": True,
         "rooted_files": 19, "cas_bytes": only_blob.stat().st_size,

@@ -50,3 +50,55 @@ pub enum BuildDiagnosticResponse<D> {
         diagnostics: Vec<D>,
     },
 }
+
+/// A sender does not reuse an ID until it has received that command's reply.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BuildSessionCommandId(pub u64);
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSessionCommand {
+    pub id: BuildSessionCommandId,
+    pub request: BuildSessionRequest,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSessionResponse<D> {
+    pub id: BuildSessionCommandId,
+    pub reply: BuildSessionReply<D>,
+}
+
+/// A connection negotiates the diagnostic protocol before using its single
+/// host-selected source lease. None of these messages select a source root.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BuildSessionRequest {
+    Start { version: u16 },
+    Analyze { request: BuildDiagnosticRequest },
+    Renew,
+    Disconnect,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSessionRefusal {
+    ExpectedStart,
+    AlreadyStarted,
+    UnsupportedVersion,
+    Busy,
+    SourceUnavailable,
+    AnalysisUnavailable,
+    ResponseTooLarge,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BuildSessionReply<D> {
+    Started { version: u16, source_root: NodeId },
+    Analysis { response: BuildDiagnosticResponse<D> },
+    Renewed,
+    Closed,
+    Refused { reason: BuildSessionRefusal },
+}

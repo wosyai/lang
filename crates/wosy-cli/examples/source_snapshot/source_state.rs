@@ -43,9 +43,16 @@ pub(super) async fn run(
         "state" => serde_json::json!({}),
         "leased-build" => {
             let profile = args.next().ok_or("expected fixture Build profile")?;
-            let oracle = args.next().as_deref() == Some("--oracle");
+            let (mut oracle, mut framed) = (false, false);
+            for option in args {
+                match option.as_str() {
+                    "--oracle" => oracle = true,
+                    "--framed" => framed = true,
+                    _ => return Err("unknown leased diagnostic fixture option".into()),
+                }
+            }
             let selected = client.acknowledged_build_source(&target)?.ok_or("fixture must have an acknowledged source")?;
-            super::leased_build::run(project, dir, selected, &profile, oracle).await?
+            super::leased_build::run(project, dir, selected, &profile, oracle, framed).await?
         }
         "pin-local" => {
             let name = args.next().ok_or("expected local fixture pin name")?;

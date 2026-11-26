@@ -1,6 +1,6 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{retention_plan::SourceLease, Result, SourceStorageWorker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION};
 
@@ -28,19 +28,21 @@ impl BuildDiagnosticSession<'_> {
     /// An expired or released lease cannot be renewed.
     pub fn renew(&self) -> bool { self.lease.renew() }
 
+    pub(super) fn deadline(&self) -> Option<Instant> { self.lease.deadline() }
+
     /// Drop the client session; already started reads retain their own roots.
     pub fn release(self) {}
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         let BuildDiagnosticRequest::BuildDiagnostics { version, profile } = request;
-        if version != BUILD_DIAGNOSTIC_VERSION { return Err("unsupported Build diagnostic protocol version".into()); }
+        if version != BUILD_DIAGNOSTIC_VERSION { return Err(BuildRequestRejection::Version.into()); }
         let slot = self.worker.try_slot()?;
         let grant = self.lease.grant();
         self.worker.spawn_reserved_query(slot, move |worker| async move {
             let snapshot = worker.phase(None, move |store| {
                 store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
             }).await?;
-            let Some(snapshot) = snapshot else { return Err("Build diagnostic session lease expired".into()); };
+            let Some(snapshot) = snapshot else { return Err(BuildRequestRejection::Expired.into()); };
             // SurrealKV commits may schedule their own blocking work. Keep
             // all awaited queries on the async task, never on a pool thread.
             let prepared = worker.store.prepare_configured(snapshot, &profile, Some(&worker)).await?;
@@ -130,3 +132,20 @@ mod tests {
         });
     }
 }
+
+#[derive(Debug)]
+pub(super) enum BuildRequestRejection {
+    Version,
+    Expired,
+}
+
+impl std::fmt::Display for BuildRequestRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Version => "unsupported Build diagnostic protocol version",
+            Self::Expired => "Build diagnostic session lease expired",
+        })
+    }
+}
+
+impl std::error::Error for BuildRequestRejection {}

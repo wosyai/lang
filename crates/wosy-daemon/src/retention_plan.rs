@@ -43,6 +43,11 @@ pub(super) struct SourceLease {
 impl SourceLease {
     pub fn grant(&self) -> LeaseGrant { self.grant }
 
+    pub fn deadline(&self) -> Option<Instant> {
+        let reads = self.reads.lock().expect("source reader registry");
+        reads.sessions.get(&self.grant.id).map(|(_, expires)| *expires)
+    }
+
     pub fn renew(&self) -> bool {
         let mut reads = self.reads.lock().expect("source reader registry");
         let now = Instant::now();
