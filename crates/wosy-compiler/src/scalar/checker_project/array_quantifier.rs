@@ -351,49 +351,54 @@ impl<'a> Cohort<'a> {
     /// one prepared owner and share a single metered startup walk.
     pub(super) fn run_capped(
         &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
-        bare: Option<&PlannedModuleProof<'_>>, rank: Option<&PlannedModuleProof<'_>>,
+        bare: Option<&PlannedModuleProof<'_>>, rank: Option<&PlannedModuleProof<'_>>, provider: Option<&SourceIdentity>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
         use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
         let prepared = &owner.prepared;
         let (project, calls) = prepared.parts();
-        let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        if module.source != owner.source { return Err(ProjectCheck::Unsupported); }
         let (root, ordinals) = package_startup_order(project, &project.modules)?;
-        let (_, authored_roots) = package_obligation_roots(prepared, scope, 1, root)?;
+        if root != &owner.source || (provider.is_some() && rank.is_some()) { return Err(ProjectCheck::Unsupported); }
+        let owned = |source: &SourceIdentity| source == root || Some(source) == provider;
+        let (_, authored_roots) = package_obligation_roots(prepared, scope, project.modules.len(), root)?;
         if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
 
         let mut targets = Vec::with_capacity(self.groups.len().checked_add(usize::from(bare.is_some()))
             .and_then(|count| count.checked_add(usize::from(rank.is_some()))).ok_or(ProjectCheck::Unsupported)?);
         for (&target, group) in &self.groups {
             let plan = &self.plans[group.ids[0]];
+            let module = project.modules.get(target.0).ok_or(ProjectCheck::Unsupported)?;
             let Some(ScalarItem::Function(declaration)) = module.items.get(target.1) else { return Err(ProjectCheck::Unsupported); };
-            if target.0 != 0 || plan.owner != root || plan.source != root { return Err(ProjectCheck::Unsupported); }
-            targets.push((target, declaration.name_span, Aggregate));
-        }
-        if let Some(plan) = bare {
-            if plan.target.0 != 0 || plan.proof_source != root || self.groups.contains_key(&plan.target) {
+            if &module.source != plan.owner || !owned(plan.owner) || plan.source != plan.owner {
                 return Err(ProjectCheck::Unsupported);
             }
-            targets.push((plan.target, plan.function.name_span, Bare));
+            if group.ids.iter().any(|&id| self.plans[id].source != plan.owner) { return Err(ProjectCheck::Unsupported); }
+            targets.push((target, plan.owner, declaration.name_span, Aggregate));
+        }
+        if let Some(plan) = bare {
+            if !owned(plan.proof_source) || self.groups.contains_key(&plan.target) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            targets.push((plan.target, plan.proof_source, plan.function.name_span, Bare));
         }
         if let Some(plan) = rank {
             if plan.target.0 != 0 || plan.proof_source != root || self.groups.contains_key(&plan.target)
                 || bare.is_some_and(|bare| bare.target == plan.target || bare.name == plan.name)
             { return Err(ProjectCheck::Unsupported); }
-            targets.push((plan.target, plan.function.name_span, Ranked));
+            targets.push((plan.target, plan.proof_source, plan.function.name_span, Ranked));
         }
         let mut scalar = bare.map(|plan| MainFlowProofObserver::from_first_plan(scope, root, plan)).transpose()?;
         if let Some(observer) = scalar.as_mut() { observer.finish_plans(prepared, scope)?; }
-        let incoming = calls.owned_direct_startup_callable_uses(root, None,
-            targets.iter().map(|(_, span, _)| (root, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
+        let incoming = calls.owned_direct_startup_callable_uses(root, provider,
+            targets.iter().map(|(_, source, span, _)| (*source, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
         let mut trace = failure_search::StartUpSearch::new(root, cap);
         trace.retain_after_cutoff = true;
+        trace.named_cross_source = provider.is_some();
         let mut reached_arrays = HashSet::new();
         let mut deferred_arrays = Vec::new();
         let mut invoked_scalar = None;
         let mut verified_rank = None;
-        for (target, span, role) in targets {
-            let sites = incoming.get(&(root, span)).ok_or(ProjectCheck::Unsupported)?;
+        for (target, source, span, role) in targets {
+            let sites = incoming.get(&(source, span)).ok_or(ProjectCheck::Unsupported)?;
             if sites.is_empty() {
                 if role == Aggregate { deferred_arrays.push(target); }
                 continue;
@@ -475,9 +480,10 @@ impl<'a> Cohort<'a> {
             // Only the original complete edge census authorizes deferred
             // work here. No replay of a partly observed startup invocation.
             for (ordinal, item) in deferred_arrays {
+                let module = project.modules.get(ordinal).ok_or(ProjectCheck::Unsupported)?;
                 let Some(ScalarItem::Function(function)) = module.items.get(item) else { return Err(ProjectCheck::Unsupported); };
                 let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
-                active |= symbolic.try_collect((ordinal, item), body, function, root, &mut effects,
+                active |= symbolic.try_collect((ordinal, item), body, function, &module.source, &mut effects,
                     SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
             }
             symbolic.complete()?;
@@ -567,7 +573,7 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
         }
         let (returned, failures) = collect_exact_fixed_array_return(
             body, first.result, args, &mut checks, &mut self.work,
-            trace.map(|trace| (&call.source, trace)),
+            trace.map(|trace| (first.owner, trace)),
         ).ok_or(ProjectCheck::Unsupported)?;
         self.seen.insert(target);
         self.applicable |= applicable;

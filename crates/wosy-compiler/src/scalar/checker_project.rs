@@ -2210,8 +2210,16 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
             watch.qualified_leaf || (watch.result_pair && pair_receivers.is_some())));
     #[cfg(not(feature = "internal-checker"))]
     let qualified_proof = || false;
+    #[cfg(feature = "internal-checker")]
+    let capped_qualified = || collection.is_some_and(|(caller, ordered)|
+        topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|target|
+            ordered.failures.borrow().startup_search.as_ref().is_some_and(|search|
+                search.borrow().allows_qualified_bare(caller, occurrence, *target))));
+    #[cfg(not(feature = "internal-checker"))]
+    let capped_qualified = || false;
     let collection = collection.filter(|(source, _)|
-        check_completed_scalar_namespace || !is_integer_type(expected) || *source == &declaration.source || qualified_proof());
+        check_completed_scalar_namespace || !is_integer_type(expected) || *source == &declaration.source
+            || qualified_proof() || capped_qualified());
     let named_literal = matches!(expected, ScalarType::Bool | ScalarType::Char)
         && actual.named_literal_initializer(topology, occurrence, expected, collection.is_some());
     let named_character = *expected == ScalarType::Char && named_literal;
@@ -4133,7 +4141,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
             let pending = search.required_sites.get(&call).filter(|_| search.owns_initialization(caller));
             let matches_aggregate = pending == Some(&(target, Aggregate))
-                && caller == &owner.source && matches!(expected, ScalarType::Array { .. })
+                && matches!(expected, ScalarType::Array { .. })
                 && self.observer.watches_fixed_array(target) && proof_site.is_some()
                 && body.checker_pure_calling_frame();
             let matches_named = pending == Some(&(target, Bare)) && is_integer_type(expected)
@@ -4161,8 +4169,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
                     && body.checker_named_route_frame() && literal_history_directives(body)));
-            let cross_authorized = caller != &owner.source && (search.named_cross_source && matches_named || ordinary_qualified)
-                && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
+            let cross_proof = matches_aggregate
+                || (matches_named && search.allows_qualified_bare(caller, call, target)
+                    && qualified_integer_proof_leaf(body, expected));
+            let cross_authorized = caller != &owner.source && if cross_proof {
+                // Both exact proof routes still consume the canonical typed site
+                // below; no ordinary observer capability is granted.
+                completed_namespace_owner(caller, &owner.source, target.0, ordered.visits)
+            } else {
+                ordinary_qualified && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits)
+            };
             if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked && !matches_aggregate)
                 || (caller != &owner.source && !cross_authorized)
                 || ordered.startup_site_source != Some(caller)
@@ -4292,10 +4308,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         #[cfg(feature = "internal-checker")]
         let passive_caller = collection.map(|(source, _)| source);
+        #[cfg(feature = "internal-checker")]
+        let capped_named_initializer = startup_named;
+        #[cfg(not(feature = "internal-checker"))]
+        let capped_named_initializer = false;
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
                 && (matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
-                    || (!enrolled_direct_proof
+                    || (!enrolled_direct_proof && !capped_named_initializer
                         && !self.completed_namespace_call(caller_source, owner, target_module, body, signature, expected, collection.visits)))
             {
                 return Err(ProjectCheck::Unsupported);
@@ -10704,7 +10724,7 @@ fn run_private_named_after_startup(
             return pointer_proof::Plan::prepare(proof_source, selected)?.run_capped(owner, scope, cap);
         }
         if array_quantifier::is_array_target(&selected) {
-            if qualified || expected.is_some() || proof_source != &owner.source { return Err(ProjectCheck::Unsupported); }
+            if expected.is_some() { return Err(ProjectCheck::Unsupported); }
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
             arrays.extend(array_quantifier::ArrayProof::prepare(proof_source, selected, &mut array_work)?);
             continue;
@@ -10740,7 +10760,7 @@ fn run_private_named_after_startup(
     if !arrays.is_empty() {
         if plans.len() > 1 { return Err(ProjectCheck::Unsupported); }
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
-        return cohort.run_capped(owner, scope, cap, plans.first(), ranked.as_ref());
+        return cohort.run_capped(owner, scope, cap, plans.first(), ranked.as_ref(), provider);
     }
     if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
@@ -24069,6 +24089,78 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert_eq!(owner, &app);
                 assert_eq!((&condition.source, &output.source), (&app, &app));
                 assert_eq!((snippet(condition), *accepted, snippet(output)), ("input == 0", keep, selected));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_qualified_array_preserves_provider_interior_and_caller_boundaries() {
+        use failure_search::{PathStep, StartUpSearch, StartupProofRole};
+        use std::num::NonZeroUsize;
+        use super::super::checker_flow::take_array_return_observations;
+        let app = source("src/main.w", "qualified-array-caller");
+        let lib = source("src/lib.w", "qualified-array-provider");
+        let library = r#"%%start
+            u8[2](u8) make = fn(input) { if (input == 0) { [7, 1] } else { [1, 7] } };
+            proof cells for make(entry) -> (items)
+                forall (u64 i where i == 0) ensures (items[i] == 8)
+            { core.show(items[i] == 8); }
+        %%end"#;
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (input, taken, literal) in [(0, true, "[7, 1]"), (1, false, "[1, 7]")] {
+                let primary = format!(r#"%%start
+                    lib = namespace demo "src/lib.w";
+                    u8[2] made = lib.make({input});
+                    u8 cell = made[0];
+                    core.require(cell == 8, {OUTPUT});
+                %%end"#);
+                let parse = |source: &SourceIdentity, text: &str|
+                    crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1;
+                let import = ScalarNamespaceBinding { binding: "lib".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), [(parse(&app, &primary), vec![import]), (parse(&lib, library), Vec::new())],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout: layout },
+                    ScalarCheckerScope::MainFlowOnly, Vec::new(),
+                ).ok().unwrap();
+                let PreparedConfiguredCheck::Named { owner, .. } = prepared.owner else { panic!("original array proof query"); };
+                let (project, calls) = owner.prepared.parts();
+                let (root, ordinals) = package_startup_order(project, &project.modules).unwrap();
+                let catalog = &owner.proofs[&lib];
+                let selected = owner.resolve_selected_proof(&catalog.definitions[0], catalog.first_query).unwrap();
+                let target = (selected.function.0, selected.function.1);
+                let decl = selected.function.2.name_span;
+                let cohort = array_quantifier::Cohort::new(
+                    array_quantifier::ArrayProof::prepare(&lib, selected, &mut 0).unwrap(), Some(calls),
+                ).unwrap();
+                let incoming = calls.owned_direct_startup_callable_uses(root, Some(&lib), [(&lib, decl)], None).unwrap();
+                let mut trace = StartUpSearch::new(root, NonZeroUsize::MIN);
+                trace.retain_after_cutoff = true;
+                trace.enroll_proof_sites(target, StartupProofRole::Aggregate, &incoming[&(&lib, decl)]).unwrap();
+                let trace = Rc::new(RefCell::new(trace));
+                let mut effects = OrderedFailures { startup_search: Some(trace.clone()), ..OrderedFailures::default() };
+                let _ = take_array_return_observations();
+                let (outcome, evidence) = walk_prepared_initialization::<_, true, true>(
+                    &owner.prepared, root, ordinals, array_quantifier::Evidence::new(&cohort).unwrap(), Some(&mut effects),
+                );
+                assert!(matches!(outcome, Err(ProjectCheck::StartupAuthoredLimitReached)));
+                assert_eq!(take_array_return_observations(), (0, 1));
+                let [failure] = evidence.failures.as_slice() else { panic!("one reached array refutation"); };
+                let trace = trace.borrow();
+                let [PathStep::Startup(startup), PathStep::Namespace { target, .. }, PathStep::Call(call),
+                    PathStep::Branch { condition, accepted }, PathStep::Output(output), PathStep::Return(back)]
+                    = trace.current_path() else { panic!("original caller/provider structural history"); };
+                assert_eq!((startup, target), (&app, &lib));
+                assert_eq!((&call.source, &back.source, &condition.source, &output.source), (&app, &app, &lib, &lib));
+                assert_eq!(call, back);
+                assert_eq!(failure.call.as_ref(), Some(call));
+                let snippet = |at: &wosy_syntax::SourceSpan| {
+                    let code = if at.source == app { primary.as_str() } else { library };
+                    &code[at.range.start as usize..at.range.end as usize]
+                };
+                assert_eq!(snippet(call), format!("lib.make({input})"));
+                assert_eq!((snippet(condition), *accepted, snippet(output)), ("input == 0", taken, literal));
+                assert!(trace.contains_return(back));
             }
         }
     }

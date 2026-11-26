@@ -2750,7 +2750,7 @@ main_artifact = "main"
                 assert_eq!(terminal(&selected(8), scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
                 assert_eq!(files(), first_file);
                 clean();
-                fs::remove_file(shared_source).unwrap();
+                fs::remove_file(&shared_source).unwrap();
                 let checked_cells = format!(r#"%%start
                     unit(*!u32) advance = fn(cell) {{ *cell = *cell +@ 1; }};
                     proof epoch for advance(p) -> () ensures (*p == core.old(*p) +@ 1) {{}}
@@ -2916,6 +2916,82 @@ main_artifact = "main"
                     assert_eq!(files(), both_files);
                     clean();
                 }
+                // Both owned proof kinds can share the same real module
+                // initialization, including a provider-produced array.
+                let scalar_library = r#"%%start
+                    u8(u8) echo = fn(value) { value };
+                    proof scalar for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {}
+                %%end"#;
+                let array_library = r#"
+                    u8[2]() make = fn { [7, 1] };
+                    proof cells for make() -> (items)
+                        forall (u64 i where i == 0) ensures (items[i] == 8)
+                    { core.show(items[i] == 8); }
+                "#;
+                for (array_in_provider, deferred) in [(false, false), (true, false), (true, true)] {
+                    let provider_code = if array_in_provider {
+                        scalar_library.replace("%%end", &format!("{array_library} %%end"))
+                    } else { scalar_library.to_owned() };
+                    let array_setup = match (array_in_provider, deferred) {
+                        (_, true) => "u8 cell = 7;",
+                        (true, false) => "u8[2] input = lib.make(); u8 cell = input[0];",
+                        (false, false) => "u8[2] input = make(); u8 cell = input[0];",
+                    };
+                    let app_array = if array_in_provider { "" } else { array_library };
+                    let app = format!(r#"%%start
+                        lib = namespace app "shared.w";
+                        {app_array}
+                        {array_setup}
+                        core.require(cell == 8, {first});
+                        u8 returned = lib.echo(7);
+                        core.require(returned == 8, {second});
+                    %%end"#);
+                    fs::write(&source, &app).unwrap();
+                    fs::write(&shared_source, &provider_code).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 1);
+                    let [scalar] = report.diagnostics.as_slice() else { panic!("actual qualified scalar proof"); };
+                    assert_eq!(scalar.proof.source.path, "src/shared.w");
+                    assert_eq!(scalar.invocation.call.source.path, "src/main.w");
+                    let scalar_span = scalar.invocation.call.range;
+                    assert_eq!(&app[scalar_span.start as usize..scalar_span.end as usize], "lib.echo(7)");
+                    if deferred && scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(report.aggregate_diagnostics.is_empty());
+                    } else {
+                        let [array] = report.aggregate_diagnostics.as_slice() else { panic!("original owned array proof"); };
+                        assert_eq!(array.proof.source.path, if array_in_provider { "src/shared.w" } else { "src/main.w" });
+                        assert_eq!(array.cell.as_ref().unwrap().value.to_string(), "7");
+                        assert_eq!(array.call.is_none(), deferred);
+                        if let Some(call) = &array.call {
+                            let span = call.range;
+                            assert_eq!(call.source.path, "src/main.w");
+                            assert_eq!(&app[span.start as usize..span.end as usize], if array_in_provider { "lib.make()" } else { "make()" });
+                        }
+                    }
+                    let clipped = terminal(&limited, scope, false);
+                    assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                    assert_eq!(clipped.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+                    if array_in_provider && !deferred {
+                        // A provider startup call is not an enrolled app
+                        // activation, even when it resolves the same function.
+                        fs::write(&shared_source, provider_code.replace("%%end",
+                            &format!("u8[2] other = make(); u8 witness = other[0]; core.require(witness == 7, {unused_output}); %%end"))).unwrap();
+                        let refused = selected(1);
+                        assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                        assert!(!state.exists());
+                    }
+                }
+                fs::remove_file(&shared_source).unwrap();
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {

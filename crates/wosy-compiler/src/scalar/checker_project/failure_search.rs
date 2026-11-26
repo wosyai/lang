@@ -135,6 +135,11 @@ impl StartUpSearch {
         super::super::checker_flow::charge_call_work(&mut self.work, activations.checked_mul(per_activation)?)
     }
 
+    pub(super) fn allows_qualified_bare(&self, caller: &SourceIdentity, site: OccurrenceOrdinal, target: (usize, usize)) -> bool {
+        self.named_cross_source && self.owns_initialization(caller)
+            && self.required_sites.get(&site) == Some(&(target, StartupProofRole::Bare))
+    }
+
     pub(super) fn has_aggregate_site(&self, caller: &SourceIdentity, site: OccurrenceOrdinal) -> bool {
         self.owns_initialization(caller) && self.required_sites.get(&site).is_some_and(|(_, role)| *role == StartupProofRole::Aggregate)
     }
