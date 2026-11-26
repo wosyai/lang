@@ -5024,6 +5024,30 @@ fn fixed_projected_reference_keeps_its_local_loan_live_until_last_use() {
 }
 
 #[test]
+fn nested_literal_carriers_keep_exact_last_use() {
+    for (lane, conflict) in [(0, true), (1, false)] {
+        let text = format!(
+            "%%start
+unit() inspect = fn {{ u8[2] bytes = [7, 9]; (*u8)[2][2] refs = [[null, null], [null, null]]; refs[0][0] = &bytes[0]; refs[0][1] = &bytes[1]; bytes[0] = 8; *u8 observed = refs[0][{lane}]; observed; }};
+%%end"
+        );
+        let access = text.find("bytes[0] = 8").unwrap() as u32;
+        let origin = text.find("&bytes[0]").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|error| error.code == "B0003"
+                    && error.labels.first().is_some_and(|label| label.span.range.start == access)
+                    && error.labels.iter().skip(1).any(|label| label.span.range.start == origin)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn singleton_checked_pointer_store_keeps_projected_local_loan_live() {
     for (install, uses, conflict) in [
         ("parcel.item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),

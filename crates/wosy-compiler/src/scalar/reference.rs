@@ -8155,17 +8155,91 @@ struct LexicalConflictMemo {
     retained: usize,
 }
 
-// A conservative use relation for directly named one-projection carriers. Forget
-// branches, writes and kills here; only the existing CFG walk can prove a
-// candidate unreachable on a particular path. A read into a lexical alias is
-// a use of the projection, not a transfer of the alias's subsequent uses back to it.
+// The conservative relation forgets branches, installs and kills. It may
+// discard only disjoint known prefixes; exact reachability owns every kill.
+const MAX_STAGED_CARRIER_DEPTH: usize = 2;
+
+enum CarrierSelector<'a> {
+    Field(&'a ScalarStructFieldId),
+    Index(&'a BigInt),
+}
+
+impl<'a> CarrierSelector<'a> {
+    fn from_projection(projection: &'a ReferencePlaceProjection) -> Option<Self> {
+        match projection {
+            ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field)) => Some(Self::Field(field)),
+            ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. }) => Some(Self::Index(value)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CarrierUse {
+    latest: Option<CfgPointId>,
+    prefix: Option<CfgPointId>,
+    descendants: Option<Box<CarrierLevel>>,
+}
+
+#[derive(Default)]
+struct CarrierLevel {
+    whole: Option<CfgPointId>,
+    fields: BTreeMap<ScalarStructFieldId, CarrierUse>,
+    indices: BTreeMap<BigInt, CarrierUse>,
+    last_field: Option<CfgPointId>,
+    last_index: Option<CfgPointId>,
+}
+
+impl CarrierLevel {
+    fn record(&mut self, path: &[ReferencePlaceProjection], at: CfgPointId, depth: usize) {
+        let Some((first, rest)) = path.split_first().filter(|_| depth != 0) else {
+            self.whole = Some(at);
+            return;
+        };
+        let selected = match CarrierSelector::from_projection(first) {
+            Some(CarrierSelector::Field(field)) => {
+                self.last_field = Some(at);
+                self.fields.entry(field.clone()).or_default()
+            }
+            Some(CarrierSelector::Index(index)) => {
+                self.last_index = Some(at);
+                self.indices.entry(index.clone()).or_default()
+            }
+            None => {
+                // Unknown selectors overlap all children within this prefix.
+                self.whole = Some(at);
+                return;
+            }
+        };
+        selected.latest = Some(at);
+        if depth > 1 {
+            if rest.is_empty() {
+                selected.prefix = Some(at);
+            } else {
+                selected.descendants.get_or_insert_with(Default::default).record(rest, at, depth - 1);
+            }
+        }
+    }
+
+    fn candidate(&self, from: CfgPointId, path: &[ReferencePlaceProjection]) -> bool {
+        let later = |latest: Option<CfgPointId>| latest.is_some_and(|point| point > from);
+        if later(self.whole) { return true; }
+        let Some((first, rest)) = path.split_first() else { return true; };
+        let (opposite, selected) = match CarrierSelector::from_projection(first) {
+            Some(CarrierSelector::Field(field)) => (self.last_index, self.fields.get(field)),
+            Some(CarrierSelector::Index(index)) => (self.last_field, self.indices.get(index)),
+            None => return true,
+        };
+        // reference_places_overlap compares comparable selectors only.
+        // Mixed classes remain candidates, even if a sound type makes them rare.
+        later(opposite) || selected.is_some_and(|entry| later(entry.latest) && (rest.is_empty()
+            || later(entry.prefix) || entry.descendants.as_ref().is_some_and(|next| next.candidate(from, rest))))
+    }
+}
+
 #[derive(Default)]
 struct ProjectedCarrierReads {
-    whole: HashMap<ReferenceBindingId, CfgPointId>,
-    fields: HashMap<ReferenceBindingId, BTreeMap<ScalarStructFieldId, CfgPointId>>,
-    indices: HashMap<ReferenceBindingId, BTreeMap<BigInt, CfgPointId>>,
-    last_field: HashMap<ReferenceBindingId, CfgPointId>,
-    last_index: HashMap<ReferenceBindingId, CfgPointId>,
+    bindings: HashMap<ReferenceBindingId, CarrierLevel>,
     opaque: Option<CfgPointId>,
 }
 
@@ -8173,7 +8247,7 @@ impl ProjectedCarrierReads {
     fn record(&mut self, point: &ReferenceFlowPoint) {
         match &point.kind {
             CfgPointKind::Read { binding } => {
-                self.whole.insert(binding.clone(), point.id);
+                self.bindings.entry(binding.clone()).or_default().whole = Some(point.id);
             }
             CfgPointKind::ReadPlace { candidates, pointer_point, reads_origin, .. } => {
                 if pointer_point.is_some() && candidates.is_empty()
@@ -8188,33 +8262,13 @@ impl ProjectedCarrierReads {
     }
 
     fn record_place(&mut self, place: &ReferencePlaceId, at: CfgPointId) {
-        match place.projections.first() {
-            Some(ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))) => {
-                self.fields.entry(place.binding.clone()).or_default().insert(field.clone(), at);
-                self.last_field.insert(place.binding.clone(), at);
-            }
-            Some(ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })) => {
-                self.indices.entry(place.binding.clone()).or_default().insert(value.clone(), at);
-                self.last_index.insert(place.binding.clone(), at);
-            }
-            _ => { self.whole.insert(place.binding.clone(), at); }
-        }
+        self.bindings.entry(place.binding.clone()).or_default()
+            .record(&place.projections, at, MAX_STAGED_CARRIER_DEPTH);
     }
 
     fn candidate(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
-        let binding = &place.binding;
-        let later = |latest: Option<&CfgPointId>| latest.is_some_and(|point| *point > from);
-        self.opaque.is_some_and(|p| p > from)
-            || later(self.whole.get(binding))
-            || match place.projections.as_slice() {
-                [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =>
-                    later(self.last_index.get(binding))
-                        || later(self.fields.get(binding).and_then(|fields| fields.get(field))),
-                [ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })] =>
-                    later(self.last_field.get(binding))
-                        || later(self.indices.get(binding).and_then(|indices| indices.get(value))),
-                _ => true,
-            }
+        self.opaque.is_some_and(|point| point > from)
+            || self.bindings.get(&place.binding).is_some_and(|entry| entry.candidate(from, &place.projections))
     }
 }
 
@@ -8238,9 +8292,8 @@ impl<'a> ConflictLiveness<'a> {
     }
 
     fn projected_after(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
-        if self.strictly_forward && matches!(place.projections.as_slice(),
-            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))]
-            | [ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })])
+        if self.strictly_forward && (1..=MAX_STAGED_CARRIER_DEPTH).contains(&place.projections.len())
+            && place.projections.iter().all(|step| CarrierSelector::from_projection(step).is_some())
         {
             let projected = self.projected.get_or_init(|| {
                 let mut reads = ProjectedCarrierReads::default();
@@ -8369,6 +8422,26 @@ fn projected_literal_carriers_run_precise_search_only_for_conservative_candidate
     let liveness = ConflictLiveness::new(&may_alias, None, true, false);
     assert!(liveness.projected_after(CfgPointId(0), &first));
     assert!(liveness.projected_after(CfgPointId(0), &second));
+
+    let nested = |outer: &ReferencePlaceId, inner: &ReferencePlaceId| {
+        let mut path = outer.clone();
+        path.projections.extend(inner.projections.iter().cloned());
+        path
+    };
+    let a = nested(&first, &first);
+    let b = nested(&first, &second);
+    let dynamic_inner = nested(&first, &unknown);
+    let stage = |place: &ReferencePlaceId| {
+        let mut summary = ProjectedCarrierReads::default();
+        summary.record_place(place, CfgPointId(1));
+        summary
+    };
+    assert!(!stage(&b).candidate(CfgPointId(0), &a), "same-prefix literal sibling");
+    assert!(stage(&a).candidate(CfgPointId(0), &a), "same full path");
+    assert!(stage(&first).candidate(CfgPointId(0), &a), "whole first-level prefix");
+    assert!(stage(&a).candidate(CfgPointId(0), &first), "descendant read of a first-level carrier");
+    assert!(stage(&dynamic_inner).candidate(CfgPointId(0), &a), "unknown inner selector");
+    assert!(!stage(&dynamic_inner).candidate(CfgPointId(0), &second), "unknown inner selector cannot widen outer prefix");
 }
 
 #[cfg(test)]
