@@ -351,9 +351,9 @@ impl<'a> Cohort<'a> {
     /// one prepared owner and share a single metered startup walk.
     pub(super) fn run_capped(
         &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
-        bare: Option<&PlannedModuleProof<'_>>,
+        bare: Option<&PlannedModuleProof<'_>>, rank: Option<&PlannedModuleProof<'_>>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
-        use failure_search::StartupProofRole::{Aggregate, Bare};
+        use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
         let prepared = &owner.prepared;
         let (project, calls) = prepared.parts();
         let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -363,7 +363,7 @@ impl<'a> Cohort<'a> {
         if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
 
         let mut targets = Vec::with_capacity(self.groups.len().checked_add(usize::from(bare.is_some()))
-            .ok_or(ProjectCheck::Unsupported)?);
+            .and_then(|count| count.checked_add(usize::from(rank.is_some()))).ok_or(ProjectCheck::Unsupported)?);
         for (&target, group) in &self.groups {
             let plan = &self.plans[group.ids[0]];
             let Some(ScalarItem::Function(declaration)) = module.items.get(target.1) else { return Err(ProjectCheck::Unsupported); };
@@ -376,15 +376,22 @@ impl<'a> Cohort<'a> {
             }
             targets.push((plan.target, plan.function.name_span, Bare));
         }
+        if let Some(plan) = rank {
+            if plan.target.0 != 0 || plan.proof_source != root || self.groups.contains_key(&plan.target)
+                || bare.is_some_and(|bare| bare.target == plan.target || bare.name == plan.name)
+            { return Err(ProjectCheck::Unsupported); }
+            targets.push((plan.target, plan.function.name_span, Ranked));
+        }
         let mut scalar = bare.map(|plan| MainFlowProofObserver::from_first_plan(scope, root, plan)).transpose()?;
         if let Some(observer) = scalar.as_mut() { observer.finish_plans(prepared, scope)?; }
         let incoming = calls.owned_direct_startup_callable_uses(root, None,
-            targets.iter().map(|(_, span, _)| (root, *span)), None).ok_or(ProjectCheck::Unsupported)?;
+            targets.iter().map(|(_, span, _)| (root, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
         let mut trace = failure_search::StartUpSearch::new(root, cap);
         trace.retain_after_cutoff = true;
         let mut reached_arrays = HashSet::new();
         let mut deferred_arrays = Vec::new();
         let mut invoked_scalar = None;
+        let mut verified_rank = None;
         for (target, span, role) in targets {
             let sites = incoming.get(&(root, span)).ok_or(ProjectCheck::Unsupported)?;
             if sites.is_empty() {
@@ -400,9 +407,14 @@ impl<'a> Cohort<'a> {
                     }
                     invoked_scalar = Some(target);
                     trace.named_target = Some(target);
-                    trace.metered_frames = sites.len() > 1;
+                    trace.metered_frames |= sites.len() > 1;
                 }
-                failure_search::StartupProofRole::Ranked => return Err(ProjectCheck::Unsupported),
+                Ranked => {
+                    let plan = rank.filter(|plan| plan.target == target).ok_or(ProjectCheck::Unsupported)?;
+                    verified_rank = Some(prepare_capped_ranked_receipts(plan)?);
+                    trace.ranked_target = Some(target);
+                    trace.metered_frames |= sites.len() > 1;
+                },
             }
             trace.enroll_proof_sites(target, role, sites).ok_or(ProjectCheck::Unsupported)?;
         }
@@ -427,23 +439,37 @@ impl<'a> Cohort<'a> {
             Err(error) => return Err(error),
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let mut diagnostic = None;
-        let mut additional = Vec::new();
-        let mut actual = Vec::new();
-        if let Some(mut observer) = scalar {
+        if let Some(verified) = &mut verified_rank {
+            check_capped_ranked_receipts(verified, &mut trace, root)?;
+            active = true;
+        }
+        let bare_evidence = scalar.map(|mut observer| {
             observe_capped_bare_receipts(&mut observer, &mut trace, invoked_scalar, root)?;
             active |= observer.active;
-            let named = NamedOrderedEvidence { observed: observer };
-            if scope == ScalarCheckerScope::CurrentPackage && invoked_scalar.is_none() {
-                let plan = bare.ok_or(ProjectCheck::Unsupported)?;
-                let mut symbolic = named.symbolic();
+            Ok::<_, ProjectCheck>(NamedOrderedEvidence { observed: observer })
+        }).transpose()?;
+        let ((diagnostic, additional), bare_evidence) = if scope == ScalarCheckerScope::CurrentPackage {
+            let mut ranked = HashMap::new();
+            let mut deferred_numeric = Vec::new();
+            if let Some(plan) = bare.filter(|_| invoked_scalar.is_none()) { deferred_numeric.push(plan); }
+            if let Some(plan) = rank.filter(|_| verified_rank.is_none()) {
+                ranked.insert(plan.target, closed_ranked_evidence::<false>(root, 1, plan,
+                    plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)?);
+                deferred_numeric.push(plan);
+            }
+            let numeric = MixedOrderedEvidence { ranked, bare: bare_evidence };
+            let mut symbolic = numeric.symbolic();
+            for ranked in symbolic.ranked.values_mut() { ranked.allow_summary = false; }
+            deferred_numeric.sort_unstable_by_key(|plan| plan.target);
+            for plan in deferred_numeric {
                 active |= symbolic.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source,
                     &mut effects, SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
-                symbolic.complete()?;
-                (diagnostic, additional) = NamedOrderedEvidence::finish_symbolic(symbolic);
             }
-            actual = named.observed.diagnostics;
-        }
+            symbolic.complete()?;
+            let result = MixedOrderedEvidence::finish_symbolic(symbolic);
+            (result, numeric.bare)
+        } else { ((None, Vec::new()), bare_evidence) };
+        let actual = bare_evidence.map_or_else(Vec::new, |named| named.observed.diagnostics);
         let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
             let mut symbolic = evidence.symbolic();
             // Only the original complete edge census authorizes deferred

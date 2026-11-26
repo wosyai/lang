@@ -2916,6 +2916,43 @@ main_artifact = "main"
                     assert_eq!(files(), both_files);
                     clean();
                 }
+                let rank_definition = r#"
+                    u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+                    proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                        if (entry < 3) { core.show(out == 4); } else { core.use(descent(entry - 3)); }
+                    }
+                "#;
+                let ranked_mixed = mixed_catalog.replace("u8[2] input = make();",
+                    &format!("{rank_definition} u8[2] input = make();"))
+                    .replace("u8 returned = echo(7);", &format!(
+                        "u8 recursed = descend(8); core.require(recursed == 4, {unused_output}); u8 returned = echo(7);"));
+                let dormant_rank = ranked_mixed.replace(&format!("u8 recursed = descend(8); core.require(recursed == 4, {unused_output});"), "")
+                    .replace("ensures (out == 4)", "ensures (out == 5)").replace("core.show(out == 4)", "core.show(out == 5)");
+                for (catalog, deferred) in [(&ranked_mixed, false), (&dormant_rank, true)] {
+                    fs::write(&source, catalog).unwrap();
+                    let old_mixed = terminal(&[legacy()], scope, false);
+                    assert_eq!(old_mixed.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.diagnostics.len(), 1);
+                    assert_eq!(report.aggregate_diagnostics.len(), 1);
+                    assert_eq!(report.symbolic_diagnostic.is_some(), deferred && scope == ScalarCheckerScope::CurrentPackage);
+                    let output = terminal(&limited, scope, false);
+                    assert_eq!((output.0, output.1), (Ok(1), b"first".to_vec()));
+                    assert_eq!(output.2.strip_prefix(b"[first]"), old_mixed.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old_mixed);
+                    assert_eq!(files(), both_files);
+                    clean();
+                }
+                fs::write(&source, ranked_mixed.replace("descend(8); core.require", "descend(9); core.require")).unwrap();
+                let no_rank_receipt = selected(1);
+                assert!(matches!(no_rank_receipt[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
                 let pruned = mixed_catalog.replace("u8 returned = echo(7);", &format!(
                     "core.narrow(false, {second}); u8 returned = echo(7);"));
                 fs::write(&source, pruned).unwrap();

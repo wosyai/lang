@@ -3183,11 +3183,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         Ok((target, owner, function, body))
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn traces_original_startup_rank(
+        &self, body: &FunctionCallSites, collection: Option<OrderedCallCollection<'_, '_>>,
+    ) -> bool {
+        ACTUAL_STARTUP && collection.and_then(|ordered| {
+            let effects = ordered.failures.borrow();
+            let target = effects.startup_search.as_ref()?.borrow().ranked_target?;
+            self.calls.function_body(target.0, target.1, None)
+        }).is_some_and(|original| std::ptr::eq(original, body))
+    }
+
     fn run_exact_calls<const NAMED: bool>(
         &mut self, body: &'project FunctionCallSites, source: &'project SourceIdentity,
         exact: &[&BigInt], expected: &ScalarType, collection: Option<OrderedCallCollection<'_, '_>>,
         named_root: Option<NamedStackRoot>,
     ) -> Result<ActualCallResult, ProjectCheck> {
+        #[cfg(feature = "internal-checker")]
+        let traced_rank = self.traces_original_startup_rank(body, collection);
+        #[cfg(not(feature = "internal-checker"))]
+        let traced_rank = false;
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
@@ -3207,7 +3222,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_extended_scalar_locals();
         }
         #[cfg(feature = "internal-checker")]
-        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
+        if ACTUAL_STARTUP && collection.is_some() && (Observer::REAL_INTEGER_TAIL_CALLS || traced_rank) && is_integer_type(expected)
             && !body.structure.checker_direct_targets.is_empty()
         {
             cursor.allow_real_integer_tail_call();
@@ -3222,7 +3237,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
             cursor.restrict_returning_writes_to_direct_locals();
         }
-        self.run_call_cursor::<NAMED>(body, source, cursor, self.exact_self_entry(Some(exact)).cloned(), collection, named_root)
+        let entry = if traced_rank { exact.first().copied() } else { self.exact_self_entry(Some(exact)) }.cloned();
+        self.run_call_cursor::<NAMED>(body, source, cursor, entry, collection, named_root)
     }
 
     #[cfg(feature = "internal-checker")]
@@ -3304,6 +3320,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ordinary_named = false;
             let (body, source) = (frame.body, frame.source);
             #[cfg(feature = "internal-checker")]
+            let traced_rank = self.traces_original_startup_rank(body, active_collection);
+            #[cfg(not(feature = "internal-checker"))]
+            let traced_rank = false;
+            #[cfg(feature = "internal-checker")]
             let mut guarded_nonreturn = false;
             let mut sink = |failure: IntegerCheckFailure<'_>| {
                 #[cfg(feature = "internal-checker")]
@@ -3354,7 +3374,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 { let _ = (entry, exit); unreachable!() }
             } else if active_collection.is_some() {
                 frame.cursor.advance::<true>(body, handler, Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS,
-                    NAMED || Observer::EXACT_INTEGER_CALL_CONTINUATIONS, Observer::ORDINARY_PROJECTED_PAIR,
+                    NAMED || Observer::EXACT_INTEGER_CALL_CONTINUATIONS || traced_rank, Observer::ORDINARY_PROJECTED_PAIR,
                     ordinary_named || Observer::ORDINARY_INTEGER_LOCALS, &mut sink)
             } else {
                 frame.cursor.advance::<false>(body, handler, false, false, false, false, &mut sink)
@@ -3800,16 +3820,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if named_pair {
             self.observer.charge_named_pair_activation(body).ok_or(ProjectCheck::Unsupported)?;
         }
+        // The generic tail-call corridor still rejects active targets.
+        // Only the enrolled original typed self-tail site may proceed to
+        // the existing checked-decrement/strict-descent admission below.
+        #[cfg(feature = "internal-checker")]
+        let traced_self = matches!(effect, ExactCallEffect::TailInteger { .. })
+            && !NAMED && std::ptr::eq(caller, body)
+            && caller.self_tail_candidates.contains(&call) && !parent.followed_self_edge
+            && parent.entry.is_some() && self.traces_original_startup_rank(body, collection);
+        #[cfg(not(feature = "internal-checker"))]
+        let traced_self = false;
         #[cfg(feature = "internal-checker")]
         if matches!(effect, ExactCallEffect::TailInteger { .. }) {
-            // The generic tail-call corridor still rejects active targets.
-            // Only the enrolled original typed self-tail site may proceed to
-            // the existing checked-decrement/strict-descent admission below.
-            let traced_self = ACTUAL_STARTUP && !NAMED && std::ptr::eq(caller, body)
-                && caller.self_tail_candidates.contains(&call) && !parent.followed_self_edge
-                && parent.entry.is_some()
-                && collection.is_some_and(|ordered| ordered.failures.borrow().startup_search.as_ref()
-                    .is_some_and(|trace| trace.borrow().ranked_target == Some(target)));
             if collection.is_none() || parent.source != &owner.source || (self.active.contains(&target) && !traced_self) {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -3836,7 +3858,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 {
                     return Err(ProjectCheck::Unsupported);
                 }
-            } else if !Observer::REAL_INTEGER_TAIL_CALLS {
+            } else if !Observer::REAL_INTEGER_TAIL_CALLS && !traced_self {
                 return Err(ProjectCheck::Unsupported);
             }
         }
@@ -3854,7 +3876,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let boolean_narrow = real_bound_boolean && Self::exact_boolean_narrow_body_has_supported_shape(body);
         let projected_narrow = self.projected_integer_narrow_shape(body, effect, collection.is_some());
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
-            || (*expected != ScalarType::Unit && (!(NAMED || Observer::EXACT_INTEGER_CALL_CONTINUATIONS)
+            || (*expected != ScalarType::Unit && (!(NAMED || Observer::EXACT_INTEGER_CALL_CONTINUATIONS || traced_self)
                 || !(supported_integer_continuation_shape_for(body, expected, ordinary_named || Observer::ORDINARY_INTEGER_LOCALS)
                     || boolean_narrow || self.exact_integer_narrow_shape(body, expected, collection.is_some())
                     || self.exact_integer_local_write_shape(body, expected, collection.is_some())
@@ -3956,7 +3978,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         // Mutating integer-return bodies cannot use the ranked self proof.
-        let ranked = !restricted_local_writes && self.exact_self_reentry_allowed(expected, collection.is_some())
+        let ranked = !restricted_local_writes && (traced_self || self.exact_self_reentry_allowed(expected, collection.is_some()))
             && (*expected == ScalarType::Unit || matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty)));
         let argument;
         let pair;
@@ -4054,7 +4076,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_extended_scalar_locals();
         }
         #[cfg(feature = "internal-checker")]
-        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
+        if ACTUAL_STARTUP && collection.is_some() && (Observer::REAL_INTEGER_TAIL_CALLS || traced_self) && is_integer_type(expected)
             && !body.structure.checker_direct_targets.is_empty()
         {
             cursor.allow_real_integer_tail_call();
@@ -4072,7 +4094,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         self.active_depth += 1;
         Ok(ExactCallActivation {
-            body, source: &owner.source, cursor, entry: self.exact_self_entry(Some(exact)).cloned(),
+            body, source: &owner.source, cursor,
+            entry: if traced_self { exact.first().copied() } else { self.exact_self_entry(Some(exact)) }.cloned(),
             followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
             named_site,
@@ -10651,13 +10674,15 @@ fn run_private_named_after_startup(
             .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
     } else { None };
     let mut named_definitions = Vec::new();
+    let mut catalog_work = 0;
     for (proof_source, catalog) in catalogs {
+        super::checker_flow::charge_call_work(&mut catalog_work, catalog.definitions.len()).ok_or(ProjectCheck::Unsupported)?;
         let is_provider = Some(proof_source) == provider;
         if (proof_source != &owner.source && !is_provider) || proof_source.project != owner.source.project
             || proof_source.package != owner.source.package
             // One real provider activation and up to one independent dormant
             // theorem per owner, without changing the evaluated call family.
-            || (!qualified && (!named_definitions.is_empty() || catalog.definitions.len() > 2))
+            || (!qualified && !named_definitions.is_empty())
             || (qualified && catalog.definitions.len() > if is_provider { 2 } else { 1 })
         { return Err(ProjectCheck::Unsupported); }
         for (index, definition) in catalog.definitions.iter().enumerate() {
@@ -10704,16 +10729,18 @@ fn run_private_named_after_startup(
             }
             ranked = Some(plan);
         } else {
-            if !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body) || !body.structure.checker_direct_targets.is_empty() {
+            if (!qualified && plans.len() >= 2) || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
+                || !body.structure.checker_direct_targets.is_empty()
+            {
                 return Err(ProjectCheck::Unsupported);
             }
             plans.push(plan);
         }
     }
     if !arrays.is_empty() {
-        if plans.len() > 1 || ranked.is_some() { return Err(ProjectCheck::Unsupported); }
+        if plans.len() > 1 { return Err(ProjectCheck::Unsupported); }
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
-        return cohort.run_capped(owner, scope, cap, plans.first());
+        return cohort.run_capped(owner, scope, cap, plans.first(), ranked.as_ref());
     }
     if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
@@ -10760,31 +10787,11 @@ fn run_private_named_after_startup(
         observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
     }
     observer.finish_plans(&owner.prepared, scope)?;
-    let mut verified_rank = if reached_rank {
-        let plan = ranked.as_ref().ok_or(ProjectCheck::Unsupported)?;
-        let body = plan.typed.body;
-        let [call] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        if !matches!(body.boundary.parameters.as_slice(), [parameter] if is_integer_type(&parameter.ty) && &parameter.ty == plan.typed.result_type)
-            || !body.self_tail_candidates.contains(&call.ordinal)
-            || body.structure.checker_direct_targets.get(&call.ordinal) != Some(&plan.target)
-        { return Err(ProjectCheck::Unsupported); }
-        Some(VerifiedInductionExactReturn::verify(plan, plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)
-            .1.ok_or(ProjectCheck::Unsupported)?)
-    } else { None };
+    let mut verified_rank = reached_rank.then(|| prepare_capped_ranked_receipts(ranked.as_ref().ok_or(ProjectCheck::Unsupported)?)).transpose()?;
     let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified,
         &[], None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)))?;
     if let Some(rank) = &mut verified_rank {
-        if trace.ranked_observations.len() > 1 {
-            trace.charge_formal_replay(trace.ranked_observations.len(), rank.where_guard.activation_replay_work()
-                .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
-        }
-        for reached in &trace.ranked_observations {
-            // A checked theorem is comparison evidence only; the existing
-            // authoritative cursor computed and returned these actual bytes.
-            if reached.site.source != owner.source
-                || rank.consume(rank.target, &[&reached.argument], &reached.parameter).as_ref() != Some(&reached.returned)
-            { return Err(ProjectCheck::Unsupported); }
-        }
+        check_capped_ranked_receipts(rank, &mut trace, &owner.source)?;
         active = true;
     }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
@@ -10821,6 +10828,39 @@ fn run_private_named_after_startup(
         additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
     }, end))
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_capped_ranked_receipts<'a>(
+    plan: &'a PlannedModuleProof<'_>,
+) -> Result<VerifiedInductionExactReturn<'a>, ProjectCheck> {
+    let body = plan.typed.body;
+    let [call] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if !matches!(body.boundary.parameters.as_slice(), [parameter] if is_integer_type(&parameter.ty) && &parameter.ty == plan.typed.result_type)
+        || !body.self_tail_candidates.contains(&call.ordinal)
+        || body.structure.checker_direct_targets.get(&call.ordinal) != Some(&plan.target)
+    { return Err(ProjectCheck::Unsupported); }
+    VerifiedInductionExactReturn::verify(plan, plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)
+        .1.ok_or(ProjectCheck::Unsupported)
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_capped_ranked_receipts(
+    rank: &mut VerifiedInductionExactReturn<'_>, trace: &mut failure_search::StartUpSearch, root: &SourceIdentity,
+) -> Result<(), ProjectCheck> {
+    if trace.ranked_observations.is_empty() { return Err(ProjectCheck::Unsupported); }
+    if trace.ranked_observations.len() > 1 {
+        trace.charge_formal_replay(trace.ranked_observations.len(), rank.where_guard.activation_replay_work()
+            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+    }
+    for reached in &trace.ranked_observations {
+        // Comparison evidence only. The canonical exact cursor computed
+        // the actual return on the current owned self-tail frames.
+        if &reached.site.source != root
+            || rank.consume(rank.target, &[&reached.argument], &reached.parameter).as_ref() != Some(&reached.returned)
+        { return Err(ProjectCheck::Unsupported); }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "internal-checker")]
