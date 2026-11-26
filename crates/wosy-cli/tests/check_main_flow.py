@@ -70,7 +70,7 @@ def main():
 
         def check(*args):
             result = subprocess.run(
-                [binary, "check", *args], cwd=root, capture_output=True, timeout=15
+                [binary, "check", "--all-errors", *args], cwd=root, capture_output=True, timeout=15
             )
             assert sorted(path.name for path in root.iterdir()) == ["main.w", "wosy.toml"]
             return result
@@ -106,7 +106,7 @@ def main():
         effects = check("--main-flow-only")
         assert (effects.returncode, effects.stdout, effects.stderr) == (71, expected_stdout, expected_stderr), effects
         merged = subprocess.run(
-            [binary, "check", "--main-flow-only"], cwd=root,
+            [binary, "check", "--all-errors", "--main-flow-only"], cwd=root,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
         )
         assert (merged.returncode, merged.stdout) == (71, "out-a:err-a:out-b café:err-b:out-cerr-c".encode()), merged
@@ -160,7 +160,7 @@ def main():
 
         def check(*args):
             result = subprocess.run(
-                [binary, "check", *args], cwd=root, capture_output=True, timeout=15
+                [binary, "check", "--all-errors", *args], cwd=root, capture_output=True, timeout=15
             )
             assert sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()) == [
                 "src/fallback.w", "src/main.w", "stray.w", "wosy.toml"
@@ -261,7 +261,7 @@ def check_file_output(binary):
         def check(code, scope=("--main-flow-only",)):
             source.write_text("%%start\n" + code + "%%end", encoding="utf-8")
             return subprocess.run(
-                [binary, "check", *scope], cwd=caller,
+                [binary, "check", "--all-errors", *scope], cwd=caller,
                 capture_output=True, timeout=15,
             )
 
@@ -356,7 +356,7 @@ def check_contextual_storage(binary):
 
         def run(scope):
             return subprocess.run(
-                [binary, "check", scope], cwd=root, capture_output=True, timeout=15
+                [binary, "check", "--all-errors", scope], cwd=root, capture_output=True, timeout=15
             )
 
         source.write_text(program, encoding="utf-8")

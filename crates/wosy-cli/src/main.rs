@@ -71,9 +71,10 @@ enum Command {
         declared_package: bool,
         #[arg(long, help = "Also check each resolved dependency's independent primary target")]
         dependencies: bool,
-        #[cfg(feature = "private-check-cap-process")]
-        #[arg(long, hide = true)]
+        #[arg(long, help = "Maximum errors to report (default: 1)")]
         max_errors: Option<std::num::NonZeroUsize>,
+        #[arg(long, conflicts_with = "max_errors", help = "Check without an error limit")]
+        all_errors: bool,
     },
     Run {
         target: Option<String>,
@@ -153,8 +154,7 @@ fn main() -> ExitCode {
         #[cfg(feature = "internal-checker")]
         Command::Check {
             target, profile, main_flow_only, dependencies,
-            #[cfg(feature = "private-check-cap-process")]
-            max_errors,
+            max_errors, all_errors,
             ..
         } => {
             // Clap rejects both scope flags. An omitted scope is exactly the explicit package scope.
@@ -163,20 +163,18 @@ fn main() -> ExitCode {
             } else {
                 ScalarCheckerScope::CurrentPackage
             };
-            let run_incumbent = || check_command(target.as_deref(), &profile, scope, dependencies);
-            #[cfg(not(feature = "private-check-cap-process"))]
-            let result = run_incumbent();
-            #[cfg(feature = "private-check-cap-process")]
-            let result = match max_errors {
-                None => run_incumbent(),
-                Some(limit) => check_and_publish(scope, dependencies, |root| {
+            let result = if all_errors {
+                check_command(target.as_deref(), &profile, scope, dependencies)
+            } else {
+                let limit = max_errors.unwrap_or(std::num::NonZeroUsize::MIN);
+                check_and_publish(scope, dependencies, Some(limit), |root| {
                     let load = if dependencies {
                         configured_check::check_targets_with_private_authored_limit
                     } else {
                         configured_check::check_target_with_private_authored_limit
                     };
                     load(root, target.as_deref(), &profile, scope, limit)
-                }),
+                })
             };
             match result {
                 Ok(code) => ExitCode::from(code),
@@ -547,6 +545,29 @@ impl CanonicalLoadFailure {
                 format_graph_error(error)
             }
         }
+    }
+    #[cfg(feature = "internal-checker")]
+    fn report_check(self, limit: Option<std::num::NonZeroUsize>) -> String {
+        let Some(limit) = limit else { return self.report("check"); };
+        let mut budget = ReportedCheckErrors::new(Some(limit));
+        let selected = match self {
+            Self::Syntax { source, text, mut diagnostics } => {
+                diagnostics.retain(|diagnostic| budget.admits(diagnostic));
+                Self::Syntax { source, text, diagnostics }
+            }
+            Self::Derivation { mut diagnostics, texts } => {
+                diagnostics.retain(|diagnostic| budget.admits(diagnostic));
+                Self::Derivation { diagnostics, texts }
+            }
+            // Every typed graph diagnostic is a fatal missing-module
+            // or import-cycle error. Keep the original prefix.
+            Self::Graph { mut error, texts } => {
+                error.diagnostics.truncate(limit.get());
+                Self::Graph { error, texts }
+            }
+            other => other,
+        };
+        selected.report("check")
     }
 }
 
@@ -1097,7 +1118,7 @@ fn render_project_diagnostics_to(
 fn check_command(
     target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dependencies: bool,
 ) -> Result<u8, String> {
-    check_and_publish(scope, dependencies, |root| {
+    check_and_publish(scope, dependencies, None, |root| {
         if dependencies {
             configured_check::check_target_with_dependencies(root, target, profile, scope)
         } else {
@@ -1111,7 +1132,7 @@ fn check_command(
 
 #[cfg(feature = "internal-checker")]
 fn check_and_publish(
-    scope: ScalarCheckerScope, dependencies: bool,
+    scope: ScalarCheckerScope, dependencies: bool, limit: Option<std::num::NonZeroUsize>,
     load: impl FnOnce(&std::path::Path) -> Result<Vec<configured_check::ConfiguredCheckReceipt>, configured_check::ConfiguredCheckLoadError>,
 ) -> Result<u8, String> {
     use configured_check::ConfiguredCheckLoadError as LoadError;
@@ -1119,7 +1140,7 @@ fn check_and_publish(
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
     let receipts = load(&root).map_err(|failure| match failure {
-            LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
+            LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report_check(limit),
             LoadError::Root => "check: invalid project root".to_owned(),
             LoadError::Manifest(error) => format!("check: invalid manifest: {error}"),
             LoadError::Target => "check: invalid target".to_owned(),
@@ -1131,30 +1152,76 @@ fn check_and_publish(
         })?;
     let stream = StandardStream::stderr(ColorChoice::Auto);
     let mut stderr = stream.lock();
-    publish_configured_check_receipts(&receipts, scope, dependencies,
-        &mut std::io::stdout().lock(), &mut stderr)
+    publish_configured_check_receipts_with_limit(&receipts, scope, dependencies,
+        &mut std::io::stdout().lock(), &mut stderr, limit)
 }
 
-#[cfg(feature = "internal-checker")]
+#[cfg(all(test, feature = "internal-checker"))]
 fn publish_configured_check_receipts(
     receipts: &[configured_check::ConfiguredCheckReceipt], scope: ScalarCheckerScope, dependencies: bool,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl codespan_reporting::term::termcolor::WriteColor,
 ) -> Result<u8, String> {
+    publish_configured_check_receipts_with_limit(receipts, scope, dependencies, stdout, stderr, None)
+}
+
+#[cfg(feature = "internal-checker")]
+struct ReportedCheckErrors(Option<usize>);
+
+#[cfg(feature = "internal-checker")]
+impl ReportedCheckErrors {
+    fn new(limit: Option<std::num::NonZeroUsize>) -> Self {
+        Self(limit.map(std::num::NonZeroUsize::get))
+    }
+
+    fn reserve_authored(&mut self, count: usize) -> Result<(), String> {
+        if let Some(left) = self.0.as_mut() {
+            *left = left.checked_sub(count).ok_or_else(||
+                "check: invalid selected error count; no result published".to_owned())?;
+        }
+        Ok(())
+    }
+
+    fn admits(&mut self, diagnostic: &wosy_compiler::Diagnostic) -> bool {
+        if diagnostic.severity != wosy_compiler::DiagnosticSeverity::Error { return true; }
+        match self.0.as_mut() {
+            None => true,
+            Some(0) => false,
+            Some(left) => { *left -= 1; true }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn publish_configured_check_receipts_with_limit(
+    receipts: &[configured_check::ConfiguredCheckReceipt], scope: ScalarCheckerScope, dependencies: bool,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl codespan_reporting::term::termcolor::WriteColor,
+    limit: Option<std::num::NonZeroUsize>,
+) -> Result<u8, String> {
     use configured_check::{CheckPublicationError, CheckPublicationPreflightError};
     use wosy_compiler::ScalarOrderedCheckerOutcome;
+    let mut budget = ReportedCheckErrors::new(limit);
     let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
     let primary = receipts.first().ok_or_else(unsupported_output)?;
     let checked = match checked_publication_reports(receipts) {
         Ok(checked) => checked,
         Err(receipt) => match &receipt.outcome {
             Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
-                render_project_diagnostics_to(stderr, diagnostics, &receipt.texts, dependencies);
+                let selected = diagnostics.iter().filter(|diagnostic| budget.admits(diagnostic)).cloned().collect::<Vec<_>>();
+                render_project_diagnostics_to(stderr, &selected, &receipt.texts, dependencies);
                 return Ok(2);
             }
             _ => return Err("check: unsupported analysis; no result published".to_owned()),
         },
     };
+    // Authored paths come first in the incumbent output order and
+    // already share the bounded search quota across configured owners.
+    // Reserve those actual distinct errors before selecting the remaining
+    // formal errors, while retaining all proof computation and status.
+    let actual = checked.iter().try_fold(0usize, |sum, report| sum.checked_add(report.directives.len()))
+        .ok_or_else(unsupported_output)?;
+    budget.reserve_authored(actual)?;
     let publication = if receipts.len() == 1 {
         primary.plan_publication()
     } else {
@@ -1168,9 +1235,12 @@ fn publish_configured_check_receipts(
     {
         return Err(unsupported_output());
     }
-    let diagnostics = checked.iter().zip(receipts)
+    let mut diagnostics = checked.iter().zip(receipts)
         .map(|(report, receipt)| ordered_check_diagnostics(report, &receipt.texts))
         .collect::<Result<Vec<_>, _>>()?;
+    let has_failure = diagnostics.iter().flatten().any(|diagnostic|
+        limit.is_none() || diagnostic.severity == wosy_compiler::DiagnosticSeverity::Error);
+    for reports in &mut diagnostics { reports.retain(|diagnostic| budget.admits(diagnostic)); }
     let authored = publication.prepare(&primary.root).map_err(|error| match error {
         CheckPublicationPreflightError::UnsupportedFilePublication => unsupported_output(),
         CheckPublicationPreflightError::File(error) =>
@@ -1180,9 +1250,7 @@ fn publish_configured_check_receipts(
     })?;
     let authored_status = authored.publish(stdout, stderr)
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
-    let mut has_failure = false;
     for (diagnostics, receipt) in diagnostics.iter().zip(receipts) {
-        has_failure |= !diagnostics.is_empty();
         render_project_diagnostics_to(stderr, diagnostics, &receipt.texts, dependencies);
     }
     Ok(if authored_status != 0 { authored_status } else { u8::from(has_failure) })
@@ -5146,6 +5214,34 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
             target: None, main_flow_only: false, declared_package: false, ..
         }));
         assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only", "--declared-package"]).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn check_error_budget_counts_authored_records_and_errors_not_warning_or_note() {
+        use wosy_compiler::{Diagnostic, DiagnosticSeverity};
+        let mut budget = ReportedCheckErrors::new(std::num::NonZeroUsize::new(2));
+        budget.reserve_authored(1).unwrap();
+        let diagnostic = |severity| Diagnostic {
+            severity, code: String::new(), message: String::new(), labels: Vec::new(), notes: vec!["attached".into()],
+        };
+        assert!(budget.admits(&diagnostic(DiagnosticSeverity::Warning)));
+        assert!(budget.admits(&diagnostic(DiagnosticSeverity::Note)));
+        assert!(budget.admits(&diagnostic(DiagnosticSeverity::Error)));
+        assert!(!budget.admits(&diagnostic(DiagnosticSeverity::Error)));
+        assert!(budget.admits(&diagnostic(DiagnosticSeverity::Warning)));
+        assert!(budget.reserve_authored(1).is_err());
+    }
+
+    #[test]
+    fn build_parser_does_not_accept_check_error_limit_flags() {
+        for args in [
+            &["wosy", "build", "--max-errors", "1"][..],
+            &["wosy", "build", "--all-errors"][..],
+        ] {
+            let error = Arguments::try_parse_from(args).err().expect("Check-only flag");
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[cfg(feature = "internal-checker")]

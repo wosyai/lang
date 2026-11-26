@@ -1,9 +1,7 @@
 #![cfg(all(target_os = "linux", feature = "internal-checker"))]
 
-#[cfg(feature = "private-check-cap-process")]
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "private-check-cap-process")]
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -14,22 +12,19 @@ fn wosy(root: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn check_cap_is_not_advertised() {
+fn check_error_limit_policy_is_visible_and_exclusive() {
     let help = wosy(Path::new("."), &["check", "--help"]);
     assert!(help.status.success());
-    assert!(!String::from_utf8_lossy(&help.stdout).contains("--max-errors"));
-    #[cfg(not(feature = "private-check-cap-process"))]
-    {
-        let absent = wosy(Path::new("."), &["check", "--max-errors", "1"]);
-        assert_eq!(absent.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&absent.stderr).contains("unexpected argument '--max-errors'"));
-    }
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--max-errors") && help.contains("--all-errors") && help.contains("default: 1"));
+    let conflict = wosy(Path::new("."), &["check", "--all-errors", "--max-errors", "1"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    let diagnostic = String::from_utf8_lossy(&conflict.stderr);
+    assert!(diagnostic.contains("--max-errors") && diagnostic.contains("--all-errors"));
 }
 
-#[cfg(feature = "private-check-cap-process")]
 struct Fixture(PathBuf);
 
-#[cfg(feature = "private-check-cap-process")]
 impl Fixture {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!(
@@ -83,24 +78,20 @@ main_artifact = "main"
     fn clear(&self) { fs::remove_dir_all(self.output()).unwrap(); }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 impl Drop for Fixture {
     fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 fn require(label: &str, code: u8, path: &str) -> String {
     format!(r#"core.require(false, {{ .stdout = "{label}"; .stderr = "[{label}]"; .code = {code}; .files = [{{ .path = "{path}"; .text = "{label}"; }}]; }});"#)
 }
 
-#[cfg(feature = "private-check-cap-process")]
 fn assert_terminal(output: &Output, code: i32, stdout: &[u8], stderr: &[u8]) {
     assert_eq!(output.status.code(), Some(code), "{output:?}");
     assert_eq!(output.stdout, stdout, "{output:?}");
     assert_eq!(output.stderr, stderr, "{output:?}");
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_publishes_only_selected_original_paths() {
     for layout in ["native", "wasm-wasip1"] {
@@ -115,10 +106,16 @@ fn check_cap_process_publishes_only_selected_original_paths() {
                 assert!(output.stdout.is_empty() && !project.output().exists());
                 assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
             }
-            let incumbent = project.run(&[scope]);
+            let incumbent = project.run(&[scope, "--all-errors"]);
             assert_terminal(&incumbent, 19, b"firstsecond", b"[first][second]");
             assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
             assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), b"second");
+            project.clear();
+
+            let default = project.run(&[scope]);
+            assert_terminal(&default, 0, b"first", b"[first]");
+            assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+            assert!(!project.output().join("second.txt").exists());
             project.clear();
 
             let one = project.run(&[scope, "--max-errors", "1"]);
@@ -136,7 +133,6 @@ fn check_cap_process_publishes_only_selected_original_paths() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_preflights_later_packages_and_outputs_atomically() {
     for (layout, other) in [("native", "wasm-wasip1"), ("wasm-wasip1", "native")] {
@@ -165,7 +161,6 @@ fn check_cap_process_preflights_later_packages_and_outputs_atomically() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_keeps_late_formal_analysis_and_never_falls_back() {
     for layout in ["native", "wasm-wasip1"] {
@@ -223,7 +218,6 @@ fn check_cap_process_keeps_late_formal_analysis_and_never_falls_back() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
     for layout in ["native", "wasm-wasip1"] {
@@ -252,7 +246,7 @@ fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
             project.package("", layout, "dev", "", &root);
             let credit = project.0.join("src/credit.w");
             fs::write(&credit, provider).unwrap();
-            let old = project.run(&[scope]);
+            let old = project.run(&[scope, "--all-errors"]);
             assert_terminal(&old, 76, b"firstsecond", b"[first][second]");
             let first = fs::read(project.output().join("first.txt")).unwrap();
             let second = fs::read(project.output().join("second.txt")).unwrap();
@@ -272,7 +266,7 @@ fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
 
             let wrong = provider.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
             fs::write(&credit, wrong).unwrap();
-            let old = project.run(&[scope]);
+            let old = project.run(&[scope, "--all-errors"]);
             let capped = project.run(&[scope, "--max-errors", "1"]);
             assert_terminal(&old, 1, b"", &capped.stderr);
             assert_terminal(&capped, 1, b"", &old.stderr);
@@ -284,7 +278,6 @@ fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
     for (layout, other) in [("native", "wasm-wasip1"), ("wasm-wasip1", "native")] {
@@ -315,7 +308,7 @@ fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
             project.package("lib", other, "own", "", &dependent);
             let credit = project.0.join("lib/src/credit.w");
             fs::write(&credit, provider).unwrap();
-            let old = project.run(&[scope, "--dependencies"]);
+            let old = project.run(&[scope, "--dependencies", "--all-errors"]);
             assert_terminal(&old, 76, b"apponetwo", b"[app][one][two]");
             project.clear();
             for (cap, status, stdout, stderr, paths) in [
@@ -341,14 +334,15 @@ fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
             // but must not erase the independent selected app path.
             let refuted_provider = provider.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
             fs::write(&credit, refuted_provider).unwrap();
-            let legacy_refuted = project.run(&[scope, "--dependencies"]);
+            let legacy_refuted = project.run(&[scope, "--dependencies", "--all-errors"]);
             assert_eq!(legacy_refuted.status.code(), Some(1), "{legacy_refuted:?}");
             assert_eq!(legacy_refuted.stdout, b"app");
             project.clear();
             for cap in ["1", "4"] {
                 let bounded = project.run(&[scope, "--dependencies", "--max-errors", cap]);
-                assert_terminal(&bounded, 1, b"app", &legacy_refuted.stderr);
-                let diagnostic = String::from_utf8_lossy(&bounded.stderr);
+                let expected_stderr = if cap == "1" { b"[app]".as_slice() } else { &legacy_refuted.stderr };
+                assert_terminal(&bounded, 1, b"app", expected_stderr);
+                let diagnostic = String::from_utf8_lossy(&legacy_refuted.stderr);
                 assert!(diagnostic.contains("proof obligation failed") && diagnostic.contains("lib::src/credit.w")
                     && diagnostic.contains("ledger.relay()") && diagnostic.contains("consume()"), "{diagnostic}");
                 assert_eq!(fs::read(project.output().join("app.txt")).unwrap(), b"app");
@@ -366,7 +360,6 @@ fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
     for layout in ["native", "wasm-wasip1"] {
@@ -400,7 +393,7 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 project.package("", layout, "dev", "", &root);
                 let credit = project.0.join("src/credit.w");
                 fs::write(&credit, provider).unwrap();
-                let old = project.run(&[scope]);
+                let old = project.run(&[scope, "--all-errors"]);
                 assert_eq!(old.status.code(), Some(19), "{old:?}");
                 assert_eq!(old.stdout, b"firstsecond");
                 let first_file = fs::read(project.output().join("first.txt")).unwrap();
@@ -410,8 +403,8 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 let capped = project.run(&[scope, "--max-errors", "1"]);
                 assert_eq!(capped.status.code(), Some(1), "{capped:?}");
                 assert_eq!(capped.stdout, b"first");
-                assert_eq!(capped.stderr.strip_prefix(b"[first]").unwrap(), old.stderr.strip_prefix(b"[first][second]").unwrap());
-                let diagnostic = String::from_utf8_lossy(&capped.stderr);
+                assert_eq!(capped.stderr, b"[first]");
+                let diagnostic = String::from_utf8_lossy(&old.stderr);
                 let first = diagnostic.find("contextual value at entry: 3; at exit: 2").unwrap();
                 let second = diagnostic.find("contextual value at entry: 2; at exit: 1").unwrap();
                 let scalar = diagnostic.find("call returned 4").unwrap();
@@ -420,7 +413,7 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 assert!(!project.output().join("second.txt").exists());
                 project.clear();
 
-                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                assert_terminal(&project.run(&[scope, "--max-errors", "5"]), 19, &old.stdout, &old.stderr);
                 assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first_file);
                 assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), second_file);
                 project.clear();
@@ -428,9 +421,9 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 let proved = provider.replace("- 0) {}", "- 1) {}");
                 assert_ne!(proved, provider);
                 fs::write(&credit, proved).unwrap();
-                let only_scalar = project.run(&[scope, "--max-errors", "1"]);
-                assert_eq!(only_scalar.status.code(), Some(1), "{only_scalar:?}");
-                assert_eq!(only_scalar.stdout, b"first");
+                let only_scalar = project.run(&[scope, "--max-errors", "3"]);
+                assert_eq!(only_scalar.status.code(), Some(19), "{only_scalar:?}");
+                assert_eq!(only_scalar.stdout, b"firstsecond");
                 let scalar_diagnostic = String::from_utf8_lossy(&only_scalar.stderr);
                 assert!(scalar_diagnostic.contains("call returned 4")
                     && !scalar_diagnostic.contains("contextual value at entry:"));
@@ -447,7 +440,6 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_preserves_exact_mixed_literal_inequality() {
     for layout in ["native", "wasm-wasip1"] {
@@ -473,7 +465,7 @@ fn check_cap_process_preserves_exact_mixed_literal_inequality() {
                 %%end"#;
                 project.package("", layout, "dev", "", &root);
                 fs::write(project.0.join("src/credit.w"), provider).unwrap();
-                let old = project.run(&[scope]);
+                let old = project.run(&[scope, "--all-errors"]);
                 assert_eq!(old.status.code(), Some(19), "{old:?}");
                 assert_eq!(old.stdout, b"firstsecond");
                 let expected = old.stderr.strip_prefix(b"[first][second]").unwrap();
@@ -484,9 +476,7 @@ fn check_cap_process_preserves_exact_mixed_literal_inequality() {
                     assert!(text.is_empty());
                 }
                 project.clear();
-                let mut stderr = b"[first]".to_vec();
-                stderr.extend(expected);
-                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", b"[first]");
                 assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
                 assert!(!project.output().join("second.txt").exists());
                 project.clear();
@@ -498,7 +488,6 @@ fn check_cap_process_preserves_exact_mixed_literal_inequality() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
     for layout in ["native", "wasm-wasip1"] {
@@ -525,7 +514,7 @@ fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
             for refuted in [false, true] {
                 let source = if refuted { provider.replace("- 1) {}", "- 0) {}") } else { provider.to_owned() };
                 fs::write(&credit, source).unwrap();
-                let old = project.run(&[scope]);
+                let old = project.run(&[scope, "--all-errors"]);
                 assert_eq!(old.status.code(), Some(19), "{old:?}");
                 assert_eq!(old.stdout, b"firstsecond");
                 let expected_diagnostics = old.stderr.strip_prefix(b"[first][second]").unwrap();
@@ -538,9 +527,7 @@ fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
                 }
                 project.clear();
 
-                let mut stderr = b"[first]".to_vec();
-                stderr.extend(expected_diagnostics);
-                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", b"[first]");
                 assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
                 assert!(!project.output().join("second.txt").exists());
                 project.clear();
@@ -553,7 +540,6 @@ fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_preserves_the_existing_binary_entry_comparison() {
     for layout in ["native", "wasm-wasip1"] {
@@ -576,7 +562,7 @@ fn check_cap_process_preserves_the_existing_binary_entry_comparison() {
                     require("first", 0, "first.txt"),
                     require("second", 19, "second.txt"));
                 project.package("", layout, "dev", "", &source);
-                let old = project.run(&[scope]);
+                let old = project.run(&[scope, "--all-errors"]);
                 assert_eq!(old.status.code(), Some(19), "{old:?}");
                 assert_eq!(old.stdout, b"firstsecond");
                 let original_diagnostics = old.stderr.strip_prefix(b"[first][second]").unwrap();
@@ -591,22 +577,40 @@ fn check_cap_process_preserves_the_existing_binary_entry_comparison() {
                 }
                 project.clear();
 
-                let mut stderr = b"[first]".to_vec();
-                stderr.extend(original_diagnostics);
-                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", b"[first]");
                 assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
                 assert!(!project.output().join("second.txt").exists());
                 project.clear();
 
-                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                let first_formal = diagnostic.match_indices("error: proof obligation failed").nth(1)
+                    .map_or(original_diagnostics, |(second, _)| &original_diagnostics[..second]);
+                let mut crossed = b"[first][second]".to_vec();
+                crossed.extend(first_formal);
+                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &crossed);
                 assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), b"second");
                 project.clear();
+                assert_terminal(&project.run(&[scope, "--max-errors", "4"]), 19, &old.stdout, &old.stderr);
+                project.clear();
+
+                let proof_only = source.replace(&require("first", 0, "first.txt"), "")
+                    .replace(&require("second", 19, "second.txt"), "");
+                fs::write(project.0.join("src/main.w"), proof_only).unwrap();
+                let complete = project.run(&[scope, "--all-errors"]);
+                assert_eq!(complete.status.code(), Some(i32::from(refuted)), "{complete:?}");
+                assert_eq!(complete.stdout, b"");
+                let proof_only_text = String::from_utf8_lossy(&complete.stderr);
+                assert_eq!(proof_only_text.matches("error: proof obligation failed").count(), if refuted { 2 } else { 0 });
+                let first = proof_only_text.match_indices("error: proof obligation failed").nth(1)
+                    .map_or(complete.stderr.as_slice(), |(second, _)| &complete.stderr[..second]);
+                assert_terminal(&project.run(&[scope]), i32::from(refuted), b"", first);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"", first);
+                assert_terminal(&project.run(&[scope, "--max-errors", "2"]), i32::from(refuted), b"", &complete.stderr);
+                assert!(!project.output().exists());
             }
         }
     }
 }
 
-#[cfg(feature = "private-check-cap-process")]
 #[test]
 fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
     for layout in ["native", "wasm-wasip1"] {
@@ -630,7 +634,7 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                     project.package("", layout, "dev", "", &source);
                     let deferred_owner = project.0.join("src/fallback.w");
                     fs::write(&deferred_owner, &dormant).unwrap();
-                    let old = project.run(&[scope]);
+                    let old = project.run(&[scope, "--all-errors"]);
                     let refuted = scope == "--declared-package" && proof == "out != 7";
                     let expected = if early { b"first".as_slice() } else { b"".as_slice() };
                     assert_eq!(old.status.code(), Some(i32::from(refuted)), "{old:?}");
@@ -646,7 +650,8 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                     }
                     if early { project.clear(); }
                     let limited = project.run(&[scope, "--max-errors", "1"]);
-                    assert_terminal(&limited, i32::from(refuted), &old.stdout, &old.stderr);
+                    let selected_stderr = if early { b"[first]".as_slice() } else { &old.stderr };
+                    assert_terminal(&limited, i32::from(refuted), &old.stdout, selected_stderr);
                     if early {
                         assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
                         assert!(!project.output().join("must-not-create.txt").exists());
@@ -658,7 +663,7 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         // source remains nonexecuting. Do not use its 8
                         // as the theorem witness instead of symbolic 7.
                         fs::write(&deferred_owner, dormant.replace("%%end", "u8 staged = fallback(8); %%end")).unwrap();
-                        let old = project.run(&[scope]);
+                        let old = project.run(&[scope, "--all-errors"]);
                         assert_eq!(old.status.code(), Some(1), "{old:?}");
                         assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));
                         assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 1, b"", &old.stderr);
@@ -667,7 +672,7 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         // A valid lexical caller is not the inspected
                         // initializer exception and remains refused.
                         fs::write(&deferred_owner, dormant.replace("%%end", "u8() caller = fn { fallback(8) }; %%end")).unwrap();
-                        let old = project.run(&[scope]);
+                        let old = project.run(&[scope, "--all-errors"]);
                         assert_eq!(old.status.code(), Some(1), "{old:?}");
                         assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));
                         assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 2, b"",
