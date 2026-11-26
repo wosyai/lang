@@ -48,6 +48,10 @@ pub(super) async fn run(
             let profile = args.next().ok_or("expected Build profile")?;
             super::source_reconciliation::run_build(&mut client, dir, &target, &profile, &mode).await?
         }
+        "reconcile-framed-build" | "reconcile-framed-stale" => {
+            let profile = args.next().ok_or("expected Build profile")?;
+            super::framed_reconciliation::run(&mut client, dir, &target, &profile, mode.ends_with("-stale")).await?
+        }
         "replay-acknowledged-for" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected captured root")?)?;
             let owner = args.next().ok_or("expected captured workspace")?;

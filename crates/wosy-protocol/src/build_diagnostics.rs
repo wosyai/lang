@@ -4,6 +4,7 @@ use super::{BaseCstProposal, NodeId};
 
 pub const BUILD_DIAGNOSTIC_VERSION: u16 = 1;
 pub const BASE_DECLARATION_PROJECTION_VERSION: u16 = 1;
+pub const BUILD_RECONCILIATION_VERSION: u16 = 1;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a
 /// wire authorization or a way for a request to switch roots.
@@ -77,6 +78,9 @@ pub struct BuildSessionResponse<D> {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BuildSessionRequest {
     Start { version: u16 },
+    /// Available only at a host-configured recoverable session. The wire
+    /// request never contains the scope or a source payload.
+    StartRecoverable { version: u16 },
     Analyze { request: BuildDiagnosticRequest },
     ProjectBaseDeclarations { version: u16, proposal: BaseCstProposal },
     Renew,
@@ -121,6 +125,9 @@ pub struct BaseDeclarationProjection {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BuildSessionReply<D> {
     Started { version: u16, source_root: NodeId },
+    RecoverableStarted { version: u16, source_root: NodeId },
+    /// Terminal for this connection and not a lease or a publication ack.
+    ReplayRequired { version: u16, source_root: NodeId },
     BaseDeclarationSessionStarted { version: u16, source_root: NodeId, connection: BaseDeclarationConnectionId },
     Analysis { response: BuildDiagnosticResponse<D> },
     BaseDeclarationProjection { projection: BaseDeclarationProjection },

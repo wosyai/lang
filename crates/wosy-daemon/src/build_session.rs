@@ -35,8 +35,14 @@ impl SourceStorageWorker {
     pub async fn open_build_diagnostics(
         &self, selected: BuildSourceSelection, lifetime: Duration,
     ) -> Result<Option<BuildDiagnosticSession<'_>>> {
+        self.open_build_diagnostics_before(selected, lifetime, None).await
+    }
+
+    pub(super) async fn open_build_diagnostics_before(
+        &self, selected: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
+    ) -> Result<Option<BuildDiagnosticSession<'_>>> {
         let slot = self.try_slot()?;
-        let lease = self.spawn_reserved(slot, move |store| store.lease_build_source(selected, lifetime))
+        let lease = self.spawn_reserved(slot, move |store| store.lease_build_source_before(selected, lifetime, start_deadline))
             .await??;
         Ok(lease.map(|lease| BuildDiagnosticSession { worker: self, lease: Arc::new(lease) }))
     }
@@ -51,13 +57,20 @@ impl SourceStorageWorker {
         &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
         lifetime: Duration,
     ) -> Result<BuildSourceOpening<'_>> {
+        self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, None).await
+    }
+
+    pub(super) async fn open_recoverable_build_diagnostics_before(
+        &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
+        lifetime: Duration, start_deadline: Option<Instant>,
+    ) -> Result<BuildSourceOpening<'_>> {
         let slot = self.try_slot()?;
         let root = selected.root;
         let outcome = self.spawn_reserved_query(slot, move |worker| async move {
             let selected = Arc::new(selected);
             let initial = Arc::clone(&selected);
             if let Some(lease) = worker.phase(None, move |store| {
-                store.lease_build_source(initial.as_ref().clone(), lifetime)
+                store.lease_build_source_before(initial.as_ref().clone(), lifetime, start_deadline)
             }).await? {
                 return Ok::<_, super::Error>(Some((lease, None)));
             }
@@ -69,7 +82,7 @@ impl SourceStorageWorker {
                 SourceReconciliation::ReplayRequired { .. } => return Err("acknowledged replay was not admitted".into()),
             };
             let lease = worker.phase(None, move |store| {
-                store.lease_build_source(selected.as_ref().clone(), lifetime)
+                store.lease_build_source_before(selected.as_ref().clone(), lifetime, start_deadline)
             }).await?.ok_or("restored source is no longer available for a lease")?;
             Ok(Some((lease, restored)))
         }).await??;

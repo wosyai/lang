@@ -7,7 +7,7 @@ use wosy_cli::source_state::SqliteSourceState;
 use wosy_daemon::{BaseCstAdmissionLimits, BuildSourceOpening, SourceReconciliation, SourceStorageWorker, SourceStore};
 use wosy_protocol::{BuildDiagnosticRequest, BuildDiagnosticResponse, BUILD_DIAGNOSTIC_VERSION};
 
-fn admission_limits(limited: bool) -> BaseCstAdmissionLimits {
+pub(super) fn admission_limits(limited: bool) -> BaseCstAdmissionLimits {
     BaseCstAdmissionLimits {
         records: 25_000, record_bytes: 16 << 20, graph_edges: 100_000,
         expanded_record_bytes: 32 << 20, cst_occurrences: 100_000, cst_depth: 128,

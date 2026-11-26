@@ -67,6 +67,16 @@ with tempfile.TemporaryDirectory() as tmp:
     assert known["written"] == known["daemon_validated_files"] == 0
     assert client_bytes() == frozen_client
 
+    legacy = state(before_loss, "leased-build", "dev", "--framed")["result"]["response"]
+    framed = state(directory / "framed-replacement", "reconcile-framed-build", "dev")["result"]
+    assert framed["initial"] == framed["current"] == root
+    assert framed["deadline_closed"] and not framed["stale_refused"]
+    for response in (framed["restored"], framed["warm"]):
+        assert {key: value for key, value in response.items() if key != "origin"} == {
+            key: value for key, value in legacy.items() if key != "origin"
+        }
+    assert client_bytes() == frozen_client
+
     # Recovery must restore normal lease access, without an alternate way to
     # dispatch diagnostics or reread the modified live source.
     expected = state(before_loss, "leased-build", "dev")["result"]["response"]
@@ -114,7 +124,9 @@ with tempfile.TemporaryDirectory() as tmp:
     fresh = state(replacement, "stage")
     assert fresh["pending"] != root and fresh["selected"] == root
     assert state(replacement, "replay-acknowledged-for", root, project)["result"]["matches"]
-    assert state(replacement, "submit-pending", "app", "src/main.w")["selected"] == fresh["pending"]
+    stale = state(directory / "framed-advanced", "reconcile-framed-stale", "dev")
+    assert stale["result"]["stale_refused"] and stale["result"]["deadline_closed"]
+    assert stale["result"]["initial"] == root and stale["result"]["current"] == fresh["pending"] == stale["selected"]
     assert not state(replacement, "replay-acknowledged-for", root, project)["result"]["matches"]
     print(json.dumps({
         "require_replay_ms": restored["probe_ms"], "sqlite_replay_ms": restored["replay_ms"],
@@ -123,4 +135,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "old_source_preserved_despite_live_edit": True, "last_acknowledgement_boundary": True,
         "restore_and_open_ms": recovered_session["recovery"]["restore_and_open_ms"],
         "warm_lease_open_ms": warm_session["probe_ms"], "scoped_lease_quota": quota["lease_quota_and_scope"],
+        "framed_challenge_pair_ms": framed["challenge_pair_ms"], "framed_recovery_ms": framed["framed_recovery_ms"],
+        "framed_warm_diagnostics_ms": framed["framed_warm_ms"], "terminal_and_stale_resume_checks": True,
     }))

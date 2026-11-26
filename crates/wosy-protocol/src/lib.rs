@@ -15,7 +15,7 @@ pub use build_diagnostics::{
     BaseDeclarationConnectionId, BaseDeclarationProjection, BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest,
     BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
     BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse,
-    BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION,
+    BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

@@ -1,7 +1,7 @@
 //! Route one bounded byte stream through the existing diagnostic session.
 use super::{
     build_session::BuildRequestRejection, encode_session_frame, BaseCstAdmissionLimits,
-    BuildDiagnosticSession, PreparedBaseDeclarations, Result, SessionFrameError, SessionFrameReader,
+    BuildDiagnosticSession, BuildSourceOpening, PreparedBaseDeclarations, Result, SessionFrameError, SessionFrameReader,
     SourceStorageWorker, StorageAdmissionError,
 };
 use std::future::poll_fn;
@@ -14,8 +14,8 @@ use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationProjection, BuildDiagnosticRequest,
     BuildDiagnosticResponse, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
     BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
-    BuildSessionResponse, BuildSourceSelection, BASE_DECLARATION_PROJECTION_VERSION,
-    BUILD_DIAGNOSTIC_VERSION,
+    BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
+    BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
 
 type Reply = BuildSessionReply<Diagnostic>;
@@ -26,6 +26,7 @@ pub enum BuildSessionEnd {
     Disconnected,
     Expired,
     Refused,
+    ReplayRequired,
 }
 
 enum Close {
@@ -38,6 +39,17 @@ struct ProjectionScope {
     binding: BaseCstProposalBinding,
     admission_limits: BaseCstAdmissionLimits,
     declaration_bytes: usize,
+}
+
+enum Opening {
+    Ordinary(Option<ProjectionScope>),
+    Recoverable { replay: Option<Delta>, limits: BaseCstAdmissionLimits },
+}
+
+enum Opened<'a> {
+    Session(BuildDiagnosticSession<'a>),
+    Unavailable,
+    ReplayRequired,
 }
 
 enum Operation<'a> {
@@ -57,7 +69,7 @@ impl SourceStorageWorker {
     pub async fn serve_build_session<T: AsyncRead + AsyncWrite + Unpin>(
         &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
-        self.serve_selected_session(stream, selected, lifetime, None).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(None)).await
     }
 
     /// Only the trusted local adapter may bind a pending source attempt to
@@ -69,12 +81,25 @@ impl SourceStorageWorker {
     ) -> Result<BuildSessionEnd> {
         let selected = binding.selected.clone();
         let scope = ProjectionScope { binding, admission_limits, declaration_bytes };
-        self.serve_selected_session(stream, selected, lifetime, Some(scope)).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(Some(scope))).await
+    }
+
+    /// Opt-in diagnostic handshake for the trusted adapter's acknowledged
+    /// source. When replay is required, send one terminal reply; a new
+    /// connection is necessary. The adapter supplies authorized replay out
+    /// of band, not as wire input or a previously issued lease token.
+    /// The adapter must discard the stream when this call returns, including
+    /// when passing a borrowed transport.
+    pub async fn serve_recoverable_build_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>,
+        limits: BaseCstAdmissionLimits, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        self.serve_selected_session(stream, selected, lifetime, Opening::Recoverable { replay, limits }).await
     }
 
     async fn serve_selected_session<T: AsyncRead + AsyncWrite + Unpin>(
         &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
-        projection: Option<ProjectionScope>,
+        opening: Opening,
     ) -> Result<BuildSessionEnd> {
         let start_deadline = Instant::now().checked_add(lifetime).ok_or("Build session start timeout is out of range")?;
         let (mut input, mut output) = io::split(stream);
@@ -85,37 +110,65 @@ impl SourceStorageWorker {
             event = frames.read::<_, Command>(&mut input) => event?,
         };
         let Some(Command { id, request }) = start else { return Ok(BuildSessionEnd::PeerClosed); };
-        let refused = match request {
-            Request::Start { version } if version == BUILD_DIAGNOSTIC_VERSION => None,
-            Request::Start { .. } => Some(Refusal::UnsupportedVersion),
+        let recoverable = matches!(opening, Opening::Recoverable { .. });
+        let refused = match (recoverable, request) {
+            (false, Request::Start { version }) if version == BUILD_DIAGNOSTIC_VERSION => None,
+            (true, Request::StartRecoverable { version }) if version == BUILD_RECONCILIATION_VERSION => None,
+            (false, Request::Start { .. }) | (true, Request::StartRecoverable { .. }) => Some(Refusal::UnsupportedVersion),
             _ => Some(Refusal::ExpectedStart),
         };
         if let Some(reason) = refused {
             return refuse_start(&mut output, start_deadline, id, reason).await;
         }
+        if Instant::now() >= start_deadline { return Ok(BuildSessionEnd::Expired); }
         let source_root = selected.root;
-        let opened = tokio::select! {
+        let (projection, recovery) = match opening {
+            Opening::Ordinary(projection) => (projection, None),
+            Opening::Recoverable { replay, limits } => (None, Some((replay, limits))),
+        };
+        let opened: Result<Opened<'_>> = tokio::select! {
             biased;
             _ = sleep_until(TokioInstant::from_std(start_deadline)) => return Ok(BuildSessionEnd::Expired),
-            opened = self.open_build_diagnostics(selected, lifetime) => opened,
+            opened = async {
+                if let Some((replay, limits)) = recovery {
+                    Ok(match self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, Some(start_deadline)).await? {
+                        BuildSourceOpening::Opened { session, .. } => Opened::Session(session),
+                        BuildSourceOpening::ReplayRequired { .. } => Opened::ReplayRequired,
+                    })
+                } else {
+                    Ok(self.open_build_diagnostics_before(selected, lifetime, Some(start_deadline)).await?
+                        .map_or(Opened::Unavailable, Opened::Session))
+                }
+            } => opened,
         };
         let session = match opened {
-            Ok(Some(session)) => session,
-            Ok(None) => return refuse_start(&mut output, start_deadline, id, Refusal::SourceUnavailable).await,
+            Ok(Opened::Session(session)) => session,
+            Ok(Opened::Unavailable) => return refuse_start(&mut output, start_deadline, id, Refusal::SourceUnavailable).await,
+            Ok(Opened::ReplayRequired) => {
+                let reply = Reply::ReplayRequired { version: BUILD_RECONCILIATION_VERSION, source_root };
+                return Ok(if send(&mut output, start_deadline, id, reply).await? {
+                    BuildSessionEnd::ReplayRequired
+                } else { BuildSessionEnd::Expired });
+            }
             Err(error) => {
+                if matches!(error.downcast_ref::<BuildRequestRejection>(), Some(BuildRequestRejection::Expired)) {
+                    return Ok(BuildSessionEnd::Expired);
+                }
                 let reason = refusal(&error, Refusal::SourceUnavailable);
                 return refuse_start(&mut output, start_deadline, id, reason).await;
             }
         };
         let Some(deadline) = session.deadline() else { return Ok(BuildSessionEnd::Expired); };
-        let started = if projection.is_some() {
+        let started = if recoverable {
+            Reply::RecoverableStarted { version: BUILD_RECONCILIATION_VERSION, source_root }
+        } else if projection.is_some() {
             Reply::BaseDeclarationSessionStarted {
                 version: BUILD_DIAGNOSTIC_VERSION, source_root, connection: session.connection_id(),
             }
         } else {
             Reply::Started { version: BUILD_DIAGNOSTIC_VERSION, source_root }
         };
-        if !send(&mut output, deadline, id, started).await? { return Ok(BuildSessionEnd::Expired); }
+        if !send(&mut output, deadline.min(start_deadline), id, started).await? { return Ok(BuildSessionEnd::Expired); }
         let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref()).await?;
         let deadline = session.deadline();
         session.release();
@@ -242,7 +295,7 @@ async fn control<W: AsyncWrite + Unpin>(
     let Some(Command { id, request }) = command else { return Ok(Some(Close::Peer)); };
     let reply = match request {
         Request::Disconnect => return Ok(Some(Close::Request(id))),
-        Request::Start { .. } => Reply::Refused { reason: Refusal::AlreadyStarted },
+        Request::Start { .. } | Request::StartRecoverable { .. } => Reply::Refused { reason: Refusal::AlreadyStarted },
         Request::Analyze { .. } | Request::ProjectBaseDeclarations { .. } => Reply::Refused { reason: Refusal::Busy },
         Request::Renew => {
             if !session.renew() { return Ok(Some(Close::Deadline)); }

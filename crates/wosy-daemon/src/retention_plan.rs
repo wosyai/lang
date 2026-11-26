@@ -1,6 +1,7 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, build_receipt, check_source_marker, edge, key, pins, project_declarations, published_source, read_node,
+    authority_key, base_declarations, build_receipt, build_session::BuildRequestRejection, check_source_marker,
+    edge, key, pins, project_declarations, published_source, read_node,
     source_reconciliation::checked_published_source_header,
     source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
@@ -340,7 +341,16 @@ impl SourceStore {
     pub(super) fn lease_build_source(
         &self, selection: BuildSourceSelection, lifetime: Duration,
     ) -> Result<Option<SourceLease>> {
+        self.lease_build_source_before(selection, lifetime, None)
+    }
+
+    pub(super) fn lease_build_source_before(
+        &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
+    ) -> Result<Option<SourceLease>> {
         if lifetime.is_zero() { return Err("a Build diagnostic lease must have a positive lifetime".into()); }
+        if start_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(BuildRequestRejection::Expired.into());
+        }
         let root = selection.root;
         let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
         let config = checked_published_source_header(&tx, root)?;
@@ -354,6 +364,9 @@ impl SourceStore {
         let lease = {
             let mut reads = self.source_reads.0.lock().expect("source reader registry");
             let now = Instant::now();
+            if start_deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(BuildRequestRejection::Expired.into());
+            }
             let expires = now.checked_add(lifetime).ok_or("Build diagnostic lease expiry is out of range")?;
             reads.sessions.retain(|_, (_, expires)| *expires > now);
             if reads.sessions.len() == MAX_BUILD_SESSIONS { return Err("Build diagnostic session quota exceeded".into()); }
