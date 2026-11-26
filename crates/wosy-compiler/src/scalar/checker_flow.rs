@@ -153,6 +153,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     fn allows_imported_condition_comparisons(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn imported_enum_match_position(self) -> Option<usize> { None }
+    #[cfg(feature = "internal-checker")]
+    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories>> { None }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -228,6 +230,54 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
     ) -> Option<&'a BigInt> {
         None
     }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct CallableHistories {
+    nodes: Vec<(usize, wosy_syntax::ByteSpan, bool)>,
+    interned: HashMap<(usize, wosy_syntax::ByteSpan, bool), usize>,
+    work: usize,
+    stopped: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl CallableHistories {
+    fn append_rows(&mut self, rows: &mut IntegerInputs, span: wosy_syntax::ByteSpan, arm: bool) -> Option<()> {
+        charge_call_work(&mut self.work, rows.0.len())?;
+        for row in &mut rows.0 {
+            let node = (row.callable_history, span, arm);
+            row.callable_history = *self.interned.entry(node).or_insert_with(|| {
+                self.nodes.push(node);
+                self.nodes.len()
+            });
+        }
+        Some(())
+    }
+
+    fn steps(&mut self, mut id: usize) -> Option<Vec<(wosy_syntax::ByteSpan, bool)>> {
+        let mut reversed = Vec::new();
+        while id != 0 {
+            charge_call_work(&mut self.work, 1)?;
+            let (parent, span, arm) = *self.nodes.get(id - 1)?;
+            reversed.push((span, arm));
+            id = parent;
+        }
+        reversed.reverse();
+        Some(reversed)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories>);
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
+    const ENABLED: bool = false;
+    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories>> { Some(self.0) }
+    fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1542,10 +1592,15 @@ struct IntegerRow {
     affine: Option<Rc<IntegerAffineAxes>>,
     entry: Option<Rc<ProjectedEntry>>,
     projected_from: u16,
+    #[cfg(feature = "internal-checker")]
+    callable_history: usize,
 }
 
 impl IntegerRow {
-    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, affine: None, entry: None, projected_from: 0 } }
+    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, affine: None, entry: None, projected_from: 0,
+        #[cfg(feature = "internal-checker")]
+        callable_history: 0,
+    } }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
         self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
@@ -1929,6 +1984,8 @@ struct IntegerRoots<'a> {
     ordinary_comparison_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     startup_trace: Option<(&'a wosy_syntax::SourceIdentity, Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>)>,
+    #[cfg(feature = "internal-checker")]
+    callable_history: Option<&'a std::cell::RefCell<CallableHistories>>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1936,7 +1993,8 @@ struct IntegerRoots<'a> {
 impl<'a> IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     fn after_startup_candidate(&self) -> Option<()> {
-        if self.startup_trace.as_ref().is_some_and(|(_, trace)| trace.borrow().cannot_continue()) {
+        if self.startup_trace.as_ref().is_some_and(|(_, trace)| trace.borrow().cannot_continue())
+            || self.callable_history.is_some_and(|trace| trace.borrow().stopped) {
             None
         } else { Some(()) }
     }
@@ -3571,6 +3629,46 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
         )
     }?;
     Some((active, failures))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum CallableHistoryCompletion { Exhausted(bool), LimitReached }
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn search_closed_callable_histories(
+    calls: &FunctionCallSites, work: &mut usize,
+    mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<(wosy_syntax::ByteSpan, bool)>) -> Option<bool>,
+) -> Option<CallableHistoryCompletion> {
+    let histories = std::cell::RefCell::new(CallableHistories { work: *work, ..Default::default() });
+    let mut unsupported = false;
+    let mut sink = |mut failure: IntegerCheckFailure<'_>| {
+        let mut seen = std::collections::HashSet::new();
+        for mut row in failure.state.0.drain(..) {
+            let mut trace = histories.borrow_mut();
+            if charge_call_work(&mut trace.work, 1).is_none() { unsupported = true; break; }
+            if !seen.insert(row.callable_history) { continue; }
+            let Some(steps) = trace.steps(row.callable_history) else { unsupported = true; break; };
+            row.callable_history = 0; // History is a selection key, not witness data.
+            let state = IntegerInputs(vec![row]);
+            let equal_axes = state.common_equal_axes();
+            if charge_call_work(&mut trace.work, failure.axes.len()).is_none() { unsupported = true; break; }
+            let selected = select(IntegerCheckFailure {
+                directive: failure.directive, state, axes: failure.axes.clone(), equal_axes,
+            }, steps);
+            match selected {
+                Some(true) => { trace.stopped = true; break; }
+                Some(false) => {}
+                None => { unsupported = true; break; }
+            }
+        }
+        if unsupported { histories.borrow_mut().stopped = true; }
+    };
+    let result = collect_integer_requirement_failures_in_scope(calls, IntegerRequirementEntry::Arbitrary,
+        None, false, false, &mut sink, TrackCallableHistory(&histories));
+    *work = histories.borrow().work;
+    if unsupported { return None; }
+    if histories.borrow().stopped { return Some(CallableHistoryCompletion::LimitReached); }
+    result.map(|(active, _)| CallableHistoryCompletion::Exhausted(active))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6483,6 +6581,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             && calls.structure.has_ordinary_predicates()).then_some(0),
         #[cfg(feature = "internal-checker")]
         symbolic_context_work: Authored::OBSERVE_FIXED_ARRAY.then_some(0),
+        #[cfg(feature = "internal-checker")]
+        callable_history: authored_return.callable_history(),
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -7388,6 +7488,25 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         }
                         continue;
                     }
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(histories) = roots.callable_history {
+                        if !COLLECT || directive.operation != CheckerOperation::Require
+                            || !matches!(predicate, CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))
+                        { return None; }
+                        for row in &path.0 {
+                            charge_call_work(&mut histories.borrow_mut().work, row.len().checked_add(1)?)?;
+                            let candidate = IntegerInputs(vec![row.clone()]);
+                            let rejecting = candidate.failing_witness(roots, predicate)?;
+                            if !rejecting.is_unreachable() {
+                                (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                    directive: expression, equal_axes: rejecting.common_equal_axes(),
+                                    state: rejecting, axes: roots.axes.clone(),
+                                });
+                                roots.after_startup_candidate()?;
+                            }
+                        }
+                        continue;
+                    }
                     if COLLECT && directive.operation == CheckerOperation::Require {
                         let failing = path.failing_witness(roots, predicate)?;
                         if !failing.is_unreachable() {
@@ -7489,6 +7608,16 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         let at = calls.occurrences.get(condition.0)?.span;
                         trace.try_borrow_mut().ok()?.branch(wosy_syntax::SourceSpan::new((*source).clone(), at), !yes.is_unreachable())?;
                     }
+                    #[cfg(feature = "internal-checker")]
+                    let (yes, no, keep_arm_rows) = if let Some(histories) = roots.callable_history {
+                        let mut yes = yes;
+                        let mut no = no;
+                        let at = calls.occurrences.get(condition.0)?.span;
+                        let mut histories = histories.borrow_mut();
+                        histories.append_rows(&mut yes, at, true)?;
+                        histories.append_rows(&mut no, at, false)?;
+                        (yes, no, true)
+                    } else { (yes, no, keep_arm_rows) };
                     let (arm, incoming, alternate) = if yes.is_unreachable() {
                         let Some(else_block) = else_block.filter(|_| !no.is_unreachable()) else {
                             path = no;

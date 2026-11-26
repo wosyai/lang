@@ -7,6 +7,7 @@ use super::{PreparedCallable, ScalarType};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(in super::super) enum PathStep {
     Startup(SourceIdentity),
+    CallableRoot(SourceSpan),
     Namespace { binding: SourceSpan, target: SourceIdentity },
     Call(SourceSpan),
     Return(SourceSpan),
@@ -57,9 +58,24 @@ impl StartUpSearch {
     }
 
     pub(super) fn admit(&mut self, directive: SourceSpan) -> Option<Admission> {
-        if self.remaining == 0 { return None; }
         super::super::checker_flow::charge_call_work(&mut self.work, self.prefix.len().checked_add(1)?)?;
-        let path = FailurePath { steps: self.prefix.clone(), directive };
+        self.select(FailurePath { steps: self.prefix.clone(), directive })
+    }
+
+    pub(super) fn admit_callable(
+        &mut self, declaration: SourceSpan, history: Vec<(wosy_syntax::ByteSpan, bool)>, directive: SourceSpan,
+    ) -> Option<Admission> {
+        super::super::checker_flow::charge_call_work(&mut self.work, history.len().checked_add(2)?)?;
+        let mut steps = Vec::with_capacity(history.len().checked_add(1)?);
+        steps.push(PathStep::CallableRoot(declaration));
+        steps.extend(history.into_iter().map(|(range, accepted)| PathStep::Branch {
+            condition: SourceSpan::new(directive.source.clone(), range), accepted,
+        }));
+        self.select(FailurePath { steps, directive })
+    }
+
+    fn select(&mut self, path: FailurePath) -> Option<Admission> {
+        if self.remaining == 0 { return None; }
         if !self.selected.insert(path) { return Some(Admission::Duplicate); }
         self.remaining -= 1;
         Some(if self.remaining == 0 { Admission::SelectedAndStop } else { Admission::Selected })
