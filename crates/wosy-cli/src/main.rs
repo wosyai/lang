@@ -3054,6 +3054,72 @@ main_artifact = "main"
                     }
                 }
                 fs::remove_file(&shared_source).unwrap();
+                // The array cohort keeps the exact owner for every bare
+                // proof, even when an actual provider return and a local
+                // return disagree with two independent claims after cap1.
+                let multi_provider = scalar_library.replace("%%end", &format!("{array_library} %%end"));
+                fs::write(&shared_source, &multi_provider).unwrap();
+                for (dormant_local, dormant_array) in [(false, false), (true, false), (false, true)] {
+                    let cell = if dormant_array { "u8 cell = 7;" }
+                        else { "u8[2] input = lib.make(); u8 cell = input[0];" };
+                    let local = if dormant_local { "u8 local_value = 5;" }
+                        else { "u8 local_value = reflect(5);" };
+                    let app = format!(r#"%%start
+                        lib = namespace app "shared.w";
+                        u8(u8) reflect = fn(value) {{ value }};
+                        proof local_claim for reflect(entry) -> (out) where (entry == 5) ensures (out == 8) {{}}
+                        {cell}
+                        core.require(cell == 8, {first});
+                        u8 external_value = lib.echo(7);
+                        core.require(external_value == 7, {unused_output});
+                        {local}
+                        core.require(local_value == 8, {second});
+                    %%end"#);
+                    fs::write(&source, &app).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old.0, Ok(19), "legacy {layout} {scope:?} {dormant_local} {dormant_array}");
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().expect("mixed array and two scalar proofs");
+                    assert_eq!(report.directives.len(), 1);
+                    assert_eq!(report.diagnostics.len(), if dormant_local { 1 } else { 2 });
+                    for (actual, expected) in report.diagnostics.iter().zip([("src/shared.w", "lib.echo(7)"), ("src/main.w", "reflect(5)")]) {
+                        assert_eq!(actual.proof.source.path, expected.0);
+                        assert_eq!(actual.invocation.call.source.path, "src/main.w");
+                        let span = actual.invocation.call.range;
+                        assert_eq!(&app[span.start as usize..span.end as usize], expected.1);
+                    }
+                    assert_eq!(report.symbolic_diagnostic.is_some(), dormant_local && scope == ScalarCheckerScope::CurrentPackage);
+                    if dormant_array && scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(report.aggregate_diagnostics.is_empty());
+                    } else {
+                        let [array] = report.aggregate_diagnostics.as_slice() else { panic!("original aggregate claim"); };
+                        assert_eq!(array.proof.source.path, "src/shared.w");
+                        assert_eq!(array.call.is_none(), dormant_array);
+                    }
+                    let clipped = terminal(&limited, scope, false);
+                    assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                    assert_eq!(clipped.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+                    if !dormant_local && !dormant_array {
+                        let duplicate = app.replace("second.txt", "first.txt");
+                        assert_ne!(duplicate, app);
+                        fs::write(&source, duplicate).unwrap();
+                        let limited_duplicate = terminal(&selected(1), scope, false);
+                        assert_eq!(limited_duplicate, (Ok(1), b"first".to_vec(), clipped.2));
+                        assert_eq!(files(), first_file);
+                        clean();
+                        let refused = terminal(&selected(2), scope, false);
+                        assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty());
+                        assert!(!state.exists());
+                    }
+                }
+                fs::remove_file(&shared_source).unwrap();
                 // The configured app-owned scalar and a contextual debit
                 // through the completed provider share one startup cursor.
                 let mixed_context_provider = r#"%%start

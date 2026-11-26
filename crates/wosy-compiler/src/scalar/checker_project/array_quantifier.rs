@@ -351,7 +351,7 @@ impl<'a> Cohort<'a> {
     /// one prepared owner and share a single metered startup walk.
     pub(super) fn run_capped(
         &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>,
-        bare: Option<&PlannedModuleProof<'_>>, rank: Option<&PlannedModuleProof<'_>>, provider: Option<&SourceIdentity>,
+        bare: &[PlannedModuleProof<'_>], rank: Option<&PlannedModuleProof<'_>>, provider: Option<&SourceIdentity>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
         use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
         let prepared = &owner.prepared;
@@ -362,7 +362,7 @@ impl<'a> Cohort<'a> {
         let (_, authored_roots) = package_obligation_roots(prepared, scope, project.modules.len(), root)?;
         if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
 
-        let mut targets = Vec::with_capacity(self.groups.len().checked_add(usize::from(bare.is_some()))
+        let mut targets = Vec::with_capacity(self.groups.len().checked_add(bare.len())
             .and_then(|count| count.checked_add(usize::from(rank.is_some()))).ok_or(ProjectCheck::Unsupported)?);
         for (&target, group) in &self.groups {
             let plan = &self.plans[group.ids[0]];
@@ -374,7 +374,7 @@ impl<'a> Cohort<'a> {
             if group.ids.iter().any(|&id| self.plans[id].source != plan.owner) { return Err(ProjectCheck::Unsupported); }
             targets.push((target, plan.owner, declaration.name_span, Aggregate));
         }
-        if let Some(plan) = bare {
+        for plan in bare {
             if !owned(plan.proof_source) || self.groups.contains_key(&plan.target) {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -382,12 +382,18 @@ impl<'a> Cohort<'a> {
         }
         if let Some(plan) = rank {
             if plan.target.0 != 0 || plan.proof_source != root || self.groups.contains_key(&plan.target)
-                || bare.is_some_and(|bare| bare.target == plan.target || bare.name == plan.name)
+                || bare.iter().any(|bare| bare.target == plan.target || bare.name == plan.name)
             { return Err(ProjectCheck::Unsupported); }
             targets.push((plan.target, plan.proof_source, plan.function.name_span, Ranked));
         }
-        let mut scalar = bare.map(|plan| MainFlowProofObserver::from_first_plan(scope, root, plan)).transpose()?;
-        if let Some(observer) = scalar.as_mut() { observer.finish_plans(prepared, scope)?; }
+        let scalar = if let [first, rest @ ..] = bare {
+            let mut observer = MainFlowProofObserver::from_first_plan(scope, root, first)?;
+            for plan in rest {
+                observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
+            }
+            observer.finish_plans(prepared, scope)?;
+            Some(observer)
+        } else { None };
         let incoming = calls.owned_direct_startup_callable_uses(root, provider,
             targets.iter().map(|(_, source, span, _)| (*source, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
         let mut trace = match cap {
@@ -398,7 +404,8 @@ impl<'a> Cohort<'a> {
         trace.named_cross_source = provider.is_some();
         let mut reached_arrays = HashSet::new();
         let mut deferred_arrays = Vec::new();
-        let mut invoked_scalar = None;
+        let mut invoked_scalars = HashSet::new();
+        let mut scalar_observations = 0usize;
         let mut verified_rank = None;
         for (target, source, span, role) in targets {
             let sites = incoming.get(&(source, span)).ok_or(ProjectCheck::Unsupported)?;
@@ -409,13 +416,13 @@ impl<'a> Cohort<'a> {
             match role {
                 Aggregate => { reached_arrays.insert(target); },
                 Bare => {
-                    let Some(plan) = bare.filter(|plan| plan.target == target) else { return Err(ProjectCheck::Unsupported); };
+                    let Some(plan) = bare.iter().find(|plan| plan.target == target) else { return Err(ProjectCheck::Unsupported); };
                     if !matches!(plan.typed.body.boundary.parameters.as_slice(), [slot] if is_integer_type(&slot.ty)) {
                         return Err(ProjectCheck::Unsupported);
                     }
-                    invoked_scalar = Some(target);
+                    if !invoked_scalars.insert(target) { return Err(ProjectCheck::Unsupported); }
+                    scalar_observations = scalar_observations.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
                     trace.named_target = Some(target);
-                    trace.metered_frames |= sites.len() > 1;
                 }
                 Ranked => {
                     let plan = rank.filter(|plan| plan.target == target).ok_or(ProjectCheck::Unsupported)?;
@@ -427,6 +434,7 @@ impl<'a> Cohort<'a> {
             }
             trace.enroll_proof_sites(target, role, sites).ok_or(ProjectCheck::Unsupported)?;
         }
+        trace.metered_frames |= scalar_observations > 1;
         deferred_arrays.sort_unstable();
         let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
         let (init, evidence) = walk_prepared_initialization::<_, true, true>(
@@ -457,14 +465,22 @@ impl<'a> Cohort<'a> {
             active = true;
         }
         let bare_evidence = scalar.map(|mut observer| {
-            observe_capped_bare_receipts(&mut observer, &mut trace, invoked_scalar, root)?;
+            if trace.named_observations.len() != scalar_observations { return Err(ProjectCheck::Unsupported); }
+            if bare.len() == 1 {
+                observe_capped_bare_receipts(&mut observer, &mut trace, invoked_scalars.iter().copied().next(), root)?;
+            } else {
+                for observed in std::mem::take(&mut trace.named_observations) {
+                    observe_capped_bare_receipt(&mut observer, &mut trace, &invoked_scalars, root, observed)?;
+                }
+                if !observer.complete(&invoked_scalars) { return Err(ProjectCheck::Unsupported); }
+            }
             active |= observer.active;
             Ok::<_, ProjectCheck>(NamedOrderedEvidence { observed: observer })
         }).transpose()?;
         let ((diagnostic, additional), bare_evidence) = if scope == ScalarCheckerScope::CurrentPackage {
             let mut ranked = HashMap::new();
-            let mut deferred_numeric = Vec::new();
-            if let Some(plan) = bare.filter(|_| invoked_scalar.is_none()) { deferred_numeric.push(plan); }
+            let mut deferred_numeric = bare.iter().filter(|plan| !invoked_scalars.contains(&plan.target))
+                .collect::<Vec<_>>();
             if let Some(plan) = rank.filter(|_| verified_rank.is_none()) {
                 ranked.insert(plan.target, closed_ranked_evidence::<false>(root, 1, plan,
                     plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)?);

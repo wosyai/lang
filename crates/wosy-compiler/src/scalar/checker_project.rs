@@ -11135,19 +11135,7 @@ fn run_private_mixed_root_context(
     let mut order = Vec::new();
     for (index, observed) in std::mem::take(&mut trace.named_observations).into_iter().enumerate() {
         if completed.refuted_after_named == Some(index) { order.push(observer.diagnostics.len()); }
-        let group = if observer.first.0 == observed.target { &observer.first.1 }
-            else { observer.other.get(&observed.target).ok_or(ProjectCheck::Unsupported)? };
-        let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
-        if !rest.is_empty() || &observed.site.source != root || !required.contains(&observed.target) {
-            return Err(ProjectCheck::Unsupported);
-        }
-        trace.charge_formal_replay(1, first.guard.activation_replay_work().ok_or(ProjectCheck::Unsupported)?)
-            .ok_or(ProjectCheck::Unsupported)?;
-        observer.observe_initializer(observed.target, Some(InitializerProofSite {
-            source: &observed.site.source, call: InitializerProofOrigin::CapturedDirect {
-                call: observed.site.range, directive_position: observed.directive_position,
-            },
-        }), &[observed.parameter], &[&observed.argument], &observed.returned);
+        observe_capped_bare_receipt(&mut observer, &mut trace, &required, root, observed)?;
     }
     if completed.refuted_after_named == Some(observation_count) { order.push(observer.diagnostics.len()); }
     if !observer.complete(&required) { return Err(ProjectCheck::Unsupported); }
@@ -11386,9 +11374,8 @@ fn run_private_named_after_startup(
         { return Err(ProjectCheck::Unsupported); }
     }
     if !arrays.is_empty() {
-        if plans.len() > 1 { return Err(ProjectCheck::Unsupported); }
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
-        return cohort.run_capped(owner, scope, cap, plans.first(), ranked.as_ref(), provider);
+        return cohort.run_capped(owner, scope, cap, &plans, ranked.as_ref(), provider);
     }
     if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
@@ -11508,6 +11495,27 @@ fn check_capped_ranked_receipts(
             || rank.consume(rank.target, &[&reached.argument], &reached.parameter).as_ref() != Some(&reached.returned)
         { return Err(ProjectCheck::Unsupported); }
     }
+    Ok(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn observe_capped_bare_receipt(
+    observer: &mut MainFlowProofObserver<'_>, trace: &mut failure_search::StartUpSearch,
+    invoked: &HashSet<PreparedCallable>, root: &SourceIdentity, observed: failure_search::StartupProofObservation,
+) -> Result<(), ProjectCheck> {
+    let group = if observer.first.0 == observed.target { &observer.first.1 }
+        else { observer.other.get(&observed.target).ok_or(ProjectCheck::Unsupported)? };
+    let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
+    if !rest.is_empty() || &observed.site.source != root || !invoked.contains(&observed.target) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    trace.charge_formal_replay(1, first.guard.activation_replay_work().ok_or(ProjectCheck::Unsupported)?)
+        .ok_or(ProjectCheck::Unsupported)?;
+    observer.observe_initializer(observed.target, Some(InitializerProofSite {
+        source: &observed.site.source, call: InitializerProofOrigin::CapturedDirect {
+            call: observed.site.range, directive_position: observed.directive_position,
+        },
+    }), &[observed.parameter], &[&observed.argument], &observed.returned);
     Ok(())
 }
 
