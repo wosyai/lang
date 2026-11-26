@@ -46,7 +46,7 @@ impl Fixture {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.w"), source).unwrap();
         fs::write(root.join("wosy.toml"), format!(r#"
-[project]
+[package]
 name = "{name}"
 default_target = "app"
 source_root = "src"
