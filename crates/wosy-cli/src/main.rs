@@ -2714,8 +2714,43 @@ main_artifact = "main"
                 let unsupported = selected(8);
                 assert!(matches!(unsupported[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
                 assert!(!state.exists());
-                fs::remove_file(shared_source).unwrap();
                 fs::remove_file(relay_source).unwrap();
+
+                let qualified = format!(r#"%%start
+                    lib = namespace app "shared.w";
+                    u8(u8) relay = fn(input) {{ u8 forwarded = lib.echo(input); forwarded }};
+                    u8 direct = lib.echo(7);
+                    core.require(direct == 7, {unused_output});
+                    core.require(direct == 8, {first});
+                    u8 nested = relay(8);
+                    core.require(nested == 8, {unused_output});
+                    core.require(nested == 9, {second});
+                %%end"#);
+                fs::write(&source, &qualified).unwrap();
+                fs::write(&shared_source, "%%start u8(u8) echo = fn(input) { input }; %%end").unwrap();
+                assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                let complete = terminal(&selected(8), scope, false);
+                assert_eq!(complete, (Ok(19), b"firstsecond".to_vec(), b"[first][second]".to_vec()));
+                assert_eq!(files(), both_files);
+                clean();
+                // A reached qualified leaf with non-admitted ordinary
+                // work cannot acquire authority through the lexical wrapper.
+                fs::write(&shared_source, format!(r#"%%start
+                    u8(u8) echo = fn(input) {{ core.require(input == 8, {relay_output}); input }};
+                %%end"#)).unwrap();
+                let refused = selected(8);
+                assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(files().is_empty() && !state.exists());
+                fs::write(&source, r#"%%start lib = namespace app "shared.w"; lib.report(7); %%end"#).unwrap();
+                fs::write(&shared_source, format!(r#"%%start
+                    unit(u8) report = fn(input) {{ core.require(input == 8, {first}); }};
+                %%end"#)).unwrap();
+                assert_eq!(terminal(&selected(8), scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                fs::remove_file(shared_source).unwrap();
                 fs::write(&source, &ranked).unwrap();
                 let legacy_render = terminal(&[legacy()], scope, false);
                 assert_eq!(legacy_render.0, Ok(19));

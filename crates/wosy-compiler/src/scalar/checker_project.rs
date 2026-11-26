@@ -3385,7 +3385,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         let rank_self = traced_rank.is_some() && target == traced_rank && std::ptr::eq(frame.body, child.body);
                         let context_leaf = trace.borrow().contextual_route.is_some_and(|(_, leaf)| target == Some(leaf))
                             && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_));
-                        if (!rank_self && !context_leaf) || frame.source != child.source {
+                        // prepare_exact_child already authenticated the
+                        // resolved edge and completed namespace owner.
+                        let qualified_scalar = trace.borrow().proof_free_scalar_initializers && frame.source != child.source
+                            && closed_startup_qualified_scalar_wrapper(frame.body, frame.source)
+                            && matches!(call, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
+                            && closed_startup_scalar_history(child.body)
+                            && child.body.structure.checker_directives.is_empty()
+                            && child.body.contextual_formal().is_none();
+                        if !qualified_scalar && ((!rank_self && !context_leaf) || frame.source != child.source) {
                             return Err(ProjectCheck::Unsupported);
                         }
                         let span = frame.body.occurrences.get(call.occurrence().0)
@@ -3503,9 +3511,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     }
                     #[cfg(feature = "internal-checker")]
                     if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
-                        if trace.borrow().ranked_target != Some(target) || !matches!(&result, ActualCallResult::Integer(_)) {
+                        let trace_state = trace.borrow();
+                        let qualified_scalar = trace_state.proof_free_scalar_initializers && parent.source != completed.source;
+                        if (!qualified_scalar && trace_state.ranked_target != Some(target)) || !matches!(&result, ActualCallResult::Integer(_)) {
                             return Err(ProjectCheck::Unsupported);
                         }
+                        drop(trace_state);
                         let span = parent.body.occurrences.get(effect.occurrence().0)
                             .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
                         trace.borrow_mut().append(failure_search::PathStep::Return(
@@ -4032,9 +4043,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let pending = search.required_sites.get(&call).filter(|_| search.owns_initialization(caller));
             let matches_named = pending == Some(&(target, Bare)) && is_integer_type(expected)
                 && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
-            let matches_plain_scalar = search.proof_free_scalar_initializers && caller == &owner.source
+            let plain_scalar_wrapper = search.proof_free_scalar_initializers && caller == &owner.source
+                && closed_startup_qualified_scalar_wrapper(body, &owner.source);
+            let matches_plain_scalar = search.proof_free_scalar_initializers
                 && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
-                && is_integer_type(expected) && closed_startup_scalar_history(body);
+                && is_integer_type(expected) && (closed_startup_scalar_history(body) || plain_scalar_wrapper);
             let matches_ranked = pending == Some(&(target, Ranked))
                 && caller == &owner.source && ordered.scalar_initializer.is_some()
                 && signature.parameters.len() == 1 && is_integer_type(expected);
@@ -4045,14 +4058,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             if search.proof_only_continuation() && search.pending_named_startup_observation()
                 && !(matches_named || matches_ranked)
             { return Err(ProjectCheck::Unsupported); }
-            let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
+            let ordinary_qualified = search.proof_free_scalar_initializers
+                && (matches_plain_scalar || (*expected == ScalarType::Unit
+                    && body.checker_named_route_frame() && literal_history_directives(body)));
+            let cross_authorized = caller != &owner.source && (search.named_cross_source && matches_named || ordinary_qualified)
                 && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
             if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked)
                 || (caller != &owner.source && !cross_authorized)
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !matches_context_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_context_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
                 || !body.structure.checker_selected_snapshots.is_empty()
                 || !body.structure.module_storage_uses.is_empty()
@@ -10228,6 +10244,22 @@ fn closed_startup_scalar_history(body: &FunctionCallSites) -> bool {
         && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
         && literal_history_directives(body)
+}
+
+#[cfg(feature = "internal-checker")]
+fn closed_startup_qualified_scalar_wrapper(body: &FunctionCallSites, caller: &SourceIdentity) -> bool {
+    body.checker_pure_calling_frame() && body.contextual_formal().is_none()
+        && matches!(body.boundary.parameters.as_slice(), [parameter] if is_integer_type(&parameter.ty))
+        && matches!(body.boundary.results.as_slice(), [result] if is_integer_type(&result.ty))
+        && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
+        && matches!(body.call_occurrences.as_slice(), [call]
+            if body.structure.checker_direct_targets.len() == 1
+                && body.structure.checker_direct_targets.contains_key(&call.ordinal)
+                && body.structure.checker_integer_call_locals.len() == 1
+                && body.structure.checker_integer_call_locals.values().any(|local| local.call == call.ordinal)
+                && matches!(body.resolved_call_site(call.ordinal).map(|site| &site.target),
+                    Some(ResolvedCallTarget::ModuleCallable { source, concrete: ConcreteCallSelection::Declaration, .. })
+                        if source != caller && source.project == caller.project && source.package == caller.package))
 }
 
 #[cfg(feature = "internal-checker")]
