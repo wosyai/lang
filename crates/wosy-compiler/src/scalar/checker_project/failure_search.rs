@@ -40,7 +40,8 @@ pub(in super::super) struct StartUpSearch {
     pub(super) proof_free_scalar_initializers: bool,
     pub(super) named_target: Option<PreparedCallable>,
     pub(super) named_cross_source: bool,
-    pub(super) named_observation: Option<StartupNamedObservation>,
+    pub(super) named_observations: Vec<StartupNamedObservation>,
+    pub(super) named_required: usize,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
     pub(super) contextual_observed: bool,
     pub(super) ranked_target: Option<PreparedCallable>,
@@ -51,7 +52,7 @@ pub(in super::super) struct StartUpSearch {
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observation: None,
+        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), named_required: 0,
             contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observation: None,
             #[cfg(test)]
             ranked_entries: Vec::new(),
@@ -100,15 +101,17 @@ impl StartUpSearch {
 
     pub(super) fn remaining(&self) -> usize { self.remaining }
     pub(super) fn invalidate(&mut self) { self.invalid = true; }
-    pub(super) fn pending_mixed_startup_observation(&self) -> bool {
-        !self.named_cross_source && self.named_target.is_some() && self.ranked_target.is_some()
-            && (self.named_observation.is_none() || self.ranked_observation.is_none())
+    pub(super) fn pending_named_startup_observation(&self) -> bool {
+        !self.named_cross_source && self.named_target.is_some()
+            && (self.named_required > 1 || self.ranked_target.is_some())
+            && (self.named_observations.len() < self.named_required
+                || (self.ranked_target.is_some() && self.ranked_observation.is_none()))
     }
 
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
             && ((self.contextual_route.is_some() && !self.contextual_observed)
-                || self.pending_mixed_startup_observation())
+                || self.pending_named_startup_observation())
     }
 
     pub(in super::super) fn cannot_continue(&self) -> bool {

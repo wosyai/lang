@@ -2687,8 +2687,35 @@ main_artifact = "main"
                 assert_eq!(files(), both_files);
                 clean();
 
-                // More than one authentic incoming bare call is a
-                // different route, not the bounded mixed owner.
+                let repeated = format!(r#"%%start
+                    u8(u8) echo = fn(value) {{ value }};
+                    proof live for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+                    u8 one = echo(7);
+                    core.require(one == 8, {first});
+                    u8 two = echo(7);
+                    core.require(two == 8, {second});
+                %%end"#);
+                fs::write(&source, &repeated).unwrap();
+                let both = terminal(&[legacy()], scope, false);
+                assert_eq!(both.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                let selected_one = selected(1);
+                let report = selected_one[0].outcome.as_ref().unwrap();
+                let [first_call, second_call] = report.diagnostics.as_slice() else { panic!("two actual formal receipts"); };
+                assert!(first_call.invocation.call.range.start < second_call.invocation.call.range.start);
+                assert_eq!(first_call.invocation.returned, second_call.invocation.returned);
+                let one = terminal(&selected_one, scope, false);
+                assert_eq!((one.0, one.1), (Ok(1), b"first".to_vec()));
+                assert_eq!(one.2.strip_prefix(b"[first]"), both.2.strip_prefix(b"[first][second]"));
+                assert_eq!(files(), first_file);
+                clean();
+                assert_eq!(terminal(&selected(3), scope, false), both);
+                assert_eq!(files(), both_files);
+                clean();
+
+                // Adding a second bare call to a ranked owner is still
+                // outside the admitted receipt family.
                 let two_bare = ranked.replace("u8 actual = echo(7);",
                     "u8 actual = echo(7); u8 second_actual = echo(7);");
                 fs::write(&source, two_bare).unwrap();

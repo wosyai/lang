@@ -4018,7 +4018,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let effects = ordered.failures.borrow();
             let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
             let matches_named = search.named_target == Some(target)
-                && search.named_observation.is_none() && is_integer_type(expected)
+                && search.named_observations.len() < search.named_required && is_integer_type(expected)
                 && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
             let matches_plain_scalar = search.proof_free_scalar_initializers && caller == &owner.source
                 && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
@@ -4028,9 +4028,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && signature.parameters.len() == 1 && is_integer_type(expected);
             let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
                 && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
-            // Once the mixed route spends its ordinary quota, only the
+            // Once the named route spends its ordinary quota, only the
             // pending, top-level authenticated binding calls may run.
-            if search.proof_only_continuation() && search.pending_mixed_startup_observation()
+            if search.proof_only_continuation() && search.pending_named_startup_observation()
                 && !(matches_named || matches_ranked)
             { return Err(ProjectCheck::Unsupported); }
             let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
@@ -4286,18 +4286,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let ActualCallResult::Integer(value) = result else { return Err(ProjectCheck::Unsupported); };
             let effects = ordered.failures.borrow();
             let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
-            let proof_only = trace.proof_only_continuation() && trace.pending_mixed_startup_observation();
-            let observation = if startup_ranked && trace.ranked_target == Some(target) {
-                &mut trace.ranked_observation
-            } else if startup_named && trace.named_target == Some(target) {
-                &mut trace.named_observation
-            } else { return Err(ProjectCheck::Unsupported); };
-            if observation.is_some() { return Err(ProjectCheck::Unsupported); }
-            *observation = Some(failure_search::StartupNamedObservation {
+            let proof_only = trace.proof_only_continuation() && trace.pending_named_startup_observation();
+            let observation = failure_search::StartupNamedObservation {
                 site: wosy_syntax::SourceSpan::new(ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?.clone(), at),
                 directive_position: effects.records.len(), parameter: parameter.clone(),
                 argument: (*argument).clone(), returned: value.clone(),
-            });
+            };
+            if startup_ranked && trace.ranked_target == Some(target) && trace.ranked_observation.is_none() {
+                trace.ranked_observation = Some(observation);
+            } else if startup_named && trace.named_target == Some(target) && trace.named_observations.len() < trace.named_required
+                && !trace.named_observations.iter().any(|seen| seen.site == observation.site)
+            {
+                trace.named_observations.push(observation);
+            } else { return Err(ProjectCheck::Unsupported); }
             // Capture the real typed return before stopping. Do not resume
             // further startup items or ordinary witness selection.
             if proof_only && !trace.proof_only_continuation() {
@@ -10297,16 +10298,19 @@ impl PreparedStartupAuthoredCheck {
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked_target: Option<PreparedCallable>,
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named: Option<(PreparedCallable, usize)>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked_target: Option<PreparedCallable>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if qualified { 2 } else { 1 };
-    if named_target.is_some() && project.modules.len() != count { return Err(ProjectCheck::Unsupported); }
+    if named.is_some_and(|(_, expected)| !(1..=2).contains(&expected) || project.modules.len() != count) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let startup = project.modules.get(..count).ok_or(ProjectCheck::Unsupported)?;
     let (root, ordinals) = package_startup_order(project, startup)?;
     let mut search = failure_search::StartUpSearch::new(root, cap);
     search.proof_free_scalar_initializers = proof_free_scalars.is_some();
-    search.named_target = named_target;
+    search.named_target = named.map(|(target, _)| target);
+    search.named_required = named.map_or(0, |(_, expected)| expected);
     search.named_cross_source = qualified;
     search.ranked_target = ranked_target;
     let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
@@ -10315,7 +10319,7 @@ fn run_startup_authored_path(
     );
     let mut search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || named_target.is_some() != search.named_observation.is_some()
+    if search.invalid() || search.named_observations.len() != search.named_required
         || ranked_target.is_some() != search.ranked_observation.is_some() { return Err(ProjectCheck::Unsupported); }
     let (completion, active) = match outcome {
         Ok((initialization, _)) if search.remaining() > 0 => {
@@ -10486,7 +10490,7 @@ fn run_private_guarded_context(
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
+enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
 
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
@@ -10562,22 +10566,25 @@ fn run_private_named_after_startup(
     } else { false };
     let mut invoked = None;
     for plan in &plans {
-        match incoming.get(&(plan.proof_source, plan.function.name_span)) {
+        match incoming.get(&(plan.proof_source, plan.function.name_span)).copied() {
             Some(0) => {},
-            Some(1) if invoked.is_none() && (!qualified || Some(plan.proof_source) == provider) && matches!(plan.typed.body.boundary.parameters.as_slice(),
-                [entry] if is_integer_type(&entry.ty)) => { invoked = Some(plan.target); },
+            Some(count @ (1 | 2)) if invoked.is_none() && (!qualified || Some(plan.proof_source) == provider)
+                && (count == 1 || (!qualified && ranked.is_none() && plans.len() == 1))
+                && matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty)) =>
+            { invoked = Some((plan.target, count)); },
             _ => return Err(ProjectCheck::Unsupported),
         }
     }
     // Classify only from the typed declarations and this one complete
     // incoming-edge census. No speculative run of another proof route.
-    let mode = match (qualified, ranked.is_some(), reached_rank, invoked.is_some(), plans.len()) {
-        (true, false, false, true, _) => StartupNamedMode::Qualified,
-        (false, false, false, false, 1) => StartupNamedMode::Dormant,
-        (false, false, false, true, 1) => StartupNamedMode::Invoked,
-        (false, false, false, true, 2) => StartupNamedMode::Mixed,
-        (false, true, false, true, 1) => StartupNamedMode::InvokedAndDormantRank,
-        (false, true, true, true, 1) => StartupNamedMode::InvokedAndReachedRank,
+    let mode = match (qualified, ranked.is_some(), reached_rank, invoked.map_or(0, |(_, count)| count), plans.len()) {
+        (true, false, false, 1, _) => StartupNamedMode::Qualified,
+        (false, false, false, 0, 1) => StartupNamedMode::Dormant,
+        (false, false, false, 1, 1) => StartupNamedMode::Invoked,
+        (false, false, false, 2, 1) => StartupNamedMode::RepeatedInvoked,
+        (false, false, false, 1, 2) => StartupNamedMode::Mixed,
+        (false, true, false, 1, 1) => StartupNamedMode::InvokedAndDormantRank,
+        (false, true, true, 1, 1) => StartupNamedMode::InvokedAndReachedRank,
         _ => return Err(ProjectCheck::Unsupported),
     };
     if expected.is_some_and(|expected| expected != mode) { return Err(ProjectCheck::Unsupported); }
@@ -10617,7 +10624,8 @@ fn run_private_named_after_startup(
         active = true;
     }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
-    if let Some(observed) = trace.named_observation {
+    let invoked = invoked.map(|(target, _)| target);
+    for observed in trace.named_observations {
         if observed.site.source != owner.source { return Err(ProjectCheck::Unsupported); }
         observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
             source: &observed.site.source,
@@ -15662,7 +15670,7 @@ mod tests {
                     let (project, _) = owner.prepared.parts();
                     let target = |name: &str| (0, project.modules[0].items.iter().position(|item|
                         matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap());
-                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, limit, Some(target("echo")), false,
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, limit, Some((target("echo"), 1)), false,
                         &[], None, Some(target("descend"))).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
                     assert_eq!(trace.ranked_observation.as_ref().unwrap().returned, BigInt::from(4));
@@ -15694,10 +15702,10 @@ mod tests {
                     let (project, _) = owner.prepared.parts();
                     let target = |name: &str| (0, project.modules[0].items.iter().position(|item|
                         matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap());
-                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, NonZeroUsize::MIN, Some(target("echo")),
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, NonZeroUsize::MIN, Some((target("echo"), 1)),
                         false, &[], None, Some(target("descend"))).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
-                    let bare = trace.named_observation.unwrap();
+                    let bare = trace.named_observations.into_iter().next().unwrap();
                     let rank = trace.ranked_observation.unwrap();
                     let snippet = |site: wosy_syntax::SourceSpan| &crossed[site.range.start as usize..site.range.end as usize];
                     assert_eq!((snippet(bare.site), bare.argument, bare.returned), ("echo(7)", 7.into(), 7.into()));
@@ -15874,6 +15882,37 @@ mod tests {
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 let duplicate = program.replace("%%end", "u8 second = echo(3); %%end");
                 assert!(matches!(prepare(&duplicate).search_startup_with_invoked_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                let repeated = program.replace("core.require(false,", "u8 second = echo(3); core.require(second == 4,");
+                let old = prepare(&repeated).run().unwrap();
+                for cap in [1, 3] {
+                    let limit = NonZeroUsize::new(cap).unwrap();
+                    let (report, end) = prepare(&repeated).run_private_authored_root(limit).unwrap();
+                    assert_eq!(end, Some(if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted }));
+                    assert_eq!(report.directives, old.directives[..cap.min(2)]);
+                    let [first, second] = report.diagnostics.as_slice() else { panic!("both authentic calls"); };
+                    assert_eq!(first.invocation.call, old.diagnostics[0].invocation.call);
+                    assert_eq!(second.invocation.call, old.diagnostics[1].invocation.call);
+                    assert_ne!(first.invocation.call, second.invocation.call);
+                    assert_eq!(first.invocation.arguments, second.invocation.arguments);
+                    assert_eq!(first.invocation.returned, second.invocation.returned);
+
+                    let PreparedConfiguredCheck::Named { owner, .. } = prepare(&repeated).owner else { panic!("named catalog"); };
+                    let (project, _) = owner.prepared.parts();
+                    let target = project.modules[0].items.iter().position(|item|
+                        matches!(item, ScalarItem::Function(function) if function.name == "echo")).unwrap();
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, limit, Some(((0, target), 2)),
+                        false, &[], None, None).unwrap();
+                    let expected_sites = [first.invocation.call.clone(), second.invocation.call.clone()];
+                    assert_eq!(trace.named_observations.iter().map(|entry| &entry.site).collect::<Vec<_>>(),
+                        expected_sites.iter().collect::<Vec<_>>());
+                    assert!(trace.call_paths().contains(&expected_sites[..1].to_vec()));
+                    assert_eq!(trace.call_paths().contains(&expected_sites.to_vec()), cap == 3);
+                    assert!(trace.contains_return(&expected_sites[0]));
+                    assert_eq!(trace.contains_return(&expected_sites[1]), cap == 3);
+                }
+                let third = repeated.replace("%%end", "u8 third = echo(3); %%end");
+                assert!(matches!(prepare(&third).run_private_authored_root(NonZeroUsize::MIN),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
