@@ -628,7 +628,8 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         {}
                         %%end"#, require("must not emit", 71, "must-not-create.txt"));
                     project.package("", layout, "dev", "", &source);
-                    fs::write(project.0.join("src/fallback.w"), dormant).unwrap();
+                    let deferred_owner = project.0.join("src/fallback.w");
+                    fs::write(&deferred_owner, &dormant).unwrap();
                     let old = project.run(&[scope]);
                     let refuted = scope == "--declared-package" && proof == "out != 7";
                     let expected = if early { b"first".as_slice() } else { b"".as_slice() };
@@ -650,6 +651,18 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
                         assert!(!project.output().join("must-not-create.txt").exists());
                     } else {
+                        assert!(!project.output().exists());
+                    }
+                    if !early && refuted {
+                        // The dormant initializer is not authoritative,
+                        // even when its call is well-typed in its own source.
+                        fs::write(&deferred_owner, dormant.replace("%%end", "u8 staged = fallback(8); %%end")).unwrap();
+                        let old = project.run(&[scope]);
+                        assert_eq!(old.status.code(), Some(1), "{old:?}");
+                        assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));
+                        assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 2, b"",
+                            b"wosy: check: unsupported analysis; no result published
+");
                         assert!(!project.output().exists());
                     }
                 }

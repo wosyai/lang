@@ -12056,12 +12056,18 @@ fn run_private_named_after_startup(
         } else { None }
     } else { None };
     let sources = project.initialization_order.iter().collect::<Vec<_>>();
-    let incoming = calls.owned_startup_callable_uses_with_forwarder(root, &sources,
-        plans.iter().chain(ranked.iter()).filter(|plan| dormant_target != Some(plan.target))
+    let incoming = calls.owned_startup_callable_uses_with_dormant(root, &sources,
+        plans.iter().chain(ranked.iter())
             .map(|plan| (plan.proof_source, plan.function.name_span))
             .chain(forwarder.iter().map(|(_, span, _)| (root, *span))),
         ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span)),
-        forwarder.map(|(wrapper, _, site)| (wrapper.1, site))).ok_or(ProjectCheck::Unsupported)?;
+        forwarder.map(|(wrapper, _, site)| (wrapper.1, site)), dormant.first().map(|module| &module.source))
+        .ok_or(ProjectCheck::Unsupported)?;
+    if let Some(plan) = plans.iter().find(|plan| dormant_target == Some(plan.target)) {
+        if !incoming.get(&(plan.proof_source, plan.function.name_span)).is_some_and(Vec::is_empty) {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
     let direct_ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
         .map(Vec::as_slice).ok_or(ProjectCheck::Unsupported)).transpose()?.unwrap_or_default();
     let ranked_sites = if let Some((_, span, _)) = forwarder {

@@ -7082,9 +7082,24 @@ impl ProjectCallSiteResults {
         rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
         forwarder: Option<(usize, OccurrenceOrdinal)>,
     ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
+        self.owned_startup_callable_uses_with_dormant(caller, sources, declarations, rank_self, forwarder, None)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn owned_startup_callable_uses_with_dormant<'a>(
+        &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
+        declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>,
+        rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
+        forwarder: Option<(usize, OccurrenceOrdinal)>,
+        dormant: Option<&SourceIdentity>,
+    ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
         if forwarder.is_some() && (sources.len() != 2 || rank_self.is_none()) { return None; }
         if !(1..=super::checker_flow::MAX_ACTUAL_CALL_DEPTH).contains(&sources.len())
-            || self.modules.len() != sources.len() || sources.first().copied() != Some(caller)
+            || self.modules.len() != sources.len().checked_add(usize::from(dormant.is_some()))?
+            || sources.first().copied() != Some(caller)
+            || dormant.is_some_and(|source| sources.len() != 1 || sources.contains(&source)
+                || source.project != caller.project || source.package != caller.package
+                || rank_self.is_some() || forwarder.is_some())
             || sources.iter().any(|source| source.project != caller.project || source.package != caller.package)
         { return None; }
         let source_set = sources.iter().copied().collect::<HashSet<_>>();
@@ -7101,9 +7116,14 @@ impl ProjectCallSiteResults {
                 if uses.contains_key(&(source, *declaration_span)));
         let mut work = 0;
         use super::checker_flow::charge_call_work;
+        let mut saw_dormant = false;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
-            if !source_set.contains(&module.initialization.source) { return None; }
+            if !source_set.contains(&module.initialization.source) {
+                if dormant != Some(&module.initialization.source) || std::mem::replace(&mut saw_dormant, true) {
+                    return None;
+                }
+            }
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
             charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
             if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }
@@ -7145,6 +7165,7 @@ impl ProjectCallSiteResults {
                 }
             }
         }
+        if saw_dormant != dormant.is_some() { return None; }
         Some(startup_uses)
     }
 
