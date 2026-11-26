@@ -14,8 +14,8 @@ use wosy_protocol::{
     BuildDiagnosticResponse, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
     BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
     write_encoded_session_frame, BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
-    OrdinaryLlvmProjection, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_PROJECTION_VERSION,
+    OrdinaryLlvmBuilderWitness, OrdinaryLlvmProjection, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 
 type Reply = BuildSessionReply<Diagnostic>;
@@ -45,6 +45,7 @@ struct ProjectionScope {
 struct OrdinaryLlvmScope {
     limits: BaseCstAdmissionLimits,
     bytes: usize,
+    version: u16,
 }
 
 enum Opening {
@@ -61,13 +62,13 @@ enum Opened<'a> {
 enum Operation<'a> {
     Analyze(BuildDiagnosticRequest),
     Project(&'a ProjectionScope, BaseCstProposal),
-    OrdinaryLlvm(OrdinaryLlvmScope, String),
+    OrdinaryLlvm(OrdinaryLlvmScope, u16, String),
 }
 
 enum Completed {
     Analysis(BuildDiagnosticResponse<Diagnostic>),
     Projection(PreparedBaseDeclarations),
-    OrdinaryLlvm(RootedLlvmProjection),
+    OrdinaryLlvm(u16, RootedLlvmProjection, Option<OrdinaryLlvmBuilderWitness>),
 }
 
 impl SourceStorageWorker {
@@ -113,9 +114,25 @@ impl SourceStorageWorker {
         &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>,
         limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
-        let ordinary_llvm = Some(OrdinaryLlvmScope { limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES) });
+        let ordinary_llvm = Some(OrdinaryLlvmScope {
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version: ORDINARY_LLVM_PROJECTION_VERSION,
+        });
         self.serve_selected_session(stream, selected, lifetime,
             Opening::Recoverable { replay, limits, ordinary_llvm }, None).await
+    }
+
+    /// The trusted local activator owns and binds this stream, selects a
+    /// known source out of band, and never supplies replay for this path.
+    /// The v2 builder witness is not an OS peer authentication mechanism.
+    pub async fn serve_known_ordinary_builder_input_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        let ordinary_llvm = Some(OrdinaryLlvmScope {
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version: ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+        });
+        self.serve_selected_session(stream, selected, lifetime,
+            Opening::Recoverable { replay: None, limits, ordinary_llvm }, None).await
     }
 
     /// Only the NativeKnown host passes a non-renewable authority cut.
@@ -267,12 +284,11 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 continue;
             }
             Some(Command { id, request: Request::ProjectOrdinaryLlvm { version, profile } }) => {
-                if let Some(scope) = ordinary_llvm.filter(|_| {
-                    version == ORDINARY_LLVM_PROJECTION_VERSION && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES
-                }) {
-                    (id, Operation::OrdinaryLlvm(scope, profile))
+                let supported = matches!(version, ORDINARY_LLVM_PROJECTION_VERSION | ORDINARY_LLVM_BUILDER_INPUT_VERSION);
+                if let Some(scope) = ordinary_llvm.filter(|scope| scope.version == version && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES) {
+                    (id, Operation::OrdinaryLlvm(scope, version, profile))
                 } else {
-                    let reason = if version != ORDINARY_LLVM_PROJECTION_VERSION { Refusal::UnsupportedVersion }
+                    let reason = if !supported { Refusal::UnsupportedVersion }
                         else { Refusal::OrdinaryLlvmUnavailable };
                     if !send(output, deadline, cutoff, id, Reply::Refused { reason }).await? {
                         return Ok(Close::Deadline);
@@ -307,8 +323,9 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Operation::Project(scope, proposal) => session.project_base_declarations(
                 scope.binding.clone(), proposal, scope.admission_limits, scope.declaration_bytes,
             ).await.map(Completed::Projection),
-            Operation::OrdinaryLlvm(scope, profile) =>
-                session.project_ordinary_llvm_framed(profile, scope.limits, scope.bytes).await.map(Completed::OrdinaryLlvm),
+            Operation::OrdinaryLlvm(scope, version, profile) => session.project_ordinary_llvm_framed(
+                profile, scope.limits, scope.bytes, version == ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+            ).await.map(|(projection, witness)| Completed::OrdinaryLlvm(version, projection, witness)),
         }
     };
     tokio::pin!(job);
@@ -333,14 +350,14 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         *owner = Some(prepared);
                         Reply::BaseDeclarationProjection { projection }
                     }
-                    Ok(Completed::OrdinaryLlvm(RootedLlvmProjection::Emitted(partition))) =>
+                    Ok(Completed::OrdinaryLlvm(version, RootedLlvmProjection::Emitted(partition), builder)) =>
                         Reply::OrdinaryLlvmProjection { projection: OrdinaryLlvmProjection {
-                            version: ORDINARY_LLVM_PROJECTION_VERSION,
+                            version, builder,
                             source_root: partition.source_root, profile: partition.profile,
                             compiler_image: partition.compiler_image, digest: partition.digest,
                             partition: String::from_utf8(partition.bytes)?,
                         }},
-                    Ok(Completed::OrdinaryLlvm(_)) => Reply::Refused { reason: Refusal::OrdinaryLlvmUnavailable },
+                    Ok(Completed::OrdinaryLlvm(..)) => Reply::Refused { reason: Refusal::OrdinaryLlvmUnavailable },
                     Err(error) => {
                         if matches!(error.downcast_ref::<BuildRequestRejection>(), Some(BuildRequestRejection::Expired)) {
                             return Ok(Some(Close::Deadline));

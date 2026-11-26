@@ -16,7 +16,7 @@ use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, prepare_scalar_project, Diagnostic,
     ScalarArtifactEmission, ScalarBuildValidation, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_protocol::{source_preparation_parts, NodeId, ParserPolicy};
+use wosy_protocol::{source_preparation_parts, NodeId, OrdinaryLlvmBuilderWitness, ParserPolicy};
 use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, CstNode, SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +106,8 @@ pub(super) struct ScalarPlan {
     root: NodeId,
     profile: String,
     exports: Option<BTreeMap<String, String>>,
+    backend: String,
+    output: String,
     layout: ScalarTargetLayout,
     parser: ParserPolicy,
     identity: RootedLlvmIdentity,
@@ -230,15 +232,29 @@ impl SourceStore {
     /// newly parsed grammar evidence is not installed by this request.
     pub(super) fn project_framed_authored_ll(
         &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits,
-        output_bytes: usize, check_active: impl Fn() -> Result<()>,
-    ) -> Result<RootedLlvmProjection> {
+        output_bytes: usize, builder_inputs: bool, check_active: impl Fn() -> Result<()>,
+    ) -> Result<(RootedLlvmProjection, Option<OrdinaryLlvmBuilderWitness>)> {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let answer = self.project_ll(&tx, grant.root, profile, limits, output_bytes, RootedLlvmIdentity::Authored,
-            &mut ProjectionEvidence::default())?;
+        let (answer, builder) = match self.plan_scalar(&tx, grant.root, profile, limits, RootedLlvmIdentity::Authored)? {
+            ScalarPlanning::Unsupported(reason) => (RootedLlvmProjection::Unsupported(reason), None),
+            ScalarPlanning::Ready(plan) => {
+                let witness = if builder_inputs {
+                    let runtime = wosy_compiler::core_runtime(&plan.backend, &plan.output)?;
+                    Some(OrdinaryLlvmBuilderWitness {
+                        compiler: wosy_compiler::COMPILER_IDENTITY.into(),
+                        llvm_adapter: wosy_compiler::LLVM_ADAPTER_IDENTITY.into(),
+                        linked_llvm: wosy_compiler::linked_llvm_version(),
+                        backend: plan.backend.clone(), output: plan.output.clone(),
+                        runtime_digest: NodeId(*blake3::hash(runtime.as_bytes()).as_bytes()),
+                    })
+                } else { None };
+                (self.project_planned_ll(&tx, plan, limits, output_bytes, None, &mut ProjectionEvidence::default())?, witness)
+            }
+        };
         lease.finish_current(check_active).ok_or(BuildRequestRejection::Expired)??;
-        Ok(answer)
+        Ok((answer, builder))
     }
 
     fn finish_ll(
@@ -323,7 +339,8 @@ impl SourceStore {
         });
         let layout = ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment };
         Ok(ScalarPlanning::Ready(ScalarPlan {
-            root, profile, exports: artifact.exports, layout, parser: config.parser, identity, image, workspace, order, receipt_key,
+            root, profile, exports: artifact.exports, backend: artifact.backend, output: artifact.output, layout,
+            parser: config.parser, identity, image, workspace, order, receipt_key,
         }))
     }
 

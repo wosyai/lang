@@ -19,9 +19,11 @@ use wosy_compiler::{
     parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
     LlvmPartition, ParseOutput, ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
+use wosy_cli::artifact_inputs::{compiler_identity, llvm_identity, pending_builder_inputs,
+    project_configuration_identity, BuilderInputPaths};
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,
-    ArtifactIdentity, ContentRevision, PackageRelativePath, ProjectConfiguration, ProjectContext,
+    ContentRevision, PackageRelativePath, ProjectConfiguration, ProjectContext,
     SourceIdentity as ProjectSourceIdentity, SourceObservation,
 };
 #[cfg(test)]
@@ -209,61 +211,27 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         target_layout,
         artifact_profile.exports.as_ref(),
     )?;
-    let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
-    let output_dir = root
-        .join(".wosy/artifacts")
-        .join(&target_name)
-        .join(profile)
-        .join(artifact_name);
-    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
-    let partition_path = output_dir.join("partition.ll");
-    let llvm_input_identity = write_llvm_partition(&partition_path, &llvm)?;
+    let paths = BuilderInputPaths::new(root.join(".wosy/artifacts")
+        .join(&target_name).join(profile).join(artifact_name));
+    fs::create_dir_all(&paths.output).map_err(|error| error.to_string())?;
+    let llvm_input_identity = write_llvm_partition(&paths.partition, &llvm)?;
     drop(llvm);
-    let runtime_path = output_dir.join("runtime.ll");
     let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
-    fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
-    let identity = artifact_identity(
-        configuration_identity,
-        &configuration,
-        &target_name,
-        profile,
-        artifact,
-        artifact_profile,
-        source_identity,
-        llvm_input_identity,
-    )?;
-    let executable = output_dir.join("main");
-    let pending_manifest = output_dir.join("artifact-manifest.pending.json");
-    let pending = wosy_project::ArtifactManifest {
-        identity,
-        executable,
-        source_observations,
-    };
-    let pending_bytes = serde_json::to_vec_pretty(&pending).map_err(|error| error.to_string())?;
-    fs::write(&pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
-    let builder = configuration
-        .builders
-        .get(&artifact_profile.builder)
-        .ok_or_else(|| format!("builder {} is missing", artifact_profile.builder))?;
-    invoke_direct(
-        &root,
-        &builder.command,
-        &builder.args,
-        &[
-            partition_path.to_string_lossy().as_ref(),
-            output_dir.to_string_lossy().as_ref(),
-            pending_manifest.to_string_lossy().as_ref(),
-            runtime_path.to_string_lossy().as_ref(),
-        ],
-    )?;
+    fs::write(&paths.runtime, runtime).map_err(|error| error.to_string())?;
+    let inputs = pending_builder_inputs(&configuration, configuration_identity, &target_name, profile,
+        artifact, artifact_profile, source_observations, llvm_input_identity, &paths.output)?;
+    let pending_bytes = serde_json::to_vec_pretty(&inputs.manifest).map_err(|error| error.to_string())?;
+    fs::write(&paths.pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
+    let arguments = paths.arguments();
+    invoke_direct(&root, &inputs.builder.command, &inputs.builder.args, &arguments.each_ref().map(|arg| arg.as_ref()))?;
     let wosy_project::ArtifactManifest {
         identity,
         executable,
         source_observations,
-    } = pending;
-    publish_artifact(&output_dir, executable, identity, source_observations)?;
-    fs::remove_file(pending_manifest).map_err(|error| error.to_string())?;
+    } = inputs.manifest;
+    publish_artifact(&paths.output, executable, identity, source_observations)?;
+    fs::remove_file(paths.pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -293,62 +261,6 @@ fn write_llvm_partition(path: &std::path::Path, llvm: &LlvmPartition) -> Result<
     llvm.write_text(&mut writer).map_err(|error| error.to_string())?;
     writer.flush().map_err(|error| error.to_string())?;
     Ok(writer.get_ref().identity.finalize().to_hex().to_string())
-}
-
-fn project_configuration_identity(
-    manifest: &[u8],
-    configuration: &ProjectConfiguration,
-) -> Result<String, String> {
-    let manifest_identity = blake3::hash(manifest);
-    // A manifest that declared source_root used to route its own namespaces
-    // from the project root. Do not accept a pre-change artifact that observed
-    // those other files, even if they still exist with the original bytes.
-    let manifest_identity = if configuration.module_source_root.is_some() {
-        blake3::Hasher::new()
-            .update(b"wosy-selected-package-namespace-root-v1\0")
-            .update(manifest_identity.as_bytes())
-            .finalize()
-    } else {
-        manifest_identity
-    };
-    if configuration.resolved_packages.is_empty() {
-        return Ok(manifest_identity.to_hex().to_string());
-    }
-    fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"wosy-package-closure-v2\0");
-    hasher.update(manifest_identity.as_bytes());
-    hasher.update(&(configuration.resolved_packages.len() as u64).to_le_bytes());
-    for (name, package) in &configuration.resolved_packages {
-        let source_root: std::path::PathBuf = package.identity.path.as_path().components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(name) => Some(name),
-                _ => None,
-            }).collect();
-        field(&mut hasher, name.as_bytes());
-        field(&mut hasher, source_root.as_os_str().as_encoded_bytes());
-        if let Some(pin) = &package.git_pin_identity {
-            field(&mut hasher, b"git");
-            field(&mut hasher, pin.as_bytes());
-            let patches = package.patch_stack_id
-                .ok_or_else(|| format!("Git dependency {name} has no verified patch stack"))?;
-            field(&mut hasher, patches.as_bytes());
-        } else {
-            field(&mut hasher, b"local");
-            let local = package.local_root_identity.as_ref()
-                .ok_or_else(|| format!("local dependency {name} has no canonical path"))?;
-            field(&mut hasher, local.as_os_str().as_encoded_bytes());
-        }
-        hasher.update(&(package.dependencies.len() as u64).to_le_bytes());
-        for dependency in &package.dependencies {
-            field(&mut hasher, dependency.as_bytes());
-        }
-    }
-    let identity = hasher.finalize();
-    Ok(identity.to_hex().to_string())
 }
 
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
@@ -553,14 +465,7 @@ fn compile_project(
         ScalarArtifactEmission::WasmRootExports(..) => {}
     });
     let llvm = emission.emit(&validation)?;
-    let source_observations = graph
-        .nodes
-        .into_iter()
-        .map(|node| SourceObservation {
-            source: node.source,
-            content_revision: node.content_revision,
-        })
-        .collect();
+    let source_observations = wosy_cli::project_sources::observations(graph);
     Ok((llvm, source_observations))
 }
 
@@ -750,47 +655,6 @@ fn render_project_diagnostics(
             texts.get(&key).map(String::as_str)
         });
     }
-}
-
-fn artifact_identity(
-    configuration_identity: String,
-    configuration: &ProjectConfiguration,
-    target: &str,
-    profile: &str,
-    artifact: &wosy_project::ArtifactConfig,
-    artifact_profile: &wosy_project::ArtifactProfile,
-    source_identity: String,
-    llvm_input_identity: String,
-) -> Result<ArtifactIdentity, String> {
-    let builder = configuration
-        .builders
-        .get(&artifact_profile.builder)
-        .ok_or_else(|| format!("builder {} is missing", artifact_profile.builder))?;
-    let runner = configuration
-        .runners
-        .get(&artifact_profile.run_runner)
-        .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
-    Ok(ArtifactIdentity {
-        source_identity,
-        configuration_identity,
-        artifact_identity: format!("{target}:{profile}:{}", artifact.artifact),
-        backend: artifact_profile.backend.clone(),
-        output: artifact_profile.output.clone(),
-        builder_identity: serde_json::to_string(builder).map_err(|error| error.to_string())?,
-        runner_identity: serde_json::to_string(runner).map_err(|error| error.to_string())?,
-        llvm_input_identity,
-        compiler_identity: compiler_identity(),
-        llvm_identity: llvm_identity(),
-        builder_toolchain_identity: builder.toolchain_identity.clone(),
-    })
-}
-
-fn compiler_identity() -> String {
-    wosy_compiler::COMPILER_IDENTITY.to_owned()
-}
-
-fn llvm_identity() -> String {
-    "inkwell-0.10.0+llvm-sys-181.3.0".to_owned()
 }
 
 fn invoke_direct(

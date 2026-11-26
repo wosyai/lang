@@ -14,12 +14,19 @@ mod build_diagnostics;
 pub use build_diagnostics::{
     BaseDeclarationConnectionId, BaseDeclarationProjection, BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest,
     BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
-    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, OrdinaryLlvmProjection,
+    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, OrdinaryLlvmBuilderWitness, OrdinaryLlvmProjection,
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, ORDINARY_LLVM_PROJECTION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
 pub mod native_diagnostics;
+
+/// Digest exactly the independently authorized local compiler image bytes.
+pub fn compiler_image_digest(reader: impl std::io::Read) -> std::io::Result<NodeId> {
+    let mut hasher = blake3::Hasher::new_derive_key("wosy local derivation executable image v1");
+    hasher.update_reader(reader)?;
+    Ok(NodeId(*hasher.finalize().as_bytes()))
+}
 
 mod session_frame;
 pub use session_frame::{encode_session_frame, write_encoded_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};

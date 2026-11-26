@@ -11,7 +11,7 @@ use wosy_compiler::Diagnostic;
 use wosy_project::packages::InstalledGitBase;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
-    BuildSourceSelection, Delta, NodeId, BUILD_DIAGNOSTIC_VERSION,
+    BuildSourceSelection, Delta, NodeId, OrdinaryLlvmBuilderWitness, BUILD_DIAGNOSTIC_VERSION,
 };
 
 /// Bound to one published source selected by a trusted local adapter. No
@@ -174,14 +174,14 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub(super) async fn project_ordinary_llvm_framed(
-        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize,
-    ) -> Result<RootedLlvmProjection> {
+        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize, builder_inputs: bool,
+    ) -> Result<(RootedLlvmProjection, Option<OrdinaryLlvmBuilderWitness>)> {
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
         let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
         self.worker.spawn_reserved_query(slot, Some(cancellation.clone()), move |worker| async move {
             worker.phase(None, move |store| store.project_framed_authored_ll(&lease, profile, limits,
-                output_bytes, || QueryCancellation::check(Some(&cancellation)))).await
+                output_bytes, builder_inputs, || QueryCancellation::check(Some(&cancellation)))).await
         }).await?
     }
 

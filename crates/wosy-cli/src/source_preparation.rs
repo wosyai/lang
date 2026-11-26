@@ -1,6 +1,6 @@
 //! Prepare base source for the incremental store. Build and Check do not use
 //! this primitive yet. The resolver and parser are the ordinary compiler paths.
-use crate::project_sources::{self, LiveSourceReader};
+use crate::{artifact_inputs::{project_configuration_identity, ObservedBuilderBasis}, project_sources::{self, LiveSourceReader}};
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -118,8 +118,8 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
 pub(crate) fn prepare_with_files(
     root: &Path, target: Option<&str>, base: Option<&Files>,
 ) -> Result<(PreparedSources, Files), String> {
-    match prepare_from_observation(root, target, base, None) {
-        Ok(prepared) => Ok(prepared),
+    match prepare_from_observation(root, target, base, None, None) {
+        Ok((prepared, files, _)) => Ok((prepared, files)),
         Err(ObservationError::Source(error)) => Err(error),
         Err(ObservationError::LiveRead(_)) => unreachable!("fresh preparation uses the ordinary reader"),
         Err(ObservationError::Changed) => unreachable!("preparation accepts fresh ordinary source"),
@@ -128,12 +128,17 @@ pub(crate) fn prepare_with_files(
 
 /// Use the ordinary locator and canonical source-root constructor. A
 /// different/missing authored revision ends the probe without parsing it.
-pub(crate) fn matches_live_source(
+pub(crate) struct LiveSourceVerification {
+    pub builder: Option<ObservedBuilderBasis>,
+}
+
+pub(crate) fn verify_live_source(
     root: &Path, target: &str, base: &Files, selected: NodeId, reader: LiveSourceReader,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    match prepare_from_observation(root, Some(target), Some(base), Some(reader)) {
-        Ok((observed, _)) => Ok(observed.root == selected),
-        Err(ObservationError::Changed) => Ok(false),
+    observe_builder: bool,
+) -> Result<Option<LiveSourceVerification>, Box<dyn std::error::Error + Send + Sync>> {
+    match prepare_from_observation(root, Some(target), Some(base), Some(reader), observe_builder.then_some(selected)) {
+        Ok((observed, _, builder)) if observed.root == selected => Ok(Some(LiveSourceVerification { builder })),
+        Ok(_) | Err(ObservationError::Changed) => Ok(None),
         Err(ObservationError::Source(error)) => Err(error.into()),
         Err(ObservationError::LiveRead(error)) => Err(error.into()),
     }
@@ -155,7 +160,8 @@ impl From<&str> for ObservationError {
 
 fn prepare_from_observation(
     root: &Path, target: Option<&str>, base: Option<&Files>, mut live: Option<LiveSourceReader>,
-) -> Result<(PreparedSources, Files), ObservationError> {
+    builder_source: Option<NodeId>,
+) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>), ObservationError> {
     let check_time = |live: &Option<LiveSourceReader>| {
         live.as_ref().map_or(Ok(()), LiveSourceReader::check_time).map_err(ObservationError::LiveRead)
     };
@@ -255,5 +261,13 @@ fn prepare_from_observation(
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
     let root = delta.add(Kind::SourcePreparation, schema.to_vec(), roots);
-    Ok((PreparedSources { root, delta, parsed, reused }, files))
+    let builder = if builder_source == Some(root) {
+        Some(ObservedBuilderBasis {
+            project,
+            configuration_identity: project_configuration_identity(manifest.raw().as_bytes(), &cfg)?,
+            configuration: cfg,
+            source: project_sources::observations(graph),
+        })
+    } else { None };
+    Ok((PreparedSources { root, delta, parsed, reused }, files, builder))
 }

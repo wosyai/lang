@@ -33,6 +33,9 @@ pub use scalar::{
 mod llvm;
 
 pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VERSION"));
+pub const LLVM_ADAPTER_IDENTITY: &str = "inkwell-0.10.0+llvm-sys-181.3.0";
+
+pub fn linked_llvm_version() -> (u32, u32, u32) { inkwell::support::get_llvm_version() }
 
 pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String> {
     match (backend, output) {

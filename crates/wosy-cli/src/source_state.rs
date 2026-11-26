@@ -19,7 +19,7 @@ mod pin_reconciliation;
 pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use diagnostic_report::{
-    AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryLlvm,
+    AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryBuilderInputs, AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer,
     ProjectDiagnosticExchange, RootedDiagnosticReport,
 };
 pub use pins::{LocalSourcePin, PinnedSourceReplay};

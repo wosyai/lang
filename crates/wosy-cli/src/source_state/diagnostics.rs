@@ -8,7 +8,7 @@ use wosy_protocol::{
     encode_session_frame, write_encoded_session_frame, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSessionCommand,
     BuildSessionCommandId, BuildSessionRefusal, BuildSessionReply, BuildSessionRequest,
     BuildSessionResponse, BuildSourceSelection, OrdinaryLlvmProjection, SessionFrameReader, BUILD_DIAGNOSTIC_VERSION,
-    BUILD_RECONCILIATION_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
+    BUILD_RECONCILIATION_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
 };
 
 #[derive(Clone)]
@@ -132,21 +132,24 @@ impl CapturedBuildDiagnostics {
         Ok(response)
     }
 
-    pub(super) fn ordinary_llvm_request(&self) -> BuildSessionRequest {
+    pub(super) fn ordinary_llvm_request(&self, version: u16) -> BuildSessionRequest {
         BuildSessionRequest::ProjectOrdinaryLlvm {
-            version: ORDINARY_LLVM_PROJECTION_VERSION, profile: self.profile.clone(),
+            version, profile: self.profile.clone(),
         }
     }
 
     pub(super) fn accept_ordinary_llvm(
-        &self, reply: BuildSessionReply<Diagnostic>, max_bytes: usize,
+        &self, reply: BuildSessionReply<Diagnostic>, version: u16, max_bytes: usize,
     ) -> Result<OrdinaryLlvmProjection> {
         let BuildSessionReply::OrdinaryLlvmProjection { projection } = reply else {
             return Err("ordinary LLVM request did not receive a projection".into());
         };
-        if projection.version != ORDINARY_LLVM_PROJECTION_VERSION || projection.source_root != self.selection().root
+        if projection.version != version || projection.source_root != self.selection().root
             || projection.profile != self.profile {
             return Err("ordinary LLVM reply did not match the captured source and profile".into());
+        }
+        if projection.builder.is_some() != (version == ORDINARY_LLVM_BUILDER_INPUT_VERSION) {
+            return Err("ordinary LLVM reply has different versioned builder evidence".into());
         }
         if projection.partition.len() > max_bytes {
             return Err("ordinary LLVM partition exceeds the client byte budget".into());

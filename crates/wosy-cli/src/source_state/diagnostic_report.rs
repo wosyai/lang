@@ -4,18 +4,23 @@ use super::{
     checked_file_key, load_usage, read_selection, AcknowledgedSourceGeneration, CapturedBuildDiagnostics, DiagnosticExchange,
     RequiredSourceReplay, Result, SourceReplay, SqliteSourceState, StoredNodes,
 };
-use crate::{project_sources::LiveSourceReader, source_preparation::matches_live_source};
+use crate::{
+    artifact_inputs::{pending_builder_inputs, BuilderInputPaths, ObservedBuilderBasis, PendingBuilderInputs},
+    project_sources::LiveSourceReader, source_preparation::verify_live_source,
+};
 use codespan_reporting::term::termcolor::WriteColor;
 use rusqlite::TransactionBehavior;
-use std::{collections::{BTreeMap, HashMap}, future::{poll_fn, Future}, pin::pin, task::Poll, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, fs::File, future::{poll_fn, Future}, io::Seek, path::{Path, PathBuf}, pin::pin,
+    task::Poll, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 use wosy_compiler::Diagnostic;
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{
     walk_cst, BuildDiagnosticResponse, BuildSessionRefusal, CstEvent, CstExpansionBudget,
-    BuildSessionReply, BuildSessionRequest, BuildSourceSelection, FileEntry, FileKey, OrdinaryLlvmProjection,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES,
+    BuildSessionReply, BuildSessionRequest, BuildSourceSelection, FileEntry, FileKey, NodeId, OrdinaryLlvmProjection,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+    ORDINARY_LLVM_PROJECTION_VERSION,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -50,14 +55,52 @@ impl AcknowledgedLlvmPartition {
     pub fn projection(&self) -> &OrdinaryLlvmProjection { &self.projection }
 }
 
-pub enum AcknowledgedOrdinaryLlvm {
+pub enum AcknowledgedOrdinaryLlvm<T = AcknowledgedLlvmPartition> {
     NotAcknowledged,
     StaleSelection,
     WorkspaceChanged,
     ProfileNotSelected,
     ReplayNotAccepted,
     Refused(BuildSessionRefusal),
-    Partition(AcknowledgedLlvmPartition),
+    Partition(T),
+}
+
+/// Expected bytes of the executable already opened by the trusted local
+/// activator. No reply field can create it. This hash does not authenticate
+/// an OS peer or associate an arbitrary stream with that executable.
+pub struct AuthorizedOrdinaryBuilderPeer(NodeId);
+
+impl AuthorizedOrdinaryBuilderPeer {
+    pub fn from_open_executable(mut file: File) -> Result<Self> {
+        if !file.metadata()?.is_file() { return Err("ordinary builder peer needs a regular executable file".into()); }
+        file.rewind()?;
+        Ok(Self(wosy_protocol::compiler_image_digest(file)?))
+    }
+}
+
+/// Exact pending ordinary no-cache builder inputs. This type deliberately
+/// has no write, spawn, artifact selection or publication method.
+pub struct AcknowledgedOrdinaryBuilderInputs {
+    source: AcknowledgedSourceGeneration,
+    project: PathBuf,
+    paths: BuilderInputPaths,
+    inputs: PendingBuilderInputs,
+    partition: String,
+    runtime: &'static str,
+}
+
+impl AcknowledgedOrdinaryBuilderInputs {
+    pub fn source(&self) -> &AcknowledgedSourceGeneration { &self.source }
+    pub fn project(&self) -> &Path { &self.project }
+    pub fn paths(&self) -> &BuilderInputPaths { &self.paths }
+    pub fn inputs(&self) -> &PendingBuilderInputs { &self.inputs }
+    pub fn partition(&self) -> &str { &self.partition }
+    pub fn runtime(&self) -> &'static str { self.runtime }
+}
+
+struct LiveCapture {
+    captured: CapturedBuildDiagnostics,
+    builder: Option<ObservedBuilderBasis>,
 }
 
 enum LiveCaptureRefusal { NotAcknowledged, StaleSelection, WorkspaceChanged, ProfileNotSelected }
@@ -73,7 +116,7 @@ impl From<LiveCaptureRefusal> for AcknowledgedBuildDiagnostics {
     }
 }
 
-impl From<LiveCaptureRefusal> for AcknowledgedOrdinaryLlvm {
+impl<T> From<LiveCaptureRefusal> for AcknowledgedOrdinaryLlvm<T> {
     fn from(refusal: LiveCaptureRefusal) -> Self {
         match refusal {
             LiveCaptureRefusal::NotAcknowledged => Self::NotAcknowledged,
@@ -88,6 +131,12 @@ enum Recovery {
     LocalAdapter,
     #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
     NativeKnown,
+}
+
+#[derive(Clone, Copy)]
+enum OrdinaryLlvmMode {
+    Projection,
+    KnownBuilderInputs,
 }
 
 impl SqliteSourceState {
@@ -147,8 +196,8 @@ impl SqliteSourceState {
         Stream: AsyncRead + AsyncWrite + Unpin + 'static,
     {
         let deadline = diagnostic_deadline(timeout)?;
-        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
-            Ok(capture) => capture,
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes, false)? {
+            Ok(capture) => capture.captured,
             Err(outcome) => return Ok(outcome.into()),
         };
         self.diagnostics_for_capture(captured, deadline, budget, open, Recovery::LocalAdapter).await
@@ -164,8 +213,8 @@ impl SqliteSourceState {
         max_authored_source_bytes: usize, budget: CstExpansionBudget,
     ) -> Result<AcknowledgedBuildDiagnostics> {
         let deadline = diagnostic_deadline(timeout)?;
-        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
-            Ok(capture) => capture,
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes, false)? {
+            Ok(capture) => capture.captured,
             Err(outcome) => return Ok(outcome.into()),
         };
         self.diagnostics_for_capture(captured, deadline, budget, |_, _| async move {
@@ -189,35 +238,82 @@ impl SqliteSourceState {
         Opening: Future<Output = Result<Stream>>,
         Stream: AsyncRead + AsyncWrite + Unpin + 'static,
     {
-        use AcknowledgedOrdinaryLlvm as Outcome;
-        if profile.len() > MAX_ORDINARY_LLVM_PROFILE_BYTES { return Err("ordinary LLVM profile exceeds the byte budget".into()); }
-        let deadline = diagnostic_deadline(timeout)?;
-        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes, false)? {
+            Ok(capture) => capture.captured,
+            Err(outcome) => return Ok(outcome.into()),
+        };
+        self.live_partition_for_capture(captured, deadline, max_partition_bytes, OrdinaryLlvmMode::Projection,
+            open, |captured, projection| Ok(AcknowledgedLlvmPartition { captured, projection }),
+        ).await
+    }
+
+    /// Plan the exact ordinary builder inputs without writing, invoking or
+    /// caching artifacts. The trusted local activator binds the dedicated
+    /// stream to the executable it independently expects. The image
+    /// comparison checks consistency, not OS peer authentication. A
+    /// missing known root is refused without preparing or sending replay.
+    /// The local manifest, canonical graph and build/runtime choices come
+    /// only from the same verified live source cut. This is not an
+    /// ArtifactKey, and does not freeze builder files, environment or mounts.
+    pub async fn live_ordinary_builder_inputs<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        max_partition_bytes: usize, expected_peer: &AuthorizedOrdinaryBuilderPeer, output: PathBuf, open: Open,
+    ) -> Result<AcknowledgedOrdinaryLlvm<AcknowledgedOrdinaryBuilderInputs>>
+    where
+        Open: FnMut(BuildSourceSelection) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let LiveCapture { captured, builder } = match self.capture_live(target, profile, deadline, max_authored_source_bytes, true)? {
             Ok(capture) => capture,
             Err(outcome) => return Ok(outcome.into()),
         };
+        let builder = builder.ok_or("current source lacks an ordinary builder observation")?;
+        let mut open = open;
+        self.live_partition_for_capture(captured, deadline, max_partition_bytes, OrdinaryLlvmMode::KnownBuilderInputs,
+            |selected, _| open(selected), |source, projection| bind_builder_inputs(source, builder, projection, expected_peer.0, output),
+        ).await
+    }
+
+    async fn live_partition_for_capture<Open, Opening, Stream, Answer>(
+        &mut self, captured: CapturedBuildDiagnostics, deadline: Instant, max_partition_bytes: usize,
+        mode: OrdinaryLlvmMode, open: Open, bind: impl FnOnce(AcknowledgedSourceGeneration, OrdinaryLlvmProjection) -> Result<Answer>,
+    ) -> Result<AcknowledgedOrdinaryLlvm<Answer>>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        use AcknowledgedOrdinaryLlvm as Outcome;
         let output = max_partition_bytes.min(MAX_SESSION_FRAME_BYTES);
-        let answer = self.exchange_for_capture(&captured, deadline, open, true,
-            CapturedBuildDiagnostics::ordinary_llvm_request,
-            |capture, reply| capture.accept_ordinary_llvm(reply, output),
+        let (version, allow_replay) = match mode {
+            OrdinaryLlvmMode::Projection => (ORDINARY_LLVM_PROJECTION_VERSION, true),
+            OrdinaryLlvmMode::KnownBuilderInputs => (ORDINARY_LLVM_BUILDER_INPUT_VERSION, false),
+        };
+        let answer = self.exchange_for_capture(&captured, deadline, open, allow_replay,
+            |capture| capture.ordinary_llvm_request(version),
+            |capture, reply| capture.accept_ordinary_llvm(reply, version, output),
         ).await?;
         require_diagnostic_time(deadline)?;
-        let current = captured.is_current(self)?;
-        require_diagnostic_time(deadline)?;
-        if !current { return Ok(Outcome::StaleSelection); }
-        Ok(match answer {
+        let source = captured.source.clone();
+        let answer = match answer {
             CommandExchange::StaleSelection => Outcome::StaleSelection,
             CommandExchange::ReplayRequired(_) => Outcome::ReplayNotAccepted,
             CommandExchange::Refused(reason) => Outcome::Refused(reason),
-            CommandExchange::Answer(projection) => Outcome::Partition(AcknowledgedLlvmPartition {
-                captured: captured.source, projection,
-            }),
-        })
+            CommandExchange::Answer(projection) => Outcome::Partition(bind(source, projection)?),
+        };
+        let current = captured.is_current(self)?;
+        require_diagnostic_time(deadline)?;
+        if !current { return Ok(Outcome::StaleSelection); }
+        Ok(answer)
     }
 
     fn capture_live(
         &mut self, target: &str, profile: &str, deadline: Instant, max_authored_source_bytes: usize,
-    ) -> Result<std::result::Result<CapturedBuildDiagnostics, LiveCaptureRefusal>> {
+        observe_builder: bool,
+    ) -> Result<std::result::Result<LiveCapture, LiveCaptureRefusal>> {
         use LiveCaptureRefusal as Outcome;
         require_diagnostic_time(deadline)?;
         let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
@@ -244,14 +340,13 @@ impl SqliteSourceState {
             (files, profile_selected)
         };
         require_diagnostic_time(deadline)?;
-        let probe = matches_live_source(&self.project, target, &files, selected.root,
-            LiveSourceReader::new(max_authored_source_bytes, deadline));
+        let probe = verify_live_source(&self.project, target, &files, selected.root,
+            LiveSourceReader::new(max_authored_source_bytes, deadline), observe_builder && profile_selected);
         require_diagnostic_time(deadline)?;
-        let matches = probe?;
-        if !matches { return Ok(Err(Outcome::WorkspaceChanged)); }
+        let Some(verified) = probe? else { return Ok(Err(Outcome::WorkspaceChanged)); };
         if !captured.is_current(self)? { return Ok(Err(Outcome::StaleSelection)); }
         if !profile_selected { return Ok(Err(Outcome::ProfileNotSelected)); }
-        Ok(Ok(captured))
+        Ok(Ok(LiveCapture { captured, builder: verified.builder }))
     }
 
     async fn diagnostics_for_capture<Open, Opening, Stream>(
@@ -303,6 +398,35 @@ impl SqliteSourceState {
             captured.converse_command(self, stream, deadline, command, verify).await
         }).await
     }
+}
+
+fn llvm_deadline(profile: &str, timeout: Duration) -> Result<Instant> {
+    if profile.len() > MAX_ORDINARY_LLVM_PROFILE_BYTES { return Err("ordinary LLVM profile exceeds the byte budget".into()); }
+    diagnostic_deadline(timeout)
+}
+
+fn bind_builder_inputs(
+    source: AcknowledgedSourceGeneration, observed: ObservedBuilderBasis, projection: OrdinaryLlvmProjection,
+    expected_peer_image: NodeId, output: PathBuf,
+) -> Result<AcknowledgedOrdinaryBuilderInputs> {
+    if projection.compiler_image != expected_peer_image {
+        return Err("ordinary builder inputs came from a different compiler image".into());
+    }
+    let witness = projection.builder.expect("v2 builder evidence checked in the conversation");
+    let target = &source.selection().target;
+    let (_, artifact, profile, _) = observed.configuration.artifact_profile(target, &projection.profile)?;
+    let runtime = wosy_compiler::core_runtime(&profile.backend, &profile.output)?;
+    if witness.compiler != wosy_compiler::COMPILER_IDENTITY || witness.llvm_adapter != wosy_compiler::LLVM_ADAPTER_IDENTITY
+        || witness.linked_llvm != wosy_compiler::linked_llvm_version()
+        || witness.backend != profile.backend || witness.output != profile.output
+        || blake3::hash(runtime.as_bytes()).as_bytes() != &witness.runtime_digest.0 {
+        return Err("ordinary builder inputs have a different compiler/runtime identity".into());
+    }
+    let paths = BuilderInputPaths::new(output);
+    let inputs = pending_builder_inputs(&observed.configuration, observed.configuration_identity, target, &projection.profile,
+        artifact, profile, observed.source, projection.digest.hex(), &paths.output)?;
+    Ok(AcknowledgedOrdinaryBuilderInputs { project: observed.project, source, paths, inputs,
+        partition: projection.partition, runtime })
 }
 
 async fn open_stream<Open, Opening, Stream>(

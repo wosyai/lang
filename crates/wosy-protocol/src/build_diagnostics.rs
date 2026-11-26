@@ -6,6 +6,7 @@ pub const BUILD_DIAGNOSTIC_VERSION: u16 = 1;
 pub const BASE_DECLARATION_PROJECTION_VERSION: u16 = 1;
 pub const BUILD_RECONCILIATION_VERSION: u16 = 1;
 pub const ORDINARY_LLVM_PROJECTION_VERSION: u16 = 1;
+pub const ORDINARY_LLVM_BUILDER_INPUT_VERSION: u16 = 2;
 pub const MAX_ORDINARY_LLVM_PROFILE_BYTES: usize = 1024;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a
@@ -126,6 +127,20 @@ pub struct BaseDeclarationProjection {
     pub entry_projection: NodeId,
 }
 
+/// Actual emitter/runtime identity for the v2 no-cache builder-input
+/// boundary. The client must independently know the authorized peer image
+/// and compare its own expected local compiler/runtime; this is not a signature.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrdinaryLlvmBuilderWitness {
+    pub compiler: String,
+    pub llvm_adapter: String,
+    pub linked_llvm: (u32, u32, u32),
+    pub backend: String,
+    pub output: String,
+    pub runtime_digest: NodeId,
+}
+
 /// Authored partition bytes from the ordinary emitter for one leased
 /// revision/profile. This is not an artifact key, permission to run a
 /// builder, a final Build verdict, or executable-identity memo evidence.
@@ -138,6 +153,8 @@ pub struct OrdinaryLlvmProjection {
     pub compiler_image: NodeId,
     pub digest: NodeId,
     pub partition: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<OrdinaryLlvmBuilderWitness>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -154,4 +171,27 @@ pub enum BuildSessionReply<D> {
     Renewed,
     Closed,
     Refused { reason: BuildSessionRefusal },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_llvm_v1_omits_builder_witness_on_wire() {
+        let root = NodeId([1; 32]);
+        let image = NodeId([2; 32]);
+        let digest = NodeId([3; 32]);
+        let projection = OrdinaryLlvmProjection {
+            version: ORDINARY_LLVM_PROJECTION_VERSION,
+            source_root: root, profile: "dev".into(), compiler_image: image, digest,
+            partition: "; ordinary fixture\n".into(), builder: None,
+        };
+        let existing = serde_json::json!({
+            "version": 1, "source_root": root, "profile": "dev", "compiler_image": image, "digest": digest,
+            "partition": "; ordinary fixture\n",
+        });
+        assert_eq!(serde_json::to_value(&projection).unwrap(), existing);
+        assert_eq!(serde_json::from_value::<OrdinaryLlvmProjection>(existing).unwrap(), projection);
+    }
 }

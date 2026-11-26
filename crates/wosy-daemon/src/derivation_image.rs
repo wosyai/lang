@@ -20,9 +20,7 @@ fn current_image() -> Option<NodeId> {
     // a version label. One bounded-buffer stream on the process's first
     // derived lookup or retention census.
     let file = std::fs::File::open("/proc/self/exe").ok()?;
-    let mut hasher = blake3::Hasher::new_derive_key("wosy local derivation executable image v1");
-    hasher.update_reader(file).ok()?;
-    Some(NodeId(*hasher.finalize().as_bytes()))
+    wosy_protocol::compiler_image_digest(file).ok()
 }
 
 #[cfg(not(target_os = "linux"))]

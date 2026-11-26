@@ -8,9 +8,14 @@ use wosy_compiler::ScalarSourceDeclarations;
 use wosy_project::{
     load_reachable_source_graph, ContentRevision, GraphLoadError, NamespaceEdgeInput,
     NamespacePackages, PackageRelativePath, ProjectConfiguration, ProjectContext, SourceGraph,
-    SourceIdentity, SourceNodeInput, SourceSpan,
+    SourceIdentity, SourceNodeInput, SourceObservation, SourceSpan,
 };
 use wosy_protocol::Import;
+
+/// Preserve the ordinary graph's first-discovery provenance ordering.
+pub fn observations(graph: SourceGraph) -> Vec<SourceObservation> {
+    graph.nodes.into_iter().map(|node| SourceObservation { source: node.source, content_revision: node.content_revision }).collect()
+}
 
 pub fn imports(declarations: &ScalarSourceDeclarations) -> Result<Vec<Import>, String> {
     declarations.namespaces().map(|ns| Import::from_tokens(
