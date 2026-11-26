@@ -18256,7 +18256,7 @@ mod tests {
     fn prepared_passive_nominal_literals_keep_declared_order_and_nested_values() {
         use PassiveLiteral::*;
         let file = source("src/main.w", "typed-passive-nominal-values");
-        let text = "%%start struct copy Part { i32 section; f32 x; } Part[1][2] rows = [[{.x=-0.0;.section=-1;}, {.section=2;.x=0.1;}]]; %%end";
+        let text = "%%start struct copy Part { i32 section; f32 x; } Part[2][1] rows = [[{.x=-0.0;.section=-1;}, {.section=2;.x=0.1;}]]; %%end";
         let prepared = prepare_checker_project(
             vec![(declarations(&file, text), Vec::new())], vec![file.clone()], inputs(),
         ).unwrap();
