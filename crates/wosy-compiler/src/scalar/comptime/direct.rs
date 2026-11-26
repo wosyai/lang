@@ -21,30 +21,52 @@ pub enum DirectComptimeArgument {
     Bool(bool),
 }
 
-/// Authored, typed facts from one inspection, not emitted code, a selected
-/// artifact or authority to execute a tool. No prepared AST escapes.
+/// The proven correspondence between one literal argument and the formal
+/// its authored occurrence reads. Pair inputs use ordinary formal order.
 #[derive(Debug, PartialEq, Eq)]
-pub struct InspectedDirectComptimeCall {
-    site: SourceSpan,
-    function: SourceSpan,
-    call: SourceSpan,
+pub struct DirectComptimeInput {
     argument: SourceSpan,
     formal: SourceSpan,
     read: SourceSpan,
     operand: FormalOperand,
     value: DirectComptimeArgument,
-    result: ScalarType,
 }
 
-impl InspectedDirectComptimeCall {
-    pub fn site(&self) -> &SourceSpan { &self.site }
-    pub fn function(&self) -> &SourceSpan { &self.function }
-    pub fn call(&self) -> &SourceSpan { &self.call }
+impl DirectComptimeInput {
     pub fn argument(&self) -> &SourceSpan { &self.argument }
     pub fn formal(&self) -> &SourceSpan { &self.formal }
     pub fn read(&self) -> &SourceSpan { &self.read }
     pub fn value(&self) -> DirectComptimeArgument { self.value }
+}
+
+/// Authored, typed facts from one inspection, not emitted code, a selected
+/// artifact or authority to execute a tool. No prepared AST escapes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InspectedDirectComptimeCall<const ARITY: usize = 1> {
+    site: SourceSpan,
+    function: SourceSpan,
+    call: SourceSpan,
+    inputs: [DirectComptimeInput; ARITY],
+    result: ScalarType,
+}
+
+impl<const ARITY: usize> InspectedDirectComptimeCall<ARITY> {
+    pub fn site(&self) -> &SourceSpan { &self.site }
+    pub fn function(&self) -> &SourceSpan { &self.function }
+    pub fn call(&self) -> &SourceSpan { &self.call }
+    pub fn inputs(&self) -> &[DirectComptimeInput; ARITY] { &self.inputs }
     pub fn result(&self) -> &ScalarType { &self.result }
+
+    fn tuple(&self) -> [DirectComptimeArgument; ARITY] {
+        self.inputs.each_ref().map(DirectComptimeInput::value)
+    }
+}
+
+impl InspectedDirectComptimeCall<1> {
+    pub fn argument(&self) -> &SourceSpan { self.inputs[0].argument() }
+    pub fn formal(&self) -> &SourceSpan { self.inputs[0].formal() }
+    pub fn read(&self) -> &SourceSpan { self.inputs[0].read() }
+    pub fn value(&self) -> DirectComptimeArgument { self.inputs[0].value() }
 }
 
 /// Inspect only one module containing a single ordinary function and one
@@ -90,28 +112,28 @@ pub fn derive_direct_function_comptime_fragment(
 /// An exact canonical startup occurrence and its index into this plan's
 /// evaluator list. The index has no meaning outside its owning plan.
 #[derive(Debug)]
-pub struct DirectStartupComptimeUse {
-    facts: InspectedDirectComptimeCall,
+pub struct DirectStartupComptimeUse<const ARITY: usize = 1> {
+    facts: InspectedDirectComptimeCall<ARITY>,
     evaluator: usize,
 }
 
-impl DirectStartupComptimeUse {
-    pub fn facts(&self) -> &InspectedDirectComptimeCall { &self.facts }
+impl<const ARITY: usize> DirectStartupComptimeUse<ARITY> {
+    pub fn facts(&self) -> &InspectedDirectComptimeCall<ARITY> { &self.facts }
     pub fn evaluator_index(&self) -> usize { self.evaluator }
 }
 
 /// Detached evaluator IR for a bounded startup list in one authored module.
 /// Call sites retain their order and provenance. Nothing runs or persists.
-pub struct DirectStartupComptimePlan {
-    calls: Vec<DirectStartupComptimeUse>,
+pub struct DirectStartupComptimePlan<const ARITY: usize = 1> {
+    calls: Vec<DirectStartupComptimeUse<ARITY>>,
     evaluators: Vec<ClosedComptimeFragment>,
 }
 
-impl DirectStartupComptimePlan {
-    pub fn calls(&self) -> &[DirectStartupComptimeUse] { &self.calls }
+impl<const ARITY: usize> DirectStartupComptimePlan<ARITY> {
+    pub fn calls(&self) -> &[DirectStartupComptimeUse<ARITY>] { &self.calls }
     pub fn evaluators(&self) -> &[ClosedComptimeFragment] { &self.evaluators }
 
-    pub fn into_parts(self) -> (Vec<DirectStartupComptimeUse>, Vec<ClosedComptimeFragment>) {
+    pub fn into_parts(self) -> (Vec<DirectStartupComptimeUse<ARITY>>, Vec<ClosedComptimeFragment>) {
         (self.calls, self.evaluators)
     }
 }
@@ -123,20 +145,36 @@ impl DirectStartupComptimePlan {
 pub fn derive_direct_startup_comptime_plan(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<DirectStartupComptimePlan, ClosedComptimeRejection> {
-    with_verified_direct_calls(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS, |calls, body, name_span| {
+    derive_direct_startup::<1>(fresh, id, layout)
+}
+
+/// The same bounded startup proof for two literal arguments and a single
+/// eager binary expression reading each exact formal once. The formals and
+/// result share an admitted scalar type. Deduplication is on the ordered
+/// typed pair, not equivalent IR or either individual input.
+pub fn derive_direct_pair_startup_comptime_plan(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<DirectStartupComptimePlan<2>, ClosedComptimeRejection> {
+    derive_direct_startup::<2>(fresh, id, layout)
+}
+
+fn derive_direct_startup<const ARITY: usize>(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
+    with_verified_direct_calls::<ARITY, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS, |calls, body, name_span| {
         let mut plan = DirectStartupComptimePlan {
             calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
         };
         let mut values = Vec::new();
         for facts in calls {
-            // The rooted function, its only formal read, and layout are
-            // identical in this analysis. The tagged literal is all that varies.
-            let evaluator = match values.iter().position(|value| *value == facts.value) {
+            // Function, exact reads and layout are fixed in this analysis.
+            let tuple = facts.tuple();
+            let evaluator = match values.iter().position(|value| *value == tuple) {
                 Some(index) => index,
                 None => {
                     let index = plan.evaluators.len();
                     plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts)?);
-                    values.push(facts.value);
+                    values.push(tuple);
                     index
                 }
             };
@@ -146,9 +184,9 @@ pub fn derive_direct_startup_comptime_plan(
     })
 }
 
-fn emit_bound_evaluator(
+fn emit_bound_evaluator<const ARITY: usize>(
     id: &str, layout: ScalarTargetLayout, authored_body: &ScalarBlock, name_span: ByteSpan,
-    facts: &InspectedDirectComptimeCall,
+    facts: &InspectedDirectComptimeCall<ARITY>,
 ) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
     let mut body = authored_body.clone();
     let ([ScalarBlockItem::Expression(item)], [expression], [output]) = (
@@ -156,19 +194,21 @@ fn emit_bound_evaluator(
     ) else {
         return Err(ClosedComptimeRejection::Emitter("verified evaluator body lost its sole output".into()));
     };
-    let span = facts.read.range;
-    let value = match facts.value {
-        DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
-        DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
-        DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
-    };
-    let Some(read) = facts.operand.get_mut(item) else {
-        return Err(ClosedComptimeRejection::Emitter("verified formal operand disappeared".into()));
-    };
-    if !matches!(read, ScalarExpression::Name { span: current, .. } if *current == span) {
-        return Err(ClosedComptimeRejection::Emitter("verified formal operand changed identity".into()));
+    for input in facts.inputs() {
+        let span = input.read.range;
+        let value = match input.value {
+            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
+        };
+        let Some(read) = input.operand.get_mut(item) else {
+            return Err(ClosedComptimeRejection::Emitter("verified formal operand disappeared".into()));
+        };
+        if !matches!(read, ScalarExpression::Name { span: current, .. } if *current == span) {
+            return Err(ClosedComptimeRejection::Emitter("verified formal operand changed identity".into()));
+        }
+        *read = value;
     }
-    *read = value;
     *expression = item.clone();
     output.value = item.clone();
     output.ty = facts.result.clone();
@@ -179,17 +219,17 @@ fn with_verified_direct_call<T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     observe: impl FnOnce(InspectedDirectComptimeCall, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
-    with_verified_direct_calls(fresh, id, layout, 1, |mut calls, body, name_span| {
+    with_verified_direct_calls::<1, _>(fresh, id, layout, 1, |mut calls, body, name_span| {
         let call = calls.pop().ok_or_else(|| ClosedComptimeRejection::Emitter("verified single call disappeared".into()))?;
         observe(call, body, name_span)
     })
 }
 
 // The analytical project stays private. The continuation is called only
-// after every startup occurrence and the sole formal read were verified.
-fn with_verified_direct_calls<T>(
+// after every startup occurrence and every exact formal read were verified.
+fn with_verified_direct_calls<const ARITY: usize, T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize,
-    observe: impl FnOnce(Vec<InspectedDirectComptimeCall>, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
+    observe: impl FnOnce(Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     let parsed = fresh.result();
@@ -231,13 +271,28 @@ fn with_verified_direct_calls<T>(
     let [ScalarBlockItem::Expression(authored)] = authored_body.items.as_slice() else {
         return Err(unsupported("comptime body must only read its formal"));
     };
-    let (operand, read_span) = FormalOperand::select(authored)
-        .map(|(operand, read)| (operand, span_of(read)))
-        .ok_or_else(|| unsupported(match authored {
-            ScalarExpression::Unary { .. } | ScalarExpression::Binary { .. } =>
-                "comptime accepts one audited eager scalar operator with one formal read",
-            _ => "comptime body must only read its formal",
-        }))?;
+    let mut authored_reads = Vec::with_capacity(ARITY);
+    match ARITY {
+        1 => {
+            let (operand, read) = FormalOperand::select(authored)
+                .ok_or_else(|| unsupported(match authored {
+                    ScalarExpression::Unary { .. } | ScalarExpression::Binary { .. } =>
+                        "comptime accepts one audited eager scalar operator with one formal read",
+                    _ => "comptime body must only read its formal",
+                }))?;
+            authored_reads.push((operand, span_of(read)));
+        }
+        2 => {
+            let ScalarExpression::Binary { operator, left, right, .. } = authored else {
+                return Err(unsupported("paired comptime requires an audited binary read of both formals"));
+            };
+            if !audited_closed_eager_binary(operator) || !is_name(left) || !is_name(right) {
+                return Err(unsupported("paired comptime requires an audited binary read of both formals"));
+            }
+            authored_reads.extend([(FormalOperand::Left, span_of(left)), (FormalOperand::Right, span_of(right))]);
+        }
+        _ => return Err(unsupported("unsupported comptime literal tuple arity")),
+    }
 
     // The ordinary contextual typer visits the actual authored scalar
     // block. This is not a substitute literal or an executable lowering:
@@ -272,20 +327,36 @@ fn with_verified_direct_calls<T>(
     let [ScalarBlockItem::Expression(typed)] = body.items.as_slice() else {
         return Err(unsupported("ordinary block does not contain one scalar result"));
     };
-    let read = operand.get(typed)
-        .filter(|value| matches!(value, ScalarExpression::Name { span, .. } if *span == read_span))
-        .ok_or_else(|| unsupported("ordinary block does not contain the authored formal read"))?;
     let points = build.callable_point_facts(0, 0, None)
         .ok_or_else(|| unsupported("ordinary parameter binding facts are unavailable"))?;
     let nodes = prepared.bind_callable_body_call_nodes(0, 0, None, &function.body)
         .map_err(|_| unsupported("ordinary callable occurrences are unavailable"))?;
-    let (formal, formal_type) = nodes.formal(points, 0)
-        .ok_or_else(|| unsupported("no ordinary formal binding was prepared"))?;
-    if nodes.checked_expression_type(read) != Some(formal_type)
-        || nodes.checked_expression_type(typed) != Some(formal_type)
-        || !matches!(nodes.plain_name(read), Some(PlainNameIdentity::Lexical(binding)) if binding == formal)
-    {
-        return Err(unsupported("authored read does not select the exact ordinary formal"));
+    let result_type = nodes.checked_expression_type(typed)
+        .ok_or_else(|| unsupported("ordinary comptime scalar result type is unavailable"))?;
+    let mut reads = Vec::with_capacity(ARITY);
+    for (operand, read_span) in authored_reads {
+        let read = operand.get(typed)
+            .filter(|value| matches!(value, ScalarExpression::Name { span, .. } if *span == read_span))
+            .ok_or_else(|| unsupported("ordinary block does not contain the authored formal read"))?;
+        let Some(PlainNameIdentity::Lexical(binding)) = nodes.plain_name(read) else {
+            return Err(unsupported("authored read does not select the exact ordinary formal"));
+        };
+        if nodes.checked_expression_type(read) != Some(result_type) {
+            return Err(unsupported("comptime reads and result require one exact scalar type"));
+        }
+        reads.push((operand, read_span, binding));
+    }
+    let mut formal_reads = Vec::with_capacity(ARITY);
+    for ordinal in 0..ARITY {
+        let (formal, formal_type) = nodes.formal(points, ordinal)
+            .ok_or_else(|| unsupported("no ordinary formal binding was prepared"))?;
+        if formal_type != result_type {
+            return Err(unsupported("comptime reads and result require one exact scalar type"));
+        }
+        let index = reads.iter().position(|(_, _, read)| *read == formal)
+            .ok_or_else(|| unsupported("authored read does not select the exact ordinary formal"))?;
+        let (operand, read, _) = reads.swap_remove(index);
+        formal_reads.push((operand, read, formal.declaration_span));
     }
 
     let facts = prepared.initializer_facts(0)
@@ -303,7 +374,9 @@ fn with_verified_direct_calls<T>(
         let ScalarExpression::Call { receiver: None, type_arguments, arguments, .. } = call else {
             return Err(unsupported("expected a direct ordinary initializer call"));
         };
-        let [argument] = arguments.as_slice() else { return Err(unsupported("one literal argument is required")); };
+        if arguments.len() != ARITY {
+            return Err(unsupported("the exact literal tuple arity is required"));
+        }
         if !type_arguments.is_empty() { return Err(unsupported("generic arguments are not admitted")); }
         let destination = facts.binding_output(binding, 0, call)
             .map_err(|_| unsupported("call is not the entire ordinary initializer"))?;
@@ -312,29 +385,38 @@ fn with_verified_direct_calls<T>(
         if target.declaration != &declaration || target.concrete != &ConcreteCallSelection::Declaration {
             return Err(unsupported("initializer did not select the authored function"));
         }
-        let ([parameter], [result]) = (target.parameters, target.outputs) else {
-            return Err(unsupported("one contextual scalar parameter and result are required"));
+        let [result] = target.outputs else {
+            return Err(unsupported("one contextual scalar result is required"));
         };
-        if destination.ty != &result.ty || parameter != &result.ty || parameter != formal_type {
-            return Err(unsupported("the declared result must be the exact read formal's scalar type"));
+        if target.parameters.len() != ARITY || destination.ty != &result.ty || &result.ty != result_type {
+            return Err(unsupported("the declared result must match the exact read formals' scalar type"));
         }
-        let argument_ty = facts.checked_expression_type(argument)
-            .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
-        if argument_ty != parameter {
-            return Err(unsupported("literal argument does not have the selected formal type"));
+        let mut inputs = Vec::with_capacity(ARITY);
+        for ((argument, parameter), &(operand, read, formal)) in
+            arguments.iter().zip(target.parameters).zip(&formal_reads)
+        {
+            let argument_ty = facts.checked_expression_type(argument)
+                .map_err(|_| unsupported("ordinary argument type is unavailable"))?;
+            if argument_ty != parameter || parameter != result_type {
+                return Err(unsupported("literal argument does not have the selected formal type"));
+            }
+            let value = match (argument, parameter) {
+                (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
+                    i32::try_from(value).ok().map(DirectComptimeArgument::I32),
+                (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
+                    u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+                (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
+                _ => None,
+            }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))?;
+            inputs.push(DirectComptimeInput {
+                argument: scope(span_of(argument)), formal: scope(formal), read: scope(read), operand, value,
+            });
         }
-        let value = match (argument, parameter) {
-            (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
-                i32::try_from(value).ok().map(DirectComptimeArgument::I32),
-            (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
-                u32::try_from(value).ok().map(DirectComptimeArgument::U32),
-            (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
-            _ => None,
-        }.ok_or_else(|| unsupported("argument must be an exact scalar literal"))?;
+        let inputs = inputs.try_into()
+            .map_err(|_| unsupported("ordinary literal tuple did not preserve every formal"))?;
         selected.push(InspectedDirectComptimeCall {
             site: scope(site.span), function: declaration.clone(), call: scope(span_of(call)),
-            argument: scope(span_of(argument)), formal: scope(formal.declaration_span),
-            read: scope(span_of(read)), operand, value, result: result.ty.clone(),
+            inputs, result: result.ty.clone(),
         });
     }
     observe(selected, body, super::super::token_span(&site.id))
@@ -350,16 +432,15 @@ enum FormalOperand {
 
 impl FormalOperand {
     fn select(expression: &ScalarExpression) -> Option<(Self, &ScalarExpression)> {
-        let name = |value: &ScalarExpression| matches!(value, ScalarExpression::Name { .. });
         let literal = |value: &ScalarExpression| matches!(value,
             ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. });
         match expression {
-            value if name(value) => Some((Self::Result, value)),
+            value if is_name(value) => Some((Self::Result, value)),
             ScalarExpression::Unary { operator, operand, .. }
-                if audited_closed_unary(operator) && name(operand) => Some((Self::Unary, operand)),
+                if audited_closed_unary(operator) && is_name(operand) => Some((Self::Unary, operand)),
             ScalarExpression::Binary { operator, left, right, .. } if audited_closed_eager_binary(operator) => {
-                if name(left) && literal(right) { Some((Self::Left, left)) }
-                else if literal(left) && name(right) { Some((Self::Right, right)) }
+                if is_name(left) && literal(right) { Some((Self::Left, left)) }
+                else if literal(left) && is_name(right) { Some((Self::Right, right)) }
                 else { None }
             }
             _ => None,
@@ -385,6 +466,10 @@ impl FormalOperand {
             _ => None,
         }
     }
+}
+
+fn is_name(value: &ScalarExpression) -> bool {
+    matches!(value, ScalarExpression::Name { .. })
 }
 
 // Bound the syntactic projection before detached AST extraction. The AST,
@@ -646,6 +731,71 @@ mod tests {
                     feature: "comptime accepts one audited eager scalar operator with one formal read", ..
                 })), "unexpectedly admitted {body}");
         }
+    }
+
+    const PAIRED_FUNCTION: &str = "u32(u32, u32) solve = fn(left, right) { comptime value { right ^ left } };";
+
+    #[test]
+    fn paired_startup_keeps_ordinary_formal_order_even_when_reversed_ir_is_equal() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let authored = fresh(&format!(
+                "{PAIRED_FUNCTION}\nu32 first = solve(7, 9);\nu32 reversed = solve(9, 7);\nu32 repeated = solve(7, 9);\nu32 changed = solve(7, 11);"
+            ));
+            assert!(authored.result().is_valid());
+            let plan = derive_direct_pair_startup_comptime_plan(&authored, "value", layout)
+                .unwrap_or_else(|error| panic!("typed pair on {layout:?}: {error:?}"));
+            let [first, reversed, repeated, changed] = plan.calls() else { panic!("four ordinary calls"); };
+            assert_eq!([first.evaluator_index(), reversed.evaluator_index(), repeated.evaluator_index(),
+                changed.evaluator_index()], [0, 1, 0, 2]);
+            for (call, expected) in [(first, [7, 9]), (reversed, [9, 7]), (repeated, [7, 9]), (changed, [7, 11])] {
+                let facts = call.facts();
+                assert_eq!(facts.tuple(), expected.map(DirectComptimeArgument::U32));
+                assert_eq!(facts.site(), first.facts().site());
+                assert_eq!(facts.function(), first.facts().function());
+                assert_eq!(facts.result(), &ScalarType::U32);
+                for (input, (value, name)) in facts.inputs().iter().zip(expected.into_iter().zip(["left", "right"])) {
+                    assert_eq!(spelling(&authored, input.formal()), name);
+                    assert_eq!(spelling(&authored, input.read()), name);
+                    assert_eq!(spelling(&authored, input.argument()), value.to_string());
+                }
+                assert!(facts.inputs()[0].argument().range.end < facts.inputs()[1].argument().range.start);
+                assert!(facts.inputs()[1].read().range.end < facts.inputs()[0].read().range.start);
+            }
+            let [a, b, different] = plan.evaluators() else { panic!("three fully typed distinct tuples"); };
+            let emit_closed = |expression: &str| {
+                let root = fresh(&format!("u32 answer = comptime value {{ {expression} }};"));
+                super::super::derive_closed_comptime_fragment(&root, "value", layout, |_| None)
+                    .unwrap().llvm().to_text()
+            };
+            assert_eq!(a.llvm().to_text(), emit_closed("9 ^ 7"));
+            assert_eq!(b.llvm().to_text(), emit_closed("7 ^ 9"));
+            assert_eq!(different.llvm().to_text(), emit_closed("11 ^ 7"));
+            assert_eq!(a.llvm().to_text(), b.llvm().to_text());
+            assert_ne!(a.llvm().to_text(), different.llvm().to_text());
+            assert!(derive_direct_startup_comptime_plan(&authored, "value", layout).is_err());
+        }
+    }
+
+    #[test]
+    fn paired_startup_refuses_a_missing_formal_and_a_late_nonliteral_operand() {
+        let layout = ScalarTargetLayout::WASM32;
+        let repeated_read = fresh("u32(u32, u32) solve = fn(left, right) { comptime value { left ^ left } };\nu32 first = solve(7, 9);");
+        assert!(repeated_read.result().is_valid());
+        let Err(ClosedComptimeRejection::OrdinaryDiagnostics(diagnostics)) =
+            derive_direct_pair_startup_comptime_plan(&repeated_read, "value", layout)
+        else { panic!("the real ordinary typer must refuse the unread formal"); };
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0009"
+            && diagnostic.labels.iter().any(|label| spelling(&repeated_read, &label.span) == "right")));
+
+        let late = fresh(&format!("{PAIRED_FUNCTION}\nu32 first = solve(7, 9);\nu32 later = solve(9, first);"));
+        assert!(late.result().is_valid());
+        assert!(matches!(derive_direct_pair_startup_comptime_plan(&late, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported { feature: "argument must be an exact scalar literal", .. })));
+
+        let short_circuit = fresh("bool(bool, bool) solve = fn(left, right) { comptime value { left && right } };\nbool first = solve(false, true);");
+        assert!(short_circuit.result().is_valid());
+        assert!(matches!(derive_direct_pair_startup_comptime_plan(&short_circuit, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported { feature: "paired comptime requires an audited binary read of both formals", .. })));
     }
 
     #[test]
