@@ -695,3 +695,49 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
         }
     }
 }
+
+#[test]
+fn check_cap_process_walks_actual_nested_unit_frames_in_prepared_owners() {
+    let a = require("a", 5, "a.txt");
+    let b = require("b", 7, "b.txt");
+    let library = format!("%%start unit() leaf = fn {{ {a}{b} }}; unit() relay = fn {{ leaf(); }}; %%end");
+    for (layout, other) in [("native", "wasm-wasip1"), ("wasm-wasip1", "native")] {
+        for scope in ["--declared-package", "--main-flow-only"] {
+            for topology in ["local", "qualified", "dependency"] {
+                let project = Fixture::new();
+                let qualified = |package| format!(r#"%%start provider = namespace {package} "relay.w"; provider.relay(); %%end"#);
+                match topology {
+                    "local" => project.package("", layout, "dev", "", &library.replace("%%end", "relay(); %%end")),
+                    "qualified" => {
+                        project.package("", layout, "dev", "", &qualified("app"));
+                        fs::write(project.0.join("src/relay.w"), &library).unwrap();
+                    }
+                    "dependency" => {
+                        project.package("", layout, "dev", "[dependencies.lib]\npath = \"lib\"", "%%start u8 placeholder = 0; %%end");
+                        project.package("lib", other, "own", "", &qualified("lib"));
+                        fs::write(project.0.join("lib/src/relay.w"), &library).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let run = |choice: &[&str]| {
+                    let mut flags = vec![scope];
+                    if topology == "dependency" { flags.push("--dependencies"); }
+                    flags.extend(choice);
+                    project.run(&flags)
+                };
+                for (limit, full) in [(&["--all-errors"][..], true), (&[][..], false),
+                    (&["--max-errors","1"][..], false), (&["--max-errors","2"][..], true),
+                    (&["--max-errors","3"][..], true)] {
+                    assert_terminal(&run(limit), 5,
+                        if full { b"ab" } else { b"a" },
+                        if full { b"[a][b]" } else { b"[a]" });
+                    assert_eq!(fs::read(project.output().join("a.txt")).unwrap(), b"a");
+                    if full { assert_eq!(fs::read(project.output().join("b.txt")).unwrap(), b"b"); }
+                    else { assert!(!project.output().join("b.txt").exists()); }
+                    assert!(!project.0.join("lib/.wosy/outputs/check").exists());
+                    project.clear();
+                }
+            }
+        }
+    }
+}

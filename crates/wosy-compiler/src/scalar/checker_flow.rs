@@ -4996,6 +4996,7 @@ impl<'a> NestedIntegerArgument<'a> {
     fn callable_history_operands(&self) -> Option<[Option<CallableHistoryOperand<'a>>; 2]> {
         use CallableHistoryOperand::{Axis, Exact};
         Some(match self {
+            Self::Single(None) => [None, None],
             Self::Single(Some(arg)) | Self::RootLexical(arg) => [Some(Exact(*arg)), None],
             Self::Pair(left, right) => [Some(Exact(*left)), Some(Exact(*right))],
             Self::Projected(projected) => {

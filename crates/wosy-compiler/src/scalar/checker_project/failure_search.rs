@@ -219,6 +219,10 @@ impl StartUpSearch {
         Some(())
     }
 
+    pub(super) fn charge_plain_history_frame(&mut self, body: &super::FunctionCallSites) -> Option<()> {
+        super::super::checker_flow::charge_call_work(&mut self.work, super::named_exact_frame_cost(body)?)
+    }
+
     pub(super) fn charge_proof_frame(&mut self, body: &super::FunctionCallSites) -> Option<()> {
         if self.metered_frames {
             super::super::checker_flow::charge_call_work(&mut self.work, super::named_exact_frame_cost(body)?)?;

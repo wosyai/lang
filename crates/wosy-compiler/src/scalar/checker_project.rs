@@ -3618,7 +3618,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         let wide_forward = frame.source != child.source && trace.borrow().pending_wide_forward.as_ref()
                             .is_some_and(|(_, inner, _)| inner.range == span && &inner.source == frame.source)
                             && target == traced_rank;
-                        if !(qualified_scalar || context_edge || cited_helper || wide_forward || (rank_self && frame.source == child.source)) {
+                        // prepare_exact_child has already resolved this exact
+                        // original typed call and checked its completed namespace.
+                        // This proof-free lane uses the same live DFS frames;
+                        // it neither invokes the symbolic cursor nor replays calls.
+                        let plain_unit_edge = trace.borrow().proof_free_scalar_initializers
+                            && ACTUAL_STARTUP && !NAMED && matches!(call, ExactCallEffect::Unit(_))
+                            && closed_actual_unit_history_frame(frame.body)
+                            && closed_actual_unit_history_frame(child.body);
+                        if plain_unit_edge {
+                            trace.borrow_mut().charge_plain_history_frame(child.body).ok_or(ProjectCheck::Unsupported)?;
+                        }
+                        if !(qualified_scalar || context_edge || cited_helper || wide_forward || plain_unit_edge || (rank_self && frame.source == child.source)) {
                             return Err(ProjectCheck::Unsupported);
                         }
                         trace.borrow_mut().append(failure_search::PathStep::Call(
@@ -4375,7 +4386,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let (startup_named, startup_plain_scalar, startup_ranked, startup_cited, startup_wide_rank) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
             let effects = ordered.failures.borrow();
-            let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
+            let mut search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
             use failure_search::StartupProofRole::{Aggregate, Bare, Cited, Ranked};
             let pending = search.required_sites.get(&call).filter(|_| search.owns_initialization(caller));
             let matches_aggregate = pending == Some(&(target, Aggregate))
@@ -4421,8 +4432,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let snapshot_candidate = search.proof_free_scalar_initializers && caller == &owner.source
                 && *expected == ScalarType::Unit && !body.structure.checker_selected_snapshots.is_empty();
             let matches_plain_snapshot = snapshot_candidate && closed_affine_snapshot_history(body);
+            let plain_unit_tree = search.proof_free_scalar_initializers && *expected == ScalarType::Unit
+                && !body.call_occurrences.is_empty() && closed_actual_unit_history_frame(body);
             let ordinary_qualified = search.proof_free_scalar_initializers
-                && (matches_plain_scalar || (*expected == ScalarType::Unit
+                && (matches_plain_scalar || plain_unit_tree || (*expected == ScalarType::Unit
                     && body.checker_named_route_frame() && literal_history_directives(body)));
             let cross_proof = matches_aggregate || matches_ranked
                 || (matches_named && search.allows_qualified_scalar_proof(caller, call, target)
@@ -4439,7 +4452,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !matches_plain_snapshot && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_cited && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_plain_snapshot && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_cited && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && !plain_unit_tree && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
                 || (!matches_plain_snapshot && !body.structure.checker_selected_snapshots.is_empty())
                 || !body.structure.module_storage_uses.is_empty()
@@ -4447,6 +4460,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                 || (!matches_plain_scalar && !signature.parameters.iter().all(is_integer_type))
             { return Err(ProjectCheck::Unsupported); }
+            if plain_unit_tree {
+                search.charge_plain_history_frame(body).ok_or(ProjectCheck::Unsupported)?;
+            }
             (matches_named, matches_plain_scalar, matches_ranked, matches_cited, matches_wide_rank)
         } else { (false, false, false, false, false) };
         #[cfg(feature = "internal-checker")]
@@ -10899,6 +10915,14 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
+fn closed_actual_unit_history_frame(body: &FunctionCallSites) -> bool {
+    !body.structure.has_ordinary_contextual_places()
+        && closed_callable_history_body(body)
+        && body.call_occurrences.iter().all(|site| body.checked_call_signatures.get(&site.ordinal)
+            .is_some_and(|signature| matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)))
+}
+
+#[cfg(feature = "internal-checker")]
 fn symbolic_history_call_target(
     project: &ScalarProject, calls: &ProjectCallSiteResults, module: usize, caller: usize,
     body: &FunctionCallSites, site: OccurrenceOrdinal, signature: &CheckedCallSignature,
@@ -10907,7 +10931,7 @@ fn symbolic_history_call_target(
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
     if (owner == module && caller == item)
         || !(output.ty == ScalarType::Unit || is_integer_type(&output.ty))
-        || !(1..=2).contains(&signature.parameters.len())
+        || signature.parameters.len() > 2 || (signature.parameters.is_empty() && output.ty != ScalarType::Unit)
         || !signature.parameters.iter().all(is_integer_type)
     { return None; }
     let source = project.modules.get(owner)?;
