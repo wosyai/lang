@@ -1397,7 +1397,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
     fn seal_local_borrow(&mut self) {
         self.proof_points.local_borrow = self.local_borrow.take()
-            .filter(|_| self.proof_points.pending_named_reborrow.is_none())
             .and_then(|author| author.seal(&self.cfg.points));
     }
 
@@ -3299,6 +3298,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         } else {
                                             None
                                         };
+                                        if *mutability == ScalarReferenceMutability::Shared {
+                                            if let (Some(author), Some((super::control::DeferredReborrowRoot::Local { borrow, .. }, entry, _))) =
+                                                (&mut self.local_borrow, &seed)
+                                            {
+                                                author.prepare_deferred_child(CfgPointId(self.cfg.points.len()), read, *entry, *borrow, &self.cfg.points);
+                                            }
+                                        }
                                         let point = self.point_with_origins(
                                             CfgPointKind::Evaluate(expression.clone()), span, scope, None,
                                         );
@@ -11421,7 +11427,9 @@ fn transfer_reference_facts(
 ) -> Vec<ReferenceAnalysisError> {
     let original_points = cfg.initial_points;
     let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
-    if !deferred_policies.is_empty() || cfg.pending_named_reborrow.is_some()
+    if !deferred_policies.is_empty()
+        || cfg.pending_named_reborrow.is_some_and(|pending| cfg.resolve_pending_named_reborrow
+            || !cfg.local_borrow.is_some_and(|sealed| sealed.admits_deferred_child(pending, original_points)))
         || cfg.local_borrow.is_some_and(|sealed| !sealed.admits_contracts(contracts.len(), &return_edges))
     {
         cfg.local_borrow = None;

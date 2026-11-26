@@ -89,12 +89,20 @@ struct PendingFork {
     join: Option<CfgPointId>,
 }
 
+#[derive(Clone, Copy)]
+struct DeferredChild {
+    child: CfgPointId,
+    pointer: CfgPointId,
+    parent: CfgPointId,
+}
+
 #[derive(Default)]
 pub(crate) struct Author {
     pending_loan: Option<Loan>,
     pending_rhs: Option<CfgPointId>,
     last_holder_read: Option<CfgPointId>,
     prepared_child: Option<(CfgPointId, CfgPointId)>,
+    deferred_child: Option<DeferredChild>,
     child_parents: HashMap<CfgPointId, CfgPointId>,
     last_literal_aggregate: Option<CfgPointId>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
@@ -141,7 +149,9 @@ impl Author {
         let scalar_read = self.pending_scalar_read.take();
         if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
             && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. })
-            && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id)))
+            && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id))
+            && !matches!(kind, CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. })
+                if self.deferred_child.is_some_and(|receipt| receipt.child == id)))
         {
             return false;
         }
@@ -164,6 +174,8 @@ impl Author {
                 true
             }
             CfgPointKind::Entry | CfgPointKind::ScopeEnter => true,
+            CfgPointKind::Evaluate(ScalarExpression::CheckedAddress { .. })
+                if self.deferred_child.is_some_and(|receipt| receipt.child == id) => true,
             CfgPointKind::Evaluate(expression) => {
                 if !scalar_literal_tree(expression) { return false; }
                 if matches!(expression, ScalarExpression::ArrayLiteral { .. } | ScalarExpression::StructLiteral { .. }) {
@@ -286,6 +298,30 @@ impl Author {
 
     pub(super) fn prepare_named_child(&mut self, child: CfgPointId, parent: CfgPointId) {
         self.prepared_child = Some((child, parent));
+    }
+
+    pub(super) fn prepare_deferred_child(
+        &mut self, child: CfgPointId, pointer: CfgPointId, entry: CfgPointId, parent: CfgPointId,
+        points: &[ReferenceFlowPoint],
+    ) {
+        let Some(fork) = self.forks.get(0) else { return; };
+        if self.deferred_child.is_some() || self.pending_loan.is_some() || !self.open_forks.is_empty()
+            || self.last_holder_read != Some(pointer) || pointer.0.checked_add(1) != Some(child.0)
+            || entry >= fork.branch || entry <= parent
+        {
+            return;
+        }
+        let Some(CfgPointKind::Read { binding }) = points.get(pointer.0).map(|point| &point.kind)
+            else { return; };
+        let Some(holder) = self.holders.get(binding) else { return; };
+        let [installed] = holder.writes.as_slice() else { return; };
+        if installed.version != entry || installed.loan.issued != parent || !installed.loan.mutable {
+            return;
+        }
+        self.deferred_child = Some(DeferredChild { child, pointer, parent });
+        self.child_parents.insert(child, parent);
+        self.pending_rhs = Some(child);
+        self.pending_loan = Some(Loan { owner: installed.loan.owner, issued: child, mutable: true });
     }
 
     pub(super) fn prepare_scalar_read(
@@ -464,7 +500,7 @@ impl Author {
         }
         let nested = if self.nested { Some(NestedGraph::seal(points, &self.forks, exit)?) } else { None };
         Some(Box::new(Sealed { exit, forks: self.forks, nested, identity_calls: self.identity_calls,
-            child_parents: self.child_parents, holders, owner_index: self.owners, owners }))
+            child_parents: self.child_parents, deferred_child: self.deferred_child, holders, owner_index: self.owners, owners }))
     }
 }
 
@@ -886,12 +922,36 @@ pub(crate) struct Sealed {
     nested: Option<NestedGraph>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
     child_parents: HashMap<CfgPointId, CfgPointId>,
+    deferred_child: Option<DeferredChild>,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
 }
 
 impl Sealed {
+    pub(super) fn admits_deferred_child(
+        &self, pending: &super::super::control::PendingNamedReborrow, points: &[ReferenceFlowPoint],
+    ) -> bool {
+        let Some(receipt) = self.deferred_child else { return false; };
+        let [site] = pending.sites.as_slice() else { return false; };
+        let super::super::control::DeferredReborrowRoot::Local { borrow, .. } = &pending.root
+            else { return false; };
+        if *borrow != receipt.parent || site.point != receipt.child || site.read != receipt.pointer
+            || site.parent.is_some()
+        {
+            return false;
+        }
+        let Some(CfgPointKind::Borrow { place, loan: child }) = points.get(receipt.child.0).map(|point| &point.kind)
+            else { return false; };
+        let Some(CfgPointKind::Borrow { loan: parent, .. }) = points.get(receipt.parent.0).map(|point| &point.kind)
+            else { return false; };
+        child.mode == ScalarReferenceMutability::Shared && child.origin_place == *place
+            && child.parent.as_deref() == Some(parent) && parent.parent.is_none()
+            && parent.mode == ScalarReferenceMutability::Mutable
+            && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(carried)]
+                if carried.as_ref() == parent)
+    }
+
     pub(super) fn admits_contracts(
         &self, contract_count: usize,
         edges: &HashMap<CfgPointId, CheckedReturnArgumentEdge>,
@@ -1711,6 +1771,55 @@ unit() examine = fn {
             assert_eq!(actual, definitive(&mut incumbent));
             assert!(actual.is_empty(), "{actual:?}");
             assert!(counts[8] > 0, "actual transfer must refine the sibling store: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn authored_joined_child_requires_the_provisionally_resolved_parent_version() {
+        let text = "%%start
+unit(bool) examine = fn(flag) {
+    u16 owner = 7;
+    u16 other = 9;
+    *!u16 parent = &!owner;
+    if (flag) { other = 3; } else { other = 5; };
+    *u16 child = &(*parent);
+    u16 observed = *child;
+    owner = 11;
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "merged-child.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = || {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().next().unwrap().1
+            };
+            let mut staged = prepared();
+            let mut incumbent = prepared();
+            incumbent.proof_points.local_borrow = None;
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("authored conditional child");
+            let pending = staged.proof_points.pending_named_reborrow.as_ref().unwrap();
+            let resolved = &staged.cfg.initial_points;
+            assert!(sealed.admits_deferred_child(pending, resolved));
+            let mut withheld = resolved.clone();
+            withheld[pending.sites[0].point.0].kind = CfgPointKind::ScopeEnter;
+            assert!(!sealed.admits_deferred_child(pending, &withheld));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[7] > 0, "actual transfer must clear the store after the child's last use: {counts:?}");
         }
     }
 
