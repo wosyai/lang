@@ -1613,8 +1613,21 @@ fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntege
     root: &'a SourceIdentity,
     ordinals: HashMap<&'a SourceIdentity, usize>,
     observer: Observer,
-    mut failures: Option<&mut OrderedFailures>,
+    failures: Option<&mut OrderedFailures>,
 ) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
+    let (outcome, observer) = walk_prepared_initialization::<Observer, COLLECT, PRIVATE_NESTED_SCALAR>(
+        prepared, root, ordinals, observer, failures,
+    );
+    Ok((outcome?, observer))
+}
+
+fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
+    prepared: &'a PreparedCheckerProject,
+    root: &'a SourceIdentity,
+    ordinals: HashMap<&'a SourceIdentity, usize>,
+    observer: Observer,
+    mut failures: Option<&mut OrderedFailures>,
+) -> (Result<CheckedInitialization<'a>, ProjectCheck>, Observer) {
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
     let mut actual = CheckedCalls {
@@ -1626,14 +1639,18 @@ fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntege
     if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
         actual.mixed_reached = Some(tap.captured.clone());
     }
-    walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures)?;
+    let outcome = walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
+        project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures);
     #[cfg(feature = "internal-checker")]
-    if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
-        if actual.mixed_reached.as_ref() != Some(&tap.captured) {
-            return Err(ProjectCheck::Unsupported);
+    if outcome.is_ok() {
+        if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
+            if actual.mixed_reached.as_ref() != Some(&tap.captured) {
+                return (Err(ProjectCheck::Unsupported), actual.observer);
+            }
         }
     }
-    Ok((CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }, actual.observer))
+    (outcome.map(|_| CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }),
+        actual.observer)
 }
 
 fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
@@ -1694,7 +1711,11 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     .is_some_and(|search| {
                         let search = search.borrow();
                         search.named_target.is_some() || search.ranked_target.is_some() || search.proof_free_scalar_initializers
+                            || (COLLECT && actual.can_initialize_fixed_arrays()
+                                && search.has_aggregate_site(source, outputs.primary))
                     }))
+                && !(COLLECT && actual.can_initialize_fixed_arrays()
+                    && matches!(binding.value, ScalarExpression::IndexedRead { place: super::ScalarPlace::Index { .. }, .. }))
                 && concrete_integer_literal(&binding.value).is_none()
             {
                 return Err(ProjectCheck::Unsupported);
@@ -1752,9 +1773,27 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 (ty @ ScalarType::Array { .. }, ScalarExpression::Call { .. })
                     if COLLECT && actual.can_initialize_fixed_arrays() =>
                 {
+                    let trace = failures.as_deref().and_then(|effects| effects.startup_search.clone());
+                    if let Some(trace) = &trace {
+                        if !trace.borrow().has_aggregate_site(source, outputs.primary) { return Err(ProjectCheck::Unsupported); }
+                        let span = topology.occurrences.get(outputs.primary.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        trace.borrow_mut().append(failure_search::PathStep::Call(
+                            wosy_syntax::SourceSpan::new(source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                    }
                     let ActualCallResult::FixedArray(cells) = run_scalar_initializer_call(
                         topology, actual, source, outputs.primary, ty, None, &storage, failures, visits, false,
                     )? else { return Err(ProjectCheck::Unsupported); };
+                    if let Some(trace) = &trace {
+                        let mut trace = trace.borrow_mut();
+                        let (_, role) = trace.required_sites.remove(&outputs.primary).ok_or(ProjectCheck::Unsupported)?;
+                        if role != failure_search::StartupProofRole::Aggregate { return Err(ProjectCheck::Unsupported); }
+                        let span = topology.occurrences.get(outputs.primary.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        trace.append(failure_search::PathStep::Return(
+                            wosy_syntax::SourceSpan::new(source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                        if trace.remaining() == 0 && trace.cannot_continue() {
+                            return Err(ProjectCheck::StartupAuthoredLimitReached);
+                        }
+                    }
                     InitializerValue::FixedArray { ty, cells }
                 }
                 #[cfg(feature = "internal-checker")]
@@ -2123,12 +2162,16 @@ fn run_scalar_initializer_call(
     #[cfg(feature = "internal-checker")]
     let sink = failures.as_deref_mut().map(RefCell::new);
     #[cfg(feature = "internal-checker")]
-    let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
-        scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
-        startup_site: (passive_binding && failures.borrow().startup_search.is_some()).then_some(OrderedInitializerCall { topology, occurrence }),
-        startup_site_source: (passive_binding && failures.borrow().startup_search.is_some()).then_some(source),
-        ..OrderedCallCollection::new(failures, Some(visits))
-    }));
+    let collection = sink.as_ref().map(|failures| {
+        let traced = failures.borrow().startup_search.as_ref().is_some_and(|trace|
+            passive_binding || (matches!(expected, ScalarType::Array { .. }) && trace.borrow().has_aggregate_site(source, occurrence)));
+        (source, OrderedCallCollection {
+            scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
+            startup_site: traced.then_some(OrderedInitializerCall { topology, occurrence }),
+            startup_site_source: traced.then_some(source),
+            ..OrderedCallCollection::new(failures, Some(visits))
+        })
+    });
     #[cfg(not(feature = "internal-checker"))]
     let collection = None;
     run_initializer_call(
@@ -4039,8 +4082,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let (startup_named, startup_plain_scalar, startup_ranked) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
             let effects = ordered.failures.borrow();
             let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
-            use failure_search::StartupProofRole::{Bare, Ranked};
+            use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
             let pending = search.required_sites.get(&call).filter(|_| search.owns_initialization(caller));
+            let matches_aggregate = pending == Some(&(target, Aggregate))
+                && caller == &owner.source && matches!(expected, ScalarType::Array { .. })
+                && self.observer.watches_fixed_array(target) && proof_site.is_some()
+                && body.checker_pure_calling_frame();
             let matches_named = pending == Some(&(target, Bare)) && is_integer_type(expected)
                 && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
             let plain_scalar_wrapper = search.proof_free_scalar_initializers && caller == &owner.source
@@ -4056,14 +4103,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             // Once the named route spends its ordinary quota, only the
             // pending, top-level authenticated binding calls may run.
             if search.proof_only_continuation() && search.pending_named_startup_observation()
-                && !(matches_named || matches_ranked)
+                && !(matches_named || matches_ranked || matches_aggregate)
             { return Err(ProjectCheck::Unsupported); }
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
                     && body.checker_named_route_frame() && literal_history_directives(body)));
             let cross_authorized = caller != &owner.source && (search.named_cross_source && matches_named || ordinary_qualified)
                 && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
-            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked)
+            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked && !matches_aggregate)
                 || (caller != &owner.source && !cross_authorized)
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
@@ -4332,6 +4379,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             match role {
                 Bare => trace.named_observations.push(observation),
                 Ranked => trace.ranked_observations.push(observation),
+                failure_search::StartupProofRole::Aggregate => return Err(ProjectCheck::Unsupported),
             }
             // Capture the real typed return before stopping. Do not resume
             // further startup items or ordinary witness selection.
@@ -10588,9 +10636,17 @@ fn run_private_named_after_startup(
     }
     let mut plans = Vec::with_capacity(named_definitions.len());
     let mut ranked = None;
+    let mut arrays = Vec::new();
+    let mut array_work = 0;
     for (proof_source, is_provider, definition, query, name) in &named_definitions {
         let proof_source = *proof_source;
         let selected = owner.resolve_selected_proof(definition, *query)?;
+        if array_quantifier::is_array_target(&selected) {
+            if qualified || expected.is_some() || proof_source != &owner.source { return Err(ProjectCheck::Unsupported); }
+            super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
+            arrays.extend(array_quantifier::ArrayProof::prepare(proof_source, selected, &mut array_work)?);
+            continue;
+        }
         let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
             proof_source, name.text(), selected, *is_provider,
         )?;
@@ -10616,6 +10672,11 @@ fn run_private_named_after_startup(
             }
             plans.push(plan);
         }
+    }
+    if !arrays.is_empty() {
+        if !plans.is_empty() || ranked.is_some() { return Err(ProjectCheck::Unsupported); }
+        let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
+        return cohort.run_capped(owner, scope, cap);
     }
     if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))

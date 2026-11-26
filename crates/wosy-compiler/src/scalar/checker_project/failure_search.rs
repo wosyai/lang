@@ -24,7 +24,7 @@ struct FailurePath {
 pub(super) enum Admission { Duplicate, Selected, SelectedAndStop }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum StartupProofRole { Bare, Ranked }
+pub(super) enum StartupProofRole { Bare, Ranked, Aggregate }
 
 pub(super) struct StartupProofObservation {
     pub(super) site: SourceSpan,
@@ -123,6 +123,10 @@ impl StartUpSearch {
 
     pub(super) fn charge_formal_replay(&mut self, activations: usize, per_activation: usize) -> Option<()> {
         super::super::checker_flow::charge_call_work(&mut self.work, activations.checked_mul(per_activation)?)
+    }
+
+    pub(super) fn has_aggregate_site(&self, caller: &SourceIdentity, site: OccurrenceOrdinal) -> bool {
+        self.owns_initialization(caller) && self.required_sites.get(&site).is_some_and(|(_, role)| *role == StartupProofRole::Aggregate)
     }
 
     pub(super) fn owns_initialization(&self, source: &SourceIdentity) -> bool {

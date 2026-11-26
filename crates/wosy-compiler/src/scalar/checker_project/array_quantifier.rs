@@ -346,6 +346,69 @@ impl<'a> Cohort<'a> {
         }
         Ok(Self { plans, groups })
     }
+
+    // The actual-only slice never infers a missing startup observation
+    // from a dormant theorem or a completed-but-different array.
+    pub(super) fn run_capped(
+        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+        let prepared = &owner.prepared;
+        let (project, calls) = prepared.parts();
+        let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if module.source != owner.source { return Err(ProjectCheck::Unsupported); }
+        let (root, ordinals) = package_startup_order(project, &project.modules)?;
+        let (_, authored_roots) = package_obligation_roots(prepared, scope, 1, root)?;
+        if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
+
+        let mut targets = Vec::with_capacity(self.groups.len());
+        for (&target, group) in &self.groups {
+            let plan = &self.plans[group.ids[0]];
+            let Some(ScalarItem::Function(declaration)) = module.items.get(target.1) else { return Err(ProjectCheck::Unsupported); };
+            // The current array materializer provides actual returned cells,
+            // but not a branch history. Scope this collector to a closed
+            // straight-line prepared body until that provenance is available.
+            if target.0 != 0 || plan.owner != root || plan.source != root || !plan.body.conditionals.is_empty() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            targets.push((target, declaration.name_span));
+        }
+        let incoming = calls.owned_direct_startup_callable_uses(root, None,
+            targets.iter().map(|(_, span)| (root, *span)), None).ok_or(ProjectCheck::Unsupported)?;
+        let mut trace = failure_search::StartUpSearch::new(root, cap);
+        trace.retain_after_cutoff = true;
+        for (target, span) in targets {
+            let sites = incoming.get(&(root, span)).filter(|sites| !sites.is_empty()).ok_or(ProjectCheck::Unsupported)?;
+            trace.enroll_proof_sites(target, failure_search::StartupProofRole::Aggregate, sites)
+                .ok_or(ProjectCheck::Unsupported)?;
+        }
+        let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
+        let (init, evidence) = walk_prepared_initialization::<_, true, true>(
+            prepared, root, ordinals, Evidence::new(self)?, Some(&mut effects),
+        );
+        let trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+            .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+        if trace.invalid() || !trace.required_sites.is_empty()
+            || self.groups.keys().any(|target| !evidence.seen.contains(target))
+            || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+            || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+        { return Err(ProjectCheck::Unsupported); }
+        let (completion, active) = match init {
+            Ok(init) if trace.remaining() > 0 => {
+                let applicable = evidence.complete_startup(&init.reached)?;
+                (StartupAuthoredCompletion::Exhausted, init.had_obligations || applicable)
+            },
+            Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 =>
+                (StartupAuthoredCompletion::LimitReached, true),
+            Err(error) => return Err(error),
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        Ok((MainFlowProofReceipt {
+            active, directives: effects.records, diagnostics: Vec::new(), mixed_context_after_scalar: None,
+            contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(),
+            aggregate_diagnostics: evidence.failures, pointer_effect_diagnostic: None, symbolic_diagnostic: None,
+            additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+        }, completion))
+    }
 }
 
 pub(super) struct Evidence<'plan, 'proof> {

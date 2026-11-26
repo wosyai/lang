@@ -2751,6 +2751,67 @@ main_artifact = "main"
                 assert_eq!(files(), first_file);
                 clean();
                 fs::remove_file(shared_source).unwrap();
+                let aggregate = format!(r#"%%start
+                    u8[2]() make = fn {{ [7, 1] }};
+                    proof cells for make() -> (items)
+                        forall (u64 i where i == 0)
+                        ensures (items[i] == 8)
+                    {{ core.show(items[i] == 8); }}
+                    u8[2] first_array = make();
+                    u8 head = first_array[0];
+                    core.require(head == 8, {first});
+                    u8[2] second_array = make();
+                    u8 tail = second_array[1];
+                    core.require(tail == 2, {second});
+                %%end"#);
+                fs::write(&source, &aggregate).unwrap();
+                let legacy_array = terminal(&[legacy()], scope, false);
+                assert_eq!(legacy_array.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                let limited = selected(1);
+                let report = limited[0].outcome.as_ref().unwrap();
+                let [a, b] = report.aggregate_diagnostics.as_slice() else { panic!("both real fixed-array proof observations"); };
+                assert!(a.call.as_ref().unwrap().range.start < b.call.as_ref().unwrap().range.start);
+                for diagnostic in [a, b] {
+                    let cell = diagnostic.cell.as_ref().unwrap();
+                    assert_eq!((cell.index.to_string(), cell.value.to_string()), ("0".into(), "7".into()));
+                }
+                let clipped = terminal(&limited, scope, false);
+                assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                assert_eq!(clipped.2.strip_prefix(b"[first]"), legacy_array.2.strip_prefix(b"[first][second]"));
+                assert_eq!(files(), first_file);
+                clean();
+                assert_eq!(terminal(&selected(8), scope, false), legacy_array);
+                assert_eq!(files(), both_files);
+                clean();
+                let proved = aggregate.replace("items[i] == 8", "items[i] == 7");
+                fs::write(&source, proved).unwrap();
+                let clipped = terminal(&selected(1), scope, false);
+                assert_eq!(clipped, (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                // A non-admitted narrowing/opaque condition cannot
+                // manufacture a missing adverse proof observation.
+                fs::write(&source, aggregate.replace("u8[2] second_array = make();", &format!(
+                    "core.narrow(false, {second}); u8[2] second_array = make();"))).unwrap();
+                let refused = selected(1);
+                assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
+                let branched = aggregate.replace("make = fn { [7, 1] };",
+                    "make = fn(input) { if (input == 0) { [7, 1] } else { [1, 7] } };")
+                    .replace("u8[2]() make", "u8[2](u8) make").replace("= make();", "= make(0);")
+                    .replace("proof cells for make()", "proof cells for make(entry)");
+                assert_ne!(branched, aggregate);
+                fs::write(&source, branched).unwrap();
+                let old_coverage = legacy().outcome.unwrap();
+                assert_eq!(old_coverage.aggregate_diagnostics.len(), 2);
+                assert_eq!(old_coverage.directives.len(), 2);
+                let refused = selected(8);
+                assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
                 fs::write(&source, &ranked).unwrap();
                 let legacy_render = terminal(&[legacy()], scope, false);
                 assert_eq!(legacy_render.0, Ok(19));
