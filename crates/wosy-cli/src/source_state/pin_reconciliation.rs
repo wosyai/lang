@@ -17,6 +17,20 @@ pub struct PinScanCursor {
     after: String,
 }
 
+/// An immutable local read of one catalog revision. Intents retain their
+/// exact generation and release state; this does not reconcile them.
+pub struct PinIntentPage {
+    pub intents: Vec<SourcePinIntent>,
+    pub continuation: Option<PinScanCursor>,
+    // Rootless releases still count as physical rows.
+    had_rows: bool,
+}
+
+pub enum PinIntentPageRead {
+    Observed(PinIntentPage),
+    RestartRequired,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PinSyncStatus {
     Durable { sent_replay: bool },
@@ -79,6 +93,50 @@ impl SqliteSourceState {
         Ok(PinScanCursor { workspace, revision, after: String::new() })
     }
 
+    /// Is the originally captured workspace catalog revision still current?
+    /// A daemon observation has its own read cut, not this SQLite instant.
+    pub fn source_pin_scan_is_current(&self, cursor: &PinScanCursor) -> Result<bool> {
+        if self.project.to_str() != Some(cursor.workspace.as_str()) {
+            return Err("source pin cursor belongs to another workspace".into());
+        }
+        Ok(catalog_revision(&self.db)? == cursor.revision)
+    }
+
+    /// Read one bounded local keyset page without reflecting or replaying
+    /// anything. A continuation is tied to the exact catalog revision.
+    pub fn read_source_pin_intent_page(
+        &mut self, cursor: &PinScanCursor, limit: NonZeroUsize,
+    ) -> Result<PinIntentPageRead> {
+        if self.project.to_str() != Some(cursor.workspace.as_str()) {
+            return Err("source pin cursor belongs to another workspace".into());
+        }
+        let limit = limit.get().min(MAX_PAGE);
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if catalog_revision(&tx)? != cursor.revision { return Ok(PinIntentPageRead::RestartRequired); }
+        let intents = {
+            let mut select = tx.prepare(PIN_PAGE_SQL)?;
+            let rows = select.query_map(params![cursor.after, limit as i64 + 1],
+                |row| {
+                    let intent = intent_from_row(row, &cursor.workspace)?;
+                    let name = match &intent {
+                        Some(intent) => intent.name.clone(),
+                        None => row.get(0)?,
+                    };
+                    Ok((name, intent))
+                })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        let had_rows = !intents.is_empty();
+        let continuation = (intents.len() > limit).then(|| PinScanCursor {
+            workspace: cursor.workspace.clone(),
+            revision: cursor.revision,
+            after: intents[limit - 1].0.clone(),
+        });
+        let intents = intents.into_iter().take(limit).filter_map(|(_, intent)| intent).collect();
+        Ok(PinIntentPageRead::Observed(PinIntentPage { intents, continuation, had_rows }))
+    }
+
     /// Process one page with the trusted local daemon adapter. An immutable
     /// page is read before any callback, with no SQLite transaction held
     /// across daemon work. A local change discards the continuation without
@@ -90,40 +148,14 @@ impl SqliteSourceState {
         F: FnMut(SourcePinIntent, Option<Delta>) -> Reply,
         Reply: Future<Output = Result<SourcePinReflection>>,
     {
-        if self.project.to_str() != Some(cursor.workspace.as_str()) {
-            return Err("source pin cursor belongs to another workspace".into());
-        }
-        let limit = limit.get().min(MAX_PAGE);
-        let intents = {
-            let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            if catalog_revision(&tx)? != cursor.revision { return Ok(PinPageResult::RestartRequired); }
-            let mut select = tx.prepare(PIN_PAGE_SQL)?;
-            let rows = select.query_map(params![cursor.after, limit as i64 + 1],
-                |row| {
-                    let intent = intent_from_row(row, &cursor.workspace)?;
-                    let name = match &intent {
-                        Some(intent) => intent.name.clone(),
-                        None => row.get(0)?,
-                    };
-                    Ok((name, intent))
-                })?;
-            let intents = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(select);
-            tx.commit()?;
-            intents
-        };
-
-        let more = intents.len() > limit;
-        let continuation = more.then(|| PinScanCursor {
-            workspace: cursor.workspace.clone(),
-            revision: cursor.revision,
-            after: intents[limit - 1].0.clone(),
-        });
-        let mut items = Vec::with_capacity(intents.len().min(limit));
-        if !intents.is_empty() && catalog_revision(&self.db)? != cursor.revision {
+        let PinIntentPageRead::Observed(PinIntentPage { intents, continuation, had_rows }) =
+            self.read_source_pin_intent_page(cursor, limit)?
+        else { return Ok(PinPageResult::RestartRequired); };
+        let mut items = Vec::with_capacity(intents.len());
+        if had_rows && catalog_revision(&self.db)? != cursor.revision {
             return Ok(PinPageResult::RestartRequired);
         }
-        for intent in intents.into_iter().take(limit).filter_map(|(_, intent)| intent) {
+        for intent in intents {
             let mut outcome = reflect(intent.clone(), None).await?;
             let replayed = outcome == SourcePinReflection::ReplayRequired;
             if replayed {

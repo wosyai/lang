@@ -17,7 +17,7 @@ use wosy_compiler::{derive_direct_pair_startup_comptime_plan, derive_direct_star
 use wosy_project::packages::InstalledGitBase;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
-    BuildSourceSelection, Delta, NodeId, OrdinaryLlvmBuilderWitness, BUILD_DIAGNOSTIC_VERSION,
+    BuildSourceSelection, Delta, NodeId, OrdinaryLlvmBuilderWitness, SourcePinIntent, BUILD_DIAGNOSTIC_VERSION,
 };
 
 /// Bound to one published source selected by a trusted local adapter. No
@@ -151,6 +151,22 @@ impl BuildDiagnosticSession<'_> {
         let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved(slot, move |store| {
             store.leased_source_pin_page(&lease, cursor, page_rows, limits)
+        }).await?
+    }
+
+    /// Match one bounded local intent page against committed mirror rows.
+    /// A result is true only for the exact reflected intent in this read
+    /// cut, in input order. It does not reconcile or confirm durability.
+    pub async fn observe_source_pin_intents(
+        &self, intents: Vec<SourcePinIntent>, limits: BaseCstAdmissionLimits,
+    ) -> Result<Vec<bool>> {
+        if intents.len() > super::pins::MAX_LIST_ROWS {
+            return Err("source pin observation exceeds the page window".into());
+        }
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.observe_leased_pin_intents(&lease, &intents, limits)
         }).await?
     }
 

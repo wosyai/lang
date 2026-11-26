@@ -174,3 +174,85 @@ fn source_pin_page_rejects_another_session_and_observes_fresh_local_cuts() {
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[test]
+fn source_pin_intent_observation_matches_only_the_actual_mirror_without_mutation() {
+    use wosy_cli::source_state::PinIntentPageRead;
+    let owned = Scratch::new();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    runtime.block_on(async {
+        let store = Arc::new(SourceStore::open(&owned.0.join("graph"), 8 << 20).unwrap());
+        let (mut local, selected) = owned.project(&store, "project").await;
+        let (mut other, _) = owned.project(&store, "other").await;
+        let worker = local_worker(&store);
+        for name in ["a-exact", "b-missing", "c-direct", "d-older", "e-release", "f-reflected-release"] {
+            let pin = local.pin_selected_source("app", name).unwrap();
+            if matches!(name, "a-exact" | "d-older" | "e-release" | "f-reflected-release") {
+                let initial = local.source_pin_intent(name).unwrap().unwrap();
+                assert_eq!(worker.reflect_source_pin(initial.clone(), None, ADMISSION).await.unwrap(),
+                    SourcePinReflection::Durable(initial));
+            }
+            if name == "d-older" {
+                // Same immutable source root, but a different real client generation.
+                let next = local.pin_selected_source("app", name).unwrap();
+                assert_eq!(next.root, pin.root);
+                assert!(next.generation > pin.generation);
+            }
+            if matches!(name, "e-release" | "f-reflected-release") {
+                assert!(local.unpin_local_source(&pin).unwrap());
+            }
+            if name == "f-reflected-release" {
+                let released = local.source_pin_intent(name).unwrap().unwrap();
+                assert_eq!(released.retention, SourcePinRetention::Released);
+                assert_eq!(worker.reflect_source_pin(released.clone(), None, ADMISSION).await.unwrap(),
+                    SourcePinReflection::Durable(released));
+            }
+        }
+        store.pin_source(selected.root, "c-direct").await.unwrap();
+        other.pin_selected_source("app", "a-exact").unwrap();
+        let foreign = other.source_pin_intent("a-exact").unwrap().unwrap();
+        let root = selected.root;
+        let direct_rows = || store.source_pins(root).unwrap().into_iter()
+            .map(|pin| (pin.name, pin.root)).collect::<Vec<_>>();
+        let before = direct_rows();
+        let selection_before = local.selection("app").unwrap();
+        let mut cursor = local.begin_source_pin_scan().unwrap();
+        let first_cursor = cursor.clone();
+        let session = worker.open_build_diagnostics(selected, Duration::from_secs(30)).await.unwrap().unwrap();
+        let mut seen = Vec::new();
+        loop {
+            let PinIntentPageRead::Observed(page) = local.read_source_pin_intent_page(&cursor, rows(2)).unwrap()
+                else { panic!("read-only fixture changed its local revision"); };
+            assert!(page.intents.len() <= 2);
+            for intent in &page.intents {
+                assert_eq!(local.source_pin_intent(&intent.name).unwrap().as_ref(), Some(intent));
+            }
+            let names: Vec<_> = page.intents.iter().map(|intent| intent.name.clone()).collect();
+            let matches = session.observe_source_pin_intents(page.intents, ADMISSION).await.unwrap();
+            assert_eq!(matches.len(), names.len());
+            assert!(local.source_pin_scan_is_current(&cursor).unwrap());
+            seen.extend(names.into_iter().zip(matches));
+            let Some(next) = page.continuation else { break };
+            cursor = next;
+        }
+        assert_eq!(seen, [
+            ("a-exact".into(), true), ("b-missing".into(), false), ("c-direct".into(), false),
+            ("d-older".into(), false), ("e-release".into(), false), ("f-reflected-release".into(), true),
+        ]);
+        let error = session.observe_source_pin_intents(vec![foreign], ADMISSION).await.err().unwrap();
+        assert_eq!(error.to_string(), "source pin intent belongs to another workspace");
+        let exact = local.source_pin_intent("a-exact").unwrap().unwrap();
+        let error = session.observe_source_pin_intents(vec![exact; 65], ADMISSION).await.err().unwrap();
+        assert_eq!(error.to_string(), "source pin observation exceeds the page window");
+        assert_eq!(direct_rows(), before);
+        assert_eq!(local.selection("app").unwrap(), selection_before);
+        assert!(local.source_pin_scan_is_current(&first_cursor).unwrap());
+        local.pin_selected_source("app", "b-missing").unwrap();
+        assert!(!local.source_pin_scan_is_current(&first_cursor).unwrap());
+        assert!(matches!(local.read_source_pin_intent_page(&first_cursor, rows(2)).unwrap(), PinIntentPageRead::RestartRequired));
+        assert_eq!(direct_rows(), before);
+        session.release();
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

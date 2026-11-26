@@ -18,7 +18,7 @@ pub struct SourcePin {
     pub root: NodeId,
 }
 
-const MAX_LIST_ROWS: usize = 64;
+pub(super) const MAX_LIST_ROWS: usize = 64;
 
 /// An in-process continuation of a workspace's pin names. It holds no
 /// lease or transaction and cannot be used by another opened session.
@@ -281,8 +281,7 @@ impl SourceStore {
         let (owner, lower) = match cursor {
             Some(cursor) => (cursor.owner, Some(cursor.lower)),
             None => {
-                let (_, config) = checked_source_header_using(grant.root, bounded_source_records(&tx, limits))?;
-                (Arc::new(Owner::new(workspace_of_source_config(&config)?.to_owned())), None)
+                (Arc::new(leased_pin_owner(&tx, grant.root, limits)?), None)
             }
         };
         let limit = page_rows.get().min(MAX_LIST_ROWS);
@@ -316,6 +315,37 @@ impl SourceStore {
         lease.finish_current(|| SourcePinPage { pins, visible_rows_visited, continuation })
             .ok_or_else(|| BuildRequestRejection::Expired.into())
     }
+
+    pub(super) fn observe_leased_pin_intents(
+        &self, lease: &SourceLease, intents: &[SourcePinIntent], limits: BaseCstAdmissionLimits,
+    ) -> Result<Vec<bool>> {
+        let grant = lease.grant();
+        let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
+            .ok_or(BuildRequestRejection::Expired)?;
+        let owner = leased_pin_owner(&tx, grant.root, limits)?;
+        let mut observed = Vec::with_capacity(intents.len());
+        for intent in intents {
+            if intent.source.project != owner.path {
+                return Err("source pin intent belongs to another workspace".into());
+            }
+            let equal = match tx.get(&owner.pin_key(&intent.name)?)? {
+                None => false,
+                Some(bytes) => {
+                    let pin = owner.stored(&bytes)?;
+                    pin.reflection.is_some_and(|reflection| pin.root == intent.source.root
+                        && reflection.target == intent.source.target
+                        && reflection.generation == intent.generation && reflection.retention == intent.retention)
+                }
+            };
+            observed.push(equal);
+        }
+        lease.finish_current(|| observed).ok_or_else(|| BuildRequestRejection::Expired.into())
+    }
+}
+
+fn leased_pin_owner(tx: &Transaction, root: NodeId, limits: BaseCstAdmissionLimits) -> Result<Owner> {
+    let (_, config) = checked_source_header_using(root, bounded_source_records(tx, limits))?;
+    Ok(Owner::new(workspace_of_source_config(&config)?.to_owned()))
 }
 
 fn retained_pin(owner: &Owner, key: &[u8], value: &[u8]) -> Result<Option<SourcePin>> {

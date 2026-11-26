@@ -27,7 +27,7 @@ pub use diagnostic_report::{
 };
 pub use current_view::PinnedEntryCst;
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
-pub use pin_reconciliation::{PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
+pub use pin_reconciliation::{PinIntentPage, PinIntentPageRead, PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 
 pub struct SqliteSourceState {
     project: PathBuf,
