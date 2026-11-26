@@ -344,7 +344,7 @@ struct Cell { bool enabled; i32 offset; }
 struct Report { std.utf8 label; u32[2] numbers; Cell[2] cells; }
 Report result = comptime prepare {
     { .cells = [{ .offset = -7; .enabled = true; }, { .offset = 0; .enabled = false; }];
-      .numbers = [10, 20]; .label = "fonte"; }
+      .numbers = [10, 20]; .label = "olá\n\"ok\\x\0"; }
 };
 %%end
 "#;
@@ -355,6 +355,26 @@ Report result = comptime prepare {
         fs::write(&source, authored).unwrap();
         let prepared = prepare_project_comptime_stdout(&project, "app", "override", "prepare", layout)
             .unwrap_or_else(|error| panic!("ordinary aggregate result on {layout:?}: {error:?}"));
+        let from_source = "[\"olá\\n\\\"ok\\\\x\\u0000\",[10,20],[[true,-7],[false,0]]]\n".as_bytes();
+        let mut produced = Vec::new();
+        assert_eq!(prepared.write_literal_stdout(&mut produced, from_source.len()).unwrap(), from_source.len());
+        assert_eq!(produced, from_source);
+        let Expr::StructLiteral { fields: produced_fields, .. } =
+            prepared.read_stdout(ok, &produced, produced.len()).unwrap()
+        else { panic!("the actual produced result is one struct"); };
+        assert!(matches!(&produced_fields[0].value, Expr::Utf8 { value, .. }
+            if value == "olá\n\"ok\\x\0".as_bytes()));
+        let Expr::ArrayLiteral { elements: produced_cells, .. } = &produced_fields[2].value
+        else { panic!("actual produced Cell array"); };
+        let Expr::StructLiteral { fields: produced_first, .. } = &produced_cells[0]
+        else { panic!("actual produced Cell"); };
+        assert!(matches!(&produced_first[1].value, Expr::Integer { value, .. }
+            if i64::try_from(value) == Ok(-7)));
+        let mut partial = Vec::new();
+        assert_eq!(prepared.write_literal_stdout(&mut partial, from_source.len() - 1).unwrap_err().to_string(),
+            "comptime stdout exceeds its byte budget");
+        assert_eq!(partial, &from_source[..from_source.len() - 1]);
+
         let example = "[\"olá\\n\\\"ok\\\\x\",[4294967295,20],[[true,-2147483648],[false,0]]]\n".as_bytes();
         let Expr::StructLiteral { fields, span } = prepared.read_stdout(ok, example, example.len()).unwrap()
         else { panic!("one ordinary struct value"); };
@@ -403,9 +423,33 @@ Report result = comptime prepare {
         fs::write(&source, "%%start\nbool answer = comptime prepare { true };\n%%end\n").unwrap();
         let scalar = prepare_project_comptime_stdout(&project, "app", "override", "prepare", layout).unwrap();
         assert_ne!(scalar.site().source.revision, prepared.site().source.revision);
-        assert!(matches!(scalar.read_stdout(ok, b"true\n", 5).unwrap(), Expr::Boolean { value: true, .. }));
+        let mut scalar_line = Vec::new();
+        assert_eq!(scalar.write_literal_stdout(&mut scalar_line, 5).unwrap(), 5);
+        assert_eq!(scalar_line, b"true\n");
+        assert!(matches!(scalar.read_stdout(ok, &scalar_line, 5).unwrap(), Expr::Boolean { value: true, .. }));
         assert_eq!(scalar.read_stdout(ok, example, 256).err(), Some(Error::Output(Format::NonCanonical)));
         assert!(prepared.read_stdout(ok, example, 256).is_ok());
+    }
+    assert!(!project.join(".wosy").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn checked_literal_producer_does_not_guess_computed_results() {
+    use wosy_cli::comptime_fragment::prepare_project_comptime_stdout;
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let source = project.join("src/main.w");
+    for body in ["7 ^ 9", "u32 selected = 43; selected"] {
+        fs::write(&source, format!("%%start\nu32 answer = comptime prepare {{ {body} }};\n%%end\n")).unwrap();
+        let candidate = prepare_project_comptime_stdout(
+            &project, "app", "override", "prepare", ScalarTargetLayout::NATIVE64,
+        );
+        let candidate = candidate.unwrap();
+        let mut bytes = Vec::new();
+        let refusal = candidate.write_literal_stdout(&mut bytes, 32).unwrap_err();
+        assert_eq!(refusal.kind(), io::ErrorKind::Unsupported);
+        assert!(bytes.is_empty(), "a computed result must not emit a partial literal");
     }
     assert!(!project.join(".wosy").exists());
 }

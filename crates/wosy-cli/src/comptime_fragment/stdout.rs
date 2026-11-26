@@ -2,7 +2,7 @@
 //! Neither entry point launches a program or accepts a result into a build.
 use super::{ClosedComptimeModuleObservation, ClosedComptimePlanError};
 use crate::project_sources::{self, Error as SourceError};
-use std::{collections::BTreeMap, fmt, path::Path, process::ExitStatus};
+use std::{collections::BTreeMap, fmt, io::{self, Write}, path::Path, process::ExitStatus};
 use wosy_compiler::{
     parse_source_with_snapshot, prepare_comptime_stdout, ComptimeStdoutError, PreparedComptimeStdout,
     ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
@@ -82,6 +82,12 @@ impl std::error::Error for ComptimeReadbackError {}
 
 impl ProjectComptimeStdout {
     pub fn site(&self) -> &SourceSpan { self.output.site() }
+
+    /// An opt-in producer for actual checked literal bodies only. This
+    /// does not invoke or replace a configured runner for computed bodies.
+    pub fn write_literal_stdout(&self, out: &mut impl Write, max_bytes: usize) -> io::Result<usize> {
+        self.output.write_literal_stdout(out, max_bytes)
+    }
 
     /// Parse one value after exit 0 against the type already prepared from
     /// this authored site. The bytes and status themselves confer no runner

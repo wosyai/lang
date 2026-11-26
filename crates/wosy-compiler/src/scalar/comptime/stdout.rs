@@ -9,17 +9,21 @@ use super::super::{
     derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
     EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject, ScalarStructId, ScalarStructLiteralField,
 };
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, io::{self, Write}, sync::Arc};
 use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, FreshParseResult, SourceSpan, SyntaxKind};
 
 // Bound recursive AST representation as well as the parser's stack.
 const MAX_VALUE_DEPTH: usize = 64;
+
+mod literal;
+use literal::LiteralStdout;
 
 #[derive(Debug)]
 pub struct PreparedComptimeStdout {
     site: SourceSpan,
     result_type: ScalarType,
     shape: Arc<Shape>,
+    literal: Option<LiteralStdout>,
 }
 
 #[derive(Debug)]
@@ -125,7 +129,14 @@ pub fn prepare_comptime_stdout(
     }
     let (shape, _) = shape_for(project, &binding.declared_type, &mut HashMap::new(), 0)
         .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
-    Ok(PreparedComptimeStdout { site: scope, result_type: binding.declared_type.clone(), shape })
+    let literal = match &binding.value {
+        ScalarExpression::Block(block) => match block.items.as_slice() {
+            [ScalarBlockItem::Expression(value)] => LiteralStdout::from_checked(&shape, value),
+            _ => None,
+        },
+        _ => None,
+    };
+    Ok(PreparedComptimeStdout { site: scope, result_type: binding.declared_type.clone(), shape, literal })
 }
 
 fn shape_for(
@@ -197,6 +208,15 @@ impl std::error::Error for ComptimeStdoutError {}
 impl PreparedComptimeStdout {
     pub fn site(&self) -> &SourceSpan { &self.site }
     pub fn result_type(&self) -> &ScalarType { &self.result_type }
+
+    /// Write the exact compiler-observed ordinary literal when the whole
+    /// selected body is that value. A computed body still needs the evaluator.
+    /// Failure returns no byte count; the caller owns any partial scratch output.
+    pub fn write_literal_stdout(&self, out: &mut impl Write, max_bytes: usize) -> io::Result<usize> {
+        self.literal.as_ref().ok_or_else(|| io::Error::new(
+            io::ErrorKind::Unsupported, "comptime stdout needs an evaluator for this computed body",
+        ))?.write_line(out, max_bytes)
+    }
 
     /// Materialize one parsed compiler value, not authority to apply it.
     pub fn parse_stdout(&self, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
