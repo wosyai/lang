@@ -7,7 +7,7 @@ use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentit
 mod source_delta;
 pub use source_delta::{
     partition_cst_files, BaseCstProposal, BaseCstProposalBinding, CstAddition, CstDelta,
-    SourceIndexAddition, BASE_CST_DELTA_VERSION,
+    SourceDeltaCommit, SourceDeltaPublication, SourceIndexAddition, BASE_CST_DELTA_VERSION,
 };
 
 mod build_diagnostics;

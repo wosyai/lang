@@ -3,15 +3,17 @@ use super::{
     load_usage, read_selection, ClientSourceLimits, Closure, Files, Result, SourceAttempt,
     SqliteSourceState, StoredNodes,
 };
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use wosy_project::{packages::{match_installed_git_base_files, InstalledGitBase}, PackageRelativePath};
 use wosy_protocol::{
     partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId,
     BaseDeclarationProjection,
     BuildSessionCommandId, BuildSessionReply, BuildSessionResponse, BuildSourceSelection, CstAddition,
-    CstDelta, NodeId, SourceConfig, SourceIndexAddition, BASE_CST_DELTA_VERSION, BASE_DECLARATION_PROJECTION_VERSION,
+    CstDelta, NodeId, SourceConfig, SourceDeltaCommit, SourceDeltaPublication, SourceIndexAddition,
+    BASE_CST_DELTA_VERSION, BASE_DECLARATION_PROJECTION_VERSION,
 };
 
 pub struct ProjectedGitBaseFile {
@@ -33,6 +35,12 @@ pub struct PendingGitBaseProjection {
     pub files: BTreeMap<PackageRelativePath, ProjectedGitBaseFile>,
 }
 
+pub enum PendingBasePublication {
+    Applied(SourceDeltaCommit),
+    PredecessorMissing,
+    StaleAttempt,
+}
+
 impl SqliteSourceState {
     /// Construct a sparse proposal for the exact still-pending base source
     /// attempt, without observing live source, parsing, or acknowledging it.
@@ -42,10 +50,16 @@ impl SqliteSourceState {
     pub fn pending_base_cst_proposal(
         &mut self, target: &str, attempt: SourceAttempt,
     ) -> Result<(BaseCstProposalBinding, BaseCstProposal)> {
+        self.proposal_if_current(target, attempt)?.ok_or("base CST proposal is not the current source attempt".into())
+    }
+
+    fn proposal_if_current(
+        &mut self, target: &str, attempt: SourceAttempt,
+    ) -> Result<Option<(BaseCstProposalBinding, BaseCstProposal)>> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let selection = read_selection(&tx, target)?;
         if selection.pending != Some(attempt) {
-            return Err("base CST proposal is not the current source attempt".into());
+            return Ok(None);
         }
         let base = selection.selected.ok_or("base CST proposal requires a selected predecessor")?;
         let root = attempt.root();
@@ -75,9 +89,44 @@ impl SqliteSourceState {
             proposed: root, attempt: attempt.generation(),
         };
         tx.commit()?;
-        Ok((binding, BaseCstProposal {
+        Ok(Some((binding, BaseCstProposal {
             version: BASE_CST_DELTA_VERSION, base, root, attempt: attempt.generation(), files, source_index,
-        }))
+        })))
+    }
+
+    /// Publish one still-pending immutable base-source update via the
+    /// trusted local adapter. The adapter may retain a committed cache root
+    /// even if our attempt advances. Only an exact local compare-and-set
+    /// can select it, and no SQLite transaction spans daemon work.
+    pub async fn publish_pending_base<F, Reply>(
+        &mut self, target: &str, attempt: SourceAttempt, publish: F,
+    ) -> Result<PendingBasePublication>
+    where
+        F: FnOnce(BaseCstProposalBinding, BaseCstProposal) -> Reply,
+        Reply: Future<Output = Result<SourceDeltaPublication>>,
+    {
+        let Some((binding, proposal)) = self.proposal_if_current(target, attempt)? else {
+            return Ok(PendingBasePublication::StaleAttempt);
+        };
+        let current = |state: &super::SourceSelection| {
+            state.selected == Some(binding.selected.root) && state.pending == Some(attempt)
+        };
+        if !current(&read_selection(&self.db, target)?) { return Ok(PendingBasePublication::StaleAttempt); }
+        let receipt = match publish(binding.clone(), proposal).await? {
+            SourceDeltaPublication::PredecessorMissing => return Ok(if current(&read_selection(&self.db, target)?) {
+                PendingBasePublication::PredecessorMissing
+            } else {
+                PendingBasePublication::StaleAttempt
+            }),
+            SourceDeltaPublication::Committed(receipt) if receipt.binding == binding => receipt,
+            SourceDeltaPublication::Committed(_) => return Err("committed base source receipt does not match the pending attempt".into()),
+        };
+        let applied = self.db.execute(
+            "UPDATE source_targets SET selected = ?2, selected_generation = ?3, pending = NULL
+             WHERE target = ?1 AND pending = ?2 AND generation = ?3 AND selected = ?4",
+            params![target, binding.proposed.0, binding.attempt, binding.selected.root.0],
+        )? == 1;
+        Ok(if applied { PendingBasePublication::Applied(receipt) } else { PendingBasePublication::StaleAttempt })
     }
 
     /// Project one directly installed pristine selection onto the exact

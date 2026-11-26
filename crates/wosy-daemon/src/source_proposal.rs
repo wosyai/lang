@@ -1,20 +1,21 @@
-//! Validate one trusted-adapter-bound base CST proposal without publishing it.
+//! Admit one trusted-adapter-bound base CST proposal.
 use super::{
-    admit_checked_namespace_authority, child_edge, file_source, key, read_index, validate_file,
+    admit_checked_namespace_authority, check_source_marker, child_edge, file_source, key, read_index, validate_file,
     validate_shape, validate_snapshot_with, write_edge, write_node,
     project_declarations::UnpublishedDeclarations,
     retention_plan::{PreparedAllocation, SourceLease, SourceRead, MAX_RETAINED_DECLARATION_BYTES},
     CheckedFile, Expected, FileTree, Index, PreparedBaseModule, PublishReport, Result,
-    SourceStorageWorker, SourceStore, INTERN, NODES,
+    SourceStorageWorker, SourceStore, INTERN, NODES, SNAPSHOT_ROOTS,
 };
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use surrealkv::{Mode, Transaction};
+use surrealkv::{Durability, Mode, Transaction};
 use wosy_protocol::{
     imports_from_cst, partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BuildSourceSelection,
-    CstExpansionBudget, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, BASE_CST_DELTA_VERSION,
+    CstExpansionBudget, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, SourceDeltaCommit,
+    SourceDeltaPublication, BASE_CST_DELTA_VERSION,
 };
 use wosy_syntax::CstNode;
 
@@ -104,6 +105,60 @@ pub(super) enum AdmissionLease {
 }
 
 impl SourceStorageWorker {
+    /// Validate and publish just the canonical base-source delta. The trusted
+    /// adapter binds one pending attempt and its acknowledged predecessor.
+    /// Uses the existing rooted lease and worker; no data from a missing
+    /// predecessor is assumed. An admitted cache commit may outlive its
+    /// observer, but a stale local attempt cannot select it.
+    pub async fn publish_bound_base_source(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, lifetime: Duration,
+    ) -> Result<SourceDeltaPublication> {
+        check_binding(&binding, &proposal)?;
+        let slot = self.try_slot()?;
+        self.spawn_reserved_query(slot, None, move |worker| async move {
+            let binding = Arc::new(binding);
+            let proposal = Arc::new(proposal);
+            let selected = binding.selected.clone();
+            let Some(lease) = worker.phase(None, move |store| store.lease_build_source(selected, lifetime)).await? else {
+                return Ok(SourceDeltaPublication::PredecessorMissing);
+            };
+            let grant = lease.grant();
+            for conflicts in 0..=1 {
+                let binding = Arc::clone(&binding);
+                let proposal = Arc::clone(&proposal);
+                let (mut tx, _read, result) = worker.phase(None, move |store| {
+                    let (mut tx, read) = store.begin_leased_source(grant, Mode::ReadWrite)?
+                        .ok_or("base CST predecessor lease expired")?;
+                    tx.set_durability(Durability::Eventual);
+                    let marker = key(SNAPSHOT_ROOTS, proposal.root);
+                    let already_present = if let Some(observed) = tx.get_for_update(&marker)? {
+                        check_source_marker(proposal.root, &observed)?;
+                        true
+                    } else {
+                        false
+                    };
+                    let mut report = PublishReport::default();
+                    let validated = validate(&mut tx, &binding, &proposal, limits, Some(&mut report))?;
+                    if !already_present { tx.set(&marker, &proposal.root.0)?; }
+                    Ok((tx, read, SourceDeltaCommit {
+                        binding: binding.as_ref().clone(), validated_files: validated.admission.validated_files,
+                        written_records: report.written, already_present, conflicts,
+                    }))
+                }).await?;
+                if lease.deadline().is_none_or(|deadline| Instant::now() >= deadline) {
+                    return Err("base CST predecessor lease expired".into());
+                }
+                match tx.commit().await {
+                    Ok(()) => return Ok(SourceDeltaPublication::Committed(result)),
+                    Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            unreachable!("a second commit conflict is returned")
+        }).await?
+    }
+
     /// Check only the authenticated local adapter's selected/pending pair.
     /// The proposal cannot open a lease or pick an unrelated base. Nothing
     /// returned here is a lease, Prepared handle, IR, or publication ack.
@@ -153,15 +208,7 @@ impl SourceStorageWorker {
         limits: BaseCstAdmissionLimits, admission_lease: AdmissionLease,
         use_validated: impl FnOnce(&SourceStore, &Transaction, ValidatedProposal) -> Result<T> + Send + 'static,
     ) -> Result<(T, Arc<SourceLease>, SourceRead)> {
-        if proposal.version != BASE_CST_DELTA_VERSION {
-            return Err("unsupported base CST proposal version".into());
-        }
-        if binding.attempt <= 0 || proposal.attempt != binding.attempt
-            || proposal.base != binding.selected.root || proposal.root != binding.proposed
-            || proposal.root == proposal.base
-        {
-            return Err("base CST proposal does not match the bound source attempt".into());
-        }
+        check_binding(&binding, &proposal)?;
         let slot = self.try_slot()?;
         self.spawn_reserved(slot, move |store| {
             let lease = match admission_lease {
@@ -172,7 +219,7 @@ impl SourceStorageWorker {
             };
             let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
-            let validated = validate(&mut tx, &binding, &proposal, limits)?;
+            let validated = validate(&mut tx, &binding, &proposal, limits, None)?;
             let accepted = use_validated(store, &tx, validated)?;
             // No transaction is committed and no snapshot entry is written.
             drop(tx);
@@ -184,9 +231,19 @@ impl SourceStorageWorker {
     }
 }
 
+fn check_binding(binding: &BaseCstProposalBinding, proposal: &BaseCstProposal) -> Result<()> {
+    if proposal.version != BASE_CST_DELTA_VERSION { return Err("unsupported base CST proposal version".into()); }
+    if binding.attempt <= 0 || proposal.attempt != binding.attempt
+        || proposal.base != binding.selected.root || proposal.root != binding.proposed || proposal.root == proposal.base
+    {
+        return Err("base CST proposal does not match the bound source attempt".into());
+    }
+    Ok(())
+}
+
 fn validate(
     tx: &mut Transaction, binding: &BaseCstProposalBinding, proposal: &BaseCstProposal,
-    limits: BaseCstAdmissionLimits,
+    limits: BaseCstAdmissionLimits, mut publish: Option<&mut PublishReport>,
 ) -> Result<ValidatedProposal> {
     if proposal.files.len() > limits.records {
         return Err("base CST proposal exceeds the record budget".into());
@@ -213,7 +270,7 @@ fn validate(
     if supplied.keys().any(|id| prior.contains_key(id)) {
         return Err("base CST proposal resends a selected predecessor record".into());
     }
-    let added = trace(tx, proposal.root, &mut graph, Some((&prior, &supplied)), None)?;
+    let added = trace(tx, proposal.root, &mut graph, Some((&prior, &supplied)), publish.as_deref_mut())?;
     if supplied.len() != added.len() {
         return Err("base CST proposal record is not reachable from its proposed root".into());
     }
@@ -230,8 +287,11 @@ fn validate(
         if previous.files.get(&key).is_some_and(|prior| prior.file == file.file) {
             return Ok(());
         }
-        let checked = grammar_checked_file(tx, file, categories, FileTree::Authored, &mut work)?;
-        if imports_from_cst(&checked.authored.ok_or("missing checked authored CST")?)? != file.metadata.imports {
+        let tree = if publish.is_some() { FileTree::Both } else { FileTree::Authored };
+        let checked = grammar_checked_file(tx, file, categories, tree, &mut work)?;
+        if let Some(report) = publish.as_deref_mut() {
+            admit_checked_namespace_authority(tx, file, checked, report)?;
+        } else if imports_from_cst(&checked.authored.ok_or("missing checked authored CST")?)? != file.metadata.imports {
             return Err("changed CST does not match canonical namespace provenance".into());
         }
         validated_files += 1;

@@ -8,11 +8,28 @@ pub const BASE_CST_DELTA_VERSION: u16 = 2;
 
 /// The trusted local adapter's scope for one admission, captured from the
 /// same SQLite transaction as the proposal. Never deserialized from a peer.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseCstProposalBinding {
     pub selected: BuildSourceSelection,
     pub proposed: NodeId,
     pub attempt: i64,
+}
+
+/// Receipt from a trusted local source-cache adapter. A committed immutable
+/// base-source root is visible and recomputable, not a semantic SnapshotRoot,
+/// compile-time completion, or a Build/Check verdict.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SourceDeltaCommit {
+    pub binding: BaseCstProposalBinding,
+    pub validated_files: usize,
+    pub written_records: usize,
+    pub already_present: bool,
+    pub conflicts: usize,
+}
+
+pub enum SourceDeltaPublication {
+    PredecessorMissing,
+    Committed(SourceDeltaCommit),
 }
 
 #[derive(Debug, Deserialize, Serialize)]

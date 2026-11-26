@@ -397,8 +397,10 @@ impl SourceStore {
             return Ok(None);
         }
         if root != grant.root { return Ok(None); }
-        let tx = self.tree.begin_with_mode(mode)?;
-        let Some(marker) = tx.get(&key(SNAPSHOT_ROOTS, root))? else { return Ok(None); };
+        let mut tx = self.tree.begin_with_mode(mode)?;
+        let marker_key = key(SNAPSHOT_ROOTS, root);
+        let marker = if matches!(mode, Mode::ReadWrite) { tx.get_for_update(&marker_key)? } else { tx.get(&marker_key)? };
+        let Some(marker) = marker else { return Ok(None); };
         check_source_marker(root, &marker)?;
         *reads.active.entry(root).or_default() += 1;
         Ok(Some((tx, SourceRead::new(&self.source_reads.0, root))))

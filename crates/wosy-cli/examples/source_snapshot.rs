@@ -20,6 +20,8 @@ mod recovery;
 mod storage_worker;
 #[path = "source_snapshot/source_state.rs"]
 mod source_state;
+#[path = "source_snapshot/pending_publication.rs"]
+mod pending_publication;
 #[path = "source_snapshot/pin_reflection.rs"]
 mod pin_reflection;
 #[path = "source_snapshot/pin_catalog.rs"]

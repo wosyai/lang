@@ -15,7 +15,7 @@ mod diagnostic_report;
 mod delta;
 mod pins;
 mod pin_reconciliation;
-pub use delta::{PendingGitBaseProjection, ProjectedGitBaseFile};
+pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use diagnostic_report::{ProjectDiagnosticExchange, RootedDiagnosticReport};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};

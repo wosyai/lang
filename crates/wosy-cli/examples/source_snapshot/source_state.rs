@@ -180,6 +180,10 @@ pub(super) async fn run(
             let profile = args.next().ok_or("expected Build profile")?;
             super::leased_build::report(&mut client, dir, &target, &profile, mode.ends_with("-limited")).await?
         }
+        "publish-pending-base" | "publish-pending-base-restage" => {
+            let profile = args.next().ok_or("expected Build profile")?;
+            super::pending_publication::run(&mut client, project, dir, &target, &profile, mode.ends_with("-restage")).await?
+        }
         "pin-local" => {
             let name = args.next().ok_or("expected local fixture pin name")?;
             local_pin(&client.pin_selected_source(&target, &name)?)
