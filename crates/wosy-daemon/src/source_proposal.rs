@@ -339,11 +339,20 @@ fn grammar_checked_file(
 }
 
 pub(super) fn authored_grammar_matches(file: &FileEntry, categories: &[String], checked: &CheckedFile) -> Result<bool> {
+    Ok(verified_authored_parse(file, categories, checked)?.is_some())
+}
+
+pub(super) fn verified_authored_parse(
+    file: &FileEntry, categories: &[String], checked: &CheckedFile,
+) -> Result<Option<wosy_syntax::FreshParseResult>> {
     let authored = checked.authored.as_ref().ok_or("source file has no authored CST")?;
-    // Source text is reconstructed from the witnessed CST, not shipped or
-    // reread from a live workspace. Use the ordinary parser as the oracle.
-    let parsed = wosy_syntax::parse(file_source(file)?, authored.text().to_string(), categories);
-    Ok(parsed.is_valid() && same_cst(authored, &parsed.canonical_cst().root) && parsed.comments == checked.comments)
+    // Use the ordinary parser and the checked Rowan text. A lease alone is
+    // not grammar authority; compiler consumers get only the matching parse.
+    let fresh = wosy_syntax::parse_with_snapshot(file_source(file)?, authored.text().to_string(), categories);
+    let parsed = fresh.result();
+    let matches = parsed.is_valid() && same_cst(authored, &parsed.canonical_cst().root)
+        && parsed.comments == checked.comments;
+    Ok(matches.then_some(fresh))
 }
 
 /// Validate and provisionally install only the full canonical graph supplied

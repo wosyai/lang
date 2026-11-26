@@ -30,7 +30,8 @@ pub use scalar::{
     ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
 pub use scalar::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection,
-    ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue};
+    ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
+    CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 
 mod llvm;
 

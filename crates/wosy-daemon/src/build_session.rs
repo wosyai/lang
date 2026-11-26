@@ -2,7 +2,8 @@
 use super::{
     retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
-    PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
+    PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
+    RootedClosedComptimeRequest, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
     SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
@@ -138,6 +139,19 @@ impl BuildDiagnosticSession<'_> {
     ) -> Result<PreparedBaseDeclarations> {
         self.worker.prepare_base_cst_with_lease(binding, proposal, limits, declaration_bytes,
             super::source_proposal::AdmissionLease::Connection(Arc::clone(&self.lease))).await
+    }
+
+    /// Examine one candidate with this local session's published-source lease.
+    /// No framed action or live workspace configuration participates.
+    pub async fn project_closed_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedClosedComptimeProjection> {
+        request.check_selector_bytes()?;
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.project_closed_comptime_for_lease(&lease, request)
+        }).await?
     }
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {

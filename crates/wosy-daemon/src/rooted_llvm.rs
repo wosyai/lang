@@ -362,10 +362,7 @@ impl SourceStore {
                         Ok(partition) => partition,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let mut output = PartitionBytes { bytes: Vec::new(), limit: output_bytes };
-                    partition.write_text(&mut output)?;
-                    let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
-                    Ok(Ok((output.bytes, digest)))
+                    Ok(Ok(bounded_partition_bytes(&partition, output_bytes)?))
                 })?;
         let project = |bytes, digest, origin| Projection::Emitted(RootedLlvmPartition {
             source_root: ordinary.root, profile: ordinary.profile, compiler_image: ordinary.image, identity, origin, bytes, digest,
@@ -529,6 +526,15 @@ fn project_authored(
         }
     }
     Ok(diagnostics)
+}
+
+pub(super) fn bounded_partition_bytes(
+    partition: &wosy_compiler::LlvmPartition, limit: usize,
+) -> io::Result<(Vec<u8>, NodeId)> {
+    let mut output = PartitionBytes { bytes: Vec::new(), limit };
+    partition.write_text(&mut output)?;
+    let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
+    Ok((output.bytes, digest))
 }
 
 // Limit retained egress, not temporary LLVM allocations during emission.

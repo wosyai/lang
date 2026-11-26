@@ -60,6 +60,7 @@ mod derivation_image;
 mod pins;
 mod project_declarations;
 mod prepared_project;
+mod rooted_comptime;
 mod rooted_llvm;
 mod retention_plan;
 mod rooted_llvm_receipts;
@@ -81,6 +82,10 @@ pub use project_declarations::{
 };
 pub use prepared_project::{
     BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
+};
+pub use rooted_comptime::{
+    RootedClosedComptimeFragment, RootedClosedComptimeProjection, RootedClosedComptimeRefusal,
+    RootedClosedComptimeRequest,
 };
 pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};

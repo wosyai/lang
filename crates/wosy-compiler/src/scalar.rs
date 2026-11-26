@@ -2529,7 +2529,8 @@ pub fn derive_scalar_program_from_cst_with_layout(
 mod declarations;
 mod comptime;
 pub use comptime::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection,
-    ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue};
+    ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
+    CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};

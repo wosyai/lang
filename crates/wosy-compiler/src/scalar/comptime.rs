@@ -10,7 +10,7 @@ use wosy_syntax::{
     byte_span, ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind,
 };
 
-const MAX_SOURCE_BYTES: usize = 1 << 16;
+pub const CLOSED_COMPTIME_MAX_SOURCE_BYTES: usize = 1 << 16;
 const FUNCTION: &str = "evaluate";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,7 +111,7 @@ fn with_closed_comptime_occurrence<R>(
         return Err(ClosedComptimeRejection::UnsupportedLayout);
     }
     if !parsed.is_valid() { return Err(ClosedComptimeRejection::InvalidParse); }
-    if parsed.text.len() > MAX_SOURCE_BYTES { return Err(ClosedComptimeRejection::SourceLimit); }
+    if parsed.text.len() > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(ClosedComptimeRejection::SourceLimit); }
     let scope = |range| SourceSpan::new(parsed.source.clone(), range);
     let unsupported = |range, feature| ClosedComptimeRejection::Unsupported { site: scope(range), feature };
     let mut matches = parsed.root.descendants().filter_map(|node| {
