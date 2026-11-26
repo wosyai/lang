@@ -365,3 +365,84 @@ fn check_cap_process_finishes_independent_two_owner_contextual_dependency() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for scalar_first in [false, true] {
+                let project = Fixture::new();
+                let calls = if scalar_first { "u8 scored = score(4); entry();" }
+                    else { "entry(); u8 scored = score(4);" };
+                let root = format!(r#"%%start
+                    lib = namespace app "credit.w";
+                    unit() entry = fn {{
+                        u8 core.context.credit = 3;
+                        lib.spend();
+                    }};
+                    u8(u8) score = fn(value) {{ value }};
+                    proof scalar_value for score(input) -> (out) where (input == 4) ensures (out == 3) {{}}
+                    {}
+                    {calls}
+                    core.require(scored == 3, {{ .stdout = "second"; .stderr = "[second]"; .code = 19;
+                        .files = [{{ .path = "second.txt"; .text = "second"; }}]; }});
+                    %%end"#, require("first", 0, "first.txt"));
+                let provider = r#"%%start
+                    unit() drain = fn { core.context.credit = core.context.credit - 1; };
+                    unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                    unit() spend = fn { consume(); drain(); };
+                    proof drain_goal for drain() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 0) {}
+                    proof debit_goal for consume() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 0) {}
+                %%end"#;
+                project.package("", layout, "dev", "", &root);
+                let credit = project.0.join("src/credit.w");
+                fs::write(&credit, provider).unwrap();
+                let old = project.run(&[scope]);
+                assert_eq!(old.status.code(), Some(19), "{old:?}");
+                assert_eq!(old.stdout, b"firstsecond");
+                let first_file = fs::read(project.output().join("first.txt")).unwrap();
+                let second_file = fs::read(project.output().join("second.txt")).unwrap();
+                project.clear();
+
+                let capped = project.run(&[scope, "--max-errors", "1"]);
+                assert_eq!(capped.status.code(), Some(1), "{capped:?}");
+                assert_eq!(capped.stdout, b"first");
+                assert_eq!(capped.stderr.strip_prefix(b"[first]").unwrap(), old.stderr.strip_prefix(b"[first][second]").unwrap());
+                let diagnostic = String::from_utf8_lossy(&capped.stderr);
+                let first = diagnostic.find("contextual value at entry: 3; at exit: 2").unwrap();
+                let second = diagnostic.find("contextual value at entry: 2; at exit: 1").unwrap();
+                let scalar = diagnostic.find("call entry: input = 4").unwrap();
+                assert!(first < second && if scalar_first { scalar < first } else { second < scalar });
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first_file);
+                assert!(!project.output().join("second.txt").exists());
+                project.clear();
+
+                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first_file);
+                assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), second_file);
+                project.clear();
+
+                let proved = provider.replace("- 0) {}", "- 1) {}");
+                assert_ne!(proved, provider);
+                fs::write(&credit, proved).unwrap();
+                let only_scalar = project.run(&[scope, "--max-errors", "1"]);
+                assert_eq!(only_scalar.status.code(), Some(1), "{only_scalar:?}");
+                assert_eq!(only_scalar.stdout, b"first");
+                let scalar_diagnostic = String::from_utf8_lossy(&only_scalar.stderr);
+                assert!(scalar_diagnostic.contains("call entry: input = 4")
+                    && !scalar_diagnostic.contains("contextual value at entry:"));
+                project.clear();
+
+                // Removing an edge cannot silently declare the second
+                // requested theorem observed or substitute another call.
+                fs::write(&credit, provider.replace("consume(); drain();", "consume(); consume();")).unwrap();
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 2, b"",
+                    b"wosy: check: unsupported analysis; no result published\n");
+                assert!(!project.output().exists());
+            }
+        }
+    }
+}

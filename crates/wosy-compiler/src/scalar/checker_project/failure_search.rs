@@ -79,9 +79,11 @@ pub(super) struct MixedContextStartup {
     pub(super) root_site: OccurrenceOrdinal,
     pub(super) entry_site: OccurrenceOrdinal,
     pub(super) bridge: PreparedCallable,
-    pub(super) bridge_site: OccurrenceOrdinal,
+    pub(super) entry: PreparedCallable,
+    pub(super) pending_leaves: std::collections::VecDeque<(OccurrenceOrdinal, PreparedCallable)>,
+    pub(super) returned_bridge: bool,
     pub(super) finished: bool,
-    pub(super) refuted_after_named: Option<usize>,
+    pub(super) refuted_after_named: Vec<usize>,
     pub(super) dependent_requires: HashSet<OccurrenceOrdinal>,
 }
 
@@ -106,8 +108,6 @@ pub(in super::super) struct StartUpSearch {
     pub(super) cited_routes: HashMap<PreparedCallable, (OccurrenceOrdinal, PreparedCallable)>,
     pub(super) pointee_route: Option<PointeeRoute>,
     pub(super) contextual_roster: Option<ContextualStartupRoster>,
-    pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
-    pub(super) contextual_observed: bool,
     pub(super) mixed_context: Option<MixedContextStartup>,
     pub(super) ranked_target: Option<PreparedCallable>,
     pub(super) ranked_observations: Vec<StartupProofObservation>,
@@ -128,7 +128,7 @@ impl StartUpSearch {
             #[cfg(test)]
             selected_in_order: Vec::new(),
             work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
-            pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(), wide_rank_recipe: None, wide_rank_observations: Vec::new(), pending_wide_forward: None,
+            pointee_route: None, contextual_roster: None, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(), wide_rank_recipe: None, wide_rank_observations: Vec::new(), pending_wide_forward: None,
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
@@ -249,7 +249,7 @@ impl StartUpSearch {
 
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
-            && (self.finish_dormant_startup || (self.contextual_route.is_some() && !self.contextual_observed)
+            && (self.finish_dormant_startup
                 || self.contextual_roster.as_ref().is_some_and(|roster| !roster.pending.is_empty())
                 || self.mixed_context.as_ref().is_some_and(|route| !route.finished)
                 || self.pending_named_startup_observation()
