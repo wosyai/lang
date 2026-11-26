@@ -42,6 +42,8 @@ mod leased_build;
 mod rooted_llvm;
 #[path = "source_snapshot/installed_git_lease.rs"]
 mod installed_git_lease;
+#[path = "source_snapshot/process_diagnostics.rs"]
+mod process_diagnostics;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -203,7 +205,11 @@ async fn materialize_project(
 async fn main() -> Result<()> {
     let process = Instant::now();
     let mut args = std::env::args().skip(1);
-    let project = PathBuf::from(args.next().ok_or("expected project path")?);
+    let first = args.next().ok_or("expected project path")?;
+    if matches!(first.as_str(), "--fixture-diagnostic-client" | "--fixture-diagnostic-peer") {
+        return process_diagnostics::run(&first, &mut args).await;
+    }
+    let project = PathBuf::from(first);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
     if selection.as_deref() == Some("--observe-installed-git-base") {
