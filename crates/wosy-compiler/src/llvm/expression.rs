@@ -839,8 +839,8 @@ fn emit_prepared_call<'ctx, 'module>(
         }
     });
     if let Some(backing) = backing_route {
-        if !arguments.is_empty() || !parameters.is_empty() {
-            return Err("closed fixed view call gained arguments".into());
+        if arguments.len() != parameters.len() || !matches!(parameters.as_slice(), [] | [ScalarType::U8]) {
+            return Err("closed fixed view call changed its scalar inputs".into());
         }
         let ScalarType::Callable { outputs, .. } = &state.signatures[target] else {
             return Err("fixed view callable lost ordinary signature".into());
@@ -864,12 +864,17 @@ fn emit_prepared_call<'ctx, 'module>(
         let callee = state.functions[target];
         let kind = callee.get_type();
         if callee.get_linkage() != Linkage::Internal || kind.get_return_type().is_some()
-            || !matches!(kind.get_param_types().as_slice(), [first, second]
-                if first.is_pointer_type() && second.is_pointer_type())
+            || kind.get_param_types().len() != parameters.len() + 2
+            || !kind.get_param_types()[parameters.len()..].iter().all(|slot| slot.is_pointer_type())
         {
             return Err("closed fixed view callable changed its destination lanes".into());
         }
-        state.builder.build_call(callee, &[record.into(), bytes.into()], "").map_err(builder_error)?;
+        let mut operands = emit_contextual_arguments(context, state, arguments, parameters, project)?
+            .into_iter().map(|value| take_basic(value).map(BasicMetadataValueEnum::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        operands.push(record.into());
+        operands.push(bytes.into());
+        state.builder.build_call(callee, &operands, "").map_err(builder_error)?;
         return Ok(EmitValue::Basic(record.into()));
     }
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;

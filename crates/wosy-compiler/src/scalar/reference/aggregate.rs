@@ -3057,6 +3057,132 @@ pub(crate) enum FixedViewBacking {
     Forward { call: usize },
 }
 
+type FixedViewUnsignedRange = (u64, u64);
+
+fn fixed_view_scalar_value(
+    sites: &FunctionCallSites, expression: &ScalarExpression, ordinal: OccurrenceOrdinal,
+    available: &HashMap<ByteSpan, FixedViewUnsignedRange>, source: &SourceIdentity, function_span: ByteSpan,
+) -> Option<FixedViewUnsignedRange> {
+    fn verify(
+        sites: &FunctionCallSites, expression: &ScalarExpression, ordinal: OccurrenceOrdinal,
+        available: &HashMap<ByteSpan, FixedViewUnsignedRange>, source: &SourceIdentity, function_span: ByteSpan,
+        budget: u8,
+    ) -> Option<FixedViewUnsignedRange> {
+        let output = sites.structure.checked_types.expressions.get(&ordinal)?;
+        let maximum = match output {
+            ScalarType::Bool => 1,
+            ScalarType::U8 => u8::MAX.into(),
+            ScalarType::U16 => u16::MAX.into(),
+            ScalarType::U32 => u32::MAX.into(),
+            ScalarType::U64 => u64::MAX,
+            _ => return None,
+        };
+        if budget == 0 { return None; }
+        let child = |edge| match sites.structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
+            Some(OccurrenceNode::Expression(value)) => Some(*value),
+            _ => None,
+        };
+        let check = |value: &ScalarExpression, ordinal| verify(sites, value, ordinal, available, source, function_span, budget - 1);
+        let branch = |syntax: &ScalarBlock, edge| {
+            let [ScalarBlockItem::Expression(value)] = syntax.items.as_slice() else { return None; };
+            let Some(OccurrenceNode::Block(block)) =
+                sites.structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) else { return None; };
+            let Some(OccurrenceNode::Expression(output)) = sites.structure.edges.get(&(
+                OccurrenceParent::Block(*block), OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+            )) else { return None; };
+            if syntax.unsafe_context { return None; }
+            check(value, *output)
+        };
+        let (minimum, high) = match expression {
+            ScalarExpression::Integer { value, .. } if output != &ScalarType::Bool => {
+                let exact = u64::try_from(value).ok()?;
+                (exact, exact)
+            }
+            ScalarExpression::Boolean { value, .. } if output == &ScalarType::Bool => {
+                let exact = u64::from(*value);
+                (exact, exact)
+            }
+            ScalarExpression::Name { .. } => match sites.prepared_plain_name(ordinal) {
+                Some(PlainNameIdentity::Lexical(id)) if &id.source == source && id.function_span == function_span =>
+                    *available.get(&id.declaration_span)?,
+                _ => return None,
+            },
+            ScalarExpression::Binary { operator, left, right, .. } => {
+                let left_id = child(OccurrenceEdge::BinaryLeft)?;
+                let right_id = child(OccurrenceEdge::BinaryRight)?;
+                let (low, high) = check(left, left_id)?;
+                let (operand_low, operand_high) = check(right, right_id)?;
+                let unsigned = |id| matches!(sites.structure.checked_types.expressions.get(&id),
+                    Some(ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64));
+                // LLVM selects integer signedness from the leftmost operand
+                // for nested arithmetic; require an enrolled unsigned local
+                // on that precise path, rather than assuming the output type
+                // alone controls div/rem or comparison lowering.
+                let unsigned_arithmetic_left = || {
+                    let mut node = left.as_ref();
+                    let mut path = left_id;
+                    loop {
+                        match node {
+                            ScalarExpression::Name { .. } => return unsigned(path),
+                            ScalarExpression::Binary { left, .. } => {
+                                let Some(OccurrenceNode::Expression(next)) = sites.structure.edges.get(&(
+                                    OccurrenceParent::Expression(path), OccurrenceEdge::BinaryLeft,
+                                )) else { return false; };
+                                node = left;
+                                path = *next;
+                            }
+                            _ => return false,
+                        }
+                    }
+                };
+                match operator {
+                    BinaryOperator::GreaterEqual if output == &ScalarType::Bool
+                        && matches!(left.as_ref(), ScalarExpression::Name { .. }) && unsigned(left_id)
+                        && matches!(right.as_ref(), ScalarExpression::Name { .. }) && unsigned(right_id) =>
+                        (0, 1),
+                    BinaryOperator::Add if output != &ScalarType::Bool => (
+                        low.checked_add(operand_low)?, high.checked_add(operand_high)?,
+                    ),
+                    BinaryOperator::Divide if output != &ScalarType::Bool && unsigned_arithmetic_left()
+                        && operand_low == operand_high && operand_low != 0 =>
+                        (low / operand_low, high / operand_low),
+                    BinaryOperator::Remainder if output != &ScalarType::Bool && unsigned_arithmetic_left()
+                        && operand_low == operand_high && operand_low != 0 =>
+                        (0, high.min(operand_low - 1)),
+                    _ => return None,
+                }
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                let guard = child(OccurrenceEdge::Condition)?;
+                if sites.structure.checked_types.expressions.get(&guard) != Some(&ScalarType::Bool) {
+                    return None;
+                }
+                check(condition, guard)?;
+                let (left_low, left_high) = branch(then_branch, OccurrenceEdge::ThenBranch)?;
+                let (right_low, right_high) = branch(else_branch, OccurrenceEdge::ElseBranch)?;
+                (left_low.min(right_low), left_high.max(right_high))
+            }
+            _ => return None,
+        };
+        (high <= maximum).then_some((minimum, high))
+    }
+    verify(sites, expression, ordinal, available, source, function_span, 12)
+}
+
+fn exact_fixed_view_arguments(body: &Body<'_>, function: &ScalarFunction, call: OccurrenceOrdinal, types: &[ScalarType]) -> bool {
+    let Some(signature) = body.sites.checked_call_signatures.get(&call) else { return false; };
+    if signature.parameters != types || body.sites.boundary.parameters.len() != types.len() { return false; }
+    types.iter().enumerate().all(|(slot, ty)| {
+        let formal = &body.sites.boundary.parameters[slot];
+        let Some(OccurrenceNode::Expression(actual)) = body.sites.structure.edges.get(&(
+            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
+        )) else { return false; };
+        formal.ty == *ty && body.sites.structure.checked_types.expressions.get(actual) == Some(ty)
+            && matches!(body.sites.prepared_plain_name(*actual), Some(PlainNameIdentity::Lexical(id))
+                if &id.source == body.source && id.function_span == function.span && id.declaration_span == formal.span)
+    })
+}
+
 fn seal_fixed_view_backing<'a>(
     reservations: &AggregateReservations,
     module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -3139,8 +3265,8 @@ fn seal_fixed_view_backing<'a>(
             let ScalarType::Callable { parameters, outputs } = &producer.signature else { return None; };
             let [returned] = outputs.outputs.as_slice() else { return None; };
             let ScalarType::Struct(structure) = &returned.ty else { return None; };
-            if !parameters.is_empty() { return None; }
-            let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::StructLiteral { fields, .. })]
+            if !matches!(parameters.as_slice(), [] | [ScalarType::U8]) || producer.body.unsafe_context { return None; }
+            let [ScalarBlockItem::LocalBinding(binding), local_items @ .., ScalarBlockItem::Expression(ScalarExpression::StructLiteral { fields, .. })]
                 = producer.body.items.as_slice() else { return None; };
             let [local] = binding.receivers.as_slice() else { return None; };
             let ScalarType::Array { element, length, .. } = &local.ty else { return None; };
@@ -3149,15 +3275,26 @@ fn seal_fixed_view_backing<'a>(
                     if elements.len() as u64 == *length && elements.iter().all(|value| matches!(value, ScalarExpression::Integer { .. })))
             { return None; }
             let sites = origin.sites;
-            let root = block_output(sites, sites.structure.root, 1)?;
+            let mut available = sites.boundary.parameters.iter().map(|formal| {
+                (formal.span, (0, u64::from(u8::MAX)))
+            }).collect::<HashMap<_, _>>();
+            let scalar = |value: &ScalarExpression, ordinal, available: &HashMap<_, _>| fixed_view_scalar_value(
+                sites, value, ordinal, available, origin.source, producer.span,
+            );
+            let same_backing = |backing| sites.structure.checked_types.places.get(&backing) == Some(&local.ty)
+                && matches!(sites.prepared_named_place_root(backing), Some(NamedPlaceRootIdentity::Lexical(id))
+                    if &id.source == origin.source && id.function_span == producer.span && id.declaration_span == local.name_span);
+            let root = block_output(sites, sites.structure.root, local_items.len() + 1)?;
             if sites.structure.checked_types.expressions.get(&root) != Some(&returned.ty) { return None; }
             let mut field_id = None;
+            let mut scalar_fields = Vec::new();
             for (slot, field) in fields.iter().enumerate() {
                 let occurrence = expression(sites, OccurrenceParent::Expression(root), OccurrenceEdge::AggregateField(slot))?;
                 let id = sites.structure.literal_fields.get(&occurrence)?;
                 if &id.structure != structure { return None; }
                 let field_type = sites.structure.checked_types.expressions.get(&occurrence)?;
-                if ordinary_value(field_type) && matches!(field.value, ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. }) {
+                if ordinary_value(field_type) {
+                    scalar_fields.push((&field.value, occurrence));
                     continue;
                 }
                 if !matches!(field_type, ScalarType::RawPointer(inner) if **inner == ScalarType::U8)
@@ -3171,20 +3308,58 @@ fn seal_fixed_view_backing<'a>(
                 let raw_ordinal = block_output(sites, block_child(sites, occurrence)?, 0)?;
                 let place = place_edge(sites, OccurrenceParent::Expression(raw_ordinal), OccurrenceEdge::ExpressionPlace)?;
                 let backing = place_edge(sites, OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase)?;
-                if sites.structure.checked_types.places.get(&backing) != Some(&local.ty)
-                    || !matches!(sites.prepared_named_place_root(backing), Some(NamedPlaceRootIdentity::Lexical(id))
-                        if &id.source == origin.source && id.function_span == producer.span && id.declaration_span == local.name_span)
-                { return None; }
+                if !same_backing(backing) { return None; }
             }
-            Some((field_id?, local, root.0, &returned.ty))
+            let field = field_id?;
+            let scalar_domain_is_closed = (|| {
+                let root_parent = OccurrenceParent::Block(sites.structure.root);
+                for (index, step) in local_items.iter().enumerate() {
+                    let item = index + 1;
+                    match step {
+                        ScalarBlockItem::LocalBinding(binding) => {
+                            let [receiver] = binding.receivers.as_slice() else { return None; };
+                            if binding.is_allocation || !ordinary_value(&receiver.ty) { return None; }
+                            let domain = scalar(&binding.value, expression(sites, root_parent,
+                                OccurrenceEdge::BindingRoot { item, output: 0 })?, &available)?;
+                            available.insert(receiver.name_span, domain);
+                        }
+                        ScalarBlockItem::Assignment(assignment) => {
+                            let [target] = assignment.targets.as_slice() else { return None; };
+                            let ScalarPlace::Index { index, .. } = &target.place else { return None; };
+                            if !matches!(index.as_ref(), ScalarExpression::Integer { value, .. }
+                                if value >= &0.into() && value < &(*length).into())
+                                || !matches!(assignment.values.as_slice(), [value] if value == &assignment.value)
+                            { return None; }
+                            let place = place_edge(sites, root_parent, OccurrenceEdge::AssignmentDestination { item, destination: 0 })?;
+                            if !same_backing(place_edge(sites, OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase)?)
+                                || sites.structure.checked_types.places.get(&place) != Some(&ScalarType::U8)
+                                { return None; }
+                            scalar(&assignment.value, expression(sites, root_parent,
+                                OccurrenceEdge::AssignmentRhs { item, output: 0 })?, &available)?;
+                        }
+                        _ => return None,
+                    }
+                }
+                for (field, ordinal) in scalar_fields {
+                    scalar(field, ordinal, &available)?;
+                }
+                Some(())
+            })().is_some();
+            Some((field, local, root.0, &returned.ty, parameters.as_slice(), scalar_domain_is_closed))
         };
-        let Some((returned_field, local, record, returned_ty)) = prove_origin() else { continue; };
+        let Some((returned_field, local, record, returned_ty, parameters, scalar_domain_is_closed)) =
+            prove_origin() else { continue; };
+        if !scalar_domain_is_closed {
+            return Err(format!("returned fixed view has no sealed scalar and index domain in {:?}", origin.source));
+        }
         let prove_uses = || {
             let (wrapper, forwarded) = incoming(key)?;
             let (wrapper_decl, wrapper_fn) = function(wrapper)?;
             if wrapper.2.is_none() || !crate::scalar::typecheck::is_module_private_name(&wrapper_decl.name) { return None; }
-            let wrapper_sites = bodies.get(&wrapper)?.sites;
-            if !matches!(wrapper_fn.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] if arguments.is_empty())
+            let wrapper_body = bodies.get(&wrapper)?;
+            let wrapper_sites = wrapper_body.sites;
+            if !matches!(wrapper_fn.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] if arguments.len() == parameters.len())
+                || !exact_fixed_view_arguments(wrapper_body, wrapper_fn, forwarded, parameters)
                 || block_output(wrapper_sites, wrapper_sites.structure.root, 0) != Some(forwarded)
                 || wrapper_sites.structure.checked_types.expressions.get(&forwarded) != Some(returned_ty)
             { return None; }
@@ -3196,7 +3371,8 @@ fn seal_fixed_view_backing<'a>(
                 = sink_fn.body.items.as_slice() else { return None; };
             let [local_result] = receiver.receivers.as_slice() else { return None; };
             if &local_result.ty != returned_ty || receiver.is_allocation
-                || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.is_empty())
+                || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.len() == parameters.len())
+                || !exact_fixed_view_arguments(sink_body, sink_fn, obtain, parameters)
                 || expression(sites, OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 }) != Some(obtain)
             { return None; }
             let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] = read.items.as_slice() else { return None; };
@@ -7414,9 +7590,8 @@ fn closed_aggregates<'a>(
         // owning-reference flow. It must see its prepared producer, selected
         // wrapper and lexical sink even when there is no legacy observation.
         let fixed_view_candidate = match (arm, body.body.items.as_slice()) {
-            (None, [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(
-                ScalarExpression::StructLiteral { .. } | ScalarExpression::Block(_),
-            )])
+            (None, [ScalarBlockItem::LocalBinding(_), .., ScalarBlockItem::Expression(ScalarExpression::StructLiteral { .. })])
+            | (None, [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(ScalarExpression::Block(_))])
             | (Some(_), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })]) => true,
             _ => false,
         };
