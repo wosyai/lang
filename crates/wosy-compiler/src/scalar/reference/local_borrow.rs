@@ -1888,9 +1888,11 @@ unit() examine = fn {
     u16[2] owner = [7, 9];
     *!(u16[2]) parent = &!owner;
     *u16 child = &(*parent)[0];
+    u16 independent = 13;
     u16 observed = *child;
     owner[1] = 11;
     observed;
+    independent;
 };
 %%end";
         for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -1922,6 +1924,10 @@ unit() examine = fn {
             assert!(parent.origin_place.projections.is_empty());
             assert!(matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_),
                 ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })]));
+            let live = points.iter().find(|point| matches!(&point.kind,
+                CfgPointKind::Evaluate(ScalarExpression::Integer { value, .. }) if value == &13.into())).unwrap();
+            assert_eq!(sealed.conflicts(&place.binding, live.id, 1, points, AccessMode::Shared, None),
+                Some(vec![points[child.0].source_span.clone()]));
             COUNTS.with(|counts| counts.set([0; 9]));
             let actual = definitive(&mut staged);
             let counts = COUNTS.with(|counts| counts.get());
