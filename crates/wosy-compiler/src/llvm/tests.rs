@@ -770,7 +770,7 @@ fn emit_initializer_test_input(
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
             super::PartitionMetadata::Full,
-            &[],
+            None,
         ),
     ]
 }
@@ -1183,7 +1183,7 @@ fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts()
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
                 super::PartitionMetadata::Full,
-                &[],
+                None,
             )
         };
         let region = prepared.initialization_region(0).unwrap();
@@ -1282,7 +1282,7 @@ i32 nested = unsafe { echo(33) };
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
                 super::PartitionMetadata::Full,
-                &[],
+                None,
             )
             .unwrap()
             .to_text(),
@@ -3021,7 +3021,7 @@ select = overload {
             },
             None,
             super::PartitionMetadata::Full,
-            &[],
+            None,
         )
         .unwrap_err();
         assert!(
@@ -7094,7 +7094,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
             super::PartitionMetadata::Full,
-            &[],
+            None,
         )
         .unwrap_err();
         assert_eq!(

@@ -5027,6 +5027,10 @@ fn fixed_projected_reference_keeps_its_local_loan_live_until_last_use() {
 fn singleton_checked_pointer_store_keeps_projected_local_loan_live() {
     for (install, uses, conflict) in [
         ("parcel.item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
+        // Copying the handle out of its field gives the alias its own last use.
+        ("parcel.item = &value;", "*u8 seen = parcel.item; parcel.item = null; value = 8; seen;", true),
+        ("parcel.item = &value;", "*u8 seen = parcel.item; parcel.item = null; seen; value = 8;", false),
+        ("parcel.item = &value;", "value = 8; *u8 seen = parcel.sibling; seen;", false),
         ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
         ("*!Bag writer = &!parcel; (*writer).item = &value;", "*u8 seen = parcel.item; seen; value = 8;", false),
         ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.sibling; seen;", false),

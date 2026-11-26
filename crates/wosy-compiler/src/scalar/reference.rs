@@ -8102,11 +8102,57 @@ struct LexicalConflictMemo {
     retained: usize,
 }
 
+// A conservative use relation for directly named, one-field carriers. Forget
+// branches, writes and kills here; only the existing CFG walk can prove a
+// candidate unreachable on a particular path. A read into a lexical alias is
+// a use of the field, not a transfer of the alias's subsequent uses back to it.
+#[derive(Default)]
+struct FieldCarrierReads {
+    whole: HashMap<ReferenceBindingId, CfgPointId>,
+    fields: HashMap<ReferenceBindingId, BTreeMap<ScalarStructFieldId, CfgPointId>>,
+    opaque: Option<CfgPointId>,
+}
+
+impl FieldCarrierReads {
+    fn record(&mut self, point: &ReferenceFlowPoint) {
+        match &point.kind {
+            CfgPointKind::Read { binding } => {
+                self.whole.insert(binding.clone(), point.id);
+            }
+            CfgPointKind::ReadPlace { candidates, pointer_point, reads_origin, .. } => {
+                if pointer_point.is_some() && candidates.is_empty()
+                    && (*reads_origin || point.possible_origins.is_none())
+                { self.opaque = Some(point.id); }
+                for place in candidates { self.record_place(place, point.id); }
+            }
+            CfgPointKind::Borrow { place, .. } | CfgPointKind::Move { place, .. } =>
+                self.record_place(place, point.id),
+            _ => {}
+        }
+    }
+
+    fn record_place(&mut self, place: &ReferencePlaceId, at: CfgPointId) {
+        match place.projections.first() {
+            Some(ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))) => {
+                self.fields.entry(place.binding.clone()).or_default().insert(field.clone(), at);
+            }
+            _ => { self.whole.insert(place.binding.clone(), at); }
+        }
+    }
+
+    fn candidate(&self, from: CfgPointId, binding: &ReferenceBindingId, field: &ScalarStructFieldId) -> bool {
+        self.opaque.is_some_and(|p| p > from)
+            || self.whole.get(binding).is_some_and(|p| *p > from)
+            || self.fields.get(binding).and_then(|fields| fields.get(field)).is_some_and(|p| *p > from)
+    }
+}
+
 struct ConflictLiveness<'a> {
     points: &'a [ReferenceFlowPoint],
     scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     strictly_forward: bool,
     lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
+    fields: std::cell::OnceCell<FieldCarrierReads>,
 }
 
 impl<'a> ConflictLiveness<'a> {
@@ -8116,8 +8162,25 @@ impl<'a> ConflictLiveness<'a> {
         strictly_forward: bool,
         branched: bool,
     ) -> Self {
-        Self { points, scope_exits, strictly_forward,
+        Self { points, scope_exits, strictly_forward, fields: Default::default(),
             lexical: (strictly_forward && branched).then(Default::default) }
+    }
+
+    fn projected_after(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
+        if self.strictly_forward {
+            if let [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =
+                place.projections.as_slice()
+            {
+                let fields = self.fields.get_or_init(|| {
+                    let mut reads = FieldCarrierReads::default();
+                    for point in self.points { reads.record(point); }
+                    reads
+                });
+                if !fields.candidate(from, &place.binding, field) { return false; }
+            }
+        }
+        reference_holder_read_reachable(self.points, self.scope_exits, self.strictly_forward,
+            from, &place.binding, Some(place))
     }
 
     fn lexical_after(&self, from: CfgPointId, binding: &ReferenceBindingId) -> bool {
@@ -8600,10 +8663,7 @@ fn conflicting_live_loan(
         for origin in &row.origins {
             if let Some(loan) = conflicting_loan(facts, *origin, &place, access) {
                 if declared_local_loan(&facts[origin.0]).is_some()
-                    && !*reachable.get_or_insert_with(|| reference_holder_read_reachable(
-                        liveness.points, liveness.scope_exits, liveness.strictly_forward,
-                        point, &row.place.binding, Some(&row.place),
-                    ))
+                    && !*reachable.get_or_insert_with(|| liveness.projected_after(point, &row.place))
                 {
                     continue;
                 }
