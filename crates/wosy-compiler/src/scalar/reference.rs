@@ -7049,8 +7049,9 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), usize>> {
-        if self.modules.len() != if provider.is_some() { 2 } else { 1 }
+    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), usize>> {
+        if (provider.is_some() && dormant_self.is_some())
+            || self.modules.len() != if provider.is_some() { 2 } else { 1 }
             || provider.is_some_and(|source| source == caller || source.project != caller.project || source.package != caller.package)
         { return None; }
         let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), 0usize))
@@ -7081,13 +7082,18 @@ impl ProjectCallSiteResults {
                 }
             }
             charge_call_work(&mut work, module.functions.len())?;
-            for function in module.functions.values() {
+            for (&item, function) in &module.functions {
                 charge_call_work(&mut work, function.arms.len())?;
                 for body in std::iter::once(function).chain(&function.arms) {
                     charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
                         .checked_add(body.callable_escapes.len())?)?;
                     if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
-                        || body.sites.iter().any(|site| resolved(&site.target, &startup_uses))
+                        || body.sites.iter().any(|site| resolved(&site.target, &startup_uses)
+                            && !matches!((&site.target, dormant_self),
+                                (ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration },
+                                    Some((self_item, self_span)))
+                                    if source == caller && &module.initialization.source == caller
+                                        && item == self_item && *declaration_span == self_span && std::ptr::eq(body, function)))
                         || body.allocation_length_call_targets.values().any(|call| resolved(call, &startup_uses))
                     { return None; }
                 }

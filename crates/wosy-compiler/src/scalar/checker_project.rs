@@ -9925,6 +9925,18 @@ impl PreparedScalarOrderedCheck {
         run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Mixed).map_err(configured_ordered_error)
     }
 
+    /// One real bare scalar startup activation and one independent ranked
+    /// theorem, without using a ranked certificate as an authored path.
+    #[doc(hidden)]
+    pub fn search_startup_with_invoked_bare_and_dormant_rank(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::InvokedAndDormantRank)
+            .map_err(configured_ordered_error)
+    }
+
     /// Private actual root call to a completed same-package namespace owner.
     #[doc(hidden)]
     pub fn search_startup_with_qualified_named(
@@ -10007,7 +10019,7 @@ impl PreparedScalarOrderedCheck {
         }
         if !mandatory_startup_scalars.is_empty() {
             let incoming = calls.owned_direct_startup_callable_uses(&root.source, None,
-                mandatory_startup_scalars.iter().map(|(_, span)| (&root.source, *span)))
+                mandatory_startup_scalars.iter().map(|(_, span)| (&root.source, *span)), None)
                 .ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
             if mandatory_startup_scalars.iter().any(|(_, span)| incoming.get(&(&root.source, *span)) != Some(&1)) {
                 return Err(ScalarOrderedCheckerOutcome::Unsupported);
@@ -10225,7 +10237,7 @@ fn run_startup_authored_path(
 }
 
 #[cfg(feature = "internal-checker")]
-enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified }
+enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified, InvokedAndDormantRank }
 
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
@@ -10240,7 +10252,8 @@ fn run_private_named_after_startup(
         Some(project.modules.iter().find(|module| module.source != owner.source)
             .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
     } else { None };
-    let count = if matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
+    let mixed_rank = matches!(mode, StartupNamedMode::InvokedAndDormantRank);
+    let count = if mixed_rank || matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
     let mut named_definitions = Vec::new();
     for (proof_source, catalog) in catalogs {
         let is_provider = Some(proof_source) == provider;
@@ -10257,6 +10270,7 @@ fn run_private_named_after_startup(
         }
     }
     let mut plans = Vec::with_capacity(named_definitions.len());
+    let mut ranked = None;
     for (proof_source, is_provider, definition, query, name) in &named_definitions {
         let proof_source = *proof_source;
         let selected = owner.resolve_selected_proof(definition, *query)?;
@@ -10266,20 +10280,35 @@ fn run_private_named_after_startup(
         let body = plan.typed.body;
         if project.modules.get(plan.target.0).map(|module| &module.source) != Some(proof_source)
             || &plan.typed.target.source != proof_source
-            || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
             || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
-            || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
-            || !body.checker_pure_calling_frame() || !body.structure.checker_direct_targets.is_empty()
+            || !is_integer_type(plan.typed.result_type) || !body.checker_pure_calling_frame()
             || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
             || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
             || !plan.function.overload_arms.is_empty()
             || plans.iter().any(|previous: &PlannedModuleProof<'_>| previous.target == plan.target
                 || (previous.proof_source == plan.proof_source && previous.name == plan.name))
         { return Err(ProjectCheck::Unsupported); }
-        plans.push(plan);
+        if plan.typed.measure.is_some() {
+            if !mixed_rank || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0 {
+                return Err(ProjectCheck::Unsupported);
+            }
+            ranked = Some(plan);
+        } else {
+            if !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body) || !body.structure.checker_direct_targets.is_empty() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            plans.push(plan);
+        }
     }
+    if mixed_rank != ranked.is_some() || (mixed_rank && plans.len() != 1)
+        || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
+    { return Err(ProjectCheck::Unsupported); }
     let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
-        plans.iter().map(|plan| (plan.proof_source, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
+        plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
+        ranked.as_ref().map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
+    if ranked.as_ref().is_some_and(|plan| incoming.get(&(plan.proof_source, plan.function.name_span)) != Some(&0)) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let mut invoked = None;
     for plan in &plans {
         match incoming.get(&(plan.proof_source, plan.function.name_span)) {
@@ -10324,7 +10353,20 @@ fn run_private_named_after_startup(
                 SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
         }
         proof.complete()?;
-        NamedOrderedEvidence::finish_symbolic(proof)
+        let result = NamedOrderedEvidence::finish_symbolic(proof);
+        if let Some(plan) = &ranked {
+            // The original typed proof runs independently; no startup reach,
+            // no imported equality, no fake call/return or authored quota use.
+            let ranked = closed_ranked_evidence::<false>(&owner.source, startup_count, plan,
+                plan.typed.measure.ok_or(ProjectCheck::Unsupported)?)?;
+            let mut proof = ranked.symbolic();
+            proof.allow_summary = false;
+            active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,
+                SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+            proof.complete()?;
+            if result.0.is_some() || !result.1.is_empty() { return Err(ProjectCheck::Unsupported); }
+            (RankedOrderedEvidence::finish_symbolic(proof), Vec::new())
+        } else { result }
     } else { (None, Vec::new()) };
     Ok((MainFlowProofReceipt {
         active, directives: effects.records, diagnostics: evidence.observed.diagnostics, contextual_diagnostic: None,
@@ -15291,6 +15333,63 @@ mod tests {
                 assert!(prepare(&main, &satisfied).search_startup_with_qualified_named(NonZeroUsize::MIN).unwrap().0.diagnostics.is_empty());
                 let early = main.replace("lib = namespace", &format!("core.require(false, {OUTPUT}); lib = namespace"));
                 assert!(matches!(prepare(&early, library).search_startup_with_qualified_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_mixed_actual_bare_keeps_independent_rank_after_cap() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-mixed-bare-dormant-rank");
+        let zero = OUTPUT.replace(".code = 1", ".code = 0");
+        let later = OUTPUT.replace(".code = 1", ".code = 19");
+        let program = format!(r#"%%start
+            u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+            u8(u8) echo = fn(value) {{ value }};
+            proof live for echo(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 5) decreases (entry) {{
+                if (entry < 3) {{ core.show(out == 5); }} else {{ core.use(rank(entry - 3)); }}
+            }}
+            u8 actual = echo(7);
+            core.require(actual == 8, {zero});
+            core.require(false, {later});
+        %%end"#);
+        let site_text = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                        scope, Vec::new()).ok().unwrap()
+                };
+                let old = prepare(&program).run().unwrap();
+                for cap in [1, 3] {
+                    let (observed, end) = prepare(&program)
+                        .search_startup_with_invoked_bare_and_dormant_rank(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(observed.directives, old.directives[..cap.min(2)]);
+                    assert_eq!(observed.directives[0].code(), &BigInt::from(0));
+                    let [actual] = observed.diagnostics.as_slice() else { panic!("actual bare diagnostic"); };
+                    assert_eq!(site_text(actual.invocation.call.range), "echo(7)");
+                    assert_eq!(actual.invocation.returned, BigInt::from(7));
+                    assert_eq!(actual.invocation.call, old.diagnostics[0].invocation.call);
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        let ranked = observed.symbolic_diagnostic.unwrap();
+                        let expected = old.symbolic_diagnostic.as_ref().unwrap();
+                        assert_eq!(ranked.returned, BigInt::from(4));
+                        assert_eq!((&ranked.proof, &ranked.goal, &ranked.output, &ranked.witness),
+                            (&expected.proof, &expected.goal, &expected.output, &expected.witness));
+                        assert_eq!(ranked.directive_position, cap.min(2));
+                    } else {
+                        assert!(observed.symbolic_diagnostic.is_none());
+                    }
+                    assert!(observed.additional_symbolic_diagnostics.is_empty());
+                }
+                let actual_rank = program.replace("%%end", &format!("u8 reached = descend(8); core.require(reached == 4, {later}); %%end"));
+                assert!(matches!(prepare(&actual_rank).search_startup_with_invoked_bare_and_dormant_rank(NonZeroUsize::MIN),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
