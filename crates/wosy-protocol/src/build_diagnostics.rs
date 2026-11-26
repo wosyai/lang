@@ -8,7 +8,7 @@ pub const BUILD_RECONCILIATION_VERSION: u16 = 1;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a
 /// wire authorization or a way for a request to switch roots.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildSourceSelection {
     pub root: NodeId,
     pub project: String,

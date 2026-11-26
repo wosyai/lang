@@ -117,7 +117,7 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 1;
                  PRAGMA cst.user_version = 1;",
             )?,
-            (1 | 2 | 3 | 4, 1) => {}
+            (1..=5, 1) => {}
             _ => return Err("incompatible local source state schema".into()),
         }
         if version < 2 {
@@ -141,6 +141,15 @@ impl SqliteSourceState {
                  );
                  UPDATE source_targets SET selected_generation = generation WHERE selected IS NOT NULL;
                  PRAGMA main.user_version = 4;",
+            )?;
+        }
+        if version < 5 {
+            // Keep the released root as a witness without retaining it as a
+            // pin. V4 tombstones predate reflection and have no recoverable
+            // root witness, so they have no new daemon intent to submit.
+            tx.execute_batch(
+                "ALTER TABLE source_pins ADD COLUMN released_root BLOB CHECK (root IS NULL OR released_root IS NULL);
+                 PRAGMA main.user_version = 5;",
             )?;
         }
         tx.commit()?;
@@ -243,17 +252,19 @@ impl SqliteSourceState {
         if state.selected != Some(captured.root)
             || epoch.is_some_and(|epoch| state.selected_generation != Some(epoch))
         { return Ok(None); }
-        if let Some(usage) = load_usage(&tx, captured.root)? { usage.admit(self.limits)?; }
-        let (delta, usage) = {
-            let mut read = StoredNodes::new(&tx)?;
-            let replay = read.closure(captured.root, self.limits)?;
-            Self::header(&self.project, &mut read, &captured.target, captured.root)?;
-            replay
-        };
+        let replay = Self::replay_confirmed_source(&tx, &self.project, &captured.target, captured.root, self.limits)?;
         tx.commit()?;
-        Ok(Some(SourceReplay {
-            source: PreparedSources { root: captured.root, delta, parsed: 0, reused: 0 }, usage, attempt: None,
-        }))
+        Ok(Some(replay))
+    }
+
+    fn replay_confirmed_source(
+        db: &Connection, project: &Path, target: &str, root: NodeId, limits: ClientSourceLimits,
+    ) -> Result<SourceReplay> {
+        if let Some(usage) = load_usage(db, root)? { usage.admit(limits)?; }
+        let mut read = StoredNodes::new(db)?;
+        let (delta, usage) = read.closure(root, limits)?;
+        Self::header(project, &mut read, target, root)?;
+        Ok(SourceReplay { source: PreparedSources { root, delta, parsed: 0, reused: 0 }, usage, attempt: None })
     }
 
     /// A complete resubmission for a reopened client and an empty or reopened

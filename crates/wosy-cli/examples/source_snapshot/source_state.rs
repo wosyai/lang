@@ -184,6 +184,13 @@ pub(super) async fn run(
             let pins = client.local_source_pins()?;
             serde_json::json!(pins.iter().map(local_pin).collect::<Vec<_>>())
         }
+        "reflect-durable-source-pin" | "reflect-durable-source-pin-exit" | "reflect-durable-source-pin-order" => {
+            let name = args.next().ok_or("expected fixture pin name")?;
+            match mode.as_str() {
+                "reflect-durable-source-pin-order" => super::pin_reflection::order(&mut client, dir, &target, &name).await?,
+                _ => super::pin_reflection::reflect(&mut client, dir, &name, mode.ends_with("-exit")).await?,
+            }
+        }
         "unpin-local" => {
             let name = args.next().ok_or("expected local fixture pin name")?;
             let root = NodeId::parse_hex(&args.next().ok_or("expected local fixture pin root")?)?;

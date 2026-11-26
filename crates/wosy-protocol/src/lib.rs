@@ -20,6 +20,29 @@ pub use build_diagnostics::{
 mod session_frame;
 pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 
+/// Trusted local adapter data, not a wire command or an authorization token.
+/// This describes named base source, not a final semantic SnapshotRoot pin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourcePinIntent {
+    pub source: BuildSourceSelection,
+    pub name: String,
+    pub generation: i64,
+    pub retention: SourcePinRetention,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourcePinRetention {
+    Retained,
+    Released,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SourcePinReflection {
+    ReplayRequired,
+    Superseded,
+    Durable(SourcePinIntent),
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NodeId(pub [u8; 32]);
 

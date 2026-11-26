@@ -23,7 +23,7 @@ def sqlite_state(version):
     with sqlite3.connect(database) as db:
         assert db.execute("PRAGMA user_version").fetchone() == (version,)
         fields = "hex(selected),hex(pending),generation"
-        if version == 4:
+        if version >= 4:
             fields += ",selected_generation"
         state = db.execute(f"SELECT {fields} FROM source_targets WHERE target = 'app'").fetchone()
     with sqlite3.connect(project / ".wosy/cst/nodes.sqlite") as nodes:
@@ -54,8 +54,8 @@ elif mode == "verify":
     assert observed["initial_generation"] == issued and observed["final_generation"] == issued + 1
     assert observed["pending_retained_selection"] and observed["delayed_reply_refused"]
     assert observed["old_terminal_replay_refused"]
-    assert sqlite_state(4) == (a, "", issued + 1, issued + 1)
+    assert sqlite_state(5) == (a, "", issued + 1, issued + 1)
     assert main.read_text() == initial
-    print("v3 migrated to v4, exact B attempt kept, re-acknowledged identical A has a fresh epoch")
+    print("v3 migrated to current schema, exact B attempt kept, re-acknowledged identical A has a fresh epoch")
 else:
     raise ValueError(mode)

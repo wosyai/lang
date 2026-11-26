@@ -408,6 +408,21 @@ impl SourceStore {
         Ok(self.begin_source_reads([root])?.map(|(tx, [read])| (tx, read)))
     }
 
+    /// Protect an already published closure while a durable pin update is
+    /// in flight. The same marker read also joins optimistic validation.
+    pub(super) fn begin_pin_update(&self, root: NodeId) -> Result<(Transaction, Option<SourceRead>)> {
+        let mut reads = self.source_reads.0.lock().expect("source reader registry");
+        let mut tx = self.tree.begin_with_mode(Mode::ReadWrite)?;
+        let read = if let Some(marker) = tx.get_for_update(&key(SNAPSHOT_ROOTS, root))? {
+            check_source_marker(root, &marker)?;
+            *reads.active.entry(root).or_default() += 1;
+            Some(SourceRead::new(&self.source_reads.0, root))
+        } else {
+            None
+        };
+        Ok((tx, read))
+    }
+
     pub(super) fn begin_source_reads<const N: usize>(
         &self, roots: [NodeId; N],
     ) -> Result<Option<(Transaction, [SourceRead; N])>> {
@@ -511,9 +526,10 @@ impl SourceStore {
         rows(&tx, pins::PINS, |pin_key, value| {
             if pin_count >= limit { return Err("source retention plan exceeded pin budget".into()); }
             pin_count += 1;
-            let (root, _) = pins::decode_pin_value(value)?;
-            if !published.contains(&root) { return Err("durable pin is outside published roots".into()); }
-            pinned.insert(root);
+            if let Some(root) = pins::decode_pin_value(value)?.retained_root() {
+                if !published.contains(&root) { return Err("durable pin is outside published roots".into()); }
+                pinned.insert(root);
+            }
             framed_hash(&mut epoch, pin_key);
             framed_hash(&mut epoch, value);
             Ok(())

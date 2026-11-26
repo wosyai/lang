@@ -1,7 +1,13 @@
 //! Explicit durable pins for admitted source roots, scoped to their workspace.
-use super::{key, published_source, read_source_config, source_top, Result, SourceStore, SNAPSHOT_ROOTS};
+use super::{
+    key, published_source, read_source_config, source_top, retention_plan::SourceRead,
+    source_proposal::{matches_source_scope, stage_reconciled_closure},
+    source_reconciliation::checked_published_source_header,
+    BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, SNAPSHOT_ROOTS,
+};
+use std::sync::Arc;
 use surrealkv::{Durability, LSMIterator, Mode, Transaction};
-use wosy_protocol::NodeId;
+use wosy_protocol::{Delta, NodeId, SourcePinIntent, SourcePinReflection, SourcePinRetention};
 
 pub(super) const PINS: u8 = 10;
 const OWNER_PREFIX_BYTES: usize = 34;
@@ -18,9 +24,46 @@ pub(super) fn workspace_of_config(tx: &Transaction, id: NodeId) -> Result<String
         .ok_or("pin scope is missing its entry namespace")?.project)
 }
 
-pub(super) fn decode_pin_value(bytes: &[u8]) -> Result<(NodeId, &[u8])> {
+pub(super) struct StoredPin<'a> {
+    root: NodeId,
+    owner: &'a [u8],
+    reflection: Option<Reflection<'a>>,
+}
+
+struct Reflection<'a> {
+    generation: i64,
+    target: &'a str,
+    retention: SourcePinRetention,
+}
+
+impl StoredPin<'_> {
+    pub fn retained_root(&self) -> Option<NodeId> {
+        self.reflection.as_ref().is_none_or(|pin| pin.retention == SourcePinRetention::Retained)
+            .then_some(self.root)
+    }
+}
+
+pub(super) fn decode_pin_value(bytes: &[u8]) -> Result<StoredPin<'_>> {
     let (root, owner) = bytes.split_first_chunk::<32>().ok_or("incomplete source pin")?;
-    Ok((NodeId(*root), owner))
+    let root = NodeId(*root);
+    // Legacy records append a filesystem path, which cannot begin with NUL.
+    let Some(body) = owner.strip_prefix(&[0]) else {
+        return Ok(StoredPin { root, owner, reflection: None });
+    };
+    let (&state, body) = body.split_first().ok_or("incomplete reflected source pin")?;
+    let retention = match state {
+        1 => SourcePinRetention::Retained,
+        2 => SourcePinRetention::Released,
+        _ => return Err("unsupported reflected source pin state".into()),
+    };
+    let (generation, body) = body.split_first_chunk::<8>().ok_or("incomplete reflected source pin generation")?;
+    let generation = i64::from_be_bytes(*generation);
+    let (length, body) = body.split_first_chunk::<4>().ok_or("incomplete reflected source pin target length")?;
+    let (target, owner) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+        .ok_or("incomplete reflected source pin target")?;
+    if generation <= 0 { return Err("invalid reflected source pin generation".into()); }
+    let target = std::str::from_utf8(target)?;
+    Ok(StoredPin { root, owner, reflection: Some(Reflection { generation, target, retention }) })
 }
 
 struct Owner {
@@ -43,11 +86,14 @@ impl Owner {
     }
 
     fn from_config(tx: &Transaction, id: NodeId) -> Result<Self> {
-        let path = workspace_of_config(tx, id)?;
+        Ok(Self::new(workspace_of_config(tx, id)?))
+    }
+
+    fn new(path: String) -> Self {
         let id = NodeId(blake3::derive_key("wosy source pin workspace v1", path.as_bytes()));
         let mut prefix = [0; OWNER_PREFIX_BYTES];
         prefix[..33].copy_from_slice(&key(PINS, id));
-        Ok(Self { path, prefix })
+        Self { path, prefix }
     }
 
     fn pin_key(&self, name: &str) -> Result<Vec<u8>> {
@@ -71,12 +117,29 @@ impl Owner {
         value
     }
 
-    fn pinned_root(&self, bytes: &[u8]) -> Result<NodeId> {
-        let (root, owner) = decode_pin_value(bytes)?;
-        if owner != self.path.as_bytes() {
+    fn stored<'a>(&self, bytes: &'a [u8]) -> Result<StoredPin<'a>> {
+        let pin = decode_pin_value(bytes)?;
+        if pin.owner != self.path.as_bytes() {
             return Err("source pin has the wrong workspace owner".into());
         }
-        Ok(root)
+        Ok(pin)
+    }
+
+    fn reflected_value(&self, intent: &SourcePinIntent) -> Result<Vec<u8>> {
+        let target = intent.source.target.as_bytes();
+        let length = u32::try_from(target.len())?.to_be_bytes();
+        let state = match intent.retention {
+            SourcePinRetention::Retained => 1,
+            SourcePinRetention::Released => 2,
+        };
+        let mut bytes = Vec::with_capacity(46 + target.len() + self.path.len());
+        bytes.extend_from_slice(&intent.source.root.0);
+        bytes.extend_from_slice(&[0, state]);
+        bytes.extend_from_slice(&intent.generation.to_be_bytes());
+        bytes.extend_from_slice(&length);
+        bytes.extend_from_slice(target);
+        bytes.extend_from_slice(self.path.as_bytes());
+        Ok(bytes)
     }
 }
 
@@ -89,8 +152,17 @@ impl SourceStore {
             let owner = Owner::for_update(&mut tx, root)?;
             let key = owner.pin_key(name)?;
             let pin = SourcePin { name: name.to_owned(), root };
-            let same = tx.get_for_update(&key)?.as_deref().map(|bytes| owner.pinned_root(bytes))
-                .transpose()? == Some(root);
+            let old = tx.get_for_update(&key)?;
+            let same = if let Some(value) = old.as_deref() {
+                let pin = owner.stored(value)?;
+                let same = pin.retained_root() == Some(root);
+                if pin.reflection.is_some() && !same {
+                    return Err("source pin is managed by an exact client intent".into());
+                }
+                same
+            } else {
+                false
+            };
 
             // Admit the already committed source closure first. The pinned
             // source graph is entirely inline with the value log disabled.
@@ -115,7 +187,9 @@ impl SourceStore {
             let owner = Owner::for_update(&mut tx, scope)?;
             let key = owner.pin_key(name)?;
             let Some(existing) = tx.get(&key)? else { return Ok(false); };
-            owner.pinned_root(&existing)?;
+            if owner.stored(&existing)?.reflection.is_some() {
+                return Err("source pin is managed by an exact client intent".into());
+            }
             tx.set_durability(Durability::Immediate);
             tx.delete(&key)?;
             match tx.commit().await {
@@ -134,10 +208,105 @@ impl SourceStore {
         scan.seek_first()?;
         while scan.valid() {
             let name = std::str::from_utf8(&scan.key().user_key()[OWNER_PREFIX_BYTES..])?.to_owned();
-            let root = owner.pinned_root(scan.value()?.as_ref())?;
-            pins.push(SourcePin { name, root });
+            if let Some(root) = owner.stored(scan.value()?.as_ref())?.retained_root() {
+                pins.push(SourcePin { name, root });
+            }
             scan.next()?;
         }
         Ok(pins)
     }
+}
+
+enum Plan {
+    ReplayRequired,
+    Superseded,
+    Confirmed,
+    Commit { transaction: Transaction, _read: Option<SourceRead> },
+}
+
+impl SourceStorageWorker {
+    /// Reconcile an exact SQLite intent supplied by the authorized local
+    /// adapter, not by an unbound socket peer. The root and reflected name
+    /// are committed together on cache loss. No SQLite transaction is held
+    /// while operating the daemon. This pins only admitted base source.
+    pub async fn reflect_source_pin(
+        &self, intent: SourcePinIntent, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
+    ) -> Result<SourcePinReflection> {
+        if intent.generation <= 0 { return Err("source pin intent has no accepted generation".into()); }
+        if replay.is_some() && intent.retention == SourcePinRetention::Released {
+            return Err("a released source pin cannot carry replay".into());
+        }
+        let slot = self.try_slot()?;
+        self.spawn_reserved_query(slot, None, move |worker| async move {
+            let intent = Arc::new(intent);
+            let replay = replay.map(Arc::new);
+            for conflicts in 0..=1 {
+                let requested = Arc::clone(&intent);
+                let payload = replay.clone();
+                let plan = worker.phase(None, move |store| plan_reflection(store, &requested, payload.as_deref(), limits)).await?;
+                match plan {
+                    Plan::ReplayRequired => return Ok(SourcePinReflection::ReplayRequired),
+                    Plan::Superseded => return Ok(SourcePinReflection::Superseded),
+                    Plan::Confirmed => break,
+                    Plan::Commit { mut transaction, _read } => match transaction.commit().await {
+                        Ok(()) => break,
+                        Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            let intent = Arc::try_unwrap(intent).ok().expect("reflection phase completed");
+            Ok(SourcePinReflection::Durable(intent))
+        }).await?
+    }
+}
+
+fn plan_reflection(
+    store: &SourceStore, intent: &SourcePinIntent, replay: Option<&Delta>, limits: BaseCstAdmissionLimits,
+) -> Result<Plan> {
+    let source = &intent.source;
+    let owner = Owner::new(source.project.clone());
+    let key = owner.pin_key(&intent.name)?;
+    let retained = intent.retention == SourcePinRetention::Retained;
+    let (mut tx, read) = if retained {
+        store.begin_pin_update(source.root)?
+    } else {
+        (store.tree.begin_with_mode(Mode::ReadWrite)?, None)
+    };
+    let previous = tx.get_for_update(&key)?;
+    let mut same = false;
+    if let Some(bytes) = previous.as_deref() {
+        let pin = owner.stored(bytes)?;
+        // A legacy name has independent direct retention and no local
+        // generation. Never infer permission to replace or release it.
+        let known = pin.reflection.ok_or("source pin name is already held by direct retention")?;
+        if known.generation > intent.generation { return Ok(Plan::Superseded); }
+        if known.generation == intent.generation {
+            if pin.root != source.root || known.target != source.target {
+                return Err("source pin generation has a different root or target".into());
+            }
+            if known.retention == SourcePinRetention::Released && retained { return Ok(Plan::Superseded); }
+            same = known.retention == intent.retention;
+        }
+    }
+
+    if retained {
+        if read.is_some() {
+            if !matches_source_scope(&checked_published_source_header(&tx, source.root)?, source) {
+                return Err("source pin root does not match its workspace and target".into());
+            }
+        } else {
+            let Some(replay) = replay else { return Ok(Plan::ReplayRequired); };
+            stage_reconciled_closure(&mut tx, source, replay, limits, &mut PublishReport::default())?;
+            tx.set(&super::key(SNAPSHOT_ROOTS, source.root), &source.root.0)?;
+        }
+    }
+    if same && (!retained || read.is_some()) { return Ok(Plan::Confirmed); }
+
+    // The new closure and pin are in one Immediate transaction. If that
+    // closure shares pre-existing dependencies, sync those before commit.
+    if retained { store.tree.flush_wal(true)?; }
+    tx.set_durability(Durability::Immediate);
+    tx.set(&key, &owner.reflected_value(intent)?)?;
+    Ok(Plan::Commit { transaction: tx, _read: read })
 }
