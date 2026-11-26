@@ -12338,6 +12338,7 @@ u8(u64, u64) no_local_index = fn(count, depth) {
     ReadMode mode = ReadMode::skip;
     bytes, value, mode = visit(bytes, 0, depth, value, mode);
     if (mode != ReadMode::skip) { core.system_panic(); };
+    unsafe { core.free(&bytes); };
     value
 };
 if (no_local_index(3, 2) != 23) { core.system_panic(); };

@@ -496,7 +496,10 @@ fn runtime_allocation_access<'ctx>(
             }
         }
     }
-    indexed.retain(|id| !unproved_writes.contains(id));
+    // The grouped root plan keeps addressing in the proven prefix; a later
+    // terminal release does not erase the checked constructor's extent.
+    indexed.retain(|id| !unproved_writes.contains(id)
+        || plan.is_some_and(|plan| plan.grouped_owning_extent_roots.contains(id)));
     let mut borrowed = RuntimeBorrowIndex::default();
     if checked_access {
         for (&point, site) in &reference_cfg.runtime_array_field_sites {

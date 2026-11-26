@@ -6136,24 +6136,103 @@ fn grouped_owning_formal(body: &Body<'_>) -> Option<ByteSpan> {
     Some(first.span)
 }
 
-fn exclude_grouped_roots_on_resolved_effect(
-    roots: &mut BTreeSet<ReferenceBindingId>,
-    effect: &CfgPointKind,
+#[derive(Default)]
+struct GroupedRootWindow {
+    last_use: Option<CfgPointId>,
+    first_effect: Option<CfgPointId>,
+}
+
+impl GroupedRootWindow {
+    fn read(&mut self, point: CfgPointId) {
+        self.last_use = Some(self.last_use.map_or(point, |last| last.max(point)));
+    }
+
+    fn invalidate(&mut self, point: CfgPointId) {
+        self.first_effect = Some(self.first_effect.map_or(point, |first| first.min(point)));
+    }
+
+    fn admits(&self, point: CfgPointId, opaque: Option<CfgPointId>, ordered: bool) -> bool {
+        let last_required = self.last_use.map_or(point, |last| last.max(point));
+        self.first_effect.into_iter().chain(opaque).all(|effect| ordered && last_required < effect)
+    }
+}
+
+fn record_grouped_root_effect(
+    roots: &mut BTreeMap<ReferenceBindingId, GroupedRootWindow>,
+    opaque: &mut Option<CfgPointId>,
+    point: &ReferenceFlowPoint,
 ) {
-    match effect {
+    let (candidates, whole_only) = match &point.kind {
         CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
-        | CfgPointKind::Invalidate { candidates, .. } => {
-            if candidates.is_empty() {
-                roots.clear();
-            } else {
-                for candidate in candidates {
-                    roots.remove(&candidate.place.binding);
+        | CfgPointKind::Invalidate { candidates, .. } => (Some(candidates.as_slice()), false),
+        CfgPointKind::AssignThrough { candidates, .. }
+        | CfgPointKind::MoveThrough { candidates, .. }
+        | CfgPointKind::DeferredMoveThrough { candidates, .. } => (Some(candidates.as_slice()), true),
+        CfgPointKind::Release { target: ReleaseTarget::Raw { .. } } => (Some(&[][..]), false),
+        _ => (None, false),
+    };
+    if let Some(candidates) = candidates {
+        if candidates.is_empty() {
+            *opaque = Some(opaque.map_or(point.id, |prior| prior.min(point.id)));
+        } else {
+            for candidate in candidates {
+                if whole_only && !candidate.place.projections.is_empty() { continue }
+                if let Some(window) = roots.get_mut(&candidate.place.binding) {
+                    window.invalidate(point.id);
                 }
             }
         }
-        CfgPointKind::Release { target: ReleaseTarget::Raw { .. } } => roots.clear(),
-        _ => {}
     }
+}
+
+fn grouped_owner_root_windows(
+    body: &Body<'_>, facts: &AggregateFlowResult, plan: &ClosedBody,
+) -> (BTreeMap<ReferenceBindingId, GroupedRootWindow>, Option<CfgPointId>, bool) {
+    let mut roots: BTreeMap<_, _> = facts.allocation_slots.keys().filter_map(|bind|
+        match &body.cfg.initial_points.get(bind.0)?.kind {
+            CfgPointKind::Bind { binding } if body.cfg.allocations.contains(binding) =>
+                Some((binding.clone(), GroupedRootWindow::default())),
+            _ => None,
+        }).collect();
+    let mut opaque = None;
+    let mut ordered = true;
+    for point in &body.cfg.points {
+        // Claim only simple monotone ordering in the resolved graph. A lower
+        // ID is necessarily prior to a higher ID on each reachable path.
+        ordered &= point.successors.iter().all(|next| point.id < *next);
+        record_grouped_root_effect(&mut roots, &mut opaque, point);
+        let mut read = |binding: &ReferenceBindingId| {
+            if let Some(window) = roots.get_mut(binding) { window.read(point.id); }
+        };
+        match &point.kind {
+            CfgPointKind::Read { binding } | CfgPointKind::Move { owner: binding, .. }
+            | CfgPointKind::DeferredMove { owner: binding, .. } => read(binding),
+            CfgPointKind::Borrow { place, .. } => read(&place.binding),
+            CfgPointKind::ReadPlace { candidates, .. } => {
+                for place in candidates { read(&place.binding); }
+            }
+            CfgPointKind::Assign { target, .. } => {
+                read(&target.binding);
+                if target.projections.is_empty() {
+                    let same_owner = facts.array_rebinds.get(&point.id)
+                        .and_then(|(call, _, destination)| facts.array_calls.get(call)
+                            .map(|(ordinal, _, source)| (ordinal, source, destination)))
+                        .is_some_and(|(ordinal, source, destination)| source == &target.binding
+                            && plan.same_array_rebinds.get(&ordinal.0) == Some(&destination.0));
+                    if !same_owner {
+                        if let Some(window) = roots.get_mut(&target.binding) { window.invalidate(point.id); }
+                    }
+                }
+            }
+            CfgPointKind::AssignThrough { candidates, .. }
+            | CfgPointKind::MoveThrough { candidates, .. }
+            | CfgPointKind::DeferredMoveThrough { candidates, .. } => {
+                for site in candidates { read(&site.place.binding); }
+            }
+            _ => {}
+        }
+    }
+    (roots, opaque, ordered)
 }
 
 fn grouped_owning_extent_calls(
@@ -6175,7 +6254,7 @@ fn grouped_owning_extent_calls(
     }).collect();
     if cohort.is_empty() { return }
     let mut calls = BTreeMap::<BodyKey, Vec<(BodyKey, usize, ByteSpan, bool)>>::new();
-    let mut roots = HashMap::<BodyKey, BTreeSet<ReferenceBindingId>>::new();
+    let mut roots = HashMap::<BodyKey, _>::new();
     cohort.retain(|key, _| {
         let Some(Some(users)) = ordinary.transport_uses.get(key) else { return false };
         if users.is_empty() { return false }
@@ -6191,30 +6270,13 @@ fn grouped_owning_extent_calls(
             }
             let incoming = body.sites.boundary.parameters.first().is_some_and(|formal|
                 formal.span == owner.declaration_span && matches!(formal.ty, ScalarType::RuntimeArray { .. }));
-            if !incoming && !roots.entry(caller).or_insert_with(|| {
-                let mut constructed: BTreeSet<_> = facts.allocation_slots.keys().filter_map(|bind|
-                    match &body.cfg.initial_points.get(bind.0)?.kind {
-                        CfgPointKind::Bind { binding } if body.cfg.allocations.contains(binding) => Some(binding.clone()),
-                        _ => None,
-                    }).collect();
-                let caller_plan = &result.bodies[&caller];
-                // Use precisely the resolved candidate union used by allocation
-                // planning; the original graph does not name destructive aliases.
-                for point in &body.cfg.points {
-                    match &point.kind {
-                        CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
-                            let same_owner = facts.array_rebinds.get(&point.id)
-                                .and_then(|(call, _, destination)| facts.array_calls.get(call)
-                                    .map(|(ordinal, _, source)| (ordinal, source, destination)))
-                                .is_some_and(|(ordinal, source, destination)| source == &target.binding
-                                    && caller_plan.same_array_rebinds.get(&ordinal.0) == Some(&destination.0));
-                            if !same_owner { constructed.remove(&target.binding); }
-                        }
-                        effect => exclude_grouped_roots_on_resolved_effect(&mut constructed, effect),
-                    }
+            if !incoming {
+                let (windows, opaque, ordered) = roots.entry(caller)
+                    .or_insert_with(|| grouped_owner_root_windows(body, facts, &result.bodies[&caller]));
+                if !windows.get(owner).is_some_and(|window| window.admits(point, *opaque, *ordered)) {
+                    return false;
                 }
-                constructed
-            }).contains(owner) { return false }
+            }
             sites.push((caller, ordinal, owner.declaration_span, incoming));
         }
         calls.insert(*key, sites);
@@ -10347,19 +10409,32 @@ mod tests {
                 creation_span: span, parent: None,
             },
         };
-        let mut roots = BTreeSet::from([root.clone(), sibling.clone()]);
+        let mut roots = BTreeMap::from([
+            (root.clone(), GroupedRootWindow::default()),
+            (sibling.clone(), GroupedRootWindow::default()),
+        ]);
+        let mut opaque = None;
+        let point = |id, kind| ReferenceFlowPoint {
+            id: CfgPointId(id), kind, scope: ReferenceScopeId(0), source_span: address_span.clone(),
+            successors: Default::default(), possible_origins: None,
+        };
         let release = |candidates| CfgPointKind::Release { target: ReleaseTarget::Checked {
             address_point: CfgPointId(0), candidates, address_span: address_span.clone(),
         }};
-        exclude_grouped_roots_on_resolved_effect(&mut roots, &release(vec![candidate]));
-        assert_eq!(roots, BTreeSet::from([sibling]));
-        exclude_grouped_roots_on_resolved_effect(&mut roots, &release(Vec::new()));
-        assert!(roots.is_empty());
-        roots.insert(root.clone());
-        exclude_grouped_roots_on_resolved_effect(&mut roots, &CfgPointKind::Release {
+        record_grouped_root_effect(&mut roots, &mut opaque, &point(8, release(vec![candidate])));
+        assert!(roots[&root].admits(CfgPointId(7), opaque, true));
+        assert!(!roots[&root].admits(CfgPointId(8), opaque, true));
+        assert!(!roots[&root].admits(CfgPointId(7), opaque, false));
+        assert!(roots[&sibling].admits(CfgPointId(8), opaque, true));
+        roots.get_mut(&root).unwrap().read(CfgPointId(9));
+        assert!(!roots[&root].admits(CfgPointId(7), opaque, true));
+        record_grouped_root_effect(&mut roots, &mut opaque, &point(7, release(Vec::new())));
+        assert!(!roots[&sibling].admits(CfgPointId(7), opaque, true));
+        record_grouped_root_effect(&mut roots, &mut opaque, &point(5, CfgPointKind::Release {
             target: ReleaseTarget::Raw { binding: root },
-        });
-        assert!(roots.is_empty());
+        }));
+        assert!(!roots[&sibling].admits(CfgPointId(5), opaque, true));
+        assert!(roots[&sibling].admits(CfgPointId(4), opaque, true));
     }
 
     #[test]
