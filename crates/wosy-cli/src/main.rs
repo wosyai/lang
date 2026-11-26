@@ -3858,19 +3858,43 @@ main_artifact = "main"
                 }
 
                 if scope == ScalarCheckerScope::CurrentPackage {
-                    // Short-circuit compound predicates remain outside this
-                    // history profile; do not coalesce their operand paths.
+                    // The same authored Require site is reached via two
+                    // genuinely distinct short-circuit decisions.
                     let compound = r#"%%start
                         unit(u8, u8) report = fn(left, right) {
                             if (left == 0 || right == 0) {
-                                core.require(false, { .stdout = "arm"; .stderr = ""; .code = 9; .files = []; });
+                                core.require(false, { .stdout = "true"; .stderr = ""; .code = 0; .files = []; });
+                            } else {
+                                core.require(false, { .stdout = "false"; .stderr = ""; .code = 9; .files = []; });
                             };
                         };
                     %%end"#;
                     fs::write(&source, compound).unwrap();
-                    assert_eq!(terminal(&[legacy()], scope, false), (Ok(9), b"arm".to_vec(), Vec::new()));
-                    let refused = terminal(&selected(1), scope, false);
+                    assert_eq!(terminal(&[legacy()], scope, false), (Ok(9), b"truefalse".to_vec(), Vec::new()));
+                    for (cap, expected, status) in [(1, "true", 0), (2, "truetrue", 0), (3, "truetruefalse", 9), (8, "truetruefalse", 9)] {
+                        let selected = selected(cap);
+                        let report = selected[0].outcome.as_ref().unwrap();
+                        assert_eq!(report.directives.len(), cap.min(3));
+                        if cap > 1 { assert_eq!(report.directives[0].directive, report.directives[1].directive); }
+                        assert_eq!(terminal(&selected, scope, false), (Ok(status), expected.as_bytes().to_vec(), Vec::new()));
+                    }
+                    let files_case = compound.replace(".code = 0; .files = [];", r#".code = left;
+                        .files = [{ .path = "short.json"; .state = left; }];"#);
+                    assert_ne!(files_case, compound);
+                    fs::write(&source, &files_case).unwrap();
+                    assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"true".to_vec(), Vec::new()));
+                    assert_eq!(files()["short.json"], b"{\"type\":{\"kind\":\"u8\"},\"value\":0}\n");
+                    clean();
+                    let refused = terminal(&selected(2), scope, false);
                     assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty() && !state.exists());
+
+                    fs::write(&source, compound.replace(".code = 0; .files = [];", r#".code = 0;
+                        .files = [{ .path = "short.json"; .state = left; }];"#)).unwrap();
+                    assert_eq!(terminal(&selected(1), scope, false).0, Ok(0));
+                    assert_eq!(files().len(), 1);
+                    clean();
+                    let duplicate = terminal(&selected(2), scope, false);
+                    assert!(duplicate.0.is_err() && duplicate.1.is_empty() && duplicate.2.is_empty() && !state.exists());
                 }
 
                 let startup_witness = r#"%%start

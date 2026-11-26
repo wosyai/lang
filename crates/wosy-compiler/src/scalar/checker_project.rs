@@ -10585,6 +10585,8 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
             };
             matches!(body.structure.checker_branches.get(condition),
                 Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                || body.structure.checker_ordinary_booleans.get(condition)
+                    .is_some_and(super::checker_flow::call_free_history_boolean)
         })
         && witness_history_directives(body)
 }
@@ -31648,6 +31650,50 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             vec![source.clone()],
             inputs(),
         )
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_compound_history_retains_only_real_short_circuit_operands() {
+        use super::super::checker_flow::{search_closed_callable_histories, CallableHistoryCompletion, CallableHistoryStep};
+        let app = source("src/main.w", "private-short-circuit");
+        let program = r#"%%start
+            unit(u8, u8) report = fn(left, right) {
+                if (left == 0 || right == 0) {
+                    core.require(false, { .stdout = "true"; .stderr = ""; .code = 0; .files = []; });
+                } else {
+                    core.require(false, { .stdout = "false"; .stderr = ""; .code = 9; .files = []; });
+                };
+            };
+        %%end"#;
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let parsed = crate::parse_source(app.clone(), program.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty());
+            let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            let prepared = prepare_checker_project(vec![(declarations, Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout: layout }).unwrap();
+            let (_, calls) = prepared.parts();
+            let body = calls.function_body(0, 0, None).unwrap();
+            let work = std::cell::Cell::new(0);
+            let mut observed = Vec::new();
+            let ended = search_closed_callable_histories(body, IntegerRequirementEntry::Arbitrary, &work, None,
+                |failure, steps| {
+                    let branches = steps.iter().map(|step| match step {
+                        CallableHistoryStep::Branch(span, decision) =>
+                            (&program[span.start as usize..span.end as usize], *decision),
+                        _ => panic!("pure branch"),
+                    }).collect::<Vec<_>>();
+                    observed.push((body.occurrences[failure.directive.0].span, branches));
+                    Some(false)
+                }).unwrap();
+            assert!(matches!(ended, CallableHistoryCompletion::Exhausted(true, _)));
+            assert_eq!(observed.len(), 3);
+            assert_eq!(observed[0].0, observed[1].0);
+            assert_ne!(observed[1].0, observed[2].0);
+            assert_eq!(observed[0].1, [("left == 0", true), ("left == 0 || right == 0", true)]);
+            assert_eq!(observed[1].1, [("left == 0", false), ("right == 0", true), ("left == 0 || right == 0", true)]);
+            assert_eq!(observed[2].1, [("left == 0", false), ("right == 0", false), ("left == 0 || right == 0", false)]);
+        }
     }
 
     #[cfg(feature = "internal-checker")]
