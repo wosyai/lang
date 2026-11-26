@@ -71,6 +71,9 @@ enum Command {
         declared_package: bool,
         #[arg(long, help = "Also check each resolved dependency's independent primary target")]
         dependencies: bool,
+        #[cfg(feature = "private-check-cap-process")]
+        #[arg(long, hide = true)]
+        max_errors: Option<std::num::NonZeroUsize>,
     },
     Run {
         target: Option<String>,
@@ -148,14 +151,34 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(feature = "internal-checker")]
-        Command::Check { target, profile, main_flow_only, dependencies, .. } => {
+        Command::Check {
+            target, profile, main_flow_only, dependencies,
+            #[cfg(feature = "private-check-cap-process")]
+            max_errors,
+            ..
+        } => {
             // Clap rejects both scope flags. An omitted scope is exactly the explicit package scope.
             let scope = if main_flow_only {
                 ScalarCheckerScope::MainFlowOnly
             } else {
                 ScalarCheckerScope::CurrentPackage
             };
-            match check_command(target.as_deref(), &profile, scope, dependencies) {
+            let run_incumbent = || check_command(target.as_deref(), &profile, scope, dependencies);
+            #[cfg(not(feature = "private-check-cap-process"))]
+            let result = run_incumbent();
+            #[cfg(feature = "private-check-cap-process")]
+            let result = match max_errors {
+                None => run_incumbent(),
+                Some(limit) => check_and_publish(scope, dependencies, |root| {
+                    let load = if dependencies {
+                        configured_check::check_targets_with_private_authored_limit
+                    } else {
+                        configured_check::check_target_with_private_authored_limit
+                    };
+                    load(root, target.as_deref(), &profile, scope, limit)
+                }),
+            };
+            match result {
                 Ok(code) => ExitCode::from(code),
                 Err(error) => {
                     eprintln!("wosy: {error}");
@@ -1074,18 +1097,28 @@ fn render_project_diagnostics_to(
 fn check_command(
     target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dependencies: bool,
 ) -> Result<u8, String> {
+    check_and_publish(scope, dependencies, |root| {
+        if dependencies {
+            configured_check::check_target_with_dependencies(root, target, profile, scope)
+        } else {
+            match scope {
+                ScalarCheckerScope::MainFlowOnly => configured_check::check_target(root, target, profile, scope, Vec::new()),
+                ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, target, profile),
+            }.map(|receipt| vec![receipt])
+        }
+    })
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_and_publish(
+    scope: ScalarCheckerScope, dependencies: bool,
+    load: impl FnOnce(&std::path::Path) -> Result<Vec<configured_check::ConfiguredCheckReceipt>, configured_check::ConfiguredCheckLoadError>,
+) -> Result<u8, String> {
     use configured_check::ConfiguredCheckLoadError as LoadError;
 
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let receipts = if dependencies {
-        configured_check::check_target_with_dependencies(&root, target, profile, scope)
-    } else {
-        match scope {
-            ScalarCheckerScope::MainFlowOnly => configured_check::check_target(&root, target, profile, scope, Vec::new()),
-            ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(&root, target, profile),
-        }.map(|receipt| vec![receipt])
-    }.map_err(|failure| match failure {
+    let receipts = load(&root).map_err(|failure| match failure {
             LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
             LoadError::Manifest(error) => format!("check: invalid manifest: {error}"),
@@ -5128,7 +5161,7 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
         assert!(!project.root.join(".wosy").exists());
         let selected = Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).unwrap();
         assert!(matches!(selected.command, Command::Check {
-            target: Some(target), profile, main_flow_only: true, declared_package: false, dependencies: false,
+            target: Some(target), profile, main_flow_only: true, declared_package: false, dependencies: false, ..
         } if target == "app" && profile == "dev"));
     }
 

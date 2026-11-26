@@ -304,7 +304,7 @@ fn map_dependency_owners<T>(
 
 /// Private configured routes classify each exact prepared owner before
 /// publishing. No unbounded fallback for mixed proof/authored dependencies.
-#[cfg(test)]
+#[cfg(any(test, feature = "private-check-cap-process"))]
 pub(crate) fn check_targets_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
     limit: std::num::NonZeroUsize,
@@ -313,7 +313,7 @@ pub(crate) fn check_targets_with_private_authored_limit(
     Ok(run_private_prepared_owners(prepared, limit))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "private-check-cap-process"))]
 pub(crate) fn check_target_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
     limit: std::num::NonZeroUsize,
@@ -323,7 +323,7 @@ pub(crate) fn check_target_with_private_authored_limit(
     Ok(run_private_prepared_owners(vec![prepared], limit))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "private-check-cap-process"))]
 fn run_private_prepared_owners(
     prepared: Vec<PreparedConfiguredCheckReceipt>, limit: std::num::NonZeroUsize,
 ) -> Vec<ConfiguredCheckReceipt> {
