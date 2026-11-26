@@ -6895,7 +6895,7 @@ impl FunctionCallSites {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn checker_closed_calling_frame(&self) -> bool {
+    pub(super) fn checker_closed_calling_frame(&self) -> bool {
         self.checker_closed_frame_allowing_snapshots() && self.structure.checker_selected_snapshots.is_empty()
     }
 

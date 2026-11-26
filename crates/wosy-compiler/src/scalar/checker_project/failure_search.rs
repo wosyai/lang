@@ -37,6 +37,7 @@ pub(in super::super) struct StartUpSearch {
     selected: HashSet<FailurePath>,
     work: usize,
     invalid: bool,
+    pub(super) proof_free_scalar_initializers: bool,
     pub(super) named_target: Option<PreparedCallable>,
     pub(super) named_cross_source: bool,
     pub(super) named_observation: Option<StartupNamedObservation>,
@@ -44,7 +45,7 @@ pub(in super::super) struct StartUpSearch {
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, named_target: None, named_cross_source: false, named_observation: None }
+        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observation: None }
     }
 
     pub(in super::super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {
