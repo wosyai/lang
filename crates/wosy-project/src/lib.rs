@@ -8,7 +8,9 @@ use toml_edit::Item;
 #[cfg(test)]
 use toml_edit::DocumentMut;
 
+mod comptime_tools;
 pub mod packages;
+pub use comptime_tools::SelectedComptimeTools;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceIdentity {
@@ -628,6 +630,13 @@ impl ProjectConfiguration {
             .ok_or_else(|| format!("target {target} is missing from wosy.toml"))
     }
 
+    fn target_profile(&self, target: &str, profile: &str) -> Result<(&TargetConfig, &TargetProfile), String> {
+        let target_config = self.target_config(target)?;
+        let target_profile = target_config.profiles.get(profile)
+            .ok_or_else(|| format!("target {target} profile {profile} is missing"))?;
+        Ok((target_config, target_profile))
+    }
+
     pub fn artifact_profile(
         &self,
         target: &str,
@@ -641,11 +650,7 @@ impl ProjectConfiguration {
         ),
         String,
     > {
-        let target_config = self.target_config(target)?;
-        let target_profile = target_config
-            .profiles
-            .get(profile)
-            .ok_or_else(|| format!("target {target} profile {profile} is missing"))?;
+        let (target_config, target_profile) = self.target_profile(target, profile)?;
         let artifact = target_config
             .artifacts
             .get(&target_profile.main_artifact)
