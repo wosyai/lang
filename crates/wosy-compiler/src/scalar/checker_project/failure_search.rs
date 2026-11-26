@@ -42,6 +42,30 @@ pub(super) struct PointeeRoute {
     pub(super) pending_calls: HashSet<OccurrenceOrdinal>,
 }
 
+/// Original typed direct contextual edges and the number of activations
+/// required by the admitted straight-line startup. Distinct caller bodies
+/// may share occurrence ordinals; the prepared parent is part of the key.
+pub(super) struct ContextualStartupRoster {
+    pub(super) root_site: OccurrenceOrdinal,
+    pub(super) entry: PreparedCallable,
+    pub(super) pending: HashMap<(PreparedCallable, OccurrenceOrdinal), (PreparedCallable, usize)>,
+}
+
+impl ContextualStartupRoster {
+    pub(super) fn expects(&self, parent: PreparedCallable, site: OccurrenceOrdinal, target: PreparedCallable) -> bool {
+        self.pending.get(&(parent, site)).is_some_and(|&(expected, count)| expected == target && count != 0)
+    }
+
+    pub(super) fn observe(&mut self, parent: PreparedCallable, site: OccurrenceOrdinal, target: PreparedCallable) -> Option<()> {
+        let key = (parent, site);
+        let (expected, count) = self.pending.get_mut(&key)?;
+        if *expected != target { return None; }
+        *count = count.checked_sub(1)?;
+        if *count == 0 { self.pending.remove(&key); }
+        Some(())
+    }
+}
+
 pub(super) struct MixedContextStartup {
     pub(super) root_site: OccurrenceOrdinal,
     pub(super) entry_site: OccurrenceOrdinal,
@@ -70,6 +94,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) metered_frames: bool,
     pub(super) cited_routes: HashMap<PreparedCallable, (OccurrenceOrdinal, PreparedCallable)>,
     pub(super) pointee_route: Option<PointeeRoute>,
+    pub(super) contextual_roster: Option<ContextualStartupRoster>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
     pub(super) contextual_observed: bool,
     pub(super) mixed_context: Option<MixedContextStartup>,
@@ -86,7 +111,7 @@ impl StartUpSearch {
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
         Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
-            pointee_route: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
+            pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
@@ -194,6 +219,7 @@ impl StartUpSearch {
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
             && (self.finish_dormant_startup || (self.contextual_route.is_some() && !self.contextual_observed)
+                || self.contextual_roster.as_ref().is_some_and(|roster| !roster.pending.is_empty())
                 || self.mixed_context.as_ref().is_some_and(|route| !route.finished)
                 || self.pending_named_startup_observation()
                 || self.pointee_route.as_ref().is_some_and(|route| !route.pending_calls.is_empty()))

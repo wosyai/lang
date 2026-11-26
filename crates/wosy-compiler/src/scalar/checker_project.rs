@@ -3515,9 +3515,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         let rank_self = traced_rank.is_some() && target == traced_rank && std::ptr::eq(frame.body, child.body);
                         let context_edge = {
                             let trace = trace.borrow();
-                            trace.contextual_route.is_some_and(|(entry, leaf)| {
-                                let original = |target: PreparedCallable, body: &FunctionCallSites|
-                                    self.calls.function_body(target.0, target.1, None).is_some_and(|actual| std::ptr::eq(actual, body));
+                            let original = |target: PreparedCallable, body: &FunctionCallSites|
+                                self.calls.function_body(target.0, target.1, None).is_some_and(|actual| std::ptr::eq(actual, body));
+                            let enrolled = trace.contextual_roster.as_ref().is_some_and(|roster| {
+                                let parent = frame.target.map_or(roster.entry, |parent| parent.0);
+                                target.is_some_and(|child_target| roster.expects(parent, call.occurrence(), child_target))
+                                    && original(parent, frame.body) && frame.source == child.source
+                            });
+                            (enrolled || trace.contextual_route.is_some_and(|(entry, leaf)| {
                                 if let Some(mixed) = &trace.mixed_context {
                                     (target == Some(mixed.bridge) && call.occurrence() == mixed.entry_site
                                         && original(entry, frame.body))
@@ -3526,7 +3531,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 } else {
                                     target == Some(leaf) && frame.source == child.source
                                 }
-                            }) && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_))
+                            })) && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_))
                         };
                         // prepare_exact_child already authenticated the
                         // resolved edge and completed namespace owner.
@@ -3639,11 +3644,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             .ok_or(ProjectCheck::Unsupported)?;
                         if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
                             let mut trace = trace.borrow_mut();
-                            if trace.contextual_route.is_some_and(|(_, leaf)| leaf == target) && !trace.contextual_observed {
+                            let mut roster_complete = false;
+                            if let Some(roster) = &mut trace.contextual_roster {
+                                let caller = parent.target.map_or(roster.entry, |parent| parent.0);
+                                if !self.calls.function_body(caller.0, caller.1, None)
+                                    .is_some_and(|original| std::ptr::eq(original, parent.body))
+                                { return Err(ProjectCheck::Unsupported); }
+                                roster.observe(caller, effect.occurrence(), target).ok_or(ProjectCheck::Unsupported)?;
+                                roster_complete = roster.pending.is_empty();
+                            } else if trace.contextual_route.is_some_and(|(_, leaf)| leaf == target) && !trace.contextual_observed {
                                 trace.contextual_observed = true;
-                                if trace.remaining() == 0 && trace.mixed_context.is_none() {
-                                    return Err(ProjectCheck::StartupAuthoredLimitReached);
-                                }
                             } else if !(trace.contextual_observed && trace.mixed_context.as_ref().is_some_and(|route|
                                 route.bridge == target && route.entry_site == effect.occurrence())) {
                                 return Err(ProjectCheck::Unsupported);
@@ -3652,6 +3662,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
                             trace.append(failure_search::PathStep::Return(
                                 wosy_syntax::SourceSpan::new(parent.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                            if roster_complete && trace.remaining() == 0 {
+                                return Err(ProjectCheck::StartupAuthoredLimitReached);
+                            }
                         }
                         continue;
                     }
@@ -4223,9 +4236,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let matches_cited = pending == Some(&(target, Cited)) && search.cited_routes.contains_key(&target)
                 && caller == &owner.source && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
                 && is_integer_type(expected);
-            let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
-                && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty()
-                && search.mixed_context.as_ref().is_none_or(|route| route.root_site == call && !route.finished);
+            let matches_context_entry = (search.contextual_roster.as_ref().is_some_and(|route|
+                target == route.entry && route.root_site == call && !route.pending.is_empty())
+                || (search.contextual_route.is_some_and(|(entry, _)| target == entry)
+                    && search.mixed_context.as_ref().is_some_and(|route| route.root_site == call && !route.finished)))
+                && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
             let matches_pointee_entry = Observer::EXACT_POINTEE_UPDATE
                 && search.pointee_route.as_ref().is_some_and(|route| route.caller == target && route.startup_site == call)
                 && search.owns_initialization(caller) && caller == &owner.source
@@ -10300,7 +10315,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_guarded_context(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error)
+        run_private_contextual_startup(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error)
     }
 
     /// One real bare scalar startup activation and one independent ranked
@@ -10355,7 +10370,7 @@ impl PreparedScalarOrderedCheck {
                 run_private_named_after_startup(&owner, self.scope, Some(cap), None)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
-                run_private_guarded_context(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error),
+                run_private_contextual_startup(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
                 run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, Some(cap), configured_root)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
@@ -10388,7 +10403,7 @@ impl PreparedScalarOrderedCheck {
                 run_private_named_after_startup(&owner, self.scope, None, None)
                     .map(|(report, completion)| (report, Some(completion))),
             PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
-                run_private_guarded_context(&owner, effects, self.scope, None),
+                run_private_contextual_startup(&owner, effects, self.scope, None),
             PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
                 run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, None, configured_root)
                     .map(|(report, completion)| (report, Some(completion))),
@@ -10860,59 +10875,105 @@ fn run_startup_authored_path(
 }
 
 #[cfg(feature = "internal-checker")]
-fn run_private_guarded_context(
+fn prepare_private_contextual_roster(
+    calls: &ProjectCallSiteResults, entry: PreparedCallable, root_site: OccurrenceOrdinal,
+    proofs: &ContextualProofCohort,
+) -> Result<failure_search::ContextualStartupRoster, ProjectCheck> {
+    use super::checker_flow::charge_call_work;
+    let mut pending = HashMap::<_, (PreparedCallable, usize)>::new();
+    let mut seen_proofs = HashSet::new();
+    let mut work = 0usize;
+    let mut frames = vec![(entry, vec![entry])];
+    while let Some((parent, chain)) = frames.pop() {
+        let body = calls.function_body(parent.0, parent.1, None).ok_or(ProjectCheck::Unsupported)?;
+        let root = body.structure.blocks.get(body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut work, body.occurrences.len().checked_add(root.items.len())
+            .and_then(|count| count.checked_add(1)).ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        if !body.checker_returns_unit() || !body.arms.is_empty() || !body.callable_escapes.is_empty()
+            || !body.allocation_length_calls.is_empty() || root.unsafe_context
+        { return Err(ProjectCheck::Unsupported); }
+        if let Some(proof) = proofs.entries.get(&parent) {
+            if parent == entry || body.contextual_formal() != Some((&proof.formal, &proof.ty))
+                || !body.call_occurrences.is_empty() || !body.structure.checker_directives.is_empty()
+            { return Err(ProjectCheck::Unsupported); }
+            seen_proofs.insert(parent);
+            continue;
+        }
+        if !body.boundary.parameters.is_empty() || !body.conditionals.is_empty() || body.call_occurrences.is_empty()
+            || (if parent == entry {
+                body.contextual_formal().is_some() || !literal_history_directives(body)
+            } else {
+                body.contextual_formal().is_none() || !body.assignments.is_empty()
+                    || !body.structure.checker_directives.is_empty()
+            })
+        { return Err(ProjectCheck::Unsupported); }
+        let mut sites = HashSet::new();
+        for item in &root.items {
+            if let BlockItemKind::Evaluation { expression } = item.kind {
+                let Some(&child) = body.structure.checker_direct_targets.get(&expression) else { continue; };
+                let signature = body.checked_call_signatures.get(&expression).ok_or(ProjectCheck::Unsupported)?;
+                if !sites.insert(expression) || child.0 != entry.0 || chain.contains(&child)
+                    || chain.len() >= MAX_ACTUAL_CALL_DEPTH
+                    || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+                    || body.contextual_argument(expression).is_none()
+                { return Err(ProjectCheck::Unsupported); }
+                charge_call_work(&mut work, chain.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+                    .ok_or(ProjectCheck::Unsupported)?;
+                let mut child_chain = chain.clone();
+                child_chain.push(child);
+                frames.push((child, child_chain));
+                let value = pending.entry((parent, expression)).or_insert((child, 0));
+                if value.0 != child { return Err(ProjectCheck::Unsupported); }
+                value.1 = value.1.checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            }
+        }
+        if sites.len() != body.call_occurrences.len() || sites.len() != body.structure.checker_direct_targets.len() {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
+    if seen_proofs.is_empty() || seen_proofs.len() != proofs.entries.len() { return Err(ProjectCheck::Unsupported); }
+    Ok(failure_search::ContextualStartupRoster { root_site, entry, pending })
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_private_contextual_startup(
     prepared: &PreparedCheckerProject, mut effects: OrderedFailures, scope: ScalarCheckerScope,
     cap: Option<std::num::NonZeroUsize>,
 ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let (root, ordinals) = package_startup_order(project, &project.modules)?;
-    let mut proofs = effects.contextual_proofs.entries.values();
-    let proof = proofs.next().ok_or(ProjectCheck::Unsupported)?;
-    let target = proof.target;
-    if proofs.next().is_some() || proof.typed_where.is_none() || target.0 != 0 {
-        return Err(ProjectCheck::Unsupported);
-    }
     let region = calls.initialization_region(0).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let ModuleInitializationDetail::Occurrences(topology) = &region.detail
         else { return Err(ProjectCheck::MissingRootOccurrences); };
-    let mut startup = topology.call_targets.values();
-    // Builtin directives are not resolved module targets. No unclassified
-    // callable edge can execute a second contextual activation at or after N.
-    let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
-        = startup.next().ok_or(ProjectCheck::Unsupported)? else { return Err(ProjectCheck::Unsupported); };
+    let mut startup = topology.call_targets.iter();
+    let Some((&root_site, ModuleInitializationCallTarget::Direct {
+        declaration, concrete: ConcreteCallSelection::Declaration,
+    })) = startup.next() else { return Err(ProjectCheck::Unsupported); };
     if startup.next().is_some() || &declaration.source != root || !topology.callable_escapes.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
-    let item = module.items.iter().position(|item| matches!(item, ScalarItem::Function(function)
-        if function.name_span == declaration.range && function.generic_parameters.is_empty() && function.overload_arms.is_empty()))
-        .ok_or(ProjectCheck::Unsupported)?;
-    let entry = calls.function_body(0, item, None).ok_or(ProjectCheck::Unsupported)?;
-    let leaf = calls.function_body(0, target.1, None).ok_or(ProjectCheck::Unsupported)?;
-    let [site] = entry.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    if item == target.1 || entry.contextual_formal().is_some() || !entry.checker_returns_unit()
-        || !entry.boundary.parameters.is_empty() || !entry.arms.is_empty() || !entry.callable_escapes.is_empty()
-        || !entry.allocation_length_calls.is_empty() || entry.structure.checker_direct_targets.get(&site.ordinal) != Some(&target)
-        || entry.contextual_argument(site.ordinal).is_none()
-        || !leaf.call_occurrences.is_empty() || !leaf.arms.is_empty() || !leaf.callable_escapes.is_empty()
-        || !leaf.structure.checker_directives.is_empty() || !literal_history_directives(entry)
+    let &entry = topology.structure.checker_direct_targets.get(&root_site).ok_or(ProjectCheck::Unsupported)?;
+    if entry.0 != 0 || !module.items.get(entry.1).is_some_and(|item| matches!(item,
+        ScalarItem::Function(function) if function.name_span == declaration.range
+            && function.generic_parameters.is_empty() && function.overload_arms.is_empty()))
     { return Err(ProjectCheck::Unsupported); }
     let (_, roots) = package_obligation_roots(prepared, scope, 1, root)?;
-    if roots.into_iter().any(|(owner, items)| owner != 0 || items.into_iter().any(|candidate| candidate != item)) {
+    if roots.into_iter().any(|(owner, items)| owner != entry.0 || items.into_iter().any(|candidate| candidate != entry.1)) {
         return Err(ProjectCheck::Unsupported);
     }
     let mut search = match cap {
         Some(cap) => failure_search::StartUpSearch::new(root, cap),
         None => failure_search::StartUpSearch::formal_only(root),
     };
-    search.contextual_route = Some(((0, item), target));
+    search.contextual_roster = Some(prepare_private_contextual_roster(calls, entry, root_site, &effects.contextual_proofs)?);
     effects.startup_search = Some(Rc::new(RefCell::new(search)));
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
     );
     let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || !search.contextual_observed || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+    if search.invalid() || search.contextual_roster.as_ref().is_none_or(|roster| !roster.pending.is_empty()) || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
         || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len())
     { return Err(ProjectCheck::Unsupported); }
     let completion = match outcome {
@@ -10922,10 +10983,9 @@ fn run_private_guarded_context(
         Err(error) => return Err(error),
         _ => return Err(ProjectCheck::Unsupported),
     };
-    let proof = effects.contextual_proofs.entries.get(&target).ok_or(ProjectCheck::Unsupported)?;
-    if !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none() {
-        return Err(ProjectCheck::Unsupported);
-    }
+    if effects.contextual_proofs.entries.values().any(|proof|
+        !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none())
+    { return Err(ProjectCheck::Unsupported); }
     let mut diagnostic = ordered_contextual_diagnostics(effects.contextual_proofs)?.into_iter();
     let contextual_diagnostic = diagnostic.next();
     // Preserve the existing contextual diagnostic priority. A veto is not

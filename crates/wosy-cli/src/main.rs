@@ -3760,6 +3760,63 @@ main_artifact = "main"
                 assert_eq!(excluded, (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
                 assert_eq!(files(), first_file);
                 clean();
+
+                let roster = format!(r#"%%start
+                    unit() consume = fn {{ core.context.credit = core.context.credit - 1; }};
+                    unit() relay = fn {{ consume(); }};
+                    unit() finish = fn {{ core.context.credit = core.context.credit - 1; }};
+                    unit() entry = fn {{
+                        u8 core.context.credit = 5;
+                        core.require(false, {first});
+                        relay();
+                        core.require(false, {second});
+                        relay();
+                        finish();
+                    }};
+                    proof debit for consume() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 1) {{}}
+                    proof final_debit for finish() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 1) {{}}
+                    entry();
+                %%end"#);
+                fs::write(&source, &roster).unwrap();
+                let old = terminal(&[legacy()], scope, false);
+                assert_eq!(old.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                for cap in [2, 8] {
+                    assert_eq!(terminal(&selected(cap), scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+                }
+
+                // A late theorem sees genuine state after two traversals
+                // of the same original nested site, even after cap1.
+                let wrong = roster.replace("proof final_debit for finish() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 1)",
+                    "proof final_debit for finish() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 0)");
+                assert_ne!(wrong, roster);
+                fs::write(&source, &wrong).unwrap();
+                let old = legacy();
+                let prior = ordered_check_diagnostics(old.outcome.as_ref().unwrap(), &old.texts).unwrap();
+                for cap in [1, 2, 8] {
+                    let receipts = selected(cap);
+                    let receipt = &receipts[0];
+                    let report = receipt.outcome.as_ref().unwrap();
+                    assert!(report.directives.is_empty() && report.additional_contextual_diagnostics.is_empty());
+                    let failure = report.contextual_diagnostic.as_ref().expect("late contextual proof");
+                    assert_eq!((&failure.entry, &failure.exit), (&3.into(), &2.into()));
+                    let range = failure.call.range;
+                    assert_eq!(&wrong[range.start as usize..range.end as usize], "finish()");
+                    assert_eq!(ordered_check_diagnostics(report, &receipt.texts).unwrap(), prior);
+                    let refused = terminal(&receipts, scope, false);
+                    assert_eq!((refused.0, refused.1), (Ok(1), Vec::new()));
+                    assert!(!refused.2.is_empty() && files().is_empty() && !state.exists());
+                }
             }
         }
 
