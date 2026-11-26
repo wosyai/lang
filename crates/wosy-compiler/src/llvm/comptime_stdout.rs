@@ -66,10 +66,16 @@ fn wire(
 pub(super) fn emit<'ctx>(
     context: &'ctx Context, module: &Module<'ctx>, layouts: &ScalarLayoutIndex<'_>,
     structs: &[&ScalarStruct], layout: ScalarTargetLayout,
-    evaluate: FunctionValue<'ctx>, ty: &ScalarType, budget: usize,
+    main: FunctionValue<'ctx>, evaluate: FunctionValue<'ctx>, ty: &ScalarType, budget: usize,
 ) -> Result<(), String> {
     if layout != ScalarTargetLayout::WASM32 {
         return Err("comptime stdout bridge requires the explicit WASI preview1 evaluator layout".into());
+    }
+    let word = context.i32_type();
+    if main.get_type() != word.fn_type(&[], false) || main.get_call_conventions() != 0
+        || main.count_basic_blocks() != 0
+    {
+        return Err("comptime stdout bridge requires the ordinary unfilled command entry".into());
     }
     let storage = memory::storage_type(context, ty, layouts, layout)?;
     let abi = evaluate.get_type();
@@ -82,7 +88,6 @@ pub(super) fn emit<'ctx>(
     let bound = bound.checked_add(1).ok_or("comptime stdout line exceeds its WASI representation")?;
     if (bound as usize) > budget { return Err("comptime stdout shape exceeds the selected byte budget".into()); }
 
-    let word = context.i32_type();
     let ptr = context.ptr_type(inkwell::AddressSpace::default());
     let byte = context.i8_type();
     let builder = context.create_builder();
@@ -105,7 +110,6 @@ pub(super) fn emit<'ctx>(
     digits.put(ir!(builder.build_int_truncate(ascii, byte, "digit")))?;
     ir!(builder.build_return(None));
 
-    let main = module.add_function("main", word.fn_type(&[], false), None);
     builder.position_at_end(context.append_basic_block(main, "entry"));
     let result = ir!(builder.build_call(evaluate, &[], "comptime.value"))
         .try_as_basic_value().basic().ok_or("ordinary comptime evaluator returned no value")?;

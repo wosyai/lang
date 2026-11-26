@@ -906,7 +906,8 @@ fn emit_single_module_llvm<'a>(
     }
     if let Some((ty, cap)) = comptime_result {
         let entry = *functions.get("evaluate").ok_or("missing selected comptime evaluator")?;
-        comptime_stdout::emit(&context, &module, &layouts, &structs, target_layout, entry, ty, cap)?;
+        let main = *functions.get("main").ok_or("missing main")?;
+        comptime_stdout::emit(&context, &module, &layouts, &structs, target_layout, main, entry, ty, cap)?;
     } else {
         emit_main(
             prepared_render,
@@ -1456,7 +1457,8 @@ fn emit_project_llvm<'a>(
         let root = project.modules.first().ok_or("missing selected comptime module")?;
         let symbol = project_function_name(&root.source, "evaluate");
         let entry = *functions.get(&symbol).ok_or("missing selected comptime evaluator")?;
-        comptime_stdout::emit(&context, &module, &layouts, &all_structs, target_layout, entry, ty, cap)?;
+        let main = *functions.get("main").ok_or("missing main")?;
+        comptime_stdout::emit(&context, &module, &layouts, &all_structs, target_layout, main, entry, ty, cap)?;
     } else {
         emit_project_main(
             prepared_render,
