@@ -18039,13 +18039,13 @@ mod tests {
             unit() relay = fn {{ {} errors(); okay(); }};
             relay();
         %%end"#, "okay(); ".repeat(fanout));
-        let occurrences = |name: &str| program.match_indices(name).map(|(offset, _)| {
+        let occurrences = |text: &str, owner: &SourceIdentity, name: &str| text.match_indices(name).map(|(offset, _)| {
             let start = offset as u32;
-            wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + name.len() as u32))
+            wosy_syntax::SourceSpan::new(owner.clone(), ByteSpan::new(start, start + name.len() as u32))
         }).collect::<Vec<_>>();
-        let outer = occurrences("relay()").pop().unwrap();
-        let failure_call = occurrences("errors()").pop().unwrap();
-        let mut okay = occurrences("okay()");
+        let outer = occurrences(&program, &source, "relay()").pop().unwrap();
+        let failure_call = occurrences(&program, &source, "errors()").pop().unwrap();
+        let mut okay = occurrences(&program, &source, "okay()");
         let suffix = okay.pop().unwrap();
         assert_eq!(okay.len(), fanout);
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -18076,8 +18076,11 @@ mod tests {
             }
 
             let narrowed = program.replace("core.require(false,", "core.narrow(false,");
+            let narrow_owner = SourceIdentity { revision: "private-wide-nonreturning-unit".into(), ..source.clone() };
+            let mut narrow_okay = occurrences(&narrowed, &narrow_owner, "okay()");
+            let narrow_suffix = narrow_okay.pop().unwrap();
             let prepare_narrowed = || prepare_loaded_scalar_ordered_local_proof_contexts(
-                vec![(declarations(&source, &narrowed), Vec::new())], [], vec![source.clone()],
+                vec![(declarations(&narrow_owner, &narrowed), Vec::new())], [], vec![narrow_owner.clone()],
                 ScalarPreparationInputs { target_layout }, ScalarCheckerScope::MainFlowOnly, Vec::new()
             ).ok().unwrap();
             assert_eq!(prepare_narrowed().run().unwrap().directives.len(), 1);
@@ -18089,8 +18092,8 @@ mod tests {
             let returned = trace.current_path().iter().filter_map(|step| match step {
                 PathStep::Return(span) => Some(span), _ => None,
             }).collect::<Vec<_>>();
-            assert_eq!(returned, okay.iter().collect::<Vec<_>>());
-            assert!(!trace.current_path().contains(&PathStep::Call(suffix.clone())));
+            assert_eq!(returned, narrow_okay.iter().collect::<Vec<_>>());
+            assert!(!trace.current_path().contains(&PathStep::Call(narrow_suffix)));
         }
     }
 
