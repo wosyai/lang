@@ -461,10 +461,15 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         let points = &caller.cfg.initial_points;
         let CfgPointKind::Bind { binding } = &points[bind.0].kind else { panic!("typed alias holder"); };
         let contracts = HashMap::from([(*call, CallOriginTransfer::Explicit(std::slice::from_ref(origin)))]);
+        let return_edges = checked_return_argument_edges(points, &contracts, &proof.resolved_checked_call_outputs);
+        let expected = match &points[call.0].kind {
+            CfgPointKind::Call { argument_points, .. } => argument_points[0],
+            _ => panic!("typed call producer"),
+        };
+        assert_eq!(return_edges[call].argument, expected);
         let mut liveness = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         liveness.call_aliases = Some(CallAliasStage {
-            contracts: &contracts, initializers: &proof.checked_binding_initializers,
-            checked_outputs: &proof.resolved_checked_call_outputs, holders: Default::default(),
+            return_edges: &return_edges, initializers: &proof.checked_binding_initializers, holders: Default::default(),
         });
         let stage = liveness.call_aliases.as_ref().unwrap();
         assert!(stage.holds(points, binding));
@@ -475,8 +480,10 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         assert!(liveness.lexical.as_ref().unwrap().borrow().rows.contains_key(binding));
         assert!(!liveness.lexical_after(read.id, binding));
         let unknown = HashMap::from([(*call, CallOriginTransfer::WholeFormal(0))]);
-        let unchecked_stage = CallAliasStage { contracts: &unknown, initializers: &proof.checked_binding_initializers,
-            checked_outputs: &proof.resolved_checked_call_outputs, holders: Default::default() };
+        let unknown_edges = checked_return_argument_edges(points, &unknown, &proof.resolved_checked_call_outputs);
+        assert!(unknown_edges.is_empty());
+        let unchecked_stage = CallAliasStage { return_edges: &unknown_edges,
+            initializers: &proof.checked_binding_initializers, holders: Default::default() };
         assert!(!unchecked_stage.holds(points, binding));
         let checked = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);

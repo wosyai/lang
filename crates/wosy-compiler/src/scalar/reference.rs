@@ -8273,37 +8273,25 @@ impl ProjectedCarrierReads {
 }
 
 struct CallAliasStage<'a> {
-    contracts: &'a HashMap<CfgPointId, CallOriginTransfer<'a>>,
+    return_edges: &'a HashMap<CfgPointId, CheckedReturnArgumentEdge>,
     initializers: &'a [(CfgPointId, CfgPointId)],
-    checked_outputs: &'a [CfgPointId],
     holders: std::cell::OnceCell<HashSet<&'a ReferenceBindingId>>,
 }
 
 impl<'a> CallAliasStage<'a> {
     fn holds(&self, points: &'a [ReferenceFlowPoint], binding: &ReferenceBindingId) -> bool {
         self.holders.get_or_init(|| self.initializers.iter().filter_map(|&(install, producer)| {
-            // Read the same typed call transfer and Bind→RHS edge used by
-            // definitive transfer. A fresh, generic, projected or opaque
-            // result cannot enter this ordinary forwarding cohort.
-            let CallOriginTransfer::Explicit([ReferenceOrigin::BorrowedFrom { parameter, loan }]) =
-                *self.contracts.get(&producer)? else { return None; };
+            let edge = self.return_edges.get(&producer)?;
             let call = points.get(producer.0)?;
             let bind = points.get(install.0)?;
-            let CfgPointKind::Call {
-                target: ResolvedCallTarget::ModuleCallable {
-                    source, concrete: ConcreteCallSelection::Declaration, ..
-                },
-                expression: ScalarExpression::Call { type_arguments, .. },
-                argument_points, output: 0,
-            } = &call.kind else { return None; };
             let CfgPointKind::Bind { binding } = &bind.kind else { return None; };
-            let actual = points.get(argument_points.get(*parameter)?.0)?;
+            let actual = points.get(edge.argument.0)?;
+            // The definite transfer and the conservative holder subset
+            // consume the same typed call edge. This particular holder slice
+            // remains limited to a fresh direct shared loan.
             if producer >= install || call.successors.as_slice() != [install]
-                || call.scope != bind.scope || actual.scope != call.scope || actual.id >= producer
-                || self.checked_outputs.binary_search(&producer).is_err()
-                || !type_arguments.is_empty() || !matches!(binding.kind, ReferenceBindingKind::Declared)
-                || loan.mode != ScalarReferenceMutability::Shared || loan.parent.is_some()
-                || !loan.origin_place.projections.is_empty() || &loan.origin_place.source != source
+                || call.scope != bind.scope || edge.mode != ScalarReferenceMutability::Shared
+                || !matches!(binding.kind, ReferenceBindingKind::Declared)
                 || !matches!(&actual.kind, CfgPointKind::Borrow { loan, place }
                     if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                         && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. }))
@@ -11196,6 +11184,41 @@ enum CallOriginTransfer<'a> {
     WholeFormal(usize),
 }
 
+/// Immutable local projection of a solved checked-return contract onto
+/// its caller CFG. No new callee effects are inferred here.
+#[derive(Clone, Copy)]
+struct CheckedReturnArgumentEdge {
+    argument: CfgPointId,
+    mode: ScalarReferenceMutability,
+}
+
+fn checked_return_argument_edges(
+    points: &[ReferenceFlowPoint],
+    contracts: &HashMap<CfgPointId, CallOriginTransfer<'_>>,
+    checked_outputs: &[CfgPointId],
+) -> HashMap<CfgPointId, CheckedReturnArgumentEdge> {
+    contracts.iter().filter_map(|(&id, &transfer)| {
+        let CallOriginTransfer::Explicit([ReferenceOrigin::BorrowedFrom { parameter, loan }]) = transfer
+            else { return None; };
+        let point = points.get(id.0)?;
+        let CfgPointKind::Call {
+            target: ResolvedCallTarget::ModuleCallable {
+                source, concrete: ConcreteCallSelection::Declaration, ..
+            },
+            expression: ScalarExpression::Call { type_arguments, .. },
+            argument_points, output: 0,
+        } = &point.kind else { return None; };
+        if !type_arguments.is_empty() || checked_outputs.binary_search(&id).is_err()
+            || &loan.origin_place.source != source || loan.parent.is_some()
+            || !loan.origin_place.projections.is_empty()
+        { return None; }
+        let argument = *argument_points.get(*parameter)?;
+        let actual = points.get(argument.0)?;
+        (actual.id == argument && argument < id && actual.scope == point.scope)
+            .then_some((id, CheckedReturnArgumentEdge { argument, mode: loan.mode }))
+    }).collect()
+}
+
 fn runtime_child_protected_bindings<'a>(
     site: &RuntimeArrayChildSite, points: &'a [ReferenceFlowPoint], facts: &'a [ReferenceOrigin],
 ) -> Option<[&'a ReferenceBindingId; 2]> {
@@ -11621,11 +11644,11 @@ fn transfer_reference_facts(
             std::collections::VecDeque::from([CfgPointId(0)]),
         )
     });
+    let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
     let mut liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
-    if strictly_forward && !contracts.is_empty() && !cfg.checked_binding_initializers.is_empty() {
+    if strictly_forward && !return_edges.is_empty() && !cfg.checked_binding_initializers.is_empty() {
         liveness.call_aliases = Some(CallAliasStage {
-            contracts, initializers: cfg.checked_binding_initializers, checked_outputs: cfg.resolved_checked_call_outputs,
-            holders: Default::default(),
+            return_edges: &return_edges, initializers: cfg.checked_binding_initializers, holders: Default::default(),
         });
     }
     let mut forward_cursor = 0;
@@ -12044,6 +12067,15 @@ fn transfer_reference_facts(
                 &cfg.points[id.0].kind
             {
                 contracts.get(&id).map(|&transfer| {
+                    if let Some(edge) = return_edges.get(&id) {
+                        return state.point_values.get(edge.argument).cloned().unwrap_or_else(|| {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: cfg.points[id.0].source_span.clone(),
+                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                            });
+                            BTreeSet::new()
+                        });
+                    }
                     let origins = match transfer {
                         CallOriginTransfer::Explicit(origins) => origins,
                         CallOriginTransfer::WholeFormal(parameter) => {
