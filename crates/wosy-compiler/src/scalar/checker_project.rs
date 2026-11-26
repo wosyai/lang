@@ -19000,6 +19000,7 @@ mod tests {
             let (records, end, trace, _) = prepare().search_startup_authored_path(NonZeroUsize::new(64).unwrap()).unwrap();
             assert_eq!(end, StartupAuthoredCompletion::Exhausted);
             assert_eq!(records.len(), 2);
+            assert_eq!(trace.selected_steps().len(), records.len());
             for (path, accepted) in trace.selected_steps().zip([true, false]) {
                 use failure_search::PathStep;
                 let ordered = path.iter().filter(|step| matches!(step,

@@ -91,6 +91,8 @@ pub(in super::super) struct StartUpSearch {
     remaining: usize,
     prefix: Vec<PathStep>,
     selected: HashSet<FailurePath>,
+    #[cfg(test)]
+    selected_in_order: Vec<Vec<PathStep>>,
     work: usize,
     invalid: bool,
     pub(super) proof_free_scalar_initializers: bool,
@@ -122,7 +124,10 @@ impl StartUpSearch {
     }
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
-        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
+        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(),
+            #[cfg(test)]
+            selected_in_order: Vec::new(),
+            work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
             pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(), wide_rank_recipe: None, wide_rank_observations: Vec::new(), pending_wide_forward: None,
             #[cfg(test)]
             ranked_entries: Vec::new(),
@@ -186,7 +191,11 @@ impl StartUpSearch {
 
     fn select(&mut self, path: FailurePath) -> Option<Admission> {
         if self.remaining == 0 { return None; }
+        #[cfg(test)]
+        let observed = path.steps.clone();
         if !self.selected.insert(path) { return Some(Admission::Duplicate); }
+        #[cfg(test)]
+        self.selected_in_order.push(observed);
         self.remaining -= 1;
         Some(if self.remaining == 0 { Admission::SelectedAndStop } else { Admission::Selected })
     }
@@ -257,7 +266,7 @@ impl StartUpSearch {
 
     #[cfg(test)]
     pub(super) fn selected_steps(&self) -> impl ExactSizeIterator<Item = &[PathStep]> {
-        self.selected.iter().map(|path| path.steps.as_slice())
+        self.selected_in_order.iter().map(Vec::as_slice)
     }
 
     #[cfg(test)]
