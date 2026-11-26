@@ -11165,53 +11165,8 @@ fn run_startup_authored_path(
             if proof_free_scalars.is_some_and(|required| required.iter().any(|target| !initialization.reached.contains(target))) {
                 return Err(ProjectCheck::Unsupported);
             }
-            let mut active = initialization.had_obligations;
-            let mut completion = StartupAuthoredCompletion::Exhausted;
-            let work = std::cell::Cell::new(0);
-            let selected = RefCell::new((&mut search, &mut effects));
-            use super::checker_flow::CallableHistoryCompletion;
-            for &(ordinal, item) in callable_roots {
-                if initialization.reached.contains(&(ordinal, item)) { continue; }
-                let expected = if ordinal < count { InitializationVisit::Completed } else { InitializationVisit::Unseen };
-                if initialization.visits.get(ordinal) != Some(&expected) {
-                    return Err(ProjectCheck::Unsupported);
-                }
-                let module = project.modules.get(ordinal).ok_or(ProjectCheck::Unsupported)?;
-                let ScalarItem::Function(function) = module.items.get(item).ok_or(ProjectCheck::Unsupported)? else {
-                    return Err(ProjectCheck::Unsupported);
-                };
-                let declaration = wosy_syntax::SourceSpan::new(module.source.clone(), function.name_span);
-                let record = |target: PreparedCallable, failure: IntegerCheckFailure<'_>,
-                    prefix: &[super::checker_flow::CallableHistoryStep], suffix: Vec<super::checker_flow::CallableHistoryStep>| {
-                    let body = calls.function_body(target.0, target.1, None)?;
-                    let occurrence = body.occurrences.get(failure.directive.0)?;
-                    let source = &project.modules.get(target.0)?.source;
-                    let directive = wosy_syntax::SourceSpan::new(source.clone(), occurrence.span);
-                    let mut pair = selected.borrow_mut();
-                    let admission = pair.0.admit_callable(declaration.clone(), prefix.iter().copied().chain(suffix), directive, &project.modules)?;
-                    if !matches!(admission, failure_search::Admission::Duplicate) {
-                        pair.1.push_callable(body, source, failure);
-                    }
-                    Some(matches!(admission, failure_search::Admission::SelectedAndStop))
-                };
-                // Symbolic activation never marks an independent startup or
-                // dormant obligation root reached.
-                let nested_active = std::cell::Cell::new(false);
-                let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
-                    observed: &nested_active, record: &record };
-                let (result, _) = graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[])
-                    .ok_or(ProjectCheck::Unsupported)?;
-                match result {
-                    CallableHistoryCompletion::Exhausted(observed) => active |= observed || nested_active.get(),
-                    CallableHistoryCompletion::LimitReached if selected.borrow().0.remaining() == 0 => {
-                        active = true;
-                        completion = StartupAuthoredCompletion::LimitReached;
-                        break;
-                    }
-                    CallableHistoryCompletion::LimitReached => return Err(ProjectCheck::Unsupported),
-                }
-            }
-            (completion, active)
+            collect_unreached_authored_paths(project, calls, count, &initialization, callable_roots,
+                &mut search, &mut effects)?
         },
         Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
         Err(error) => return Err(error),
@@ -11228,6 +11183,61 @@ fn run_startup_authored_path(
         return Err(ProjectCheck::Unsupported);
     }
     Ok((effects.records, completion, search, active))
+}
+
+#[cfg(feature = "internal-checker")]
+fn collect_unreached_authored_paths(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, count: usize,
+    initialization: &CheckedInitialization<'_>, callable_roots: &[PreparedCallable],
+    search: &mut failure_search::StartUpSearch, effects: &mut OrderedFailures,
+) -> Result<(StartupAuthoredCompletion, bool), ProjectCheck> {
+    let mut active = initialization.had_obligations;
+    let mut completion = StartupAuthoredCompletion::Exhausted;
+    let work = std::cell::Cell::new(0);
+    let selected = RefCell::new((search, effects));
+    use super::checker_flow::CallableHistoryCompletion;
+    for &(ordinal, item) in callable_roots {
+        if initialization.reached.contains(&(ordinal, item)) { continue; }
+        let expected = if ordinal < count { InitializationVisit::Completed } else { InitializationVisit::Unseen };
+        if initialization.visits.get(ordinal) != Some(&expected) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let module = project.modules.get(ordinal).ok_or(ProjectCheck::Unsupported)?;
+        let ScalarItem::Function(function) = module.items.get(item).ok_or(ProjectCheck::Unsupported)? else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let declaration = wosy_syntax::SourceSpan::new(module.source.clone(), function.name_span);
+        let record = |target: PreparedCallable, failure: IntegerCheckFailure<'_>,
+            prefix: &[super::checker_flow::CallableHistoryStep], suffix: Vec<super::checker_flow::CallableHistoryStep>| {
+            let body = calls.function_body(target.0, target.1, None)?;
+            let occurrence = body.occurrences.get(failure.directive.0)?;
+            let source = &project.modules.get(target.0)?.source;
+            let directive = wosy_syntax::SourceSpan::new(source.clone(), occurrence.span);
+            let mut pair = selected.borrow_mut();
+            let admission = pair.0.admit_callable(declaration.clone(), prefix.iter().copied().chain(suffix), directive, &project.modules)?;
+            if !matches!(admission, failure_search::Admission::Duplicate) {
+                pair.1.push_callable(body, source, failure);
+            }
+            Some(matches!(admission, failure_search::Admission::SelectedAndStop))
+        };
+        // Symbolic activation never marks an independent startup or
+        // dormant obligation root reached.
+        let nested_active = std::cell::Cell::new(false);
+        let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
+            observed: &nested_active, record: &record };
+        let (result, _) = graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[])
+            .ok_or(ProjectCheck::Unsupported)?;
+        match result {
+            CallableHistoryCompletion::Exhausted(observed) => active |= observed || nested_active.get(),
+            CallableHistoryCompletion::LimitReached if selected.borrow().0.remaining() == 0 => {
+                active = true;
+                completion = StartupAuthoredCompletion::LimitReached;
+                break;
+            }
+            CallableHistoryCompletion::LimitReached => return Err(ProjectCheck::Unsupported),
+        }
+    }
+    Ok((completion, active))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11334,8 +11344,16 @@ fn run_private_contextual_startup(
         ScalarItem::Function(function) if function.name_span == declaration.range
             && function.generic_parameters.is_empty() && function.overload_arms.is_empty()))
     { return Err(ProjectCheck::Unsupported); }
-    let (_, roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
-    if roots.into_iter().any(|(owner, items)| owner != entry.0 || items.into_iter().any(|candidate| candidate != entry.1)) {
+    let (_, mut roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
+    if let Some(items) = roots.get_mut(&entry.0) {
+        items.retain(|&item| item != entry.1);
+    }
+    // Admission is limited to independent ordinary dormant owners; the
+    // authenticated startup entry and contextual proof cohort stay separate.
+    let (callable_roots, _) = plan_closed_authored_roots(prepared, root, startup_count, &ordinals, roots, false)?;
+    if callable_roots.contains(&entry)
+        || callable_roots.iter().any(|candidate| effects.contextual_proofs.entries.contains_key(candidate))
+    {
         return Err(ProjectCheck::Unsupported);
     }
     let mut search = match cap {
@@ -11347,21 +11365,34 @@ fn run_private_contextual_startup(
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
     );
-    let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+    let mut search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || search.contextual_roster.as_ref().is_none_or(|roster| !roster.pending.is_empty()) || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-        || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len())
+    if search.invalid() || search.contextual_roster.as_ref().is_none_or(|roster| !roster.pending.is_empty())
+        || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+        || effects.contextual_proofs.entries.values().any(|proof|
+            !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none())
     { return Err(ProjectCheck::Unsupported); }
+    let refuted = effects.contextual_proofs.entries.values().any(|proof| proof.refutation.is_some());
     let completion = match outcome {
         Ok(_) if cap.is_none() => StartupAuthoredCompletion::LimitReached,
-        Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
+        Ok((initialization, _)) if search.remaining() > 0 => {
+            if refuted || callable_roots.is_empty() {
+                StartupAuthoredCompletion::Exhausted
+            } else {
+                collect_unreached_authored_paths(project, calls, startup_count, &initialization, &callable_roots,
+                    &mut search, &mut effects)?.0
+            }
+        }
         Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
         Err(error) => return Err(error),
         _ => return Err(ProjectCheck::Unsupported),
     };
-    if effects.contextual_proofs.entries.values().any(|proof|
-        !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none())
-    { return Err(ProjectCheck::Unsupported); }
+    if cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len()) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    if !refuted && !callable_roots.is_empty() {
+        effects.finalize_selected_outputs(false)?;
+    }
     let mut diagnostic = ordered_contextual_diagnostics(effects.contextual_proofs)?.into_iter();
     let contextual_diagnostic = diagnostic.next();
     // Preserve the existing contextual diagnostic priority. A veto is not
@@ -28995,6 +29026,31 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     assert_eq!(completion, Some(if cap <= 2 { StartupAuthoredCompletion::LimitReached }
                         else { StartupAuthoredCompletion::Exhausted }));
                 }
+                let with_dormant = child.replace("%%end", &format!(r#"
+                    unit(u8) deferred = fn(value) {{ core.require(value == 0, {}); }};
+                    unit(u8) later = fn(value) {{ core.require(value < 3, {}); }};
+                    %%end"#, OUTPUT.replace(".code = 1", ".code = 77"), OUTPUT.replace(".code = 1", ".code = 78")));
+                let baseline = prepare(&with_dormant).unwrap().run().unwrap();
+                let count = if scope == ScalarCheckerScope::CurrentPackage { 4 } else { 2 };
+                assert_eq!(baseline.directives.len(), count);
+                for cap in [1, 2, 3, 4, 5] {
+                    let (report, completion) = prepare(&with_dormant).unwrap()
+                        .run_private_authored_root(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(report.directives, baseline.directives[..cap.min(count)]);
+                    assert_eq!(completion, Some(if cap <= count { StartupAuthoredCompletion::LimitReached }
+                        else { StartupAuthoredCompletion::Exhausted }));
+                    if let Some(first_dormant) = report.directives.get(2) {
+                        assert_eq!(first_dormant.source, leaf);
+                        assert_eq!(first_dormant.witness.row_count(), 1);
+                        assert!(first_dormant.witness.intervals_at(0, 0).unwrap()
+                            .eq([(&1.into(), &255.into())]));
+                    }
+                }
+                let refuted_dormant = with_dormant.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+                let (report, completion) = prepare(&refuted_dormant).unwrap()
+                    .run_private_authored_root(NonZeroUsize::new(5).unwrap()).unwrap();
+                assert!(completion.is_none() && report.directives.is_empty() && report.contextual_diagnostic.is_some());
+
                 let wrong = child.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
                 let (report, completion) = prepare(&wrong).unwrap().run_private_authored_root(NonZeroUsize::MIN).unwrap();
                 assert!(completion.is_none() && report.directives.is_empty());
