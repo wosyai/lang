@@ -103,9 +103,18 @@ with tempfile.TemporaryDirectory() as temp:
 
     call(project, store, "proposal", root, attempt, target="different-target",
          refusal="not the current source attempt")
-    assert call(project, store, "abandon", root, attempt)["result"]["abandoned"]
-    again = call(project, store, "stage")
-    assert again["pending"] == root and again["attempt"] != attempt
+    call(project, store.with_name("empty"), "proposal-admission", root, attempt,
+         refusal="bound base CST predecessor is not published")
+    snap = (metadata_db.read_bytes(), nodes_db.read_bytes())
+    accepted = call(project, store, "proposal-admission", root, attempt)
+    receipt = accepted["result"]["admission"]
+    assert receipt["base_records"] == baseline_nodes and receipt["novel_records"] == out["added"]
+    assert receipt["validated_files"] == 4 and not receipt["stale_attempt_rejected"]
+    assert receipt["noncanonical_order_rejected"]
+    assert (metadata_db.read_bytes(), nodes_db.read_bytes()) == snap
+    again = call(project, store, "proposal-stale", root, attempt)
+    assert again["pending"] == root and again["attempt"] > attempt
+    assert again["result"]["admission"]["stale_attempt_rejected"]
     call(project, store, "proposal", root, attempt, refusal="not the current source attempt")
     actual = call(project, store, "proposal-oracle", root, again["attempt"])
     assert (actual["selected"], actual["pending"], actual["attempt"]) == (selected["selected"], root, again["attempt"])
@@ -119,8 +128,12 @@ with tempfile.TemporaryDirectory() as temp:
     (project / "wosy.toml").write_text(manifest + "\n# configuration observation only\n")
     config = call(project, store, "stage")
     assert (config["result"]["parsed"], config["result"]["reused"]) == (0, 5)
+    config_accept = call(project, store, "proposal-admission", config["pending"], config["attempt"])["result"]["admission"]
+    assert config_accept["validated_files"] == 0 and config_accept["novel_records"] == 2
+    assert config_accept["noncanonical_order_rejected"]
     config_proposal = call(project, store, "proposal-oracle", config["pending"], config["attempt"])
     assert config_proposal["result"]["files"] == []
     assert config_proposal["result"]["oracle"]
     assert config_proposal["result"]["added"] == config_proposal["result"]["index"] > 0
-    print(json.dumps({"changed": out, "config_only": config_proposal["result"]}))
+    print(json.dumps({"changed": out, "admission": receipt, "config_only": config_proposal["result"],
+                      "config_admission": config_accept}))

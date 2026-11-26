@@ -1,9 +1,19 @@
 //! Client-owned, selected-predecessor base CST delta. A proposal does not
 //! confer a daemon lease, prepare compile-time IR, or publish a snapshot.
-use super::{FileKey, Kind, Node, NodeId};
+use super::{BuildSourceSelection, FileEntry, FileKey, Kind, Node, NodeId};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub const BASE_CST_DELTA_VERSION: u16 = 1;
+pub const BASE_CST_DELTA_VERSION: u16 = 2;
+
+/// The trusted local adapter's scope for one admission, captured from the
+/// same SQLite transaction as the proposal. Never deserialized from a peer.
+#[derive(Clone)]
+pub struct BaseCstProposalBinding {
+    pub selected: BuildSourceSelection,
+    pub proposed: NodeId,
+    pub attempt: i64,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +21,7 @@ pub struct BaseCstProposal {
     pub version: u16,
     pub base: NodeId,
     pub root: NodeId,
+    pub attempt: i64,
     pub files: Vec<CstDelta>,
     pub source_index: Vec<SourceIndexAddition>,
 }
@@ -26,6 +37,41 @@ pub struct CstDelta {
     pub old_file_root: Option<NodeId>,
     pub new_file_root: Option<NodeId>,
     pub added: Vec<CstAddition>,
+}
+
+/// A canonical change partition. More than one file may use a single new
+/// CST node, but only its first reachable changed file carries the record.
+pub struct CstFilePartition {
+    pub file: FileKey,
+    pub old_file_root: Option<NodeId>,
+    pub new_file_root: Option<NodeId>,
+    pub added: Vec<NodeId>,
+}
+
+pub fn partition_cst_files<'a>(
+    previous: &BTreeMap<FileKey, FileEntry>, proposed: &BTreeMap<FileKey, FileEntry>,
+    mut novel: impl FnMut(NodeId) -> Option<&'a [u8]>,
+) -> Result<Vec<CstFilePartition>, &'static str> {
+    let mut files = Vec::new();
+    let mut assigned = BTreeSet::new();
+    for key in previous.keys().chain(proposed.keys()).collect::<BTreeSet<_>>() {
+        let old_file_root = previous.get(key).map(|file| file.file);
+        let current = proposed.get(key);
+        let new_file_root = current.map(|file| file.file);
+        if old_file_root == new_file_root { continue; }
+        let mut added = Vec::new();
+        if let Some(file) = current {
+            let mut pending = vec![file.executable, file.authored];
+            while let Some(id) = pending.pop() {
+                let Some(bytes) = novel(id) else { continue; };
+                if !assigned.insert(id) { continue; }
+                pending.extend(Node::child_ids(bytes).ok_or("invalid packed CST node")?);
+                added.push(id);
+            }
+        }
+        files.push(CstFilePartition { file: key.clone(), old_file_root, new_file_root, added });
+    }
+    Ok(files)
 }
 
 #[derive(Debug, Deserialize, Serialize)]

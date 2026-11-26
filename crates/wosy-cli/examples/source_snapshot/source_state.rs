@@ -41,13 +41,26 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
-        "proposal" | "proposal-oracle" | "proposal-limited" => {
+        "proposal" | "proposal-oracle" | "proposal-limited" | "proposal-admission" | "proposal-stale" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
             let generation = args.next().ok_or("expected fixture attempt")?.parse()?;
             let attempt = SourceAttempt::new(root, generation);
-            let proposed = client.pending_base_cst_proposal(&target, attempt)?;
+            let (binding, proposed) = client.pending_base_cst_proposal(&target, attempt)?;
             let proposal_ms = milliseconds(start);
             let encoded = encode_session_frame(&proposed)?;
+            let admission = match mode.as_str() {
+                "proposal-admission" => Some(super::proposal_admission::verify(dir, binding, &encoded, None).await?),
+                "proposal-stale" => {
+                    assert!(client.abandon(&target, attempt)?);
+                    let restaged = client.stage(&target)?.pending.ok_or("fixture did not restage")?;
+                    assert_eq!(restaged.root(), root);
+                    assert!(restaged.generation() > attempt.generation());
+                    let (current, renewed) = client.pending_base_cst_proposal(&target, restaged)?;
+                    let next = encode_session_frame(&renewed)?;
+                    Some(super::proposal_admission::verify(dir, current, &next, Some(&encoded)).await?)
+                }
+                _ => None,
+            };
             let restored = SessionFrameReader::default().read::<_, BaseCstProposal>(&mut encoded.as_ref())
                 .await?.ok_or("expected a framed base CST proposal")?;
             assert_eq!(restored.version, BASE_CST_DELTA_VERSION);
@@ -95,7 +108,7 @@ pub(super) async fn run(
             serde_json::json!({
                 "root": root.hex(), "base": restored.base.hex(), "files": files,
                 "added": added.nodes.len(), "index": restored.source_index.len(),
-                "wire_bytes": encoded.len(), "proposal_ms": proposal_ms, "oracle": oracle,
+                "wire_bytes": encoded.len(), "proposal_ms": proposal_ms, "oracle": oracle, "admission": admission,
             })
         }
         "leased-build" => {

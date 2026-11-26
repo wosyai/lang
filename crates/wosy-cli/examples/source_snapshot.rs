@@ -20,6 +20,8 @@ mod recovery;
 mod storage_worker;
 #[path = "source_snapshot/source_state.rs"]
 mod source_state;
+#[path = "source_snapshot/proposal_admission.rs"]
+mod proposal_admission;
 #[path = "source_snapshot/leased_build.rs"]
 mod leased_build;
 

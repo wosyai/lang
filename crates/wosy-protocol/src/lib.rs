@@ -5,7 +5,10 @@ use wosy_project::packages::{LockedInputId, PatchStackId};
 use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
 mod source_delta;
-pub use source_delta::{BaseCstProposal, CstAddition, CstDelta, SourceIndexAddition, BASE_CST_DELTA_VERSION};
+pub use source_delta::{
+    partition_cst_files, BaseCstProposal, BaseCstProposalBinding, CstAddition, CstDelta,
+    SourceIndexAddition, BASE_CST_DELTA_VERSION,
+};
 
 mod build_diagnostics;
 pub use build_diagnostics::{

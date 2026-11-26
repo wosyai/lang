@@ -323,20 +323,24 @@ impl SourceStore {
     }
 
     pub(super) fn leased_source_snapshot(&self, grant: LeaseGrant) -> Result<Option<super::SourceView>> {
-        let (tx, read) = {
-            let mut reads = self.source_reads.0.lock().expect("source reader registry");
-            let Some(&(root, expires)) = reads.sessions.get(&grant.id) else { return Ok(None); };
-            if Instant::now() >= expires {
-                reads.sessions.remove(&grant.id);
-                return Ok(None);
-            }
-            if root != grant.root { return Ok(None); }
-            let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-            if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
-            *reads.active.entry(root).or_default() += 1;
-            (tx, SourceRead::new(&self.source_reads.0, root))
-        };
+        let Some((tx, read)) = self.begin_leased_source(grant, Mode::ReadOnly)? else { return Ok(None); };
         self.snapshot_with_read(grant.root, tx, read)
+    }
+
+    pub(super) fn begin_leased_source(
+        &self, grant: LeaseGrant, mode: Mode,
+    ) -> Result<Option<(Transaction, SourceRead)>> {
+        let mut reads = self.source_reads.0.lock().expect("source reader registry");
+        let Some(&(root, expires)) = reads.sessions.get(&grant.id) else { return Ok(None); };
+        if Instant::now() >= expires {
+            reads.sessions.remove(&grant.id);
+            return Ok(None);
+        }
+        if root != grant.root { return Ok(None); }
+        let tx = self.tree.begin_with_mode(mode)?;
+        if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+        *reads.active.entry(root).or_default() += 1;
+        Ok(Some((tx, SourceRead::new(&self.source_reads.0, root))))
     }
 
     pub(super) fn begin_source_read(&self, root: NodeId) -> Result<Option<(Transaction, SourceRead)>> {

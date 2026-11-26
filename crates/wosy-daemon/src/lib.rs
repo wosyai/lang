@@ -51,6 +51,7 @@ mod project_declarations;
 mod prepared_project;
 mod retention_plan;
 mod source_impact;
+mod source_proposal;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use build_session::BuildDiagnosticSession;
@@ -65,6 +66,7 @@ pub use prepared_project::{
 };
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
+pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits};
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};
 
@@ -371,7 +373,12 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
 }
 
 fn read_node(tx: &Transaction, id: NodeId) -> Result<Node> {
+    read_node_with(tx, id, |_| Ok(()))
+}
+
+fn read_node_with(tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Result<()>) -> Result<Node> {
     let bytes = tx.get(&key(NODES, id))?.ok_or("referenced source node is missing")?;
+    charge(bytes.len())?;
     Node::decode(&bytes).ok_or_else(|| "invalid stored source node".into())
 }
 
@@ -455,7 +462,16 @@ fn check_path(path: &PackageRelativePath) -> Result<()> {
 }
 
 fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishReport) -> Result<()> {
-    // The newly interned root has already passed the schema boundary.
+    validate_snapshot_with(tx, root, |_| Ok(()), |tx, file, categories| {
+        admit_namespace_authority(tx, file, categories, report)
+    }).map(|_| ())
+}
+
+fn validate_snapshot_with(
+    tx: &mut Transaction, root: NodeId, check_scope: impl FnOnce(&SourceConfig) -> Result<()>,
+    mut check_file: impl FnMut(&mut Transaction, &FileEntry, &[String]) -> Result<()>,
+) -> Result<Index> {
+    // The root's closure has already passed the schema boundary.
     let top = read_node(tx, root)?;
     let schema = top.data.as_slice().try_into().map(|array: &[u8; 32]| *array)?;
     let index = read_index(tx, top)?;
@@ -470,6 +486,7 @@ fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishRep
     {
         return Err("incompatible source configuration or index".into());
     }
+    check_scope(&config)?;
     for ns in config.namespaces.values() {
         if let Some(path) = &ns.source_root {
             check_path(path)?;
@@ -492,7 +509,7 @@ fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishRep
         {
             return Err("source provenance does not match the projections".into());
         }
-        admit_namespace_authority(tx, file, &config.parser.categories, report)?;
+        check_file(tx, file, &config.parser.categories)?;
         // The file's imports now have exact canonical CST authority, including
         // their authored positions. Use the same verified order for module edges.
         let edges = index.module_edges.get(&key).ok_or("missing module for source")?;
@@ -516,7 +533,7 @@ fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishRep
     if reachable.len() != index.files.len() {
         return Err("source index contains unreachable files".into());
     }
-    Ok(())
+    Ok(index)
 }
 
 fn read_comments(tx: &Transaction, id: NodeId) -> Result<Vec<TypedComment>> {
@@ -543,7 +560,8 @@ fn admit_namespace_authority(
     }
     let query = authority_key(NAMESPACE_QUERIES, file.executable);
     let existing = tx.get(&query)?;
-    let (executable, comments) = validate_file(tx, file, configured, existing.is_none())?;
+    let tree = if existing.is_some() { FileTree::None } else { FileTree::Executable };
+    let (executable, comments) = validate_file(tx, file, configured, tree, None)?;
     let (fact, mut imports) = if let Some(id) = existing {
         let id = NodeId(id.as_slice().try_into()?);
         let facts = read_node(tx, id)?;
@@ -588,70 +606,93 @@ fn restore_authored_spans(imports: &mut [Import], comments: &[TypedComment]) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FileTree {
+    None,
+    Executable,
+    Authored,
+}
+
 fn validate_file(
-    tx: &Transaction, file: &FileEntry, configured: &[String], build_executable: bool,
+    tx: &Transaction, file: &FileEntry, configured: &[String], tree: FileTree,
+    mut work: Option<&mut source_proposal::CstWork>,
 ) -> Result<(Option<CstNode>, Vec<TypedComment>)> {
-    let comments = read_comments(tx, file.annotation)?;
+    let bounded = work.is_some();
+    if let Some(work) = work.as_mut() {
+        work.file(file.metadata.bytes as usize)?;
+    }
+    let read = |id, work: &mut Option<&mut source_proposal::CstWork>| {
+        read_node_with(tx, id, |bytes| work.as_mut().map_or(Ok(()), |work| work.read(bytes)))
+    };
+    let comments: Vec<TypedComment> = serde_json::from_slice(&read(file.annotation, &mut work)?.data)?;
     let mut position = 0u32;
     let mut hasher = blake3::Hasher::new();
     let mut next_comment = comments.iter();
-    let authored = read_node(tx, file.authored)?;
+    let authored = read(file.authored, &mut work)?;
     if authored.kind != Kind::Syntax || syntax_kind(&authored)? != SyntaxKind::Root {
         return Err("invalid canonical Rowan root".into());
     }
-    let mut builder = build_executable.then(GreenNodeBuilder::new);
-    let mut stack = vec![Some((file.authored, authored, Some(file.executable)))];
-    while let Some(event) = stack.pop() {
-        let Some((id, node, projection)) = event else {
-            builder.as_mut().expect("requested executable tree").finish_node();
-            continue;
+    let mut builder = (tree != FileTree::None).then(GreenNodeBuilder::new);
+    enum Step {
+        Enter(NodeId, Node, Option<NodeId>, usize),
+        Children(std::vec::IntoIter<NodeId>, std::vec::IntoIter<NodeId>, usize),
+    }
+    let mut pending = vec![Step::Enter(file.authored, authored, Some(file.executable), 1)];
+    while let Some(step) = pending.pop() {
+        let (id, node, projection, depth) = match step {
+            Step::Enter(id, node, projection, depth) => (id, node, projection, depth),
+            Step::Children(mut children, mut projected, depth) => {
+                let Some(child) = children.next() else {
+                    if projected.next().is_some() { return Err("extra executable syntax nodes".into()); }
+                    if let Some(builder) = builder.as_mut() { builder.finish_node(); }
+                    continue;
+                };
+                let record = read(child, &mut work)?;
+                let projection = if record.kind == Kind::Token && syntax_kind(&record)? == SyntaxKind::TypedComment {
+                    None
+                } else {
+                    Some(projected.next().ok_or("incomplete executable syntax projection")?)
+                };
+                // Read one child at a time; don't clone all sibling payloads
+                // before charging their unfolded bytes.
+                pending.push(Step::Children(children, projected, depth));
+                (child, record, projection, depth)
+            }
         };
         match node.kind {
             Kind::Syntax => {
+                if let Some(work) = work.as_mut() { work.children(depth, node.children.len())?; }
                 if let Some(builder) = builder.as_mut() {
                     builder.start_node(rowan::SyntaxKind(syntax_kind(&node)? as u16));
-                    stack.push(None);
                 }
                 let projected = if projection == Some(id) {
                     node.children.clone()
                 } else {
-                    let projected = read_node(tx, projection.ok_or("missing CST projection")?)?;
+                    let projected = read(projection.ok_or("missing CST projection")?, &mut work)?;
                     if projected.kind != Kind::Syntax || projected.data != node.data {
                         return Err("incompatible executable syntax projection".into());
                     }
                     projected.children
                 };
-                let mut next = projected.into_iter();
-                let mut pairs = Vec::with_capacity(node.children.len());
-                for child in node.children {
-                    let child_record = read_node(tx, child)?;
-                    if child_record.kind == Kind::Token && syntax_kind(&child_record)? == SyntaxKind::TypedComment {
-                        pairs.push((child, child_record, None));
-                    } else {
-                        pairs.push((child, child_record, Some(next.next().ok_or("incomplete executable syntax projection")?)));
-                    }
-                }
-                if next.next().is_some() {
-                    return Err("extra executable syntax nodes".into());
-                }
-                stack.extend(pairs.into_iter().rev().map(Some));
+                pending.push(Step::Children(node.children.into_iter(), projected.into_iter(), depth + 1));
             }
             Kind::Token => {
                 let text = token_text(&node)?;
                 let end = position.checked_add(text.len().try_into()?).ok_or("CST exceeds the source range")?;
+                if bounded && end > file.metadata.bytes {
+                    return Err("CST exceeds its admitted authored byte range".into());
+                }
                 if projection.is_none() {
                     let canonical = typed_comment_from_token(text, position, configured)
                         .ok_or("invalid canonical typed comment token")?;
                     if next_comment.next() != Some(&canonical) {
                         return Err("typed comment does not match source provenance".into());
                     }
-                } else {
-                    if projection != Some(id) {
-                        return Err("executable token differs from authored source".into());
-                    }
-                    if let Some(builder) = builder.as_mut() {
-                        builder.token(rowan::SyntaxKind(syntax_kind(&node)? as u16), text);
-                    }
+                } else if projection != Some(id) {
+                    return Err("executable token differs from authored source".into());
+                }
+                if let Some(builder) = builder.as_mut().filter(|_| tree == FileTree::Authored || projection.is_some()) {
+                    builder.token(rowan::SyntaxKind(syntax_kind(&node)? as u16), text);
                 }
                 hasher.update(text.as_bytes());
                 position = end;
