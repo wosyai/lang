@@ -1927,11 +1927,20 @@ struct IntegerRoots<'a> {
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     ordinary_comparison_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    startup_trace: Option<(&'a wosy_syntax::SourceIdentity, Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>)>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
 
 impl<'a> IntegerRoots<'a> {
+    #[cfg(feature = "internal-checker")]
+    fn after_startup_candidate(&self) -> Option<()> {
+        if self.startup_trace.as_ref().is_some_and(|(_, trace)| trace.borrow().cannot_continue()) {
+            None
+        } else { Some(()) }
+    }
+
     fn add(&mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType) {
         let previous = self.by_binding.insert(binding, self.axes.len());
         assert!(previous.is_none());
@@ -7290,6 +7299,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     #[cfg(feature = "internal-checker")]
+                    if roots.startup_trace.is_some() && (evaluated_guard.1.is_some()
+                        || !matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))))
+                    { return None; }
+                    #[cfg(feature = "internal-checker")]
                     if evaluated_guard.1.is_some() {
                         let [rejected, accepted] = evaluated_guard.0.take()?;
                         let before = evaluated_guard.1.take()?;
@@ -7311,6 +7324,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                 directive: expression, equal_axes, state: failing, axes: roots.axes.clone(),
                             });
+                            #[cfg(feature = "internal-checker")]
+                            roots.after_startup_candidate()?;
                         }
                         continue;
                     }
@@ -7334,6 +7349,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                     directive: expression, equal_axes, state: failing, axes: roots.axes.clone(),
                                 });
+                                #[cfg(feature = "internal-checker")]
+                                roots.after_startup_candidate()?;
                             }
                             continue;
                         }
@@ -7366,6 +7383,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                 directive: expression, equal_axes: failing.common_equal_axes(), state: failing, axes: roots.axes.clone(),
                             });
+                            #[cfg(feature = "internal-checker")]
+                            roots.after_startup_candidate()?;
                         }
                         continue;
                     }
@@ -7375,6 +7394,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                 directive: expression, equal_axes: failing.common_equal_axes(), state: failing, axes: roots.axes.clone(),
                             });
+                            #[cfg(feature = "internal-checker")]
+                            roots.after_startup_candidate()?;
                         }
                         continue;
                     }
@@ -7385,6 +7406,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         };
                         if COLLECT {
                             (failures.as_deref_mut()?.sink)(failure);
+                            #[cfg(feature = "internal-checker")]
+                            roots.after_startup_candidate()?;
                         } else {
                             return Some(IntegerControl::Fail(failure));
                         }
@@ -7457,6 +7480,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         #[cfg(not(feature = "internal-checker"))]
                         return None;
                     };
+                    #[cfg(feature = "internal-checker")]
+                    if let Some((source, trace)) = &roots.startup_trace {
+                        if evaluated_guard.1.is_some() || !matches!(structure.checker_branches.get(condition),
+                            Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                            || yes.is_unreachable() == no.is_unreachable()
+                        { return None; }
+                        let at = calls.occurrences.get(condition.0)?.span;
+                        trace.try_borrow_mut().ok()?.branch(wosy_syntax::SourceSpan::new((*source).clone(), at), !yes.is_unreachable())?;
+                    }
                     let (arm, incoming, alternate) = if yes.is_unreachable() {
                         let Some(else_block) = else_block.filter(|_| !no.is_unreachable()) else {
                             path = no;
@@ -8734,6 +8766,18 @@ pub(super) struct ExactCallCursor<'a> {
 }
 
 impl<'a> ExactCallCursor<'a> {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn track_startup_path(
+        &mut self, source: &'a wosy_syntax::SourceIdentity,
+        trace: Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>,
+    ) -> Option<()> {
+        if self.roots.startup_trace.is_some() || self.tail.is_some()
+            || self.projected_slot.is_some() || self.projected_pair.is_some()
+        { return None; }
+        self.roots.startup_trace = Some((source, trace));
+        Some(())
+    }
+
     #[cfg(feature = "internal-checker")]
     pub(super) fn allow_empty_scalar_return(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());

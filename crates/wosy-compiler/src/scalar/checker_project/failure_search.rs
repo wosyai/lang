@@ -3,8 +3,10 @@ use std::{collections::HashSet, num::NonZeroUsize};
 use wosy_syntax::{SourceIdentity, SourceSpan};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) enum PathStep {
+pub(in super::super) enum PathStep {
     Startup(SourceIdentity),
+    Call(SourceSpan),
+    Return(SourceSpan),
     Branch { condition: SourceSpan, accepted: bool },
 }
 
@@ -16,21 +18,26 @@ struct FailurePath {
 
 pub(super) enum Admission { Duplicate, Selected, SelectedAndStop }
 
-pub(super) struct StartUpSearch {
+pub(in super::super) struct StartUpSearch {
     remaining: usize,
     prefix: Vec<PathStep>,
     selected: HashSet<FailurePath>,
     work: usize,
+    invalid: bool,
 }
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0 }
+        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false }
     }
 
-    pub(super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {
+    pub(in super::super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {
+        self.append(PathStep::Branch { condition, accepted })
+    }
+
+    pub(in super::super) fn append(&mut self, step: PathStep) -> Option<()> {
         super::super::checker_flow::charge_call_work(&mut self.work, 1)?;
-        self.prefix.push(PathStep::Branch { condition, accepted });
+        self.prefix.push(step);
         Some(())
     }
 
@@ -44,6 +51,17 @@ impl StartUpSearch {
     }
 
     pub(super) fn remaining(&self) -> usize { self.remaining }
+    pub(super) fn invalidate(&mut self) { self.invalid = true; }
+    pub(in super::super) fn cannot_continue(&self) -> bool { self.invalid || self.remaining == 0 }
+    pub(super) fn invalid(&self) -> bool { self.invalid }
+
+    #[cfg(test)]
+    pub(super) fn call_paths(&self) -> Vec<Vec<SourceSpan>> {
+        self.selected.iter().map(|path| path.steps.iter().filter_map(|step| match step {
+            PathStep::Call(site) => Some(site.clone()),
+            _ => None,
+        }).collect()).collect()
+    }
 
     #[cfg(test)]
     pub(super) fn contains_branch(&self, condition: SourceSpan, accepted: bool) -> bool {

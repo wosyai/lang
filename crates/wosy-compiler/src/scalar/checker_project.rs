@@ -11,7 +11,7 @@ mod case_splits;
 #[cfg(feature = "internal-checker")]
 mod catalog_composition;
 #[cfg(feature = "internal-checker")]
-mod failure_search;
+pub(super) mod failure_search;
 #[cfg(feature = "internal-checker")]
 mod qualified_demand;
 #[cfg(feature = "internal-checker")]
@@ -1815,7 +1815,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             #[cfg(feature = "internal-checker")]
             let capped = if let Some(search) = &mut effects.startup_search {
                 use failure_search::Admission::*;
-                match search.admit(wosy_syntax::SourceSpan::new(source.clone(), span)).ok_or(ProjectCheck::Unsupported)? {
+                match search.borrow_mut().admit(wosy_syntax::SourceSpan::new(source.clone(), span)).ok_or(ProjectCheck::Unsupported)? {
                     Duplicate => return Ok(if directive.operation == CheckerOperation::Narrow { StartupLane::Empty } else { StartupLane::Feasible }),
                     Selected => false,
                     SelectedAndStop => true,
@@ -1859,7 +1859,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         #[cfg(feature = "internal-checker")]
         if let Some(search) = failures.as_deref_mut().and_then(|effects| effects.startup_search.as_mut()) {
             let site = topology.occurrences.get(condition.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            search.branch(wosy_syntax::SourceSpan::new(source.clone(), site.span), value).ok_or(ProjectCheck::Unsupported)?;
+            search.borrow_mut().branch(wosy_syntax::SourceSpan::new(source.clone(), site.span), value).ok_or(ProjectCheck::Unsupported)?;
         }
         let selected = if value { Some(then_block) } else { else_block };
         if let Some(selected) = selected {
@@ -1874,7 +1874,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         return Ok(StartupLane::Feasible);
     }
     #[cfg(feature = "internal-checker")]
-    if startup_trace_requested(failures) { return Err(ProjectCheck::Unsupported); }
+    let startup_site = startup_trace_requested(failures).then_some(OrderedInitializerCall { topology, occurrence: expression });
     #[cfg(feature = "internal-checker")]
     let proof_site = actual.initializer_proof_site(topology, source, expression, failures.as_deref());
     let sink;
@@ -1883,6 +1883,8 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         Some((source, OrderedCallCollection {
             #[cfg(feature = "internal-checker")]
             outer: (PRIVATE_NESTED_SCALAR && depth == 0).then_some(OrderedInitializerCall { topology, occurrence: expression }),
+            #[cfg(feature = "internal-checker")]
+            startup_site,
             ..OrderedCallCollection::new(&sink, Some(visits))
         }))
     } else { None };
@@ -2331,6 +2333,8 @@ struct OrderedCallCollection<'a, 'visits> {
     scalar_initializer: Option<OrderedInitializerCall<'a>>,
     #[cfg(feature = "internal-checker")]
     meter_named_legacy_unit: bool,
+    #[cfg(feature = "internal-checker")]
+    startup_site: Option<OrderedInitializerCall<'a>>,
 }
 
 impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
@@ -2343,6 +2347,8 @@ impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
             scalar_initializer: None,
             #[cfg(feature = "internal-checker")]
             meter_named_legacy_unit: false,
+            #[cfg(feature = "internal-checker")]
+            startup_site: None,
         }
     }
 }
@@ -3127,13 +3133,22 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
 
     fn run_call_cursor<const NAMED: bool>(
         &mut self, body: &'project FunctionCallSites, source: &'project SourceIdentity,
-        cursor: ExactCallCursor<'project>, entry: Option<BigInt>, collection: Option<OrderedCallCollection<'_, '_>>,
+        #[allow(unused_mut)] mut cursor: ExactCallCursor<'project>, entry: Option<BigInt>, collection: Option<OrderedCallCollection<'_, '_>>,
         named_root: Option<NamedStackRoot>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         #[cfg(feature = "internal-checker")]
         if NAMED {
             self.charge_named_exact_frame(body)?;
         }
+        #[cfg(feature = "internal-checker")]
+        let authored_site = if let Some((ordered, site)) = collection.and_then(|ordered| ordered.startup_site.map(|site| (ordered, site))) {
+            let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+            let at = wosy_syntax::SourceSpan::new(source.clone(), at);
+            let trace = ordered.failures.borrow().startup_search.clone().ok_or(ProjectCheck::Unsupported)?;
+            trace.borrow_mut().append(failure_search::PathStep::Call(at.clone())).ok_or(ProjectCheck::Unsupported)?;
+            cursor.track_startup_path(source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
+            Some((at, trace))
+        } else { None };
         let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
             named_site: None,
@@ -3151,6 +3166,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             if let Some((target, first_activation, _, _)) = frame.target {
                 self.active_depth -= 1;
                 if first_activation { self.active.remove(&target); }
+            }
+        }
+        #[cfg(feature = "internal-checker")]
+        if let Some((site, trace)) = authored_site {
+            if trace.borrow().invalid() { return Err(ProjectCheck::Unsupported); }
+            if trace.borrow().remaining() == 0 { return Err(ProjectCheck::StartupAuthoredLimitReached); }
+            if matches!(result, Ok(ActualCallResult::Unit)) {
+                trace.borrow_mut().append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
             }
         }
         result
@@ -3187,7 +3210,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     guarded_nonreturn = true;
                 }
                 if let Some(collection) = active_collection {
-                    collection.failures.borrow_mut().push_callable(body, source, failure);
+                    let mut effects = collection.failures.borrow_mut();
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(trace) = &effects.startup_search {
+                        let mut trace = trace.borrow_mut();
+                        let decision = body.occurrences.get(failure.directive.0)
+                            .and_then(|site| trace.admit(wosy_syntax::SourceSpan::new(source.clone(), site.span)));
+                        match decision {
+                            Some(failure_search::Admission::Duplicate) => return,
+                            Some(failure_search::Admission::Selected | failure_search::Admission::SelectedAndStop) => {},
+                            None => { trace.invalidate(); return; }
+                        }
+                    }
+                    effects.push_callable(body, source, failure);
                 }
             };
             let mut nested_error = None;
@@ -3867,6 +3902,20 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
         #[cfg(feature = "internal-checker")]
+        if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
+            if !ACTUAL_STARTUP || *expected != ScalarType::Unit || caller != &owner.source
+                || !ordered.startup_site.is_some_and(|site|
+                    std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
+                || !body.checker_named_route_frame() || !body.call_occurrences.is_empty()
+                || !body.structure.checker_direct_targets.is_empty()
+                || !body.structure.checker_selected_snapshots.is_empty()
+                || !body.structure.module_storage_uses.is_empty()
+                || !body.callable_escapes.is_empty()
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                || !signature.parameters.iter().all(is_integer_type)
+            { return Err(ProjectCheck::Unsupported); }
+        }
+        #[cfg(feature = "internal-checker")]
         if body.contextual_formal().is_some() {
             // Only the exact child activation path can install a formal.
             return Err(ProjectCheck::Unsupported);
@@ -4541,7 +4590,7 @@ fn select_checked_root<'a>(
 struct OrderedFailures {
     records: Vec<ScalarOrderedCheckerFailure>,
     #[cfg(feature = "internal-checker")]
-    startup_search: Option<failure_search::StartUpSearch>,
+    startup_search: Option<Rc<RefCell<failure_search::StartUpSearch>>>,
     payloads: OrderedFailurePayloads,
     #[cfg(feature = "internal-checker")]
     has_authored_state: bool,
@@ -9784,11 +9833,13 @@ impl PreparedScalarOrderedCheck {
         let (project, _) = owner.parts();
         let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
-        let mut effects = OrderedFailures { startup_search: Some(failure_search::StartUpSearch::new(root, cap)), ..OrderedFailures::default() };
+        let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(failure_search::StartUpSearch::new(root, cap)))), ..OrderedFailures::default() };
         let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
             &owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
         );
-        let search = effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?;
+        let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+            .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+        if search.invalid() { return Err(ProjectCheck::Unsupported); }
         let completion = match outcome {
             Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
             Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
@@ -14717,6 +14768,48 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn private_startup_unit_calls_keep_same_directive_distinct_by_real_callsite() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "startup-unit-structural-path");
+        let program = format!(r#"%%start
+            unit(u8) report = fn(value) {{
+                if (value >= 4) {{ core.require(false, {OUTPUT}); }};
+            }};
+            report(4);
+            report(4);
+        %%end"#);
+        let original = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = || {
+                let parsed = crate::parse_source(source.clone(), program.clone(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations, Vec::new())], [], vec![source.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::MainFlowOnly, Vec::new(),
+                ).ok().unwrap()
+            };
+            for cap in [1, 3] {
+                let (records, end, search) = prepare().search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert_eq!(records.len(), cap.min(2));
+                assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                assert!(records.iter().all(|record| record.directive == records[0].directive));
+                let start = program.find("value >= 4").unwrap() as u32;
+                assert!(search.contains_branch(wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + 10)), true));
+                let mut histories = search.call_paths();
+                histories.sort_unstable_by_key(|path| path.len());
+                for (index, path) in histories.iter().enumerate() {
+                    assert_eq!(path.len(), index + 1);
+                    assert!(path.iter().all(|site| site.source == source && original(site.range) == "report(4)"));
+                }
+                if cap == 3 { assert!(histories[1][0].range.start < histories[1][1].range.start); }
+                assert_eq!(prepare().run().unwrap().directives.len(), 2);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_startup_budget_stops_at_real_branch_and_zero_code() {
         use std::num::NonZeroUsize;
         let app = source("src/main.w", "startup-budget-recovery");
@@ -14751,7 +14844,7 @@ mod tests {
             // tranche does not have. It must not be visited past the first cap,
             // and must not silently be treated as traced with quota still open.
             let reached_later = program.replace("%%end", &format!(
-                "unit() later = fn {{ core.require(false, {second}); }}; later(); %%end"));
+                "unit() later = fn {{ core.require(false, {second}); }}; unit() wrapper = fn {{ later(); }}; wrapper(); %%end"));
             assert!(prepare(&reached_later).run().unwrap().directives.len() > 2);
             assert_eq!(prepare(&reached_later).search_startup_authored(NonZeroUsize::MIN).unwrap().1,
                 StartupAuthoredCompletion::LimitReached);
