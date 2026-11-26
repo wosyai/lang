@@ -8,6 +8,7 @@ use crate::project_sources::{self, Error as SourceError};
 use std::{collections::BTreeMap, fmt, io::{self, Write}, path::{Path, PathBuf}, process::ExitStatus};
 use wosy_compiler::{
     parse_source_with_snapshot, prepare_comptime_stdout, prepare_comptime_stdout_evaluator,
+    prepare_comptime_wasip1_stdout_evaluator,
     ClosedComptimeRejection, ComptimeStdoutError, PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
     ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
@@ -24,15 +25,15 @@ pub struct ProjectComptimeStdout {
 pub fn prepare_project_comptime_stdout(
     root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ProjectComptimeStdout, ClosedComptimePlanError> {
-    let (output, _, _) = observe_project(root, target, profile, |sources, order| {
+    let (output, _, _) = observe_project(root, target, profile, false, |sources, order| {
         prepare_comptime_stdout(sources, order, id, layout)
     })?;
     Ok(ProjectComptimeStdout { output })
 }
 
 /// The compiler-emitted aggregate evaluator and the exact result shape.
-/// The builder/runner descriptions are inert. A stdout bridge inside the
-/// evaluator is still required before this can run as a comptime tool.
+/// The builder/runner descriptions are inert. Only the explicitly selected
+/// preview1 variant includes a stdout entry; detached IR does not.
 pub struct ProjectComptimeStdoutEvaluator {
     evaluator: PreparedComptimeStdoutEvaluator,
     project: PathBuf,
@@ -42,8 +43,20 @@ pub struct ProjectComptimeStdoutEvaluator {
 pub fn prepare_project_comptime_stdout_evaluator(
     root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ProjectComptimeStdoutEvaluator, ClosedComptimePlanError> {
-    let (evaluator, project, tools) = observe_project(root, target, profile, |sources, order| {
+    let (evaluator, project, tools) = observe_project(root, target, profile, false, |sources, order| {
         prepare_comptime_stdout_evaluator(sources, order, id, layout)
+    })?;
+    Ok(ProjectComptimeStdoutEvaluator { evaluator, project, tools })
+}
+
+/// Prepare an explicitly requested WASI preview1 stdout stage. The
+/// selected ordinary artifact profile must declare llvm/wasm-wasip1;
+/// this does not infer evaluator tool identity or support wasip2.
+pub fn prepare_project_comptime_wasip1_stdout_evaluator(
+    root: &Path, target: &str, profile: &str, id: &str, max_stdout: usize,
+) -> Result<ProjectComptimeStdoutEvaluator, ClosedComptimePlanError> {
+    let (evaluator, project, tools) = observe_project(root, target, profile, true, |sources, order| {
+        prepare_comptime_wasip1_stdout_evaluator(sources, order, id, max_stdout)
     })?;
     Ok(ProjectComptimeStdoutEvaluator { evaluator, project, tools })
 }
@@ -73,14 +86,17 @@ impl ProjectComptimeStdoutEvaluator {
 }
 
 fn observe_project<T>(
-    root: &Path, target: &str, profile: &str,
+    root: &Path, target: &str, profile: &str, wasip1: bool,
     prepare: impl FnOnce(
         Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>, Vec<SourceIdentity>,
     ) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<(T, PathBuf, SelectedComptimeTools), ClosedComptimePlanError> {
     let root = root.canonicalize().map_err(|error| error.to_string())?;
     let (configuration, manifest) = ProjectConfiguration::load_with_manifest(&root)?;
-    configuration.artifact_profile(target, profile)?;
+    let (_, _, artifact, _) = configuration.artifact_profile(target, profile)?;
+    if wasip1 && (artifact.backend != "llvm" || artifact.output != "wasm-wasip1") {
+        return Err(ClosedComptimePlanError::Project("computed stdout stage requires an explicit llvm/wasm-wasip1 profile".into()));
+    }
     let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
     let mut remaining = CLOSED_COMPTIME_MAX_SOURCE_BYTES;

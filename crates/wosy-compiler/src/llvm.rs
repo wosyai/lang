@@ -390,13 +390,27 @@ fn emit_scalar_llvm_with_metadata(
         &|_, _, function| Some(&function.reference_cfg),
         metadata,
         &[],
+        None,
     )
+}
+
+mod comptime_stdout;
+
+pub(crate) fn emit_scalar_build_wasip1_comptime_stdout(
+    validation: &ScalarBuildValidation<'_>, result: &ScalarType, max_stdout: usize,
+) -> Result<LlvmPartition, String> {
+    let plan = Some((result, max_stdout));
+    if validation.prepared().project().modules.len() == 1 {
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[], plan)
+    } else {
+        emit_scalar_build_project_with_policy(validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &[], plan)
+    }
 }
 
 pub fn emit_scalar_build_single_module_llvm(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<LlvmPartition, String> {
-    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full, &[])
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full, &[], None)
 }
 
 pub fn emit_scalar_build_single_module_llvm_text(
@@ -408,7 +422,7 @@ pub fn emit_scalar_build_single_module_llvm_text(
 pub fn emit_scalar_build_single_module_artifact_llvm(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<LlvmPartition, String> {
-    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[], None)
 }
 
 /// The ordinary artifact emitter selected from the authored graph and the
@@ -521,10 +535,10 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
         });
     }
     if singleton {
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports, None)
     } else {
         emit_scalar_build_project_with_policy(
-            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports,
+            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports, None,
         )
     }
 }
@@ -574,6 +588,7 @@ fn emit_scalar_build_single_module_with_metadata(
     validation: &ScalarBuildValidation<'_>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
+    comptime_result: Option<(&ScalarType, usize)>,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -604,6 +619,7 @@ fn emit_scalar_build_single_module_with_metadata(
         &|item, arm, _| validation.reference_cfg(0, item, arm),
         metadata,
         exports,
+        comptime_result,
     )
 }
 
@@ -623,6 +639,7 @@ fn emit_single_module_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
+    comptime_result: Option<(&ScalarType, usize)>,
 ) -> Result<LlvmPartition, String> {
     let prepared_render = generic_input.prepared_render();
     let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
@@ -887,27 +904,32 @@ fn emit_single_module_llvm<'a>(
             target_layout,
         )?;
     }
-    emit_main(
-        prepared_render,
-        aggregates.initializer(source),
-        &context,
-        &builder,
-        &functions,
-        &call_targets,
-        &signatures,
-        &runtime_array_results,
-        &dynamic_owner_outputs,
-        &globals,
-        &names,
-        items,
-        initialization_region,
-        initializer_nodes.as_ref(),
-        &initializer_symbols,
-        &module,
-        &structs,
-        &layouts,
-        target_layout,
-    )?;
+    if let Some((ty, cap)) = comptime_result {
+        let entry = *functions.get("evaluate").ok_or("missing selected comptime evaluator")?;
+        comptime_stdout::emit(&context, &module, &layouts, &structs, target_layout, entry, ty, cap)?;
+    } else {
+        emit_main(
+            prepared_render,
+            aggregates.initializer(source),
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            &runtime_array_results,
+            &dynamic_owner_outputs,
+            &globals,
+            &names,
+            items,
+            initialization_region,
+            initializer_nodes.as_ref(),
+            &initializer_symbols,
+            &module,
+            &structs,
+            &layouts,
+            target_layout,
+        )?;
+    }
     if !exports.is_empty() {
         emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
     }
@@ -935,6 +957,7 @@ pub fn emit_scalar_project_llvm(
         EmissionPolicy::RawCompatibility,
         PartitionMetadata::Full,
         &[],
+        None,
     )
 }
 
@@ -946,6 +969,7 @@ pub fn emit_scalar_build_project_llvm(
         EmissionPolicy::Prepared,
         PartitionMetadata::Full,
         &[],
+        None,
     )
 }
 
@@ -963,6 +987,7 @@ pub fn emit_scalar_build_project_artifact_llvm(
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
         &[],
+        None,
     )
 }
 
@@ -971,6 +996,7 @@ fn emit_scalar_build_project_with_policy(
     policy: EmissionPolicy,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
+    comptime_result: Option<(&ScalarType, usize)>,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -991,6 +1017,7 @@ fn emit_scalar_build_project_with_policy(
         },
         metadata,
         exports,
+        comptime_result,
     )
 }
 
@@ -1008,6 +1035,7 @@ fn emit_project_llvm<'a>(
     project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
+    comptime_result: Option<(&ScalarType, usize)>,
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -1424,27 +1452,34 @@ fn emit_project_llvm<'a>(
             target_layout,
         )?;
     }
-    emit_project_main(
-        prepared_render,
-        &aggregates,
-        &context,
-        &builder,
-        &functions,
-        &call_targets,
-        &signatures,
-        &runtime_array_results,
-        &dynamic_owner_outputs,
-        &modules,
-        &regions,
-        &names,
-        initializer_nodes.as_deref(),
-        &initializer_symbols,
-        &globals,
-        &module,
-        &all_structs,
-        &layouts,
-        target_layout,
-    )?;
+    if let Some((ty, cap)) = comptime_result {
+        let root = project.modules.first().ok_or("missing selected comptime module")?;
+        let symbol = project_function_name(&root.source, "evaluate");
+        let entry = *functions.get(&symbol).ok_or("missing selected comptime evaluator")?;
+        comptime_stdout::emit(&context, &module, &layouts, &all_structs, target_layout, entry, ty, cap)?;
+    } else {
+        emit_project_main(
+            prepared_render,
+            &aggregates,
+            &context,
+            &builder,
+            &functions,
+            &call_targets,
+            &signatures,
+            &runtime_array_results,
+            &dynamic_owner_outputs,
+            &modules,
+            &regions,
+            &names,
+            initializer_nodes.as_deref(),
+            &initializer_symbols,
+            &globals,
+            &module,
+            &all_structs,
+            &layouts,
+            target_layout,
+        )?;
+    }
     if !exports.is_empty() {
         emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
     }

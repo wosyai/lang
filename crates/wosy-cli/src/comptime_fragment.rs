@@ -24,7 +24,8 @@ pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime};
 mod stdout;
 #[cfg(target_os = "linux")]
 pub use stdout::{
-    prepare_project_comptime_stdout, prepare_project_comptime_stdout_evaluator, ComptimeReadbackError,
+    prepare_project_comptime_stdout, prepare_project_comptime_stdout_evaluator,
+    prepare_project_comptime_wasip1_stdout_evaluator, ComptimeReadbackError,
     ProjectComptimeStdout, ProjectComptimeStdoutEvaluator,
 };
 

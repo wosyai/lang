@@ -578,3 +578,75 @@ Report result = comptime prepare {
     ))));
     assert!(!project.join(".wosy").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn computed_wasip1_stdout_has_one_ordinary_evaluation_and_only_preview1_stdout() {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    use wosy_cli::comptime_fragment::prepare_project_comptime_wasip1_stdout_evaluator;
+    use wosy_compiler::{ClosedComptimeRejection, ScalarExpression as Expr};
+
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let source = project.join("src/main.w");
+    let text = r#"%%start
+struct copy Child { i32 delta; bool active; }
+struct copy Report { Child state; u32[2] buckets; }
+u32 unrelated = 99;
+Report result = comptime prepare {
+    i32 baseline = -7;
+    i32 adjusted = baseline ^ 1;
+    u32 low = 9;
+    u32 high = low | 2;
+    { .buckets = [high, low]; .state = { .active = true; .delta = adjusted; }; }
+};
+%%end
+"#;
+    fs::write(&source, text).unwrap();
+    let select = |budget| prepare_project_comptime_wasip1_stdout_evaluator(
+        &project, "app", "override", "prepare", budget,
+    );
+    for manifest in [MANIFEST.to_owned(), MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip2\"")] {
+        fixture.manifest(&manifest);
+        assert!(matches!(select(256), Err(ClosedComptimePlanError::Project(message))
+            if message == "computed stdout stage requires an explicit llvm/wasm-wasip1 profile"));
+    }
+    fixture.manifest(&MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\""));
+    assert!(matches!(select(1), Err(ClosedComptimePlanError::Fragment(ClosedComptimeRejection::Emitter(message)))
+        if message == "comptime stdout shape exceeds the selected byte budget"));
+    let staged = select(256).unwrap_or_else(|error| panic!("preview1 computed stdout: {error:?}"));
+    let mut bytes = Vec::new();
+    let receipt = staged.write_evaluator_ir(&mut bytes, 1 << 16).unwrap();
+    assert_eq!(receipt.blake3, blake3::hash(&bytes));
+    let ir = std::str::from_utf8(&bytes).unwrap();
+    let evaluator = ir.split_once("define [16 x i8] @evaluate(").unwrap().1.split_once("\n}").unwrap().0;
+    assert!(evaluator.contains("xor i32") && evaluator.contains("or i32"), "{evaluator}");
+    let main = ir.split_once("define i32 @main(").unwrap().1.split_once("\n}").unwrap().0;
+    assert_eq!(main.matches("call [16 x i8] @evaluate(").count(), 1);
+    assert!(main.contains("icmp slt i32") && main.contains("wire.array.index"));
+    assert!(main.contains("call i32 @fd_write(i32 1,"));
+    assert!(main.contains("stdout.progress") && main.contains("stdout.within") && main.contains("stdout.next.write"));
+    assert!(main.contains("ret i32 1") && main.contains("ret i32 0"));
+    assert!(ir.contains("\"wasm-import-module\"=\"wasi_snapshot_preview1\""));
+    assert!(ir.contains("\"wasm-import-name\"=\"fd_write\""));
+    assert!(!ir.contains("@unrelated") && !ir.contains("@printf"));
+    // No evaluator has run: these bytes are a host oracle for the result
+    // shape kept by the same emitted staging object.
+    let expected = b"[[-8,true],[11,9]]\n";
+    let Expr::StructLiteral { fields, .. } = staged.read_stdout(ExitStatus::from_raw(0), expected, 256).unwrap()
+    else { panic!("ordinary struct stdout result"); };
+    assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["state", "buckets"]);
+
+    // A separate scalar uses the same compiled stdout entry without an
+    // aggregate-specific extension or a different client grammar.
+    fs::write(&source, "%%start\nu32 answer = comptime prepare { u32 seed = 7; seed ^ 9 };\n%%end\n").unwrap();
+    assert!(matches!(select(10), Err(ClosedComptimePlanError::Fragment(ClosedComptimeRejection::Emitter(_)))));
+    let scalar = select(11).unwrap();
+    let mut bytes = Vec::new();
+    scalar.write_evaluator_ir(&mut bytes, 1 << 16).unwrap();
+    let scalar_ir = std::str::from_utf8(&bytes).unwrap();
+    assert!(scalar_ir.contains("call i32 @evaluate()") && scalar_ir.contains("@fd_write(i32 1,"));
+    assert!(matches!(scalar.read_stdout(ExitStatus::from_raw(0), b"14\n", 11).unwrap(),
+        Expr::Integer { value, .. } if i64::try_from(&value) == Ok(14)));
+    assert!(!project.join(".wosy").exists());
+}

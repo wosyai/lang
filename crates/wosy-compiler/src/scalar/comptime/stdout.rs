@@ -10,6 +10,7 @@ use super::super::{
     derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
     EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject, ScalarStructId, ScalarStructLiteralField,
 };
+use crate::llvm::emit_scalar_build_wasip1_comptime_stdout;
 use crate::{
     emit_scalar_build_project_artifact_llvm, emit_scalar_build_single_module_artifact_llvm, LlvmPartition,
     ScalarBlock, ScalarFunction, ScalarOutput, ScalarOutputSequence, UnaryOperator,
@@ -64,7 +65,7 @@ pub fn prepare_comptime_stdout(
     id: &str,
     layout: ScalarTargetLayout,
 ) -> Result<PreparedComptimeStdout, ClosedComptimeRejection> {
-    prepare(sources, initialization_order, id, layout, false).map(|(output, _)| output)
+    prepare(sources, initialization_order, id, layout, Delivery::Observe).map(|(output, _)| output)
 }
 
 /// The compiler-issued standalone evaluator and the stdout type from that
@@ -91,19 +92,44 @@ pub fn prepare_comptime_stdout_evaluator(
     id: &str,
     layout: ScalarTargetLayout,
 ) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
-    let (output, llvm) = prepare(sources, initialization_order, id, layout, true)?;
+    prepare_evaluator(sources, initialization_order, id, layout, Delivery::Detached)
+}
+
+/// Emit the actual selected body and its compiler-owned stdout entry for
+/// an explicitly selected WASI preview1 command. No p2 claim or launch.
+pub fn prepare_comptime_wasip1_stdout_evaluator(
+    sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<wosy_syntax::SourceIdentity>,
+    id: &str,
+    max_stdout: usize,
+) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
+    prepare_evaluator(sources, initialization_order, id, ScalarTargetLayout::WASM32, Delivery::Wasip1(max_stdout))
+}
+
+fn prepare_evaluator(
+    sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<wosy_syntax::SourceIdentity>,
+    id: &str,
+    layout: ScalarTargetLayout,
+    delivery: Delivery,
+) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
+    let (output, llvm) = prepare(sources, initialization_order, id, layout, delivery)?;
     let llvm = llvm.ok_or_else(|| ClosedComptimeRejection::Emitter("prepared evaluator is missing".into()))?;
     Ok(PreparedComptimeStdoutEvaluator { output, llvm, layout })
 }
+
+#[derive(Clone, Copy)]
+enum Delivery { Observe, Detached, Wasip1(usize) }
 
 fn prepare(
     sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<wosy_syntax::SourceIdentity>,
     id: &str,
     layout: ScalarTargetLayout,
-    emit: bool,
+    delivery: Delivery,
 ) -> Result<(PreparedComptimeStdout, Option<LlvmPartition>), ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
+    let emit = !matches!(delivery, Delivery::Observe);
     if !matches!(layout, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) {
         return Err(Error::UnsupportedLayout);
     }
@@ -235,14 +261,17 @@ fn prepare(
     let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), 0)
         .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
     let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, value));
-    let llvm = if emit {
-        let llvm = if project.modules.len() == 1 {
+    let llvm = match delivery {
+        Delivery::Observe => None,
+        Delivery::Detached => Some(if project.modules.len() == 1 {
             emit_scalar_build_single_module_artifact_llvm(&build)
         } else {
             emit_scalar_build_project_artifact_llvm(&build)
-        }.map_err(Error::Emitter)?;
-        Some(llvm)
-    } else { None };
+        }.map_err(Error::Emitter)?),
+        Delivery::Wasip1(maximum) => Some(
+            emit_scalar_build_wasip1_comptime_stdout(&build, result_type, maximum).map_err(Error::Emitter)?,
+        ),
+    };
     Ok((PreparedComptimeStdout { site: scope, result_type: result_type.clone(), shape, literal }, llvm))
 }
 

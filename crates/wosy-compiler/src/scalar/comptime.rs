@@ -16,7 +16,8 @@ const FUNCTION: &str = "evaluate";
 mod direct;
 mod stdout;
 pub use stdout::{
-    prepare_comptime_stdout, prepare_comptime_stdout_evaluator, ComptimeStdoutError,
+    prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
+    ComptimeStdoutError,
     PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
 };
 pub use direct::{

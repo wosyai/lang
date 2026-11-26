@@ -30,7 +30,8 @@ pub use scalar::{
     ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
 pub use scalar::{
-    prepare_comptime_stdout, prepare_comptime_stdout_evaluator, ComptimeStdoutError,
+    prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
+    ComptimeStdoutError,
     PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
 };
 pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
