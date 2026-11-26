@@ -20,7 +20,7 @@ pub(super) async fn run(
     let target = args.next().ok_or("expected fixture target")?;
     let mode = args.next().ok_or("expected local source action")?;
     let start = Instant::now();
-    let limits = if matches!(mode.as_str(), "stage-limited" | "proposal-limited") {
+    let limits = if matches!(mode.as_str(), "stage-limited" | "proposal-limited" | "git-base-projection-limited") {
         ClientSourceLimits {
             nodes: args.next().ok_or("expected fixture node limit")?.parse()?,
             encoded_bytes: args.next().ok_or("expected fixture byte limit")?.parse()?,
@@ -41,6 +41,26 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "git-base-projection" | "git-base-projection-limited" => {
+            let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
+            let generation = args.next().ok_or("expected fixture attempt")?.parse()?;
+            let package = args.next().ok_or("expected fixture package")?;
+            let projection = client.pending_git_base_projection(&target, SourceAttempt::new(root, generation), &package)?;
+            let projection = projection.map(|projection| {
+                let files: Vec<_> = projection.files.into_iter().map(|(path, file)| serde_json::json!({
+                    "path": path, "revision": file.revision.hex(), "authored": file.authored.hex(),
+                    "executable": file.executable.hex(),
+                })).collect();
+                serde_json::json!({
+                    "project": projection.project, "target": projection.target, "package": projection.package,
+                    "root": projection.attempt.root().hex(), "attempt": projection.attempt.generation(),
+                    "policy": projection.parser_policy.hex(), "tree": projection.installed.tree(),
+                    "locked": NodeId(*projection.installed.locked().as_bytes()).hex(),
+                    "revision": projection.installed.revision(), "files": files,
+                })
+            });
+            serde_json::json!({ "projection": projection, "project_ms": milliseconds(start) })
+        }
         "framed-base-projection" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
             let generation = args.next().ok_or("expected fixture attempt")?.parse()?;

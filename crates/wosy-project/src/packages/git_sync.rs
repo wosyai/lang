@@ -1,6 +1,6 @@
 use super::{git_wire::{self, GitOid, GitTreeOid}, graph, load_git, load_local_declarations, GitDirectory, GitProject, LockedInputId, LockedPackage, ProjectSnapshot, DEPS};
 use super::patches::{GitOverlay, PatchStack, PatchStackId};
-use crate::{dependency_diagnostic, project_dependencies, scalar_string, DependencyDeclaration, DependencySource, GitSource};
+use crate::{dependency_diagnostic, project_dependencies, scalar_string, DependencyDeclaration, DependencySource, GitSource, PackageRelativePath};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -897,6 +897,8 @@ pub(super) fn verify_installed(
 /// receipt identifies a Git tree, not a live filesystem or a compiler root.
 pub struct InstalledGitBase {
     locked: LockedInputId,
+    patches: PatchStackId,
+    checkout: PathBuf,
     revision: GitOid,
     package_path: String,
     tree: GitTreeOid,
@@ -905,6 +907,8 @@ pub struct InstalledGitBase {
 
 impl InstalledGitBase {
     pub fn locked(&self) -> &LockedInputId { &self.locked }
+    pub fn patches(&self) -> PatchStackId { self.patches }
+    pub fn checkout_path(&self) -> &Path { &self.checkout }
     pub fn revision(&self) -> &str { self.revision.as_str() }
     pub fn package_path(&self) -> &str { &self.package_path }
     pub fn tree(&self) -> &str { self.tree.as_str() }
@@ -917,6 +921,16 @@ impl InstalledGitBase {
 /// but have no pristine capture here. Only this observation is verified; it is
 /// not a lock against subsequent external edits.
 pub fn observe_installed_git_base(root: &Path, name: &str) -> Result<Option<InstalledGitBase>, String> {
+    match_installed_git_base_files(root, name, std::iter::empty())
+}
+
+/// Compare existing source revision digests to the same anchored file bytes
+/// used to verify the installed base. Hash and open each file once; no second
+/// reading by filename and no retention of source bytes. Only visited files in
+/// the supplied projection are matched; this is not a complete package CST.
+pub fn match_installed_git_base_files<'a>(
+    root: &Path, name: &str, expected: impl IntoIterator<Item = (&'a PackageRelativePath, &'a [u8; 32])>,
+) -> Result<Option<InstalledGitBase>, String> {
     let snapshot = ProjectSnapshot::reader(root)?;
     let git = snapshot.git_project()?;
     let manifest = git.directory.read_text(Path::new(super::snapshot::MANIFEST))?
@@ -934,15 +948,24 @@ pub fn observe_installed_git_base(root: &Path, name: &str) -> Result<Option<Inst
         .map_err(|_| "installed Git dependency does not match a valid lock entry")?;
     let Some(installed) = git.installed(name, pin)? else { return Ok(None) };
     let stack = PatchStack::load(&git.directory, name)?;
-    installed.require_stack(name, stack.identity())?;
+    let patches = stack.identity();
+    installed.require_stack(name, patches)?;
     if !stack.is_empty() { return Ok(None) }
     let (Some(tree), Some(baseline)) = (installed.base_tree, installed.baseline) else { return Ok(None) };
-    let actual = tree_identity(&installed.checkout)?;
+    let files = tree_file_digests(&installed.checkout)?;
+    let actual = identity_from_files(&files);
     if actual.working != baseline || actual.original_v1 != pin.source_hash {
         return Err(dirty_checkout(&git, name));
     }
+    for (path, revision) in expected {
+        let path = path.as_path().to_str().ok_or("staged Git source path is not UTF-8")?;
+        if files.get(path).is_none_or(|(actual, _)| actual.as_bytes() != revision) {
+            return Err("staged source revision does not match the installed Git base".to_owned());
+        }
+    }
     Ok(Some(InstalledGitBase {
-        locked: pin.input_identity(), revision: pin.revision.clone(), package_path: pin.source.package_path.clone(),
+        locked: pin.input_identity(), patches, checkout: git.root.join(DEPS).join(name),
+        revision: pin.revision.clone(), package_path: pin.source.package_path.clone(),
         tree, source_hash: pin.source_hash.clone(),
     }))
 }
@@ -1310,7 +1333,7 @@ pub(super) struct TreeIdentity {
     pub(super) working: WorkingTreeId,
 }
 
-pub(super) fn tree_identity(root: &GitDirectory) -> Result<TreeIdentity, String> {
+fn tree_file_digests(root: &GitDirectory) -> Result<BTreeMap<String, (blake3::Hash, bool)>, String> {
     let mut files = BTreeMap::new();
     collect_tree_files(root, |path, file, executable| {
         let mut content = blake3::Hasher::new();
@@ -1319,7 +1342,11 @@ pub(super) fn tree_identity(root: &GitDirectory) -> Result<TreeIdentity, String>
         files.insert(path.to_owned(), (content.finalize(), executable));
         Ok(())
     })?;
-    Ok(identity_from_files(&files))
+    Ok(files)
+}
+
+pub(super) fn tree_identity(root: &GitDirectory) -> Result<TreeIdentity, String> {
+    Ok(identity_from_files(&tree_file_digests(root)?))
 }
 
 fn identity_from_files(files: &BTreeMap<String, (blake3::Hash, bool)>) -> TreeIdentity {

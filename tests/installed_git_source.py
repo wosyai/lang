@@ -127,6 +127,56 @@ with tempfile.TemporaryDirectory() as directory:
     finally:
         installed.chmod(permissions)
 
+    def pending(project, operation, *args, refusal=None, target="app"):
+        cmd = [example, project, store, "--persistent-source", target, operation, *map(str, args)]
+        child = subprocess.run(cmd, env=read_env, text=True, capture_output=True)
+        if refusal:
+            assert child.returncode and refusal in child.stderr, child.stderr
+            return
+        child.check_returncode()
+        return json.loads(child.stdout)
+
+    def source_db_evidence(project):
+        return tuple((project / name).read_bytes() for name in (".wosy/client.sqlite", ".wosy/cst/nodes.sqlite"))
+
+    staged = pending(peer, "stage")
+    same = staged["pending"]
+    old_attempt = staged["attempt"]
+    assert staged["selected"] is None
+    assert pending(peer, "abandon", same, old_attempt)["result"]["abandoned"]
+    current_stage = pending(peer, "stage")
+    current_attempt = current_stage["attempt"]
+    assert current_stage["pending"] == same and current_attempt > old_attempt
+    peer_state = source_db_evidence(peer)
+    pending(peer, "git-base-projection", same, old_attempt, "remote_lib", refusal="not the current source attempt")
+    pending(peer, "git-base-projection", same, current_attempt, "remote_lib", target="different",
+            refusal="not the current source attempt")
+    pending(peer, "git-base-projection-limited", 0, 16 << 20, same, current_attempt, "remote_lib", refusal="LimitExceeded")
+    projected = pending(peer, "git-base-projection", same, current_attempt, "remote_lib")
+    clean_projection = projected["result"]["projection"]
+    assert (clean_projection["project"], clean_projection["target"], clean_projection["package"]) == (
+        str(peer), "app", "remote_lib",
+    )
+    assert (clean_projection["root"], clean_projection["attempt"], projected["selected"]) == (same, current_attempt, None)
+    assert (clean_projection["revision"], clean_projection["tree"], clean_projection["locked"]) == (
+        revision, tree, pristine_base["locked"],
+    )
+    assert [f["path"] for f in clean_projection["files"]] == ["src/constants.w", "src/packet.w"]
+    assert source_db_evidence(peer) == peer_state and not store.exists()
+    assert pending(peer, "abandon", same, current_attempt)["result"]["abandoned"]
+
+    # The current checkout is pristine again; the saved staged generation is
+    # not. Checkout provenance must not bless a different authored payload.
+    peer_source.write_text(edited)
+    other_stage = pending(peer, "stage")
+    peer_source.write_text(pristine)
+    assert other_stage["pending"] != same
+    dirty_state = source_db_evidence(peer)
+    pending(peer, "git-base-projection", other_stage["pending"], other_stage["attempt"], "remote_lib",
+            refusal="staged source revision does not match the installed Git base")
+    assert source_db_evidence(peer) == dirty_state and not store.exists()
+    assert pending(peer, "abandon", other_stage["pending"], other_stage["attempt"])["result"]["abandoned"]
+
     first, cold_wall, cold_rss = snapshot(app, store)
     first = first["snapshot"]
     initial = first["source_root"]
@@ -142,6 +192,10 @@ with tempfile.TemporaryDirectory() as directory:
     assert warm["reused"] == 3
     peer_first = snapshot(peer, store)[0]["snapshot"]
     peer_root = peer_first["source_root"]
+    assert peer_root == same
+    observed_roots = [(f["path"], f["authored"], f["executable"]) for f in clean_projection["files"]]
+    assert observed_roots == [(f["path"], f["authored"], f["executable"]) for f in peer_first["files"]
+                              if f["package"] == "remote_lib"]
     assert peer_root != initial and peer_first["executable"] == first["executable"]
     assert snapshot(peer, store, peer_root, "--installed-git")[0]["remote_lib"] == selection
     peer_typed = snapshot(peer, store, peer_root, "--typed-project", "dev", "--oracle")[0]
@@ -170,6 +224,11 @@ with tempfile.TemporaryDirectory() as directory:
     assert observe(app)["base"] is None
     assert json.loads(seal_a.read_text())["verified_base"]["tree"] == tree
     assert observe(peer)["base"] == pristine_base
+    overlay_stage = pending(app, "stage")
+    overlay_state = source_db_evidence(app)
+    assert pending(app, "git-base-projection", overlay_stage["pending"], overlay_stage["attempt"],
+                   "remote_lib")["result"]["projection"] is None
+    assert source_db_evidence(app) == overlay_state
     overlay, patch_wall, patch_rss = snapshot(app, store, authored)
     overlay = overlay["snapshot"]
     patched = overlay["source_root"]
@@ -221,5 +280,6 @@ with tempfile.TemporaryDirectory() as directory:
         "peer_warm_ms": round(peer_wall, 3), "peer_warm_peak_kib": peer_rss,
         "verified_git_base_ms": round(observed["observe_ms"], 3),
         "older_release_reader": bool(older),
+        "staged_git_base_projection_ms": round(projected["result"]["project_ms"], 3),
         "sizes_A_B_A_historical": [8, 4, 8, 4],
     }, flush=True)

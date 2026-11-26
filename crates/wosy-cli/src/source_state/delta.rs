@@ -5,13 +5,33 @@ use super::{
 };
 use rusqlite::{Connection, TransactionBehavior};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use wosy_project::{packages::{match_installed_git_base_files, InstalledGitBase}, PackageRelativePath};
 use wosy_protocol::{
     partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId,
     BaseDeclarationProjection,
     BuildSessionCommandId, BuildSessionReply, BuildSessionResponse, BuildSourceSelection, CstAddition,
-    CstDelta, NodeId, SourceIndexAddition, BASE_CST_DELTA_VERSION, BASE_DECLARATION_PROJECTION_VERSION,
+    CstDelta, NodeId, SourceConfig, SourceIndexAddition, BASE_CST_DELTA_VERSION, BASE_DECLARATION_PROJECTION_VERSION,
 };
+
+pub struct ProjectedGitBaseFile {
+    pub revision: NodeId,
+    pub authored: NodeId,
+    pub executable: NodeId,
+}
+
+/// Evidence about the reachable files of one directly selected Git package in
+/// a pending source attempt. It grants no authority to a daemon, does not
+/// acknowledge source, and is not a complete package representation.
+pub struct PendingGitBaseProjection {
+    pub project: PathBuf,
+    pub target: String,
+    pub package: String,
+    pub attempt: SourceAttempt,
+    pub parser_policy: NodeId,
+    pub installed: InstalledGitBase,
+    pub files: BTreeMap<PackageRelativePath, ProjectedGitBaseFile>,
+}
 
 impl SqliteSourceState {
     /// Construct a sparse proposal for the exact still-pending base source
@@ -29,10 +49,10 @@ impl SqliteSourceState {
         }
         let base = selection.selected.ok_or("base CST proposal requires a selected predecessor")?;
         let root = attempt.root();
-        let (known, previous) =
+        let (known, _, previous) =
             trace_and_index(&tx, &self.project, target, base, self.limits, |_, _| ())?;
         let mut novel = BTreeMap::new();
-        let (_, proposed) =
+        let (_, _, proposed) =
             trace_and_index(&tx, &self.project, target, root, self.limits, |id, bytes| {
                 if !known.contains(id) { novel.insert(id, bytes); }
             })?;
@@ -57,6 +77,49 @@ impl SqliteSourceState {
         tx.commit()?;
         Ok((binding, BaseCstProposal {
             version: BASE_CST_DELTA_VERSION, base, root, attempt: attempt.generation(), files, source_index,
+        }))
+    }
+
+    /// Project one directly installed pristine selection onto the exact
+    /// still-pending source attempt (including a first/cold attempt). The
+    /// bounded SQLite read and checkout observation are separate; neither
+    /// acquires a writer lock across the other. The last SQLite read is a
+    /// freshness cut, not a guarantee about future workspace or DB writes.
+    pub fn pending_git_base_projection(
+        &mut self, target: &str, attempt: SourceAttempt, package: &str,
+    ) -> Result<Option<PendingGitBaseProjection>> {
+        let (selection, config, files) = {
+            let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let selection = read_selection(&tx, target)?;
+            if selection.pending != Some(attempt) {
+                return Err("Git base projection is not the current source attempt".into());
+            }
+            let (_, config, files) = trace_and_index(&tx, &self.project, target, attempt.root(), self.limits, |_, _| ())?;
+            tx.commit()?;
+            (selection, config, files)
+        };
+        let Some(namespace) = config.namespaces.get(package) else { return Ok(None) };
+        let Some(git) = &namespace.git else { return Ok(None) };
+        let files: BTreeMap<_, _> = files.into_iter().filter_map(|(key, file)| {
+            (key.package == package).then_some((key.path, ProjectedGitBaseFile {
+                revision: file.metadata.revision, authored: file.authored, executable: file.executable,
+            }))
+        }).collect();
+        if files.is_empty() { return Ok(None) }
+        let Some(installed) = match_installed_git_base_files(&self.project, package,
+            files.iter().map(|(path, file)| (path, &file.revision.0)),
+        )? else { return Ok(None) };
+        if installed.locked() != &git.locked || installed.patches() != git.patches
+            || installed.checkout_path() != Path::new(&namespace.project)
+        {
+            return Err("staged Git base selection no longer matches the installed package".into());
+        }
+        if read_selection(&self.db, target)? != selection {
+            return Err("Git base projection source attempt advanced during observation".into());
+        }
+        Ok(Some(PendingGitBaseProjection {
+            project: self.project.clone(), target: target.to_owned(), package: package.to_owned(),
+            attempt, parser_policy: config.parser.id(), installed, files,
         }))
     }
 
@@ -91,12 +154,13 @@ impl SqliteSourceState {
 fn trace_and_index(
     tx: &Connection, project: &Path, target: &str, root: NodeId, limits: ClientSourceLimits,
     keep: impl FnMut(NodeId, Vec<u8>),
-) -> Result<(Closure, Files)> {
+) -> Result<(Closure, SourceConfig, Files)> {
     if let Some(usage) = load_usage(tx, root)? { usage.admit(limits)?; }
     let mut read = StoredNodes::new(tx)?;
     // A usage receipt can refuse early. Verify the actual closure before
     // retaining the file index even when a migrated root has no receipt.
     let closure = read.trace(root, limits, keep)?;
     let (config, entries) = SqliteSourceState::header(project, &mut read, target, root)?;
-    Ok((closure, read.file_index(&config, entries)?))
+    let files = read.file_index(&config, entries)?;
+    Ok((closure, config, files))
 }

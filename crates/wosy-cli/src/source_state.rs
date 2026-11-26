@@ -12,6 +12,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 mod delta;
 mod pins;
+pub use delta::{PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 
 pub struct SqliteSourceState {
