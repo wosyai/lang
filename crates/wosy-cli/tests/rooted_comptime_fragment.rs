@@ -16,7 +16,8 @@ use wosy_compiler::{ClosedComptimeRejection, DirectComptimeArgument, ScalarTarge
 use wosy_daemon::{
     BaseCstAdmissionLimits, RootedClosedComptimeFragment, RootedClosedComptimeProjection,
     RootedClosedComptimeRefusal, RootedClosedComptimeRequest,
-    RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection, SourceStorageWorker, SourceStore,
+    RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection,
+    RootedDirectStartupComptimePlan, RootedDirectStartupComptimeProjection, SourceStorageWorker, SourceStore,
 };
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{BuildSourceSelection, FileKey, NodeId};
@@ -387,6 +388,95 @@ async fn direct_evaluator_binds_the_call_to_the_exact_leased_singleton_root() {
         RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::NotTargetEntry)));
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, multi.root);
     drop((old, session));
+    drop((worker, client));
+    Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+}
+
+fn emitted_startup(projection: RootedDirectStartupComptimeProjection) -> RootedDirectStartupComptimePlan {
+    match projection {
+        RootedDirectStartupComptimeProjection::Emitted(plan) => plan,
+        RootedDirectStartupComptimeProjection::Refused(reason) => panic!("unexpected startup plan refusal: {reason:?}"),
+    }
+}
+
+fn assert_startup_evidence(
+    plan: &RootedDirectStartupComptimePlan, root: NodeId, layout: ScalarTargetLayout, source: &str, middle: i32,
+) -> usize {
+    assert_eq!(plan.source_root(), root);
+    assert_eq!(plan.target(), "app");
+    assert_eq!(plan.profile(), "dev");
+    assert_eq!(plan.id(), "value");
+    assert_eq!(plan.evaluator_layout(), layout);
+    let [first, second, third] = plan.calls() else { panic!("three leased startup calls"); };
+    let [seven, other] = plan.evaluators() else { panic!("two leased evaluator tuples"); };
+    assert_eq!([first.evaluator_index(), second.evaluator_index(), third.evaluator_index()], [0, 1, 0]);
+    for (call, expected) in [(first, 7), (second, middle), (third, 7)] {
+        let facts = call.facts();
+        assert_eq!(facts.value(), DirectComptimeArgument::I32(expected));
+        assert_eq!(facts.function(), first.facts().function());
+        assert_eq!(facts.formal(), first.facts().formal());
+        assert_eq!(facts.site(), first.facts().site());
+        assert_eq!(&source[facts.argument().range.start as usize..facts.argument().range.end as usize], expected.to_string());
+    }
+    assert!(first.facts().call().range.end < second.facts().call().range.start);
+    assert!(second.facts().call().range.end < third.facts().call().range.start);
+    for (evaluator, expected) in [(seven, 7), (other, middle)] {
+        assert_eq!(evaluator.digest(), NodeId(*blake3::hash(evaluator.bytes()).as_bytes()));
+        let llvm = std::str::from_utf8(evaluator.bytes()).unwrap();
+        assert!(llvm.lines().any(|line| line.trim() == format!("ret i32 {expected}")));
+        assert!(!llvm.contains("@solve("));
+    }
+    assert_ne!(seven.digest(), other.digest());
+    seven.bytes().len() + other.bytes().len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_plan_retains_ordered_old_root_and_checks_total_egress() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let original_text = DIRECT_SOURCE.replace("i32 answer = solve(7);",
+        "i32 first = solve(7);\ni32 second = solve(9);\ni32 third = solve(7);");
+    fs::write(project.join("src/main.w"), &original_text).unwrap();
+    let mut client = client(&project);
+    let store = Arc::new(SourceStore::open(&fixture.0.join("daemon"), 1 << 20).unwrap());
+    let original = publish(&mut client, &store).await;
+    let worker = worker(&store);
+    let retained = worker.open_build_diagnostics(original.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+
+    let updated_text = original_text.replace("solve(9)", "solve(11)");
+    fs::write(project.join("src/main.w"), &updated_text).unwrap();
+    let updated = publish(&mut client, &store).await;
+    let current = worker.open_build_diagnostics(updated.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    assert_ne!(original.root, updated.root);
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let historical = emitted_startup(retained.project_direct_startup_comptime(request("value", layout)).await.unwrap());
+        assert_startup_evidence(&historical, original.root, layout, &original_text, 9);
+        let fresh = emitted_startup(current.project_direct_startup_comptime(request("value", layout)).await.unwrap());
+        let emitted_bytes = assert_startup_evidence(&fresh, updated.root, layout, &updated_text, 11);
+        assert_eq!(historical.compiler_image(), fresh.compiler_image());
+        assert_ne!(historical.authored_cst(), fresh.authored_cst());
+        assert_eq!(historical.evaluators()[0].digest(), fresh.evaluators()[0].digest());
+        assert_ne!(historical.evaluators()[1].digest(), fresh.evaluators()[1].digest());
+
+        // Each partition independently fits both limits. Only the aggregate
+        // distinguishes the whole successful reply from the failed one.
+        let mut too_little = request("value", layout);
+        too_little.output_bytes = emitted_bytes - 1;
+        assert!(fresh.evaluators().iter().all(|part| part.bytes().len() <= too_little.output_bytes));
+        assert!(current.project_direct_startup_comptime(too_little).await.unwrap_err().to_string()
+            .contains("output byte budget"));
+        let mut exact = request("value", layout);
+        exact.output_bytes = emitted_bytes;
+        let whole = emitted_startup(current.project_direct_startup_comptime(exact).await.unwrap());
+        assert_eq!(assert_startup_evidence(&whole, updated.root, layout, &updated_text, 11), emitted_bytes);
+        assert!(whole.evaluators().iter().zip(fresh.evaluators())
+            .all(|(left, right)| left.digest() == right.digest() && left.bytes() == right.bytes()));
+        assert!(matches!(current.project_direct_function_comptime(request("value", layout)).await.unwrap(),
+            RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
+                ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. }))));
+    }
+    assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
+    drop((retained, current));
     drop((worker, client));
     Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
 }

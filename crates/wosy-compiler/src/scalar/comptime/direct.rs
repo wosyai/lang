@@ -87,6 +87,7 @@ pub fn derive_direct_function_comptime_fragment(
 
 /// An exact canonical startup occurrence and its index into this plan's
 /// evaluator list. The index has no meaning outside its owning plan.
+#[derive(Debug)]
 pub struct DirectStartupComptimeUse {
     facts: InspectedDirectComptimeCall,
     evaluator: usize,
@@ -107,6 +108,10 @@ pub struct DirectStartupComptimePlan {
 impl DirectStartupComptimePlan {
     pub fn calls(&self) -> &[DirectStartupComptimeUse] { &self.calls }
     pub fn evaluators(&self) -> &[ClosedComptimeFragment] { &self.evaluators }
+
+    pub fn into_parts(self) -> (Vec<DirectStartupComptimeUse>, Vec<ClosedComptimeFragment>) {
+        (self.calls, self.evaluators)
+    }
 }
 
 /// One formal-only tail and at most sixteen direct literal startup calls to

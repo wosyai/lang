@@ -3,7 +3,8 @@ use super::{
     retention_plan::SourceLease, rooted_comptime::SiteScope, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
-    RootedClosedComptimeRequest, RootedDirectFunctionComptimeProjection, RootedLlvmIdentity,
+    RootedClosedComptimeRequest, RootedDirectFunctionComptimeProjection, RootedDirectStartupComptimeProjection,
+    RootedLlvmIdentity,
     RootedLlvmProjection, RootedPreparedProject,
     SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
 };
@@ -170,6 +171,19 @@ impl BuildDiagnosticSession<'_> {
         let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved(slot, move |store| {
             store.project_direct_function_comptime_for_lease(&lease, request)
+        }).await?
+    }
+
+    /// Derive a bounded startup plan from the exact local singleton lease.
+    /// The byte cap is aggregate LLVM egress, not total compiler memory.
+    pub async fn project_direct_startup_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedDirectStartupComptimeProjection> {
+        request.check_selector_bytes()?;
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.project_direct_startup_comptime_for_lease(&lease, request)
         }).await?
     }
 

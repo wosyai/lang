@@ -8,12 +8,13 @@ use super::{
 };
 use surrealkv::{Mode, Transaction};
 use wosy_compiler::{
-    derive_closed_comptime_fragment, derive_direct_function_comptime_fragment, derive_first_source_initializer_comptime,
-    ClosedComptimeRejection, ComptimeParameter, InspectedDirectComptimeCall,
+    derive_closed_comptime_fragment, derive_direct_function_comptime_fragment, derive_direct_startup_comptime_plan,
+    derive_first_source_initializer_comptime, ClosedComptimeFragment, ClosedComptimeRejection, ComptimeParameter,
+    DirectStartupComptimeUse, InspectedDirectComptimeCall,
     ComptimeParameterRejection, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
-use wosy_syntax::SourceSpan;
+use wosy_syntax::{FreshParseResult, SourceSpan};
 
 const MAX_SELECTOR_BYTES: usize = 4096;
 const MAX_EVALUATOR_IR_BYTES: usize = 1 << 20;
@@ -102,17 +103,102 @@ pub enum RootedDirectFunctionComptimeProjection {
     Emitted(RootedDirectFunctionComptimeFragment),
 }
 
-type SelectedComptime = std::result::Result<
-    (RootedClosedComptimeFragment, Option<InspectedDirectComptimeCall>), RootedClosedComptimeRefusal,
->;
+/// One source-authorized in-memory plan. Its ordered calls and evaluator
+/// indices are only meaningful together, for this exact root and profile.
+#[derive(Debug)]
+pub struct RootedDirectStartupComptimePlan {
+    source: RootedComptimeIdentity,
+    id: String,
+    evaluator_layout: ScalarTargetLayout,
+    calls: Vec<DirectStartupComptimeUse>,
+    evaluators: Vec<RootedStartupComptimeEvaluator>,
+}
+
+impl RootedDirectStartupComptimePlan {
+    pub fn source_root(&self) -> NodeId { self.source.root }
+    pub fn authored_cst(&self) -> NodeId { self.source.authored_cst }
+    pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
+    pub fn target(&self) -> &str { &self.source.target }
+    pub fn profile(&self) -> &str { &self.source.profile }
+    pub fn id(&self) -> &str { &self.id }
+    pub fn evaluator_layout(&self) -> ScalarTargetLayout { self.evaluator_layout }
+    pub fn calls(&self) -> &[DirectStartupComptimeUse] { &self.calls }
+    pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
+}
+
+#[derive(Debug)]
+pub struct RootedStartupComptimeEvaluator {
+    bytes: Vec<u8>,
+    digest: NodeId,
+}
+
+impl RootedStartupComptimeEvaluator {
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn digest(&self) -> NodeId { self.digest }
+}
+
+#[derive(Debug)]
+pub enum RootedDirectStartupComptimeProjection {
+    Refused(RootedClosedComptimeRefusal),
+    Emitted(RootedDirectStartupComptimePlan),
+}
+
+type SelectedComptime<T> = std::result::Result<T, RootedClosedComptimeRefusal>;
+
+#[derive(Debug)]
+struct RootedComptimeIdentity {
+    root: NodeId,
+    authored_cst: NodeId,
+    compiler_image: NodeId,
+    target: String,
+    profile: String,
+}
+
+impl RootedComptimeIdentity {
+    fn fragment(self, fragment: ClosedComptimeFragment, output_bytes: usize) -> Result<RootedClosedComptimeFragment> {
+        let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), output_bytes.min(MAX_EVALUATOR_IR_BYTES))?;
+        Ok(RootedClosedComptimeFragment {
+            source_root: self.root, authored_cst: self.authored_cst, compiler_image: self.compiler_image,
+            target: self.target, profile: self.profile, id: fragment.id().into(), site: fragment.site().clone(),
+            evaluator_layout: fragment.layout(), result_type: fragment.result_type().clone(), bytes, digest,
+        })
+    }
+}
+
+struct VerifiedComptimeSource {
+    source: RootedComptimeIdentity,
+    fresh: FreshParseResult,
+}
+
+fn compiler_refusal(reason: ClosedComptimeRejection) -> RootedClosedComptimeRefusal {
+    match reason {
+        ClosedComptimeRejection::Parameter { site, name, reason: ComptimeParameterRejection::UnsupportedProfileValue } =>
+            RootedClosedComptimeRefusal::ParameterAuthorityUnavailable { site, name },
+        other => RootedClosedComptimeRefusal::Compiler(other),
+    }
+}
 
 impl SourceStore {
     pub(super) fn project_closed_comptime_for_lease(
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest, scope: SiteScope,
     ) -> Result<RootedClosedComptimeProjection> {
-        Ok(match self.project_comptime_for_lease(lease, request, scope)? {
-            Ok((fragment, None)) => RootedClosedComptimeProjection::Emitted(fragment),
-            Ok((_, Some(_))) => return Err("direct argument facts require the direct comptime route".into()),
+        let answer = self.project_comptime_for_lease(lease, request, scope, |input, request| {
+            let derived = match scope {
+                // A profile named in SourceConfig is not an authoritative
+                // parameter table. Even source defaults cannot be selected.
+                SiteScope::AuthoredFile => derive_closed_comptime_fragment(&input.fresh, &request.id,
+                    request.evaluator_layout, |_| Some(ComptimeParameter::UnsupportedValue)),
+                SiteScope::FirstTargetInitializer => derive_first_source_initializer_comptime(
+                    &input.fresh, &request.id, request.evaluator_layout),
+                SiteScope::DirectTargetCall => return Err("direct comptime requires its typed route".into()),
+            };
+            Ok(match derived {
+                Ok(fragment) => Ok(input.source.fragment(fragment, request.output_bytes)?),
+                Err(reason) => Err(compiler_refusal(reason)),
+            })
+        })?;
+        Ok(match answer {
+            Ok(fragment) => RootedClosedComptimeProjection::Emitted(fragment),
             Err(reason) => RootedClosedComptimeProjection::Refused(reason),
         })
     }
@@ -120,28 +206,67 @@ impl SourceStore {
     pub(super) fn project_direct_function_comptime_for_lease(
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
     ) -> Result<RootedDirectFunctionComptimeProjection> {
-        Ok(match self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall)? {
-            Ok((rooted, Some(call))) => RootedDirectFunctionComptimeProjection::Emitted(
-                RootedDirectFunctionComptimeFragment { rooted, call }),
-            Ok((_, None)) => return Err("verified direct comptime argument was not retained".into()),
+        let answer = self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+            let plan = match derive_direct_function_comptime_fragment(&input.fresh, &request.id, request.evaluator_layout) {
+                Ok(plan) => plan,
+                Err(reason) => return Ok(Err(compiler_refusal(reason))),
+            };
+            let (call, fragment) = plan.into_parts();
+            let rooted = input.source.fragment(fragment, request.output_bytes)?;
+            Ok(Ok(RootedDirectFunctionComptimeFragment { rooted, call }))
+        })?;
+        Ok(match answer {
+            Ok(fragment) => RootedDirectFunctionComptimeProjection::Emitted(fragment),
             Err(reason) => RootedDirectFunctionComptimeProjection::Refused(reason),
         })
     }
 
-    fn project_comptime_for_lease(
+    pub(super) fn project_direct_startup_comptime_for_lease(
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedDirectStartupComptimeProjection> {
+        let answer = self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+            let plan = match derive_direct_startup_comptime_plan(&input.fresh, &request.id, request.evaluator_layout) {
+                Ok(plan) => plan,
+                Err(reason) => return Ok(Err(compiler_refusal(reason))),
+            };
+            let (calls, fragments) = plan.into_parts();
+            let mut evaluators = Vec::with_capacity(fragments.len());
+            let mut remaining = request.output_bytes.min(MAX_EVALUATOR_IR_BYTES);
+            for fragment in fragments {
+                let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), remaining)?;
+                remaining -= bytes.len();
+                evaluators.push(RootedStartupComptimeEvaluator { bytes, digest });
+            }
+            Ok(Ok(RootedDirectStartupComptimePlan {
+                source: input.source, id: request.id.clone(), evaluator_layout: request.evaluator_layout,
+                calls, evaluators,
+            }))
+        })?;
+        Ok(match answer {
+            Ok(plan) => RootedDirectStartupComptimeProjection::Emitted(plan),
+            Err(reason) => RootedDirectStartupComptimeProjection::Refused(reason),
+        })
+    }
+
+    fn project_comptime_for_lease<T>(
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest, scope: SiteScope,
-    ) -> Result<SelectedComptime> {
+        project: impl FnOnce(VerifiedComptimeSource, &RootedClosedComptimeRequest) -> Result<SelectedComptime<T>>,
+    ) -> Result<SelectedComptime<T>> {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let answer = self.project_closed_comptime(&tx, grant.root, request, scope);
+        let answer = self.verified_comptime_source(&tx, grant.root, &request, scope)
+            .and_then(|verified| match verified {
+                Ok(input) => project(input, &request),
+                Err(reason) => Ok(Err(reason)),
+            });
         lease.finish_current(|| ()).ok_or(BuildRequestRejection::Expired)?;
         answer
     }
 
-    fn project_closed_comptime(
-        &self, tx: &Transaction, root: NodeId, request: RootedClosedComptimeRequest, scope: SiteScope,
-    ) -> Result<SelectedComptime> {
+    fn verified_comptime_source(
+        &self, tx: &Transaction, root: NodeId, request: &RootedClosedComptimeRequest, scope: SiteScope,
+    ) -> Result<SelectedComptime<VerifiedComptimeSource>> {
         use RootedClosedComptimeRefusal as Refusal;
 
         let limits = request.source_limits;
@@ -179,30 +304,12 @@ impl SourceStore {
         let Some(fresh) = verified_authored_parse(file, &config.parser.categories, &checked)? else {
             return Ok(Err(Refusal::AuthoredGrammarNotVerified));
         };
-        // SourceConfig has no authoritative consuming profile parameter
-        // table. An authored default is not evidence of absence.
-        let derived = match scope {
-            SiteScope::AuthoredFile => derive_closed_comptime_fragment(&fresh, &request.id, request.evaluator_layout,
-                |_| Some(ComptimeParameter::UnsupportedValue)).map(|fragment| (fragment, None)),
-            SiteScope::FirstTargetInitializer => derive_first_source_initializer_comptime(&fresh, &request.id,
-                request.evaluator_layout).map(|fragment| (fragment, None)),
-            SiteScope::DirectTargetCall => derive_direct_function_comptime_fragment(&fresh, &request.id,
-                request.evaluator_layout).map(|direct| {
-                    let (call, fragment) = direct.into_parts();
-                    (fragment, Some(call))
-                }),
-        };
-        let (fragment, direct_call) = match derived {
-            Ok(output) => output,
-            Err(ClosedComptimeRejection::Parameter { site, name, reason: ComptimeParameterRejection::UnsupportedProfileValue }) =>
-                return Ok(Err(Refusal::ParameterAuthorityUnavailable { site, name })),
-            Err(reason) => return Ok(Err(Refusal::Compiler(reason))),
-        };
-        let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), request.output_bytes.min(MAX_EVALUATOR_IR_BYTES))?;
-        Ok(Ok((RootedClosedComptimeFragment {
-            source_root: root, authored_cst: file.authored, compiler_image: image,
-            target: config.target, profile: request.profile, id: fragment.id().into(), site: fragment.site().clone(),
-            evaluator_layout: fragment.layout(), result_type: fragment.result_type().clone(), bytes, digest,
-        }, direct_call)))
+        Ok(Ok(VerifiedComptimeSource {
+            source: RootedComptimeIdentity {
+                root, authored_cst: file.authored, compiler_image: image,
+                target: config.target, profile: request.profile.clone(),
+            },
+            fresh,
+        }))
     }
 }
