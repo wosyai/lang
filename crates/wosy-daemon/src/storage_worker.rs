@@ -3,6 +3,7 @@ use super::{retention_plan::SourceRead, Result, SourceRetentionInventory, Source
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::{runtime::Handle, sync::{OwnedSemaphorePermit, Semaphore}, task::JoinHandle};
 use wosy_protocol::NodeId;
@@ -48,6 +49,8 @@ pub struct SourceStorageWorker {
     slots: Arc<Semaphore>,
     selection_limit: usize,
     census_limit: usize,
+    #[cfg(test)]
+    after_cancellable_phase: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SourceStorageWorker {
@@ -61,6 +64,8 @@ impl SourceStorageWorker {
         Ok(Self {
             store, runtime, slots: Arc::new(Semaphore::new(slots.get())),
             selection_limit: selection_limit.get(), census_limit: census_limit.get(),
+            #[cfg(test)]
+            after_cancellable_phase: None,
         })
     }
 
@@ -102,14 +107,51 @@ impl SourceStorageWorker {
     }
 
     pub(super) fn spawn_reserved_query<T, F>(
-        &self, slot: OwnedSemaphorePermit, query: impl FnOnce(QueryWorker) -> F + Send + 'static,
+        &self, slot: OwnedSemaphorePermit, cancellation: Option<QueryCancellation>,
+        query: impl FnOnce(QueryWorker) -> F + Send + 'static,
     ) -> JoinHandle<T>
     where T: Send + 'static, F: Future<Output = T> + Send + 'static {
         let worker = QueryWorker {
             store: Arc::clone(&self.store), runtime: self.runtime.clone(), slot: Arc::new(slot),
+            #[cfg(test)]
+            after_phase: cancellation.as_ref().and(self.after_cancellable_phase.as_ref()).cloned(),
+            cancellation,
         };
         self.runtime.spawn(query(worker))
     }
+
+    #[cfg(test)]
+    pub(super) fn after_cancellable_phase(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.after_cancellable_phase = Some(Arc::new(hook));
+    }
+}
+
+/// An observer-owned stop signal for one reserved query, not its lease or
+/// a shared compiler cell. Running phases and handed-off commits still drain.
+#[derive(Clone, Default)]
+pub(super) struct QueryCancellation(Arc<AtomicBool>);
+
+impl QueryCancellation {
+    fn check(cancellation: Option<&Self>) -> Result<()> {
+        if cancellation.is_some_and(|stop| stop.0.load(Ordering::Acquire)) {
+            Err("framed Build analysis no longer has an observer".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CancelQueryOnDrop {
+    signal: QueryCancellation,
+}
+
+impl CancelQueryOnDrop {
+    pub fn signal(&self) -> QueryCancellation { self.signal.clone() }
+}
+
+impl Drop for CancelQueryOnDrop {
+    fn drop(&mut self) { self.signal.0.store(true, Ordering::Release); }
 }
 
 /// One admitted query. Blocking phases never await a commit, and keep the
@@ -118,18 +160,34 @@ pub(super) struct QueryWorker {
     pub store: Arc<SourceStore>,
     runtime: Handle,
     slot: Arc<OwnedSemaphorePermit>,
+    cancellation: Option<QueryCancellation>,
+    #[cfg(test)]
+    after_phase: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl QueryWorker {
     pub async fn phase<T: Send + 'static>(
         &self, source: Option<&SourceRead>, job: impl FnOnce(&SourceStore) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        QueryCancellation::check(self.cancellation.as_ref())?;
         let store = Arc::clone(&self.store);
         let ownership = (Arc::clone(&self.slot), source.cloned());
-        self.runtime.spawn_blocking(move || {
+        let cancellation = self.cancellation.clone();
+        #[cfg(test)]
+        let after_phase = self.after_phase.clone();
+        let result = self.runtime.spawn_blocking(move || {
             let _ownership = ownership;
-            job(&store)
-        }).await?
+            QueryCancellation::check(cancellation.as_ref())?;
+            let result = job(&store);
+            #[cfg(test)]
+            if let Some(hook) = after_phase { hook(); }
+            result
+        }).await?;
+        // Consume a phase's output only while it has an observer. In
+        // particular, do not hand off a newly staged transaction or perform
+        // another compiler phase after a disconnected running read drains.
+        QueryCancellation::check(self.cancellation.as_ref())?;
+        result
     }
 }
 
@@ -180,7 +238,7 @@ mod tests {
             ).unwrap();
             let (entered, waiting) = tokio::sync::oneshot::channel();
             let (release, blocked) = mpsc::channel();
-            let job = worker.spawn_reserved_query(worker.try_slot().unwrap(), move |worker| async move {
+            let job = worker.spawn_reserved_query(worker.try_slot().unwrap(), None, move |worker| async move {
                 let read = worker.phase(None, move |store| {
                     let (tx, read) = store.begin_source_read(source)?.ok_or("expected admitted source")?;
                     drop(tx);

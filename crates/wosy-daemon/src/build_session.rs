@@ -1,6 +1,7 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
     retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    storage_worker::{CancelQueryOnDrop, QueryCancellation},
     PreparedBaseDeclarations, Result, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
@@ -66,7 +67,7 @@ impl SourceStorageWorker {
     ) -> Result<BuildSourceOpening<'_>> {
         let slot = self.try_slot()?;
         let root = selected.root;
-        let outcome = self.spawn_reserved_query(slot, move |worker| async move {
+        let outcome = self.spawn_reserved_query(slot, None, move |worker| async move {
             let selected = Arc::new(selected);
             let initial = Arc::clone(&selected);
             if let Some(lease) = worker.phase(None, move |store| {
@@ -117,11 +118,22 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
+        self.dispatch_analysis(request, None).await
+    }
+
+    pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
+        let stop = CancelQueryOnDrop::default();
+        self.dispatch_analysis(request, Some(stop.signal())).await
+    }
+
+    async fn dispatch_analysis(
+        &self, request: BuildDiagnosticRequest, cancellation: Option<QueryCancellation>,
+    ) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         let BuildDiagnosticRequest::BuildDiagnostics { version, profile } = request;
         if version != BUILD_DIAGNOSTIC_VERSION { return Err(BuildRequestRejection::Version.into()); }
         let slot = self.worker.try_slot()?;
         let grant = self.lease.grant();
-        self.worker.spawn_reserved_query(slot, move |worker| async move {
+        self.worker.spawn_reserved_query(slot, cancellation, move |worker| async move {
             let snapshot = worker.phase(None, move |store| {
                 store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
             }).await?;

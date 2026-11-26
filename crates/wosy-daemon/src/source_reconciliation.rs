@@ -31,7 +31,7 @@ impl SourceStorageWorker {
         &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
     ) -> Result<SourceReconciliation> {
         let slot = self.try_slot()?;
-        self.spawn_reserved_query(slot, move |worker| async move {
+        self.spawn_reserved_query(slot, None, move |worker| async move {
             reconcile_on_worker(&worker, Arc::new(selected), replay, limits).await
         }).await?
     }

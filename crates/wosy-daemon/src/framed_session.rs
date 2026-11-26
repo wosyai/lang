@@ -239,7 +239,7 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     };
     let job = async {
         match operation {
-            Operation::Analyze(request) => session.dispatch(request).await.map(Completed::Analysis),
+            Operation::Analyze(request) => session.dispatch_framed(request).await.map(Completed::Analysis),
             Operation::Project(scope, proposal) => session.project_base_declarations(
                 scope.binding.clone(), proposal, scope.admission_limits, scope.declaration_bytes,
             ).await.map(Completed::Projection),
@@ -401,14 +401,20 @@ mod tests {
         });
     }
 
-    #[test]
-    #[ignore = "requires a disposable store with two admitted source fixture roots"]
-    fn framed_lifecycle_releases_session_without_aborting_running_work() {
+    fn fixture() -> (PathBuf, BuildSourceSelection, NodeId) {
         let path = PathBuf::from(std::env::var_os("WOSY_TEST_IMAGE_STORE").unwrap());
         let root = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_ROOT").unwrap()).unwrap();
         let scope = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_OTHER_ROOT").unwrap()).unwrap();
         let workspace = path.parent().unwrap().join("project").canonicalize().unwrap();
         let selection = BuildSourceSelection { root, project: workspace.to_str().unwrap().into(), target: "app".into() };
+        (path, selection, scope)
+    }
+
+    #[test]
+    #[ignore = "requires a disposable store with two admitted source fixture roots"]
+    fn framed_lifecycle_releases_session_without_aborting_running_work() {
+        let (path, selection, scope) = fixture();
+        let root = selection.root;
         let runtime = Builder::new_current_thread().max_blocking_threads(1).enable_time().build().unwrap();
         runtime.block_on(async {
             let store = Arc::new(SourceStore::open(&path, 8 << 20).unwrap());
@@ -500,6 +506,87 @@ mod tests {
             );
             assert_eq!(end.unwrap(), BuildSessionEnd::Expired);
             assert_eq!(present(), 0);
+            drop(worker);
+            Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a disposable store with two admitted source fixture roots"]
+    fn framed_disconnect_stops_later_analyze_phases() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
+
+        let (path, selection, scope) = fixture();
+        let root = selection.root;
+        let runtime = Builder::new_current_thread().max_blocking_threads(1).enable_time().build().unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(SourceStore::open(&path, 8 << 20).unwrap());
+            let bound = |value| NonZeroUsize::new(value).unwrap();
+            let mut worker = SourceStorageWorker::new(
+                Arc::clone(&store), Handle::current(), bound(1), bound(1), bound(20_000),
+            ).unwrap();
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let (resume, held) = mpsc::channel::<()>();
+            let gate = Mutex::new(Some((entered, held)));
+            let phases = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&phases);
+            worker.after_cancellable_phase(move || {
+                observed.fetch_add(1, Ordering::Relaxed);
+                if let Some((entered, held)) = gate.lock().unwrap().take() {
+                    // Stop inside the real source-admission phase after its
+                    // snapshot owns an independent read, before handing it
+                    // back to the async scheduler for compilation.
+                    entered.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            });
+            let limit = Duration::from_secs(10);
+            let lifetime = Duration::from_secs(30);
+            let (mut client, stream) = io::duplex(256);
+            let (end, ()) = tokio::time::timeout(limit, async {
+                tokio::join!(worker.serve_build_session(stream, selection.clone(), lifetime), async {
+                    let mut frames = SessionFrameReader::default();
+                    start(&mut client, &mut frames, root).await;
+                    send_request(&mut client, 31, analyze_request()).await;
+                    wait.await.unwrap();
+                    send_request(&mut client, 32, Request::Disconnect).await;
+                    assert!(matches!(receive(&mut client, &mut frames, 32).await, Reply::Closed));
+                    assert!(frames.read::<_, BuildSessionResponse<Diagnostic>>(&mut client).await.unwrap().is_none());
+                })
+            }).await.unwrap();
+            assert_eq!(end.unwrap(), BuildSessionEnd::Disconnected);
+            let held = store.plan_source_retention(scope, &[root], &[], 20_000).unwrap();
+            assert_eq!((held.active_read_roots, held.candidate_roots), (1, 0));
+            assert!(matches!(worker.try_inspect(scope, &[root], &[]), Err(StorageAdmissionError::Busy)));
+            resume.send(()).unwrap();
+
+            let drained = tokio::time::timeout(limit, async {
+                loop {
+                    match worker.try_inspect(scope, &[root], &[]) {
+                        Ok(read) => break read.finish().await.unwrap().inventory.plan,
+                        Err(StorageAdmissionError::Busy) => tokio::task::yield_now().await,
+                        Err(other) => panic!("fixture worker error: {other}"),
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!((drained.active_read_roots, drained.candidate_roots), (0, 1));
+            assert_eq!(phases.load(Ordering::Relaxed), 1);
+
+            let (mut client, stream) = io::duplex(256);
+            let (end, ()) = tokio::time::timeout(limit, async {
+                tokio::join!(worker.serve_build_session(stream, selection, lifetime), async {
+                    let mut frames = SessionFrameReader::default();
+                    start(&mut client, &mut frames, root).await;
+                    send_request(&mut client, 41, analyze_request()).await;
+                    assert!(matches!(receive(&mut client, &mut frames, 41).await,
+                        Reply::Analysis { response: BuildDiagnosticResponse::BuildDiagnostics {
+                            source_root, origin: BuildAnalysisOrigin::Derived, ..
+                        }} if source_root == root));
+                    drop(client);
+                })
+            }).await.unwrap();
+            assert_eq!(end.unwrap(), BuildSessionEnd::PeerClosed);
+            assert!(phases.load(Ordering::Relaxed) > 1);
             drop(worker);
             Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
         });
