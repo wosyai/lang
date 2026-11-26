@@ -1711,6 +1711,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     .is_some_and(|search| {
                         let search = search.borrow();
                         search.named_target.is_some() || search.ranked_target.is_some() || search.proof_free_scalar_initializers
+                            || (search.owns_initialization(source) && search.required_sites.get(&outputs.primary)
+                                .is_some_and(|(_, role)| *role == failure_search::StartupProofRole::Cited))
                             || (COLLECT && actual.can_initialize_fixed_arrays()
                                 && search.has_aggregate_site(source, outputs.primary))
                     }))
@@ -3309,6 +3311,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         result
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn enrolled_citation_helper(
+        &self, trace: &failure_search::StartUpSearch, collection: Option<OrderedCallCollection<'_, '_>>,
+        parent: &FunctionCallSites, site: OccurrenceOrdinal, child: PreparedCallable,
+    ) -> bool {
+        let Some(initializer) = collection.and_then(|ordered| ordered.scalar_initializer) else { return false; };
+        let Some(&(caller, failure_search::StartupProofRole::Cited)) = trace.required_sites.get(&initializer.occurrence)
+            else { return false; };
+        trace.cited_routes.get(&caller) == Some(&(site, child))
+            && self.calls.function_body(caller.0, caller.1, None).is_some_and(|original| std::ptr::eq(original, parent))
+    }
+
     fn drive_exact_calls<const NAMED: bool>(
         &mut self, frames: &mut Vec<ExactCallActivation<'project>>,
         collection: Option<OrderedCallCollection<'_, '_>>,
@@ -3522,7 +3536,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             && closed_startup_scalar_history(child.body)
                             && child.body.structure.checker_directives.is_empty()
                             && child.body.contextual_formal().is_none();
-                        if !(qualified_scalar || context_edge || (rank_self && frame.source == child.source)) {
+                        let cited_helper = NAMED && frame.source == child.source
+                            && matches!(call, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
+                            && target.is_some_and(|target| self.enrolled_citation_helper(&trace.borrow(), active_collection, frame.body, call.occurrence(), target));
+                        if !(qualified_scalar || context_edge || cited_helper || (rank_self && frame.source == child.source)) {
                             return Err(ProjectCheck::Unsupported);
                         }
                         let span = frame.body.occurrences.get(call.occurrence().0)
@@ -3655,7 +3672,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
                         let trace_state = trace.borrow();
                         let qualified_scalar = trace_state.proof_free_scalar_initializers && parent.source != completed.source;
-                        if (!qualified_scalar && trace_state.ranked_target != Some(target)) || !matches!(&result, ActualCallResult::Integer(_)) {
+                        let cited_helper = NAMED && parent.source == completed.source
+                            && self.enrolled_citation_helper(&trace_state, collection, parent.body, effect.occurrence(), target);
+                        if (!qualified_scalar && !cited_helper && trace_state.ranked_target != Some(target))
+                            || !matches!(&result, ActualCallResult::Integer(_)) {
                             return Err(ProjectCheck::Unsupported);
                         }
                         drop(trace_state);
@@ -4181,10 +4201,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
         #[cfg(feature = "internal-checker")]
-        let (startup_named, startup_plain_scalar, startup_ranked) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
+        let (startup_named, startup_plain_scalar, startup_ranked, startup_cited) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
             let effects = ordered.failures.borrow();
             let search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow();
-            use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
+            use failure_search::StartupProofRole::{Aggregate, Bare, Cited, Ranked};
             let pending = search.required_sites.get(&call).filter(|_| search.owns_initialization(caller));
             let matches_aggregate = pending == Some(&(target, Aggregate))
                 && matches!(expected, ScalarType::Array { .. })
@@ -4200,6 +4220,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let matches_ranked = pending == Some(&(target, Ranked))
                 && caller == &owner.source && ordered.scalar_initializer.is_some()
                 && signature.parameters.len() == 1 && is_integer_type(expected);
+            let matches_cited = pending == Some(&(target, Cited)) && search.cited_routes.contains_key(&target)
+                && caller == &owner.source && ordered.scalar_initializer.is_some() && signature.parameters.len() == 1
+                && is_integer_type(expected);
             let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
                 && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty()
                 && search.mixed_context.as_ref().is_none_or(|route| route.root_site == call && !route.finished);
@@ -4211,7 +4234,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             // Once the named route spends its ordinary quota, only the
             // pending, top-level authenticated binding calls may run.
             if search.proof_only_continuation() && search.pending_named_startup_observation()
-                && !(matches_named || matches_ranked || matches_aggregate || matches_context_entry)
+                && !(matches_named || matches_ranked || matches_aggregate || matches_context_entry || matches_cited)
             { return Err(ProjectCheck::Unsupported); }
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
@@ -4226,12 +4249,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             } else {
                 ordinary_qualified && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits)
             };
-            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked && !matches_aggregate)
+            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked && !matches_aggregate && !matches_cited)
                 || (caller != &owner.source && !cross_authorized)
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_cited && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
                 || !body.structure.checker_selected_snapshots.is_empty()
                 || !body.structure.module_storage_uses.is_empty()
@@ -4239,8 +4262,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                 || !signature.parameters.iter().all(is_integer_type)
             { return Err(ProjectCheck::Unsupported); }
-            (matches_named, matches_plain_scalar, matches_ranked)
-        } else { (false, false, false) };
+            (matches_named, matches_plain_scalar, matches_ranked, matches_cited)
+        } else { (false, false, false, false) };
         #[cfg(feature = "internal-checker")]
         if body.contextual_formal().is_some() {
             // Only the exact child activation path can install a formal.
@@ -4471,7 +4494,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(not(feature = "internal-checker"))]
         let exact_literal = None;
         #[cfg(feature = "internal-checker")]
-        let startup_named_result = (startup_named || startup_plain_scalar || startup_ranked).then(|| {
+        let startup_named_result = (startup_named || startup_plain_scalar || startup_ranked || startup_cited).then(|| {
             let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
             let site = ordered.scalar_initializer.ok_or(ProjectCheck::Unsupported)?;
             let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -4480,16 +4503,32 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 ordered.failures.borrow().startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?
                     .borrow_mut().charge_proof_frame(body).ok_or(ProjectCheck::Unsupported)?;
             }
-            let result = self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None)?;
+            let result = if startup_cited {
+                let named_root = named_root.ok_or(ProjectCheck::Unsupported)?;
+                self.run_exact_calls::<true>(body, &owner.source, exact, expected, collection, Some(named_root))?
+            } else {
+                self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None)?
+            };
             if startup_plain_scalar { return Ok(result); }
             let ActualCallResult::Integer(value) = result else { return Err(ProjectCheck::Unsupported); };
             let effects = ordered.failures.borrow();
             let mut trace = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
             let proof_only = trace.proof_only_continuation() && trace.pending_named_startup_observation();
-            use failure_search::StartupProofRole::{Bare, Ranked};
-            let role = if startup_ranked { Ranked } else if startup_named { Bare } else { return Err(ProjectCheck::Unsupported); };
+            use failure_search::StartupProofRole::{Bare, Cited, Ranked};
+            let role = if startup_ranked { Ranked } else if startup_cited { Cited } else if startup_named { Bare } else { return Err(ProjectCheck::Unsupported); };
             if trace.required_sites.remove(&site.occurrence) != Some((target, role)) {
                 return Err(ProjectCheck::Unsupported);
+            }
+            if startup_cited {
+                let caller = ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?;
+                let at = InitializerProofSite { source: caller, call: InitializerProofOrigin::Direct {
+                    topology: site.topology, occurrence: site.occurrence, directive_position: effects.records.len(),
+                } };
+                let stop = proof_only && !trace.proof_only_continuation();
+                drop(trace);
+                self.observer.observe_initializer(target, Some(at), &signature.parameters, exact, &value);
+                return if stop { Err(ProjectCheck::StartupAuthoredLimitReached) }
+                    else { Ok(ActualCallResult::Integer(value)) };
             }
             let observation = failure_search::StartupProofObservation {
                 site: wosy_syntax::SourceSpan::new(ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?.clone(), at),
@@ -4499,7 +4538,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             match role {
                 Bare => trace.named_observations.push(observation),
                 Ranked => trace.ranked_observations.push(observation),
-                failure_search::StartupProofRole::Aggregate => return Err(ProjectCheck::Unsupported),
+                failure_search::StartupProofRole::Aggregate | Cited => return Err(ProjectCheck::Unsupported),
             }
             // Capture the real typed return before stopping. Do not resume
             // further startup items or ordinary witness selection.
@@ -4630,7 +4669,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
         }
         #[cfg(feature = "internal-checker")]
-        if ACTUAL_STARTUP && Observer::CONTEXTUAL {
+        if ACTUAL_STARTUP && Observer::CONTEXTUAL && !startup_cited {
             if let Ok(ActualCallResult::Integer(value)) = &result {
                 let mut scalar_site = proof_site.take();
                 if let (Some(InitializerProofSite { call: InitializerProofOrigin::Direct { directive_position, .. }, .. }), Some(collection)) =
@@ -10968,11 +11007,11 @@ fn run_private_mixed_root_context(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
 
-/// Cited callable roots are never substitutes for ordinary call histories.
-/// With a complete zero-incoming census, the existing authored catalogue may
-/// check their original symbolic bodies after the ordinary startup caps out.
+/// Check cited premises on real bounded startup returns, or on a genuinely
+/// zero-incoming symbolic source root. The authored graph is never used as a
+/// substitute for the ordinary call's structural history.
 #[cfg(feature = "internal-checker")]
-fn run_private_dormant_citation_catalog(
+fn run_private_citation_catalog(
     owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>,
     plans: &[PlannedModuleProof<'_>],
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
@@ -10984,6 +11023,7 @@ fn run_private_dormant_citation_catalog(
     let mut targets = Vec::with_capacity(plans.len());
     let mut names = HashSet::with_capacity(plans.len());
     let mut unique = HashSet::with_capacity(plans.len());
+    let mut cited_targets = HashSet::new();
     for plan in plans {
         if plan.target.0 != 0 || plan.proof_source != root || !names.insert(plan.name)
             || !(plan.has_no_authored_steps() || plan.public_calling_citation().is_some())
@@ -10991,11 +11031,37 @@ fn run_private_dormant_citation_catalog(
             || !matches!(plan.typed.body.boundary.parameters.as_slice(), [input] if is_integer_type(&input.ty))
             || !is_integer_type(plan.typed.result_type)
         { return Err(ProjectCheck::Unsupported); }
+        if plan.public_calling_citation().is_some() { cited_targets.insert(plan.target); }
         if unique.insert(plan.target) { targets.push(plan); }
     }
     let incoming = calls.owned_direct_startup_callable_uses(root, None,
         targets.iter().map(|plan| (root, plan.function.name_span)), None).ok_or(ProjectCheck::Unsupported)?;
-    if !incoming.values().all(Vec::is_empty) { return Err(ProjectCheck::Unsupported); }
+    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    let mut trace = match cap {
+        Some(cap) => failure_search::StartUpSearch::new(root, cap),
+        None => failure_search::StartUpSearch::formal_only(root),
+    };
+    trace.retain_after_cutoff = true;
+    let mut required = HashSet::new();
+    let mut work = 0;
+    for plan in &targets {
+        let sites = incoming.get(&(root, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
+        if sites.is_empty() { continue; }
+        let body = plan.typed.body;
+        super::checker_flow::charge_call_work(&mut work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
+        let [child] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let helper = *body.structure.checker_direct_targets.get(&child.ordinal).ok_or(ProjectCheck::Unsupported)?;
+        let child_body = calls.function_body(helper.0, helper.1, None).ok_or(ProjectCheck::Unsupported)?;
+        if !cited_targets.contains(&plan.target) || helper.0 != 0 || unique.contains(&helper)
+            || !supported_integer_continuation(body, plan.typed.result_type)
+            || !body.structure.checker_directives.is_empty()
+            || !body.structure.checker_integer_call_locals.values().any(|local| local.call == child.ordinal)
+            || !qualified_integer_proof_leaf(child_body, plan.typed.result_type)
+        { return Err(ProjectCheck::Unsupported); }
+        trace.cited_routes.insert(plan.target, (child.ordinal, helper));
+        trace.enroll_proof_sites(plan.target, failure_search::StartupProofRole::Cited, sites).ok_or(ProjectCheck::Unsupported)?;
+        required.insert(plan.target);
+    }
     let (_, authored) = package_obligation_roots(&owner.prepared, scope, 1, root)?;
     if !authored.is_empty() { return Err(ProjectCheck::Unsupported); }
 
@@ -11009,16 +11075,35 @@ fn run_private_dormant_citation_catalog(
         observer.insert(scope, false, plan, prepare_ordered_public_observation(plan, Some(&catalog))?);
     }
     observer.finish_plans(&owner.prepared, scope)?;
-    let evidence = NamedOrderedEvidence { observed: observer };
-    let (records, end, _, mut active) = run_startup_authored_path(&owner.prepared, cap, None, false, &[], None, None)?;
-    let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
+    let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
+    let (outcome, evidence) = walk_prepared_initialization::<_, true, true>(
+        &owner.prepared, root, ordinals, NamedOrderedEvidence { observed: observer }, Some(&mut effects),
+    );
+    let trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+        .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+    if trace.invalid() || !trace.required_sites.is_empty() || !evidence.observed.complete(&required)
+        || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(trace.remaining()) != Some(effects.records.len())
+        || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+    { return Err(ProjectCheck::Unsupported); }
+    let (end, mut active) = match outcome {
+        Ok(init) if cap.is_none() => (StartupAuthoredCompletion::LimitReached, init.had_obligations),
+        Ok(init) if trace.remaining() > 0 => {
+            if !required.iter().all(|target| init.reached.contains(target)) { return Err(ProjectCheck::Unsupported); }
+            (StartupAuthoredCompletion::Exhausted, init.had_obligations)
+        }
+        Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 =>
+            (StartupAuthoredCompletion::LimitReached, cap.is_some()),
+        Err(error) => return Err(error),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    active |= evidence.observed.active;
     let startup_records = effects.records.len();
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
         let mut symbolic = evidence.symbolic();
         // Clause order stays intact in each group; symbolic callable roots
         // are visited in their canonical declaration order.
         targets.sort_unstable_by_key(|plan| plan.target);
-        for plan in targets {
+        for plan in targets.into_iter().filter(|plan| !required.contains(&plan.target)) {
             active |= symbolic.try_collect(plan.target, plan.typed.body, plan.function, root, &mut effects,
                 SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
         }
@@ -11029,7 +11114,7 @@ fn run_private_dormant_citation_catalog(
         NamedOrderedEvidence::finish_symbolic(symbolic)
     } else { (None, Vec::new()) };
     Ok((MainFlowProofReceipt {
-        active, mixed_context_after_scalar: None, directives: effects.records, diagnostics: Vec::new(),
+        active, mixed_context_after_scalar: None, directives: effects.records, diagnostics: evidence.observed.diagnostics,
         contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
     }, end))
@@ -11109,7 +11194,7 @@ fn run_private_named_after_startup(
         if qualified || expected.is_some() || !arrays.is_empty() || ranked.is_some() {
             return Err(ProjectCheck::Unsupported);
         }
-        return run_private_dormant_citation_catalog(owner, scope, cap, &plans);
+        return run_private_citation_catalog(owner, scope, cap, &plans);
     }
     if !qualified && plans.len() > 2 { return Err(ProjectCheck::Unsupported); }
     let mut targets = HashSet::with_capacity(plans.len());

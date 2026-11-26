@@ -423,6 +423,7 @@ impl<'a> Cohort<'a> {
                     trace.ranked_target = Some(target);
                     trace.metered_frames |= sites.len() > 1;
                 },
+                failure_search::StartupProofRole::Cited => return Err(ProjectCheck::Unsupported),
             }
             trace.enroll_proof_sites(target, role, sites).ok_or(ProjectCheck::Unsupported)?;
         }

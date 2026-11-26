@@ -3203,9 +3203,47 @@ main_artifact = "main"
                     assert_eq!(files(), both_files);
                     clean();
                 }
-                let reached_citation = cited.replace("%%end", &format!(
-                    "i8 called = producer(3); core.require(called == 7, {unused_output}); %%end"));
-                fs::write(&source, reached_citation).unwrap();
+                let reached_citation = show.replace(&format!("core.require(false, {second});"), &format!(r#"
+                    i8 called = producer(3);
+                    i8 repeated = producer(4);
+                    core.require(called != 7, {second});
+                    core.require(repeated == 7, {unused_output});
+                "#));
+                assert_ne!(reached_citation, show);
+                fs::write(&source, &reached_citation).unwrap();
+                let old = terminal(&[legacy()], scope, false);
+                assert_eq!(old.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                for cap in [1, 8] {
+                    let current = selected(cap);
+                    let report = current[0].outcome.as_ref().unwrap();
+                    let [first_call, second_call] = report.diagnostics.as_slice() else { panic!("two actual cited returns"); };
+                    assert!(report.symbolic_diagnostic.is_none());
+                    for (proof, snippet) in [(first_call, "producer(3)"), (second_call, "producer(4)")] {
+                        assert_eq!(proof.invocation.returned, 7.into());
+                        assert_eq!(proof.invocation.directive_position, 1);
+                        let span = proof.invocation.call.range;
+                        assert_eq!(proof.invocation.call.source.path, "src/main.w");
+                        assert_eq!(&reached_citation[span.start as usize..span.end as usize], snippet);
+                        let at = proof.failed_step.as_ref().unwrap().range;
+                        assert!(reached_citation[at.start as usize..at.end as usize].contains("out > 7"));
+                    }
+                    let live = terminal(&current, scope, false);
+                    if cap == 1 {
+                        assert_eq!((live.0, live.1), (Ok(1), b"first".to_vec()));
+                        assert_eq!(live.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                        assert_eq!(files(), first_file);
+                    } else {
+                        assert_eq!(live, old);
+                        assert_eq!(files(), both_files);
+                    }
+                    clean();
+                }
+                let opaque = reached_citation.replace("i8 result = execute(input); result",
+                    "i8 result = execute(input); i8 twice = execute(result); twice");
+                assert_ne!(opaque, reached_citation);
+                fs::write(&source, opaque).unwrap();
                 assert!(matches!(selected(1)[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
                 assert!(!state.exists());
                 if scope == ScalarCheckerScope::CurrentPackage {

@@ -24,7 +24,7 @@ struct FailurePath {
 pub(super) enum Admission { Duplicate, Selected, SelectedAndStop }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum StartupProofRole { Bare, Ranked, Aggregate }
+pub(super) enum StartupProofRole { Bare, Ranked, Aggregate, Cited }
 
 pub(super) struct StartupProofObservation {
     pub(super) site: SourceSpan,
@@ -67,6 +67,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) retain_after_cutoff: bool,
     finish_dormant_startup: bool,
     pub(super) metered_frames: bool,
+    pub(super) cited_routes: HashMap<PreparedCallable, (OccurrenceOrdinal, PreparedCallable)>,
     pub(super) pointee_route: Option<PointeeRoute>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
     pub(super) contextual_observed: bool,
@@ -83,7 +84,7 @@ impl StartUpSearch {
     }
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
-        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false,
+        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
             pointee_route: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
