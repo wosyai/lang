@@ -76,6 +76,24 @@ mod tests {
     use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
 
     #[test]
+    fn authored_comptime_is_not_derived_as_a_runtime_expression() {
+        let text = "%%start\n# WHY: café ☕\ni32(i32) size = fn(n) { comptime measured { n + 1 } };\n%%end";
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &["WHY".into()]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let canonical = parsed.result.canonical_cst();
+        let authored = super::derive_scalar_declarations_from_cst(canonical);
+        assert!(authored.items().is_empty());
+        let [diagnostic] = authored.diagnostics() else { panic!("expected one compile-time diagnostic"); };
+        assert_eq!(diagnostic.severity, super::DiagnosticSeverity::Error);
+        assert!(diagnostic.message.contains("requires specialization"));
+        let span = &diagnostic.labels[0].span;
+        assert_eq!(span.source, source);
+        assert_eq!(&text[span.range.start as usize..span.range.end as usize], "comptime measured { n + 1 }");
+        assert_eq!(super::derive_scalar_diagnostics_from_cst(canonical).as_slice(), authored.diagnostics());
+    }
+
+    #[test]
     fn publication_uses_first_comment_with_an_exact_span() {
         let source = SourceIdentity::new(
             "project".into(),

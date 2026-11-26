@@ -7,7 +7,8 @@ use super::{
 };
 use std::sync::Arc;
 use surrealkv::{Durability, Mode, Transaction};
-use wosy_protocol::{source_preparation_parts, BuildSourceSelection, Delta, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{source_preparation_parts, BuildSourceSelection, Delta, Kind, Node, NodeId, SourceConfig,
+    SourcePreparationParts};
 
 pub enum SourceReconciliation {
     Known { root: NodeId },
@@ -101,14 +102,18 @@ pub(super) fn checked_source_header_using(
 ) -> Result<(Node, SourceConfig)> {
     let source = read(root)?;
     let parts = source_preparation_parts(&source).ok_or("unsupported acknowledged source schema")?;
-    let config = read(parts.config)?;
+    let config = checked_source_config_for_parts(&parts, read(parts.config)?)?;
+    Ok((source, config))
+}
+
+pub(super) fn checked_source_config_for_parts(parts: &SourcePreparationParts<'_>, config: Node) -> Result<SourceConfig> {
     if config.kind != Kind::Config { return Err("invalid acknowledged source configuration kind".into()); }
     super::validate_shape(&config)?;
     let config: SourceConfig = serde_json::from_slice(&config.data)?;
-    if !parts.envelope.matches_config(&config) {
+    if !parts.matches_config(&config) {
         return Err("invalid acknowledged source configuration schema".into());
     }
-    Ok((source, config))
+    Ok(config)
 }
 
 pub(super) fn bounded_source_records(

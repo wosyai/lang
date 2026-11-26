@@ -33,7 +33,7 @@ impl SqliteSourceState {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let Some(pin) = read_retained_pin(&tx, name)? else { return Ok(None); };
         let entry = load_entry(&tx, &self.project, &pin.target, pin.root,
-            SourceHeaderRead::PinnedEntry, self.limits, budget, json_bytes)?;
+            SourceHeaderRead::LocalMetadata, self.limits, budget, json_bytes)?;
         tx.commit()?;
         let json = entry.encode(json_bytes)?;
         Ok((read_retained_pin(&self.db, name)?.as_ref() == Some(&pin)).then_some(PinnedEntryCst { pin, json }))

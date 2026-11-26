@@ -95,6 +95,7 @@ pub enum SyntaxKind {
     DirectFieldChainTail,
     ValueField,
     InvalidTemporaryPlace,
+    ComptimeExpr = 85,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -199,6 +200,7 @@ impl SyntaxKind {
             82 => SyntaxKind::DirectFieldChainTail,
             83 => SyntaxKind::ValueField,
             84 => SyntaxKind::InvalidTemporaryPlace,
+            85 => SyntaxKind::ComptimeExpr,
             _ => return None,
         })
     }
@@ -206,6 +208,23 @@ impl SyntaxKind {
 
 pub type CstNode = SyntaxNode<WosyLanguage>;
 pub type CstToken = SyntaxToken<WosyLanguage>;
+
+/// Authored Base syntax, not specialization or execution authority.
+pub struct ComptimeCst {
+    pub id: CstToken,
+    pub block: CstNode,
+    pub span: ByteSpan,
+}
+
+impl ComptimeCst {
+    pub fn from_node(node: &CstNode) -> Option<Self> {
+        if node.kind() != SyntaxKind::ComptimeExpr { return None; }
+        let id = node.children_with_tokens().filter_map(rowan::NodeOrToken::into_token)
+            .find(|token| token.kind() == SyntaxKind::Identifier)?;
+        let block = node.children().find(|child| child.kind() == SyntaxKind::Block)?;
+        Some(Self { id, block, span: byte_span(node) })
+    }
+}
 
 pub struct NamespaceCst {
     pub binding: CstToken,
@@ -1003,6 +1022,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::receiver => SyntaxKind::Receiver,
         Rule::output_list => SyntaxKind::OutputList,
         Rule::assignment_targets => SyntaxKind::AssignmentTargets,
+        Rule::comptime_expr => SyntaxKind::ComptimeExpr,
         Rule::struct_literal => SyntaxKind::StructLiteral,
         Rule::struct_literal_field => SyntaxKind::StructLiteralField,
         Rule::field_access => SyntaxKind::FieldAccess,
@@ -1057,6 +1077,61 @@ mod tests {
 
     fn identity() -> SourceIdentity {
         SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "r1".into())
+    }
+
+    #[test]
+    fn authored_base_comptime_uses_the_expression_and_block_grammar() {
+        let text = r#"%%start
+i32 limit = core.comp_param("limit");
+i32 mode = core.comp_param("mode", 1);
+i32(i32) size = fn(n) {
+    # WHY: café ☕
+    comptime measured {
+        i32 total = n + 1;
+        total
+    }
+};
+i32 value = 2 * (comptime fixed { size(3) } + 1);
+%%end"#;
+        let parsed = parse(identity(), text.into(), &["WHY".into()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let parts: Vec<_> = parsed.root.descendants().filter_map(|node| ComptimeCst::from_node(&node)).collect();
+        assert_eq!(parts.iter().map(|part| part.id.text()).collect::<Vec<_>>(), ["measured", "fixed"]);
+        let exact = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(exact(parts[0].span), "comptime measured {\n        i32 total = n + 1;\n        total\n    }");
+        assert_eq!(parts[0].block.kind(), SyntaxKind::Block);
+        assert_eq!(exact(byte_span(&parts[1].block)), "{ size(3) }");
+        let parameters = parsed.root.descendants().filter(|node| node.kind() == SyntaxKind::QualifiedCall)
+            .filter(|node| {
+                let identifiers = node.children_with_tokens().filter_map(rowan::NodeOrToken::into_token)
+                    .filter(|token| token.kind() == SyntaxKind::Identifier)
+                    .collect::<Vec<_>>();
+                identifiers.iter().map(|token| token.text()).eq(["core", "comp_param"])
+            });
+        assert_eq!(parameters.count(), 2);
+        assert_eq!(SyntaxKind::try_from_raw(84), Some(SyntaxKind::InvalidTemporaryPlace));
+        assert_eq!(SyntaxKind::try_from_raw(85), Some(SyntaxKind::ComptimeExpr));
+    }
+
+    #[test]
+    fn comptime_requires_its_exact_id_and_block_without_reserving_old_identifiers() {
+        for text in [
+            "%%start\ni32 value = comptime {};\n%%end",
+            "%%start\ni32 value = comptime name 1;\n%%end",
+            "%%start\ni32 value = comptime_name { 1 };\n%%end",
+        ] {
+            let parsed = parse(identity(), text.into(), &[]);
+            assert!(!parsed.is_valid(), "{text}");
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(!parsed.root.descendants().any(|node| node.kind() == SyntaxKind::ComptimeExpr));
+        }
+        let text = "%%start\ni32(i32) comptime = fn(value) { value };\ni32 comptimeValue = comptime(2);\n%%end";
+        let parsed = parse(identity(), text.into(), &[]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        assert!(parsed.root.descendants().any(|node| node.kind() == SyntaxKind::Call));
+        assert!(!parsed.root.descendants().any(|node| node.kind() == SyntaxKind::ComptimeExpr));
     }
     #[test]
     fn borrowed_snapshot_preserves_pretty_json_bytes() {
@@ -2921,5 +2996,5 @@ mod tests {
 /// scanner or tree-construction changes (grammar bytes are always included).
 pub fn base_cst_schema() -> &'static [u8; 32] {
     static ID: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    ID.get_or_init(|| blake3::derive_key("wosy base CST grammar, scanner, and Rowan encoding v3", include_bytes!("grammar.pest")))
+    ID.get_or_init(|| blake3::derive_key("wosy base CST grammar, scanner, and Rowan encoding v4", include_bytes!("grammar.pest")))
 }

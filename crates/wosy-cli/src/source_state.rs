@@ -7,7 +7,7 @@ use crate::source_recovery::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use wosy_protocol::{
-    pinned_source_preparation_parts, source_preparation_parts, CstKindEncoding,
+    retained_source_preparation_metadata, source_preparation_parts, CstKindEncoding,
     Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig,
 };
 
@@ -37,7 +37,7 @@ pub struct SqliteSourceState {
 
 enum SourceHeaderRead {
     Active,
-    PinnedEntry,
+    LocalMetadata,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -96,6 +96,9 @@ pub struct SourceStage {
     pub new_bytes: usize,
     pub storage_reads: usize,
     pub pending: Option<SourceAttempt>,
+    /// No current-grammar predecessor can anchor a sparse update. The
+    /// existing full upload of `ReplaySource::Pending` must be acknowledged.
+    pub requires_complete_upload: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +117,7 @@ struct Observation {
     source: PreparedSources,
     usage_to_record: Option<ClientSourceUsage>,
     storage_reads: usize,
+    requires_complete_upload: bool,
 }
 
 impl SqliteSourceState {
@@ -217,21 +221,26 @@ impl SqliteSourceState {
     pub fn stage(&mut self, target: &str) -> Result<SourceStage> {
         let before = self.selection(target)?;
         if before.pending.is_some() { return Err("an exact source upload is already pending".into()); }
-        if let Some(root) = before.selected {
-            let observation = self.observe_again(target, root)?;
-            self.record(target, before, observation)
-        } else {
-            let initial = RetainedSources::observe(&self.project, Some(target), self.limits)?;
-            let usage_to_record = Some(initial.usage());
-            self.record(target, before, Observation {
-                source: initial.into_prepared(), usage_to_record, storage_reads: 0,
-            })
-        }
+        let observation = match before.selected {
+            Some(root) => self.observe_again(target, root)?,
+            None => self.observe_complete(target, 0)?,
+        };
+        self.record(target, before, observation)
+    }
+
+    fn observe_complete(&self, target: &str, storage_reads: usize) -> Result<Observation> {
+        let source = RetainedSources::observe(&self.project, Some(target), self.limits)?;
+        let usage_to_record = Some(source.usage());
+        Ok(Observation {
+            source: source.into_prepared(), usage_to_record, storage_reads,
+            requires_complete_upload: true,
+        })
     }
 
     fn record(&mut self, target: &str, prior: SourceSelection, observation: Observation) -> Result<SourceStage> {
         let Observation {
             source: PreparedSources { root, delta, parsed, reused }, usage_to_record, storage_reads,
+            requires_complete_upload,
         } = observation;
         let pending = if prior.selected != Some(root) {
             let generation = prior.generation.checked_add(1).ok_or("local source generation exhausted")?;
@@ -272,7 +281,8 @@ impl SqliteSourceState {
                 "stored source observation receipt differs from admitted source")?;
         }
         tx.commit()?;
-        Ok(SourceStage { root, parsed, reused, new_nodes, new_bytes, storage_reads, pending })
+        Ok(SourceStage { root, parsed, reused, new_nodes, new_bytes, storage_reads, pending,
+            requires_complete_upload })
     }
 
     /// Bind only SQLite's acknowledged target selection to this canonical
@@ -371,7 +381,7 @@ impl SqliteSourceState {
         let top = record(root)?;
         let parts = match purpose {
             SourceHeaderRead::Active => source_preparation_parts(&top),
-            SourceHeaderRead::PinnedEntry => pinned_source_preparation_parts(&top),
+            SourceHeaderRead::LocalMetadata => retained_source_preparation_metadata(&top),
         }.ok_or("unsupported persisted source schema")?;
         let config = record(parts.config)?;
         if config.kind != Kind::Config { return Err("expected persisted source configuration".into()); }
@@ -388,7 +398,23 @@ impl SqliteSourceState {
 
     fn observe_again(&self, target: &str, root: NodeId) -> Result<Observation> {
         let mut read = StoredNodes::new(&self.db)?;
-        let (config, entries) = Self::header(&self.project, &mut read, target, root)?;
+        let mut metadata = ClientSourceUsage { nodes: 0, encoded_bytes: 0 };
+        let (config, entries, encoding) = Self::read_source_header(
+            &self.project, target, root, SourceHeaderRead::LocalMetadata, |id| {
+                read.charged_record(id, true, |bytes| {
+                    metadata.nodes += 1;
+                    metadata.encoded_bytes = metadata.encoded_bytes.saturating_add(bytes);
+                    Ok(metadata.admit(self.limits)?)
+                })
+            },
+        )?;
+        if encoding == CstKindEncoding::FrozenBaseV3 {
+            // Never reactivate or copy the old canonical closure. Retain the
+            // previous selection until the freshly parsed upload is acked.
+            let storage_reads = read.count;
+            drop((read, config, entries));
+            return self.observe_complete(target, storage_reads);
+        }
         let budget = load_usage(&self.db, root)?;
         if let Some(usage) = budget { usage.admit(self.limits)?; }
         let files = read.file_index(&config, entries)?;
@@ -404,7 +430,9 @@ impl SqliteSourceState {
             // storing a receipt rather than assuming the earlier limits.
             Some(read.closure(root, self.limits)?.1)
         } else { None };
-        Ok(Observation { source, usage_to_record, storage_reads: read.count })
+        Ok(Observation {
+            source, usage_to_record, storage_reads: read.count, requires_complete_upload: false,
+        })
     }
 }
 

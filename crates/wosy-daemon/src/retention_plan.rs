@@ -1,6 +1,6 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, build_receipt, build_session::BuildRequestRejection, check_source_marker,
+    authority_key_for_encoding, base_declarations, build_receipt, build_session::BuildRequestRejection, check_source_marker,
     key, module_parts, pins, prepared_project::SelectedBuildProfile, project_declarations, projection_file_parts,
     read_node_with, read_source_config_charged, read_verified_node_with, validate_shape, Expected,
     source_reconciliation::checked_published_source_header_with_top,
@@ -12,7 +12,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use surrealkv::{LSMIterator, Mode, Transaction};
-use wosy_protocol::{BuildSourceSelection, FileKey, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{retained_source_preparation_metadata, syntax_kind, BuildSourceSelection, CstKindEncoding,
+    FileKey, Kind, Node, NodeId, SourceConfig, SourceEnvelopeIdentity};
 
 const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
@@ -194,6 +195,7 @@ pub struct SourceRetentionInventory {
 
 struct Mark {
     classes: u8,
+    graph_classes: [u8; 2],
     encoded_bytes: usize,
     is_projection: bool,
 }
@@ -222,6 +224,7 @@ struct CensusRead<'a> {
 
 struct CensusConfig {
     encoded_bytes: usize,
+    envelope: SourceEnvelopeIdentity,
     entry: FileKey,
     owner: String,
     profiles: Vec<SelectedBuildProfile<String>>,
@@ -230,6 +233,7 @@ struct CensusConfig {
 
 struct CensusRoot {
     encoded_bytes: usize,
+    encoding: CstKindEncoding,
     inputs: build_receipt::BuildInputs,
     children: Vec<NodeId>,
 }
@@ -261,6 +265,7 @@ impl<'a> CensusRead<'a> {
                 self.remaining_profiles = self.remaining_profiles.checked_sub(config.profiles.len())
                     .ok_or("source retention plan exceeded configured profile budget")?;
                 let owner = pins::workspace_of_source_config(&config)?.to_owned();
+                let envelope = config.envelope_identity();
                 let mut profiles = Vec::new();
                 let mut other_profile_names = BTreeSet::new();
                 for (name, profile) in config.profiles {
@@ -270,7 +275,7 @@ impl<'a> CensusRead<'a> {
                     }
                 }
                 let candidate = Arc::new(CensusConfig {
-                    encoded_bytes, owner, entry: config.entry, profiles, other_profile_names,
+                    encoded_bytes, envelope, owner, entry: config.entry, profiles, other_profile_names,
                 });
                 slot.insert(Arc::clone(&candidate));
                 Ok(candidate)
@@ -280,13 +285,17 @@ impl<'a> CensusRead<'a> {
 
     fn load_root(&mut self, id: NodeId) -> Result<CensusRoot> {
         let node = self.verified(id)?;
-        let parts = wosy_protocol::source_preparation_parts(&node)
+        let parts = retained_source_preparation_metadata(&node)
             .ok_or("unsupported published root in retention census")?;
+        if parts.envelope_identity() != self.config(parts.config)?.envelope {
+            return Err("published root and configuration parser differ in retention census".into());
+        }
         let inputs = build_receipt::BuildInputs {
             config: parts.config, executable: parts.executable, dependencies: parts.dependencies,
         };
         let encoded_bytes = node.encoded_len();
-        Ok(CensusRoot { encoded_bytes, inputs, children: node.children })
+        let encoding = parts.kind_encoding();
+        Ok(CensusRoot { encoded_bytes, encoding, inputs, children: node.children })
     }
 
     fn root_owner(&mut self, id: NodeId) -> Result<Arc<CensusConfig>> {
@@ -315,7 +324,7 @@ fn charge_bytes(remaining: &mut usize, bytes: usize) -> Result<()> {
 enum WalkOrigin {
     Published,
     Config,
-    Graph,
+    Graph(CstKindEncoding),
 }
 
 fn walk(
@@ -326,60 +335,76 @@ fn walk(
     while let Some((id, origin)) = todo.pop() {
         let at_limit = marks.nodes.len() >= limit;
         let entry = marks.nodes.entry(id);
-        if matches!(&entry, Entry::Occupied(existing) if existing.get().classes & class != 0) { continue; }
+        let epoch = match origin {
+            WalkOrigin::Graph(CstKindEncoding::Current) => Some(0),
+            WalkOrigin::Graph(CstKindEncoding::FrozenBaseV3) => Some(1),
+            _ => None,
+        };
+        if matches!(&entry, Entry::Occupied(existing)
+            if epoch.map_or(existing.get().classes, |index| existing.get().graph_classes[index]) & class != 0)
+        { continue; }
         let (encoded_bytes, is_projection) = match origin {
             WalkOrigin::Config => (reader.config(id)?.encoded_bytes, false),
             WalkOrigin::Published => {
                 let root = reader.root_for_walk(id)?;
-                if let Some(image) = image {
+                if let Some(image) = image.filter(|_| root.encoding == CstKindEncoding::Current) {
                     let scope = marks.receipt_scopes.entry(root.inputs.scope(image))
                         .or_insert(ReceiptScope { inputs: root.inputs, classes: 0 });
                     scope.classes |= class;
                 }
-                todo.extend(root.children.into_iter().skip(1).map(|child| (child, WalkOrigin::Graph)));
+                let encoding = root.encoding;
+                todo.extend(root.children.into_iter().skip(1).map(|child| (child, WalkOrigin::Graph(encoding))));
                 todo.push((root.inputs.config, WalkOrigin::Config));
                 (root.encoded_bytes, false)
             }
-            WalkOrigin::Graph => {
-                let node = reader.record(id)?;
+            WalkOrigin::Graph(encoding) => {
+                let archive = encoding == CstKindEncoding::FrozenBaseV3;
+                let image = image.filter(|_| !archive);
+                let node = if archive { reader.verified(id)? } else { reader.record(id)? };
                 match node.kind {
                     // A generic link can never mark or follow a receipt or
                     // confer the more specific authority of a root or config.
                     Kind::BuildDiagnosticReceipt | Kind::SavedBuildDiagnostic | Kind::SourcePreparation | Kind::Config => continue,
                     Kind::File => {
-                        let authority = reader.tx.get(&authority_key(FILE_AUTHORITY, id))?
+                        let authority = reader.tx.get(&authority_key_for_encoding(FILE_AUTHORITY, id, encoding))?
                             .ok_or("missing namespace authority for source retention")?;
-                        todo.push((decode_id(authority.as_ref())?, WalkOrigin::Graph));
+                        todo.push((decode_id(authority.as_ref())?, origin));
                         let [_, executable, _] = node.children.as_slice() else { return Err("invalid retained file shape".into()); };
                         if let Some(image) = image {
                             if let Some(body) = reader.tx.get(&base_declarations::query_key(image, *executable))? {
-                                todo.push((decode_id(body.as_ref())?, WalkOrigin::Graph));
+                                todo.push((decode_id(body.as_ref())?, origin));
                             }
                         }
                     }
                     Kind::Module => {
                         if let Some(image) = image {
                             if let Some(context) = reader.tx.get(&project_declarations::projection_key(image, id))? {
-                                todo.push((decode_id(context.as_ref())?, WalkOrigin::Graph));
+                                todo.push((decode_id(context.as_ref())?, origin));
                             }
                         }
                     }
                     Kind::BaseDeclarations => {
+                        if archive { return Err("compiler body outside the historical source closure".into()); }
                         if let Some(blob) = base_declarations::cas_digest(&node.data)? {
                             *marks.cas.entry(blob).or_default() |= class;
                         }
                     }
+                    Kind::ModuleDeclarations if archive => return Err("compiler projection outside the historical source closure".into()),
+                    Kind::Syntax | Kind::Token if archive && !encoding.allows(syntax_kind(&node)?) =>
+                        return Err("historical source syntax kind is outside its parser epoch".into()),
                     _ => {}
                 }
                 let encoded_bytes = node.encoded_len();
-                todo.extend(node.children.into_iter().map(|child| (child, WalkOrigin::Graph)));
+                todo.extend(node.children.into_iter().map(|child| (child, origin)));
                 (encoded_bytes, node.kind == Kind::ModuleDeclarations)
             }
         };
         if matches!(&entry, Entry::Vacant(_) if at_limit) {
             return Err("source retention plan exceeded node budget".into());
         }
-        entry.or_insert_with(|| Mark { classes: 0, encoded_bytes, is_projection }).classes |= class;
+        let mark = entry.or_insert_with(|| Mark { classes: 0, graph_classes: [0; 2], encoded_bytes, is_projection });
+        mark.classes |= class;
+        if let Some(epoch) = epoch { mark.graph_classes[epoch] |= class; }
     }
     Ok(())
 }
@@ -464,7 +489,7 @@ fn mark_receipts(reader: &mut CensusRead<'_>, image: NodeId, limit: usize, marks
                 Entry::Occupied(mut mark) => mark.get_mut().classes |= classes,
                 Entry::Vacant(_) if at_limit => return Err("source retention plan exceeded node budget".into()),
                 Entry::Vacant(mark) => {
-                    mark.insert(Mark { classes, encoded_bytes: receipt.encoded_bytes, is_projection: false });
+                    mark.insert(Mark { classes, graph_classes: [0; 2], encoded_bytes: receipt.encoded_bytes, is_projection: false });
                 }
             }
             Ok(())
@@ -503,7 +528,7 @@ pub(super) fn assert_bounded_semantic_census_read(store: &SourceStore, root: Nod
     // corruption or mutable links are needed for this invariant.
     reader.remaining_bytes = length(receipt);
     let mut marks = Marks::default();
-    walk(&mut reader, [(receipt, WalkOrigin::Graph)], None, PROTECTED, 100, &mut marks).unwrap();
+    walk(&mut reader, [(receipt, WalkOrigin::Graph(CstKindEncoding::Current))], None, PROTECTED, 100, &mut marks).unwrap();
     assert_eq!(reader.remaining_bytes, 0);
     assert!(marks.nodes.is_empty());
 }
@@ -766,7 +791,7 @@ impl SourceStore {
                             }
                             attachment.insert(root);
                             marks.nodes.insert(record, Mark {
-                                classes: PROTECTED, encoded_bytes, is_projection: false,
+                                classes: PROTECTED, graph_classes: [0; 2], encoded_bytes, is_projection: false,
                             });
                         }
                     }

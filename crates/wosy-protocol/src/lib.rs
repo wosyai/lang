@@ -263,10 +263,21 @@ pub struct SourcePreparationParts<'a> {
 
 impl SourcePreparationParts<'_> {
     pub fn matches_config(&self, config: &SourceConfig) -> bool {
-        self.envelope == config.envelope() && config.parser.schema.0 == *self.grammar.parser
+        self.envelope_identity() == config.envelope_identity()
     }
 
     pub fn kind_encoding(&self) -> CstKindEncoding { self.grammar.kind_encoding }
+
+    pub fn envelope_identity(&self) -> SourceEnvelopeIdentity {
+        SourceEnvelopeIdentity { family: self.envelope, parser: NodeId(*self.grammar.parser) }
+    }
+}
+
+/// Structural layout and parser stamp, not workspace or compile authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceEnvelopeIdentity {
+    family: SourcePreparationEnvelope,
+    parser: NodeId,
 }
 
 /// A published source envelope family. A decoded envelope identifies a
@@ -303,6 +314,15 @@ pub enum CstKindEncoding {
 
 impl CstKindEncoding {
     pub fn allows(self, kind: wosy_syntax::SyntaxKind) -> bool { self.allows_raw(kind as u16) }
+
+    /// Keys for per-file namespace facts have always used the ordinary
+    /// envelope's digest, even for the installed-Git root family.
+    pub fn namespace_authority_schema(self) -> &'static [u8; 32] {
+        match self {
+            Self::Current => source_preparation_schema(),
+            Self::FrozenBaseV3 => SourceEnvelopeGrammar::FROZEN_BASE_V3.namespace,
+        }
+    }
 
     fn allows_raw(self, raw: u16) -> bool {
         match self {
@@ -359,9 +379,11 @@ pub fn source_preparation_parts(node: &Node) -> Option<SourcePreparationParts<'_
     source_preparation_parts_using(node, SourceEnvelopeGrammar::current(), false)
 }
 
-/// Decode only for a read-only local pinned view. This does not admit a
-/// frozen grammar as active, deserialized compiler input, or source replay.
-pub fn pinned_source_preparation_parts(node: &Node) -> Option<SourcePreparationParts<'_>> {
+/// Read-only metadata for archived source or deciding to observe current
+/// source from scratch. Callers still authenticate the rooted owner and
+/// scope. This does not admit a frozen grammar as active, deserialized
+/// compiler input, or source replay.
+pub fn retained_source_preparation_metadata(node: &Node) -> Option<SourcePreparationParts<'_>> {
     source_preparation_parts_using(node, SourceEnvelopeGrammar::current(), true)
 }
 
@@ -370,9 +392,9 @@ fn source_preparation_parts_using(
 ) -> Option<SourcePreparationParts<'_>> {
     if node.kind != Kind::SourcePreparation { return None; }
     let frozen = SourceEnvelopeGrammar::FROZEN_BASE_V3;
-    let (envelope, grammar) = allow_frozen_read.then(|| frozen.classify(&node.data)).flatten()
-        .map(|envelope| (envelope, frozen))
-        .or_else(|| current.classify(&node.data).map(|envelope| (envelope, current)))?;
+    let (envelope, grammar) = current.classify(&node.data).map(|envelope| (envelope, current))
+        .or_else(|| allow_frozen_read.then(|| frozen.classify(&node.data)).flatten()
+            .map(|envelope| (envelope, frozen)))?;
     let [config, executable, annotation, dependencies, files @ ..] = node.children.as_slice() else {
         return None;
     };
@@ -438,6 +460,10 @@ impl SourceConfig {
     }
 
     pub fn schema(&self) -> &'static [u8; 32] { self.envelope().digest() }
+
+    pub fn envelope_identity(&self) -> SourceEnvelopeIdentity {
+        SourceEnvelopeIdentity { family: self.envelope(), parser: self.parser.schema }
+    }
 }
 
 #[cfg(test)]
@@ -497,35 +523,34 @@ mod source_envelope_tests {
     }
 
     #[test]
-    fn frozen_pinned_reader_does_not_depend_on_the_active_epoch() {
-        // Exercise the exact reader with different active IDs only in this
-        // unit test. No alternative grammar or storage epoch is installed.
-        let simulated = SourceEnvelopeGrammar {
-            parser: &[0xa1; 32], namespace: &[0xa2; 32], git: &[0xa3; 32],
-            kind_encoding: CstKindEncoding::Current,
-        };
+    fn frozen_local_metadata_is_distinct_from_the_actual_current_epoch() {
+        let current = SourceEnvelopeGrammar::current();
         let frozen = SourceEnvelopeGrammar::FROZEN_BASE_V3;
+        assert_ne!(current.parser, frozen.parser);
+        assert_ne!(current.namespace, frozen.namespace);
+        assert_ne!(current.git, frozen.git);
         let frozen_local = top(frozen.namespace);
         let frozen_git = top(frozen.git);
-        let current_local = top(simulated.namespace);
-        let current_git = top(simulated.git);
+        let current_local = top(current.namespace);
+        let current_git = top(current.git);
         for (is_git, retained, active) in [(false, &frozen_local, &current_local), (true, &frozen_git, &current_git)] {
             let mut old_config = config(frozen.parser);
-            let mut active_config = config(simulated.parser);
+            let mut active_config = config(current.parser);
             if is_git {
                 add_git_namespace(&mut old_config);
                 add_git_namespace(&mut active_config);
             }
-            assert!(source_preparation_parts_using(retained, simulated, false).is_none());
-            let archive = source_preparation_parts_using(retained, simulated, true).unwrap();
+            assert!(source_preparation_parts(retained).is_none());
+            let archive = retained_source_preparation_metadata(retained).unwrap();
             assert_eq!(archive.kind_encoding(), CstKindEncoding::FrozenBaseV3);
             assert!(archive.matches_config(&old_config));
             assert!(!archive.matches_config(&active_config));
             assert!(archive.kind_encoding().allows_raw(84));
             assert!(!archive.kind_encoding().allows_raw(85));
-            let current = source_preparation_parts_using(active, simulated, false).unwrap();
-            let current_pin = source_preparation_parts_using(active, simulated, true).unwrap();
+            let current = source_preparation_parts(active).unwrap();
+            let current_pin = retained_source_preparation_metadata(active).unwrap();
             assert_eq!(current_pin.kind_encoding(), CstKindEncoding::Current);
+            assert!(current_pin.kind_encoding().allows(wosy_syntax::SyntaxKind::ComptimeExpr));
             assert!(current.matches_config(&active_config) && current_pin.matches_config(&active_config));
             assert!(!current.matches_config(&old_config) && !current_pin.matches_config(&old_config));
             if !is_git { add_git_namespace(&mut old_config); }

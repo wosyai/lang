@@ -5,6 +5,7 @@ use std::{collections::HashMap, io::Write, num::NonZeroUsize, path::Path, sync::
 use wosy_daemon::{SavedBuildDiagnostic, SourceStorageWorker, SourceStore};
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{BuildSourceSelection, FileKey};
+use wosy_syntax::SourceIdentity;
 
 fn rendered(store: &SourceStore, report: &SavedBuildDiagnostic) -> Result<String> {
     let source = store.snapshot(report.source_root)?.ok_or("saved fixture source root is missing")?;
@@ -17,9 +18,13 @@ fn rendered(store: &SourceStore, report: &SavedBuildDiagnostic) -> Result<String
         if file.cst.source != *requested { return Err("saved fixture diagnostic revision mismatch".into()); }
         files.insert(requested.clone(), file.cst.root.text().to_string());
     }
+    render(report, |source| files.get(source).map(String::as_str))
+}
+
+fn render<'a>(report: &SavedBuildDiagnostic, source_text: impl Fn(&SourceIdentity) -> Option<&'a str>) -> Result<String> {
     let mut buffer = Buffer::no_color();
     for diagnostic in &report.diagnostics {
-        wosy_cli::diagnostic_output::emit_project_diagnostic(&mut buffer, diagnostic, |source| files.get(source).map(String::as_str))?;
+        wosy_cli::diagnostic_output::emit_project_diagnostic(&mut buffer, diagnostic, &source_text)?;
     }
     Ok(std::str::from_utf8(buffer.as_slice())?.to_owned())
 }
@@ -34,12 +39,25 @@ pub(super) async fn run(
         .ok_or("fixture requires the exact published source")?;
     let limits = super::source_reconciliation::admission_limits(false);
     let start = Instant::now();
-    let result = match profile {
-        Some(profile) => Some(session.save_build_diagnostic(profile, name, limits, max_bytes).await?),
-        None => session.saved_build_diagnostic(name, limits, max_bytes).await?,
+    let (result, rendered, operation_ms) = match profile {
+        Some(profile) => {
+            let saved = session.save_build_diagnostic(profile, name, limits, max_bytes).await?;
+            let elapsed = milliseconds(start);
+            let rendered = rendered(&store, &saved)?;
+            (Some(saved), Some(rendered), elapsed)
+        }
+        None => {
+            let view = session.saved_build_diagnostic_view(name, limits, max_bytes).await?;
+            let elapsed = milliseconds(start);
+            match view {
+                Some(view) => {
+                    let rendered = render(view.report(), |source| view.authored_text(source))?;
+                    (Some(view.into_report()), Some(rendered), elapsed)
+                }
+                None => (None, None, elapsed),
+            }
+        }
     };
-    let operation_ms = milliseconds(start);
-    let rendered = result.as_ref().map(|report| rendered(&store, report)).transpose()?;
     let value = serde_json::json!({ "report": result, "rendered": rendered, "operation_ms": operation_ms });
     if exit {
         println!("{value}");

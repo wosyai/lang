@@ -3,7 +3,7 @@ use super::{
     retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedLlvmIdentity, RootedLlvmProjection, RootedPreparedProject,
-    SavedBuildDiagnostic, SourceReconciliation, SourceStorageWorker,
+    SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -211,12 +211,28 @@ impl BuildDiagnosticSession<'_> {
     pub async fn saved_build_diagnostic(
         &self, name: &str, limits: BaseCstAdmissionLimits, max_report_bytes: usize,
     ) -> Result<Option<SavedBuildDiagnostic>> {
+        self.read_saved_build_diagnostic(name, limits, max_report_bytes, false).await
+            .map(|view| view.map(SavedBuildDiagnosticView::into_report))
+    }
+
+    /// Read the same archive with its bounded, verified authored label
+    /// sources. A historical root need not be (or become) an active snapshot.
+    pub async fn saved_build_diagnostic_view(
+        &self, name: &str, limits: BaseCstAdmissionLimits, max_report_bytes: usize,
+    ) -> Result<Option<SavedBuildDiagnosticView>> {
+        self.read_saved_build_diagnostic(name, limits, max_report_bytes, true).await
+    }
+
+    async fn read_saved_build_diagnostic(
+        &self, name: &str, limits: BaseCstAdmissionLimits, max_report_bytes: usize,
+        include_authored: bool,
+    ) -> Result<Option<SavedBuildDiagnosticView>> {
         super::saved_diagnostics::validate_name(name)?;
         let slot = self.worker.try_slot()?;
         let name = name.to_owned();
         let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved(slot, move |store| {
-            super::saved_diagnostics::read(store, &lease, &name, limits, max_report_bytes)
+            super::saved_diagnostics::read(store, &lease, &name, limits, max_report_bytes, include_authored)
         }).await?
     }
 

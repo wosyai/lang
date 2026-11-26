@@ -37,6 +37,7 @@ pub(super) async fn run(
                 "root": stage.root.hex(), "parsed": stage.parsed, "reused": stage.reused,
                 "new_nodes": stage.new_nodes, "new_bytes": stage.new_bytes,
                 "storage_reads": stage.storage_reads,
+                "requires_complete_upload": stage.requires_complete_upload,
                 "attempt": stage.pending.map(SourceAttempt::generation),
                 "stage_ms": milliseconds(start),
             })

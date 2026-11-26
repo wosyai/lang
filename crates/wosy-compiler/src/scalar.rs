@@ -2606,13 +2606,16 @@ fn collect_scalar_diagnostics(
             }
             NodeOrToken::Node(node)
                 if node.kind() == SyntaxKind::InvalidTemporaryPlace
+                    || node.kind() == SyntaxKind::ComptimeExpr
                     || (node.kind() == SyntaxKind::ValueField
                         && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
             {
-                let message = if node.kind() == SyntaxKind::InvalidTemporaryPlace {
-                    "a field of a temporary is not an assignable or borrowable place"
-                } else {
-                    "an indexed call result field is not supported"
+                let message = match node.kind() {
+                    SyntaxKind::InvalidTemporaryPlace =>
+                        "a field of a temporary is not an assignable or borrowable place",
+                    SyntaxKind::ComptimeExpr =>
+                        "compile-time block requires specialization, which is not implemented",
+                    _ => "an indexed call result field is not supported",
                 };
                 projections.push(Diagnostic {
                     code: "B0003".to_owned(),

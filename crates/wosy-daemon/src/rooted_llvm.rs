@@ -16,7 +16,7 @@ use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, prepare_scalar_project, Diagnostic,
     ScalarArtifactEmission, ScalarBuildValidation, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_protocol::{source_preparation_parts, NodeId, OrdinaryLlvmBuilderWitness, ParserPolicy};
+use wosy_protocol::{source_preparation_parts, CstKindEncoding, NodeId, OrdinaryLlvmBuilderWitness, ParserPolicy};
 use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, CstNode, SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,7 +439,7 @@ impl SourceStore {
                 (true, false) => FileTree::Authored,
                 (false, _) => identity.tree(),
             };
-            let checked = validate_file_using(&module.file, &parser.categories, trees,
+            let checked = validate_file_using(&module.file, &parser.categories, trees, CstKindEncoding::Current,
                 Some(&mut work), |id, work| {
                     read_verified_node_with(tx, id, |bytes| work.expect("bounded authored expansion").read(bytes))
                 })?;

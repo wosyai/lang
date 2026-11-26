@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
-    imports_from_cst, source_preparation_parts, source_preparation_schema, syntax_kind, token_text, walk_cst, CstEvent,
-    Delta, FileEntry,
+    imports_from_cst, source_preparation_parts, syntax_kind, token_text, walk_cst, CstEvent,
+    CstKindEncoding, Delta, FileEntry,
     FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourcePreparationEnvelope, SourceUpdate,
 };
 use wosy_syntax::{
@@ -64,7 +64,7 @@ mod rooted_llvm;
 mod retention_plan;
 mod rooted_llvm_receipts;
 mod saved_diagnostics;
-pub use saved_diagnostics::{SavedBuildDiagnostic, SavedBuildPhase};
+pub use saved_diagnostics::{SavedBuildDiagnostic, SavedBuildDiagnosticView, SavedBuildPhase};
 mod source_impact;
 mod source_proposal;
 mod source_reconciliation;
@@ -591,9 +591,13 @@ fn read_comments(tx: &Transaction, id: NodeId) -> Result<Vec<TypedComment>> {
 }
 
 fn authority_key(tag: u8, source: NodeId) -> [u8; 65] {
+    authority_key_for_encoding(tag, source, CstKindEncoding::Current)
+}
+
+fn authority_key_for_encoding(tag: u8, source: NodeId, encoding: CstKindEncoding) -> [u8; 65] {
     let mut bytes = [0; 65];
     bytes[0] = tag;
-    bytes[1..33].copy_from_slice(source_preparation_schema());
+    bytes[1..33].copy_from_slice(encoding.namespace_authority_schema());
     bytes[33..].copy_from_slice(&source.0);
     bytes
 }
@@ -691,13 +695,13 @@ fn validate_file(
     tx: &Transaction, file: &FileEntry, configured: &[String], tree: FileTree,
     work: Option<&mut source_proposal::CstWork>,
 ) -> Result<CheckedFile> {
-    validate_file_using(file, configured, tree, work, |id, charge| {
+    validate_file_using(file, configured, tree, CstKindEncoding::Current, work, |id, charge| {
         read_node_with(tx, id, |bytes| charge.map_or(Ok(()), |work| work.read(bytes)))
     })
 }
 
 fn validate_file_using(
-    file: &FileEntry, configured: &[String], tree: FileTree,
+    file: &FileEntry, configured: &[String], tree: FileTree, encoding: CstKindEncoding,
     mut work: Option<&mut source_proposal::CstWork>,
     mut read: impl FnMut(NodeId, Option<&mut source_proposal::CstWork>) -> Result<Node>,
 ) -> Result<CheckedFile> {
@@ -718,13 +722,13 @@ fn validate_file_using(
     let mut executable_builder = (matches!(tree, FileTree::Executable | FileTree::Both) && !same_projection)
         .then(GreenNodeBuilder::new);
     enum Step {
-        Enter(NodeId, Node, Option<NodeId>, usize),
+        Enter(NodeId, Node, SyntaxKind, Option<NodeId>, usize),
         Children(std::vec::IntoIter<NodeId>, std::vec::IntoIter<NodeId>, usize),
     }
-    let mut pending = vec![Step::Enter(file.authored, authored, Some(file.executable), 1)];
+    let mut pending = vec![Step::Enter(file.authored, authored, SyntaxKind::Root, Some(file.executable), 1)];
     while let Some(step) = pending.pop() {
-        let (id, node, projection, depth) = match step {
-            Step::Enter(id, node, projection, depth) => (id, node, projection, depth),
+        let (id, node, kind, projection, depth) = match step {
+            Step::Enter(id, node, kind, projection, depth) => (id, node, kind, projection, depth),
             Step::Children(mut children, mut projected, depth) => {
                 let Some(child) = children.next() else {
                     if projected.next().is_some() { return Err("extra executable syntax nodes".into()); }
@@ -734,7 +738,10 @@ fn validate_file_using(
                     continue;
                 };
                 let record = read(child, work.as_deref_mut())?;
-                let projection = if record.kind == Kind::Token && syntax_kind(&record)? == SyntaxKind::TypedComment {
+                if !matches!(record.kind, Kind::Syntax | Kind::Token) { return Err("invalid authored CST child".into()); }
+                let kind = syntax_kind(&record)?;
+                if !encoding.allows(kind) { return Err("authored syntax kind is outside its parser epoch".into()); }
+                let projection = if record.kind == Kind::Token && kind == SyntaxKind::TypedComment {
                     None
                 } else {
                     Some(projected.next().ok_or("incomplete executable syntax projection")?)
@@ -742,14 +749,14 @@ fn validate_file_using(
                 // Read one child at a time; don't clone all sibling payloads
                 // before charging their unfolded bytes.
                 pending.push(Step::Children(children, projected, depth));
-                (child, record, projection, depth)
+                (child, record, kind, projection, depth)
             }
         };
         match node.kind {
             Kind::Syntax => {
                 if let Some(work) = work.as_mut() { work.children(depth, node.children.len())?; }
                 if authored_builder.is_some() || executable_builder.is_some() {
-                    let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
+                    let kind = rowan::SyntaxKind(kind as u16);
                     for builder in [&mut authored_builder, &mut executable_builder].into_iter().flatten() {
                         builder.start_node(kind);
                     }
@@ -781,7 +788,7 @@ fn validate_file_using(
                     return Err("executable token differs from authored source".into());
                 }
                 if authored_builder.is_some() || (projection.is_some() && executable_builder.is_some()) {
-                    let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
+                    let kind = rowan::SyntaxKind(kind as u16);
                     if let Some(builder) = authored_builder.as_mut() { builder.token(kind, text); }
                     if let Some(builder) = executable_builder.as_mut().filter(|_| projection.is_some()) {
                         builder.token(kind, text);

@@ -4,7 +4,8 @@ use super::{
     pins::{workspace_of_source_config, Owner},
     read_verified_node_with, retention_plan::{SourceLease, SourceRead},
     rooted_llvm::{ScalarPlanning, RootedLlvmRejection, ScalarOutcome},
-    source_reconciliation::{bounded_source_records, checked_source_header_using}, storage_worker::QueryWorker,
+    source_reconciliation::{bounded_source_records, checked_source_config_for_parts, checked_source_header_using},
+    storage_worker::QueryWorker,
     validate_file_using, write_edge, write_node, BaseCstAdmissionLimits, FileTree, Result, RootedLlvmIdentity,
     SourceStore, NODES, SNAPSHOT_ROOTS,
 };
@@ -13,7 +14,7 @@ use std::{collections::{BTreeMap, HashMap}, future::{poll_fn, Future}, io::{self
 use surrealkv::{Durability, Mode, Transaction};
 use wosy_compiler::{Diagnostic, COMPILER_IDENTITY};
 use wosy_project::PackageRelativePath;
-use wosy_protocol::{source_preparation_parts, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{retained_source_preparation_metadata, CstKindEncoding, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig};
 use wosy_syntax::{ByteSpan, CstNode, SourceIdentity};
 
 const FORMAT: u16 = 1;
@@ -37,6 +38,21 @@ pub struct SavedBuildDiagnostic {
 #[derive(Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SavedBuildPhase { Declarations, Preparation, Analysis }
+
+/// Exact archived diagnostic and its verified authored label sources.
+/// The selected live lease only authorizes this workspace's named archive.
+pub struct SavedBuildDiagnosticView {
+    report: SavedBuildDiagnostic,
+    authored: HashMap<SourceIdentity, String>,
+}
+
+impl SavedBuildDiagnosticView {
+    pub fn report(&self) -> &SavedBuildDiagnostic { &self.report }
+    pub fn into_report(self) -> SavedBuildDiagnostic { self.report }
+    pub fn authored_text(&self, source: &SourceIdentity) -> Option<&str> {
+        self.authored.get(source).map(String::as_str)
+    }
+}
 
 struct ReportBytes {
     bytes: Vec<u8>,
@@ -201,7 +217,8 @@ async fn commit_save(
 
 pub(super) fn read(
     store: &SourceStore, lease: &SourceLease, name: &str, limits: BaseCstAdmissionLimits, max_bytes: usize,
-) -> Result<Option<SavedBuildDiagnostic>> {
+    include_authored: bool,
+) -> Result<Option<SavedBuildDiagnosticView>> {
     let grant = lease.grant();
     let (tx, _read) = store.begin_leased_source(grant, Mode::ReadOnly)?.ok_or(BuildRequestRejection::Expired)?;
     let mut record_bytes = bounded_source_records(&tx, limits);
@@ -211,28 +228,37 @@ pub(super) fn read(
     let pin = owner.stored(&value)?;
     let Some(record) = pin.saved_diagnostic() else { return Ok(None); };
     let root = pin.retained_root().ok_or("saved diagnostic lost its authored source")?;
-    let (tree, config) = if root == grant.root {
-        (selected_tree, selected_config)
+    let archive_tree = if root == grant.root {
+        None
     } else {
         let marker = tx.get(&key(SNAPSHOT_ROOTS, root))?.ok_or("saved diagnostic lost its published source")?;
         super::check_source_marker(root, &marker)?;
-        let (tree, config) = checked_source_header_using(root, &mut record_bytes)?;
+        Some(record_bytes(root)?)
+    };
+    let parts = retained_source_preparation_metadata(archive_tree.as_ref().unwrap_or(&selected_tree))
+        .ok_or("unsupported saved diagnostic source schema")?;
+    let config = if archive_tree.is_some() {
+        let config = checked_source_config_for_parts(&parts, record_bytes(parts.config)?)?;
         if workspace_of_source_config(&config)? != workspace_of_source_config(&selected_config)? {
             return Err("saved diagnostic source belongs to another workspace".into());
         }
-        (tree, config)
-    };
+        config
+    } else { selected_config };
     let (report, _) = read_record(&tx, record, root, max_bytes, |_| Ok(()))?;
     if !config.profiles.contains_key(&report.profile) { return Err("saved diagnostic profile is outside its source".into()); }
-    let files = source_preparation_parts(&tree).expect("checked header").files;
-    let sources = load_label_sources(&tx, &mut record_bytes, files, &config, &report.diagnostics, limits)?;
+    let sources = load_label_sources(&tx, &mut record_bytes, parts.files, &config, parts.kind_encoding(),
+        &report.diagnostics, limits)?;
     check_labels(&report.diagnostics, &sources)?;
-    lease.finish_current(|| report).ok_or_else(|| BuildRequestRejection::Expired.into()).map(Some)
+    let authored = if include_authored {
+        sources.into_iter().map(|(source, tree)| (source, tree.text().to_string())).collect()
+    } else { HashMap::new() };
+    lease.finish_current(|| SavedBuildDiagnosticView { report, authored })
+        .ok_or_else(|| BuildRequestRejection::Expired.into()).map(Some)
 }
 
 fn load_label_sources(
     tx: &Transaction, mut read: impl FnMut(NodeId) -> Result<Node>, files: &[NodeId],
-    config: &SourceConfig, diagnostics: &[Diagnostic], limits: BaseCstAdmissionLimits,
+    config: &SourceConfig, encoding: CstKindEncoding, diagnostics: &[Diagnostic], limits: BaseCstAdmissionLimits,
 ) -> Result<HashMap<SourceIdentity, CstNode>> {
     let mut requested = BTreeMap::new();
     for source in diagnostics.iter().flat_map(|diagnostic| diagnostic.labels.iter().map(|label| &label.span.source)) {
@@ -255,7 +281,7 @@ fn load_label_sources(
             return Err("saved diagnostic label does not match the authored source".into());
         }
         if sources.contains_key(source) { return Err("duplicate source in saved diagnostic index".into()); }
-        let checked = validate_file_using(&file, &config.parser.categories, FileTree::Authored, Some(&mut work),
+        let checked = validate_file_using(&file, &config.parser.categories, FileTree::Authored, encoding, Some(&mut work),
             |id, work| read_verified_node_with(tx, id, |bytes| work.expect("bounded archive CST").read(bytes)))?;
         sources.insert(source.clone(), checked.authored.expect("authored tree was requested"));
     }
@@ -309,7 +335,7 @@ fn decode(node: &Node, root: NodeId) -> Result<SavedBuildDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wosy_protocol::BuildSourceSelection;
+    use wosy_protocol::{source_preparation_parts, BuildSourceSelection};
 
     #[test]
     fn archive_labels_observe_inclusive_utf8_boundaries() {
@@ -391,7 +417,7 @@ mod tests {
             let pending = plan_save(&store, &lease, "concurrent", &archive).unwrap();
             store.pin_source(root, "concurrent").await.unwrap();
             assert!(!commit_save(pending, &lease, || Ok(())).await.unwrap());
-            assert!(read(&store, &lease, "concurrent", limits, MAX_REPORT_BYTES).unwrap().is_none());
+            assert!(read(&store, &lease, "concurrent", limits, MAX_REPORT_BYTES, false).unwrap().is_none());
             assert!(plan_save(&store, &lease, "concurrent", &archive).is_err());
             assert!(store.tree.begin_with_mode(Mode::ReadOnly).unwrap().get(&key(NODES, archive.id)).unwrap().is_none());
             assert_eq!(store.source_pins(root).unwrap()[0].name, "concurrent");
@@ -409,9 +435,12 @@ mod tests {
                 (no_config, "record budget"), (no_config_bytes, "byte budget"),
                 (no_file_records, "record budget"), (no_expansion, "authored byte budget"),
             ] {
-                assert!(read(&store, &lease, "normal", bound, MAX_REPORT_BYTES).unwrap_err().to_string().contains(reason));
+                let refusal = read(&store, &lease, "normal", bound, MAX_REPORT_BYTES, false)
+                    .err().expect("bounded archived source must be refused");
+                assert!(refusal.to_string().contains(reason));
             }
-            assert_eq!(read(&store, &lease, "normal", limits, MAX_REPORT_BYTES).unwrap().as_ref(), Some(&archive.report));
+            assert_eq!(read(&store, &lease, "normal", limits, MAX_REPORT_BYTES, false)
+                .unwrap().map(SavedBuildDiagnosticView::into_report), Some(archive.report));
             drop(lease);
             store.close().await.unwrap();
         });
