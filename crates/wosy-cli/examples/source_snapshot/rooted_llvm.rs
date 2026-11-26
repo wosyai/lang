@@ -65,7 +65,7 @@ pub(super) async fn run(
     Ok(serde_json::json!({ "answer": answer, "projection_ms": elapsed, "grammar_ms": grammar_ms }))
 }
 
-fn ordinary_worker(store: &Arc<SourceStore>) -> Result<SourceStorageWorker> {
+pub(super) fn ordinary_worker(store: &Arc<SourceStore>) -> Result<SourceStorageWorker> {
     let bound = |n| NonZeroUsize::new(n).unwrap();
     SourceStorageWorker::new(
         Arc::clone(store), tokio::runtime::Handle::current(), bound(1), bound(2), bound(20_000),

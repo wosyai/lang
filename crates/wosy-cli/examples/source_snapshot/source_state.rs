@@ -50,6 +50,12 @@ pub(super) async fn run(
         }
         "leased-llvm-grammar-memo" => super::rooted_llvm::run_memo(&mut client, dir, &target).await?,
         "leased-llvm-grammar-policy" => super::rooted_llvm::run_policy(&mut client, project, dir, &target).await?,
+        "leased-installed-git-llvm" => {
+            let package = args.next().ok_or("expected installed fixture package")?;
+            let profile = args.next().ok_or("expected installed fixture profile")?;
+            let control = args.next().unwrap_or_default();
+            super::installed_git_lease::run(&mut client, project, dir, &target, &package, &profile, &control).await?
+        }
         "current-entry-cst" | "current-entry-cst-restage" => {
             let encoding: usize = args.next().ok_or("expected fixture JSON byte limit")?.parse()?;
             let expanded: usize = args.next().ok_or("expected fixture record byte limit")?.parse()?;

@@ -15,7 +15,25 @@ compiler, example, *older = [Path(arg).resolve() for arg in sys.argv[1:]]
 here = Path(__file__).parent
 template = (here / "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
 manifest = template.replace('[dependencies.std]\npath = "stdlib"\n\n', '')
-manifest = manifest.replace("categories = []", 'categories = ["WHY"]')
+manifest = manifest.replace("categories = []", 'categories = ["WHY"]') + """
+[builders.llvm-native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.native"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[targets.app.artifacts.main.profiles.native]
+backend = "llvm"
+output = "native"
+builder = "llvm-native"
+run_runner = "native"
+
+[targets.app.profiles.native]
+main_artifact = "main"
+"""
 
 
 def capture(*args, cwd=None):
@@ -133,7 +151,7 @@ with tempfile.TemporaryDirectory() as directory:
         if refusal:
             assert child.returncode and refusal in child.stderr, child.stderr
             return
-        child.check_returncode()
+        assert child.returncode == 0, child.stderr
         return json.loads(child.stdout)
 
     def source_db_evidence(project):
@@ -271,6 +289,72 @@ with tempfile.TemporaryDirectory() as directory:
     assert workspace_evidence(app) == overlay_workspace
     assert workspace_evidence(peer) == peer_workspace
 
+    # The authorized installed ref is the old exact package pin, not the
+    # current upstream HEAD. Advance only this owned file:// fixture.
+    (package / "src/constants.w").write_text("%%start\nu32 value = 18;\n%%end\n")
+    capture("git", "add", "--all", cwd=origin)
+    capture("git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--quiet", "--no-verify", "--no-gpg-sign", "-m", "new unselected revision", cwd=origin)
+    assert capture("git", "rev-parse", "HEAD", cwd=origin).strip() != revision
+
+    app_stage = pending(app, "state")
+    assert app_stage["pending"] == patched
+    assert pending(app, "submit-pending", "app", "src/main.w")["selected"] == patched
+    peer_stage = pending(peer, "stage")
+    assert peer_stage["pending"] == peer_root
+    assert pending(peer, "submit-pending", "app", "src/main.w")["selected"] == peer_root
+    stale = pending(peer, "leased-installed-git-llvm", "remote_lib", "dev", "stale")["result"]
+    assert stale["kind"] == "stale-unopened" and stale["root"] == peer_root
+    assert stale["to_generation"] > stale["from_generation"]
+    untouched = workspace_evidence(peer)
+    sqlite_before = source_db_evidence(peer)
+    native, wasi = {}, {}
+    for profile, result in (("dev", wasi), ("native", native)):
+        mode = "reject-incomplete" if profile == "dev" else ""
+        result.update(pending(peer, "leased-installed-git-llvm", "remote_lib", profile, mode)["result"])
+        assert (result["kind"], result["root"], result["revision"], result["tree"], result["witnessed_files"]) == (
+            "partition", peer_root, revision, tree, 2)
+        patched_refusal = pending(app, "leased-installed-git-llvm", "remote_lib", profile)["result"]
+        assert patched_refusal == {"kind": "not-pristine-or-not-current"}
+    pending(peer, "leased-installed-git-llvm", "remote_lib", "dev", "records", refusal="index exceeds the record budget")
+    pending(peer, "leased-installed-git-llvm", "remote_lib", "dev", "bytes", refusal="index exceeds the byte budget")
+    assert workspace_evidence(peer) == untouched and source_db_evidence(peer) == sqlite_before
+    assert not (peer / ".wosy/artifacts").exists()
+
+    # Only the ordinary Build oracle needs its normal compiler executables;
+    # any Git invocation in that path is also refused.
+    no_git = work / "no-git"
+    no_git.mkdir()
+    sentinel = no_git / "attempted"
+    (no_git / "git").write_text(f"#!/bin/sh\n: > {shlex.quote(str(sentinel))}\nexit 1\n")
+    (no_git / "git").chmod(0o755)
+    build_env = {**env, "PATH": f"{no_git}:{os.environ['PATH']}"}
+    wasm_scripts = here / "fixtures/build/shared_stdlib_local_dependency/project/scripts"
+    native_scripts = here / "fixtures/build/short_circuit_project/project/scripts"
+    for consumer_root in (app, peer):
+        scripts = consumer_root / "scripts"
+        scripts.mkdir()
+        for directory, names in ((wasm_scripts, ("build-wasm", "start.ll", "run-wasmtime")),
+                                 (native_scripts, ("build-native", "run-native"))):
+            for name in names:
+                shutil.copyfile(directory / name, scripts / name)
+    for profile, result in (("dev", wasi), ("native", native)):
+        for consumer_root in (peer, app):
+            child = subprocess.run([compiler, "build", "app", "--profile", profile], cwd=consumer_root,
+                                   env=build_env, capture_output=True, timeout=30)
+            assert child.returncode == 0, child.stderr
+            artifact = consumer_root / ".wosy/artifacts/app" / profile / "main"
+            assert (artifact / "main").read_bytes().startswith(b"\0asm" if profile == "dev" else b"\x7fELF")
+            oracle = json.loads((artifact / "artifact-manifest.json").read_bytes())
+            if consumer_root == app:
+                scoped = pending(app, "leased-ordinary-llvm", profile, 2 << 20)["result"]["answer"]
+                assert scoped["kind"] == "llvm" and scoped["root"] == patched
+            else:
+                scoped = result
+            assert (artifact / "partition.ll").read_bytes() == scoped["llvm"].encode()
+            assert oracle["identity"]["llvm_input_identity"] == scoped["digest"]
+    assert not sentinel.exists()
+
     print("shared store, one Git pin, two patch stacks, A→B→A, authored history, read-only consumers", {
         "cold_wall_ms": round(cold_wall, 3), "warm_wall_ms": round(warm_wall, 3),
         "one_edited_file_wall_ms": round(dirty_wall, 3), "new_stack_same_sources_ms": round(patch_wall, 3),
@@ -282,4 +366,7 @@ with tempfile.TemporaryDirectory() as directory:
         "older_release_reader": bool(older),
         "staged_git_base_projection_ms": round(projected["result"]["project_ms"], 3),
         "sizes_A_B_A_historical": [8, 4, 8, 4],
+        "selected_old_ref_native_wasi_llvm": True, "patched_ordinary_without_pristine_lease": True,
+        "installed_scope_open_ms": [round(wasi["scope_open_ms"], 3), round(native["scope_open_ms"], 3)],
+        "stale_generation_never_opened": True, "git_not_invoked_on_either_read_route": True,
     }, flush=True)

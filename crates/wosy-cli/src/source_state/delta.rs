@@ -1,6 +1,6 @@
 //! The read side of the exact selected/predecessor SQLite generation boundary.
 use super::{
-    load_usage, read_selection, ClientSourceLimits, Closure, Files, Result, SourceAttempt,
+    load_usage, read_selection, AcknowledgedSourceGeneration, ClientSourceLimits, Closure, Files, Result, SourceAttempt,
     SqliteSourceState, StoredNodes,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
@@ -147,22 +147,7 @@ impl SqliteSourceState {
             tx.commit()?;
             (selection, config, files)
         };
-        let Some(namespace) = config.namespaces.get(package) else { return Ok(None) };
-        let Some(git) = &namespace.git else { return Ok(None) };
-        let files: BTreeMap<_, _> = files.into_iter().filter_map(|(key, file)| {
-            (key.package == package).then_some((key.path, ProjectedGitBaseFile {
-                revision: file.metadata.revision, authored: file.authored, executable: file.executable,
-            }))
-        }).collect();
-        if files.is_empty() { return Ok(None) }
-        let Some(installed) = match_installed_git_base_files(&self.project, package,
-            files.iter().map(|(path, file)| (path, &file.revision.0)),
-        )? else { return Ok(None) };
-        if installed.locked() != &git.locked || installed.patches() != git.patches
-            || installed.checkout_path() != Path::new(&namespace.project)
-        {
-            return Err("staged Git base selection no longer matches the installed package".into());
-        }
+        let Some((installed, files)) = matching_git_base(&self.project, package, &config, files)? else { return Ok(None) };
         if read_selection(&self.db, target)? != selection {
             return Err("Git base projection source attempt advanced during observation".into());
         }
@@ -198,6 +183,60 @@ impl SqliteSourceState {
         let attempt = SourceAttempt::new(captured.proposed, captured.attempt);
         Ok((state.selected == Some(captured.selected.root) && state.pending == Some(attempt)).then_some(projection))
     }
+}
+
+impl AcknowledgedSourceGeneration {
+    /// Offer an exact observed installed base only for the reachable package
+    /// files of this acknowledged revision. The local adapter still opens
+    /// and checks the daemon lease. No Git program or live compiler source
+    /// is consulted; the anchored installation observation reads files.
+    pub async fn open_installed_git_session<T, Open, Opening>(
+        &self, local: &mut SqliteSourceState, package: &str, open: Open,
+    ) -> Result<Option<T>>
+    where
+        Open: FnOnce(BuildSourceSelection, InstalledGitBase) -> Opening,
+        Opening: Future<Output = Result<T>>,
+    {
+        let selected = self.selection();
+        if local.project.to_str() != Some(selected.project.as_str()) { return Ok(None); }
+        let (config, files) = {
+            let tx = local.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            if !self.matches(read_selection(&tx, &selected.target)?) { return Ok(None); }
+            let (_, config, files) = trace_and_index(
+                &tx, &local.project, &selected.target, selected.root, local.limits, |_, _| (),
+            )?;
+            tx.commit()?;
+            (config, files)
+        };
+        let Some((installation, _)) = matching_git_base(&local.project, package, &config, files)? else { return Ok(None) };
+        if !self.is_current(local)? { return Ok(None); }
+        let opened = open(selected.clone(), installation).await;
+        // Never return a live session for a capture that advanced while
+        // opening. This is a freshness cut, not a lease over SQLite.
+        if self.is_current(local)? { opened.map(Some) } else { Ok(None) }
+    }
+}
+
+fn matching_git_base(
+    project: &Path, package: &str, config: &SourceConfig, files: Files,
+) -> Result<Option<(InstalledGitBase, BTreeMap<PackageRelativePath, ProjectedGitBaseFile>)>> {
+    let Some(namespace) = config.namespaces.get(package) else { return Ok(None) };
+    let Some(git) = &namespace.git else { return Ok(None) };
+    let files: BTreeMap<_, _> = files.into_iter().filter_map(|(key, file)| {
+        (key.package == package).then_some((key.path, ProjectedGitBaseFile {
+            revision: file.metadata.revision, authored: file.authored, executable: file.executable,
+        }))
+    }).collect();
+    if files.is_empty() { return Ok(None); }
+    let Some(installed) = match_installed_git_base_files(project, package,
+        files.iter().map(|(path, file)| (path, &file.revision.0)),
+    )? else { return Ok(None) };
+    if installed.locked() != &git.locked || installed.patches() != git.patches
+        || installed.checkout_path() != Path::new(&namespace.project)
+    {
+        return Err("staged Git base selection no longer matches the installed package".into());
+    }
+    Ok(Some((installed, files)))
 }
 
 fn trace_and_index(

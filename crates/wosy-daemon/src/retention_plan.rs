@@ -2,7 +2,7 @@
 use super::{
     authority_key, base_declarations, build_receipt, build_session::BuildRequestRejection, check_source_marker,
     edge, key, pins, project_declarations, published_source, read_node,
-    source_reconciliation::checked_published_source_header,
+    source_reconciliation::checked_published_source_header_with_top,
     source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
@@ -11,7 +11,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use surrealkv::{LSMIterator, Mode, Transaction};
-use wosy_protocol::{BuildSourceSelection, FileKey, Kind, NodeId};
+use wosy_protocol::{BuildSourceSelection, FileKey, Kind, Node, NodeId, SourceConfig};
 
 const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
@@ -347,19 +347,27 @@ impl SourceStore {
     pub(super) fn lease_build_source_before(
         &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
     ) -> Result<Option<SourceLease>> {
+        self.lease_build_source_inspect(selection, lifetime, start_deadline, |_, _, _| Ok(()))
+    }
+
+    pub(super) fn lease_build_source_inspect(
+        &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
+        inspect: impl FnOnce(&Transaction, &Node, &SourceConfig) -> Result<()>,
+    ) -> Result<Option<SourceLease>> {
         if lifetime.is_zero() { return Err("a Build diagnostic lease must have a positive lifetime".into()); }
         if start_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(BuildRequestRejection::Expired.into());
         }
         let root = selection.root;
         let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
-        let config = checked_published_source_header(&tx, root)?;
+        let (top, config) = checked_published_source_header_with_top(&tx, root)?;
         let owner = config.namespaces.get(&config.entry.package)
             .ok_or("Build diagnostic scope is missing its entry namespace")?;
         if owner.git.is_some() || owner.project != selection.project {
             return Err("Build diagnostic selection has a different workspace".into());
         }
         if config.target != selection.target { return Err("Build diagnostic selection has a different target".into()); }
+        inspect(&tx, &top, &config)?;
         drop(tx);
         let lease = {
             let mut reads = self.source_reads.0.lock().expect("source reader registry");

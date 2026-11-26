@@ -7,6 +7,7 @@ use super::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wosy_compiler::Diagnostic;
+use wosy_project::packages::InstalledGitBase;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
     BuildSourceSelection, Delta, NodeId, BUILD_DIAGNOSTIC_VERSION,
@@ -37,6 +38,25 @@ impl SourceStorageWorker {
         &self, selected: BuildSourceSelection, lifetime: Duration,
     ) -> Result<Option<BuildDiagnosticSession<'_>>> {
         self.open_build_diagnostics_before(selected, lifetime, None).await
+    }
+
+    /// Accept the normal selected-source lease only after verifying the
+    /// witnessed subset of one direct installed Git base. This is a local
+    /// adapter operation, not a wire action or whole-workspace claim.
+    pub async fn open_installed_git_build_scope(
+        &self, selected: BuildSourceSelection, base: InstalledGitBase, limits: BaseCstAdmissionLimits,
+        lifetime: Duration,
+    ) -> Result<Option<BuildDiagnosticSession<'_>>> {
+        let slot = self.try_slot()?;
+        let lease = self.spawn_reserved(slot, move |store| {
+            if base.project().to_str() != Some(selected.project.as_str()) {
+                return Err(super::InstalledGitScopeRejection::Ownership.into());
+            }
+            store.lease_build_source_inspect(selected, lifetime, None, |tx, top, config| {
+                super::installed_git_scope::verify(tx, top, config, &base, limits)
+            })
+        }).await??;
+        Ok(lease.map(|lease| BuildDiagnosticSession { worker: self, lease: Arc::new(lease) }))
     }
 
     pub(super) async fn open_build_diagnostics_before(

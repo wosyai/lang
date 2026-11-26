@@ -40,6 +40,8 @@ mod framed_projection;
 mod leased_build;
 #[path = "source_snapshot/rooted_llvm.rs"]
 mod rooted_llvm;
+#[path = "source_snapshot/installed_git_lease.rs"]
+mod installed_git_lease;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

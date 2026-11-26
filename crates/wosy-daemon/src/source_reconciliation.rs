@@ -89,6 +89,10 @@ fn reconciliation_plan(
 }
 
 pub(super) fn checked_published_source_header(tx: &Transaction, root: NodeId) -> Result<SourceConfig> {
+    Ok(checked_published_source_header_with_top(tx, root)?.1)
+}
+
+pub(super) fn checked_published_source_header_with_top(tx: &Transaction, root: NodeId) -> Result<(Node, SourceConfig)> {
     let source = checked_header_node(tx, root)?;
     let parts = source_preparation_parts(&source).ok_or("unsupported acknowledged source schema")?;
     let config = checked_header_node(tx, parts.config)?;
@@ -97,7 +101,7 @@ pub(super) fn checked_published_source_header(tx: &Transaction, root: NodeId) ->
     if source.data != config.schema() || config.parser.schema.0 != *wosy_syntax::base_cst_schema() {
         return Err("invalid acknowledged source configuration schema".into());
     }
-    Ok(config)
+    Ok((source, config))
 }
 
 fn checked_header_node(tx: &Transaction, id: NodeId) -> Result<Node> {

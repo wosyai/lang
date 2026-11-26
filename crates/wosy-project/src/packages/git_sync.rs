@@ -898,21 +898,29 @@ pub(super) fn verify_installed(
 pub struct InstalledGitBase {
     locked: LockedInputId,
     patches: PatchStackId,
+    project: PathBuf,
+    package: String,
     checkout: PathBuf,
     revision: GitOid,
     package_path: String,
     tree: GitTreeOid,
     source_hash: String,
+    visited: BTreeMap<PackageRelativePath, [u8; 32]>,
 }
 
 impl InstalledGitBase {
     pub fn locked(&self) -> &LockedInputId { &self.locked }
     pub fn patches(&self) -> PatchStackId { self.patches }
+    pub fn project(&self) -> &Path { &self.project }
+    pub fn package(&self) -> &str { &self.package }
     pub fn checkout_path(&self) -> &Path { &self.checkout }
     pub fn revision(&self) -> &str { self.revision.as_str() }
     pub fn package_path(&self) -> &str { &self.package_path }
     pub fn tree(&self) -> &str { self.tree.as_str() }
     pub fn source_hash(&self) -> &str { &self.source_hash }
+    /// Only the caller-selected file revisions actually compared with the
+    /// anchored install. A metadata observation alone has no visited files.
+    pub fn visited_files(&self) -> &BTreeMap<PackageRelativePath, [u8; 32]> { &self.visited }
 }
 
 /// Verify a direct installed package against its original Git source. No Git
@@ -957,14 +965,17 @@ pub fn match_installed_git_base_files<'a>(
     if actual.working != baseline || actual.original_v1 != pin.source_hash {
         return Err(dirty_checkout(&git, name));
     }
-    for (path, revision) in expected {
-        let path = path.as_path().to_str().ok_or("staged Git source path is not UTF-8")?;
+    let mut visited = BTreeMap::new();
+    for (file, revision) in expected {
+        let path = file.as_path().to_str().ok_or("staged Git source path is not UTF-8")?;
         if files.get(path).is_none_or(|(actual, _)| actual.as_bytes() != revision) {
             return Err("staged source revision does not match the installed Git base".to_owned());
         }
+        visited.insert(file.clone(), *revision);
     }
     Ok(Some(InstalledGitBase {
-        locked: pin.input_identity(), patches, checkout: git.root.join(DEPS).join(name),
+        locked: pin.input_identity(), patches, project: git.root.clone(), package: name.to_owned(),
+        checkout: git.root.join(DEPS).join(name), visited,
         revision: pin.revision.clone(), package_path: pin.source.package_path.clone(),
         tree, source_hash: pin.source_hash.clone(),
     }))
