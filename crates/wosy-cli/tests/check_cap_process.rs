@@ -875,7 +875,9 @@ fn check_cap_process_initializes_exact_passive_part_and_nested_literals() {
     let authored = require("reachable", 13, "selected.txt");
     for layout in ["native", "wasm-wasip1"] {
         let project = Fixture::new();
-        let bindings = format!("Part empty={literal}; Part[1][1] nested=[[{literal}]];");
+        let row = vec!["empty"; 16].join(",");
+        let parts = vec!["row"; 16].join(",");
+        let bindings = format!("Part empty={literal}; Part[16] row=[{row}]; Part[16][16] parts=[{parts}]; Part[1][1] nested=[[{literal}]];");
         project.package("", layout, "dev", "", &format!("%%start {declaration} {bindings} {authored} %%end"));
         for scope in ["--main-flow-only", "--declared-package"] {
             for mode in [&[][..], &["--all-errors"][..]] {
@@ -888,7 +890,9 @@ fn check_cap_process_initializes_exact_passive_part_and_nested_literals() {
         }
         let source = project.0.join("src/main.w");
         for change in [
-            format!("Part empty={literal}; Part[1] row=[empty];"),
+            format!("Part empty={literal}; Part replica=empty;"),
+            format!("Part empty={literal}; i32 barrier=0; Part[1] row=[empty];"),
+            format!("Part empty={literal}; core.require(true, {{ .stdout = \"\"; .stderr = \"\"; .code = 0; .files = []; }}); Part[1] row=[empty];"),
             format!("Part empty={literal}; f32 sample=empty.x;"),
             format!("Part empty={};", literal.replace(".taper=1.0;", ".taper=0.75+0.25;")),
         ] {

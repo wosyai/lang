@@ -1663,8 +1663,16 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
     let structure = &topology.structure;
     let mut checked_items = structure.blocks[structure.root.0].items.iter();
     let mut storage = HashMap::new();
-    for step in &region.steps {
+    // A copy is only valid in the same contiguous passive initializer
+    // segment. Never defer analysis of possibly effectful intervening items.
+    #[cfg(feature = "internal-checker")]
+    let mut passive_generation = 0usize;
+    for (generation, step) in region.steps.iter().enumerate() {
+        #[cfg(not(feature = "internal-checker"))]
+        let _ = generation;
         if let ModuleInitializationStepKind::NamespaceDispatch { target, binding_span, .. } = &step.kind {
+            #[cfg(feature = "internal-checker")]
+            { passive_generation = generation + 1; }
             let NamespaceTarget::Bound(target) = target else {
                 return Err(ProjectCheck::Unsupported);
             };
@@ -1695,6 +1703,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 && matches!(checked.receivers(), [receiver]
                     if receiver.contextual_storage.is_none()
                         && passive_startup_initializer(&receiver.ty, &binding.value));
+            #[cfg(feature = "internal-checker")]
+            if !passive_literal { passive_generation = generation + 1; }
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures) && !passive_literal
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
@@ -1747,9 +1757,15 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 #[cfg(feature = "internal-checker")]
                 (ty, expression) if passive_literal => {
                     let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
-                    InitializerValue::PassiveAggregate(PassiveLiteralPreparation {
+                    let mut preparation = PassiveLiteralPreparation {
                         topology, project, ordinals, work: &mut effects.passive_literal_work,
-                    }.node(outputs.primary, ty, expression, 0).ok_or(ProjectCheck::Unsupported)?)
+                        copies: Some((&storage, passive_generation)), maximum_depth: 0,
+                    };
+                    let value = preparation.node(outputs.primary, ty, expression, 0).ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::PassiveAggregate {
+                        ty, generation: passive_generation, depth: preparation.maximum_depth,
+                        value: std::rc::Rc::new(value),
+                    }
                 }
                 #[cfg(feature = "internal-checker")]
                 (ScalarType::Char, ScalarExpression::Char { value, .. })
@@ -1858,6 +1874,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             (&step.kind, &checked_item.kind) else {
                 return Err(ProjectCheck::Unsupported);
             };
+        #[cfg(feature = "internal-checker")]
+        { passive_generation = generation + 1; }
         if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(topology, actual, source, &storage, *expression, 0, failures, visits)? == StartupLane::Empty {
             return Ok(StartupLane::Empty);
         }
@@ -2348,10 +2366,14 @@ enum InitializerValue<'a> {
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
     #[cfg(feature = "internal-checker")]
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
-    // An exact typed value, not a license to read, copy, mutate or escape.
+    // An exact typed value, not a license to access runtime storage.
     #[cfg(feature = "internal-checker")]
-    #[allow(dead_code)]
-    PassiveAggregate(PassiveLiteral<'a>),
+    PassiveAggregate {
+        ty: &'a ScalarType,
+        generation: usize,
+        depth: usize,
+        value: std::rc::Rc<PassiveLiteral<'a>>,
+    },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2374,6 +2396,8 @@ enum PassiveLiteral<'a> {
     Float(ranked_float::Atom),
     Array(Box<[Self]>),
     Nominal(&'a super::ScalarStructId, Box<[Self]>),
+    // Share immutable semantic data, not Wosy locations or runtime storage.
+    Copy(std::rc::Rc<Self>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2382,6 +2406,8 @@ struct PassiveLiteralPreparation<'a, 'w> {
     project: &'a ScalarProject,
     ordinals: &'w HashMap<&'a SourceIdentity, usize>,
     work: &'w mut usize,
+    copies: Option<(&'w HashMap<ByteSpan, InitializerValue<'a>>, usize)>,
+    maximum_depth: usize,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2397,6 +2423,23 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
         }
         charge_call_work(self.work, 1)?;
         let typed = self.topology.structure.checked_types.expressions.get(&at)?;
+        self.maximum_depth = self.maximum_depth.max(depth);
+        if depth != 0 && matches!(expression, ScalarExpression::Name { .. })
+            && matches!(ty, ScalarType::Array { .. } | ScalarType::Struct(_))
+        {
+            let (storage, current_generation) = self.copies?;
+            let InitializationName::Storage(InitializationStorage::Module(span)) =
+                self.topology.identities.names.get(&at)? else { return None; };
+            let InitializerValue::PassiveAggregate { ty: original, generation, value, depth: source_depth } =
+                storage.get(span)? else { return None; };
+            let expanded_depth = depth.checked_add(*source_depth)?;
+            if *generation != current_generation || expanded_depth > MAX_DEPTH
+                || !passive_type_equal(ty, original, MAX_DEPTH - depth)
+                || !passive_type_equal(ty, typed, MAX_DEPTH - depth)
+            { return None; }
+            self.maximum_depth = self.maximum_depth.max(expanded_depth);
+            return Some(PassiveLiteral::Copy(std::rc::Rc::clone(value)));
+        }
         let child = |edge| {
             let OccurrenceNode::Expression(at) = *self.topology.structure.edges.get(&(
                 OccurrenceParent::Expression(at), edge,
@@ -18229,17 +18272,17 @@ mod tests {
             let BlockItemKind::Binding(checked) = &item.kind else { panic!("binding") };
             let BindingInitialization::Outputs(outputs) = &checked.initialization else { panic!("bound output") };
             let [slot] = checked.receivers() else { panic!("one slot") };
-            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work }
+            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
                 .node(outputs.primary, &slot.ty, &binding.value, 17).is_none());
             let ScalarType::Array { element, length_span, span, .. } = &slot.ty else { panic!("array receiver") };
             let wrong_extent = ScalarType::Array {
                 element: element.clone(), length: 1, length_span: *length_span, span: *span,
             };
             let mut refused_work = 0;
-            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut refused_work }
+            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut refused_work, copies: None, maximum_depth: 0 }
                 .node(outputs.primary, &wrong_extent, &binding.value, 0).is_none());
             let PassiveLiteral::Array(cells) = (PassiveLiteralPreparation {
-                topology, project, ordinals: &ordinals, work: &mut work,
+                topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0,
             }).node(outputs.primary, &slot.ty, &binding.value, 0).unwrap() else { panic!("array") };
             values.push(cells);
         }
@@ -18273,7 +18316,7 @@ mod tests {
         let [slot] = checked.receivers() else { panic!("one slot") };
         let ordinals = HashMap::from([(&owner.source, 0)]);
         let mut work = 0;
-        let prepared = PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work }
+        let prepared = PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0).unwrap();
         let id = &owner.structs[0].id;
         assert_eq!(prepared, Array(Box::new([Array(Box::new([
@@ -18282,8 +18325,54 @@ mod tests {
         ]))])));
         assert_eq!(work, 8);
         let mut exhausted = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK - 1;
-        assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted }
+        assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn prepared_passive_copies_share_only_exact_earlier_semantic_values() {
+        let file = source("src/main.w", "typed-passive-nominal-copy-dag");
+        let text = "%%start struct copy Part { f32 x; } Part empty={.x=-0.0;}; Part[2] row=[empty,empty]; Part[2][1] parts=[row]; %%end";
+        let prepared = prepare_checker_project(
+            vec![(declarations(&file, text), Vec::new())], vec![file.clone()], inputs(),
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let owner = &project.modules[0];
+        let region = calls.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { panic!("typed initialization") };
+        let ordinals = HashMap::from([(&owner.source, 0)]);
+        let mut work = 0;
+        let mut storage = HashMap::new();
+        let mut values = Vec::new();
+        for step in &region.steps {
+            let ScalarItem::Binding(binding) = &owner.items[step.item] else { continue; };
+            let item = topology.structure.blocks[topology.structure.root.0].items.iter()
+                .find(|item| item.position == step.item).unwrap();
+            let BlockItemKind::Binding(checked) = &item.kind else { panic!("binding") };
+            let BindingInitialization::Outputs(outputs) = &checked.initialization else { panic!("bound output") };
+            let [slot] = checked.receivers() else { panic!("one slot") };
+            if !values.is_empty() {
+                let mut refused_work = 0;
+                let mut wrong_generation = PassiveLiteralPreparation { topology, project, ordinals: &ordinals,
+                    work: &mut refused_work, copies: Some((&storage, 1)), maximum_depth: 0 };
+                assert!(wrong_generation.node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
+            }
+            let mut preparation = PassiveLiteralPreparation { topology, project, ordinals: &ordinals,
+                work: &mut work, copies: Some((&storage, 0)), maximum_depth: 0 };
+            let value = std::rc::Rc::new(preparation.node(outputs.primary, &slot.ty, &binding.value, 0).unwrap());
+            let depth = preparation.maximum_depth;
+            storage.insert(slot.span, InitializerValue::PassiveAggregate { ty: &slot.ty, generation: 0, value: value.clone(), depth });
+            values.push((value, depth));
+        }
+        let [(empty, 1), (row, 2), (parts, 3)] = values.as_slice() else { panic!("expanded semantic depths") };
+        assert!(matches!(&**empty, PassiveLiteral::Nominal(_, fields)
+            if fields.as_ref() == [PassiveLiteral::Float(ranked_float::Atom::Single((-0.0f32).to_bits()))]));
+        assert!(matches!(&**row, PassiveLiteral::Array(cells) if cells.len() == 2
+            && cells.iter().all(|cell| matches!(cell, PassiveLiteral::Copy(link) if std::rc::Rc::ptr_eq(link, empty)))));
+        assert!(matches!(&**parts, PassiveLiteral::Array(cells)
+            if matches!(cells.as_ref(), [PassiveLiteral::Copy(link)] if std::rc::Rc::ptr_eq(link, row))));
+        assert_eq!(work, 7);
     }
 
     #[cfg(feature = "internal-checker")]
