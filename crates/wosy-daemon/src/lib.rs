@@ -75,7 +75,7 @@ pub use project_declarations::{
 pub use prepared_project::{
     BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
-pub use rooted_llvm::{RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
+pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};

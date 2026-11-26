@@ -2,7 +2,7 @@ use super::{milliseconds, source_reconciliation::admission_limits, Result};
 use std::{num::NonZeroUsize, path::Path, sync::Arc, time::{Duration, Instant}};
 use wosy_cli::source_state::{PendingBasePublication, ReplaySource, SqliteSourceState};
 use wosy_daemon::{
-    BaseCstAdmissionLimits, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported,
+    BaseCstAdmissionLimits, RootedLlvmIdentity, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported,
     SourceStorageWorker, SourceStore,
 };
 use wosy_protocol::BuildSourceSelection;
@@ -29,7 +29,8 @@ pub(super) async fn run(
     let mut limits = admission_limits(source == "authored");
     if source == "index" { limits.records = 1; }
     let start = Instant::now();
-    let projected = session.project_ordinary_llvm(profile, limits, output).await;
+    let identity = if source == "executable" { RootedLlvmIdentity::Executable } else { RootedLlvmIdentity::Authored };
+    let projected = session.project_llvm(profile, limits, output, identity).await;
     let elapsed = milliseconds(start);
     session.release();
     drop(worker);
@@ -38,6 +39,7 @@ pub(super) async fn run(
     let answer = match projected? {
         RootedLlvmProjection::Emitted(ll) => {
             assert_eq!(ll.source_root, selected.root);
+            assert_eq!(ll.identity, identity);
             grammar_ms = Some(ll.grammar_verification.as_secs_f64() * 1000.0);
             serde_json::json!({ "kind": "llvm", "root": ll.source_root.hex(), "profile": ll.profile,
                 "image": ll.compiler_image.hex(), "digest": ll.digest.hex(), "llvm": String::from_utf8(ll.bytes)?,

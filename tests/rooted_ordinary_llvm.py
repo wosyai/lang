@@ -135,6 +135,48 @@ with tempfile.TemporaryDirectory() as temporary:
         assert b"@fixture_answer(" in expected if profile == "dev" else b"@fixture_answer(" not in expected
         return view, result["projection_ms"], result["grammar_ms"]
 
+    def link_executable_projection(profile, view, expected):
+        output = directory / "candidate"
+        output.mkdir(exist_ok=True)
+        source = output / "partition.ll"
+        source.write_text(view["llvm"])
+        ordinary_main = project / ".wosy/artifacts/app" / profile / "main"
+        executable = output / "main"
+        runtime = ordinary_main / "runtime.ll"
+        if profile == "dev":
+            builder = [sys.executable, project / "scripts/build-wasm", source, output,
+                       ordinary_main / "artifact-manifest.json", runtime]
+        else:
+            # The chosen Native fixture function has the ordinary i32(void)
+            # ABI, but no public Native export table. Use its known checked
+            # executable source owner, not textual discovery of an IR symbol.
+            rooted = subprocess.check_output([example, project, catalog, view["root"],
+                                              "app", "src/main.w", "--declarations"], timeout=30)
+            revision = json.loads(rooted)["executable"]
+            assert len(bytes.fromhex(revision)) == 32
+            symbol = "wosy_fn__" + "__".join(part.encode().hex() for part in (
+                "app", "src/main.w", revision, "answer",
+            ))
+            harness = output / "native-answer.c"
+            harness.write_text(f"extern int __real_main(void);\nextern int {symbol}(void);\n"
+                               f"int __wrap_main(void) {{ return __real_main() == 0 ? {symbol}() : 125; }}\n")
+            builder = ["clang", "-x", "ir", source, runtime, "-x", "c", harness,
+                       "-Wl,--wrap=main", "-o", executable]
+        linked = subprocess.run(builder, cwd=project, capture_output=True, timeout=30)
+        assert linked.returncode == 0, linked.stderr
+        assert executable.read_bytes().startswith(b"\x00asm" if profile == "dev" else b"\x7fELF")
+        command = (["wasmtime", "run", "--invoke", "fixture_answer", executable]
+                   if profile == "dev" else [executable])
+        run = subprocess.run(command, capture_output=True, timeout=30)
+        assert run.returncode == (0 if profile == "dev" else expected), (run.returncode, run.stderr)
+        assert run.stdout.strip() == (str(expected).encode() if profile == "dev" else b""), (run.stdout, run.stderr)
+
+    def executable_view(selected, profile):
+        view = projection(profile, control="executable")["answer"]
+        assert view["kind"] == "llvm" and view["root"] == selected and view["profile"] == profile
+        assert view["grammar_verified_files"] == files
+        return view
+
     authored.write_text(entry("proveniência original ☕"))
     a = state("stage")
     assert (a["result"]["parsed"], a["result"]["reused"]) == (files, 0)
@@ -150,6 +192,10 @@ with tempfile.TemporaryDirectory() as temporary:
     projection("dev", budget=1, refusal=b"partition exceeds the output byte budget")
     assert not (project / ".wosy/artifacts").exists()
     before = {profile: require_parity(root_a, profile) for profile in profiles}
+    stable_a = {profile: executable_view(root_a, profile) for profile in profiles}
+    assert all(stable_a[profile]["digest"] != before[profile][0]["digest"] for profile in profiles)
+    for profile, view in stable_a.items():
+        link_executable_projection(profile, view, 42)
 
     leaf.write_text(provider("somente uma anotação mais longa 🚀"))
     b = state("stage")
@@ -168,12 +214,23 @@ with tempfile.TemporaryDirectory() as temporary:
     assert memo["wasi_digest"] == after["dev"][0]["digest"]
     assert memo["native_digest"] == after["native"][0]["digest"]
     assert all(after[profile][0]["digest"] != before[profile][0]["digest"] for profile in profiles)
+    for profile in profiles:
+        stable_b = executable_view(root_b, profile)
+        assert stable_b["digest"] == stable_a[profile]["digest"] and stable_b["llvm"] == stable_a[profile]["llvm"]
+        link_executable_projection(profile, stable_b, 42)
     impact = subprocess.run([example, project, catalog, root_a, "--source-impact", root_b],
                             capture_output=True, check=True, timeout=30)
     effect = json.loads(impact.stdout)
     assert effect["annotation_tree_changed"] and not effect["executable_tree_changed"]
     policy = state("leased-llvm-grammar-policy")["result"]
     assert policy == {"new_policy_reparsed": files, "rollback_did_not_seed": True}
+
+    leaf.write_text(provider("somente uma anotação mais longa 🚀").replace("{ 42 }", "{ 43 }"))
+    root_c = acknowledge(state("stage"))
+    for profile in profiles:
+        stable_c = executable_view(root_c, profile)
+        assert stable_c["digest"] != stable_a[profile]["digest"]
+        link_executable_projection(profile, stable_c, 43)
 
     # An existing ordinary ownership diagnostic must still prevent emission.
     authored.write_text(entry("reject before LLVM", "struct Item { u8 value; }\n"
@@ -182,11 +239,15 @@ with tempfile.TemporaryDirectory() as temporary:
     for profile in profiles:
         refused = projection(profile)["answer"]
         assert refused["kind"] == "analysis-rejected" and refused["diagnostics"] and "llvm" not in refused
+        stable_refusal = projection(profile, control="executable")["answer"]
+        assert stable_refusal == refused
         ordinary_build(profile, refusal=b"build rejected by semantic diagnostics")
         path = project / ".wosy/artifacts/app" / profile / "main/partition.ll"
         assert path.read_bytes() == after[profile][0]["llvm"].encode()
     print(json.dumps({"native_and_wasi_exact": True, "ordinary_wasi_export": True,
                       "annotation_only_changes_current_ordinary_llvm": True,
+                      "annotation_stable_internal_linked_projection": True,
+                      "executable_edit_changes_internal_projection": True,
                       "retained_accepted_source_without_live_entry": True, "errors_emit_no_bytes": True,
                       "projection_ms": {key: [before[key][1], after[key][1]] for key in profiles},
                       "grammar_ms": {key: [before[key][2], after[key][2]] for key in profiles},
