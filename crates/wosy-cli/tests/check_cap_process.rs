@@ -414,7 +414,7 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 let diagnostic = String::from_utf8_lossy(&capped.stderr);
                 let first = diagnostic.find("contextual value at entry: 3; at exit: 2").unwrap();
                 let second = diagnostic.find("contextual value at entry: 2; at exit: 1").unwrap();
-                let scalar = diagnostic.find("call entry: input = 4").unwrap();
+                let scalar = diagnostic.find("call returned 4").unwrap();
                 assert!(first < second && if scalar_first { scalar < first } else { second < scalar });
                 assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first_file);
                 assert!(!project.output().join("second.txt").exists());
@@ -432,7 +432,7 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
                 assert_eq!(only_scalar.status.code(), Some(1), "{only_scalar:?}");
                 assert_eq!(only_scalar.stdout, b"first");
                 let scalar_diagnostic = String::from_utf8_lossy(&only_scalar.stderr);
-                assert!(scalar_diagnostic.contains("call entry: input = 4")
+                assert!(scalar_diagnostic.contains("call returned 4")
                     && !scalar_diagnostic.contains("contextual value at entry:"));
                 project.clear();
 
