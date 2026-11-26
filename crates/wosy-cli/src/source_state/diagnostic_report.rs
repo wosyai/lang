@@ -4,6 +4,7 @@ use super::{
     checked_file_key, load_usage, read_selection, CapturedBuildDiagnostics, DiagnosticExchange,
     RequiredSourceReplay, Result, SourceReplay, SqliteSourceState, StoredNodes,
 };
+use crate::{project_sources::LiveSourceReader, source_preparation::matches_live_source};
 use codespan_reporting::term::termcolor::WriteColor;
 use rusqlite::TransactionBehavior;
 use std::{collections::{BTreeMap, HashMap}, future::{poll_fn, Future}, pin::pin, task::Poll, time::Duration};
@@ -27,6 +28,8 @@ pub enum ProjectDiagnosticExchange {
 pub enum AcknowledgedBuildDiagnostics {
     NotAcknowledged,
     StaleSelection,
+    WorkspaceChanged,
+    ProfileNotSelected,
     ReplayNotAccepted,
     Refused(BuildSessionRefusal),
     Report(RootedDiagnosticReport),
@@ -45,7 +48,7 @@ impl SqliteSourceState {
     /// retain their separate read budgets. This neither advances the
     /// selection nor emits artifacts.
     pub async fn acknowledged_build_diagnostics<Open, Opening, Stream>(
-        &mut self, target: &str, profile: &str, timeout: Duration, budget: CstExpansionBudget, mut open: Open,
+        &mut self, target: &str, profile: &str, timeout: Duration, budget: CstExpansionBudget, open: Open,
     ) -> Result<AcknowledgedBuildDiagnostics>
     where
         Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
@@ -57,6 +60,83 @@ impl SqliteSourceState {
         let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
             return Ok(Outcome::NotAcknowledged);
         };
+        self.diagnostics_for_capture(captured, deadline, budget, open).await
+    }
+
+    /// Opt in only for a command observing the live workspace. A fresh
+    /// ordinary source observation must match the captured acknowledged
+    /// root and profile before any stream is opened. Changed files are not
+    /// parsed here and no pending or historical source is substituted.
+    ///
+    /// This uses the same single observation cut as ordinary source loading,
+    /// not a filesystem lock or a promise that worktree bytes cannot change
+    /// afterward. The same captured SQLite generation owns the entire
+    /// exchange. The authored source byte cap is aggregate across reachable
+    /// files, separate from SQLite and diagnostic projection limits. It does
+    /// not limit manifest, lockfile or installed Git metadata reads by the
+    /// ordinary resolver. Live local files use nonblocking Linux open flags
+    /// and are checked on the opened handle; unsupported platforms refuse.
+    /// The deadline is checked between synchronous phases and source reads,
+    /// not a way to preempt an in-progress filesystem syscall.
+    ///
+    /// Recovery may replay the exact acknowledged root into a missing daemon
+    /// cache. This does not stage, publish a new observation, advance the
+    /// selection, emit an artifact or produce a verdict.
+    pub async fn live_build_diagnostics<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        budget: CstExpansionBudget, open: Open,
+    ) -> Result<AcknowledgedBuildDiagnostics>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        use AcknowledgedBuildDiagnostics as Outcome;
+        let deadline = diagnostic_deadline(timeout)?;
+        require_diagnostic_time(deadline)?;
+        let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
+            return Ok(Outcome::NotAcknowledged);
+        };
+        let selected = captured.selection();
+        let (files, profile_selected) = {
+            let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            if !captured.source.matches(read_selection(&tx, target)?) { return Ok(Outcome::StaleSelection); }
+            let mut read = StoredNodes::new(&tx)?;
+            // Bound selected metadata before decoding or copying SQLite
+            // values. This is not a bound on the ordinary live file reader.
+            let mut remaining = self.limits;
+            let mut record = |id| read.charged_record(id, false, |bytes| {
+                remaining.nodes = remaining.nodes.checked_sub(1).ok_or("live source index exceeds the record budget")?;
+                remaining.encoded_bytes = remaining.encoded_bytes.checked_sub(bytes).ok_or("live source index exceeds the byte budget")?;
+                Ok(())
+            });
+            let (config, entries) = Self::header_using(&self.project, target, selected.root, &mut record)?;
+            let profile_selected = config.profiles.contains_key(profile);
+            let files = StoredNodes::file_index_using(&config, entries, record)?;
+            drop(read);
+            tx.commit()?;
+            (files, profile_selected)
+        };
+        require_diagnostic_time(deadline)?;
+        let probe = matches_live_source(&self.project, target, &files, selected.root,
+            LiveSourceReader::new(max_authored_source_bytes, deadline));
+        require_diagnostic_time(deadline)?;
+        let matches = probe?;
+        if !matches { return Ok(Outcome::WorkspaceChanged); }
+        if !captured.is_current(self)? { return Ok(Outcome::StaleSelection); }
+        if !profile_selected { return Ok(Outcome::ProfileNotSelected); }
+        self.diagnostics_for_capture(captured, deadline, budget, open).await
+    }
+
+    async fn diagnostics_for_capture<Open, Opening, Stream>(
+        &mut self, captured: CapturedBuildDiagnostics, deadline: Instant, budget: CstExpansionBudget, mut open: Open,
+    ) -> Result<AcknowledgedBuildDiagnostics>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        use AcknowledgedBuildDiagnostics as Outcome;
         let answer = within_diagnostic_deadline(deadline, async {
             let first = open_exchange(self, &captured, deadline, None, &mut open).await?;
             let DiagnosticExchange::ReplayRequired(challenge) = first else { return Ok(first) };

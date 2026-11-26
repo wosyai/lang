@@ -449,10 +449,14 @@ impl<'a> StoredNodes<'a> {
     }
 
     fn file_index(&mut self, config: &SourceConfig, entries: Vec<NodeId>) -> Result<Files> {
+        Self::file_index_using(config, entries, |id| self.record(id))
+    }
+
+    fn file_index_using(config: &SourceConfig, entries: Vec<NodeId>, mut record: impl FnMut(NodeId) -> Result<Node>) -> Result<Files> {
         let parser = config.parser.id();
         let mut files = Files::new();
         for id in entries {
-            let file = FileEntry::from_node(id, self.record(id)?)?;
+            let file = FileEntry::from_node(id, record(id)?)?;
             let key = checked_file_key(config, parser, &file)?;
             if files.insert(key, file).is_some() { return Err("invalid persisted source file index".into()); }
         }

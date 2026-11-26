@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
-use std::fs;
+use std::{fs, io};
 use std::path::{Path, PathBuf};
 use toml_edit::Item;
 #[cfg(test)]
@@ -29,6 +29,23 @@ impl SourceIdentity {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ContentRevision(pub String);
+
+/// Open a local source for the bounded live comparison. Do not wait for
+/// stream endpoints at open or acquire a terminal; the caller must verify
+/// metadata on this same handle before reading. The ordinary resolver's
+/// path/symlink semantics are unchanged.
+pub fn open_live_source(path: &Path) -> io::Result<fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "live source comparison requires Linux file open flags"))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceObservation {

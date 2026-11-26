@@ -1,8 +1,9 @@
 //! Shared source observation and namespace discovery for the ordinary CLI.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
+use tokio::time::Instant;
 use wosy_compiler::ScalarSourceDeclarations;
 use wosy_project::{
     load_reachable_source_graph, ContentRevision, GraphLoadError, NamespaceEdgeInput,
@@ -19,14 +20,14 @@ pub fn imports(declarations: &ScalarSourceDeclarations) -> Result<Vec<Import>, S
 
 /// Each source is read and observed once. The observer supplies imports from
 /// fresh CST declarations or a matching persisted observation.
-pub enum Error {
-    Observe(String),
+pub enum Error<E = String> {
+    Observe(E),
     Graph(GraphLoadError),
 }
 
-impl From<String> for Error {
+impl<E: From<String>> From<String> for Error<E> {
     fn from(message: String) -> Self {
-        Self::Observe(message)
+        Self::Observe(message.into())
     }
 }
 
@@ -34,8 +35,95 @@ pub fn load(
     root: &Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
-    mut observe: impl FnMut(&SourceIdentity, &ContentRevision, String) -> Result<Vec<Import>, String>,
+    observe: impl FnMut(&SourceIdentity, &ContentRevision, String) -> Result<Vec<Import>, String>,
 ) -> Result<SourceGraph, Error> {
+    load_with_reader(root, project, configuration, read_source, observe)
+}
+
+pub(crate) fn read_source(
+    path: &Path, opened: Option<fs::File>,
+) -> Result<(ContentRevision, String), String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
+    let text = if let Some(mut file) = opened {
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(read_error)?;
+        text
+    } else {
+        fs::read_to_string(path).map_err(read_error)?
+    };
+    Ok((revision(blake3::hash(text.as_bytes())), text))
+}
+
+fn revision(hash: blake3::Hash) -> ContentRevision {
+    ContentRevision(hash.to_hex().to_string())
+}
+
+/// Used only to compare live bytes with a previously parsed authored root.
+/// The aggregate cap is shared by the root and all reachable source files.
+pub(crate) struct LiveSourceReader {
+    remaining: usize,
+    deadline: Instant,
+}
+
+impl LiveSourceReader {
+    pub(crate) fn new(bytes: usize, deadline: Instant) -> Self { Self { remaining: bytes, deadline } }
+
+    pub(crate) fn check_time(&self) -> io::Result<()> {
+        require_live_time(self.deadline)
+    }
+
+    pub(crate) fn observe(&mut self, path: &Path, opened: Option<fs::File>) -> io::Result<ContentRevision> {
+        self.check_time()?;
+        let mut file = match opened { Some(file) => file, None => wosy_project::open_live_source(path)? };
+        self.check_time()?;
+        let info = file.metadata()?;
+        self.check_time()?;
+        if !info.is_file() { return Err(io::Error::other("live authored source must be a regular file")); }
+        if info.len() > self.remaining as u64 { return Err(source_budget_exceeded()); }
+        let deadline = self.deadline;
+        read_live_revision(&mut file, &mut self.remaining, || require_live_time(deadline))
+    }
+}
+
+fn require_live_time(deadline: Instant) -> io::Result<()> {
+    if Instant::now() < deadline { Ok(()) }
+    else { Err(io::Error::new(io::ErrorKind::TimedOut, "diagnostic session deadline elapsed")) }
+}
+
+fn source_budget_exceeded() -> io::Error {
+    io::Error::other("live authored source exceeds the byte budget")
+}
+
+fn read_live_revision(
+    file: &mut impl Read, remaining: &mut usize, mut check_time: impl FnMut() -> io::Result<()>,
+) -> io::Result<ContentRevision> {
+    let mut hash = blake3::Hasher::new();
+    let mut scratch = [0u8; 8192];
+    loop {
+        check_time()?;
+        // A single overflow sentinel detects growth after the metadata
+        // observation. Its byte is never admitted or retained.
+        let end = scratch.len().min(remaining.saturating_add(1));
+        let read = match file.read(&mut scratch[..end]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        check_time()?;
+        if read == 0 { return Ok(revision(hash.finalize())); }
+        *remaining = remaining.checked_sub(read).ok_or_else(source_budget_exceeded)?;
+        hash.update(&scratch[..read]);
+    }
+}
+
+/// Source traversal and namespace resolution are shared by parsing and live
+/// digest probes. The latter need not retain the file text.
+pub(crate) fn load_with_reader<E: From<String>, S>(
+    root: &Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    mut read: impl FnMut(&Path, Option<fs::File>) -> Result<(ContentRevision, S), E>,
+    mut observe: impl FnMut(&SourceIdentity, &ContentRevision, S) -> Result<Vec<Import>, E>,
+) -> Result<SourceGraph, Error<E>> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
     let packages = NamespacePackages {
@@ -61,17 +149,9 @@ pub fn load(
             (resolved.project_root.as_path(), resolved.identity.project.clone())
         };
         let source_path = package_root.join(path.as_path());
-        let read_error = |error| format!("failed to read {}: {error}", source_path.display());
-        let text = if let Some(mut file) = checked_git_source {
-            let mut text = String::new();
-            file.read_to_string(&mut text).map_err(read_error)?;
-            text
-        } else {
-            fs::read_to_string(&source_path).map_err(read_error)?
-        };
-        let revision = ContentRevision(blake3::hash(text.as_bytes()).to_hex().to_string());
+        let (revision, text) = read(&source_path, checked_git_source).map_err(Error::Observe)?;
         let source = SourceIdentity::new(project_identity, package.to_owned(), path);
-        let imports = observe(&source, &revision, text)?;
+        let imports = observe(&source, &revision, text).map_err(Error::Observe)?;
         let mut namespace_edges = Vec::with_capacity(imports.len());
         for Import { origin, path, binding, span } in imports {
             let module = packages
@@ -110,4 +190,35 @@ pub fn load(
     let mut nodes = nodes.into_iter();
     let entry = nodes.next().ok_or_else(|| "project root source is missing".to_owned())?;
     load_reachable_source_graph(&packages, entry, nodes.collect()).map_err(Error::Graph)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a disposable regular file larger than one read chunk"]
+    fn live_source_deadline_stops_after_one_completed_file_read() {
+        use std::io::Seek;
+        use std::time::Duration;
+
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_LIVE_DEADLINE_SOURCE").unwrap());
+        let mut file = wosy_project::open_live_source(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let mut remaining = metadata.len() as usize;
+        assert!(metadata.is_file() && remaining > 8192);
+        let mut polls = 0;
+        let mut expiry = Instant::now() + Duration::from_secs(60);
+        let error = read_live_revision(&mut file, &mut remaining, || {
+            polls += 1;
+            if polls == 2 { expiry = Instant::now(); }
+            require_live_time(expiry)
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(polls, 2);
+        assert_eq!(file.stream_position().unwrap(), 8192);
+        // The chunk returned at the expiry cut was never hashed or charged.
+        assert_eq!(remaining as u64, file.metadata().unwrap().len());
+    }
 }

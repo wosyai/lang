@@ -20,7 +20,8 @@ pub(super) async fn run(
     let target = args.next().ok_or("expected fixture target")?;
     let mode = args.next().ok_or("expected local source action")?;
     let start = Instant::now();
-    let limits = if matches!(mode.as_str(), "stage-limited" | "proposal-limited" | "git-base-projection-limited") {
+    let limits = if matches!(mode.as_str(), "stage-limited" | "proposal-limited" | "git-base-projection-limited"
+        | "reconcile-terminal-report-limited") {
         ClientSourceLimits {
             nodes: args.next().ok_or("expected fixture node limit")?.parse()?,
             encoded_bytes: args.next().ok_or("expected fixture byte limit")?.parse()?,
@@ -109,10 +110,11 @@ pub(super) async fn run(
             let edited = args.next().ok_or("expected disposable fixture edit")?;
             super::framed_reconciliation::run_generation(&mut client, project, dir, &target, &profile, &edited).await?
         }
-        "reconcile-terminal-report" => {
+        "reconcile-terminal-report" | "reconcile-terminal-report-limited" => {
             let profile = args.next().ok_or("expected Build profile")?;
             let mode = args.next().ok_or("expected terminal report control")?;
-            super::framed_reconciliation::run_terminal_report(&mut client, project, dir, &target, &profile, &mode).await?
+            let live_bytes = args.next().map(|bytes| bytes.parse()).transpose()?.unwrap_or(8 << 20);
+            super::framed_reconciliation::run_terminal_report(&mut client, project, dir, &target, &profile, &mode, live_bytes).await?
         }
         "replay-acknowledged-for" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected captured root")?)?;

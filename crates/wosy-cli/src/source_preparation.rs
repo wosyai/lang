@@ -1,5 +1,6 @@
 //! Prepare base source for the incremental store. Build and Check do not use
 //! this primitive yet. The resolver and parser are the ordinary compiler paths.
+use crate::project_sources::{self, LiveSourceReader};
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -117,8 +118,53 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
 pub(crate) fn prepare_with_files(
     root: &Path, target: Option<&str>, base: Option<&Files>,
 ) -> Result<(PreparedSources, Files), String> {
+    match prepare_from_observation(root, target, base, None) {
+        Ok(prepared) => Ok(prepared),
+        Err(ObservationError::Source(error)) => Err(error),
+        Err(ObservationError::LiveRead(_)) => unreachable!("fresh preparation uses the ordinary reader"),
+        Err(ObservationError::Changed) => unreachable!("preparation accepts fresh ordinary source"),
+    }
+}
+
+/// Use the ordinary locator and canonical source-root constructor. A
+/// different/missing authored revision ends the probe without parsing it.
+pub(crate) fn matches_live_source(
+    root: &Path, target: &str, base: &Files, selected: NodeId, reader: LiveSourceReader,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match prepare_from_observation(root, Some(target), Some(base), Some(reader)) {
+        Ok((observed, _)) => Ok(observed.root == selected),
+        Err(ObservationError::Changed) => Ok(false),
+        Err(ObservationError::Source(error)) => Err(error.into()),
+        Err(ObservationError::LiveRead(error)) => Err(error.into()),
+    }
+}
+
+enum ObservationError {
+    Changed,
+    Source(String),
+    LiveRead(std::io::Error),
+}
+
+impl From<String> for ObservationError {
+    fn from(error: String) -> Self { Self::Source(error) }
+}
+
+impl From<&str> for ObservationError {
+    fn from(error: &str) -> Self { Self::Source(error.into()) }
+}
+
+fn prepare_from_observation(
+    root: &Path, target: Option<&str>, base: Option<&Files>, mut live: Option<LiveSourceReader>,
+) -> Result<(PreparedSources, Files), ObservationError> {
+    let check_time = |live: &Option<LiveSourceReader>| {
+        live.as_ref().map_or(Ok(()), LiveSourceReader::check_time).map_err(ObservationError::LiveRead)
+    };
+    check_time(&live)?;
     let project = root.canonicalize().map_err(|e| e.to_string())?;
-    let (cfg, manifest) = ProjectConfiguration::load_with_manifest(&project)?;
+    check_time(&live)?;
+    let configuration = ProjectConfiguration::load_with_manifest(&project);
+    check_time(&live)?;
+    let (cfg, manifest) = configuration?;
     let target = cfg.resolve_target(target)?;
     let ctx = ProjectContext::from_manifest(&project, &target, manifest.as_table())?;
 
@@ -154,7 +200,10 @@ pub(crate) fn prepare_with_files(
     let mut delta = Delta::default();
     let (mut parsed, mut reused) = (0, 0);
     let mut files = Files::new();
-    let graph = crate::project_sources::load(&project, &ctx, &cfg, |source, revision, text| {
+    let graph = project_sources::load_with_reader(&project, &ctx, &cfg, |path, opened| match live.as_mut() {
+        Some(reader) => reader.observe(path, opened).map(|id| (id, None)).map_err(ObservationError::LiveRead),
+        None => project_sources::read_source(path, opened).map(|(id, text)| (id, Some(text))).map_err(Into::into),
+    }, |source, revision, text| -> Result<_, ObservationError> {
         let key = FileKey::from(source);
         let revision = NodeId::parse_hex(&revision.0).expect("source observation is a BLAKE3 hash");
         let file = if let Some(old) = base.and_then(|files| files.get(&key)).filter(|old| {
@@ -162,20 +211,23 @@ pub(crate) fn prepare_with_files(
         }) {
             reused += 1;
             old.clone()
-        } else {
+        } else if let Some(text) = text {
             parsed += 1;
             let metadata = FileMetadata {
                 source: source.clone(), revision, policy, imports: Vec::new(), bytes: text.len() as u32,
             };
             parse_file(metadata, text, &ctx.comment_categories, &mut delta)?
+        } else {
+            return Err(ObservationError::Changed);
         };
         let imports = file.metadata.imports.clone();
         files.insert(key, file);
         Ok(imports)
-    })
-    .map_err(|error| match error {
+    });
+    check_time(&live)?;
+    let graph = graph.map_err(|error| match error {
         crate::project_sources::Error::Observe(error) => error,
-        crate::project_sources::Error::Graph(error) => format!("{error:?}"),
+        crate::project_sources::Error::Graph(error) => ObservationError::Source(format!("{error:?}")),
     })?;
     let profiles = cfg.targets[&target].profiles.keys().filter_map(|profile| {
         cfg.artifact_profile(&target, profile).ok().map(|(_, _, artifact, _)| {

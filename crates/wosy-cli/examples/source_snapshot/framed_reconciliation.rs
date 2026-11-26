@@ -238,6 +238,7 @@ pub(super) async fn confirm(store: &SourceStore, writer: &SqliteSourceState, tar
 
 pub(super) async fn run_terminal_report(
     client: &mut SqliteSourceState, project: &Path, path: &Path, target: &str, profile: &str, mode: &str,
+    live_bytes: usize,
 ) -> Result<serde_json::Value> {
     use codespan_reporting::term::termcolor::Buffer;
     use std::cell::Cell;
@@ -247,6 +248,7 @@ pub(super) async fn run_terminal_report(
     };
     use wosy_protocol::CstExpansionBudget;
 
+    let (live, mode) = mode.strip_prefix("live-").map_or((false, mode), |mode| (true, mode));
     let initial = client.capture_build_diagnostics(target, profile)?;
     let store = Arc::new(SourceStore::open(path, 8 << 20)?);
     let bound = |n| NonZeroUsize::new(n).unwrap();
@@ -263,32 +265,39 @@ pub(super) async fn run_terminal_report(
     let start = Instant::now();
     let calls = Cell::new(0);
     let open_calls = &calls;
-    let (answer, opened) = tokio::join!(
-        client.acknowledged_build_diagnostics(target, profile, timeout, budget, move |selected, replay| {
-            let ordinal = open_calls.get() + 1;
-            open_calls.set(ordinal);
-            let open = open.clone();
-            async move {
-                if mode == "late-replay" {
-                    let ready = if ordinal == 1 {
-                        assert!(replay.is_none());
-                        start + Duration::from_millis(160)
-                    } else {
-                        assert_eq!(ordinal, 2);
-                        assert!(replay.is_some());
-                        let late = start + timeout + Duration::from_millis(40);
-                        // A reset timeout would admit this retry.
-                        assert!(late < Instant::now() + timeout);
-                        late
-                    };
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(ready)).await;
-                }
-                let (stream, peer) = io::duplex(256);
-                open.send((selected, replay, peer)).await
-                    .map_err(|_| "fixture adapter closed before opening the stream")?;
-                Ok(stream)
+    let adapter = move |selected, replay: Option<SourceReplay>| {
+        let ordinal = open_calls.get() + 1;
+        open_calls.set(ordinal);
+        let open = open.clone();
+        async move {
+            if mode == "late-replay" {
+                let ready = if ordinal == 1 {
+                    assert!(replay.is_none());
+                    start + Duration::from_millis(160)
+                } else {
+                    assert_eq!(ordinal, 2);
+                    assert!(replay.is_some());
+                    let late = start + timeout + Duration::from_millis(40);
+                    // A reset timeout would admit this retry.
+                    assert!(late < Instant::now() + timeout);
+                    late
+                };
+                tokio::time::sleep_until(tokio::time::Instant::from_std(ready)).await;
             }
-        }),
+            let (stream, peer) = io::duplex(256);
+            open.send((selected, replay, peer)).await
+                .map_err(|_| "fixture adapter closed before opening the stream")?;
+            Ok(stream)
+        }
+    };
+    let (answer, opened) = tokio::join!(
+        async {
+            if live {
+                client.live_build_diagnostics(target, profile, timeout, live_bytes, budget, adapter).await
+            } else {
+                client.acknowledged_build_diagnostics(target, profile, timeout, budget, adapter).await
+            }
+        },
         async {
             let mut ended = Vec::new();
             while let Some((selected, replay, mut peer)) = peers.recv().await {
@@ -356,6 +365,22 @@ pub(super) async fn run_terminal_report(
         ("none", Ok(Outcome::NotAcknowledged)) => {
             assert!(ended.is_empty());
             serde_json::json!({ "kind": "none" })
+        }
+        ("changed", Ok(Outcome::WorkspaceChanged)) | ("missing-profile", Ok(Outcome::ProfileNotSelected)) => {
+            assert!(live && ended.is_empty());
+            assert_eq!(calls.get(), 0);
+            serde_json::json!({ "kind": mode })
+        }
+        ("record-budget" | "byte-budget" | "authored-budget", Err(error)) => {
+            assert!(live && ended.is_empty());
+            assert_eq!(calls.get(), 0);
+            let reason = match mode {
+                "record-budget" => "live source index exceeds the record budget",
+                "byte-budget" => "live source index exceeds the byte budget",
+                _ => "live authored source exceeds the byte budget",
+            };
+            assert!(error.to_string().contains(reason), "{error}");
+            serde_json::json!({ "kind": mode })
         }
         ("expired", Err(error)) => {
             assert!(ended.is_empty());
