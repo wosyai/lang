@@ -7490,19 +7490,56 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                     #[cfg(feature = "internal-checker")]
                     if let Some(histories) = roots.callable_history {
-                        if !COLLECT || directive.operation != CheckerOperation::Require
-                            || !matches!(predicate, CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_))
-                        { return None; }
-                        for row in &path.0 {
-                            charge_call_work(&mut histories.borrow_mut().work, row.len().checked_add(1)?)?;
-                            let candidate = IntegerInputs(vec![row.clone()]);
-                            let rejecting = candidate.failing_witness(roots, predicate)?;
-                            if !rejecting.is_unreachable() {
-                                (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
-                                    directive: expression, equal_axes: rejecting.common_equal_axes(),
-                                    state: rejecting, axes: roots.axes.clone(),
+                        if !COLLECT { return None; }
+                        let axis = match predicate {
+                            CheckerPredicate::Boolean(_) => None,
+                            CheckerPredicate::Integer(predicate) => Some(roots.lookup(&predicate.binding)?.0),
+                            _ => return None,
+                        };
+                        let mut emit = |rejecting: IntegerInputs| {
+                            charge_call_work(&mut histories.borrow_mut().work, roots.axes.len().checked_add(1)?)?;
+                            (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                directive: expression, equal_axes: rejecting.common_equal_axes(),
+                                state: rejecting, axes: roots.axes.clone(),
+                            });
+                            roots.after_startup_candidate()
+                        };
+                        let charge_row = |row: &IntegerRow| {
+                            let cuts = axis.and_then(|axis| row.get(axis)).map_or(0, |set| set.intervals().len());
+                            charge_call_work(&mut histories.borrow_mut().work,
+                                row.len().checked_add(cuts.checked_mul(2)?)?.checked_add(1)?)
+                        };
+                        if directive.operation == CheckerOperation::Require {
+                            for row in &path.0 {
+                                charge_row(row)?;
+                                let candidate = IntegerInputs(vec![row.clone()]);
+                                let rejecting = candidate.failing_witness(roots, predicate)?;
+                                if !rejecting.is_unreachable() { emit(rejecting)?; }
+                            }
+                        } else {
+                            // A Narrow is refuted only if none of the rows of
+                            // the same structural history can satisfy it.
+                            // Index groups in encounter order, not hash order.
+                            charge_call_work(&mut histories.borrow_mut().work, path.0.len())?;
+                            let mut order = HashMap::new();
+                            let mut groups = Vec::<IntegerInputs>::new();
+                            for row in std::mem::take(&mut path.0) {
+                                let group = *order.entry(row.callable_history).or_insert_with(|| {
+                                    let index = groups.len();
+                                    groups.push(IntegerInputs::default());
+                                    index
                                 });
-                                roots.after_startup_candidate()?;
+                                groups[group].0.push(row);
+                            }
+                            for group in groups {
+                                for row in &group.0 { charge_row(row)?; }
+                                let (passing, failing, _) = group.split(roots, predicate)?;
+                                if passing.is_unreachable() {
+                                    if !failing.is_unreachable() { emit(failing)?; }
+                                } else {
+                                    charge_call_work(&mut histories.borrow_mut().work, passing.0.len())?;
+                                    path.0.extend(passing.0);
+                                }
                             }
                         }
                         continue;

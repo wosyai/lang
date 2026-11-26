@@ -9982,7 +9982,7 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
             matches!(body.structure.checker_branches.get(condition),
                 Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
         })
-        && body.structure.checker_directives.values().all(|directive| directive.operation == CheckerOperation::Require
+        && body.structure.checker_directives.values().all(|directive| matches!(directive.operation, CheckerOperation::Require | CheckerOperation::Narrow)
             && matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
             && !directive.output.has_module_values && directive.output.state_files.is_empty()
             && matches!(directive.output.code_value, CheckerCode::Literal(_)))
@@ -15392,6 +15392,61 @@ mod tests {
             assert_eq!(end, StartupAuthoredCompletion::Exhausted);
             assert_eq!(records.iter().map(|record| record.code().clone()).collect::<Vec<_>>(), [0, 19].map(BigInt::from));
             assert!(search.call_paths().iter().any(|path| path.len() == 1));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_symbolic_narrow_checks_whole_history_and_propagates_survivors() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-callable-narrow");
+        let narrow = OUTPUT.replace(".code = 1", ".code = 0");
+        let require = OUTPUT.replace(".code = 1", ".code = 23");
+        let split = format!(r#"%%start
+            unit(u8) report = fn(value) {{
+                if (value < 128) {{ core.require(true, {OUTPUT}); }};
+                core.narrow(value >= 128, {narrow});
+                core.require(false, {require});
+            }};
+        %%end"#);
+        let sparse = format!(r#"%%start
+            unit(i8) report = fn(value) {{
+                core.narrow(value != 0, {narrow});
+                core.narrow(value > 0, {narrow});
+                core.require(false, {require});
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| {
+                let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations, Vec::new())], [], vec![source.clone()], ScalarPreparationInputs { target_layout },
+                    ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).ok().unwrap()
+            };
+            let ranges = |record: &ScalarOrderedCheckerFailure| record.witness.intervals_at(0, 0).unwrap()
+                .map(|(lower, upper)| (lower.clone(), upper.clone())).collect::<Vec<_>>();
+            for (cap, count, expected_end) in [(1, 1, StartupAuthoredCompletion::LimitReached),
+                (2, 2, StartupAuthoredCompletion::LimitReached), (3, 2, StartupAuthoredCompletion::Exhausted)] {
+                let (records, end, _, active) = prepare(&split)
+                    .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert!(active);
+                assert_eq!((records.len(), end), (count, expected_end));
+                assert_eq!(&split[records[0].condition.start as usize..records[0].condition.end as usize], "value >= 128");
+                assert_eq!(records[0].code(), &BigInt::from(0));
+                assert_eq!(ranges(&records[0]), [(0.into(), 127.into())]);
+                if cap >= 2 {
+                    assert_eq!(records[1].code(), &BigInt::from(23));
+                    assert_eq!(ranges(&records[1]), [(128.into(), 255.into())]);
+                }
+            }
+            let (records, end, _, _) = prepare(&sparse).search_startup_authored_path(NonZeroUsize::new(2).unwrap()).unwrap();
+            assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+            let [only] = records.as_slice() else { panic!("sparse numeric pieces are not independent structural failures"); };
+            assert_eq!(only.code(), &BigInt::from(23));
+            assert_eq!(ranges(only), [(1.into(), 127.into())]);
         }
     }
 
