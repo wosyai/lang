@@ -122,16 +122,21 @@ impl StartUpSearch {
         for step in history {
             super::super::checker_flow::charge_call_work(&mut self.work, 1)?;
             let at = |range| SourceSpan::new(directive.source.clone(), range);
+            let provider_at = |owner, range| -> Option<SourceSpan> {
+                let module: &super::ScalarModule = modules.get(owner)?;
+                let source = &module.source;
+                if source.project != directive.source.project || source.package != directive.source.package
+                    || source == &directive.source { return None; }
+                Some(SourceSpan::new(source.clone(), range))
+            };
             steps.push(match step {
                 CallableHistoryStep::Branch(span, accepted) => PathStep::Branch { condition: at(span), accepted },
-                CallableHistoryStep::ProviderBranch(owner, span, accepted) => {
-                    let source = &modules.get(owner)?.source;
-                    if source.project != directive.source.project || source.package != directive.source.package
-                        || source == &directive.source { return None; }
-                    PathStep::Branch { condition: SourceSpan::new(source.clone(), span), accepted }
-                },
+                CallableHistoryStep::ProviderBranch(owner, span, accepted) =>
+                    PathStep::Branch { condition: provider_at(owner, span)?, accepted },
                 CallableHistoryStep::Call(span) => PathStep::Call(at(span)),
                 CallableHistoryStep::Return(span) => PathStep::Return(at(span)),
+                CallableHistoryStep::ProviderCall(owner, span) => PathStep::Call(provider_at(owner, span)?),
+                CallableHistoryStep::ProviderReturn(owner, span) => PathStep::Return(provider_at(owner, span)?),
             });
         }
         self.select(FailurePath { steps, directive })

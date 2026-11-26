@@ -241,6 +241,8 @@ pub(super) enum CallableHistoryStep {
     ProviderBranch(usize, wosy_syntax::ByteSpan, bool),
     Call(wosy_syntax::ByteSpan),
     Return(wosy_syntax::ByteSpan),
+    ProviderCall(usize, wosy_syntax::ByteSpan),
+    ProviderReturn(usize, wosy_syntax::ByteSpan),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -250,7 +252,7 @@ struct CallableHistories<'a> {
     work: &'a std::cell::Cell<usize>,
     outgoing_call: Option<Vec<CallableHistoryStep>>,
     scalar_return_steps: Option<Vec<Vec<CallableHistoryStep>>>,
-    branch_owner: Option<usize>,
+    step_owner: Option<usize>,
     stopped: bool,
 }
 
@@ -263,6 +265,15 @@ impl CallableHistories<'_> {
         Some(())
     }
 
+    fn boundary(&self, span: wosy_syntax::ByteSpan, returned: bool) -> CallableHistoryStep {
+        match (self.step_owner, returned) {
+            (None, false) => CallableHistoryStep::Call(span),
+            (None, true) => CallableHistoryStep::Return(span),
+            (Some(owner), false) => CallableHistoryStep::ProviderCall(owner, span),
+            (Some(owner), true) => CallableHistoryStep::ProviderReturn(owner, span),
+        }
+    }
+
     fn append(&mut self, row: &mut IntegerRow, step: CallableHistoryStep) {
         let node = (row.callable_history, step);
         row.callable_history = *self.interned.entry(node).or_insert_with(|| {
@@ -273,7 +284,7 @@ impl CallableHistories<'_> {
 
     fn append_rows(&mut self, rows: &mut IntegerInputs, span: wosy_syntax::ByteSpan, arm: bool) -> Option<()> {
         self.charge(rows.0.len())?;
-        let step = self.branch_owner.map_or(CallableHistoryStep::Branch(span, arm),
+        let step = self.step_owner.map_or(CallableHistoryStep::Branch(span, arm),
             |owner| CallableHistoryStep::ProviderBranch(owner, span, arm));
         for row in &mut rows.0 { self.append(row, step); }
         Some(())
@@ -3701,7 +3712,7 @@ pub(super) fn search_closed_callable_histories(
     mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<CallableHistoryCompletion> {
     let histories = std::cell::RefCell::new(CallableHistories {
-        work, outgoing_call: None, scalar_return_steps: None, branch_owner: None, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
+        work, outgoing_call: None, scalar_return_steps: None, step_owner: None, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
     });
     let mut unsupported = false;
     let mut sink = |mut failure: IntegerCheckFailure<'_>| {
@@ -3745,11 +3756,11 @@ pub(super) fn search_closed_callable_histories(
 /// exact input row; extraction reads only the already retained return rows.
 #[cfg(feature = "internal-checker")]
 pub(super) fn trace_closed_projected_scalar_return(
-    calls: &FunctionCallSites, entry: Rc<IntegerSet>, expected: &ScalarType, branch_owner: Option<usize>, work: &std::cell::Cell<usize>,
+    calls: &FunctionCallSites, entry: Rc<IntegerSet>, expected: &ScalarType, step_owner: Option<usize>, work: &std::cell::Cell<usize>,
     mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
 ) -> Option<CallableHistoryCall> {
     let histories = std::cell::RefCell::new(CallableHistories {
-        work, outgoing_call: None, scalar_return_steps: None, branch_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
+        work, outgoing_call: None, scalar_return_steps: None, step_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
     });
     histories.borrow().charge(calls.occurrences.len().checked_add(entry.interval_count())?)?;
     let mut cursor = ExactCallCursor::projected(calls, Rc::clone(&entry), expected)?;
@@ -7722,7 +7733,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         for mut row in std::mem::take(&mut path.0) {
                             let mut tracker = histories.borrow_mut();
                             tracker.charge(row.len().checked_add(3)?)?;
-                            tracker.append(&mut row, CallableHistoryStep::Call(span));
+                            let call = tracker.boundary(span, false);
+                            tracker.append(&mut row, call);
                             tracker.outgoing_call = Some(tracker.steps(row.callable_history)?);
                             drop(tracker);
                             let mut exact_row = IntegerInputs(vec![row]);
@@ -7743,7 +7755,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 _ => return None,
                             }
                             let mut tracker = histories.borrow_mut();
-                            for row in &mut exact_row.0 { tracker.append(row, CallableHistoryStep::Return(span)); }
+                            let returned = tracker.boundary(span, true);
+                            for row in &mut exact_row.0 { tracker.append(row, returned); }
                             survivors.0.extend(exact_row.0);
                         }
                         path = survivors;
@@ -8443,7 +8456,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         for mut row in std::mem::take(&mut path.0) {
                             let mut tracker = histories.borrow_mut();
                             tracker.charge(row.len().checked_add(3)?)?;
-                            tracker.append(&mut row, CallableHistoryStep::Call(span));
+                            let call = tracker.boundary(span, false);
+                            tracker.append(&mut row, call);
                             tracker.outgoing_call = Some(tracker.steps(row.callable_history)?);
                             drop(tracker);
                             let exact = IntegerInputs(vec![row]);
@@ -8480,7 +8494,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 tracker.work.set(work);
                                 for mut row in returned.0 {
                                     for step in &steps { tracker.append(&mut row, *step); }
-                                    tracker.append(&mut row, CallableHistoryStep::Return(span));
+                                    let returned = tracker.boundary(span, true);
+                                    tracker.append(&mut row, returned);
                                     survivors.0.push(row);
                                 }
                             }
