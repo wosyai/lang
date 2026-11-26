@@ -10106,8 +10106,8 @@ impl PreparedScalarOrderedCheck {
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
         let proof_free = match &self.owner {
-            PreparedConfiguredCheck::Plain { startup_count: 1, .. } => true,
-            PreparedConfiguredCheck::Named { owner, startup_count: 1 } =>
+            PreparedConfiguredCheck::Plain { .. } => true,
+            PreparedConfiguredCheck::Named { owner, .. } =>
                 owner.context.is_none() && owner.proofs.values().all(|catalog| catalog.definitions.is_empty()),
             _ => false,
         };
@@ -10141,29 +10141,30 @@ impl PreparedScalarOrderedCheck {
     /// package obligations. Call once before sharing a command budget.
     #[doc(hidden)]
     pub fn into_startup_authored_owner(self) -> Result<PreparedStartupAuthoredCheck, ScalarOrderedCheckerOutcome> {
-        let owner = match self.owner {
-            PreparedConfiguredCheck::Plain { owner, startup_count: 1 } => owner,
+        let (owner, startup_count) = match self.owner {
+            PreparedConfiguredCheck::Plain { owner, startup_count } => (owner, startup_count),
             // Configured extraction assigns even an empty catalog a named
             // preparation. Exactly the same empty/no-context disposition as
             // the legacy path can use the proof-free authored lane.
-            PreparedConfiguredCheck::Named { owner, startup_count: 1 }
+            PreparedConfiguredCheck::Named { owner, startup_count }
                 if owner.context.is_none() && owner.proofs.values().all(|catalog| catalog.definitions.is_empty())
-                => owner.prepared,
+                => (owner.prepared, startup_count),
             _ => return Err(ScalarOrderedCheckerOutcome::Unsupported),
         };
         let (project, calls) = owner.parts();
-        let root = project.modules.first().ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
-        if project.initialization_order.as_slice() != std::slice::from_ref(&root.source)
-            || (self.scope != ScalarCheckerScope::CurrentPackage && project.modules.len() != 1)
+        let startup = project.modules.get(..startup_count).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
+        let (root, ordinals) = package_startup_order(project, startup).map_err(configured_ordered_error)?;
+        if startup.iter().any(|module| module.source.project != root.project || module.source.package != root.package)
+            || (self.scope != ScalarCheckerScope::CurrentPackage && project.modules.len() != startup_count)
         { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
         let mut callable_roots = Vec::new();
         let mut mandatory_startup_scalars = Vec::new();
         if self.scope == ScalarCheckerScope::CurrentPackage {
-            let (_, deferred) = package_obligation_roots(&owner, self.scope, 1, &root.source).map_err(configured_ordered_error)?;
+            let (_, deferred) = package_obligation_roots(&owner, self.scope, startup_count, root).map_err(configured_ordered_error)?;
             let mut needed = deferred.into_iter().flat_map(|(module, items)|
                 items.into_iter().map(move |item| (module, item))).collect::<HashSet<_>>();
             if !needed.is_empty() {
-                let callers = ordered_symbolic_callers(project, calls, &root.source, None).map_err(configured_ordered_error)?;
+                let callers = ordered_symbolic_callers(project, calls, root, None).map_err(configured_ordered_error)?;
                 let mut pending = needed.iter().copied().collect::<Vec<_>>();
                 let mut work = 0;
                 while let Some(callee) = pending.pop() {
@@ -10173,14 +10174,20 @@ impl PreparedScalarOrderedCheck {
                 }
             }
             let mut ordered = needed.into_iter().collect::<Vec<_>>();
-            ordered.sort_unstable();
+            // Match the original package symbolic order: declared startup
+            // order for initialized modules, then dormant owner order.
+            let mut order = (0..project.modules.len()).collect::<Vec<_>>();
+            for (position, source) in project.initialization_order.iter().enumerate() {
+                order[ordinals[source]] = position;
+            }
+            ordered.sort_unstable_by_key(|&(module, item)| (order[module], item));
             for (module, item) in ordered {
                 let source = project.modules.get(module).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
-                if source.source.project != root.source.project || source.source.package != root.source.package {
+                if source.source.project != root.project || source.source.package != root.package {
                     return Err(ScalarOrderedCheckerOutcome::Unsupported);
                 }
                 let body = calls.function_body(module, item, None).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
-                if module == 0 && closed_startup_scalar_history(body) {
+                if startup_count == 1 && module == 0 && closed_startup_scalar_history(body) {
                     let ScalarItem::Function(function) = source.items.get(item).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?
                         else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
                     mandatory_startup_scalars.push((item, function.name_span));
@@ -10193,10 +10200,10 @@ impl PreparedScalarOrderedCheck {
             }
         }
         if !mandatory_startup_scalars.is_empty() {
-            let incoming = calls.owned_direct_startup_callable_uses(&root.source, None,
-                mandatory_startup_scalars.iter().map(|(_, span)| (&root.source, *span)), None)
+            let incoming = calls.owned_direct_startup_callable_uses(root, None,
+                mandatory_startup_scalars.iter().map(|(_, span)| (root, *span)), None)
                 .ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
-            if mandatory_startup_scalars.iter().any(|(_, span)| incoming.get(&(&root.source, *span)).map(Vec::len) != Some(1)) {
+            if mandatory_startup_scalars.iter().any(|(_, span)| incoming.get(&(root, *span)).map(Vec::len) != Some(1)) {
                 return Err(ScalarOrderedCheckerOutcome::Unsupported);
             }
         }
@@ -10319,7 +10326,8 @@ fn run_startup_authored_path(
     owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named: Option<(PreparedCallable, &[OccurrenceOrdinal])>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
-    let count = if qualified { 2 } else { 1 };
+    let count = if proof_free_scalars.is_some() { project.initialization_order.len() }
+        else if qualified { 2 } else { 1 };
     if named.is_some_and(|(_, sites)| sites.is_empty() || project.modules.len() != count || (qualified && sites.len() != 1))
         || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.is_none())
     {

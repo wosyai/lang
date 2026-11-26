@@ -2670,6 +2670,52 @@ main_artifact = "main"
                     ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, None, "dev"),
                     ScalarCheckerScope::MainFlowOnly => configured_check::check_target(root, None, "dev", scope, Vec::new()),
                 }.ok().unwrap();
+                let graph_root = format!(r#"%%start
+                    shared = namespace app "shared.w";
+                    relay = namespace app "relay.w";
+                    alias = namespace app "shared.w";
+                    core.require(false, {second});
+                %%end"#);
+                let relay_output = authored(11, "relay");
+                let unused_output = authored(23, "unused");
+                let shared = format!(r#"%%start
+                    u8(u8) echo = fn(input) {{ input }};
+                    u8 actual = echo(7);
+                    core.require(actual == 8, {first});
+                    unit(u8) dormant = fn(input) {{ core.require(input == 0, {unused_output}); }};
+                %%end"#);
+                let relay = format!(r#"%%start
+                    nested = namespace app "shared.w";
+                    core.require(false, {relay_output});
+                %%end"#);
+                let shared_source = root.join("src/shared.w");
+                let relay_source = root.join("src/relay.w");
+                fs::write(&source, &graph_root).unwrap();
+                fs::write(&shared_source, &shared).unwrap();
+                fs::write(&relay_source, &relay).unwrap();
+                let expected = if scope == ScalarCheckerScope::CurrentPackage {
+                    vec!["src/shared.w", "src/relay.w", "src/main.w", "src/shared.w"]
+                } else { vec!["src/shared.w", "src/relay.w", "src/main.w"] };
+                let legacy_graph = terminal(&[legacy()], scope, false);
+                assert_eq!(legacy_graph.0, Ok(11));
+                clean();
+                let clipped = terminal(&selected(1), scope, false);
+                assert_eq!(clipped, (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                let full = selected(8);
+                let directives = &full[0].outcome.as_ref().unwrap().directives;
+                assert_eq!(directives.iter().map(|record| record.source.path.as_str()).collect::<Vec<_>>(), expected);
+                assert_eq!(terminal(&full, scope, false), legacy_graph);
+                clean();
+                // The shared visit and original result are retained, but
+                // an unsupported condition still cannot authorize full search.
+                fs::write(&relay_source, relay.replace("core.require(false,", "core.require(false || true,")).unwrap();
+                let unsupported = selected(8);
+                assert!(matches!(unsupported[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+                fs::remove_file(shared_source).unwrap();
+                fs::remove_file(relay_source).unwrap();
                 fs::write(&source, &ranked).unwrap();
                 let legacy_render = terminal(&[legacy()], scope, false);
                 assert_eq!(legacy_render.0, Ok(19));
