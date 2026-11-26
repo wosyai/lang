@@ -25,7 +25,7 @@ pub struct ProjectComptimeStdout {
 pub fn prepare_project_comptime_stdout(
     root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ProjectComptimeStdout, ClosedComptimePlanError> {
-    let (output, _, _) = observe_project(root, target, profile, false, |sources, order| {
+    let (output, _, _) = observe_project(root, target, profile, None, |sources, order| {
         prepare_comptime_stdout(sources, order, id, layout)
     })?;
     Ok(ProjectComptimeStdout { output })
@@ -43,7 +43,7 @@ pub struct ProjectComptimeStdoutEvaluator {
 pub fn prepare_project_comptime_stdout_evaluator(
     root: &Path, target: &str, profile: &str, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ProjectComptimeStdoutEvaluator, ClosedComptimePlanError> {
-    let (evaluator, project, tools) = observe_project(root, target, profile, false, |sources, order| {
+    let (evaluator, project, tools) = observe_project(root, target, profile, None, |sources, order| {
         prepare_comptime_stdout_evaluator(sources, order, id, layout)
     })?;
     Ok(ProjectComptimeStdoutEvaluator { evaluator, project, tools })
@@ -51,12 +51,14 @@ pub fn prepare_project_comptime_stdout_evaluator(
 
 /// Prepare an explicitly requested WASI preview1 stdout stage. The
 /// selected ordinary artifact profile must declare llvm/wasm-wasip1;
-/// this does not infer evaluator tool identity or support wasip2.
+/// this does not infer evaluator tool identity or support wasip2. The
+/// caller's authored byte budget covers the selected root and imports.
 pub fn prepare_project_comptime_wasip1_stdout_evaluator(
-    root: &Path, target: &str, profile: &str, id: &str, max_stdout: usize,
+    root: &Path, target: &str, profile: &str, id: &str,
+    max_authored_source_bytes: usize, max_stdout: usize,
 ) -> Result<ProjectComptimeStdoutEvaluator, ClosedComptimePlanError> {
-    let (evaluator, project, tools) = observe_project(root, target, profile, true, |sources, order| {
-        prepare_comptime_wasip1_stdout_evaluator(sources, order, id, max_stdout)
+    let (evaluator, project, tools) = observe_project(root, target, profile, Some(max_authored_source_bytes), |sources, order| {
+        prepare_comptime_wasip1_stdout_evaluator(sources, order, id, max_authored_source_bytes, max_stdout)
     })?;
     Ok(ProjectComptimeStdoutEvaluator { evaluator, project, tools })
 }
@@ -86,7 +88,7 @@ impl ProjectComptimeStdoutEvaluator {
 }
 
 fn observe_project<T>(
-    root: &Path, target: &str, profile: &str, wasip1: bool,
+    root: &Path, target: &str, profile: &str, wasip1_source_limit: Option<usize>,
     prepare: impl FnOnce(
         Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>, Vec<SourceIdentity>,
     ) -> Result<T, ClosedComptimeRejection>,
@@ -94,22 +96,21 @@ fn observe_project<T>(
     let root = root.canonicalize().map_err(|error| error.to_string())?;
     let (configuration, manifest) = ProjectConfiguration::load_with_manifest(&root)?;
     let (_, _, artifact, _) = configuration.artifact_profile(target, profile)?;
-    if wasip1 && (artifact.backend != "llvm" || artifact.output != "wasm-wasip1") {
+    if wasip1_source_limit.is_some() && (artifact.backend != "llvm" || artifact.output != "wasm-wasip1") {
         return Err(ClosedComptimePlanError::Project("computed stdout stage requires an explicit llvm/wasm-wasip1 profile".into()));
     }
     let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
-    let mut remaining = CLOSED_COMPTIME_MAX_SOURCE_BYTES;
+    let mut remaining = wasip1_source_limit.unwrap_or(CLOSED_COMPTIME_MAX_SOURCE_BYTES);
     let mut is_entry = true;
     let mut authored = BTreeMap::new();
     let graph = project_sources::load_with_reader(&root, &context, &configuration, |path, opened| {
-        // Only the selected authored evaluator needs the closed-site limit.
-        // In the P1 lane, imported declarations (including the real stdlib)
-        // follow the same authorized source reads as ordinary project Build.
-        if wasip1 && !std::mem::replace(&mut is_entry, false) {
-            return project_sources::read_source(path, opened).map_err(ClosedComptimePlanError::Project);
-        }
-        let (revision, text) = project_sources::read_bounded_regular_source(path, opened, remaining)
+        // The selected closed evaluator retains its per-entry ceiling.
+        // Every ordinary reachable source consumes the same graph budget.
+        let limit = if std::mem::take(&mut is_entry) {
+            remaining.min(CLOSED_COMPTIME_MAX_SOURCE_BYTES)
+        } else { remaining };
+        let (revision, text) = project_sources::read_bounded_regular_source(path, opened, limit)
             .map_err(ClosedComptimePlanError::Project)?;
         remaining -= text.len();
         Ok((revision, text))

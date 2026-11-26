@@ -97,14 +97,17 @@ pub fn prepare_comptime_stdout_evaluator(
 }
 
 /// Emit the actual selected body and its compiler-owned stdout entry for
-/// an explicitly selected WASI preview1 command. No p2 claim or launch.
+/// an explicitly selected WASI preview1 command. Its authored byte budget
+/// applies across the supplied graph. No p2 claim or launch.
 pub fn prepare_comptime_wasip1_stdout_evaluator(
     sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<wosy_syntax::SourceIdentity>,
     id: &str,
+    max_authored_source_bytes: usize,
     max_stdout: usize,
 ) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
-    prepare_evaluator(sources, initialization_order, id, ScalarTargetLayout::WASM32, Delivery::Wasip1(max_stdout))
+    prepare_evaluator(sources, initialization_order, id, ScalarTargetLayout::WASM32,
+        Delivery::Wasip1 { max_authored_source_bytes, max_stdout })
 }
 
 fn prepare_evaluator(
@@ -120,7 +123,11 @@ fn prepare_evaluator(
 }
 
 #[derive(Clone, Copy)]
-enum Delivery { Observe, Detached, Wasip1(usize) }
+enum Delivery {
+    Observe,
+    Detached,
+    Wasip1 { max_authored_source_bytes: usize, max_stdout: usize },
+}
 
 fn prepare(
     sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
@@ -135,15 +142,15 @@ fn prepare(
         return Err(Error::UnsupportedLayout);
     }
     let Some((entry, _)) = sources.first() else { return Err(Error::InvalidParse); };
-    let mut bytes = 0usize;
+    let mut remaining = match delivery {
+        Delivery::Wasip1 { max_authored_source_bytes, .. } => max_authored_source_bytes,
+        _ => CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    };
     for (ordinal, (fresh, _)) in sources.iter().enumerate() {
         if !fresh.result().is_valid() { return Err(Error::InvalidParse); }
-        // For P1 the closed body is selected from the entry; imported
-        // declarations are read through the ordinary project graph.
-        if ordinal == 0 || !matches!(delivery, Delivery::Wasip1(_)) {
-            bytes = bytes.saturating_add(fresh.result().text.len());
-            if bytes > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
-        }
+        let size = fresh.result().text.len();
+        if ordinal == 0 && size > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
+        remaining = remaining.checked_sub(size).ok_or(Error::SourceLimit)?;
     }
     let parsed = (*entry).result();
     let qualify = |span| SourceSpan::new(parsed.source.clone(), span);
@@ -264,7 +271,7 @@ fn prepare(
         };
         (&binding.declared_type, literal_body)
     };
-    let mut text_fields = matches!(delivery, Delivery::Wasip1(_)).then(HashMap::new);
+    let mut text_fields = matches!(delivery, Delivery::Wasip1 { .. }).then(HashMap::new);
     let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), &mut text_fields, 0)
         .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
     let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, value));
@@ -275,7 +282,7 @@ fn prepare(
         } else {
             emit_scalar_build_project_artifact_llvm(&build)
         }.map_err(Error::Emitter)?),
-        Delivery::Wasip1(max_stdout) => {
+        Delivery::Wasip1 { max_stdout, .. } => {
             let text_fields = text_fields.expect("selected WASI output shape");
             let facts = body_facts.expect("selected closed WASI body");
             if !text_fields.is_empty() && (facts.allocates || facts.has_null) {

@@ -604,7 +604,7 @@ Report result = comptime prepare {
 "#;
     fs::write(&source, text).unwrap();
     let select = |budget| prepare_project_comptime_wasip1_stdout_evaluator(
-        &project, "app", "override", "prepare", budget,
+        &project, "app", "override", "prepare", 1 << 16, budget,
     );
     for manifest in [MANIFEST.to_owned(), MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip2\"")] {
         fixture.manifest(&manifest);
@@ -672,7 +672,7 @@ fn wasip1_stdout_captures_authored_text_from_real_standard_library() {
     fixture.manifest(&format!("{}\n[dependencies.std]\npath=\"../std\"\n",
         MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")));
     let assemble = |maximum| prepare_project_comptime_wasip1_stdout_evaluator(
-        &project, "app", "override", "prepare", maximum,
+        &project, "app", "override", "prepare", 1 << 17, maximum,
     );
     let ok = ExitStatus::from_raw(0);
     let aggregate = r#"%%start
@@ -744,8 +744,15 @@ std.utf8[2] result = comptime prepare {
         };
         assert_eq!(actual_text, "olá\n\t\r\"ok\\\0".as_bytes());
     }
+    // Each of these checked-in/imported sources is individually below
+    // the caller's cap; an additional reachable regular file is too large
+    // for what remains after the genuine std sources and the entry.
+    fs::write(standard.join("src/extra.w"), format!("%%start\n{}\n%%end\n", " ".repeat(1 << 16))).unwrap();
+    fs::write(&source, direct.replacen("%%start\n", "%%start\nextra = namespace std \"extra.w\";\n", 1)).unwrap();
+    assert!(matches!(assemble(256), Err(ClosedComptimePlanError::Project(message))
+        if message == "preview source exceeds the authored byte budget"));
     // The old authored-site cap still applies to the exact entry file,
-    // not to the ordinary installed dependency bytes proved above.
+    // not to the individually larger std bootstrap proved above.
     fs::write(&source, format!("{}{}", " ".repeat(1 << 16), direct)).unwrap();
     assert!(matches!(assemble(256), Err(ClosedComptimePlanError::Project(message))
         if message == "preview source exceeds the authored byte budget"));
