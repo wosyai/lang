@@ -392,7 +392,9 @@ async fn direct_evaluator_binds_the_call_to_the_exact_leased_singleton_root() {
     Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
 }
 
-fn emitted_startup(projection: RootedDirectStartupComptimeProjection) -> RootedDirectStartupComptimePlan {
+fn emitted_startup<const ARITY: usize>(
+    projection: RootedDirectStartupComptimeProjection<ARITY>,
+) -> RootedDirectStartupComptimePlan<ARITY> {
     match projection {
         RootedDirectStartupComptimeProjection::Emitted(plan) => plan,
         RootedDirectStartupComptimeProjection::Refused(reason) => panic!("unexpected startup plan refusal: {reason:?}"),
@@ -474,6 +476,94 @@ async fn startup_plan_retains_ordered_old_root_and_checks_total_egress() {
         assert!(matches!(current.project_direct_function_comptime(request("value", layout)).await.unwrap(),
             RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
                 ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. }))));
+    }
+    assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
+    drop((retained, current));
+    drop((worker, client));
+    Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paired_startup_plan_retains_distinct_ordered_tuples_and_checks_total_egress() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let original_text = r#"%%start
+# WHY: prova de dois argumentos ☕
+u32(u32, u32) solve = fn(left, right) { comptime value { right ^ left } };
+u32 first = solve(7, 9);
+u32 reversed = solve(9, 7);
+u32 repeated = solve(7, 9);
+u32 changed = solve(7, 11);
+%%end
+"#;
+    let updated_text = original_text.replace("solve(7, 11)", "solve(7, 13)");
+    fs::write(project.join("src/main.w"), original_text).unwrap();
+    let mut client = client(&project);
+    let store = Arc::new(SourceStore::open(&fixture.0.join("daemon"), 1 << 20).unwrap());
+    let original = publish(&mut client, &store).await;
+    let worker = worker(&store);
+    let retained = worker.open_build_diagnostics(original.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    fs::write(project.join("src/main.w"), &updated_text).unwrap();
+    let updated = publish(&mut client, &store).await;
+    let current = worker.open_build_diagnostics(updated.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
+    assert_ne!(original.root, updated.root);
+
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let historical = emitted_startup(retained.project_direct_pair_startup_comptime(request("value", layout)).await.unwrap());
+        let fresh = emitted_startup(current.project_direct_pair_startup_comptime(request("value", layout)).await.unwrap());
+        for (plan, root, text, last) in [(&historical, original.root, original_text, 11),
+                                        (&fresh, updated.root, updated_text.as_str(), 13)] {
+            assert_eq!(plan.source_root(), root);
+            assert_eq!(plan.target(), "app");
+            assert_eq!(plan.profile(), "dev");
+            assert_eq!(plan.id(), "value");
+            assert_eq!(plan.evaluator_layout(), layout);
+            let [a, b, repeated, c] = plan.calls() else { panic!("four exact startup calls"); };
+            assert_eq!([a.evaluator_index(), b.evaluator_index(), repeated.evaluator_index(), c.evaluator_index()],
+                [0, 1, 0, 2]);
+            for (call, expected) in [(a, [7, 9]), (b, [9, 7]), (repeated, [7, 9]), (c, [7, last])] {
+                let facts = call.facts();
+                assert_eq!(facts.inputs().each_ref().map(|input| input.value()), expected.map(DirectComptimeArgument::U32));
+                assert_eq!(facts.result(), &ScalarType::U32);
+                assert_eq!(facts.function(), a.facts().function());
+                assert_eq!(facts.site(), a.facts().site());
+                for (input, value) in facts.inputs().iter().zip(expected) {
+                    let span = &input.argument().range;
+                    assert_eq!(&text[span.start as usize..span.end as usize], value.to_string());
+                }
+            }
+            let [first, reversed, changed] = plan.evaluators() else { panic!("three distinct typed tuples"); };
+            for evaluator in plan.evaluators() {
+                assert_eq!(evaluator.digest(), NodeId(*blake3::hash(evaluator.bytes()).as_bytes()));
+            }
+            assert_eq!(first.bytes(), reversed.bytes());
+            assert_eq!(first.digest(), reversed.digest());
+            assert_ne!(first.digest(), changed.digest());
+        }
+        assert_eq!(historical.compiler_image(), fresh.compiler_image());
+        assert_ne!(historical.authored_cst(), fresh.authored_cst());
+        assert_eq!(historical.evaluators()[0].bytes(), fresh.evaluators()[0].bytes());
+        assert_eq!(historical.evaluators()[1].bytes(), fresh.evaluators()[1].bytes());
+        assert_ne!(historical.evaluators()[2].digest(), fresh.evaluators()[2].digest());
+
+        // Identical bytes for the first two tuples still occupy two distinct
+        // slots. A budget that counted only unique digests would admit this.
+        let total: usize = fresh.evaluators().iter().map(|part| part.bytes().len()).sum();
+        let mut tight = request("value", layout);
+        tight.output_bytes = total - fresh.evaluators()[1].bytes().len();
+        assert!(current.project_direct_pair_startup_comptime(tight).await.unwrap_err().to_string()
+            .contains("output byte budget"));
+        let mut exact = request("value", layout);
+        exact.output_bytes = total;
+        let complete = emitted_startup(current.project_direct_pair_startup_comptime(exact).await.unwrap());
+        assert_eq!(complete.source_root(), updated.root);
+        assert_eq!(complete.evaluators().iter().map(|part| part.bytes()).collect::<Vec<_>>(),
+            fresh.evaluators().iter().map(|part| part.bytes()).collect::<Vec<_>>());
+        assert!(matches!(current.project_direct_startup_comptime(request("value", layout)).await.unwrap(),
+            RootedDirectStartupComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
+                ClosedComptimeRejection::Unsupported {
+                    feature: "comptime accepts one audited eager scalar operator with one formal read", ..
+                }))));
     }
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
     drop((retained, current));

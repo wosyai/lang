@@ -8,10 +8,10 @@ use super::{
 };
 use surrealkv::{Mode, Transaction};
 use wosy_compiler::{
-    derive_closed_comptime_fragment, derive_direct_function_comptime_fragment, derive_direct_startup_comptime_plan,
+    derive_closed_comptime_fragment, derive_direct_function_comptime_fragment,
     derive_first_source_initializer_comptime, ClosedComptimeFragment, ClosedComptimeRejection, ComptimeParameter,
-    DirectStartupComptimeUse, InspectedDirectComptimeCall,
-    ComptimeParameterRejection, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    ComptimeParameterRejection, DirectStartupComptimePlan, DirectStartupComptimeUse, InspectedDirectComptimeCall,
+    ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
 use wosy_syntax::{FreshParseResult, SourceSpan};
@@ -106,15 +106,15 @@ pub enum RootedDirectFunctionComptimeProjection {
 /// One source-authorized in-memory plan. Its ordered calls and evaluator
 /// indices are only meaningful together, for this exact root and profile.
 #[derive(Debug)]
-pub struct RootedDirectStartupComptimePlan {
+pub struct RootedDirectStartupComptimePlan<const ARITY: usize = 1> {
     source: RootedComptimeIdentity,
     id: String,
     evaluator_layout: ScalarTargetLayout,
-    calls: Vec<DirectStartupComptimeUse>,
+    calls: Vec<DirectStartupComptimeUse<ARITY>>,
     evaluators: Vec<RootedStartupComptimeEvaluator>,
 }
 
-impl RootedDirectStartupComptimePlan {
+impl<const ARITY: usize> RootedDirectStartupComptimePlan<ARITY> {
     pub fn source_root(&self) -> NodeId { self.source.root }
     pub fn authored_cst(&self) -> NodeId { self.source.authored_cst }
     pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
@@ -122,7 +122,7 @@ impl RootedDirectStartupComptimePlan {
     pub fn profile(&self) -> &str { &self.source.profile }
     pub fn id(&self) -> &str { &self.id }
     pub fn evaluator_layout(&self) -> ScalarTargetLayout { self.evaluator_layout }
-    pub fn calls(&self) -> &[DirectStartupComptimeUse] { &self.calls }
+    pub fn calls(&self) -> &[DirectStartupComptimeUse<ARITY>] { &self.calls }
     pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
 }
 
@@ -138,10 +138,14 @@ impl RootedStartupComptimeEvaluator {
 }
 
 #[derive(Debug)]
-pub enum RootedDirectStartupComptimeProjection {
+pub enum RootedDirectStartupComptimeProjection<const ARITY: usize = 1> {
     Refused(RootedClosedComptimeRefusal),
-    Emitted(RootedDirectStartupComptimePlan),
+    Emitted(RootedDirectStartupComptimePlan<ARITY>),
 }
+
+pub(super) type StartupComptimeDerivation<const ARITY: usize> =
+    fn(&FreshParseResult, &str, ScalarTargetLayout)
+        -> std::result::Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection>;
 
 type SelectedComptime<T> = std::result::Result<T, RootedClosedComptimeRefusal>;
 
@@ -221,11 +225,11 @@ impl SourceStore {
         })
     }
 
-    pub(super) fn project_direct_startup_comptime_for_lease(
-        &self, lease: &SourceLease, request: RootedClosedComptimeRequest,
-    ) -> Result<RootedDirectStartupComptimeProjection> {
+    pub(super) fn project_direct_startup_comptime_for_lease<const ARITY: usize>(
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest, derive: StartupComptimeDerivation<ARITY>,
+    ) -> Result<RootedDirectStartupComptimeProjection<ARITY>> {
         let answer = self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
-            let plan = match derive_direct_startup_comptime_plan(&input.fresh, &request.id, request.evaluator_layout) {
+            let plan = match derive(&input.fresh, &request.id, request.evaluator_layout) {
                 Ok(plan) => plan,
                 Err(reason) => return Ok(Err(compiler_refusal(reason))),
             };

@@ -1,6 +1,7 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::SourceLease, rooted_comptime::SiteScope, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    retention_plan::SourceLease, rooted_comptime::{SiteScope, StartupComptimeDerivation},
+    source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::{QueryCancellation, QueryWorker},
     PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedClosedComptimeProjection,
     RootedClosedComptimeRequest, RootedDirectFunctionComptimeProjection, RootedDirectStartupComptimeProjection,
@@ -10,7 +11,7 @@ use super::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wosy_compiler::Diagnostic;
+use wosy_compiler::{derive_direct_pair_startup_comptime_plan, derive_direct_startup_comptime_plan, Diagnostic};
 use wosy_project::packages::InstalledGitBase;
 use wosy_protocol::{
     BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
@@ -179,11 +180,25 @@ impl BuildDiagnosticSession<'_> {
     pub async fn project_direct_startup_comptime(
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedDirectStartupComptimeProjection> {
+        self.project_direct_startup_comptime_using(request, derive_direct_startup_comptime_plan).await
+    }
+
+    /// The same local leased plan projection for two literal formals. Unequal
+    /// typed tuples remain distinct even when their evaluator LLVM is equal.
+    pub async fn project_direct_pair_startup_comptime(
+        &self, request: RootedClosedComptimeRequest,
+    ) -> Result<RootedDirectStartupComptimeProjection<2>> {
+        self.project_direct_startup_comptime_using(request, derive_direct_pair_startup_comptime_plan).await
+    }
+
+    async fn project_direct_startup_comptime_using<const ARITY: usize>(
+        &self, request: RootedClosedComptimeRequest, derive: StartupComptimeDerivation<ARITY>,
+    ) -> Result<RootedDirectStartupComptimeProjection<ARITY>> {
         request.check_selector_bytes()?;
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
         self.worker.spawn_reserved(slot, move |store| {
-            store.project_direct_startup_comptime_for_lease(&lease, request)
+            store.project_direct_startup_comptime_for_lease(&lease, request, derive)
         }).await?
     }
 
