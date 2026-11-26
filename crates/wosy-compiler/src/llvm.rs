@@ -729,10 +729,6 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
     if root_module.target_layout != ScalarTargetLayout::WASM32 {
         return Err("Wasm root exports require a Wasm artifact".into());
     }
-    let direct = |ty: &ScalarType| matches!(
-        ty, ScalarType::I32 | ScalarType::U32 | ScalarType::I64 | ScalarType::U64
-            | ScalarType::F32 | ScalarType::F64
-    );
     let mut root_functions = requested
         .values()
         .map(|name| (name.as_str(), None))
@@ -749,12 +745,7 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
     }
     let mut exports = Vec::with_capacity(requested.len());
     for (label, authored) in requested {
-        let mut bytes = label.bytes();
-        if !bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
-            || matches!(label.as_str(), "main" | "_start" | "memory")
-            || label.starts_with("__") || label.starts_with("wosy_")
-        {
+        if !valid_wasm_link_label(label) {
             return Err(format!("invalid or reserved Wasm root export label {label:?}"));
         }
         let (function, ambiguous) = root_functions[authored.as_str()].ok_or_else(|| {
@@ -765,14 +756,7 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
         {
             return Err(format!("Wasm root export {label:?} needs an unambiguous concrete declaration"));
         }
-        let ScalarType::Callable { outputs, parameters } = &function.signature else {
-            return Err(format!("Wasm root export {label:?} is not callable"));
-        };
-        if !parameters.iter().all(direct) || !match outputs.outputs.as_slice() {
-            [] => true,
-            [output] => output.ty == ScalarType::Unit || direct(&output.ty),
-            _ => false,
-        } {
+        if !direct_wasm_export_signature(&function.signature) {
             return Err(format!("Wasm root export {label:?} needs only direct scalar ABI values"));
         }
         exports.push(WasmRootExport {
@@ -785,9 +769,55 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
         emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)
     } else {
         emit_scalar_build_project_with_policy(
-            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports,
+            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, Some(&exports),
         )
     }
+}
+
+fn valid_wasm_link_label(label: &str) -> bool {
+    let mut bytes = label.bytes();
+    bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        && !matches!(label, "main" | "_start" | "memory")
+        && !label.starts_with("__") && !label.starts_with("wosy_")
+}
+
+fn direct_wasm_export_signature(signature: &ScalarType) -> bool {
+    let ScalarType::Callable { outputs, parameters } = signature else { return false };
+    let direct = |ty: &ScalarType| matches!(ty, ScalarType::I32 | ScalarType::U32
+        | ScalarType::I64 | ScalarType::U64 | ScalarType::F32 | ScalarType::F64);
+    parameters.iter().all(direct) && match outputs.outputs.as_slice() {
+        [] => true,
+        [output] => output.ty == ScalarType::Unit || direct(&output.ty),
+        _ => false,
+    }
+}
+
+// The release bounds/null helper must not change the linker names of an otherwise
+// single-source Wasm app. Aliases retain the qualified identity and add no call.
+fn restore_singleton_wasm_link_names<'ctx>(
+    context: &'ctx Context, module: &Module<'ctx>, root: &ScalarModule,
+    functions: &BTreeMap<String, FunctionValue<'ctx>>,
+) -> Result<(), String> {
+    use inkwell::{types::AsTypeRef, values::AsValueRef};
+    for item in &root.items {
+        let ScalarItem::Function(function) = item else { continue };
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+            || !valid_wasm_link_label(&function.name) || !direct_wasm_export_signature(&function.signature)
+        { continue; }
+        let target = functions[&project_function_name(&root.source, &function.name)];
+        if target.get_linkage() != Linkage::External || target.get_call_conventions() != 0
+            || target.get_type() != function_type(context, &function.signature, ScalarTargetLayout::WASM32)?
+        { continue; }
+        let label = std::ffi::CString::new(function.name.as_str()).expect("validated Wasm label");
+        // SAFETY: target is defined in this module, the type is taken from target,
+        // function address space is the default (0), and LLVM copies the label.
+        unsafe {
+            inkwell::llvm_sys::core::LLVMAddAlias2(module.as_mut_ptr(), target.get_type().as_type_ref(),
+                0, target.as_value_ref(), label.as_ptr());
+        }
+    }
+    Ok(())
 }
 
 fn emit_wasm_root_export_wrappers<'ctx>(
@@ -1206,7 +1236,7 @@ pub fn emit_scalar_project_llvm(
         &build,
         EmissionPolicy::RawCompatibility,
         PartitionMetadata::Full,
-        &[],
+        None,
     )
 }
 
@@ -1217,7 +1247,7 @@ pub fn emit_scalar_build_project_llvm(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::Full,
-        &[],
+        None,
     )
 }
 
@@ -1234,7 +1264,7 @@ pub fn emit_scalar_build_project_artifact_llvm(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
-        &[],
+        None,
     )
 }
 
@@ -1242,7 +1272,7 @@ fn emit_scalar_build_project_with_policy(
     validation: &ScalarBuildValidation<'_>,
     policy: EmissionPolicy,
     metadata: PartitionMetadata,
-    exports: &[WasmRootExport<'_>],
+    exports: Option<&[WasmRootExport<'_>]>,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -1279,7 +1309,7 @@ fn emit_project_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
-    exports: &[WasmRootExport<'_>],
+    exports: Option<&[WasmRootExport<'_>]>,
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -1402,7 +1432,7 @@ fn emit_project_llvm<'a>(
                 let name = project_function_name(&source_module.source, &function.name);
                 if root_source == Some(&source_module.source) {
                     if let Some((owner, sites)) = root_array_uses.and_then(|uses| uses.accessor_sites.get(&function.name_span)) {
-                        if exports.iter().any(|export| export.symbol == name) {
+                        if exports.unwrap_or_default().iter().any(|export| export.symbol == name) {
                             return Err("root-owned runtime array accessors cannot be exported".into());
                         }
                         root_array_accessors.insert(name.clone(), (wosy_syntax::SourceSpan::new(source_module.source.clone(), *owner), sites.clone()));
@@ -1871,8 +1901,17 @@ fn emit_project_llvm<'a>(
         &layouts,
         target_layout,
     )?;
-    if !exports.is_empty() {
+    if let Some(exports) = exports {
         emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
+    } else if matches!(metadata, PartitionMetadata::ExternsOnly) && target_layout == ScalarTargetLayout::WASM32 {
+        if let (Some(leaf), [first, second]) = (
+            project_build.and_then(|v| v.prepared().checked_access_source()), project.modules.as_slice(),
+        ) {
+            let root = if &second.source == leaf { Some(first) } else if &first.source == leaf { Some(second) } else { None };
+            if let Some(root) = root {
+                restore_singleton_wasm_link_names(&context, &module, root, &functions)?;
+            }
+        }
     }
     finish_partition(
         ManuallyDrop::into_inner(module),

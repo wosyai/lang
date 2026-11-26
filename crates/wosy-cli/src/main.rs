@@ -1612,6 +1612,15 @@ unit() stop = fn { core.system_panic(); };
             compile_project(&project.root, &project, &configuration, ScalarTargetLayout::WASM32).unwrap();
         assert_eq!(baseline_observations, observations);
         assert!(!baseline.contains("@observe_value") && !baseline.contains("@stop_now"));
+        // A toolchain-only leaf keeps the original app link names without
+        // exposing toolchain helpers. A configured export table replaces this surface.
+        assert!(baseline.lines().any(|line| line.starts_with("@observe = alias i64 (i64), ptr @wosy_fn__")));
+        assert!(baseline.lines().any(|line| line.starts_with("@stop = alias void (), ptr @wosy_fn__")));
+        assert!(!baseline.contains("@check_index_in_extent = alias "));
+        assert!(!llvm.contains("@observe = alias "));
+        let (empty, _) = compile_project_with_root_exports(&project.root, &project, &configuration,
+            ScalarTargetLayout::WASM32, Some(&BTreeMap::new())).unwrap();
+        assert!(!empty.contains("@observe = alias "));
         let directory = std::env::var_os("WOSY_CONFIGURED_WEB_IR_DIR");
         let path = directory.as_ref().map_or_else(|| project.root.join("partition.ll"),
             |directory| std::path::PathBuf::from(directory).join("partition.ll"));
