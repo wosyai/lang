@@ -7072,14 +7072,15 @@ impl ProjectCallSiteResults {
         &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
         declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, rank_self: Option<(&'a SourceIdentity, usize, ByteSpan)>,
     ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
-        if !(1..=3).contains(&sources.len()) || self.modules.len() != sources.len()
-            || sources.first().copied() != Some(caller)
+        if !(1..=super::checker_flow::MAX_ACTUAL_CALL_DEPTH).contains(&sources.len())
+            || self.modules.len() != sources.len() || sources.first().copied() != Some(caller)
             || sources.iter().any(|source| source.project != caller.project || source.package != caller.package)
-            || sources.iter().copied().collect::<HashSet<_>>().len() != sources.len()
         { return None; }
+        let source_set = sources.iter().copied().collect::<HashSet<_>>();
+        if source_set.len() != sources.len() { return None; }
         let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), Vec::new()))
             .collect::<HashMap<_, _>>();
-        if rank_self.is_some_and(|(owner, _, span)| !sources.contains(&owner) || !startup_uses.contains_key(&(owner, span))) {
+        if rank_self.is_some_and(|(owner, _, span)| !source_set.contains(owner) || !startup_uses.contains_key(&(owner, span))) {
             return None;
         }
         let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
@@ -7091,7 +7092,7 @@ impl ProjectCallSiteResults {
         use super::checker_flow::charge_call_work;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
-            if !sources.contains(&&module.initialization.source) { return None; }
+            if !source_set.contains(&module.initialization.source) { return None; }
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
             charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
             if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }

@@ -10418,7 +10418,8 @@ impl PreparedScalarOrderedCheck {
         };
         if proof_free { return self.into_startup_authored_owner()?.run_report(cap); }
         match self.owner {
-            PreparedConfiguredCheck::Named { owner, startup_count: 1 | 2 } =>
+            PreparedConfiguredCheck::Named { owner, startup_count }
+                if (1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) =>
                 run_private_named_after_startup(&owner, self.scope, Some(cap), None)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
@@ -10435,7 +10436,8 @@ impl PreparedScalarOrderedCheck {
     #[doc(hidden)]
     pub fn supports_private_proof_authored_dependency(&self) -> bool {
         match &self.owner {
-            PreparedConfiguredCheck::Named { owner, startup_count: 1 | 2 } =>
+            PreparedConfiguredCheck::Named { owner, startup_count }
+                if (1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) =>
                 owner.context.is_none() && owner.proofs.values().any(|catalog| !catalog.definitions.is_empty()),
             PreparedConfiguredCheck::Contextual { startup_count: 1, .. }
                 | PreparedConfiguredCheck::Mixed { startup_count: 2 | 3, .. } => true,
@@ -10946,8 +10948,8 @@ fn run_startup_authored_path(
     owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
-    let count = if proof_free_scalars.is_some() { project.initialization_order.len() }
-        else if qualified { 2 } else { 1 };
+    let count = if proof_free_scalars.is_some() || qualified { project.initialization_order.len() }
+        else { 1 };
     if (!named.is_empty() && project.modules.len() != count)
         || named.iter().any(|(_, sites)| sites.is_empty())
         || ranked.is_some_and(|(_, sites)| sites.is_empty() || named.len() > 1 || (qualified && !named.is_empty()))
@@ -11554,10 +11556,15 @@ fn run_private_named_after_startup(
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
     let (project, calls) = owner.prepared.parts();
     let startup_count = project.initialization_order.len();
-    let qualified = startup_count == 2;
-    if !(1..=2).contains(&startup_count) || project.modules.len() != startup_count { return Err(ProjectCheck::Unsupported); }
+    let qualified = startup_count > 1;
+    let wide_bare = startup_count > 2;
+    if !(1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) || project.modules.len() != startup_count
+        || (wide_bare && expected.is_some())
+    { return Err(ProjectCheck::Unsupported); }
+    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    if root != &owner.source { return Err(ProjectCheck::Unsupported); }
     let catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
-    let provider = if qualified {
+    let provider = if startup_count == 2 {
         Some(project.modules.iter().find(|module| module.source != owner.source)
             .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
     } else { None };
@@ -11565,7 +11572,7 @@ fn run_private_named_after_startup(
     let mut catalog_work = 0;
     for (proof_source, catalog) in catalogs {
         super::checker_flow::charge_call_work(&mut catalog_work, catalog.definitions.len()).ok_or(ProjectCheck::Unsupported)?;
-        let is_provider = Some(proof_source) == provider;
+        let is_provider = proof_source != root && ordinals.contains_key(proof_source);
         if (proof_source != &owner.source && !is_provider) || proof_source.project != owner.source.project
             || proof_source.package != owner.source.package
         { return Err(ProjectCheck::Unsupported); }
@@ -11588,7 +11595,7 @@ fn run_private_named_after_startup(
             return pointer_proof::Plan::prepare(proof_source, selected)?.run_capped(owner, scope, cap);
         }
         if array_quantifier::is_array_target(&selected) {
-            if expected.is_some() { return Err(ProjectCheck::Unsupported); }
+            if expected.is_some() || wide_bare { return Err(ProjectCheck::Unsupported); }
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
             arrays.extend(array_quantifier::ArrayProof::prepare(proof_source, selected, &mut array_work)?);
             continue;
@@ -11605,7 +11612,7 @@ fn run_private_named_after_startup(
             || !plan.function.overload_arms.is_empty()
         { return Err(ProjectCheck::Unsupported); }
         if plan.typed.measure.is_some() {
-            if ranked.is_some() || (if qualified { Some(plan.proof_source) != provider }
+            if wide_bare || ranked.is_some() || (if qualified { Some(plan.proof_source) != provider }
                 else { plan.proof_source != &owner.source || plan.target.0 != 0 })
                 || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
             { return Err(ProjectCheck::Unsupported); }
@@ -11643,7 +11650,8 @@ fn run_private_named_after_startup(
     if (plans.is_empty() && ranked.is_none()) || (ranked.is_some() && plans.len() > 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
     { return Err(ProjectCheck::Unsupported); }
-    let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
+    let incoming = calls.owned_direct_startup_callable_uses_in(root,
+        &project.initialization_order.iter().collect::<Vec<_>>(),
         plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
         ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
     let ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
@@ -11680,8 +11688,6 @@ fn run_private_named_after_startup(
     if expected.is_some_and(|expected| expected != mode) { return Err(ProjectCheck::Unsupported); }
     let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, startup_count, &owner.source)?;
     if !authored_roots.is_empty() && (expected.is_some() || (ranked.is_some() && !plans.is_empty())) { return Err(ProjectCheck::Unsupported); }
-    let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
-    if root != &owner.source { return Err(ProjectCheck::Unsupported); }
     // The exact incoming-edge census above already refused lexical uses
     // of named targets. This ordinary graph cannot depend on theorem
     // results, so an independent proof diagnostic never becomes a path.
@@ -11690,9 +11696,9 @@ fn run_private_named_after_startup(
     let authored = if cap.is_some() { callable_roots.as_slice() } else { &[] };
     // Legacy dormant observers walk declaration order, not proof clause
     // order. Preserve it even when typed goals were authored in reverse.
-    plans.sort_unstable_by_key(|plan| (
-        usize::from(plan.proof_source != &owner.source), plan.target.1,
-    ));
+    let owner_order = project.initialization_order.iter().enumerate()
+        .map(|(position, source)| (source, position)).collect::<HashMap<_, _>>();
+    plans.sort_unstable_by_key(|plan| (owner_order[plan.proof_source], plan.target.1));
     let mut observer = if let [first, rest @ ..] = plans.as_slice() {
         let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
         for plan in rest {

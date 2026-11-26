@@ -3388,6 +3388,60 @@ main_artifact = "main"
                 assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !state.exists());
                 fs::remove_file(&shared_source).unwrap();
 
+                let additional_source = root.join("src/extra.w");
+                let roster_root = format!(r#"%%start
+                    lib = namespace app "shared.w";
+                    second_lib = namespace app "extra.w";
+                    u8 actual_left = lib.echo(3);
+                    u8 actual_right = second_lib.echo(5);
+                    core.require(actual_left == 3, {unused_output});
+                    core.require(actual_right == 5, {unused_output});
+                    core.require(false, {{ .stdout = "root"; .stderr = "[root]"; .code = 23; .files = []; }});
+                %%end"#);
+                let provider = |output: &str| format!(r#"%%start
+                    u8(u8) echo = fn(value) {{ value }};
+                    proof exact for echo(entry) -> (out) where (entry <= 5) ensures (out == 8) {{}}
+                    core.require(false, {output});
+                %%end"#);
+                fs::write(&source, &roster_root).unwrap();
+                fs::write(&shared_source, provider(&first)).unwrap();
+                fs::write(&additional_source, provider(&second)).unwrap();
+                let incumbent = legacy();
+                let expected = incumbent.outcome.as_ref().unwrap();
+                assert_eq!(expected.directives.len(), 3);
+                assert_eq!(expected.diagnostics.len(), 2);
+                let complete = terminal(std::slice::from_ref(&incumbent), scope, false);
+                assert_eq!(complete.0, Ok(19));
+                assert_eq!(complete.1, b"firstsecondroot");
+                assert_eq!(files(), both_files);
+                clean();
+                for cap in [1, 2, 3, 4] {
+                    let receipts = selected(cap);
+                    let actual = receipts[0].outcome.as_ref().unwrap();
+                    assert_eq!(actual.directives, expected.directives[..cap.min(3)]);
+                    assert_eq!(actual.directives.iter().map(|item| item.source.path.as_str()).collect::<Vec<_>>(),
+                        ["src/shared.w", "src/extra.w", "src/main.w"][..cap.min(3)]);
+                    assert_eq!(actual.diagnostics.len(), 2);
+                    for (diagnostic, (path, argument, returned)) in actual.diagnostics.iter().zip([
+                        ("src/shared.w", "lib.echo(3)", 3), ("src/extra.w", "second_lib.echo(5)", 5),
+                    ]) {
+                        assert_eq!(diagnostic.proof.source.path, path);
+                        assert_eq!(diagnostic.invocation.call.source.path, "src/main.w");
+                        let span = diagnostic.invocation.call.range;
+                        assert_eq!(&roster_root[span.start as usize..span.end as usize], argument);
+                        assert_eq!(diagnostic.invocation.returned, returned.into());
+                    }
+                    let observed = terminal(&receipts, scope, false);
+                    match cap {
+                        1 => { assert_eq!(observed.0, Ok(1)); assert_eq!(observed.1, b"first"); assert_eq!(files(), first_file); }
+                        2 => { assert_eq!(observed.0, Ok(19)); assert_eq!(observed.1, b"firstsecond"); assert_eq!(files(), both_files); }
+                        _ => { assert_eq!(observed, complete); assert_eq!(files(), both_files); }
+                    }
+                    clean();
+                }
+                fs::remove_file(&shared_source).unwrap();
+                fs::remove_file(&additional_source).unwrap();
+
                 let aggregate = format!(r#"%%start
                     u8[2]() make = fn {{ [7, 1] }};
                     proof cells for make() -> (items)
