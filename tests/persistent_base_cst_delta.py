@@ -12,6 +12,26 @@ manifest = (Path(__file__).parent /
             "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
 manifest = manifest.replace("categories = []", 'categories = ["WHY"]')
 
+manifest += """
+[builders.llvm-native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.native"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[targets.app.artifacts.main.profiles.native]
+backend = "llvm"
+output = "native"
+builder = "llvm-native"
+run_runner = "native"
+
+[targets.app.profiles.native]
+main_artifact = "main"
+"""
+
 
 def call(project, store, *args, target="app", refusal=None):
     child = subprocess.run([example, project, store, "--persistent-source", target, *map(str, args)],
@@ -47,8 +67,9 @@ with tempfile.TemporaryDirectory() as temp:
     shared = "%%start\nu32 deliberately_shared_new_binding = 913;\n%%end\n"
     (pkg / "a.w").write_text(shared)
     (pkg / "b.w").write_text(shared)
-    (pkg / "note.w").write_text("%%start\n# WHY: nova anotação 🚀\nu32 note = 11;\n%%end\n")
-    updated = ('%%start\na = namespace std "a.w";\nb = namespace std "b.w";\n'
+    body = "".join(f"u32 detail{i} = {i};\n" for i in range(180))
+    (pkg / "note.w").write_text(f"%%start\n# WHY: nova anotação 🚀\nu32 note = 11;\n{body}%%end\n")
+    updated = ('%%start\n# WHY: revisão atualizada 🚀\na = namespace std "a.w";\nb = namespace std "b.w";\n'
                'stable = namespace std "stable.w";\nnote = namespace std "note.w";\n%%end\n')
     main.write_text(updated)
     candidate = call(project, store, "stage")
@@ -112,9 +133,17 @@ with tempfile.TemporaryDirectory() as temp:
     assert receipt["validated_files"] == 4 and not receipt["stale_attempt_rejected"]
     assert receipt["noncanonical_order_rejected"]
     assert (metadata_db.read_bytes(), nodes_db.read_bytes()) == snap
+    prepared = call(project, store, "proposal-preparation", root, attempt)["result"]["admission"]
+    assert prepared["validated_files"] == 4 and prepared["modules"] == 5 and prepared["unique_bodies"] == 4
+    assert prepared["declaration_bytes"] > 64 << 10
+    assert prepared["profiles"] == ["dev", "native"] and prepared["quota_and_passive_guard"]
+    assert (metadata_db.read_bytes(), nodes_db.read_bytes()) == snap
     again = call(project, store, "proposal-stale", root, attempt)
     assert again["pending"] == root and again["attempt"] > attempt
     assert again["result"]["admission"]["stale_attempt_rejected"]
+    reprepared = call(project, store, "proposal-preparation", root, again["attempt"])["result"]["admission"]
+    assert reprepared["identity"] != prepared["identity"]
+    assert reprepared["entry_projection"] == prepared["entry_projection"]
     call(project, store, "proposal", root, attempt, refusal="not the current source attempt")
     actual = call(project, store, "proposal-oracle", root, again["attempt"])
     assert (actual["selected"], actual["pending"], actual["attempt"]) == (selected["selected"], root, again["attempt"])
@@ -131,9 +160,14 @@ with tempfile.TemporaryDirectory() as temp:
     config_accept = call(project, store, "proposal-admission", config["pending"], config["attempt"])["result"]["admission"]
     assert config_accept["validated_files"] == 0 and config_accept["novel_records"] == 2
     assert config_accept["noncanonical_order_rejected"]
+    config_prepared = call(project, store, "proposal-preparation", config["pending"], config["attempt"])["result"]["admission"]
+    assert config_prepared["validated_files"] == 0
+    assert config_prepared["entry_projection"] == prepared["entry_projection"]
+    assert config_prepared["identity"] != reprepared["identity"]
     config_proposal = call(project, store, "proposal-oracle", config["pending"], config["attempt"])
     assert config_proposal["result"]["files"] == []
     assert config_proposal["result"]["oracle"]
     assert config_proposal["result"]["added"] == config_proposal["result"]["index"] > 0
     print(json.dumps({"changed": out, "admission": receipt, "config_only": config_proposal["result"],
-                      "config_admission": config_accept}))
+                      "config_admission": config_accept, "prepared": prepared,
+                      "same_bytes_new_attempt": reprepared, "config_prepared": config_prepared}))

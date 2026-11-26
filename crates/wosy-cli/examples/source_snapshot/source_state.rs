@@ -41,7 +41,8 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
-        "proposal" | "proposal-oracle" | "proposal-limited" | "proposal-admission" | "proposal-stale" => {
+        "proposal" | "proposal-oracle" | "proposal-limited" | "proposal-admission" | "proposal-stale"
+        | "proposal-preparation" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
             let generation = args.next().ok_or("expected fixture attempt")?.parse()?;
             let attempt = SourceAttempt::new(root, generation);
@@ -50,6 +51,10 @@ pub(super) async fn run(
             let encoded = encode_session_frame(&proposed)?;
             let admission = match mode.as_str() {
                 "proposal-admission" => Some(super::proposal_admission::verify(dir, binding, &encoded, None).await?),
+                "proposal-preparation" => {
+                    let full = client.replay(&target, ReplaySource::Pending)?.ok_or("expected pending source")?;
+                    Some(super::prepared_proposal::verify(project, dir, binding, &encoded, full.source).await?)
+                }
                 "proposal-stale" => {
                     assert!(client.abandon(&target, attempt)?);
                     let restaged = client.stage(&target)?.pending.ok_or("fixture did not restage")?;

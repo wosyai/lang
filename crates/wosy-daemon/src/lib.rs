@@ -59,14 +59,15 @@ pub use framed_session::BuildSessionEnd;
 pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 pub use pins::SourcePin;
 pub use project_declarations::{
-    ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
+    PreparedBaseModule, ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport,
+    ProjectDeclarationsView,
 };
 pub use prepared_project::{
     BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
-pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits};
+pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};
 
@@ -470,7 +471,7 @@ fn validate_snapshot(tx: &mut Transaction, root: NodeId, report: &mut PublishRep
 fn validate_snapshot_with(
     tx: &mut Transaction, root: NodeId, check_scope: impl FnOnce(&SourceConfig) -> Result<()>,
     mut check_file: impl FnMut(&mut Transaction, &FileEntry, &[String]) -> Result<()>,
-) -> Result<Index> {
+) -> Result<(Index, SourceConfig)> {
     // The root's closure has already passed the schema boundary.
     let top = read_node(tx, root)?;
     let schema = top.data.as_slice().try_into().map(|array: &[u8; 32]| *array)?;
@@ -533,7 +534,7 @@ fn validate_snapshot_with(
     if reachable.len() != index.files.len() {
         return Err("source index contains unreachable files".into());
     }
-    Ok(index)
+    Ok((index, config))
 }
 
 fn read_comments(tx: &Transaction, id: NodeId) -> Result<Vec<TypedComment>> {
@@ -740,20 +741,28 @@ fn file_source(file: &FileEntry) -> Result<SourceIdentity> {
 }
 
 fn read_cst(tx: &Transaction, root: NodeId) -> Result<CstNode> {
+    read_cst_with(tx, root, None)
+}
+
+fn read_cst_with(
+    tx: &Transaction, root: NodeId, mut work: Option<&mut source_proposal::CstWork>,
+) -> Result<CstNode> {
+    if let Some(work) = work.as_mut() { work.start_tree()?; }
     let mut green = GreenNodeBuilder::new();
-    let mut stack = vec![Some(root)];
+    let mut stack = vec![Some((root, 1))];
     while let Some(id) = stack.pop() {
-        let Some(id) = id else {
+        let Some((id, depth)) = id else {
             green.finish_node();
             continue;
         };
-        let node = read_node(tx, id)?;
+        let node = read_node_with(tx, id, |bytes| work.as_mut().map_or(Ok(()), |work| work.read(bytes)))?;
         let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
         match node.kind {
             Kind::Syntax => {
+                if let Some(work) = work.as_mut() { work.children(depth, node.children.len())?; }
                 green.start_node(kind);
                 stack.push(None);
-                stack.extend(node.children.into_iter().rev().map(Some));
+                stack.extend(node.children.into_iter().rev().map(|id| Some((id, depth + 1))));
             }
             Kind::Token => green.token(kind, token_text(&node)?),
             _ => return Err("invalid CST child".into()),

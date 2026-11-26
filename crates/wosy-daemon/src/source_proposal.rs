@@ -1,15 +1,18 @@
 //! Validate one trusted-adapter-bound base CST proposal without publishing it.
 use super::{
     child_edge, file_source, key, read_index, validate_file, validate_shape, validate_snapshot_with,
-    Expected, FileTree, Result, SourceStorageWorker, NODES,
+    project_declarations::UnpublishedDeclarations,
+    retention_plan::{PreparedAllocation, SourceLease, SourceRead, MAX_RETAINED_DECLARATION_BYTES},
+    Expected, FileTree, Index, PreparedBaseModule, Result, SourceStorageWorker, SourceStore, NODES,
 };
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use surrealkv::{Mode, Transaction};
 use wosy_protocol::{
-    imports_from_cst, partition_cst_files, BaseCstProposal, BaseCstProposalBinding, Kind, Node, NodeId,
-    BASE_CST_DELTA_VERSION,
+    imports_from_cst, partition_cst_files, BaseCstProposal, BaseCstProposalBinding, FileKey, Kind, Node,
+    NodeId, BASE_CST_DELTA_VERSION,
 };
 use wosy_syntax::CstNode;
 
@@ -36,6 +39,63 @@ pub struct BaseCstAdmission {
     pub validated_files: usize,
 }
 
+/// Scoped identity of this local prepared owner; not a source or published
+/// snapshot ID, and not a capability that can be reconstructed from bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedBaseIdentity(NodeId);
+
+impl PreparedBaseIdentity {
+    pub fn digest(self) -> NodeId { self.0 }
+}
+
+/// An immutable, ordinary base declaration projection of a proposal. Holding
+/// it retains its actual predecessor, but does not occupy a worker permit.
+/// It is not a protocol Prepared response, fragment IR, or a typed program.
+pub struct PreparedBaseDeclarations {
+    identity: PreparedBaseIdentity,
+    admission: BaseCstAdmission,
+    declarations: UnpublishedDeclarations,
+    lease: SourceLease,
+    _read: SourceRead,
+    _allocation: PreparedAllocation,
+    // A held owner belongs to the same store and quota even after its
+    // worker or request is gone; the store cannot be consumed for close.
+    _store: Arc<SourceStore>,
+}
+
+impl PreparedBaseDeclarations {
+    pub fn identity(&self) -> PreparedBaseIdentity { self.identity }
+    pub fn admission(&self) -> &BaseCstAdmission { &self.admission }
+    pub fn entry_projection(&self) -> NodeId { self.declarations.entry_projection }
+    pub fn modules(&self) -> &[PreparedBaseModule] { &self.declarations.modules }
+    pub fn unique_bodies(&self) -> usize { self.declarations.unique_bodies }
+    /// Canonical serialized bodies once per executable, not total RSS.
+    pub fn declaration_bytes(&self) -> usize { self.declarations.declaration_bytes }
+
+    pub fn lease_is_live(&self) -> bool {
+        self.lease.deadline().is_some_and(|deadline| Instant::now() < deadline)
+    }
+}
+
+struct ValidatedProposal {
+    admission: BaseCstAdmission,
+    entry: FileKey,
+    index: Index,
+    work: CstWork,
+}
+
+fn prepared_identity(
+    scope: &BaseCstAdmission, entry: NodeId, image: Option<NodeId>,
+) -> PreparedBaseIdentity {
+    let mut hash = blake3::Hasher::new_derive_key("wosy local admitted base declaration owner v1");
+    hash.update(wosy_compiler::BASE_DECLARATION_ABI.as_bytes())
+        .update(wosy_syntax::base_cst_schema())
+        .update(&scope.base.0).update(&scope.proposed.0).update(&scope.attempt.to_be_bytes())
+        .update(&entry.0);
+    if let Some(image) = image { hash.update(&image.0); }
+    PreparedBaseIdentity(NodeId(*hash.finalize().as_bytes()))
+}
+
 impl SourceStorageWorker {
     /// Check only the authenticated local adapter's selected/pending pair.
     /// The proposal cannot open a lease or pick an unrelated base. Nothing
@@ -44,6 +104,41 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<BaseCstAdmission> {
+        let (admission, _, _) = self.with_cst_admission(binding, proposal, limits, lifetime, |_, _, valid| {
+            Ok(valid.admission)
+        }).await?;
+        Ok(admission)
+    }
+
+    /// Materialize only the real reachable base declarations in the very
+    /// transaction that admitted this proposal. Never write query/CAS data.
+    pub async fn prepare_base_cst_declarations(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, declaration_bytes: usize, lifetime: Duration,
+    ) -> Result<PreparedBaseDeclarations> {
+        let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lifetime,
+            move |store, tx, valid| {
+                let ValidatedProposal { admission, entry, index, mut work } = valid;
+                let mut allocation = store.source_reads.reserve_preparation()?;
+                let declarations = store.prepare_unpublished_declarations(tx, &entry, index, &mut work,
+                    declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
+                allocation.charge(declarations.declaration_bytes)?;
+                let identity = prepared_identity(&admission, declarations.entry_projection, store.derivation_image());
+                Ok((identity, admission, declarations, allocation))
+            },
+        ).await?;
+        let (identity, admission, declarations, allocation) = owned;
+        Ok(PreparedBaseDeclarations {
+            identity, admission, declarations, lease, _read: read, _allocation: allocation,
+            _store: self.retained_store(),
+        })
+    }
+
+    async fn with_cst_admission<T: Send + 'static>(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, lifetime: Duration,
+        use_validated: impl FnOnce(&SourceStore, &Transaction, ValidatedProposal) -> Result<T> + Send + 'static,
+    ) -> Result<(T, SourceLease, SourceRead)> {
         if proposal.version != BASE_CST_DELTA_VERSION {
             return Err("unsupported base CST proposal version".into());
         }
@@ -57,15 +152,16 @@ impl SourceStorageWorker {
         self.spawn_reserved(slot, move |store| {
             let lease = store.lease_build_source(binding.selected.clone(), lifetime)?
                 .ok_or("bound base CST predecessor is not published")?;
-            let (mut tx, _read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
+            let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
-            let accepted = validate(&mut tx, &binding, &proposal, limits)?;
+            let validated = validate(&mut tx, &binding, &proposal, limits)?;
+            let accepted = use_validated(store, &tx, validated)?;
             // No transaction is committed and no snapshot entry is written.
             drop(tx);
             if lease.deadline().is_none_or(|deadline| Instant::now() >= deadline) {
                 return Err("base CST predecessor lease expired".into());
             }
-            Ok(accepted)
+            Ok((accepted, lease, read))
         }).await?
     }
 }
@@ -73,7 +169,7 @@ impl SourceStorageWorker {
 fn validate(
     tx: &mut Transaction, binding: &BaseCstProposalBinding, proposal: &BaseCstProposal,
     limits: BaseCstAdmissionLimits,
-) -> Result<BaseCstAdmission> {
+) -> Result<ValidatedProposal> {
     if proposal.files.len() > limits.records {
         return Err("base CST proposal exceeds the record budget".into());
     }
@@ -110,7 +206,7 @@ fn validate(
         authored_bytes: limits.authored_bytes,
     };
     let mut validated_files = 0;
-    let current = validate_snapshot_with(tx, proposal.root, |config| {
+    let (current, config) = validate_snapshot_with(tx, proposal.root, |config| {
         if config.target != binding.selected.target
             || config.namespaces[&config.entry.package].project != binding.selected.project
         {
@@ -147,10 +243,11 @@ fn validate(
         return Err("base CST proposal does not match the canonical per-file changes".into());
     }
 
-    Ok(BaseCstAdmission {
+    let admission = BaseCstAdmission {
         base: proposal.base, proposed: proposal.root, attempt: proposal.attempt,
         base_records: prior.len(), novel_records: supplied.len(), validated_files,
-    })
+    };
+    Ok(ValidatedProposal { admission, entry: config.entry, index: current, work })
 }
 
 struct GraphWork {
@@ -180,6 +277,10 @@ impl CstWork {
 
     pub(super) fn file(&mut self, bytes: usize) -> Result<()> {
         take(&mut self.authored_bytes, bytes, "base CST validation exceeds the authored byte budget")?;
+        self.start_tree()
+    }
+
+    pub(super) fn start_tree(&mut self) -> Result<()> {
         take(&mut self.occurrences, 1, "base CST validation exceeds the occurrence budget")
     }
 

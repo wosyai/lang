@@ -1,16 +1,17 @@
 //! Ordered base declarations over the admitted executable import graph.
 use super::{
-    child_edge, file_source, key, read_node, retention_plan::SourceRead,
+    base_declarations::authored_declaration_diagnostics, child_edge, file_source, key, read_node,
+    read_node_with, retention_plan::SourceRead, source_proposal::CstWork,
     storage_worker::{QueryPhases, QueryWorker}, write_edge, write_node, BaseDeclarationsView,
-    ConfiguredSourceView, QueryDisposition, Result, SourceStore, SourceView, INTERN,
+    ConfiguredSourceView, Index, QueryDisposition, Result, SourceStore, SourceView, INTERN,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use surrealkv::{Durability, Mode, Transaction};
-use wosy_compiler::BASE_DECLARATION_ABI;
+use wosy_compiler::{Diagnostic, ScalarSourceDeclarations, BASE_DECLARATION_ABI};
 use wosy_project::SourceNodeId;
 use wosy_protocol::{FileEntry, FileKey, Import, Kind, Node, NodeId};
-use wosy_syntax::SourceIdentity;
+use wosy_syntax::{AuthoredSpanMap, ByteSpan, SourceIdentity, TypedComment};
 
 const MODULE_DECLARATION_QUERIES: u8 = 14;
 const MODULE_DECLARATION_ABI: &str = "wosy ordered module declarations v1";
@@ -42,6 +43,32 @@ pub struct ProjectDeclarationModule {
     pub body: NodeId,
     pub imports: Vec<ProjectDeclarationImport>,
     pub(super) file: FileEntry,
+}
+
+/// One BASE declaration body from an admitted, not-yet-published proposal.
+pub struct PreparedBaseModule {
+    module: ProjectDeclarationModule,
+    declarations: Arc<ScalarSourceDeclarations>,
+    spans: AuthoredSpanMap,
+}
+
+impl PreparedBaseModule {
+    pub fn module(&self) -> &ProjectDeclarationModule { &self.module }
+
+    pub fn executable_declarations(&self) -> &ScalarSourceDeclarations { &self.declarations }
+
+    pub fn authored_span(&self, span: ByteSpan) -> ByteSpan { self.spans.project(span) }
+
+    pub fn authored_diagnostics(&self) -> Vec<Diagnostic> {
+        authored_declaration_diagnostics(&self.declarations, &self.module.source, &self.spans)
+    }
+}
+
+pub(super) struct UnpublishedDeclarations {
+    pub entry_projection: NodeId,
+    pub modules: Vec<PreparedBaseModule>,
+    pub unique_bodies: usize,
+    pub declaration_bytes: usize,
 }
 
 /// Modules are in the ordinary compiler's first-discovery initialization
@@ -86,9 +113,16 @@ struct RootedOrder {
 
 impl RootedOrder {
     fn from_snapshot(view: SourceView, entry: &FileKey) -> (Self, SourceRead) {
-        let entry = view.modules[entry];
-        let SourceView { tx, modules, mut files, mut module_edges, read, .. } = view;
+        let SourceView { tx, modules, files, module_edges, read, .. } = view;
         drop(tx);
+        (Self::from_parts(entry, modules, files, module_edges), read)
+    }
+
+    fn from_parts(
+        entry: &FileKey, modules: BTreeMap<FileKey, NodeId>, mut files: BTreeMap<FileKey, FileEntry>,
+        mut module_edges: BTreeMap<FileKey, Vec<NodeId>>,
+    ) -> Self {
+        let entry = modules[entry];
         let mut locations: HashMap<_, _> = modules.into_iter().map(|(key, id)| (id, key)).collect();
         let mut order = Vec::with_capacity(files.len());
         let mut postorder = Vec::with_capacity(files.len());
@@ -117,7 +151,7 @@ impl RootedOrder {
         let modules = order.into_iter().map(|(id, key, file, imports)| ModuleInput {
             id, key, file, imports: imports.into_iter().map(|id| visited[&id]).collect(),
         }).collect();
-        (Self { modules, postorder }, read)
+        Self { modules, postorder }
     }
 }
 
@@ -163,17 +197,62 @@ struct ProjectionPlan {
 
 impl ProjectionPlan {
     fn in_memory(&self) -> Vec<Option<Projection>> {
-        let mut projections = self.cached.clone();
-        for &index in &self.order.postorder {
-            projections[index] = Some(compose_projection(
-                &self.order.modules[index], self.bodies[&index], &projections,
-            ).0);
-        }
-        projections
+        compose_memory(&self.order, self.cached.clone(), |index| self.bodies[&index])
     }
 }
 
+fn compose_memory(
+    order: &RootedOrder, mut projections: Vec<Option<Projection>>, body_id: impl Fn(usize) -> NodeId,
+) -> Vec<Option<Projection>> {
+    for &index in &order.postorder {
+        if projections[index].is_none() {
+            projections[index] = Some(compose_projection(&order.modules[index], body_id(index), &projections).0);
+        }
+    }
+    projections
+}
+
+fn projected_module(module: ModuleInput, projection: Projection) -> Result<ProjectDeclarationModule> {
+    let source = file_source(&module.file)?;
+    let imports = module.file.metadata.imports.iter().cloned().zip(module.imports)
+        .map(|(authored, target)| ProjectDeclarationImport { authored, target })
+        .collect();
+    Ok(ProjectDeclarationModule {
+        key: module.key, source, module: module.id, projection: projection.id,
+        body: projection.body, imports, file: module.file,
+    })
+}
+
 impl SourceStore {
+    pub(super) fn prepare_unpublished_declarations(
+        &self, tx: &Transaction, entry: &FileKey, index: Index, work: &mut CstWork, body_bytes: usize,
+    ) -> Result<UnpublishedDeclarations> {
+        let order = RootedOrder::from_parts(entry, index.modules, index.files, index.module_edges);
+        let mut remaining = body_bytes;
+        let mut bodies = HashMap::new();
+        for module in &order.modules {
+            let executable = module.file.executable;
+            if let std::collections::hash_map::Entry::Vacant(body) = bodies.entry(executable) {
+                let (id, declarations) = self.prepare_base_body(tx, executable, work, &mut remaining)?;
+                body.insert((id, Arc::new(declarations)));
+            }
+        }
+        let projections = compose_memory(&order, vec![None; order.modules.len()], |i| {
+            bodies[&order.modules[i].file.executable].0
+        });
+        let entry_projection = projections[0].expect("entry projection").id;
+        let modules = order.modules.into_iter().zip(projections).map(|(input, projection)| {
+            let annotations = read_node_with(tx, input.file.annotation, |bytes| work.read(bytes))?;
+            let comments: Vec<TypedComment> = serde_json::from_slice(&annotations.data)?;
+            let declarations = Arc::clone(&bodies[&input.file.executable].1);
+            let module = projected_module(input, projection.expect("prepared module projection"))?;
+            Ok(PreparedBaseModule { module, declarations, spans: AuthoredSpanMap::from_comments(&comments) })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(UnpublishedDeclarations {
+            entry_projection, modules, unique_bodies: bodies.len(), declaration_bytes: body_bytes - remaining,
+        })
+    }
+
     pub async fn project_declarations(&self, root: NodeId) -> Result<Option<ProjectDeclarationsView<'_>>> {
         let Some(view) = self.snapshot(root)? else { return Ok(None); };
         self.project_declarations_for_snapshot(view.configured()?, None).await.map(Some)
@@ -230,17 +309,9 @@ impl SourceStore {
             (owned.order, projections)
         };
         let entry_projection = projections[0].expect("entry projection").id;
-        let modules = order.modules.into_iter().zip(projections).map(|(module, projection)| {
-            let projection = projection.expect("published module projection");
-            let source = file_source(&module.file)?;
-            let imports = module.file.metadata.imports.iter().cloned().zip(module.imports)
-                .map(|(authored, target)| ProjectDeclarationImport { authored, target })
-                .collect();
-            Ok(ProjectDeclarationModule {
-                key: module.key, source, module: module.id, projection: projection.id,
-                body: projection.body, imports, file: module.file,
-            })
-        }).collect::<Result<Arc<[_]>>>()?;
+        let modules = order.modules.into_iter().zip(projections)
+            .map(|(module, projection)| projected_module(module, projection.expect("published module projection")))
+            .collect::<Result<Arc<[_]>>>()?;
         Ok(ProjectDeclarationsView { store: self, snapshot: root, entry_projection, report, modules, image, read })
     }
 

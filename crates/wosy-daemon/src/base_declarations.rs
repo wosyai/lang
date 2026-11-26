@@ -1,6 +1,7 @@
 //! Rooted, lazy canonical base declarations. No semantic Build/Check query.
 use super::{
-    file_source, key, read_comments, read_cst, read_node, storage_worker::QueryPhases,
+    file_source, key, read_comments, read_cst, read_cst_with, read_node,
+    source_proposal::CstWork, storage_worker::QueryPhases,
     write_edge, write_node, Edge, Result, SourceStore, INTERN,
 };
 use std::collections::HashMap;
@@ -16,7 +17,7 @@ use wosy_compiler::{
     derive_scalar_declarations_from_cst, Diagnostic, ScalarSourceDeclarations, BASE_DECLARATION_ABI,
 };
 use wosy_protocol::{FileKey, Kind, Node, NodeId};
-use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, SourceIdentity};
+use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, CstNode, SourceIdentity};
 
 const BASE_DECLARATION_QUERIES: u8 = 13;
 const INLINE_BYTES: usize = 64 * 1024;
@@ -76,15 +77,21 @@ impl BaseDeclarationsView {
 
     /// These are declaration-derivation diagnostics, not type/ownership checks.
     pub fn authored_diagnostics(&self) -> Vec<Diagnostic> {
-        let mut diagnostics = self.declarations.diagnostics().to_vec();
-        for diagnostic in &mut diagnostics {
-            for label in &mut diagnostic.labels {
-                label.span.source = self.source.clone();
-                label.span.range = self.authored_span(label.span.range);
-            }
-        }
-        diagnostics
+        authored_declaration_diagnostics(&self.declarations, &self.source, &self.spans)
     }
+}
+
+pub(super) fn authored_declaration_diagnostics(
+    declarations: &ScalarSourceDeclarations, source: &SourceIdentity, spans: &AuthoredSpanMap,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = declarations.diagnostics().to_vec();
+    for diagnostic in &mut diagnostics {
+        for label in &mut diagnostic.labels {
+            label.span.source = source.clone();
+            label.span.range = spans.project(label.span.range);
+        }
+    }
+    diagnostics
 }
 
 pub(super) fn query_key(image: NodeId, executable: NodeId) -> [u8; 33] {
@@ -118,6 +125,26 @@ pub(super) fn cas_digest(data: &[u8]) -> Result<Option<NodeId>> {
 
 fn detached_identity(executable: NodeId) -> SourceIdentity {
     SourceIdentity::new(String::new(), String::new(), String::new(), executable.hex())
+}
+
+fn derive_base(executable: NodeId, cst: CstNode) -> ScalarSourceDeclarations {
+    derive_scalar_declarations_from_cst(&CanonicalCstRoot::new(detached_identity(executable), cst))
+}
+
+struct BoundedDeclarationBytes<'a> {
+    remaining: &'a mut usize,
+    encoded: Vec<u8>,
+}
+
+impl Write for BoundedDeclarationBytes<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        *self.remaining = self.remaining.checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("prepared base declaration payload exceeds its encoded byte budget"))?;
+        self.encoded.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 struct BaseOutput {
@@ -284,15 +311,28 @@ impl SourceStore {
                 return Ok((BaseOutput { id, declarations: Some(declarations), disposition: QueryDisposition::Reused }, None));
             }
         }
-        let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(read, executable)?);
-        let declarations = derive_scalar_declarations_from_cst(&cst);
-        let bytes = serde_json::to_vec(&declarations)?;
-        let payload = self.pack_payload(bytes, query.is_some())?;
-        let node = Node { kind: Kind::BaseDeclarations, data: payload, children: vec![executable] };
-        let encoded = node.encode();
-        let id = Node::id(&encoded);
+        let declarations = derive_base(executable, read_cst(read, executable)?);
+        let (id, encoded) = self.encode_base(executable, serde_json::to_vec(&declarations)?, query.is_some())?;
         let addition = query.map(|query| BaseAddition { query, id, executable, encoded });
         Ok((BaseOutput { id, declarations: load.then_some(declarations), disposition: QueryDisposition::Derived }, addition))
+    }
+
+    /// Derive the same detached declaration type and record identity as the
+    /// published query, without creating a cache row or a CAS file.
+    pub(super) fn prepare_base_body(
+        &self, read: &Transaction, executable: NodeId, work: &mut CstWork, remaining: &mut usize,
+    ) -> Result<(NodeId, ScalarSourceDeclarations)> {
+        let declarations = derive_base(executable, read_cst_with(read, executable, Some(work))?);
+        let mut bytes = BoundedDeclarationBytes { remaining, encoded: Vec::new() };
+        serde_json::to_writer(&mut bytes, &declarations)?;
+        let (id, _) = self.encode_base(executable, bytes.encoded, false)?;
+        Ok((id, declarations))
+    }
+
+    fn encode_base(&self, executable: NodeId, bytes: Vec<u8>, persist: bool) -> Result<(NodeId, Vec<u8>)> {
+        let data = self.pack_payload(bytes, persist)?;
+        let encoded = Node { kind: Kind::BaseDeclarations, data, children: vec![executable] }.encode();
+        Ok((Node::id(&encoded), encoded))
     }
 
     fn base_transaction(&self, additions: &[BaseAddition]) -> Result<Option<Transaction>> {

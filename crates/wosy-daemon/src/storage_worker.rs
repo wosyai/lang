@@ -83,6 +83,8 @@ impl SourceStorageWorker {
         Ok(RetentionReadJob(job))
     }
 
+    pub(super) fn retained_store(&self) -> Arc<SourceStore> { Arc::clone(&self.store) }
+
     pub(super) fn try_slot(&self) -> std::result::Result<OwnedSemaphorePermit, StorageAdmissionError> {
         Arc::clone(&self.slots).try_acquire_owned().map_err(|_| StorageAdmissionError::Busy)
     }

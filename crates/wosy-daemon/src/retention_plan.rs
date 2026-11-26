@@ -15,6 +15,8 @@ const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
 const SHARED: u8 = PROTECTED | CANDIDATE;
 const MAX_BUILD_SESSIONS: usize = 64;
+const MAX_LIVE_BASE_PREPARATIONS: usize = 8;
+pub(super) const MAX_RETAINED_DECLARATION_BYTES: usize = 16 << 20;
 
 /// Direct reads and expiring client sessions share the existing read gate.
 /// A started query holds a direct read independently of the session owner.
@@ -26,6 +28,45 @@ struct ReadRegistry {
     active: BTreeMap<NodeId, usize>,
     sessions: BTreeMap<u64, (NodeId, Instant)>,
     next_session: u64,
+    prepared: usize,
+    prepared_bytes: usize,
+}
+
+/// Count held owners independently of session expiry so pruning expired
+/// leases cannot unbound caller-owned passive data.
+pub(super) struct PreparedAllocation {
+    reads: Arc<Mutex<ReadRegistry>>,
+    bytes: usize,
+}
+
+impl SourceReads {
+    pub(super) fn reserve_preparation(&self) -> Result<PreparedAllocation> {
+        let mut reads = self.0.lock().expect("source reader registry");
+        if reads.prepared == MAX_LIVE_BASE_PREPARATIONS {
+            return Err("live base declaration preparations are at capacity".into());
+        }
+        reads.prepared += 1;
+        Ok(PreparedAllocation { reads: Arc::clone(&self.0), bytes: 0 })
+    }
+}
+
+impl PreparedAllocation {
+    pub(super) fn charge(&mut self, bytes: usize) -> Result<()> {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        reads.prepared_bytes = (reads.prepared_bytes - self.bytes).checked_add(bytes)
+            .filter(|&total| total <= MAX_RETAINED_DECLARATION_BYTES)
+            .ok_or("live base declaration preparations exceed retained declaration bytes")?;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedAllocation {
+    fn drop(&mut self) {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        reads.prepared -= 1;
+        reads.prepared_bytes -= self.bytes;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -503,6 +544,20 @@ impl SourceStore {
 mod lease_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn passive_preparation_charges_share_the_live_store_budget() {
+        let reads = SourceReads::default();
+        let mut first = reads.reserve_preparation().unwrap();
+        let mut second = reads.reserve_preparation().unwrap();
+        first.charge(MAX_RETAINED_DECLARATION_BYTES).unwrap();
+        assert!(second.charge(1).is_err());
+        drop(first);
+        second.charge(MAX_RETAINED_DECLARATION_BYTES).unwrap();
+        drop(second);
+        let registry = reads.0.lock().unwrap();
+        assert_eq!((registry.prepared, registry.prepared_bytes), (0, 0));
+    }
 
     #[test]
     #[ignore = "requires a disposable store with two acknowledged source roots"]
