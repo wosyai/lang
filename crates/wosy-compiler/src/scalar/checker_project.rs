@@ -10947,7 +10947,7 @@ fn run_startup_authored_path(
         else if qualified { 2 } else { 1 };
     if (!named.is_empty() && project.modules.len() != count)
         || named.iter().any(|(_, sites)| sites.is_empty())
-        || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.len() != 1)
+        || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.len() > 1)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -11430,7 +11430,7 @@ fn run_private_mixed_root_context(
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, BareRoster, InvokedAndDormantRank, InvokedAndReachedRank }
+enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, BareRoster, RankOnly, InvokedAndDormantRank, InvokedAndReachedRank }
 
 /// Check cited premises on real bounded startup returns, or on a genuinely
 /// zero-incoming symbolic source root. The authored graph is never used as a
@@ -11604,7 +11604,7 @@ fn run_private_named_after_startup(
         { return Err(ProjectCheck::Unsupported); }
         if plan.typed.measure.is_some() {
             if qualified || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0
-                || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+                || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
             { return Err(ProjectCheck::Unsupported); }
             ranked = Some(plan);
         } else {
@@ -11627,11 +11627,16 @@ fn run_private_named_after_startup(
             || !targets.insert(plan.target) || !names.insert((plan.proof_source, plan.name))
         { return Err(ProjectCheck::Unsupported); }
     }
+    let ranked_requires_equality = ranked.as_ref().is_some_and(|plan|
+        !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }));
+    if ranked_requires_equality && (!plans.is_empty() || !arrays.is_empty()) {
+        return Err(ProjectCheck::Unsupported);
+    }
     if !arrays.is_empty() {
         let cohort = array_quantifier::Cohort::new(arrays, Some(calls))?;
         return cohort.run_capped(owner, scope, cap, &plans, ranked.as_ref(), provider);
     }
-    if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
+    if (plans.is_empty() && ranked.is_none()) || (ranked.is_some() && plans.len() > 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
     { return Err(ProjectCheck::Unsupported); }
     let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
@@ -11640,6 +11645,7 @@ fn run_private_named_after_startup(
     let ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
         .map(Vec::as_slice).ok_or(ProjectCheck::Unsupported)).transpose()?.unwrap_or_default();
     let reached_rank = !ranked_sites.is_empty();
+    if reached_rank && ranked_requires_equality { return Err(ProjectCheck::Unsupported); }
     let mut invoked = Vec::new();
     let mut activation_count = 0usize;
     for plan in &plans {
@@ -11660,6 +11666,7 @@ fn run_private_named_after_startup(
         (false, false, false, 1, 1) => StartupNamedMode::Invoked,
         (false, false, false, 2.., 1) => StartupNamedMode::RepeatedInvoked,
         (false, false, false, 1, 2) => StartupNamedMode::Mixed,
+        (false, true, _, 0, 0) => StartupNamedMode::RankOnly,
         (false, true, false, 1.., 1) => StartupNamedMode::InvokedAndDormantRank,
         (false, true, true, 1.., 1) => StartupNamedMode::InvokedAndReachedRank,
         (false, false, false, _, _) | (true, false, false, 1.., _) => StartupNamedMode::BareRoster,
@@ -11667,7 +11674,7 @@ fn run_private_named_after_startup(
     };
     if expected.is_some_and(|expected| expected != mode) { return Err(ProjectCheck::Unsupported); }
     let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, startup_count, &owner.source)?;
-    if !authored_roots.is_empty() && (expected.is_some() || ranked.is_some()) { return Err(ProjectCheck::Unsupported); }
+    if !authored_roots.is_empty() && (expected.is_some() || (ranked.is_some() && !plans.is_empty())) { return Err(ProjectCheck::Unsupported); }
     let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
     if root != &owner.source { return Err(ProjectCheck::Unsupported); }
     // The exact incoming-edge census above already refused lexical uses
@@ -11681,42 +11688,49 @@ fn run_private_named_after_startup(
     plans.sort_unstable_by_key(|plan| (
         usize::from(plan.proof_source != &owner.source), plan.target.1,
     ));
-    let [first, rest @ ..] = plans.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
-    for plan in rest {
-        observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
-    }
-    observer.finish_plans(&owner.prepared, scope)?;
+    let mut observer = if let [first, rest @ ..] = plans.as_slice() {
+        let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
+        for plan in rest {
+            observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
+        }
+        observer.finish_plans(&owner.prepared, scope)?;
+        Some(observer)
+    } else { None };
     let mut verified_rank = reached_rank.then(|| prepare_capped_ranked_receipts(ranked.as_ref().ok_or(ProjectCheck::Unsupported)?)).transpose()?;
     let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, &invoked, qualified,
         authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)))?;
     if let Some(rank) = &mut verified_rank {
+        if trace.ranked_observations.len() != ranked_sites.len() { return Err(ProjectCheck::Unsupported); }
         check_capped_ranked_receipts(rank, &mut trace, &owner.source)?;
         active = true;
     }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
     if trace.named_observations.len() != activation_count { return Err(ProjectCheck::Unsupported); }
     let invoked = invoked.into_iter().map(|(target, _)| target).collect::<HashSet<_>>();
-    if invoked.len() <= 1 && (activation_count <= 1 || plans.len() == 1) {
-        observe_capped_bare_receipts(&mut observer, &mut trace, invoked.iter().copied().next(), &owner.source)?;
-    } else {
-        for observed in std::mem::take(&mut trace.named_observations) {
-            observe_capped_bare_receipt(&mut observer, &mut trace, &invoked, &owner.source, observed)?;
+    if let Some(observer) = &mut observer {
+        if invoked.len() <= 1 && (activation_count <= 1 || plans.len() == 1) {
+            observe_capped_bare_receipts(observer, &mut trace, invoked.iter().copied().next(), &owner.source)?;
+        } else {
+            for observed in std::mem::take(&mut trace.named_observations) {
+                observe_capped_bare_receipt(observer, &mut trace, &invoked, &owner.source, observed)?;
+            }
+            if !observer.complete(&invoked) { return Err(ProjectCheck::Unsupported); }
         }
-        if !observer.complete(&invoked) { return Err(ProjectCheck::Unsupported); }
+        active |= observer.active;
     }
-    active |= observer.active;
-    let evidence = NamedOrderedEvidence { observed: observer };
+    let evidence = observer.map(|observed| NamedOrderedEvidence { observed });
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
-        let mut proof = evidence.symbolic();
-        for plan in plans.iter().filter(|plan| !invoked.contains(&plan.target)) {
-            // No invented completion/dependency access, only the original
-            // closed dormant theorem allowed by the resolved-edge census.
-            active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,
-                SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
-        }
-        proof.complete()?;
-        let result = NamedOrderedEvidence::finish_symbolic(proof);
+        let result = if let Some(evidence) = &evidence {
+            let mut proof = evidence.symbolic();
+            for plan in plans.iter().filter(|plan| !invoked.contains(&plan.target)) {
+                // No invented completion/dependency access, only the original
+                // closed dormant theorem allowed by the resolved-edge census.
+                active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,
+                    SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+            }
+            proof.complete()?;
+            NamedOrderedEvidence::finish_symbolic(proof)
+        } else { (None, Vec::new()) };
         if let Some(plan) = ranked.as_ref().filter(|_| !reached_rank) {
             // The original typed proof runs independently; no startup reach,
             // no imported equality, no fake call/return or authored quota use.
@@ -11731,8 +11745,9 @@ fn run_private_named_after_startup(
             (RankedOrderedEvidence::finish_symbolic(proof), Vec::new())
         } else { result }
     } else { (None, Vec::new()) };
+    let diagnostics = evidence.map_or_else(Vec::new, |proved| proved.observed.diagnostics);
     Ok((MainFlowProofReceipt {
-        active, directives: effects.records, diagnostics: evidence.observed.diagnostics, contextual_diagnostic: None,
+        active, directives: effects.records, diagnostics, contextual_diagnostic: None,
         additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
     }, end))
@@ -23436,6 +23451,65 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 text.replace("ensures (out == 4)", "ensures (out <= 4)"),
             ] {
                 assert!(matches!(run(&rejected, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_rank_only_keeps_reached_induction_and_dormant_refutation_separate() {
+        use std::num::NonZeroUsize;
+        let root = source("src/main.w", "private-standalone-rank");
+        let body = r#"
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+        "#;
+        let invoke = format!("u8 actual = descend(8); core.require(actual == 4, {OUTPUT});");
+        let actual = format!("%%start {body} core.require(false, {OUTPUT}); {invoke} core.require(false, {OUTPUT}); %%end");
+        let dormant = actual.replace(&invoke, "").replace("ensures (out == 4)", "ensures (out <= 3)");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |src: &str| {
+                    let (_, proof) = crate::parse_proof_source(root.clone(), src.to_owned(), &[])
+                        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(proof, Vec::new())],
+                        vec![root.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new()).unwrap()
+                };
+                for (deferred, program) in [(false, &actual), (true, &dormant)] {
+                    let incumbent = prepare(program).run().unwrap();
+                    assert_eq!(incumbent.directives.len(), 2);
+                    for cap in [1, 2, 3] {
+                        let (report, end) = prepare(program).run_private_authored_root(NonZeroUsize::new(cap).unwrap()).unwrap();
+                        assert_eq!(report.directives, incumbent.directives[..cap.min(2)]);
+                        assert_eq!(end, Some(if cap <= 2 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted }));
+                        assert!(report.diagnostics.is_empty());
+                        if deferred && scope == ScalarCheckerScope::CurrentPackage {
+                            let check = report.symbolic_diagnostic.unwrap();
+                            let previous = incumbent.symbolic_diagnostic.as_ref().unwrap();
+                            assert_eq!((&check.proof, &check.goal, &check.returned), (&previous.proof, &previous.goal, &previous.returned));
+                            assert_eq!(check.directive_position, cap.min(2));
+                        } else {
+                            assert!(report.symbolic_diagnostic.is_none());
+                        }
+                    }
+                    let formal = prepare(program).run_private_proofs_after_command_cap().unwrap();
+                    assert!(formal.directives.is_empty());
+                    assert_eq!(formal.symbolic_diagnostic.is_some(), deferred && scope == ScalarCheckerScope::CurrentPackage);
+                }
+                let mixed = dormant.replacen("core.require(false,", r#"
+                    u8(u8) echo = fn(value) { value };
+                    proof bare for echo(entry) -> (out) where (entry == 3) ensures (out == 3) {}
+                    u8 copied = echo(3);
+                    core.require(copied == 3, { .stdout = ""; .stderr = ""; .code = 9; .files = []; });
+                    core.require(false,"#, 1);
+                let equality = mixed.replace("ensures (out <= 3)", "ensures (out == 5)")
+                    .replace("core.show(out == 4)", "core.show(out == 5)");
+                assert!(prepare(&equality).run_private_authored_root(NonZeroUsize::MIN).is_ok());
+                for refusal in [&mixed, &actual.replace("descend(8)", "descend(9)")] {
+                    assert!(matches!(prepare(refusal).run_private_authored_root(NonZeroUsize::MIN), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
             }
         }
     }

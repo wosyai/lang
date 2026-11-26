@@ -2690,10 +2690,49 @@ proof debit for consume() -> (null)
                 assert!(stdout.is_empty() && !stderr.as_slice().is_empty() && !root.join(".wosy").exists());
             }
         }
+        fs::write(&leaf_manifest, &saved_leaf_manifest).unwrap();
+        fs::write(&leaf_source, body("leaf", 6)).unwrap();
+
+        let rank_leaf = r#"%%start
+u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out <= 3) decreases (entry) {
+    if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+}
+core.require(false, { .stdout = "rankleaf"; .stderr = ""; .code = 6; .files = []; });
+%%end"#;
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            fs::write(&leaf_source, rank_leaf).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let old = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                let leaf = old.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                let expected = leaf.outcome.as_ref().unwrap();
+                assert_eq!(expected.directives.len(), 1);
+                for cap in [1, 8] {
+                    let selected = configured_check::check_targets_with_private_authored_limit(
+                        root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                    ).ok().unwrap();
+                    let leaf = selected.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                    let formal = leaf.outcome.as_ref().unwrap();
+                    assert_eq!(formal.directives, expected.directives[..usize::from(cap > 1)]);
+                    // Explicit dependencies always prepare their own CurrentPackage scope.
+                    let observed = formal.symbolic_diagnostic.as_ref().unwrap();
+                    let original = expected.symbolic_diagnostic.as_ref().unwrap();
+                    assert_eq!((&observed.goal, &observed.returned), (&original.goal, &original.returned));
+                    assert_eq!(observed.proof.source.package, "leaf");
+                    assert_eq!(observed.directive_position, usize::from(cap > 1));
+                    let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                    assert_eq!(publish_configured_check_receipts(&selected, scope, true, &mut stdout, &mut stderr), Ok(3));
+                    if cap == 1 { assert_eq!(stdout, b"app"); }
+                    else { assert!(stdout.windows(8).any(|bytes| bytes == b"rankleaf")); }
+                    assert!(!root.join(".wosy").exists());
+                }
+            }
+        }
         fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();
         fs::write(&leaf_source, body("leaf", 6)).unwrap();
-        fs::write(&leaf_dormant, old_dormant).unwrap();
 
+        fs::write(&leaf_dormant, old_dormant).unwrap();
         let root_dormant = root.join("src/more.w");
         let dormant_program = fs::read_to_string(root.join("leaf/src/dormant.w")).unwrap();
         fs::write(&root_dormant, &dormant_program).unwrap();
@@ -3936,6 +3975,12 @@ main_artifact = "main"
                     assert_eq!(files(), both_files);
                     clean();
                 }
+                fs::write(&source, &dormant_rank).unwrap();
+                assert!(selected(1)[0].outcome.is_ok());
+                fs::write(&source, dormant_rank.replace("ensures (out == 5)", "ensures (out <= 3)")).unwrap();
+                assert!(matches!(selected(1)[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
                 fs::write(&source, ranked_mixed.replace("descend(8); core.require", "descend(9); core.require")).unwrap();
                 let no_rank_receipt = selected(1);
                 assert!(matches!(no_rank_receipt[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
