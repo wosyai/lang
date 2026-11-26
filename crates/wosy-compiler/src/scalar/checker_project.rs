@@ -9830,6 +9830,18 @@ impl PreparedScalarOrderedCheck {
         self.into_startup_authored_owner().map_err(|_| ProjectCheck::Unsupported)?.run_path(cap)
     }
 
+    /// Private one-owner path for an independent dormant integer theorem.
+    /// A real incoming activation, including one after the authored cap,
+    /// requires a different lane and is refused before the startup walk.
+    #[doc(hidden)]
+    pub fn search_startup_with_independent_named(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_independent_named_after_startup(&owner, self.scope, cap).map_err(configured_ordered_error)
+    }
+
     /// Accepts only a proof-free owner and never drops possible dormant
     /// package obligations. Call once before sharing a command budget.
     #[doc(hidden)]
@@ -9869,30 +9881,87 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        let owner = self.owner;
-        let (project, _) = owner.parts();
-        let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
-        let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(failure_search::StartUpSearch::new(root, cap)))), ..OrderedFailures::default() };
-        let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
-            &owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
-        );
-        let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
-            .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-        if search.invalid() { return Err(ProjectCheck::Unsupported); }
-        let (completion, active) = match outcome {
-            Ok((initialization, _)) if search.remaining() > 0 => (StartupAuthoredCompletion::Exhausted, initialization.had_obligations),
-            Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
-            Err(error) => return Err(error),
-            _ => return Err(ProjectCheck::Unsupported),
-        };
-        // Only concrete already-rendered startup records cross this private
-        // boundary until the full selected output finalizer is shared.
-        if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-            || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
-        { return Err(ProjectCheck::Unsupported); }
-        Ok((effects.records, completion, search, active))
+        run_startup_authored_path(&self.owner, cap)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_startup_authored_path(
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize,
+) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
+    let (project, _) = owner.parts();
+    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
+    let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(failure_search::StartUpSearch::new(root, cap)))), ..OrderedFailures::default() };
+    let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
+        owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+    );
+    let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+        .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+    if search.invalid() { return Err(ProjectCheck::Unsupported); }
+    let (completion, active) = match outcome {
+        Ok((initialization, _)) if search.remaining() > 0 => (StartupAuthoredCompletion::Exhausted, initialization.had_obligations),
+        Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
+        Err(error) => return Err(error),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    // Only concrete already-rendered startup records cross this private
+    // boundary until the full selected output finalizer is shared.
+    if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+        || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
+    { return Err(ProjectCheck::Unsupported); }
+    Ok((effects.records, completion, search, active))
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_independent_named_after_startup(
+    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+    let (project, calls) = owner.prepared.parts();
+    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let mut catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
+    let (proof_source, catalog) = catalogs.next().ok_or(ProjectCheck::Unsupported)?;
+    let [definition] = catalog.definitions.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if catalogs.next().is_some() || owner.context.is_some() || proof_source != &owner.source || &module.source != proof_source {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
+    let selected = owner.resolve_selected_proof(definition, catalog.first_query)?;
+    let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
+        proof_source, name.text(), selected, false,
+    )?;
+    let body = plan.typed.body;
+    if plan.target.0 != 0 || &plan.typed.target.source != proof_source
+        || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
+        || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
+        || !body.checker_pure_calling_frame() || !body.structure.checker_direct_targets.is_empty()
+        || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
+        || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
+        || !plan.function.overload_arms.is_empty()
+        || !calls.owns_no_incoming_callable_use(proof_source, plan.function.name_span).unwrap_or(false)
+    { return Err(ProjectCheck::Unsupported); }
+    let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, 1, &owner.source)?;
+    if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
+    let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, &plan)?;
+    observer.finish_plans(&owner.prepared, scope)?;
+    let (records, end, _, mut active) = run_startup_authored_path(&owner.prepared, cap)?;
+    let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
+    let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
+        let evidence = NamedOrderedEvidence { observed: observer };
+        let mut proof = evidence.symbolic();
+        // No invented completion or dependency access. The graph certificate
+        // above permits only this closed local dormant theorem.
+        active |= proof.try_collect(plan.target, body, plan.function, proof_source, &mut effects,
+            SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+        proof.complete()?;
+        NamedOrderedEvidence::finish_symbolic(proof)
+    } else { (None, Vec::new()) };
+    Ok((MainFlowProofReceipt {
+        active, directives: effects.records, diagnostics: Vec::new(), contextual_diagnostic: None,
+        additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
+        aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
+    }, end))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -14805,6 +14874,60 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_authored_cap_preserves_authenticated_independent_named_proof() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-authored-independent-proof");
+        let first = OUTPUT.replace(".code = 1", ".code = 0");
+        let second = OUTPUT.replace(".code = 1", ".code = 43");
+        let program = format!(r#"%%start
+            u8(u8) echo = fn(value) {{ value }};
+            proof named for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {{}}
+            core.require(false, {first});
+            core.require(false, {second});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout },
+                        scope, Vec::new()).ok().unwrap()
+                };
+                let prior = prepare(&program).run().unwrap();
+                let at = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+                for cap in [1, 3] {
+                    let (report, end) = prepare(&program).search_startup_with_independent_named(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(report.directives.len(), cap.min(2));
+                    for (actual, expected) in report.directives.iter().zip(&prior.directives) {
+                        assert_eq!(actual.directive, expected.directive);
+                        assert_eq!(actual.code(), expected.code());
+                    }
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        let received = report.symbolic_diagnostic.unwrap();
+                        let expected = prior.symbolic_diagnostic.as_ref().unwrap();
+                        assert_eq!(at(received.goal.range), "out == 4");
+                        assert_eq!((received.proof, received.goal, received.output, received.returned),
+                            (expected.proof.clone(), expected.goal.clone(), expected.output.clone(), 3.into()));
+                        assert_eq!(received.witness, expected.witness);
+                        assert_eq!(received.directive_position, cap.min(2));
+                    } else {
+                        assert!(report.symbolic_diagnostic.is_none());
+                    }
+                    assert!(report.diagnostics.is_empty() && report.additional_symbolic_diagnostics.is_empty());
+                }
+                let dormant_valid = program.replace("out == 4", "out == 3");
+                assert!(prepare(&dormant_valid).search_startup_with_independent_named(NonZeroUsize::MIN)
+                    .unwrap().0.symbolic_diagnostic.is_none());
+                let incoming = program.replace("%%end", "u8 result = echo(3); %%end");
+                assert!(matches!(prepare(&incoming).search_startup_with_independent_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

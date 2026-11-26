@@ -7049,6 +7049,39 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
+    pub(super) fn owns_no_incoming_callable_use(&self, source: &SourceIdentity, declaration: ByteSpan) -> Option<bool> {
+        let [module] = self.modules.as_slice() else { return Some(false); };
+        let module = module.as_ref().ok()?;
+        if &module.initialization.source != source { return Some(false); }
+        let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
+        let target = SourceSpan::new(source.clone(), declaration);
+        let resolved = |call: &ResolvedCallTarget| matches!(call, ResolvedCallTarget::ModuleCallable {
+            source: owner, declaration_span, ..
+        } if owner == source && *declaration_span == declaration);
+        let mut work = 0;
+        use super::checker_flow::charge_call_work;
+        charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
+        if startup.callable_escapes.contains(&target) || startup.call_targets.values().any(|call| match call {
+            ModuleInitializationCallTarget::Direct { declaration, .. } | ModuleInitializationCallTarget::Generic { declaration, .. }
+                | ModuleInitializationCallTarget::CallableBinding(declaration) => declaration == &target,
+            _ => false,
+        }) { return Some(false); }
+        charge_call_work(&mut work, module.functions.len())?;
+        for function in module.functions.values() {
+            charge_call_work(&mut work, function.arms.len())?;
+            for body in std::iter::once(function).chain(&function.arms) {
+                charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
+                    .checked_add(body.callable_escapes.len())?)?;
+                if body.callable_escapes.contains(&target)
+                    || body.sites.iter().any(|site| resolved(&site.target))
+                    || body.allocation_length_call_targets.values().any(resolved)
+                { return Some(false); }
+            }
+        }
+        Some(true)
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn has_nested_proof_use(&self, target: (usize, usize)) -> bool {
         self.nested_proof_targets.contains_key(&target)
     }
