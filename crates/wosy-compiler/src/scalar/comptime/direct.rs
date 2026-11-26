@@ -14,6 +14,7 @@ use super::super::{
 use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
 const MAX_DIRECT_STARTUP_CALLS: usize = 16;
+const MAX_PAIR_STARTUP_HOPS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectComptimeArgument {
@@ -201,9 +202,92 @@ pub fn derive_forwarded_pair_startup_comptime_plan(
 ) -> Result<ForwardedPairStartupComptimePlan, ClosedComptimeRejection> {
     with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
         StartupEntry::OneForwarder, |calls, body, name_span, forwarding| {
-            let forwarding = forwarding.expect("verified exact tail hop");
+            let VerifiedStartupPaths::OneForwarder(forwarding) = forwarding else {
+                return Err(ClosedComptimeRejection::Emitter("verified tail hop disappeared".into()));
+            };
             let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
             Ok(ForwardedPairStartupComptimePlan { forwarding, plan })
+        })
+}
+
+/// An authored argument read at a checked tail-call edge. The array order
+/// is the callee's formal order; this position names the caller's formal.
+#[derive(Debug)]
+pub struct PairStartupHopInput {
+    caller_position: usize,
+    caller_formal: SourceSpan,
+    read: SourceSpan,
+}
+
+impl PairStartupHopInput {
+    pub fn caller_position(&self) -> usize { self.caller_position }
+    pub fn caller_formal(&self) -> &SourceSpan { &self.caller_formal }
+    pub fn read(&self) -> &SourceSpan { &self.read }
+}
+
+/// One checked, complete tail edge between exact local declarations.
+#[derive(Debug)]
+pub struct PairStartupCallHop {
+    caller: SourceSpan,
+    callee: SourceSpan,
+    tail_call: SourceSpan,
+    inputs: [PairStartupHopInput; 2],
+}
+
+impl PairStartupCallHop {
+    pub fn caller(&self) -> &SourceSpan { &self.caller }
+    pub fn callee(&self) -> &SourceSpan { &self.callee }
+    pub fn tail_call(&self) -> &SourceSpan { &self.tail_call }
+    pub fn inputs(&self) -> &[PairStartupHopInput; 2] { &self.inputs }
+
+    fn positions(&self) -> [usize; 2] { self.inputs.each_ref().map(PairStartupHopInput::caller_position) }
+}
+
+/// Path from one ordinary startup call into the selected comptime
+/// declaration. Hop indices address the owning plan's authored edge table.
+#[derive(Clone, Debug)]
+pub struct PairStartupCallPath {
+    hops: Vec<usize>,
+    positions: [usize; 2],
+}
+
+impl PairStartupCallPath {
+    pub fn hop_indices(&self) -> &[usize] { &self.hops }
+    pub fn startup_argument_positions(&self) -> [usize; 2] { self.positions }
+}
+
+pub struct PairStartupCallGraphComptimePlan {
+    plan: DirectStartupComptimePlan<2>,
+    hops: Vec<PairStartupCallHop>,
+    paths: Vec<PairStartupCallPath>,
+}
+
+impl PairStartupCallGraphComptimePlan {
+    pub fn hops(&self) -> &[PairStartupCallHop] { &self.hops }
+    pub fn calls(&self) -> impl ExactSizeIterator<Item = (&DirectStartupComptimeUse<2>, &PairStartupCallPath)> {
+        self.plan.calls().iter().zip(&self.paths)
+    }
+    pub fn evaluators(&self) -> &[ClosedComptimeFragment] { self.plan.evaluators() }
+}
+
+/// Inspect the selected comptime function and up to eight safe local
+/// forwarders, followed by at most sixteen ordinary startup bindings. A
+/// binding may call the comptime function directly or enter any checked
+/// acyclic forwarding path. Every hop is an unconditional complete tail
+/// call preserving each typed formal once. Equal final ordered tuples
+/// share one evaluator; neither an equal IR nor an equal path is required.
+/// The caller still authenticates the selected target entry. No execution,
+/// durable key/result, arbitrary branch control, or cross-module claim.
+pub fn derive_pair_startup_call_graph_comptime_plan(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
+    with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+        StartupEntry::PairCallGraph, |calls, body, name_span, proof| {
+            let VerifiedStartupPaths::Graph { hops, paths } = proof else {
+                return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
+            };
+            let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
+            Ok(PairStartupCallGraphComptimePlan { plan, hops, paths })
         })
 }
 
@@ -282,9 +366,17 @@ fn with_verified_direct_call<T>(
     })
 }
 
+#[derive(Clone, Copy)]
 enum StartupEntry {
     Direct,
     OneForwarder,
+    PairCallGraph,
+}
+
+enum VerifiedStartupPaths {
+    Direct,
+    OneForwarder(PairStartupForwarding),
+    Graph { hops: Vec<PairStartupCallHop>, paths: Vec<PairStartupCallPath> },
 }
 
 // The analytical project stays private. The continuation is called only
@@ -292,7 +384,7 @@ enum StartupEntry {
 fn with_verified_startup_calls<const ARITY: usize, T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize, entry: StartupEntry,
     observe: impl FnOnce(
-        Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan, Option<PairStartupForwarding>,
+        Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan, VerifiedStartupPaths,
     ) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
@@ -313,20 +405,37 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
     let (tail, declaration_item, source) = function_tail(&node)
         .ok_or_else(|| unsupported("expected the only tail of one ordinary function"))?;
     let mut authored_items = source.children()
-        .filter(|child| !matches!(child.kind(), SyntaxKind::BoundaryStart | SyntaxKind::BoundaryEnd));
+        .filter(|child| !matches!(child.kind(), SyntaxKind::BoundaryStart | SyntaxKind::BoundaryEnd)).peekable();
     if authored_items.next().as_ref() != Some(&declaration_item) {
         return Err(unsupported("expected the only tail of one ordinary function"));
     }
-    let forwarder = match entry {
-        StartupEntry::Direct => None,
+    let safe_forwarder = |declaration: &CstNode| {
+        !declaration.children_with_tokens().any(|token| token.kind() == SyntaxKind::Unsafe)
+    };
+    let mut forwarders = Vec::new();
+    match entry {
+        StartupEntry::Direct => {}
         StartupEntry::OneForwarder => {
             let declaration = authored_items.next().and_then(|item| only(item.children()))
-                .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
-                .filter(|node| !node.children_with_tokens().any(|token| token.kind() == SyntaxKind::Unsafe))
+                .filter(|node| node.kind() == SyntaxKind::FunctionDecl).filter(safe_forwarder)
                 .ok_or_else(|| unsupported("expected one safe authored forwarder before startup bindings"))?;
-            Some(wosy_syntax::byte_span(&declaration))
+            forwarders.push(wosy_syntax::byte_span(&declaration));
         }
-    };
+        StartupEntry::PairCallGraph => {
+            while let Some(declaration) = authored_items.peek().and_then(|item| only(item.children()))
+                .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+            {
+                if forwarders.len() == MAX_PAIR_STARTUP_HOPS {
+                    return Err(unsupported("comptime startup forwarding declaration limit exceeded"));
+                }
+                if !safe_forwarder(&declaration) {
+                    return Err(unsupported("comptime startup requires safe authored forwarding declarations"));
+                }
+                forwarders.push(wosy_syntax::byte_span(&declaration));
+                authored_items.next();
+            }
+        }
+    }
     let mut count = 0;
     for item in authored_items {
         if only(item.children()).is_none_or(|child| child.kind() != SyntaxKind::BindingDecl) {
@@ -380,22 +489,27 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         ScalarPreparationInputs { target_layout: layout },
     ).map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
     let [module] = prepared.project().modules.as_slice() else { unreachable!("one supplied module"); };
-    let [ScalarItem::Function(function), bindings @ ..] = module.items.as_slice() else {
+    let [ScalarItem::Function(function), rest @ ..] = module.items.as_slice() else {
         return Err(unsupported("expected one ordinary function before startup"));
     };
     let Some(region) = prepared.initialization_region(0) else {
         return Err(unsupported("ordinary entry initialization was not prepared"));
     };
-    let (forwarder, bindings) = if let Some(span) = forwarder {
-        let [ScalarItem::Function(wrapper), bindings @ ..] = bindings else {
+    let Some((wrappers, bindings)) = rest.split_at_checked(forwarders.len()) else {
+        return Err(unsupported("ordinary entry does not contain the authored forwarder"));
+    };
+    let mut declarations = Vec::with_capacity(1 + wrappers.len());
+    declarations.push(scope(function.name_span));
+    for (item, span) in wrappers.iter().zip(&forwarders) {
+        let ScalarItem::Function(wrapper) = item else {
             return Err(unsupported("ordinary entry does not contain the authored forwarder"));
         };
-        if wrapper.span != span {
+        if wrapper.span != *span {
             return Err(unsupported("ordinary entry does not contain the authored forwarder"));
         }
-        (Some(wrapper), bindings)
-    } else { (None, bindings) };
-    let first_binding = 1 + usize::from(forwarder.is_some());
+        declarations.push(scope(wrapper.name_span));
+    }
+    let first_binding = declarations.len();
     if bindings.len() != count || region.steps.len() != count
         || region.steps.iter().enumerate().any(|(offset, step)| step.item != offset + first_binding
             || step.kind != ModuleInitializationStepKind::BindingInitialization)
@@ -445,16 +559,18 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
 
     let facts = prepared.initializer_facts(0)
         .map_err(|_| unsupported("ordinary initializer occurrence facts are unavailable"))?;
-    let declaration = scope(function.name_span);
-    let forwarding = forwarder.map(|wrapper| {
-        check_pair_forwarding(&prepared, &build, wrapper, &declaration, result_type, &scope, &unsupported)
-    }).transpose()?;
-    let (startup_declaration, argument_positions): (_, [usize; ARITY]) = match &forwarding {
-        Some(hop) => (hop.declaration(), hop.startup_argument_positions.as_slice().try_into()
-            .map_err(|_| unsupported("forwarding requires the exact pair arity"))?),
-        None => (&declaration, std::array::from_fn(|ordinal| ordinal)),
-    };
+    let mut hops = Vec::with_capacity(wrappers.len());
+    for (offset, item) in wrappers.iter().enumerate() {
+        let ScalarItem::Function(wrapper) = item else { unreachable!("checked ordinary forwarding prefix"); };
+        hops.push(check_pair_forwarding(
+            &prepared, &build, wrapper, offset + 1, &declarations, entry, result_type, &scope, &unsupported,
+        )?);
+    }
+    let routes = if matches!(entry, StartupEntry::PairCallGraph) {
+        verified_pair_paths(&hops)?
+    } else { Vec::new() };
     let mut selected = Vec::with_capacity(count);
+    let mut paths = Vec::new();
     for item in bindings {
         let ScalarItem::Binding(binding) = item else {
             return Err(unsupported("expected one argument binding at each startup step"));
@@ -474,9 +590,26 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             .map_err(|_| unsupported("call is not the entire ordinary initializer"))?;
         let target = facts.checked_direct_call(call)
             .map_err(|_| unsupported("no exact direct declaration was selected"))?;
-        if target.declaration != startup_declaration || target.concrete != &ConcreteCallSelection::Declaration {
+        let selected_declaration = declarations.iter().position(|declaration| declaration == target.declaration);
+        let chosen = match (entry, selected_declaration) {
+            (StartupEntry::Direct, Some(0)) => 0,
+            (StartupEntry::OneForwarder, Some(1)) => 1,
+            (StartupEntry::PairCallGraph, Some(index)) => index,
+            _ => return Err(unsupported("initializer did not select the authored function")),
+        };
+        if target.concrete != &ConcreteCallSelection::Declaration {
             return Err(unsupported("initializer did not select the authored function"));
         }
+        let positions = match (entry, chosen) {
+            (_, 0) => None,
+            (StartupEntry::OneForwarder, _) => Some(hops[0].edge.positions()),
+            (StartupEntry::PairCallGraph, index) => Some(routes[index].positions),
+            (StartupEntry::Direct, _) => unreachable!("direct startup selects declaration zero"),
+        };
+        let argument_positions: [usize; ARITY] = if let Some(positions) = positions {
+            positions.as_slice().try_into().map_err(|_| unsupported("forwarding requires the exact pair arity"))?
+        } else { std::array::from_fn(|ordinal| ordinal) };
+        if matches!(entry, StartupEntry::PairCallGraph) { paths.push(routes[chosen].clone()); }
         let [result] = target.outputs else {
             return Err(unsupported("one contextual scalar result is required"));
         };
@@ -507,18 +640,69 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         let inputs = inputs.try_into()
             .map_err(|_| unsupported("ordinary literal tuple did not preserve every formal"))?;
         selected.push(InspectedDirectComptimeCall {
-            site: scope(site.span), function: declaration.clone(), call: scope(span_of(call)),
+            site: scope(site.span), function: declarations[0].clone(), call: scope(span_of(call)),
             inputs, result: result.ty.clone(),
         });
     }
-    observe(selected, body, super::super::token_span(&site.id), forwarding)
+    let proof = match entry {
+        StartupEntry::Direct => VerifiedStartupPaths::Direct,
+        StartupEntry::OneForwarder => {
+            let edge = hops.pop().expect("one checked authored forwarding declaration").edge;
+            let startup_argument_positions = edge.positions();
+            VerifiedStartupPaths::OneForwarder(PairStartupForwarding {
+                declaration: edge.caller, tail_call: edge.tail_call, startup_argument_positions,
+            })
+        }
+        StartupEntry::PairCallGraph => VerifiedStartupPaths::Graph {
+            hops: hops.into_iter().map(|hop| hop.edge).collect(), paths,
+        },
+    };
+    observe(selected, body, super::super::token_span(&site.id), proof)
+}
+
+struct IndexedPairHop {
+    target: usize,
+    edge: PairStartupCallHop,
+}
+
+fn verified_pair_paths(hops: &[IndexedPairHop]) -> Result<Vec<PairStartupCallPath>, ClosedComptimeRejection> {
+    // Each wrapper has exactly one checked outgoing edge. Memoize proved
+    // suffixes before any startup tuple is admitted; at most eight wrappers
+    // can reach this recursion and marked re-entry is rejected immediately.
+    fn visit(
+        index: usize, hops: &[IndexedPairHop], complete: &mut [Option<PairStartupCallPath>], active: &mut [bool],
+    ) -> Result<PairStartupCallPath, ClosedComptimeRejection> {
+        if let Some(path) = &complete[index] { return Ok(path.clone()); }
+        let hop = &hops[index - 1];
+        if active[index] {
+            return Err(ClosedComptimeRejection::Unsupported {
+                site: hop.edge.tail_call.clone(), feature: "comptime startup forwarding contains a cycle",
+            });
+        }
+        active[index] = true;
+        let suffix = visit(hop.target, hops, complete, active)?;
+        let edge = hop.edge.positions();
+        let positions = suffix.positions.map(|callee_position| edge[callee_position]);
+        let mut path = Vec::with_capacity(suffix.hops.len() + 1);
+        path.push(index - 1);
+        path.extend(suffix.hops);
+        let path = PairStartupCallPath { hops: path, positions };
+        active[index] = false;
+        complete[index] = Some(path.clone());
+        Ok(path)
+    }
+    let mut complete = vec![None; hops.len() + 1];
+    complete[0] = Some(PairStartupCallPath { hops: Vec::new(), positions: [0, 1] });
+    let mut active = vec![false; complete.len()];
+    (0..complete.len()).map(|index| visit(index, hops, &mut complete, &mut active)).collect()
 }
 
 fn check_pair_forwarding(
     prepared: &PreparedScalarProject, build: &ScalarBuildValidation<'_>, wrapper: &ScalarFunction,
-    callee: &SourceSpan, result_type: &ScalarType, scope: &impl Fn(ByteSpan) -> SourceSpan,
+    index: usize, declarations: &[SourceSpan], entry: StartupEntry,
+    result_type: &ScalarType, scope: &impl Fn(ByteSpan) -> SourceSpan,
     unsupported: &impl Fn(&'static str) -> ClosedComptimeRejection,
-) -> Result<PairStartupForwarding, ClosedComptimeRejection> {
+) -> Result<IndexedPairHop, ClosedComptimeRejection> {
     let [ScalarBlockItem::Expression(call @ ScalarExpression::Call {
         receiver: None, type_arguments, arguments, ..
     })] = wrapper.body.items.as_slice() else {
@@ -530,38 +714,49 @@ fn check_pair_forwarding(
     if !type_arguments.is_empty() || wrapper.parameters.len() != 2 {
         return Err(unsupported("forwarding requires the exact pair arity"));
     }
-    // Item 1 is the exact verified authored second function, not a name
-    // lookup. Resolve the call by the ordinary checked AST occurrence.
-    let nodes = prepared.bind_callable_body_call_nodes(0, 1, None, &wrapper.body)
+    // The item is the verified authored wrapper, not a name lookup.
+    let nodes = prepared.bind_callable_body_call_nodes(0, index, None, &wrapper.body)
         .map_err(|_| unsupported("ordinary forwarding occurrences are unavailable"))?;
-    let points = build.callable_point_facts(0, 1, None)
+    let points = build.callable_point_facts(0, index, None)
         .ok_or_else(|| unsupported("ordinary forwarding formal facts are unavailable"))?;
     if nodes.final_output(call) != Some(0) || nodes.evaluation_point(points, call).is_none()
         || nodes.checked_expression_type(call) != Some(result_type)
     {
         return Err(unsupported("forwarding call does not itself evaluate as the exact output"));
     }
-    match nodes.target(call) {
-        Ok(ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration })
-            if source == &callee.source && declaration_span == &callee.range => {}
+    let target = match nodes.target(call) {
+        Ok(ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }) =>
+            declarations.iter().position(|decl| source == &decl.source && declaration_span == &decl.range),
+        _ => None,
+    };
+    let target = match (entry, target) {
+        (StartupEntry::OneForwarder, Some(0)) => 0,
+        (StartupEntry::PairCallGraph, Some(target)) => target,
+        (StartupEntry::PairCallGraph, _) =>
+            return Err(unsupported("forwarding call did not select a verified local declaration")),
         _ => return Err(unsupported("forwarding call did not select the authored comptime function")),
-    }
+    };
     let formals = [nodes.formal(points, 0), nodes.formal(points, 1)];
-    let formal_position = |argument| {
+    let forwarded_input = |argument| {
         let Some(PlainNameIdentity::Lexical(binding)) = nodes.plain_name(argument) else { return None; };
         if nodes.checked_expression_type(argument) != Some(result_type) { return None; }
-        formals.iter().position(|formal| formal.is_some_and(|(id, ty)| id == binding && ty == result_type))
+        let caller_position = formals.iter().position(|formal| formal.is_some_and(|(id, ty)| id == binding && ty == result_type))?;
+        Some(PairStartupHopInput {
+            caller_position, caller_formal: scope(binding.declaration_span), read: scope(span_of(argument)),
+        })
     };
-    let (Some(left_position), Some(right_position)) = (formal_position(left), formal_position(right)) else {
+    let (Some(left), Some(right)) = (forwarded_input(left), forwarded_input(right)) else {
         return Err(unsupported("forwarding must pass each exact formal without intervening computation"));
     };
-    if left_position == right_position {
+    if left.caller_position == right.caller_position {
         return Err(unsupported("forwarding must pass each exact formal without intervening computation"));
     }
-    Ok(PairStartupForwarding {
-        declaration: scope(wrapper.name_span),
-        tail_call: scope(span_of(call)),
-        startup_argument_positions: [left_position, right_position],
+    Ok(IndexedPairHop {
+        target,
+        edge: PairStartupCallHop {
+            caller: declarations[index].clone(), callee: declarations[target].clone(), tail_call: scope(span_of(call)),
+            inputs: [left, right],
+        },
     })
 }
 
@@ -918,6 +1113,147 @@ mod tests {
             assert!(derive_direct_startup_comptime_plan(&authored, "value", layout).is_err());
         }
     }
+
+    fn authored_call_graph() -> String {
+        format!(
+            "{PAIRED_FUNCTION}\n\
+             u32(u32, u32) near = fn(near_left, near_right) {{ solve(near_right, near_left) }};\n\
+             u32(u32, u32) center = fn(center_left, center_right) {{ near(center_right, center_left) }};\n\
+             u32(u32, u32) side = fn(side_left, side_right) {{ near(side_left, side_right) }};\n\
+             u32(u32, u32) far = fn(far_left, far_right) {{ center(far_left, far_right) }};\n\
+             u32 root_first = center(7, 9);\n\
+             u32 root_second = side(9, 7);\n\
+             u32 root_third = side(7, 9);\n\
+             u32 root_direct = solve(7, 9);\n\
+             u32 root_far = far(7, 11);\n\
+             u32 root_repeat = far(7, 9);"
+        )
+    }
+
+    #[test]
+    fn pair_call_graph_proves_different_paths_and_reuses_only_the_final_tuple() {
+        let source = fresh(&authored_call_graph());
+        assert!(source.result().is_valid());
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let plan = derive_pair_startup_call_graph_comptime_plan(&source, "value", layout)
+                .unwrap_or_else(|error| panic!("typed call graph on {layout:?}: {error:?}"));
+            let expected_hops = [
+                ("near", "solve", "solve(near_right, near_left)", [1, 0], ["near_right", "near_left"]),
+                ("center", "near", "near(center_right, center_left)", [1, 0], ["center_right", "center_left"]),
+                ("side", "near", "near(side_left, side_right)", [0, 1], ["side_left", "side_right"]),
+                ("far", "center", "center(far_left, far_right)", [0, 1], ["far_left", "far_right"]),
+            ];
+            assert_eq!(plan.hops().len(), expected_hops.len());
+            for (hop, (caller, callee, tail, positions, names)) in plan.hops().iter().zip(expected_hops) {
+                assert_eq!(spelling(&source, hop.caller()), caller);
+                assert_eq!(spelling(&source, hop.callee()), callee);
+                assert_eq!(spelling(&source, hop.tail_call()), tail);
+                for ((input, position), name) in hop.inputs().iter().zip(positions).zip(names) {
+                    assert_eq!(input.caller_position(), position);
+                    assert_eq!(spelling(&source, input.caller_formal()), name);
+                    assert_eq!(spelling(&source, input.read()), name);
+                    assert_ne!(input.caller_formal(), input.read());
+                }
+            }
+            let expected_calls: [(&str, &[usize], [usize; 2], [u32; 2], usize); 6] = [
+                ("center(7, 9)", &[1, 0], [0, 1], [7, 9], 0),
+                ("side(9, 7)", &[2, 0], [1, 0], [7, 9], 0),
+                ("side(7, 9)", &[2, 0], [1, 0], [9, 7], 1),
+                ("solve(7, 9)", &[], [0, 1], [7, 9], 0),
+                ("far(7, 11)", &[3, 1, 0], [0, 1], [7, 11], 2),
+                ("far(7, 9)", &[3, 1, 0], [0, 1], [7, 9], 0),
+            ];
+            assert_eq!(plan.calls().len(), expected_calls.len());
+            for ((call, path), (spelling_in_entry, hops, positions, tuple, slot)) in plan.calls().zip(expected_calls) {
+                let facts = call.facts();
+                assert_eq!(spelling(&source, facts.call()), spelling_in_entry);
+                assert_eq!(spelling(&source, facts.function()), "solve");
+                assert_eq!(path.hop_indices(), hops);
+                assert_eq!(path.startup_argument_positions(), positions);
+                assert_eq!(facts.tuple(), tuple.map(DirectComptimeArgument::U32));
+                assert_eq!(call.evaluator_index(), slot);
+                for (input, value) in facts.inputs().iter().zip(tuple) {
+                    assert_eq!(spelling(&source, input.argument()), value.to_string());
+                }
+                assert_eq!(facts.inputs()[0].argument().range.start < facts.inputs()[1].argument().range.start,
+                    positions == [0, 1]);
+            }
+            let [ordered, swapped, different] = plan.evaluators() else { panic!("three typed tuple slots"); };
+            for (evaluator, expression) in [(ordered, "9 ^ 7"), (swapped, "7 ^ 9"), (different, "11 ^ 7")] {
+                let ordinary = fresh(&format!("u32 answer = comptime value {{ {expression} }};"));
+                let oracle = super::super::derive_closed_comptime_fragment(&ordinary, "value", layout, |_| None).unwrap();
+                assert_eq!(evaluator.llvm().to_text(), oracle.llvm().to_text());
+            }
+            assert_eq!(ordered.llvm().to_text(), swapped.llvm().to_text());
+            assert_ne!(ordered.llvm().to_text(), different.llvm().to_text());
+        }
+    }
+
+    #[test]
+    fn pair_call_graph_refuses_a_real_cycle_and_computation_in_a_shared_edge() {
+        let layout = ScalarTargetLayout::WASM32;
+        let cyclic = fresh(&format!(
+            "{PAIRED_FUNCTION}\n\
+             u32(u32, u32) loop_node = fn(loop_left, loop_right) {{ loop_node(loop_right, loop_left) }};\n\
+             u32 root_safe = solve(7, 9);\n\
+             u32 root_cyclic = loop_node(7, 9);"
+        ));
+        assert!(cyclic.result().is_valid());
+        let Err(ClosedComptimeRejection::Unsupported { site, feature: "comptime startup forwarding contains a cycle" }) =
+            derive_pair_startup_call_graph_comptime_plan(&cyclic, "value", layout)
+        else { panic!("the checked self edge must be refused as cyclic"); };
+        assert_eq!(spelling(&cyclic, &site), "loop_node(loop_right, loop_left)");
+
+        let remapped = fresh(&authored_call_graph().replace("solve(near_right, near_left)", "solve(near_right ^ near_left, near_left)"));
+        assert!(remapped.result().is_valid());
+        assert!(matches!(derive_pair_startup_call_graph_comptime_plan(&remapped, "value", layout),
+            Err(ClosedComptimeRejection::Unsupported {
+                feature: "forwarding must pass each exact formal without intervening computation", ..
+            })));
+    }
+
+    #[test]
+    fn pair_call_graph_checks_full_declared_hop_and_startup_bounds() {
+        let layout = ScalarTargetLayout::WASM32;
+        let authored = |hops: usize, calls: usize| {
+            use std::fmt::Write;
+            let mut authored = PAIRED_FUNCTION.to_owned();
+            let mut previous = "solve".to_owned();
+            for index in 0..hops {
+                let name = format!("relay_{index}");
+                writeln!(authored, "\nu32(u32, u32) {name} = fn(chain_left, chain_right) {{ {previous}(chain_right, chain_left) }};").unwrap();
+                previous = name;
+            }
+            for index in 0..calls {
+                writeln!(authored, "\nu32 startup_{index} = {previous}(7, 9);").unwrap();
+            }
+            fresh(&authored)
+        };
+        let edge = authored(MAX_PAIR_STARTUP_HOPS, MAX_DIRECT_STARTUP_CALLS);
+        assert!(edge.result().is_valid());
+        let plan = derive_pair_startup_call_graph_comptime_plan(&edge, "value", layout)
+            .unwrap_or_else(|error| panic!("full bounded graph: {error:?}"));
+        assert_eq!(plan.hops().len(), MAX_PAIR_STARTUP_HOPS);
+        assert_eq!(plan.calls().len(), MAX_DIRECT_STARTUP_CALLS);
+        assert_eq!(plan.evaluators().len(), 1);
+        let expected: Vec<_> = (0..MAX_PAIR_STARTUP_HOPS).rev().collect();
+        for (call, path) in plan.calls() {
+            assert_eq!(path.hop_indices(), expected);
+            assert_eq!(path.startup_argument_positions(), [0, 1]);
+            assert_eq!(call.facts().tuple(), [DirectComptimeArgument::U32(7), DirectComptimeArgument::U32(9)]);
+        }
+
+        for (hops, calls, expected) in [
+            (MAX_PAIR_STARTUP_HOPS + 1, MAX_DIRECT_STARTUP_CALLS, "comptime startup forwarding declaration limit exceeded"),
+            (MAX_PAIR_STARTUP_HOPS, MAX_DIRECT_STARTUP_CALLS + 1, "direct comptime startup call limit exceeded"),
+        ] {
+            let source = authored(hops, calls);
+            assert!(source.result().is_valid());
+            assert!(matches!(derive_pair_startup_call_graph_comptime_plan(&source, "value", layout),
+                Err(ClosedComptimeRejection::Unsupported { feature, .. }) if feature == expected));
+        }
+    }
+
 
     #[test]
     fn forwarded_pair_reaches_the_exact_typed_target_with_the_formal_permutation() {
