@@ -3290,7 +3290,7 @@ fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
     }
 }
 
-fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
+pub(super) fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
     let (minimum, maximum) = match ty {
         ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
         ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),

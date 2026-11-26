@@ -1,6 +1,45 @@
 use super::{string_array, BuilderConfig, ProjectConfiguration, RunnerConfig};
-use std::path::Path;
-use toml_edit::{Item, TableLike};
+use std::{collections::BTreeMap, path::Path};
+use toml_edit::{ImDocument, Item, TableLike};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeclaredComptimeParameter {
+    Integer(i64),
+    Boolean(bool),
+    /// An authored value needing a compiler expansion not supported by
+    /// the first closed scalar evaluator. Unused values stay irrelevant.
+    Other,
+}
+
+pub fn declared_comptime_parameters(
+    configuration: &ProjectConfiguration, document: &ImDocument<String>, target: &str, profile: &str,
+) -> Result<BTreeMap<String, DeclaredComptimeParameter>, String> {
+    configuration.target_profile(target, profile)?;
+    let Some(parameters) = authored_profile(document, target, profile)?.get("params") else {
+        return Ok(BTreeMap::new());
+    };
+    let parameters = parameters.as_table_like().ok_or("compile-time params must be a table")?;
+    Ok(parameters.iter().map(|(name, value)| {
+        let value = if let Some(value) = value.as_integer() {
+            DeclaredComptimeParameter::Integer(value)
+        } else if let Some(value) = value.as_bool() {
+            DeclaredComptimeParameter::Boolean(value)
+        } else {
+            DeclaredComptimeParameter::Other
+        };
+        (name.to_owned(), value)
+    }).collect())
+}
+
+fn authored_profile<'a>(
+    document: &'a ImDocument<String>, target: &str, profile: &str,
+) -> Result<&'a toml_edit::Table, String> {
+    document.get("targets").and_then(Item::as_table)
+        .and_then(|targets| targets.get(target)).and_then(Item::as_table)
+        .and_then(|target| target.get("profiles")).and_then(Item::as_table)
+        .and_then(|profiles| profiles.get(profile)).and_then(Item::as_table)
+        .ok_or_else(|| format!("target {target} profile {profile} is missing from its manifest"))
+}
 
 /// The consuming profile's evaluator tools and build declarations from one
 /// ordinary manifest read. Not an executable identity, a capability grant,
@@ -44,11 +83,7 @@ impl SelectedComptimeTools {
     pub fn load(root: &Path, target: &str, profile: &str) -> Result<Option<Self>, String> {
         let (mut configuration, document) = ProjectConfiguration::load_with_manifest(root)?;
         configuration.target_profile(target, profile)?;
-        let authored = document.get("targets").and_then(Item::as_table)
-            .and_then(|targets| targets.get(target)).and_then(Item::as_table)
-            .and_then(|target| target.get("profiles")).and_then(Item::as_table)
-            .and_then(|profiles| profiles.get(profile)).and_then(Item::as_table)
-            .ok_or_else(|| format!("target {target} profile {profile} is missing from its manifest"))?;
+        let authored = authored_profile(&document, target, profile)?;
         let (builder, runner) = match (authored.get("comptime_builder"), authored.get("comptime_runner")) {
             (None, None) => return Ok(None),
             (Some(builder), Some(runner)) => (builder, runner),

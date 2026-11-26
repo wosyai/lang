@@ -29,6 +29,8 @@ pub use scalar::{
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
     ScalarValidation, UnaryOperator, BASE_DECLARATION_ABI,
 };
+pub use scalar::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection,
+    ComptimeParameter, ComptimeParameterRejection};
 
 mod llvm;
 

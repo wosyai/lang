@@ -626,7 +626,7 @@ pub enum CfgPointKind {
 }
 
 #[cfg_attr(not(test), derive(Clone))]
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ScalarReferenceCfg {
     pub facts: Vec<ReferenceOrigin>,
     pub points: Vec<ReferenceFlowPoint>,
@@ -2512,6 +2512,9 @@ pub fn derive_scalar_program_from_cst_with_layout(
 }
 
 mod declarations;
+mod comptime;
+pub use comptime::{derive_closed_comptime_fragment, ClosedComptimeFragment, ClosedComptimeRejection,
+    ComptimeParameter, ComptimeParameterRejection};
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};
@@ -3703,14 +3706,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         span: wosy_syntax::byte_span(node),
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
-        reference_cfg: ScalarReferenceCfg {
-            primary_call_points: HashMap::new(),
-            facts: Vec::new(),
-            points: Vec::new(),
-            initial_points: Vec::new(),
-            allocations: BTreeSet::new(),
-            specialized_policies: Vec::new(),
-        },
+        reference_cfg: ScalarReferenceCfg::default(),
     }
 }
 
