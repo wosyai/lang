@@ -3443,7 +3443,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         if startup_context_entry && trace.mixed_context.as_ref().is_some_and(|route|
                             route.dependent_requires.contains(&failure.directive))
                         {
-                            if trace.mixed_context.as_ref().is_none_or(|route| !route.returned_bridge) { trace.invalidate(); return; }
+                            if trace.mixed_context.as_ref().is_none_or(|route| !route.returned_context) { trace.invalidate(); return; }
                             if trace.mixed_context.as_ref().is_some_and(|route| !route.refuted_after_named.is_empty()) {
                                 // This row's snapshot came from the very
                                 // theorem that refuted. It cannot buy a slot
@@ -3595,10 +3595,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                             active_collection.and_then(|ordered| ordered.visits))))
                             });
                             (enrolled || trace.mixed_context.as_ref().is_some_and(|mixed| {
-                                (target == Some(mixed.bridge) && call.occurrence() == mixed.entry_site
-                                    && !mixed.returned_bridge && original(mixed.entry, frame.body))
+                                (target == Some(mixed.entry_target) && call.occurrence() == mixed.entry_site
+                                    && !mixed.returned_context && original(mixed.entry, frame.body))
                                 || target.is_some_and(|target| mixed.pending_leaves.front() == Some(&(call.occurrence(), target))
-                                    && original(mixed.bridge, frame.body))
+                                    && mixed.bridge.is_some_and(|bridge| original(bridge, frame.body)))
                             })) && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_))
                         };
                         // prepare_exact_child already authenticated the
@@ -3726,14 +3726,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 let matches_caller = |caller: PreparedCallable| self.calls.function_body(caller.0, caller.1, None)
                                     .is_some_and(|original| std::ptr::eq(original, parent.body));
                                 if route.pending_leaves.front() == Some(&(effect.occurrence(), target))
-                                    && matches_caller(route.bridge)
+                                    && route.bridge.is_some_and(matches_caller)
                                 {
                                     route.pending_leaves.pop_front();
-                                } else if route.pending_leaves.is_empty() && !route.returned_bridge
-                                    && target == route.bridge && effect.occurrence() == route.entry_site
+                                } else if route.pending_leaves.is_empty() && !route.returned_context
+                                    && target == route.entry_target && effect.occurrence() == route.entry_site
                                     && matches_caller(route.entry)
                                 {
-                                    route.returned_bridge = true;
+                                    route.returned_context = true;
                                 } else {
                                     return Err(ProjectCheck::Unsupported);
                                 }
@@ -4801,7 +4801,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         if let Some(route) = trace.mixed_context.as_mut().filter(|route|
                             route.entry == target && route.root_site == call)
                         {
-                            if !route.returned_bridge || !route.pending_leaves.is_empty() { return Err(ProjectCheck::Unsupported); }
+                            if !route.returned_context || !route.pending_leaves.is_empty() { return Err(ProjectCheck::Unsupported); }
                             route.finished = true;
                             if trace.remaining() == 0 && trace.cannot_continue() {
                                 return Err(ProjectCheck::StartupAuthoredLimitReached);
@@ -11611,53 +11611,67 @@ fn run_private_mixed_root_context(
         { return Err(ProjectCheck::Unsupported); }
         Ok((site.ordinal, *body.structure.checker_direct_targets.get(&site.ordinal).ok_or(ProjectCheck::Unsupported)?))
     };
-    let (entry_site, bridge) = edge_to(entry_body)?;
-    if bridge.0 != context_ordinal || leaves.contains(&bridge) || entry_body.contextual_formal().is_some()
+    let (entry_site, entry_target) = edge_to(entry_body)?;
+    if entry_target.0 != context_ordinal || entry_body.contextual_formal().is_some()
         || entry_body.structure.checker_contextual_declarations.len() != 1
     { return Err(ProjectCheck::Unsupported); }
-    let bridge_body = calls.function_body(bridge.0, bridge.1, None).ok_or(ProjectCheck::Unsupported)?;
-    if bridge_body.contextual_formal().is_none() || !bridge_body.structure.checker_directives.is_empty() {
-        return Err(ProjectCheck::Unsupported);
-    }
     let dependent_requires = mixed_context_entry_requires(entry_body, entry_site)?;
     let mut pending_leaves = std::collections::VecDeque::new();
-    if leaves.len() == 1 {
-        pending_leaves.push_back(edge_to(bridge_body)?);
-    } else {
-        // Multiple leaves require a straight-line, source-ordered bridge
-        // with no extra authored operations or inferred call schedule.
-        if !dependent_requires.is_empty() || !bridge_body.checker_returns_unit()
-            || !bridge_body.boundary.parameters.is_empty() || !bridge_body.arms.is_empty()
-            || !bridge_body.callable_escapes.is_empty() || !bridge_body.allocation_length_calls.is_empty()
-            || !bridge_body.conditionals.is_empty()
-            || bridge_body.call_occurrences.len() != leaves.len()
-        { return Err(ProjectCheck::Unsupported); }
-        let block = bridge_body.structure.blocks.get(bridge_body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
-        if block.unsafe_context || block.items.len() != leaves.len() { return Err(ProjectCheck::Unsupported); }
-        for item in &block.items {
-            let BlockItemKind::Evaluation { expression } = item.kind else { return Err(ProjectCheck::Unsupported); };
-            let target = *bridge_body.structure.checker_direct_targets.get(&expression).ok_or(ProjectCheck::Unsupported)?;
-            if bridge_body.contextual_argument(expression).is_none() { return Err(ProjectCheck::Unsupported); }
-            pending_leaves.push_back((expression, target));
-        }
-    }
-    if pending_leaves.iter().map(|(_, target)| *target).collect::<HashSet<_>>() != leaves {
-        return Err(ProjectCheck::Unsupported);
-    }
-    for &(site, leaf) in &pending_leaves {
-        let body = calls.function_body(leaf.0, leaf.1, None).ok_or(ProjectCheck::Unsupported)?;
-        let signature = bridge_body.checked_call_signatures.get(&site).ok_or(ProjectCheck::Unsupported)?;
-        if !body.call_occurrences.is_empty() || !body.structure.checker_directives.is_empty()
-            || (leaves.len() > 1 && (!signature.parameters.is_empty() || !body.boundary.parameters.is_empty()))
+    let bridge = if leaves.contains(&entry_target) {
+        // Direct entry-to-theorem calls have no forwarding frame.
+        // The actual qualified Unit return completes the contextual route.
+        let body = calls.function_body(entry_target.0, entry_target.1, None).ok_or(ProjectCheck::Unsupported)?;
+        let signature = entry_body.checked_call_signatures.get(&entry_site).ok_or(ProjectCheck::Unsupported)?;
+        if leaves.len() != 1 || !dependent_requires.is_empty() || !body.call_occurrences.is_empty() || !body.structure.checker_directives.is_empty()
+            || body.contextual_formal().is_none()
             || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
         { return Err(ProjectCheck::Unsupported); }
-    }
-    if !dependent_requires.is_empty() {
-        let bridge_root = bridge_body.structure.blocks.get(bridge_body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
-        if !matches!(bridge_root.items.as_slice(), [item]
-            if matches!(&item.kind, BlockItemKind::Evaluation { expression } if Some(expression) == pending_leaves.front().map(|(site, _)| site)))
-        { return Err(ProjectCheck::Unsupported); }
-    }
+        None
+    } else {
+        let bridge = entry_target;
+        let bridge_body = calls.function_body(bridge.0, bridge.1, None).ok_or(ProjectCheck::Unsupported)?;
+        if bridge_body.contextual_formal().is_none() || !bridge_body.structure.checker_directives.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if leaves.len() == 1 {
+            pending_leaves.push_back(edge_to(bridge_body)?);
+        } else {
+            // Multiple leaves require a straight-line, source-ordered bridge
+            // with no extra authored operations or inferred call schedule.
+            if !dependent_requires.is_empty() || !bridge_body.checker_returns_unit()
+                || !bridge_body.boundary.parameters.is_empty() || !bridge_body.arms.is_empty()
+                || !bridge_body.callable_escapes.is_empty() || !bridge_body.allocation_length_calls.is_empty()
+                || !bridge_body.conditionals.is_empty()
+                || bridge_body.call_occurrences.len() != leaves.len()
+            { return Err(ProjectCheck::Unsupported); }
+            let block = bridge_body.structure.blocks.get(bridge_body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
+            if block.unsafe_context || block.items.len() != leaves.len() { return Err(ProjectCheck::Unsupported); }
+            for item in &block.items {
+                let BlockItemKind::Evaluation { expression } = item.kind else { return Err(ProjectCheck::Unsupported); };
+                let target = *bridge_body.structure.checker_direct_targets.get(&expression).ok_or(ProjectCheck::Unsupported)?;
+                if bridge_body.contextual_argument(expression).is_none() { return Err(ProjectCheck::Unsupported); }
+                pending_leaves.push_back((expression, target));
+            }
+        }
+        if pending_leaves.iter().map(|(_, target)| *target).collect::<HashSet<_>>() != leaves {
+            return Err(ProjectCheck::Unsupported);
+        }
+        for &(site, leaf) in &pending_leaves {
+            let body = calls.function_body(leaf.0, leaf.1, None).ok_or(ProjectCheck::Unsupported)?;
+            let signature = bridge_body.checked_call_signatures.get(&site).ok_or(ProjectCheck::Unsupported)?;
+            if !body.call_occurrences.is_empty() || !body.structure.checker_directives.is_empty()
+                || (leaves.len() > 1 && (!signature.parameters.is_empty() || !body.boundary.parameters.is_empty()))
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
+            { return Err(ProjectCheck::Unsupported); }
+        }
+        if !dependent_requires.is_empty() {
+            let bridge_root = bridge_body.structure.blocks.get(bridge_body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
+            if !matches!(bridge_root.items.as_slice(), [item]
+                if matches!(&item.kind, BlockItemKind::Evaluation { expression } if Some(expression) == pending_leaves.front().map(|(site, _)| site)))
+            { return Err(ProjectCheck::Unsupported); }
+        }
+        Some(bridge)
+    };
     let (_, roots) = package_obligation_roots(&owner.prepared, scope, startup_count, root)?;
     if roots.into_iter().any(|(module, items)| module != entry.0 || items.into_iter().any(|item| item != entry.1)) {
         return Err(ProjectCheck::Unsupported);
@@ -11670,7 +11684,7 @@ fn run_private_mixed_root_context(
     trace.retain_after_cutoff = true;
     trace.named_cross_source = ordinary_ordinal != root_ordinal;
     trace.mixed_context = Some(MixedContextStartup {
-        root_site, entry_site, entry, bridge, pending_leaves, returned_bridge: false,
+        root_site, entry_site, entry, entry_target, bridge, pending_leaves, returned_context: false,
         finished: false, refuted_after_named: Vec::new(), dependent_requires,
     });
     let mut required = HashSet::new();
@@ -11691,7 +11705,7 @@ fn run_private_mixed_root_context(
     let mut trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
     let completed = trace.mixed_context.take().ok_or(ProjectCheck::Unsupported)?;
-    if trace.invalid() || !completed.finished || !completed.returned_bridge || !completed.pending_leaves.is_empty() || !trace.required_sites.is_empty()
+    if trace.invalid() || !completed.finished || !completed.returned_context || !completed.pending_leaves.is_empty() || !trace.required_sites.is_empty()
         || trace.named_observations.len() != observation_count || effects.has_authored_state || effects.has_selected_code
         || !effects.snapshot_records.is_empty() || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(trace.remaining()) != Some(effects.records.len())
     { return Err(ProjectCheck::Unsupported); }

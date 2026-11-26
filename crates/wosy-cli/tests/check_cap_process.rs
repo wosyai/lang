@@ -497,3 +497,58 @@ fn check_cap_process_preserves_exact_mixed_literal_inequality() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_preserves_original_direct_qualified_contextual_leaf() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            let project = Fixture::new();
+            let root = format!(r#"%%start
+                lib = namespace app "credit.w";
+                unit() entry = fn {{ u8 core.context.credit = 3; lib.consume(); }};
+                u8(u8) score = fn(value) {{ value }};
+                proof scalar_value for score(input) -> (out) where (input == 4) ensures (out > 3) {{}}
+                {}
+                entry();
+                u8 scored = score(4);
+                core.require(scored == 5, {{ .stdout = "second"; .stderr = "[second]"; .code = 19;
+                    .files = [{{ .path = "second.txt"; .text = "second"; }}]; }});
+                %%end"#, require("first", 0, "first.txt"));
+            let provider = r#"%%start
+                unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                proof debit_goal for consume() -> (null)
+                    ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+            %%end"#;
+            project.package("", layout, "dev", "", &root);
+            let credit = project.0.join("src/credit.w");
+            for refuted in [false, true] {
+                let source = if refuted { provider.replace("- 1) {}", "- 0) {}") } else { provider.to_owned() };
+                fs::write(&credit, source).unwrap();
+                let old = project.run(&[scope]);
+                assert_eq!(old.status.code(), Some(19), "{old:?}");
+                assert_eq!(old.stdout, b"firstsecond");
+                let expected_diagnostics = old.stderr.strip_prefix(b"[first][second]").unwrap();
+                let diagnostic = String::from_utf8_lossy(expected_diagnostics);
+                if refuted {
+                    assert!(diagnostic.contains("src/credit.w") && diagnostic.contains("lib.consume()")
+                        && diagnostic.contains("contextual value at entry: 3; at exit: 2"), "{diagnostic}");
+                } else {
+                    assert!(diagnostic.is_empty());
+                }
+                project.clear();
+
+                let mut stderr = b"[first]".to_vec();
+                stderr.extend(expected_diagnostics);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+                assert!(!project.output().join("second.txt").exists());
+                project.clear();
+
+                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), b"second");
+                project.clear();
+            }
+        }
+    }
+}

@@ -78,10 +78,11 @@ impl ContextualStartupRoster {
 pub(super) struct MixedContextStartup {
     pub(super) root_site: OccurrenceOrdinal,
     pub(super) entry_site: OccurrenceOrdinal,
-    pub(super) bridge: PreparedCallable,
+    pub(super) entry_target: PreparedCallable,
+    pub(super) bridge: Option<PreparedCallable>,
     pub(super) entry: PreparedCallable,
     pub(super) pending_leaves: std::collections::VecDeque<(OccurrenceOrdinal, PreparedCallable)>,
-    pub(super) returned_bridge: bool,
+    pub(super) returned_context: bool,
     pub(super) finished: bool,
     pub(super) refuted_after_named: Vec<usize>,
     pub(super) dependent_requires: HashSet<OccurrenceOrdinal>,
