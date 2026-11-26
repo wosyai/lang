@@ -34,6 +34,8 @@ pub(super) struct StartupProofObservation {
     pub(super) returned: BigInt,
 }
 
+pub(in super::super) type SharedStartupTrace = std::rc::Rc<std::cell::RefCell<StartUpSearch>>;
+
 pub(in super::super) struct StartUpSearch {
     remaining: usize,
     prefix: Vec<PathStep>,
@@ -147,6 +149,9 @@ impl StartUpSearch {
         self.invalid || (self.remaining == 0 && !self.proof_only_continuation())
     }
     pub(super) fn invalid(&self) -> bool { self.invalid }
+
+    #[cfg(test)]
+    pub(super) fn current_path(&self) -> &[PathStep] { &self.prefix }
 
     #[cfg(test)]
     pub(super) fn call_paths(&self) -> Vec<Vec<SourceSpan>> {

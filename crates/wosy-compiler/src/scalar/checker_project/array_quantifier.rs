@@ -364,10 +364,7 @@ impl<'a> Cohort<'a> {
         for (&target, group) in &self.groups {
             let plan = &self.plans[group.ids[0]];
             let Some(ScalarItem::Function(declaration)) = module.items.get(target.1) else { return Err(ProjectCheck::Unsupported); };
-            // The current array materializer provides actual returned cells,
-            // but not a branch history. Scope this collector to a closed
-            // straight-line prepared body until that provenance is available.
-            if target.0 != 0 || plan.owner != root || plan.source != root || !plan.body.conditionals.is_empty() {
+            if target.0 != 0 || plan.owner != root || plan.source != root {
                 return Err(ProjectCheck::Unsupported);
             }
             targets.push((target, declaration.name_span));
@@ -462,7 +459,8 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
     fn watches_fixed_array(&self, target: PreparedCallable) -> bool { self.cohort.groups.contains_key(&target) }
 
     fn observe_fixed_array_initializer(
-        &mut self, target: PreparedCallable, body: &FunctionCallSites, args: &[&BigInt], call: wosy_syntax::SourceSpan,
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, args: &[&BigInt],
+        call: wosy_syntax::SourceSpan, trace: Option<&failure_search::SharedStartupTrace>,
     ) -> Result<Vec<BigInt>, ProjectCheck> {
         let group = self.cohort.groups.get(&target).ok_or(ProjectCheck::Unsupported)?;
         let first = &self.cohort.plans[group.ids[0]];
@@ -484,6 +482,7 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
         }
         let (returned, failures) = collect_exact_fixed_array_return(
             body, first.result, args, &mut checks, &mut self.work,
+            trace.map(|trace| (&call.source, trace)),
         ).ok_or(ProjectCheck::Unsupported)?;
         self.seen.insert(target);
         self.applicable |= applicable;

@@ -2802,15 +2802,29 @@ main_artifact = "main"
                 let branched = aggregate.replace("make = fn { [7, 1] };",
                     "make = fn(input) { if (input == 0) { [7, 1] } else { [1, 7] } };")
                     .replace("u8[2]() make", "u8[2](u8) make").replace("= make();", "= make(0);")
-                    .replace("proof cells for make()", "proof cells for make(entry)");
+                    .replace("proof cells for make()", "proof cells for make(entry)")
+                    .replace("second_array = make(0)", "second_array = make(1)");
                 assert_ne!(branched, aggregate);
-                fs::write(&source, branched).unwrap();
-                let old_coverage = legacy().outcome.unwrap();
-                assert_eq!(old_coverage.aggregate_diagnostics.len(), 2);
-                assert_eq!(old_coverage.directives.len(), 2);
-                let refused = selected(8);
-                assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
-                assert!(!state.exists());
+                fs::write(&source, &branched).unwrap();
+                let old_coverage = terminal(&[legacy()], scope, false);
+                assert_eq!(old_coverage.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                let clipped = selected(1);
+                let report = clipped[0].outcome.as_ref().unwrap();
+                let observed = report.aggregate_diagnostics.iter().map(|failure| {
+                    let call = failure.call.as_ref().unwrap().range;
+                    (&branched[call.start as usize..call.end as usize], failure.cell.as_ref().unwrap().value.to_string())
+                }).collect::<Vec<_>>();
+                assert_eq!(observed, [("make(0)", "7".into()), ("make(1)", "1".into())]);
+                let clipped = terminal(&clipped, scope, false);
+                assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                assert_eq!(clipped.2.strip_prefix(b"[first]"), old_coverage.2.strip_prefix(b"[first][second]"));
+                assert_eq!(files(), first_file);
+                clean();
+                assert_eq!(terminal(&selected(8), scope, false), old_coverage);
+                assert_eq!(files(), both_files);
+                clean();
 
                 fs::write(&source, &ranked).unwrap();
                 let legacy_render = terminal(&[legacy()], scope, false);

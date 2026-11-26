@@ -2614,7 +2614,7 @@ trait ActualIntegerObserver {
     #[cfg(feature = "internal-checker")]
     fn observe_fixed_array_initializer(
         &mut self, _: PreparedCallable, _: &FunctionCallSites,
-        _: &[&BigInt], _: wosy_syntax::SourceSpan,
+        _: &[&BigInt], _: wosy_syntax::SourceSpan, _: Option<&failure_search::SharedStartupTrace>,
     ) -> Result<Vec<BigInt>, ProjectCheck> { Err(ProjectCheck::Unsupported) }
 
     #[cfg(feature = "internal-checker")]
@@ -4396,8 +4396,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             #[cfg(feature = "internal-checker")]
             {
                 proof_call.ok_or(ProjectCheck::Unsupported).and_then(|(caller, span)| {
+                    let trace = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone());
                     self.observer.observe_fixed_array_initializer(
-                        target, body, exact, wosy_syntax::SourceSpan::new(caller.clone(), span),
+                        target, body, exact, wosy_syntax::SourceSpan::new(caller.clone(), span), trace.as_ref(),
                     )
                 }).map(ActualCallResult::FixedArray)
             }
@@ -23943,6 +23944,48 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(combined.aggregate_diagnostics.len() == 1 && combined.directives.len() == 1);
         let main = ordered(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!main.active && main.aggregate_diagnostics.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn fixed_array_actual_trace_preserves_original_selected_branch_and_output_once() {
+        use std::num::NonZeroUsize;
+        use failure_search::{PathStep, StartUpSearch};
+        use super::super::checker_flow::{collect_exact_fixed_array_return, take_array_return_observations};
+        let app = source("src/main.w", "fixed-array-actual-path");
+        let text = r#"%%start
+            u8[2](u8) make = fn(input) { if (input == 0) { [7, 1] } else { [1, 7] } };
+            proof cells for make(entry) -> (items)
+                forall (u64 i where i == 0) ensures (items[i] == 8)
+            { core.show(items[i] == 8); }
+        %%end"#;
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, Vec::new())], vec![app.clone()], ScalarPreparationInputs { target_layout: layout },
+                ScalarCheckerScope::MainFlowOnly, Vec::new(),
+            ).ok().unwrap();
+            let PreparedConfiguredCheck::Named { owner, .. } = prepared.owner else { panic!("actual array proof query"); };
+            let (_, calls) = owner.prepared.parts();
+            let body = calls.function_body(0, 0, None).unwrap();
+            assert_eq!(body.structure.checker_array_returns.len(), 2);
+            let [result] = body.boundary.results.as_slice() else { panic!("one typed result"); };
+            for (argument, keep, array, selected) in [(0, true, [7, 1], "[7, 1]"), (1, false, [1, 7], "[1, 7]")] {
+                let trace = Rc::new(RefCell::new(StartUpSearch::new(&app, NonZeroUsize::MIN)));
+                take_array_return_observations();
+                let (cells, _) = collect_exact_fixed_array_return(body, &result.ty, &[&BigInt::from(argument)],
+                    &mut [], &mut 0, Some((&app, &trace))).unwrap();
+                assert_eq!(cells, array.map(BigInt::from));
+                assert_eq!(take_array_return_observations(), (0, 1));
+                let trace = trace.borrow();
+                let [PathStep::Startup(owner), PathStep::Branch { condition, accepted }, PathStep::Output(output)]
+                    = trace.current_path() else { panic!("exact original branch and output trace"); };
+                let snippet = |at: &wosy_syntax::SourceSpan| &text[at.range.start as usize..at.range.end as usize];
+                assert_eq!(owner, &app);
+                assert_eq!((&condition.source, &output.source), (&app, &app));
+                assert_eq!((snippet(condition), *accepted, snippet(output)), ("input == 0", keep, selected));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]

@@ -155,6 +155,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     fn imported_enum_match_position(self) -> Option<usize> { None }
     #[cfg(feature = "internal-checker")]
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { None }
+    #[cfg(feature = "internal-checker")]
+    fn startup_trace(self) -> Option<(&'a wosy_syntax::SourceIdentity, super::checker_project::failure_search::SharedStartupTrace)> { None }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -5071,16 +5073,21 @@ enum FixedArrayObservationMode<'a> {
 struct FixedArrayObservation<'a, 'cursor, 'claims> {
     mode: FixedArrayObservationMode<'a>,
     state: &'a std::cell::RefCell<FixedArrayObservationState<'cursor, 'claims>>,
+    startup_trace: Option<(&'a wosy_syntax::SourceIdentity, &'a super::checker_project::failure_search::SharedStartupTrace)>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_, '_, '_> {
+impl<'body, 'trace: 'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'trace, '_, '_> {
     const ENABLED: bool = false;
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
     const OBSERVE_FIXED_ARRAY: bool = true;
     const REQUIRE_TOTAL_RETURN: bool = true;
 
     fn allows_extended_scalar_locals(self) -> bool { true }
+
+    fn startup_trace(self) -> Option<(&'body wosy_syntax::SourceIdentity, super::checker_project::failure_search::SharedStartupTrace)> {
+        self.startup_trace.map(|(source, trace)| (source, Rc::clone(trace)))
+    }
 
     fn take_fixed_array_entries(self) -> Option<(usize, IntegerInputs)> {
         match self.mode {
@@ -5601,7 +5608,7 @@ pub(super) fn observe_fixed_array_returns(
         work: *work, failures: fresh(), applied: vec![false; checks.len()], returned: None,
         exact_checks: None, symbolic_entries,
     });
-    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Symbolic(checks), state: &state };
+    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Symbolic(checks), state: &state, startup_trace: None };
     #[cfg(test)]
     ARRAY_RETURN_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic + 1, actual)); });
     run_integer_callable::<false, false, _>(
@@ -5620,12 +5627,13 @@ pub(super) fn observe_fixed_array_returns(
 pub(super) fn collect_exact_fixed_array_return<'claims>(
     calls: &FunctionCallSites, result: &ScalarType, arguments: &[&BigInt], checks: &mut [Option<FixedArrayCheck<'claims>>],
     work: &mut usize,
+    startup_trace: Option<(&wosy_syntax::SourceIdentity, &super::checker_project::failure_search::SharedStartupTrace)>,
 ) -> Option<(Vec<BigInt>, Vec<Option<FixedArrayReturnFailure>>)> {
     let state = std::cell::RefCell::new(FixedArrayObservationState {
         work: *work, failures: (0..checks.len()).map(|_| None).collect(), applied: Vec::new(),
         returned: None, exact_checks: Some(checks), symbolic_entries: None,
     });
-    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Exact, state: &state };
+    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Exact, state: &state, startup_trace };
     #[cfg(test)]
     ARRAY_RETURN_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic, actual + 1)); });
     let ProofCoverage::Applicable(_) = run_integer_callable::<false, false, _>(
@@ -6630,6 +6638,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         symbolic_context_work: Authored::OBSERVE_FIXED_ARRAY.then_some(0),
         #[cfg(feature = "internal-checker")]
         callable_history: authored_return.callable_history(),
+        #[cfg(feature = "internal-checker")]
+        startup_trace: authored_return.startup_trace(),
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -7876,6 +7886,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 #[cfg(feature = "internal-checker")]
                 if Authored::OBSERVE_FIXED_ARRAY {
                     authored_return.observe_fixed_array(calls, slot, ty, roots, &path)?;
+                    if let Some((source, trace)) = &roots.startup_trace {
+                        let [_] = path.0.as_slice() else { return None; };
+                        trace.try_borrow_mut().ok()?.append(super::checker_project::failure_search::PathStep::Output(
+                            wosy_syntax::SourceSpan::new((*source).clone(), slot.span)))?;
+                    }
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
                 }

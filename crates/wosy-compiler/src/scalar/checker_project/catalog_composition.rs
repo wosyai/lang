@@ -96,9 +96,10 @@ impl<Scalar: ScalarCatalogEvidence> ActualIntegerObserver for WithArrays<'_, '_,
     }
 
     fn observe_fixed_array_initializer(
-        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], call: wosy_syntax::SourceSpan,
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt],
+        call: wosy_syntax::SourceSpan, trace: Option<&failure_search::SharedStartupTrace>,
     ) -> Result<Vec<BigInt>, ProjectCheck> {
-        self.array.observe_fixed_array_initializer(target, body, arguments, call)
+        self.array.observe_fixed_array_initializer(target, body, arguments, call, trace)
     }
 }
 
