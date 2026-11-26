@@ -3288,6 +3288,35 @@ main_artifact = "main"
                     assert!(!state.exists());
                 }
 
+                let qualified_projected = projected
+                    .replace("u8(u8) choose = fn(input) { if (input < 128) { 7 } else { 7 } };",
+                        r#"lib = namespace app "shared.w";"#)
+                    .replace("choose(value)", "lib.choose(value)");
+                assert!(!qualified_projected.contains("fn(input)") && qualified_projected.contains("lib.choose(value)"));
+                fs::write(&source, &qualified_projected).unwrap();
+                fs::write(&shared_source, "%%start u8(u8) choose = fn(input) { if (input < 128) { 7 } else { 7 } }; %%end").unwrap();
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 1);
+                    let witness = &report.directives[0].witness;
+                    assert!(witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                    assert_eq!(terminal(&limited, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    let full = selected(2);
+                    let report = full[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 2);
+                    assert!(report.directives[1].witness.intervals_at(0, 0).unwrap().eq([(&128.into(), &255.into())]));
+                    let refused = terminal(&full, scope, false);
+                    assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty());
+                    assert!(!state.exists());
+                } else {
+                    assert!(selected(1)[0].outcome.as_ref().unwrap().directives.is_empty());
+                    assert!(!state.exists());
+                }
+                fs::remove_file(&shared_source).unwrap();
+
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {

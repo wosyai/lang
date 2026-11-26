@@ -113,7 +113,8 @@ impl StartUpSearch {
     }
 
     pub(super) fn admit_callable(
-        &mut self, declaration: SourceSpan, history: impl IntoIterator<Item = super::super::checker_flow::CallableHistoryStep>, directive: SourceSpan,
+        &mut self, declaration: SourceSpan, history: impl IntoIterator<Item = super::super::checker_flow::CallableHistoryStep>,
+        directive: SourceSpan, modules: &[super::ScalarModule],
     ) -> Option<Admission> {
         use super::super::checker_flow::CallableHistoryStep;
         super::super::checker_flow::charge_call_work(&mut self.work, 2)?;
@@ -123,6 +124,12 @@ impl StartUpSearch {
             let at = |range| SourceSpan::new(directive.source.clone(), range);
             steps.push(match step {
                 CallableHistoryStep::Branch(span, accepted) => PathStep::Branch { condition: at(span), accepted },
+                CallableHistoryStep::ProviderBranch(owner, span, accepted) => {
+                    let source = &modules.get(owner)?.source;
+                    if source.project != directive.source.project || source.package != directive.source.package
+                        || source == &directive.source { return None; }
+                    PathStep::Branch { condition: SourceSpan::new(source.clone(), span), accepted }
+                },
                 CallableHistoryStep::Call(span) => PathStep::Call(at(span)),
                 CallableHistoryStep::Return(span) => PathStep::Return(at(span)),
             });

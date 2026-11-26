@@ -10547,21 +10547,27 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
 fn symbolic_history_call_target(
     project: &ScalarProject, calls: &ProjectCallSiteResults, module: usize, caller: usize,
     body: &FunctionCallSites, site: OccurrenceOrdinal, signature: &CheckedCallSignature,
-) -> Option<usize> {
+) -> Option<PreparedCallable> {
     let (owner, item) = *body.structure.checker_direct_targets.get(&site)?;
-    if owner != module || caller == item || signature.parameters.len() != 1
-        || !matches!(signature.outputs.outputs.as_slice(), [result] if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
+    let [output] = signature.outputs.outputs.as_slice() else { return None; };
+    if (owner == module && caller == item) || signature.parameters.len() != 1
+        || !(is_integer_type(&output.ty) || (owner == module && output.ty == ScalarType::Unit))
     { return None; }
-    let source = project.modules.get(module)?;
+    let source = project.modules.get(owner)?;
+    let caller_source = &project.modules.get(module)?.source;
+    if source.source.project != caller_source.project || source.source.package != caller_source.package {
+        return None;
+    }
     let ScalarItem::Function(function) = source.items.get(item)? else { return None; };
     let ResolvedCallTarget::ModuleCallable { source: target_source, declaration_span, concrete: ConcreteCallSelection::Declaration }
         = &body.resolved_call_site(site)?.target else { return None; };
-    let leaf = calls.function_body(module, item, None)?;
+    let leaf = calls.function_body(owner, item, None)?;
     if target_source != &source.source || *declaration_span != function.name_span
         || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
         || !matches!(leaf.boundary.parameters.as_slice(), [parameter] if parameter.ty == signature.parameters[0])
+        || !matches!(leaf.boundary.results.as_slice(), [result] if result.ty == output.ty)
     { return None; }
-    Some(item)
+    Some((owner, item))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10577,9 +10583,9 @@ fn closed_callable_history_calls(
         let target = body.checked_call_signatures.get(&site)
             .and_then(|signature| symbolic_history_call_target(project, calls, module, item, body, site, signature));
         let Some(target) = target else { return false; };
-        let Some(leaf) = calls.function_body(module, target, None) else { return false; };
+        let Some(leaf) = calls.function_body(target.0, target.1, None) else { return false; };
         if !leaf.checker_returns_unit() && !scalar_sites.contains(&site) { return false; }
-        *leaf_shapes.entry((module, target)).or_insert_with(|| {
+        *leaf_shapes.entry(target).or_insert_with(|| {
             if super::checker_flow::charge_call_work(work, leaf.occurrences.len()).is_none() { return false; }
             if leaf.checker_returns_unit() {
                 leaf.structure.checker_direct_targets.is_empty() && leaf.conditionals.is_empty()
@@ -10692,7 +10698,7 @@ fn run_startup_authored_path(
                     let declaration = wosy_syntax::SourceSpan::new(module.source.clone(), function.name_span);
                     let directive = wosy_syntax::SourceSpan::new(module.source.clone(), occurrence.span);
                     let mut pair = selected.borrow_mut();
-                    let admission = pair.0.admit_callable(declaration, prefix.iter().copied().chain(suffix), directive)?;
+                    let admission = pair.0.admit_callable(declaration, prefix.iter().copied().chain(suffix), directive, &project.modules)?;
                     if !matches!(admission, failure_search::Admission::Duplicate) {
                         pair.1.push_callable(target, &module.source, failure);
                     }
@@ -10705,7 +10711,14 @@ fn run_startup_authored_path(
                     argument: NestedIntegerArgument<'_>, prefix: Vec<super::checker_flow::CallableHistoryStep>| {
                     if !std::ptr::eq(body, caller) { return None; }
                     let target = symbolic_history_call_target(project, calls, ordinal, item, body, site, signature)?;
-                    let callee = calls.function_body(ordinal, target, None)?;
+                    let callee = calls.function_body(target.0, target.1, None)?;
+                    let foreign_owner = (target.0 != ordinal).then_some(target.0);
+                    if let Some(provider) = foreign_owner {
+                        let provider_source = &project.modules.get(provider)?.source;
+                        if initialization.visits.get(ordinal) != Some(&InitializationVisit::Completed)
+                            || !completed_namespace_owner(&module.source, provider_source, provider, Some(&initialization.visits))
+                        { return None; }
+                    }
                     let [output] = signature.outputs.outputs.as_slice() else { return None; };
                     if is_integer_type(&output.ty) {
                         let domain = match argument {
@@ -10717,7 +10730,7 @@ fn run_startup_authored_path(
                                 projection.materialize()?,
                             _ => return None,
                         };
-                        return super::checker_flow::trace_closed_projected_scalar_return(callee, domain, &output.ty, &work);
+                        return super::checker_flow::trace_closed_projected_scalar_return(callee, domain, &output.ty, foreign_owner, &work);
                     }
                     let exact;
                     let entry = match argument {
@@ -17016,6 +17029,74 @@ mod tests {
             let (records, end, _, active) = prepare(&text, ScalarCheckerScope::MainFlowOnly)
                 .search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert!(!active && records.is_empty() && end == StartupAuthoredCompletion::Exhausted);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_projected_qualified_scalar_keeps_child_owner_and_parent_boundaries() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "projected-qualified-caller");
+        let lib = source("src/lib.w", "projected-qualified-provider");
+        let main = format!(r#"%%start
+            lib = namespace demo "src/lib.w";
+            unit(u8) verify = fn(value) {{
+                u8 result = lib.choose(value);
+                core.require(result == 8, {OUTPUT});
+            }};
+        %%end"#);
+        let provider = r#"%%start
+            u8(u8) choose = fn(input) { if (input < 128) { 7 } else { input } };
+        %%end"#;
+        let at = |source: &SourceIdentity, code: &str, snippet: &str| {
+            let start = code.find(snippet).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + snippet.len() as u32))
+        };
+        let call = at(&app, &main, "lib.choose(value)");
+        let branch = at(&lib, provider, "input < 128");
+        let counterfeit = wosy_syntax::SourceSpan::new(app.clone(), branch.range);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |provider: &str| {
+                    let parse = |source: &SourceIdentity, text: &str| {
+                        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+                        assert!(parsed.diagnostics.is_empty());
+                        crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst())
+                    };
+                    let import = ScalarNamespaceBinding { binding: "lib".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(parse(&app, &main), vec![import]), (parse(&lib, provider), Vec::new())],
+                        [], vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    ).ok().unwrap()
+                };
+                for cap in [1, 2, 3] {
+                    let (records, end, trace, _) = prepare(provider).search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    if scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(records.is_empty() && end == StartupAuthoredCompletion::Exhausted);
+                        assert!(!trace.contains_return(&call));
+                        continue;
+                    }
+                    assert_eq!(records.len(), cap.min(2));
+                    assert_eq!(end, if cap < 3 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert!(records.iter().all(|record| record.source == app));
+                    assert!(trace.contains_return(&call) && trace.contains_branch(branch.clone(), true));
+                    assert_eq!(trace.contains_branch(branch.clone(), false), cap >= 2);
+                    assert!(!trace.contains_branch(counterfeit.clone(), true));
+                    assert!(trace.call_paths().into_iter().all(|path| path == [call.clone()]));
+                    assert!(records[0].witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                    if cap >= 2 {
+                        assert_eq!(records[1].witness.equal_axes(), [(1, 0)]);
+                        assert!(records[1].witness.intervals_at(0, 1).unwrap().eq([(&128.into(), &255.into())]));
+                    }
+                }
+                // The same genuine resolved target cannot authorize a
+                // deferred result if startup never completed its module.
+                let pruned = provider.replace("%%end", &format!("core.narrow(false, {OUTPUT}); %%end"));
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    assert!(matches!(prepare(&pruned).search_startup_authored_path(NonZeroUsize::new(3).unwrap()),
+                        Err(ProjectCheck::Unsupported)));
+                }
+            }
         }
     }
 
