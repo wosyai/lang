@@ -2348,17 +2348,17 @@ pub fn derive_scalar_declarations_from_cst(
     derive_scalar_declarations_with_embedding(canonical, None)
 }
 
-/// A compiler-internal substitution at a single authored root initializer.
-/// The ordinary declaration route never provides one.
-struct EmbeddedComptimeInitializer<'a> {
+/// A compiler-internal projection at one exact authored occurrence.
+/// Ordinary declaration extraction always uses the unprojected path.
+struct EmbeddedComptimeExpression<'a> {
     site: &'a CstNode,
-    initializer: &'a CstNode,
+    expression: &'a CstNode,
     value: &'a ScalarExpression,
 }
 
 fn derive_scalar_declarations_with_embedding(
     canonical: &CanonicalCstRoot,
-    embedded: Option<EmbeddedComptimeInitializer<'_>>,
+    embedded: Option<EmbeddedComptimeExpression<'_>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
@@ -2404,7 +2404,7 @@ fn derive_scalar_declarations_with_embedding(
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
             SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, embedded.as_ref()))),
             SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node)))
+                items.push(ScalarItem::Function(derive_function(&node, embedded.as_ref())))
             }
             SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node))),
             SyntaxKind::GenericFunctionDecl => {
@@ -2428,7 +2428,7 @@ fn derive_scalar_declarations_with_embedding(
                             items.push(ScalarItem::Binding(derive_binding(&item, embedded.as_ref())))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item)))
+                            items.push(ScalarItem::Function(derive_function(&item, embedded.as_ref())))
                         }
                         SyntaxKind::OverloadDecl => {
                             items.push(ScalarItem::Function(derive_overload(&item)))
@@ -2532,6 +2532,7 @@ pub use comptime::{derive_closed_comptime_fragment, derive_first_source_initiali
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES};
+pub use comptime::{inspect_direct_function_comptime, DirectComptimeArgument, InspectedDirectComptimeCall};
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};
@@ -3329,7 +3330,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     }
 }
 
-fn derive_binding(node: &CstNode, embedded: Option<&EmbeddedComptimeInitializer<'_>>) -> ScalarBinding {
+fn derive_binding(node: &CstNode, embedded: Option<&EmbeddedComptimeExpression<'_>>) -> ScalarBinding {
     let receiver_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::ReceiverList)
@@ -3378,7 +3379,7 @@ fn derive_binding(node: &CstNode, embedded: Option<&EmbeddedComptimeInitializer<
             .children()
             .filter(|child| child.kind() == SyntaxKind::Expression)
             .map(|child| match embedded {
-                Some(embedded) if embedded.initializer == &child => embedded.value.clone(),
+                Some(embedded) if embedded.expression == &child => embedded.value.clone(),
                 _ => derive_expression(&child),
             })
             .collect::<Vec<_>>()
@@ -3671,7 +3672,7 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
     }
 }
 
-fn derive_function(node: &CstNode) -> ScalarFunction {
+fn derive_function(node: &CstNode, embedded: Option<&EmbeddedComptimeExpression<'_>>) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
         children
@@ -3711,7 +3712,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
     let mut body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
-        .map(|node| derive_block(node))
+        .map(|node| derive_block_with_context(node, false, embedded))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -3752,7 +3753,7 @@ fn derive_generic_function(node: &CstNode) -> ScalarFunction {
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::FunctionDecl)
         .expect("generic function declaration");
-    let mut function = derive_function(&function);
+    let mut function = derive_function(&function, None);
     function.generic_parameters = derive_generic_parameters(&generic);
     function.span = wosy_syntax::byte_span(node);
     function
@@ -4228,10 +4229,12 @@ fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan 
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
-    derive_block_with_context(node, false)
+    derive_block_with_context(node, false, None)
 }
 
-fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
+fn derive_block_with_context(
+    node: &CstNode, unsafe_context: bool, embedded: Option<&EmbeddedComptimeExpression<'_>>,
+) -> ScalarBlock {
     let block_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
@@ -4253,7 +4256,10 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .filter(|child| child.kind() == SyntaxKind::Expression)
                 .enumerate()
                 .map(|(position, child)| {
-                    let value = derive_expression(&child);
+                    let value = match embedded {
+                        Some(embedded) if embedded.expression == &child => embedded.value.clone(),
+                        _ => derive_expression(&child),
+                    };
                     ScalarOutputValue {
                         position,
                         ty: ScalarType::Error,
@@ -4457,6 +4463,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::Block)
                 .expect("unsafe block"),
             true,
+            None,
         )),
         SyntaxKind::ArrayLiteral => ScalarExpression::ArrayLiteral {
             elements: direct_nodes(&actual)

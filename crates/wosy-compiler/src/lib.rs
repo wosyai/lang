@@ -33,6 +33,7 @@ pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initialize
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES};
+pub use scalar::{inspect_direct_function_comptime, DirectComptimeArgument, InspectedDirectComptimeCall};
 
 mod llvm;
 

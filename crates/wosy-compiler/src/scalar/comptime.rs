@@ -13,6 +13,9 @@ use wosy_syntax::{
 pub const CLOSED_COMPTIME_MAX_SOURCE_BYTES: usize = 1 << 16;
 const FUNCTION: &str = "evaluate";
 
+mod direct;
+pub use direct::{inspect_direct_function_comptime, DirectComptimeArgument, InspectedDirectComptimeCall};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComptimeParameter {
     Integer(i64),
@@ -347,7 +350,7 @@ mod tests {
     use super::*;
     use crate::scalar::{
         derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
-        EmbeddedComptimeInitializer,
+        EmbeddedComptimeExpression,
     };
     use wosy_syntax::SourceIdentity;
 
@@ -387,7 +390,7 @@ mod tests {
                     _ => return Err("fixture return does not match compiler result type"),
                 };
                 Ok(derive_scalar_declarations_with_embedding(canonical, Some(
-                    EmbeddedComptimeInitializer { site, initializer, value: &value },
+                    EmbeddedComptimeExpression { site, expression: initializer, value: &value },
                 )))
             },
         ).expect("ordinary closed fragment preparation")
