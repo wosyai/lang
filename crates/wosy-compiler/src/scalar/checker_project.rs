@@ -29048,8 +29048,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
             for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
                 let prepare = |provider: &str| {
-                    let root_proof = crate::parse_proof_source(app.clone(), root.clone(), &[]).ok().unwrap().1;
-                    let leaf_proof = crate::parse_proof_source(leaf.clone(), provider.to_owned(), &[]).ok().unwrap().1;
+                    let root_proof = crate::parse_configured_root_proof_source(app.clone(), root.clone(), &[]).ok().unwrap().1;
+                    let leaf_proof = crate::parse_configured_proof_source(leaf.clone(), provider.to_owned(), &[]).ok().unwrap().1;
                     let edge = ScalarNamespaceBinding { binding: "lib".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0) };
                     prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
                         [(leaf_proof, Vec::new()), (root_proof, vec![edge])], vec![app.clone(), leaf.clone()],
