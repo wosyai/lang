@@ -58,6 +58,7 @@ mod project_declarations;
 mod prepared_project;
 mod rooted_llvm;
 mod retention_plan;
+mod rooted_llvm_receipts;
 mod source_impact;
 mod source_proposal;
 mod source_reconciliation;
@@ -75,7 +76,7 @@ pub use project_declarations::{
 pub use prepared_project::{
     BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
-pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
+pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
@@ -91,6 +92,7 @@ pub struct SourceStore {
     prepared_projects: prepared_project::PreparationCache,
     source_reads: retention_plan::SourceReads,
     grammar_receipts: grammar_receipts::GrammarReceipts,
+    llvm_receipts: rooted_llvm_receipts::ExecutableLlvmReceipts,
     #[cfg(test)]
     test_without_derivation_image: bool,
 }
@@ -135,6 +137,7 @@ impl SourceStore {
             project_commit: Default::default(),
             prepared_projects: Default::default(), source_reads: Default::default(),
             grammar_receipts: Default::default(),
+            llvm_receipts: Default::default(),
             #[cfg(test)]
             test_without_derivation_image: false,
         })

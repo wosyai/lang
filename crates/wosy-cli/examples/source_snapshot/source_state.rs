@@ -50,6 +50,12 @@ pub(super) async fn run(
         }
         "leased-llvm-grammar-memo" => super::rooted_llvm::run_memo(&mut client, dir, &target).await?,
         "leased-llvm-grammar-policy" => super::rooted_llvm::run_policy(&mut client, project, dir, &target).await?,
+        "leased-executable-llvm-receipts" => {
+            let mut root = || -> Result<NodeId> { NodeId::parse_hex(&args.next().ok_or("expected fixture historical root")?)
+                .map_err(Into::into) };
+            let history = [root()?, root()?, root()?];
+            super::rooted_llvm::run_executable_receipts(&client, dir, &target, history).await?
+        }
         "leased-installed-git-llvm" => {
             let package = args.next().ok_or("expected installed fixture package")?;
             let profile = args.next().ok_or("expected installed fixture profile")?;

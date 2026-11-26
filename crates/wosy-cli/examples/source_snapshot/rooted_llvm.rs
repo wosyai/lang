@@ -2,10 +2,11 @@ use super::{milliseconds, source_reconciliation::admission_limits, Result};
 use std::{num::NonZeroUsize, path::Path, sync::Arc, time::{Duration, Instant}};
 use wosy_cli::source_state::{PendingBasePublication, ReplaySource, SqliteSourceState};
 use wosy_daemon::{
-    BaseCstAdmissionLimits, RootedLlvmIdentity, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported,
+    BaseCstAdmissionLimits, RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection,
+    RootedLlvmRejection, RootedLlvmUnsupported,
     SourceStorageWorker, SourceStore,
 };
-use wosy_protocol::BuildSourceSelection;
+use wosy_protocol::{BuildSourceSelection, NodeId};
 
 pub(super) async fn run(
     path: &Path, selected: BuildSourceSelection, profile: String, output: usize, source: &str,
@@ -177,4 +178,82 @@ pub(super) async fn run_policy(
     drop(worker);
     Arc::try_unwrap(store).ok().expect("policy fixture owns its store").close().await?;
     Ok(serde_json::json!({ "new_policy_reparsed": total, "rollback_did_not_seed": true }))
+}
+
+pub(super) async fn run_executable_receipts(
+    local: &SqliteSourceState, path: &Path, target: &str, history: [NodeId; 3],
+) -> Result<serde_json::Value> {
+    let d = local.acknowledged_build_source(target)?.ok_or("fixture needs the acknowledged alternate export")?;
+    let [a, b, c] = history.map(|root| BuildSourceSelection { root, ..d.clone() });
+    assert_ne!(a.root, b.root);
+    assert_ne!(b.root, c.root);
+    assert_ne!(c.root, d.root);
+    let store = Arc::new(SourceStore::open(path, 8 << 20)?);
+    let worker = ordinary_worker(&store)?;
+
+    let fresh = RootedLlvmOrigin::Derived;
+    let cached = RootedLlvmOrigin::LiveExecutableReceipt;
+    let should_refuse = |error: super::Result<_>, reason: &str| {
+        assert!(error.unwrap_err().to_string().contains(reason));
+    };
+    should_refuse(executable_projection(&worker, &a, "dev", admission_limits(false), 1).await,
+        "output byte budget");
+    let (cold_a, cold_ms) = executable_projection(&worker, &a, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!(cold_a.origin, fresh);
+    let total = cold_a.grammar_verified_files;
+    assert_eq!(cold_a.grammar_reparsed_files, total, "over-budget egress cannot seed either receipt");
+    let (same_a, same_ms) = executable_projection(&worker, &a, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!((same_a.origin, same_a.grammar_reparsed_files), (cached, 0));
+    assert_eq!(cold_a.bytes, same_a.bytes);
+    let (native_a, _) = executable_projection(&worker, &a, "native", admission_limits(false), 2 << 20).await?;
+    assert_eq!(native_a.origin, fresh, "WASI cannot seed Native");
+    assert_ne!(cold_a.digest, native_a.digest);
+
+    should_refuse(executable_projection(&worker, &b, "dev", admission_limits(true), 2 << 20).await,
+        "authored byte budget");
+    let (authored_b, edited_ms) = executable_projection(&worker, &b, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!((authored_b.origin, authored_b.source_root), (cached, b.root));
+    assert_eq!((authored_b.grammar_verified_files, authored_b.grammar_reparsed_files), (total, 1));
+    assert_eq!((authored_b.digest, authored_b.bytes), (cold_a.digest, cold_a.bytes));
+    should_refuse(executable_projection(&worker, &b, "dev", admission_limits(false), 1).await,
+        "output byte budget");
+    let (native_b, _) = executable_projection(&worker, &b, "native", admission_limits(false), 2 << 20).await?;
+    assert_eq!((native_b.origin, native_b.grammar_reparsed_files), (cached, 0));
+    assert_eq!(native_b.bytes, native_a.bytes);
+
+    let (executable_c, changed_ms) = executable_projection(&worker, &c, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!((executable_c.origin, executable_c.grammar_reparsed_files), (fresh, 1));
+    assert_ne!(executable_c.digest, cold_a.digest);
+    let (export_d, _) = executable_projection(&worker, &d, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!((export_d.origin, export_d.grammar_reparsed_files), (fresh, 0));
+    assert_ne!(export_d.digest, executable_c.digest);
+    drop(worker);
+    Arc::try_unwrap(store).ok().expect("fixture owns its source store").close().await?;
+
+    let store = Arc::new(SourceStore::open(path, 8 << 20)?);
+    let worker = ordinary_worker(&store)?;
+    let (reopened, reopen_ms) = executable_projection(&worker, &d, "dev", admission_limits(false), 2 << 20).await?;
+    assert_eq!((reopened.origin, reopened.grammar_reparsed_files), (fresh, total));
+    assert_eq!(reopened.bytes, export_d.bytes);
+    assert_eq!(reopened.compiler_image, export_d.compiler_image);
+    drop(worker);
+    Arc::try_unwrap(store).ok().expect("fixture owns reopened store").close().await?;
+    Ok(serde_json::json!({ "files": total, "annotated_reparsed": authored_b.grammar_reparsed_files,
+        "cold_derived_ms": cold_ms, "same_live_ms": same_ms, "annotation_live_ms": edited_ms,
+        "changed_derived_ms": changed_ms, "reopened_derived_ms": reopen_ms,
+        "profile_dependency_export_and_reopen_distinct": true, "hit_source_and_output_budgets": true }))
+}
+
+async fn executable_projection(
+    worker: &SourceStorageWorker, selection: &BuildSourceSelection, profile: &str,
+    limits: BaseCstAdmissionLimits, output: usize,
+) -> Result<(RootedLlvmPartition, f64)> {
+    let lease = worker.open_build_diagnostics(selection.clone(), Duration::from_secs(30)).await?
+        .ok_or("fixture needs an acknowledged source lease")?;
+    let start = Instant::now();
+    let outcome = lease.project_llvm(profile.to_owned(), limits, output, RootedLlvmIdentity::Executable).await?;
+    match outcome {
+        RootedLlvmProjection::Emitted(partition) => Ok((partition, milliseconds(start))),
+        _ => Err("receipt fixture expected an executable LLVM projection".into()),
+    }
 }

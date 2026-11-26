@@ -1,5 +1,5 @@
 //! Process-local evidence for the canonical authored grammar check only.
-use std::{collections::{HashSet, VecDeque}, sync::Mutex};
+use std::{collections::{HashSet, VecDeque}, sync::{Mutex, MutexGuard}};
 use wosy_protocol::{FileEntry, NodeId};
 
 const RECEIPTS: usize = 2048;
@@ -22,6 +22,8 @@ impl GrammarKey {
 pub(super) struct VerifiedGrammarBatch(Vec<GrammarKey>);
 
 impl VerifiedGrammarBatch {
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
     /// Only after the real canonical grammar check accepted this file.
     pub fn verified(&mut self, file: &FileEntry) {
         if self.0.len() < RECEIPTS { self.0.push(GrammarKey::for_file(file)); }
@@ -30,6 +32,8 @@ impl VerifiedGrammarBatch {
 
 #[derive(Default)]
 pub(super) struct GrammarReceipts(Mutex<Receipts>);
+
+pub(super) struct GrammarReceiptAdmission<'a>(MutexGuard<'a, Receipts>);
 
 #[derive(Default)]
 struct Receipts {
@@ -58,9 +62,17 @@ impl GrammarReceipts {
     /// serialized, carried over to another process, or inferred from a
     /// generic published/legacy marker. No validation runs under this lock.
     pub fn accept(&self, batch: VerifiedGrammarBatch) {
-        if batch.0.is_empty() { return; }
-        let mut receipts = self.0.lock().expect("grammar receipt memo");
-        for key in batch.0 { receipts.remember(key); }
+        if !batch.is_empty() { self.admission().accept(batch); }
+    }
+
+    pub fn admission(&self) -> GrammarReceiptAdmission<'_> {
+        GrammarReceiptAdmission(self.0.lock().expect("grammar receipt memo"))
+    }
+}
+
+impl GrammarReceiptAdmission<'_> {
+    pub fn accept(&mut self, batch: VerifiedGrammarBatch) {
+        for key in batch.0 { self.0.remember(key); }
     }
 }
 

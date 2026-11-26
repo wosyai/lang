@@ -98,6 +98,17 @@ impl SourceLease {
         reads.sessions.get(&self.grant.id).map(|(_, expires)| *expires)
     }
 
+    /// Linearize a short, already staged update against this exact live
+    /// session. The caller must acquire other locks before entering.
+    pub(super) fn finish_current<T>(&self, apply: impl FnOnce() -> T) -> Option<T> {
+        let reads = self.reads.lock().expect("source reader registry");
+        let &(root, expires) = reads.sessions.get(&self.grant.id)?;
+        if root != self.grant.root || Instant::now() >= expires { return None; }
+        let result = apply();
+        drop(reads);
+        Some(result)
+    }
+
     pub fn renew(&self) -> bool {
         let mut reads = self.reads.lock().expect("source reader registry");
         let now = Instant::now();

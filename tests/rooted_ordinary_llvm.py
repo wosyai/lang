@@ -1,5 +1,6 @@
 """Compare real optimized ordinary Build LLVM with a read-only leased projection."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -7,6 +8,7 @@ import tempfile
 
 
 example, ordinary = (Path(argument).resolve() for argument in sys.argv[1:3])
+daemon_tests = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
 fixtures = Path(__file__).parent / "fixtures/build"
 wasi = fixtures / "shared_stdlib_local_dependency/project"
 native = fixtures / "short_circuit_project/project"
@@ -181,6 +183,11 @@ with tempfile.TemporaryDirectory() as temporary:
     a = state("stage")
     assert (a["result"]["parsed"], a["result"]["reused"]) == (files, 0)
     root_a = acknowledge(a)
+    if daemon_tests:
+        subprocess.run([daemon_tests, "rooted_llvm::tests::closed_projection_cannot_install_grammar_or_llvm",
+                        "--exact", "--ignored"], env={**os.environ, "WOSY_TEST_IMAGE_STORE": str(catalog),
+                          "WOSY_TEST_LLVM_PROJECT": str(project), "WOSY_TEST_IMAGE_ROOT": root_a},
+                       check=True, timeout=30)
     assert not (project / ".wosy/artifacts").exists()
     assert projection("dev", control="wrong-project")["kind"] == "scope-refused"
     assert projection("not-configured")["answer"] == {"kind": "profile-not-selected"}
@@ -222,15 +229,22 @@ with tempfile.TemporaryDirectory() as temporary:
                             capture_output=True, check=True, timeout=30)
     effect = json.loads(impact.stdout)
     assert effect["annotation_tree_changed"] and not effect["executable_tree_changed"]
-    policy = state("leased-llvm-grammar-policy")["result"]
-    assert policy == {"new_policy_reparsed": files, "rollback_did_not_seed": True}
-
     leaf.write_text(provider("somente uma anotação mais longa 🚀").replace("{ 42 }", "{ 43 }"))
     root_c = acknowledge(state("stage"))
     for profile in profiles:
         stable_c = executable_view(root_c, profile)
         assert stable_c["digest"] != stable_a[profile]["digest"]
         link_executable_projection(profile, stable_c, 43)
+
+    # Same executable source and layout, different selected WASI export.
+    # Verify C needed fresh derivation from just the dependency edit first.
+    (project / "wosy.toml").write_text(manifest.replace('fixture_answer = "answer"', 'fixture_alternate = "answer"'))
+    assert acknowledge(state("stage")) != root_c
+    receipts = state("leased-executable-llvm-receipts", root_a, root_b, root_c)["result"]
+    assert receipts["files"] == files and receipts["annotated_reparsed"] == 1
+    assert receipts["profile_dependency_export_and_reopen_distinct"] and receipts["hit_source_and_output_budgets"]
+    policy = state("leased-llvm-grammar-policy")["result"]
+    assert policy == {"new_policy_reparsed": files, "rollback_did_not_seed": True}
 
     # An existing ordinary ownership diagnostic must still prevent emission.
     authored.write_text(entry("reject before LLVM", "struct Item { u8 value; }\n"
@@ -253,4 +267,5 @@ with tempfile.TemporaryDirectory() as temporary:
                       "grammar_ms": {key: [before[key][2], after[key][2]] for key in profiles},
                       "same_process_grammar_memo": {key: memo[key] for key in
                           ("files", "hot_admission_reparsed", "cold_a", "warm_a", "hot_b", "reopened_b")},
+                      "executable_receipts": receipts,
                       "policy_change_and_rollback": policy}))
