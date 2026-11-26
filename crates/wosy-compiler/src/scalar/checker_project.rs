@@ -10011,7 +10011,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Dormant).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::Dormant)).map_err(configured_ordered_error)
     }
 
     /// Private exact single direct returning named activation before cap.
@@ -10021,7 +10021,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Invoked).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::Invoked)).map_err(configured_ordered_error)
     }
 
     /// Private pair: one original direct returning theorem activation and
@@ -10032,7 +10032,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Mixed).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::Mixed)).map_err(configured_ordered_error)
     }
 
     /// Private guarded contextual startup with one original reached proof
@@ -10054,7 +10054,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::InvokedAndDormantRank)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::InvokedAndDormantRank))
             .map_err(configured_ordered_error)
     }
 
@@ -10066,7 +10066,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::InvokedAndReachedRank)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::InvokedAndReachedRank))
             .map_err(configured_ordered_error)
     }
 
@@ -10077,7 +10077,30 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 2 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Qualified).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, Some(StartupNamedMode::Qualified)).map_err(configured_ordered_error)
+    }
+
+    /// Classify only the bounded routes already implemented on this exact
+    /// prepared root. No fallback to the ordinary unbounded checker.
+    #[doc(hidden)]
+    pub fn run_private_authored_root(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
+        let proof_free = match &self.owner {
+            PreparedConfiguredCheck::Plain { startup_count: 1, .. } => true,
+            PreparedConfiguredCheck::Named { owner, startup_count: 1 } =>
+                owner.context.is_none() && owner.proofs.values().all(|catalog| catalog.definitions.is_empty()),
+            _ => false,
+        };
+        if proof_free { return self.into_startup_authored_owner()?.run_report(cap); }
+        match self.owner {
+            PreparedConfiguredCheck::Named { owner, startup_count: 1 | 2 } =>
+                run_private_named_after_startup(&owner, self.scope, cap, None)
+                    .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
+            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
+                run_private_guarded_context(&owner, effects, self.scope, cap).map_err(configured_ordered_error),
+            _ => Err(ScalarOrderedCheckerOutcome::Unsupported),
+        }
     }
 
     /// Positively classify a prepared named owner which cannot publish an
@@ -10249,6 +10272,20 @@ impl PreparedStartupAuthoredCheck {
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, bool), ScalarOrderedCheckerOutcome> {
         self.run_path(cap).map(|(records, completion, _, active)| (records, completion, active)).map_err(configured_ordered_error)
+    }
+
+    #[doc(hidden)]
+    pub fn run_report(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
+        self.run(cap).map(|(directives, completion, active)| (
+            MainFlowProofReceipt {
+                active, mixed_context_after_scalar: None, directives, diagnostics: Vec::new(),
+                contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
+                aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
+                entry_evidence: None,
+            }, Some(completion),
+        ))
     }
 
     fn run_path(
@@ -10448,24 +10485,22 @@ fn run_private_guarded_context(
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
 
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
-    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, mode: StartupNamedMode,
+    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, expected: Option<StartupNamedMode>,
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
     let (project, calls) = owner.prepared.parts();
-    let qualified = matches!(mode, StartupNamedMode::Qualified);
-    let startup_count = if qualified { 2 } else { 1 };
-    if project.modules.len() != startup_count { return Err(ProjectCheck::Unsupported); }
+    let startup_count = project.initialization_order.len();
+    let qualified = startup_count == 2;
+    if !(1..=2).contains(&startup_count) || project.modules.len() != startup_count { return Err(ProjectCheck::Unsupported); }
     let catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
     let provider = if qualified {
         Some(project.modules.iter().find(|module| module.source != owner.source)
             .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
     } else { None };
-    let reached_rank = matches!(mode, StartupNamedMode::InvokedAndReachedRank);
-    let mixed_rank = reached_rank || matches!(mode, StartupNamedMode::InvokedAndDormantRank);
-    let count = if mixed_rank || matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
     let mut named_definitions = Vec::new();
     for (proof_source, catalog) in catalogs {
         let is_provider = Some(proof_source) == provider;
@@ -10473,7 +10508,7 @@ fn run_private_named_after_startup(
             || proof_source.package != owner.source.package
             // One real provider activation and up to one independent dormant
             // theorem per owner, without changing the evaluated call family.
-            || (!qualified && (!named_definitions.is_empty() || catalog.definitions.len() != count))
+            || (!qualified && (!named_definitions.is_empty() || catalog.definitions.len() > 2))
             || (qualified && catalog.definitions.len() > if is_provider { 2 } else { 1 })
         { return Err(ProjectCheck::Unsupported); }
         for (index, definition) in catalog.definitions.iter().enumerate() {
@@ -10501,7 +10536,7 @@ fn run_private_named_after_startup(
                 || (previous.proof_source == plan.proof_source && previous.name == plan.name))
         { return Err(ProjectCheck::Unsupported); }
         if plan.typed.measure.is_some() {
-            if !mixed_rank || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0 {
+            if qualified || ranked.is_some() || plan.proof_source != &owner.source || plan.target.0 != 0 {
                 return Err(ProjectCheck::Unsupported);
             }
             ranked = Some(plan);
@@ -10512,16 +10547,19 @@ fn run_private_named_after_startup(
             plans.push(plan);
         }
     }
-    if mixed_rank != ranked.is_some() || (mixed_rank && plans.len() != 1)
+    if plans.is_empty() || (ranked.is_some() && plans.len() != 1)
         || ranked.as_ref().is_some_and(|ranked| plans.iter().any(|plan| plan.target == ranked.target || plan.name == ranked.name))
     { return Err(ProjectCheck::Unsupported); }
     let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
         plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span)),
         ranked.as_ref().map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
-    if ranked.as_ref().is_some_and(|plan|
-        incoming.get(&(plan.proof_source, plan.function.name_span)) != Some(&usize::from(reached_rank))) {
-        return Err(ProjectCheck::Unsupported);
-    }
+    let reached_rank = if let Some(plan) = &ranked {
+        match incoming.get(&(plan.proof_source, plan.function.name_span)) {
+            Some(0) => false,
+            Some(1) => true,
+            _ => return Err(ProjectCheck::Unsupported),
+        }
+    } else { false };
     let mut invoked = None;
     for plan in &plans {
         match incoming.get(&(plan.proof_source, plan.function.name_span)) {
@@ -10531,7 +10569,18 @@ fn run_private_named_after_startup(
             _ => return Err(ProjectCheck::Unsupported),
         }
     }
-    if invoked.is_some() == matches!(mode, StartupNamedMode::Dormant) { return Err(ProjectCheck::Unsupported); }
+    // Classify only from the typed declarations and this one complete
+    // incoming-edge census. No speculative run of another proof route.
+    let mode = match (qualified, ranked.is_some(), reached_rank, invoked.is_some(), plans.len()) {
+        (true, false, false, true, _) => StartupNamedMode::Qualified,
+        (false, false, false, false, 1) => StartupNamedMode::Dormant,
+        (false, false, false, true, 1) => StartupNamedMode::Invoked,
+        (false, false, false, true, 2) => StartupNamedMode::Mixed,
+        (false, true, false, true, 1) => StartupNamedMode::InvokedAndDormantRank,
+        (false, true, true, true, 1) => StartupNamedMode::InvokedAndReachedRank,
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    if expected.is_some_and(|expected| expected != mode) { return Err(ProjectCheck::Unsupported); }
     let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, startup_count, &owner.source)?;
     if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
     // Legacy dormant observers walk declaration order, not proof clause

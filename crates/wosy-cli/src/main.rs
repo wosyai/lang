@@ -2344,7 +2344,6 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
         use std::num::NonZeroUsize;
         let private = |cap| configured_check::check_targets_with_private_authored_limit(
             root, None, "dev", ScalarCheckerScope::MainFlowOnly, NonZeroUsize::new(cap).unwrap(),
-            configured_check::PrivateAuthoredPrimary::ProofFree,
         ).ok().unwrap();
         fs::write(root.join("src/primary.w"), body("app", 0)).unwrap();
         for (cap, expected, status) in [(1, &b"app"[..], 0), (2, &b"appa"[..], 4), (8, &b"appableaf"[..], 4)] {
@@ -2389,7 +2388,6 @@ proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
                 fs::write(root.join("wosy.toml"), configured).unwrap();
                 let run = |cap| configured_check::check_targets_with_private_authored_limit(
                     root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
-                    configured_check::PrivateAuthoredPrimary::QualifiedNamed,
                 ).ok().unwrap();
                 let legacy = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
                 let legacy_reports = checked_publication_reports(&legacy).ok().unwrap();
@@ -2477,7 +2475,6 @@ proof leaf_contract for echo(entry) -> (out) where (entry == 3) ensures (out == 
                 ] {
                     let receipts = configured_check::check_targets_with_private_authored_limit(
                         root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
-                        configured_check::PrivateAuthoredPrimary::ProofFree,
                     ).ok().unwrap();
                     let reports = checked_publication_reports(&receipts).ok().unwrap();
                     let actual_order = receipts.iter().map(|r|
@@ -2513,7 +2510,6 @@ proof leaf_contract for echo(entry) -> (out) where (entry == 3) ensures (out == 
         fs::write(&root_dormant, &dormant_program).unwrap();
         let root_only = |scope, cap| configured_check::check_target_with_private_authored_limit(
             root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
-            configured_check::PrivateAuthoredPrimary::ProofFree,
         ).ok().unwrap();
         for layout in ["native", "wasm-wasip1"] {
             let configured = app.replace("output = \"native\"", &format!("output = \"{layout}\""));
@@ -2583,7 +2579,6 @@ core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
     fn private_configured_terminal_preserves_proofs_files_status_and_atomicity() {
         use std::num::NonZeroUsize;
         use codespan_reporting::term::termcolor::Buffer;
-        use configured_check::PrivateAuthoredPrimary::{GuardedContext, ProofFree, ReachedRanked};
         let (fixture, _) = routing_test_project("private-configured-terminal", &[]);
         let root = &fixture.root;
         let manifest = |package: &str, output: &str| format!(r#"
@@ -2668,8 +2663,8 @@ main_artifact = "main"
         for layout in ["native", "wasm-wasip1"] {
             fs::write(root.join("wosy.toml"), manifest("app", layout)).unwrap();
             for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
-                let selected = |cap, route| configured_check::check_target_with_private_authored_limit(
-                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(), route,
+                let selected = |cap| configured_check::check_target_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
                 ).ok().unwrap();
                 let legacy = || match scope {
                     ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, None, "dev"),
@@ -2680,7 +2675,7 @@ main_artifact = "main"
                 assert_eq!(legacy_render.0, Ok(19));
                 assert_eq!(files(), both_files);
                 clean();
-                let cap_one = terminal(&selected(1, ReachedRanked), scope, false);
+                let cap_one = terminal(&selected(1), scope, false);
                 assert_eq!(cap_one.0, Ok(1)); // code zero selected; independent formal error remains
                 assert_eq!(cap_one.1, b"first");
                 assert_eq!(files(), first_file);
@@ -2688,9 +2683,19 @@ main_artifact = "main"
                 assert!(String::from_utf8_lossy(suffix).contains("call returned 7"));
                 assert_eq!(cap_one.2.strip_prefix(b"[first]"), Some(suffix));
                 clean();
-                assert_eq!(terminal(&selected(3, ReachedRanked), scope, false), legacy_render);
+                assert_eq!(terminal(&selected(3), scope, false), legacy_render);
                 assert_eq!(files(), both_files);
                 clean();
+
+                // More than one authentic incoming bare call is a
+                // different route, not the bounded mixed owner.
+                let two_bare = ranked.replace("u8 actual = echo(7);",
+                    "u8 actual = echo(7); u8 second_actual = echo(7);");
+                fs::write(&source, two_bare).unwrap();
+                let refused = selected(1);
+                let [refused] = refused.as_slice() else { panic!("one unsupported owner"); };
+                assert!(matches!(refused.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(files().is_empty() && !state.exists());
 
                 fs::write(&source, context.replace(" where (cost <= 1)", "")).unwrap();
                 let legacy_context = terminal(&[legacy()], scope, false);
@@ -2698,21 +2703,21 @@ main_artifact = "main"
                 assert_eq!(files(), both_files);
                 clean();
                 fs::write(&source, &context).unwrap();
-                assert_eq!(terminal(&selected(3, GuardedContext), scope, false), legacy_context);
+                assert_eq!(terminal(&selected(3), scope, false), legacy_context);
                 assert_eq!(files(), both_files);
                 clean();
                 let wrong = context.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
                 fs::write(&source, &wrong).unwrap();
-                let refuted = terminal(&selected(1, GuardedContext), scope, false);
+                let refuted = terminal(&selected(1), scope, false);
                 assert_eq!(refuted.0, Ok(1));
                 assert!(refuted.1.is_empty() && files().is_empty() && !state.exists());
                 let diagnostic = String::from_utf8_lossy(&refuted.2);
                 assert!(diagnostic.contains("proof obligation failed") && diagnostic.contains("explicit call entry: cost = 1")
                     && diagnostic.contains("contextual value at entry: 3; at exit: 3") && diagnostic.contains("consume(1)")
                     && !diagnostic.contains("[first]"));
-                assert_eq!(terminal(&selected(3, GuardedContext), scope, false), refuted);
+                assert_eq!(terminal(&selected(3), scope, false), refuted);
                 fs::write(&source, wrong.replace("consume(1)", "consume(2)")).unwrap();
-                let excluded = terminal(&selected(1, GuardedContext), scope, false);
+                let excluded = terminal(&selected(1), scope, false);
                 assert_eq!(excluded, (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
                 assert_eq!(files(), first_file);
                 clean();
@@ -2738,7 +2743,7 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
         fs::write(&source, "%%start core.require(true, { .stdout = \"\"; .stderr = \"\"; .code = 0; .files = []; }); %%end").unwrap();
         let scope = ScalarCheckerScope::CurrentPackage;
         let batch = |cap| configured_check::check_targets_with_private_authored_limit(
-            root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(), ProofFree,
+            root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
         ).ok().unwrap();
         assert_eq!(terminal(&batch(1), scope, true), (Ok(7), b"a".to_vec(), Vec::new()));
         assert_eq!(files(), BTreeMap::from([("same.txt".to_owned(), b"a".to_vec())]));

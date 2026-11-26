@@ -302,40 +302,31 @@ fn map_dependency_owners<T>(
     Ok(receipts)
 }
 
-#[cfg(test)]
-pub(crate) enum PrivateAuthoredPrimary {
-    ProofFree,
-    QualifiedNamed,
-    ReachedRanked,
-    GuardedContext,
-}
-
-/// Private configured fixture routes, never legacy fallback. The named
-/// route is explicit and primary-only; no formal work can be skipped in
-/// a later proof-free dependency when the budget is exhausted.
+/// Private configured routes classify the exact prepared primary. Non-primary
+/// owners remain explicitly limited to the previously supported dependency
+/// lanes. No fallback to the unbounded evaluator for authored owners.
 #[cfg(test)]
 pub(crate) fn check_targets_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
-    limit: std::num::NonZeroUsize, primary: PrivateAuthoredPrimary,
+    limit: std::num::NonZeroUsize,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
     let prepared = map_dependency_owners(root, target, profile, scope, std::convert::identity)?;
-    Ok(run_private_prepared_owners(prepared, limit, primary))
+    Ok(run_private_prepared_owners(prepared, limit))
 }
 
 #[cfg(test)]
 pub(crate) fn check_target_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
-    limit: std::num::NonZeroUsize, primary: PrivateAuthoredPrimary,
+    limit: std::num::NonZeroUsize,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
     let prepared = prepare_configured_target(root, target, profile, scope,
         (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?;
-    Ok(run_private_prepared_owners(vec![prepared], limit, primary))
+    Ok(run_private_prepared_owners(vec![prepared], limit))
 }
 
 #[cfg(test)]
 fn run_private_prepared_owners(
     prepared: Vec<PreparedConfiguredCheckReceipt>, limit: std::num::NonZeroUsize,
-    primary: PrivateAuthoredPrimary,
 ) -> Vec<ConfiguredCheckReceipt> {
     // Input failures precede selection and any staged output, even if a
     // previous package would exhaust the shared authored quota.
@@ -345,21 +336,14 @@ fn run_private_prepared_owners(
     }
     enum Owner {
         ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
-        QualifiedNamed(PreparedScalarOrderedCheck),
-        ReachedRanked(PreparedScalarOrderedCheck),
-        GuardedContext(PreparedScalarOrderedCheck),
+        Primary(PreparedScalarOrderedCheck),
         DependencyProofOnly(PreparedScalarOrderedCheck),
     }
     let mut owners = Vec::with_capacity(prepared.len());
     for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
         let classified = check.and_then(|check| {
             if index == 0 {
-                return match primary {
-                    PrivateAuthoredPrimary::ProofFree => check.into_startup_authored_owner().map(Owner::ProofFree),
-                    PrivateAuthoredPrimary::QualifiedNamed => Ok(Owner::QualifiedNamed(check)),
-                    PrivateAuthoredPrimary::ReachedRanked => Ok(Owner::ReachedRanked(check)),
-                    PrivateAuthoredPrimary::GuardedContext => Ok(Owner::GuardedContext(check)),
-                };
+                return Ok(Owner::Primary(check));
             }
             if check.is_private_named_without_authored_paths()? {
                 Ok(Owner::DependencyProofOnly(check))
@@ -390,19 +374,8 @@ fn run_private_prepared_owners(
         };
         let Some(cap) = std::num::NonZeroUsize::new(remaining) else { continue; };
         let (report, completion) = match match owner {
-            Owner::ProofFree(owner) => owner.run(cap).map(|(directives, completion, active)| (
-                MainFlowProofReceipt {
-                    active, mixed_context_after_scalar: None, directives, diagnostics: Vec::new(),
-                    contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
-                    aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
-                    entry_evidence: None,
-                }, Some(completion),
-            )),
-            Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap)
-                .map(|(report, completion)| (report, Some(completion))),
-            Owner::ReachedRanked(owner) => owner.search_startup_with_invoked_bare_and_reached_rank(cap)
-                .map(|(report, completion)| (report, Some(completion))),
-            Owner::GuardedContext(owner) => owner.search_startup_with_guarded_context(cap),
+            Owner::ProofFree(owner) => owner.run_report(cap),
+            Owner::Primary(owner) => owner.run_private_authored_root(cap),
             Owner::DependencyProofOnly(_) => unreachable!("formal owners do not use the authored quota"),
         } {
             Ok(report) => report,
