@@ -2351,11 +2351,15 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
 
         let named_primary = r#"%%start
 lib = namespace app "lib.w";
+u8(u8) app_sleep = fn(value) { value };
+proof dormant for app_sleep(entry) -> (out) where (entry == 5) ensures (out == 6) {}
 u8 actual = lib.echo(3);
 core.require(actual == 4, { .stdout = "app"; .stderr = ""; .code = 0; .files = []; });
 %%end"#;
         let named_lib = r#"%%start
 u8(u8) echo = fn(value) { if (value < 4) { value } else { 7 } };
+u8(u8) lib_sleep = fn(value) { value };
+proof dormant for lib_sleep(entry) -> (out) where (entry == 9) ensures (out == 10) {}
 proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
 %%end"#;
         fs::write(root.join("src/primary.w"), named_primary).unwrap();
@@ -2368,6 +2372,9 @@ proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
                     root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
                     configured_check::PrivateAuthoredPrimary::QualifiedNamed,
                 ).ok().unwrap();
+                let legacy = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                let legacy_reports = checked_publication_reports(&legacy).ok().unwrap();
+                let legacy_diagnostics = ordered_check_diagnostics(legacy_reports[0], &legacy[0].texts).unwrap();
                 for (cap, expected, status) in [(1, &b"app"[..], 0), (2, &b"appa"[..], 4)] {
                     let receipts = run(cap);
                     let reports = checked_publication_reports(&receipts).ok().unwrap();
@@ -2376,6 +2383,16 @@ proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
                     assert_eq!(proof.proof.source.path, "src/lib.w");
                     assert_eq!(proof.invocation.returned, 3.into());
                     assert_eq!(proof.invocation.namespaced_callable.as_ref().unwrap().source, proof.proof.source);
+                    let symbolic = reports[0].symbolic_diagnostic.iter()
+                        .chain(&reports[0].additional_symbolic_diagnostics)
+                        .map(|failure| (failure.proof.source.path.as_str(), failure.returned.clone()))
+                        .collect::<Vec<_>>();
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        assert_eq!(symbolic, [("src/primary.w", 5.into()), ("src/lib.w", 9.into())]);
+                    } else {
+                        assert!(symbolic.is_empty());
+                    }
+                    assert_eq!(ordered_check_diagnostics(reports[0], &receipts[0].texts).unwrap(), legacy_diagnostics);
                     let plan = plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()).unwrap();
                     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
                     assert_eq!(plan.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), status);

@@ -7049,31 +7049,34 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owned_direct_startup_callable_uses(&self, source: &SourceIdentity, caller: &SourceIdentity, declarations: &[ByteSpan]) -> Option<HashMap<ByteSpan, usize>> {
-        let expected_modules = if source == caller { 1 } else { 2 };
-        if self.modules.len() != expected_modules || source.project != caller.project || source.package != caller.package { return None; }
-        let mut startup_uses = declarations.iter().map(|span| (*span, 0usize)).collect::<HashMap<_, _>>();
-        let candidate = |span: &SourceSpan| &span.source == source && declarations.contains(&span.range);
-        let resolved = |call: &ResolvedCallTarget| matches!(call, ResolvedCallTarget::ModuleCallable {
-            source: owner, declaration_span, ..
-        } if owner == source && declarations.contains(declaration_span));
+    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), usize>> {
+        if self.modules.len() != if provider.is_some() { 2 } else { 1 }
+            || provider.is_some_and(|source| source == caller || source.project != caller.project || source.package != caller.package)
+        { return None; }
+        let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), 0usize))
+            .collect::<HashMap<_, _>>();
+        let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), usize>|
+            uses.contains_key(&(&span.source, span.range));
+        let resolved = |call: &ResolvedCallTarget, uses: &HashMap<(&SourceIdentity, ByteSpan), usize>|
+            matches!(call, ResolvedCallTarget::ModuleCallable { source, declaration_span, .. }
+                if uses.contains_key(&(source, *declaration_span)));
         let mut work = 0;
         use super::checker_flow::charge_call_work;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
-            if &module.initialization.source != source && &module.initialization.source != caller { return None; }
+            if &module.initialization.source != caller && Some(&module.initialization.source) != provider { return None; }
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
             charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
-            if startup.callable_escapes.iter().any(candidate) { return None; }
+            if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }
             for call in startup.call_targets.values() {
                 match call {
-                    ModuleInitializationCallTarget::Direct { declaration, concrete } if candidate(declaration) => {
+                    ModuleInitializationCallTarget::Direct { declaration, concrete } if candidate(declaration, &startup_uses) => {
                         if &module.initialization.source != caller || *concrete != ConcreteCallSelection::Declaration { return None; }
-                        let count = startup_uses.get_mut(&declaration.range)?;
+                        let count = startup_uses.get_mut(&(&declaration.source, declaration.range))?;
                         *count = count.checked_add(1)?;
                     }
                     ModuleInitializationCallTarget::Generic { declaration, .. }
-                        | ModuleInitializationCallTarget::CallableBinding(declaration) if candidate(declaration) => return None,
+                        | ModuleInitializationCallTarget::CallableBinding(declaration) if candidate(declaration, &startup_uses) => return None,
                     _ => {},
                 }
             }
@@ -7083,9 +7086,9 @@ impl ProjectCallSiteResults {
                 for body in std::iter::once(function).chain(&function.arms) {
                     charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
                         .checked_add(body.callable_escapes.len())?)?;
-                    if body.callable_escapes.iter().any(candidate)
-                        || body.sites.iter().any(|site| resolved(&site.target))
-                        || body.allocation_length_call_targets.values().any(resolved)
+                    if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
+                        || body.sites.iter().any(|site| resolved(&site.target, &startup_uses))
+                        || body.allocation_length_call_targets.values().any(|call| resolved(call, &startup_uses))
                     { return None; }
                 }
             }

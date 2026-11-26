@@ -10014,25 +10014,35 @@ fn run_private_named_after_startup(
     let qualified = matches!(mode, StartupNamedMode::Qualified);
     let startup_count = if qualified { 2 } else { 1 };
     if project.modules.len() != startup_count { return Err(ProjectCheck::Unsupported); }
-    let mut catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
-    let (proof_source, catalog) = catalogs.next().ok_or(ProjectCheck::Unsupported)?;
+    let catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
+    let provider = if qualified {
+        Some(project.modules.iter().find(|module| module.source != owner.source)
+            .map(|module| &module.source).ok_or(ProjectCheck::Unsupported)?)
+    } else { None };
     let count = if matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
-    if catalog.definitions.len() != count || catalogs.next().is_some() || owner.context.is_some()
-        || (proof_source != &owner.source) != qualified || proof_source.project != owner.source.project
-        || proof_source.package != owner.source.package
-    { return Err(ProjectCheck::Unsupported); }
-    let names = catalog.definitions.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut plans = Vec::with_capacity(count);
-    for (index, (definition, name)) in catalog.definitions.iter().zip(&names).enumerate() {
-        let selected = owner.resolve_selected_proof(definition, catalog.first_query + index)?;
+    let mut named_definitions = Vec::new();
+    for (proof_source, catalog) in catalogs {
+        let is_provider = Some(proof_source) == provider;
+        if (proof_source != &owner.source && !is_provider) || proof_source.project != owner.source.project
+            || proof_source.package != owner.source.package
+            // One real provider activation and up to one independent dormant
+            // theorem per owner, without changing the evaluated call family.
+            || (!qualified && (!named_definitions.is_empty() || catalog.definitions.len() != count))
+            || (qualified && catalog.definitions.len() > if is_provider { 2 } else { 1 })
+        { return Err(ProjectCheck::Unsupported); }
+        for (index, definition) in catalog.definitions.iter().enumerate() {
+            let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
+            named_definitions.push((proof_source, is_provider, definition, catalog.first_query + index, name));
+        }
+    }
+    let mut plans = Vec::with_capacity(named_definitions.len());
+    for (proof_source, is_provider, definition, query, name) in &named_definitions {
+        let proof_source = *proof_source;
+        let selected = owner.resolve_selected_proof(definition, *query)?;
         let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
-            proof_source, name.text(), selected, qualified,
+            proof_source, name.text(), selected, *is_provider,
         )?;
         let body = plan.typed.body;
-        // Prepared module ordinals follow the loaded declaration order, not the
-        // startup order. Authenticate the target's actual owner instead of
-        // assuming that the root was loaded at ordinal zero.
         if project.modules.get(plan.target.0).map(|module| &module.source) != Some(proof_source)
             || &plan.typed.target.source != proof_source
             || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
@@ -10042,17 +10052,18 @@ fn run_private_named_after_startup(
             || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
             || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
             || !plan.function.overload_arms.is_empty()
-            || plans.iter().any(|previous: &PlannedModuleProof<'_>| previous.target == plan.target || previous.name == plan.name)
+            || plans.iter().any(|previous: &PlannedModuleProof<'_>| previous.target == plan.target
+                || (previous.proof_source == plan.proof_source && previous.name == plan.name))
         { return Err(ProjectCheck::Unsupported); }
         plans.push(plan);
     }
-    let declarations = plans.iter().map(|plan| plan.function.name_span).collect::<Vec<_>>();
-    let incoming = calls.owned_direct_startup_callable_uses(proof_source, &owner.source, &declarations).ok_or(ProjectCheck::Unsupported)?;
+    let incoming = calls.owned_direct_startup_callable_uses(&owner.source, provider,
+        plans.iter().map(|plan| (plan.proof_source, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
     let mut invoked = None;
     for plan in &plans {
-        match incoming.get(&plan.function.name_span) {
+        match incoming.get(&(plan.proof_source, plan.function.name_span)) {
             Some(0) => {},
-            Some(1) if invoked.is_none() && matches!(plan.typed.body.boundary.parameters.as_slice(),
+            Some(1) if invoked.is_none() && (!qualified || Some(plan.proof_source) == provider) && matches!(plan.typed.body.boundary.parameters.as_slice(),
                 [entry] if is_integer_type(&entry.ty)) => { invoked = Some(plan.target); },
             _ => return Err(ProjectCheck::Unsupported),
         }
@@ -10062,7 +10073,9 @@ fn run_private_named_after_startup(
     if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
     // Legacy dormant observers walk declaration order, not proof clause
     // order. Preserve it even when typed goals were authored in reverse.
-    plans.sort_unstable_by_key(|plan| plan.target.1);
+    plans.sort_unstable_by_key(|plan| (
+        usize::from(plan.proof_source != &owner.source), plan.target.1,
+    ));
     let [first, rest @ ..] = plans.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
     for plan in rest {
@@ -10086,7 +10099,7 @@ fn run_private_named_after_startup(
         for plan in plans.iter().filter(|plan| Some(plan.target) != invoked) {
             // No invented completion/dependency access, only the original
             // closed dormant theorem allowed by the resolved-edge census.
-            active |= proof.try_collect(plan.target, plan.typed.body, plan.function, proof_source, &mut effects,
+            active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,
                 SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
         }
         proof.complete()?;
