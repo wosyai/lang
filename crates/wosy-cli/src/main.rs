@@ -3259,6 +3259,35 @@ main_artifact = "main"
                     }
                 }
 
+                let projected = format!(r#"%%start
+                    u8(u8) choose = fn(input) {{ if (input < 128) {{ 7 }} else {{ 7 }} }};
+                    unit(u8) open = fn(value) {{
+                        u8 result = choose(value);
+                        core.require(result == 8, {first});
+                    }};
+                %%end"#);
+                fs::write(&source, &projected).unwrap();
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    let [row] = report.directives.as_slice() else { panic!("first structural child branch"); };
+                    assert!(row.witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                    assert_eq!(terminal(&limited, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    let two = selected(2);
+                    let report = two[0].outcome.as_ref().unwrap();
+                    let [early, late] = report.directives.as_slice() else { panic!("distinct returned branches with equal value"); };
+                    assert_eq!(early.directive, late.directive);
+                    assert!(late.witness.intervals_at(0, 0).unwrap().eq([(&128.into(), &255.into())]));
+                    let refused = terminal(&two, scope, false);
+                    assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty());
+                    assert!(!state.exists());
+                } else {
+                    assert!(selected(1)[0].outcome.as_ref().unwrap().directives.is_empty());
+                    assert!(!state.exists());
+                }
+
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {

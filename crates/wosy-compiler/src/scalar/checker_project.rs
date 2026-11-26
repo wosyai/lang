@@ -10447,6 +10447,8 @@ impl PreparedScalarOrderedCheck {
                 order[ordinals[source]] = position;
             }
             ordered.sort_unstable_by_key(|&(module, item)| (order[module], item));
+            let mut history_leaves = HashMap::new();
+            let mut history_work = 0;
             for (module, item) in ordered {
                 let source = project.modules.get(module).ok_or(ScalarOrderedCheckerOutcome::Unsupported)?;
                 if source.source.project != root.project || source.source.package != root.package {
@@ -10459,7 +10461,8 @@ impl PreparedScalarOrderedCheck {
                     mandatory_startup_scalars.push((item, function.name_span));
                     continue;
                 }
-                if !closed_callable_history_body(body) || !closed_callable_history_calls(project, calls, module, item, body) {
+                if !closed_callable_history_body(body) || !closed_callable_history_calls(
+                    project, calls, module, item, body, &mut history_leaves, &mut history_work) {
                     return Err(ScalarOrderedCheckerOutcome::Unsupported);
                 }
                 callable_roots.push((module, item));
@@ -10547,7 +10550,7 @@ fn symbolic_history_call_target(
 ) -> Option<usize> {
     let (owner, item) = *body.structure.checker_direct_targets.get(&site)?;
     if owner != module || caller == item || signature.parameters.len() != 1
-        || !matches!(signature.outputs.outputs.as_slice(), [result] if result.ty == ScalarType::Unit)
+        || !matches!(signature.outputs.outputs.as_slice(), [result] if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
     { return None; }
     let source = project.modules.get(module)?;
     let ScalarItem::Function(function) = source.items.get(item)? else { return None; };
@@ -10564,13 +10567,31 @@ fn symbolic_history_call_target(
 #[cfg(feature = "internal-checker")]
 fn closed_callable_history_calls(
     project: &ScalarProject, calls: &ProjectCallSiteResults, module: usize, item: usize, body: &FunctionCallSites,
+    leaf_shapes: &mut HashMap<PreparedCallable, bool>, work: &mut usize,
 ) -> bool {
+    if body.structure.checker_integer_call_locals.len().checked_add(body.structure.checker_direct_targets.len())
+        .and_then(|cost| super::checker_flow::charge_call_work(work, cost)).is_none()
+    { return false; }
+    let scalar_sites = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
     body.structure.checker_direct_targets.keys().all(|&site| {
         let target = body.checked_call_signatures.get(&site)
             .and_then(|signature| symbolic_history_call_target(project, calls, module, item, body, site, signature));
-        target.and_then(|target| calls.function_body(module, target, None)).is_some_and(|leaf|
-            leaf.structure.checker_direct_targets.is_empty() && leaf.conditionals.is_empty()
-                && closed_callable_history_body(leaf))
+        let Some(target) = target else { return false; };
+        let Some(leaf) = calls.function_body(module, target, None) else { return false; };
+        if !leaf.checker_returns_unit() && !scalar_sites.contains(&site) { return false; }
+        *leaf_shapes.entry((module, target)).or_insert_with(|| {
+            if super::checker_flow::charge_call_work(work, leaf.occurrences.len()).is_none() { return false; }
+            if leaf.checker_returns_unit() {
+                leaf.structure.checker_direct_targets.is_empty() && leaf.conditionals.is_empty()
+                    && closed_callable_history_body(leaf)
+            } else {
+                let [result] = leaf.boundary.results.as_slice() else { return false; };
+                qualified_integer_proof_leaf(leaf, &result.ty) && leaf.structure.checker_directives.is_empty()
+                    && leaf.conditionals.values().all(|region| matches!(region, ConditionalRegion::Value { condition, .. }
+                        if matches!(leaf.structure.checker_branches.get(condition),
+                            Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))))
+            }
+        })
     })
 }
 
@@ -10685,6 +10706,19 @@ fn run_startup_authored_path(
                     if !std::ptr::eq(body, caller) { return None; }
                     let target = symbolic_history_call_target(project, calls, ordinal, item, body, site, signature)?;
                     let callee = calls.function_body(ordinal, target, None)?;
+                    let [output] = signature.outputs.outputs.as_slice() else { return None; };
+                    if is_integer_type(&output.ty) {
+                        let domain = match argument {
+                            NestedIntegerArgument::Single(Some((ty, value))) | NestedIntegerArgument::RootLexical((ty, value))
+                                if ty == &signature.parameters[0] && integer_literal_fits_type(value, ty) =>
+                                Rc::new(IntegerSet::singleton(value)),
+                            NestedIntegerArgument::Projected(projection) if projection.slot == 0
+                                && projection.ty == &signature.parameters[0] && matches!(projection.companion, ProjectedCompanion::Unary) =>
+                                projection.materialize()?,
+                            _ => return None,
+                        };
+                        return super::checker_flow::trace_closed_projected_scalar_return(callee, domain, &output.ty, &work);
+                    }
                     let exact;
                     let entry = match argument {
                         NestedIntegerArgument::Single(Some((ty, value))) | NestedIntegerArgument::RootLexical((ty, value))
@@ -16925,6 +16959,63 @@ mod tests {
                 .search_startup_authored_path(NonZeroUsize::new(4).unwrap()).unwrap();
             assert_eq!(records.iter().map(|r| r.code().clone()).collect::<Vec<_>>(), [7, 7, 11].map(BigInt::from));
             assert!(!search.contains_return(&call));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_projected_scalar_returns_keep_original_child_branches_at_caller() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-projected-scalar-branches");
+        let text = format!(r#"%%start
+            u8(u8) choose = fn(input) {{ if (input < 128) {{ 7 }} else {{ 7 }} }};
+            unit(u8) caller = fn(value) {{
+                u8 result = choose(value);
+                core.require(result == 8, {OUTPUT});
+            }};
+        %%end"#);
+        let at = |snippet: &str| {
+            let start = text.find(snippet).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + snippet.len() as u32))
+        };
+        let call = at("choose(value)");
+        let branch = at("input < 128");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| {
+                let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+                assert!(parsed.diagnostics.is_empty());
+                let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+                prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations, Vec::new())], [], vec![source.clone()], ScalarPreparationInputs { target_layout },
+                    scope, Vec::new(),
+                ).ok().unwrap()
+            };
+            for cap in [1, 2, 3] {
+                let (records, end, trace, active) = prepare(&text, ScalarCheckerScope::CurrentPackage)
+                    .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                assert!(active);
+                assert_eq!(end, if cap < 3 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                assert_eq!(records.len(), cap.min(2));
+                assert!(trace.contains_return(&call) && trace.contains_branch(branch.clone(), true));
+                assert_eq!(trace.contains_branch(branch.clone(), false), cap >= 2);
+                assert!(trace.call_paths().into_iter().all(|path| path == [call.clone()]));
+                for (failure, (lo, hi)) in records.iter().zip([(0, 127), (128, 255)]) {
+                    assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&lo.into(), &hi.into())]));
+                    assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&7.into(), &7.into())]));
+                }
+            }
+            let changed = text.replace("else { 7 }", "else { input }").replace("result == 8", "result == 7");
+            let (records, _, trace, _) = prepare(&changed, ScalarCheckerScope::CurrentPackage)
+                .search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            let [failure] = records.as_slice() else { panic!("original alias arm's failing row"); };
+            assert!(trace.contains_branch(branch.clone(), false) && !trace.contains_branch(branch.clone(), true));
+            assert_eq!(failure.witness.equal_axes(), [(1, 0)]);
+            for axis in 0..2 {
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&128.into(), &255.into())]));
+            }
+            let (records, end, _, active) = prepare(&text, ScalarCheckerScope::MainFlowOnly)
+                .search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert!(!active && records.is_empty() && end == StartupAuthoredCompletion::Exhausted);
         }
     }
 
