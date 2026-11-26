@@ -249,12 +249,20 @@ pub(super) struct SelectedBuildProfile<Name> {
 
 impl<Name: AsRef<str>> SelectedBuildProfile<Name> {
     pub fn configured(name: Name, profile: &ArtifactProfile) -> Result<Self> {
-        let layout = profile.target_layout()?;
-        Ok(Self {
-            name,
-            layout: ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment },
-        })
+        Self::try_configured(name, profile).map_err(|(_, error)| error.into())
     }
+
+    pub(super) fn try_configured(name: Name, profile: &ArtifactProfile) -> std::result::Result<Self, (Name, String)> {
+        match profile.target_layout() {
+            Ok(layout) => Ok(Self {
+                name,
+                layout: ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment },
+            }),
+            Err(error) => Err((name, error)),
+        }
+    }
+
+    pub(super) fn name(&self) -> &str { self.name.as_ref() }
 
     pub fn identity(&self, image: Option<NodeId>, inputs: BuildInputs, projection: NodeId) -> (NodeId, Lookup) {
         let identity = preparation_identity(projection, inputs, self.name.as_ref(), self.layout);

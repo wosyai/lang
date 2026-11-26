@@ -225,6 +225,7 @@ struct CensusConfig {
     entry: FileKey,
     owner: String,
     profiles: Vec<SelectedBuildProfile<String>>,
+    other_profile_names: BTreeSet<String>,
 }
 
 struct CensusRoot {
@@ -260,9 +261,17 @@ impl<'a> CensusRead<'a> {
                 self.remaining_profiles = self.remaining_profiles.checked_sub(config.profiles.len())
                     .ok_or("source retention plan exceeded configured profile budget")?;
                 let owner = pins::workspace_of_source_config(&config)?.to_owned();
-                let profiles = config.profiles.into_iter().filter_map(|(name, profile)|
-                    SelectedBuildProfile::configured(name, &profile).ok()).collect();
-                let candidate = Arc::new(CensusConfig { encoded_bytes, owner, entry: config.entry, profiles });
+                let mut profiles = Vec::new();
+                let mut other_profile_names = BTreeSet::new();
+                for (name, profile) in config.profiles {
+                    match SelectedBuildProfile::try_configured(name, &profile) {
+                        Ok(selected) => profiles.push(selected),
+                        Err((name, _)) => { other_profile_names.insert(name); }
+                    }
+                }
+                let candidate = Arc::new(CensusConfig {
+                    encoded_bytes, owner, entry: config.entry, profiles, other_profile_names,
+                });
                 slot.insert(Arc::clone(&candidate));
                 Ok(candidate)
             }
@@ -336,7 +345,7 @@ fn walk(
                 match node.kind {
                     // A generic link can never mark or follow a receipt or
                     // confer the more specific authority of a root or config.
-                    Kind::BuildDiagnosticReceipt | Kind::SourcePreparation | Kind::Config => continue,
+                    Kind::BuildDiagnosticReceipt | Kind::SavedBuildDiagnostic | Kind::SourcePreparation | Kind::Config => continue,
                     Kind::File => {
                         let authority = reader.tx.get(&authority_key(FILE_AUTHORITY, id))?
                             .ok_or("missing namespace authority for source retention")?;
@@ -721,22 +730,53 @@ impl SourceStore {
             return Err("retention selection names an unpublished root".into());
         }
 
+        let mut reader = CensusRead::new(&tx, limit);
+        let owner = reader.root_owner(scope)?;
+        let mut marks = Marks::default();
+        let mut saved_roots = BTreeMap::new();
         let mut pinned = BTreeSet::new();
         let mut pin_count = 0;
         rows(&tx, pins::PINS, |pin_key, value| {
             if pin_count >= limit { return Err("source retention plan exceeded pin budget".into()); }
             pin_count += 1;
-            if let Some(root) = pins::decode_pin_value(value)?.retained_root() {
+            let pin = pins::decode_pin_value(value)?;
+            if let Some(root) = pin.retained_root() {
                 if !published.contains(&root) { return Err("durable pin is outside published roots".into()); }
                 pinned.insert(root);
+                if let Some(record) = pin.saved_diagnostic() {
+                    let config = reader.root_owner(root)?;
+                    if pin.owner() != config.owner.as_bytes()
+                        || !pins::Owner::new(config.owner.clone()).owns_named_key(pin_key)
+                    {
+                        return Err("saved diagnostic pin has the wrong workspace".into());
+                    }
+                    match saved_roots.entry(record) {
+                        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != root =>
+                            return Err("saved diagnostic has conflicting authored roots".into()),
+                        std::collections::btree_map::Entry::Occupied(_) => (),
+                        std::collections::btree_map::Entry::Vacant(attachment) => {
+                            if marks.nodes.len() >= limit { return Err("source retention plan exceeded node budget".into()); }
+                            let (report, encoded_bytes) = super::saved_diagnostics::read_record(
+                                reader.tx, record, root, super::saved_diagnostics::MAX_REPORT_BYTES,
+                                |bytes| charge_bytes(&mut reader.remaining_bytes, bytes))?;
+                            if !config.other_profile_names.contains(&report.profile)
+                                && !config.profiles.iter().any(|profile| profile.name() == report.profile)
+                            {
+                                return Err("saved diagnostic profile is outside its source".into());
+                            }
+                            attachment.insert(root);
+                            marks.nodes.insert(record, Mark {
+                                classes: PROTECTED, encoded_bytes, is_projection: false,
+                            });
+                        }
+                    }
+                }
             }
             framed_hash(&mut epoch, pin_key);
             framed_hash(&mut epoch, value);
             Ok(())
         })?;
 
-        let mut reader = CensusRead::new(&tx, limit);
-        let owner = reader.root_owner(scope)?;
         let mut candidates = BTreeSet::new();
         for &root in &nominated {
             if reader.root_owner(root)?.owner != owner.owner {
@@ -747,7 +787,6 @@ impl SourceStore {
             }
         }
 
-        let mut marks = Marks::default();
         walk(&mut reader, published.difference(&candidates).map(|&root| (root, WalkOrigin::Published)),
             image, PROTECTED, limit, &mut marks)?;
         walk(&mut reader, candidates.iter().map(|&root| (root, WalkOrigin::Published)),

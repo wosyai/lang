@@ -1,8 +1,9 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
-    retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
-    storage_worker::QueryCancellation,
-    PreparedBaseDeclarations, Result, RootedLlvmIdentity, RootedLlvmProjection, SourceReconciliation, SourceStorageWorker,
+    retention_plan::{LeaseGrant, SourceLease}, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
+    storage_worker::{QueryCancellation, QueryWorker},
+    PreparedBaseDeclarations, Result, RootedBuildAnalysis, RootedLlvmIdentity, RootedLlvmProjection,
+    SavedBuildDiagnostic, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -176,6 +177,37 @@ impl BuildDiagnosticSession<'_> {
         self.dispatch_analysis(request, Some(cancellation)).await
     }
 
+    /// Save the actual ordinary Build diagnostic outcome for this exact
+    /// leased revision. An archive is historical evidence, never a reusable
+    /// Build/Check verdict, artifact or caller-supplied diagnostic.
+    pub async fn save_build_diagnostic(
+        &self, profile: &str, name: &str, limits: BaseCstAdmissionLimits, max_report_bytes: usize,
+    ) -> Result<SavedBuildDiagnostic> {
+        super::saved_diagnostics::validate_name(name)?;
+        super::saved_diagnostics::validate_profile(profile, max_report_bytes)?;
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
+        let (profile, name) = (profile.to_owned(), name.to_owned());
+        self.worker.spawn_reserved_query(slot, Some(cancellation), move |worker| async move {
+            super::saved_diagnostics::save(&worker, lease, &name, profile, limits, max_report_bytes).await
+        }).await?
+    }
+
+    /// Read a named historical diagnostic belonging to this lease's
+    /// workspace, using the archive's exact authored revision.
+    pub async fn saved_build_diagnostic(
+        &self, name: &str, limits: BaseCstAdmissionLimits, max_report_bytes: usize,
+    ) -> Result<Option<SavedBuildDiagnostic>> {
+        super::saved_diagnostics::validate_name(name)?;
+        let slot = self.worker.try_slot()?;
+        let name = name.to_owned();
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            super::saved_diagnostics::read(store, &lease, &name, limits, max_report_bytes)
+        }).await?
+    }
+
     async fn dispatch_analysis(
         &self, request: BuildDiagnosticRequest, cancellation: Option<QueryCancellation>,
     ) -> Result<BuildDiagnosticResponse<Diagnostic>> {
@@ -185,14 +217,7 @@ impl BuildDiagnosticSession<'_> {
         let slot = self.worker.try_slot()?;
         let grant = self.lease.grant();
         self.worker.spawn_reserved_query(slot, cancellation, move |worker| async move {
-            let snapshot = worker.phase(None, move |store| {
-                store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
-            }).await?;
-            let Some(snapshot) = snapshot else { return Err(BuildRequestRejection::Expired.into()); };
-            // SurrealKV commits may schedule their own blocking work. Keep
-            // all awaited queries on the async task, never on a pool thread.
-            let prepared = worker.store.prepare_configured(snapshot, &profile, Some(&worker)).await?;
-            let analysis = prepared.build_analysis_with(Some(&worker)).await?;
+            let analysis = analyze_leased(&worker, grant, &profile).await?;
             Ok(BuildDiagnosticResponse::BuildDiagnostics {
                 version, source_root: analysis.source_root, profile,
                 preparation: analysis.preparation, receipt: analysis.key.digest(),
@@ -200,6 +225,16 @@ impl BuildDiagnosticSession<'_> {
             })
         }).await?
     }
+}
+
+async fn analyze_leased(worker: &QueryWorker, grant: LeaseGrant, profile: &str) -> Result<RootedBuildAnalysis> {
+    let snapshot = worker.phase(None, move |store| {
+        store.leased_source_snapshot(grant)?.map(|source| source.configured()).transpose()
+    }).await?;
+    let Some(snapshot) = snapshot else { return Err(BuildRequestRejection::Expired.into()); };
+    // SurrealKV commits can schedule blocking work; await on the async task.
+    let prepared = worker.store.prepare_configured(snapshot, profile, Some(worker)).await?;
+    prepared.build_analysis_with(Some(worker)).await
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ pub(super) fn workspace_of_source_config(config: &SourceConfig) -> Result<&str> 
 pub(super) struct StoredPin<'a> {
     root: NodeId,
     owner: &'a [u8],
+    saved: Option<NodeId>,
     reflection: Option<Reflection<'a>>,
 }
 
@@ -40,6 +41,9 @@ struct Reflection<'a> {
 }
 
 impl StoredPin<'_> {
+    pub fn saved_diagnostic(&self) -> Option<NodeId> { self.saved }
+    pub fn owner(&self) -> &[u8] { self.owner }
+
     pub fn retained_root(&self) -> Option<NodeId> {
         self.reflection.as_ref().is_none_or(|pin| pin.retention == SourcePinRetention::Retained)
             .then_some(self.root)
@@ -51,9 +55,13 @@ pub(super) fn decode_pin_value(bytes: &[u8]) -> Result<StoredPin<'_>> {
     let root = NodeId(*root);
     // Legacy records append a filesystem path, which cannot begin with NUL.
     let Some(body) = owner.strip_prefix(&[0]) else {
-        return Ok(StoredPin { root, owner, reflection: None });
+        return Ok(StoredPin { root, owner, saved: None, reflection: None });
     };
     let (&state, body) = body.split_first().ok_or("incomplete reflected source pin")?;
+    if state == 3 {
+        let (saved, owner) = body.split_first_chunk::<32>().ok_or("incomplete saved diagnostic pin")?;
+        return Ok(StoredPin { root, owner, saved: Some(NodeId(*saved)), reflection: None });
+    }
     let retention = match state {
         1 => SourcePinRetention::Retained,
         2 => SourcePinRetention::Released,
@@ -66,10 +74,10 @@ pub(super) fn decode_pin_value(bytes: &[u8]) -> Result<StoredPin<'_>> {
         .ok_or("incomplete reflected source pin target")?;
     if generation <= 0 { return Err("invalid reflected source pin generation".into()); }
     let target = std::str::from_utf8(target)?;
-    Ok(StoredPin { root, owner, reflection: Some(Reflection { generation, target, retention }) })
+    Ok(StoredPin { root, owner, saved: None, reflection: Some(Reflection { generation, target, retention }) })
 }
 
-struct Owner {
+pub(super) struct Owner {
     path: String,
     prefix: [u8; OWNER_PREFIX_BYTES],
 }
@@ -92,19 +100,23 @@ impl Owner {
         Ok(Self::new(workspace_of_config(tx, id)?))
     }
 
-    fn new(path: String) -> Self {
+    pub(super) fn new(path: String) -> Self {
         let id = NodeId(blake3::derive_key("wosy source pin workspace v1", path.as_bytes()));
         let mut prefix = [0; OWNER_PREFIX_BYTES];
         prefix[..33].copy_from_slice(&key(PINS, id));
         Self { path, prefix }
     }
 
-    fn pin_key(&self, name: &str) -> Result<Vec<u8>> {
+    pub(super) fn pin_key(&self, name: &str) -> Result<Vec<u8>> {
         if name.is_empty() { return Err("pin name is empty".into()); }
         let mut key = Vec::with_capacity(OWNER_PREFIX_BYTES + name.len());
         key.extend_from_slice(&self.prefix);
         key.extend_from_slice(name.as_bytes());
         Ok(key)
+    }
+
+    pub(super) fn owns_named_key(&self, key: &[u8]) -> bool {
+        key.strip_prefix(self.prefix.as_slice()).is_some_and(|name| !name.is_empty())
     }
 
     fn upper_bound(&self) -> [u8; OWNER_PREFIX_BYTES] {
@@ -120,12 +132,21 @@ impl Owner {
         value
     }
 
-    fn stored<'a>(&self, bytes: &'a [u8]) -> Result<StoredPin<'a>> {
+    pub(super) fn stored<'a>(&self, bytes: &'a [u8]) -> Result<StoredPin<'a>> {
         let pin = decode_pin_value(bytes)?;
         if pin.owner != self.path.as_bytes() {
             return Err("source pin has the wrong workspace owner".into());
         }
         Ok(pin)
+    }
+
+    pub(super) fn saved_value(&self, root: NodeId, record: NodeId) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(66 + self.path.len());
+        bytes.extend_from_slice(&root.0);
+        bytes.extend_from_slice(&[0, 3]);
+        bytes.extend_from_slice(&record.0);
+        bytes.extend_from_slice(self.path.as_bytes());
+        bytes
     }
 
     fn reflected_value(&self, intent: &SourcePinIntent) -> Result<Vec<u8>> {
@@ -159,6 +180,7 @@ impl SourceStore {
             let same = if let Some(value) = old.as_deref() {
                 let pin = owner.stored(value)?;
                 let same = pin.retained_root() == Some(root);
+                if pin.saved.is_some() { return Err("name belongs to a saved Build diagnostic".into()); }
                 if pin.reflection.is_some() && !same {
                     return Err("source pin is managed by an exact client intent".into());
                 }
@@ -190,7 +212,9 @@ impl SourceStore {
             let owner = Owner::for_update(&mut tx, scope)?;
             let key = owner.pin_key(name)?;
             let Some(existing) = tx.get(&key)? else { return Ok(false); };
-            if owner.stored(&existing)?.reflection.is_some() {
+            let pin = owner.stored(&existing)?;
+            if pin.saved.is_some() { return Err("name belongs to a saved Build diagnostic".into()); }
+            if pin.reflection.is_some() {
                 return Err("source pin is managed by an exact client intent".into());
             }
             tx.set_durability(Durability::Immediate);

@@ -44,6 +44,8 @@ mod rooted_llvm;
 mod installed_git_lease;
 #[path = "source_snapshot/process_diagnostics.rs"]
 mod process_diagnostics;
+#[path = "source_snapshot/saved_diagnostic.rs"]
+mod saved_diagnostic;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

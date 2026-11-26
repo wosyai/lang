@@ -185,10 +185,14 @@ pub(super) struct QueryWorker {
 }
 
 impl QueryWorker {
+    pub(super) fn check_active(&self) -> Result<()> {
+        QueryCancellation::check(self.cancellation.as_ref())
+    }
+
     pub async fn phase<T: Send + 'static>(
         &self, source: Option<&SourceRead>, job: impl FnOnce(&SourceStore) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        QueryCancellation::check(self.cancellation.as_ref())?;
+        self.check_active()?;
         let store = Arc::clone(&self.store);
         let ownership = (Arc::clone(&self.slot), source.cloned());
         let cancellation = self.cancellation.clone();

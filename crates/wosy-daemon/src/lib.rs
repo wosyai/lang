@@ -63,6 +63,8 @@ mod prepared_project;
 mod rooted_llvm;
 mod retention_plan;
 mod rooted_llvm_receipts;
+mod saved_diagnostics;
+pub use saved_diagnostics::{SavedBuildDiagnostic, SavedBuildPhase};
 mod source_impact;
 mod source_proposal;
 mod source_reconciliation;
@@ -325,6 +327,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         NamespaceFacts | BaseDeclarations => count == 1,
         ModuleDeclarations => count >= 2,
         BuildDiagnosticReceipt => count == 4,
+        SavedBuildDiagnostic => count == 1,
     };
     if good { Ok(()) } else { Err("invalid base source schema or node shape".into()) }
 }
@@ -353,6 +356,7 @@ enum Edge {
     ModuleDeclarationBody,
     ModuleDeclarationImport,
     ReceiptDeclarations,
+    SavedDiagnosticSource,
 }
 
 fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
@@ -392,6 +396,7 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
             2 => (Edge::Dependencies, Exact(Dependencies)),
             _ => (Edge::ReceiptDeclarations, Exact(ModuleDeclarations)),
         },
+        SavedBuildDiagnostic => (Edge::SavedDiagnosticSource, Exact(SourcePreparation)),
         Token | Annotations | Config => unreachable!("validated leaf"),
     }
 }

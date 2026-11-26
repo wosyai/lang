@@ -1,9 +1,9 @@
 //! Restore already-acknowledged source after loss of recomputable store data.
 use super::{
-    check_source_marker, key,
-    source_proposal::{matches_source_scope, stage_reconciled_closure},
+    check_source_marker, key, read_verified_node_with,
+    source_proposal::{matches_source_scope, stage_reconciled_closure, take},
     storage_worker::QueryWorker,
-    BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, NODES, SNAPSHOT_ROOTS,
+    BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, SNAPSHOT_ROOTS,
 };
 use std::sync::Arc;
 use surrealkv::{Durability, Mode, Transaction};
@@ -93,10 +93,17 @@ pub(super) fn checked_published_source_header(tx: &Transaction, root: NodeId) ->
 }
 
 pub(super) fn checked_published_source_header_with_top(tx: &Transaction, root: NodeId) -> Result<(Node, SourceConfig)> {
-    let source = checked_header_node(tx, root)?;
+    checked_source_header_using(root, |id| read_verified_node_with(tx, id, |_| Ok(())))
+}
+
+pub(super) fn checked_source_header_using(
+    root: NodeId, mut read: impl FnMut(NodeId) -> Result<Node>,
+) -> Result<(Node, SourceConfig)> {
+    let source = read(root)?;
     let parts = source_preparation_parts(&source).ok_or("unsupported acknowledged source schema")?;
-    let config = checked_header_node(tx, parts.config)?;
+    let config = read(parts.config)?;
     if config.kind != Kind::Config { return Err("invalid acknowledged source configuration kind".into()); }
+    super::validate_shape(&config)?;
     let config: SourceConfig = serde_json::from_slice(&config.data)?;
     if source.data != config.schema() || config.parser.schema.0 != *wosy_syntax::base_cst_schema() {
         return Err("invalid acknowledged source configuration schema".into());
@@ -104,8 +111,12 @@ pub(super) fn checked_published_source_header_with_top(tx: &Transaction, root: N
     Ok((source, config))
 }
 
-fn checked_header_node(tx: &Transaction, id: NodeId) -> Result<Node> {
-    let bytes = tx.get(&key(NODES, id))?.ok_or("acknowledged source header is missing")?;
-    if Node::id(&bytes) != id { return Err("acknowledged source header digest mismatch".into()); }
-    Node::decode(&bytes).ok_or_else(|| "invalid acknowledged source header".into())
+pub(super) fn bounded_source_records(
+    tx: &Transaction, limits: BaseCstAdmissionLimits,
+) -> impl FnMut(NodeId) -> Result<Node> + '_ {
+    let (mut records, mut encoded) = (limits.records, limits.record_bytes);
+    move |id| read_verified_node_with(tx, id, |bytes| {
+        take(&mut records, 1, "source index exceeds the record budget")?;
+        take(&mut encoded, bytes, "source index exceeds the byte budget")
+    })
 }

@@ -42,6 +42,15 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "save-build-diagnostic" | "save-build-diagnostic-exit" | "read-saved-build-diagnostic" => {
+            let name = args.next().ok_or("expected a fixture diagnostic name")?;
+            let limit = args.next().ok_or("expected the fixture byte limit")?.parse()?;
+            let profile = if mode.starts_with("save") {
+                Some(args.next().ok_or("expected a fixture Build profile")?)
+            } else { None };
+            let selected = client.acknowledged_build_source(&target)?.ok_or("fixture has no acknowledged source")?;
+            super::saved_diagnostic::run(dir, selected, &name, profile.as_deref(), limit, mode.ends_with("-exit")).await?
+        }
         "leased-ordinary-llvm" => {
             let profile = args.next().ok_or("expected fixture LLVM profile")?;
             let output = args.next().ok_or("expected fixture partition byte limit")?.parse()?;

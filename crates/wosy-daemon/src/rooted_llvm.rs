@@ -5,6 +5,7 @@ use super::{
     read_index_using, read_verified_node_with, retention_plan::SourceLease,
     rooted_llvm_receipts::{ExecutableLlvmFlight, ExecutableLlvmKey, ExecutableLlvmReceipt, FlightState, StagedExecutableLlvmReceipt},
     source_proposal::{authored_grammar_matches, take},
+    source_reconciliation::{bounded_source_records, checked_source_header_using},
     storage_worker::{QueryPhases, QueryWorker},
     validate_file_using, BaseCstAdmissionLimits, FileTree, Result, SourceStore,
 };
@@ -13,10 +14,10 @@ use surrealkv::Mode;
 use tokio::{sync::{Mutex, OwnedMutexGuard}, time::{sleep_until, Instant as TokioInstant}};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, prepare_scalar_project, Diagnostic,
-    ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    ScalarArtifactEmission, ScalarBuildValidation, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_protocol::{source_preparation_parts, Kind, NodeId, ParserPolicy, SourceConfig};
-use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, SourceIdentity};
+use wosy_protocol::{source_preparation_parts, NodeId, ParserPolicy};
+use wosy_syntax::{AuthoredSpanMap, ByteSpan, CanonicalCstRoot, CstNode, SourceIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootedLlvmIdentity {
@@ -96,12 +97,12 @@ struct ProjectionEvidence {
     executable: Option<ExecutableLlvmKey>,
 }
 
-enum LlvmPlanning {
-    Ready(LlvmPlan),
+pub(super) enum ScalarPlanning {
+    Ready(ScalarPlan),
     Unsupported(RootedLlvmUnsupported),
 }
 
-struct LlvmPlan {
+pub(super) struct ScalarPlan {
     root: NodeId,
     profile: String,
     exports: Option<BTreeMap<String, String>>,
@@ -109,8 +110,27 @@ struct LlvmPlan {
     parser: ParserPolicy,
     identity: RootedLlvmIdentity,
     image: NodeId,
+    workspace: String,
     order: RootedOrder,
     receipt_key: Option<ExecutableLlvmKey>,
+}
+
+pub(super) struct ScalarObservation<T> {
+    pub outcome: ScalarOutcome<T>,
+    pub root: NodeId,
+    pub profile: String,
+    pub image: NodeId,
+    pub workspace: String,
+    module_count: usize,
+    grammar_reparsed_files: usize,
+    grammar_verification: Duration,
+}
+
+pub(super) enum ScalarOutcome<T> {
+    Rejected(RootedLlvmRejection),
+    Unsupported(RootedLlvmUnsupported),
+    Value(T),
+    AlreadyEmitted,
 }
 
 /// One bounded existing worker slot across both stages. A waiting request
@@ -121,12 +141,12 @@ pub(super) async fn project_executable_on_worker(
     let grant = lease.grant();
     let (tx, read, plan) = worker.phase(None, move |store| {
         let (tx, read) = store.begin_leased_source(grant, Mode::ReadOnly)?.ok_or(BuildRequestRejection::Expired)?;
-        let plan = store.plan_ll(&tx, grant.root, profile, limits, RootedLlvmIdentity::Executable)?;
+        let plan = store.plan_scalar(&tx, grant.root, profile, limits, RootedLlvmIdentity::Executable)?;
         Ok((tx, read, plan))
     }).await?;
     let plan = match plan {
-        LlvmPlanning::Ready(plan) => plan,
-        LlvmPlanning::Unsupported(reason) => {
+        ScalarPlanning::Ready(plan) => plan,
+        ScalarPlanning::Unsupported(reason) => {
             lease.finish_current(|| ()).ok_or(BuildRequestRejection::Expired)?;
             return Ok(RootedLlvmProjection::Unsupported(reason));
         }
@@ -246,44 +266,36 @@ impl SourceStore {
         limits: BaseCstAdmissionLimits, output_bytes: usize, identity: RootedLlvmIdentity,
         evidence: &mut ProjectionEvidence,
     ) -> Result<RootedLlvmProjection> {
-        match self.plan_ll(tx, root, profile, limits, identity)? {
-            LlvmPlanning::Ready(plan) => {
+        match self.plan_scalar(tx, root, profile, limits, identity)? {
+            ScalarPlanning::Ready(plan) => {
                 let receipt = plan.receipt_key.and_then(|key| self.llvm_receipts.get(key));
                 self.project_planned_ll(tx, plan, limits, output_bytes, receipt, evidence)
             }
-            LlvmPlanning::Unsupported(reason) => Ok(RootedLlvmProjection::Unsupported(reason)),
+            ScalarPlanning::Unsupported(reason) => Ok(RootedLlvmProjection::Unsupported(reason)),
         }
     }
 
-    fn plan_ll(
+    pub(super) fn plan_scalar(
         &self, tx: &surrealkv::Transaction, root: NodeId, profile: String,
         limits: BaseCstAdmissionLimits, identity: RootedLlvmIdentity,
-    ) -> Result<LlvmPlanning> {
+    ) -> Result<ScalarPlanning> {
         use RootedLlvmUnsupported as Unsupported;
 
-        let (mut records, mut encoded, mut imports) = (limits.records, limits.record_bytes, limits.graph_edges);
-        let mut read_index_node = |id| read_verified_node_with(tx, id, |bytes| {
-            take(&mut records, 1, "LLVM source index exceeds the record budget")?;
-            take(&mut encoded, bytes, "LLVM source index exceeds the byte budget")
-        });
-        let top = read_index_node(root)?;
-        let parts = source_preparation_parts(&top).ok_or("not a supported rooted base source")?;
+        let mut imports = limits.graph_edges;
+        let mut read_index_node = bounded_source_records(tx, limits);
+        let (top, mut config) = checked_source_header_using(root, &mut read_index_node)?;
+        let parts = source_preparation_parts(&top).expect("checked header");
         let (config_id, executable, dependencies) = (parts.config, parts.executable, parts.dependencies);
-        let config = read_index_node(config_id)?;
-        if config.kind != Kind::Config { return Err("invalid LLVM source configuration kind".into()); }
-        let mut config: SourceConfig = serde_json::from_slice(&config.data)?;
-        if top.data != config.schema() || config.parser.schema.0 != *wosy_syntax::base_cst_schema() {
-            return Err("invalid LLVM source configuration schema".into());
-        }
+        let workspace = super::pins::workspace_of_source_config(&config)?.to_owned();
         let Some(artifact) = config.profiles.remove(&profile) else {
-            return Ok(LlvmPlanning::Unsupported(Unsupported::ProfileNotSelected));
+            return Ok(ScalarPlanning::Unsupported(Unsupported::ProfileNotSelected));
         };
         let layout = match artifact.target_layout() {
             Ok(layout) => layout,
-            Err(reason) => return Ok(LlvmPlanning::Unsupported(Unsupported::ProfileNotSupported(reason))),
+            Err(reason) => return Ok(ScalarPlanning::Unsupported(Unsupported::ProfileNotSupported(reason))),
         };
         let Some(image) = self.derivation_image() else {
-            return Ok(LlvmPlanning::Unsupported(Unsupported::CompilerImageUnavailable));
+            return Ok(ScalarPlanning::Unsupported(Unsupported::CompilerImageUnavailable));
         };
         let index = read_index_using(top, read_index_node, |count| {
             take(&mut imports, count, "LLVM source index exceeds the import budget")
@@ -295,23 +307,76 @@ impl SourceStore {
             ExecutableLlvmKey::new(image, config_id, executable, dependencies, &profile, &order)
         });
         let layout = ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment };
-        Ok(LlvmPlanning::Ready(LlvmPlan {
-            root, profile, exports: artifact.exports, layout, parser: config.parser, identity, image, order, receipt_key,
+        Ok(ScalarPlanning::Ready(ScalarPlan {
+            root, profile, exports: artifact.exports, layout, parser: config.parser, identity, image, workspace, order, receipt_key,
         }))
     }
 
     fn project_planned_ll(
-        &self, tx: &surrealkv::Transaction, plan: LlvmPlan, limits: BaseCstAdmissionLimits, output_bytes: usize,
+        &self, tx: &surrealkv::Transaction, mut plan: ScalarPlan, limits: BaseCstAdmissionLimits, output_bytes: usize,
         receipt: Option<Arc<ExecutableLlvmReceipt>>, evidence: &mut ProjectionEvidence,
     ) -> Result<RootedLlvmProjection> {
         use RootedLlvmProjection as Projection;
+        let exports = plan.exports.take();
+        let identity = plan.identity;
+        let receipt_key = plan.receipt_key;
+        let ordinary = self.observe_planned_scalar(tx, plan, limits,
+                Some((receipt.as_deref(), &mut evidence.grammar)),
+                |_, _| Ok(()), |owner, module_count, validation| {
+                    let emission = ScalarArtifactEmission::select(
+                        module_count, exports.as_ref().map(|exports| (owner, exports)),
+                    );
+                    let partition = match emission.emit(validation) {
+                        Ok(partition) => partition,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let mut output = PartitionBytes { bytes: Vec::new(), limit: output_bytes };
+                    partition.write_text(&mut output)?;
+                    let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
+                    Ok(Ok((output.bytes, digest)))
+                })?;
+        let project = |bytes, digest, origin| Projection::Emitted(RootedLlvmPartition {
+            source_root: ordinary.root, profile: ordinary.profile, compiler_image: ordinary.image, identity, origin, bytes, digest,
+            grammar_verified_files: ordinary.module_count, grammar_reparsed_files: ordinary.grammar_reparsed_files,
+            grammar_verification: ordinary.grammar_verification,
+        });
+        match ordinary.outcome {
+            ScalarOutcome::Unsupported(reason) => Ok(Projection::Unsupported(reason)),
+            ScalarOutcome::Rejected(error) => Ok(Projection::Rejected(error)),
+            ScalarOutcome::Value(Err(error)) => Ok(Projection::Rejected(RootedLlvmRejection::Emitter(error))),
+            ScalarOutcome::Value(Ok((bytes, digest))) => {
+                evidence.executable = receipt_key;
+                Ok(project(bytes, digest, RootedLlvmOrigin::Derived))
+            }
+            ScalarOutcome::AlreadyEmitted => {
+                let receipt = receipt.expect("no analysis implies an existing LLVM receipt");
+                if receipt.bytes.len() > output_bytes { return Err(partition_budget_error().into()); }
+                Ok(project(receipt.bytes.to_vec(), receipt.digest, RootedLlvmOrigin::LiveExecutableReceipt))
+            }
+        }
+    }
+
+    /// Same ordinary scalar preparation/analysis for emission and a fresh
+    /// authored observation. Only the LLVM caller can supply a cached result.
+    pub(super) fn observe_planned_scalar<T>(
+        &self, tx: &surrealkv::Transaction, plan: ScalarPlan, limits: BaseCstAdmissionLimits,
+        mut llvm_memo: Option<(Option<&ExecutableLlvmReceipt>, &mut VerifiedGrammarBatch)>,
+        mut authored_tree: impl FnMut(&SourceIdentity, &CstNode) -> Result<()>,
+        finish: impl FnOnce(&SourceIdentity, usize, &ScalarBuildValidation<'_>) -> Result<T>,
+    ) -> Result<ScalarObservation<T>> {
         use RootedLlvmRejection as Rejection;
         use RootedLlvmUnsupported as Unsupported;
 
-        let LlvmPlan { root, profile, exports, layout, parser, identity, image, order, receipt_key } = plan;
+        let ScalarPlan { root, profile, layout, parser, identity, image, workspace, order, .. } = plan;
         let policy = parser.id();
         let module_count = order.modules.len();
-        let compile_modules = if receipt.is_none() { module_count } else { 0 };
+        let mut grammar_verification = Duration::ZERO;
+        let mut grammar_reparsed_files = 0;
+        let complete = |outcome, grammar_reparsed_files, grammar_verification| Ok(ScalarObservation {
+            outcome, root, profile, image, workspace, module_count, grammar_reparsed_files, grammar_verification,
+        });
+        let cache_hit = llvm_memo.as_ref().is_some_and(|(receipt, _)| receipt.is_some());
+        let compile_modules = if !cache_hit { module_count } else { 0 };
         let mut owners = Vec::with_capacity(compile_modules);
         let mut original_owners = Vec::new();
         if identity == RootedLlvmIdentity::Executable { original_owners.reserve(compile_modules); }
@@ -322,9 +387,9 @@ impl SourceStore {
             if module.file.metadata.source.path.as_path().to_str().is_none_or(|path| path.contains('\\')) {
                 // Legacy ordinary Build rewrites the display path. This is
                 // not the same identity as the rooted native path.
-                return Ok(Projection::Unsupported(Unsupported::LegacySourcePath));
+                return complete(ScalarOutcome::Unsupported(Unsupported::LegacySourcePath), 0, Duration::ZERO);
             }
-            if receipt.is_none() {
+            if !cache_hit {
                 let (owner, authored) = identity.owner(file_source(&module.file)?, module.file.executable);
                 owners.push(owner);
                 original_owners.extend(authored);
@@ -334,15 +399,13 @@ impl SourceStore {
         let mut input = Vec::with_capacity(compile_modules);
         let mut extracted = Vec::new();
         let mut authored_sources = HashMap::new();
-        let mut grammar_verification = Duration::ZERO;
-        let mut grammar_reparsed_files = 0;
         let mut original_owners = original_owners.into_iter();
         for (ordinal, module) in order.modules.into_iter().enumerate() {
-            let grammar_known = self.grammar_receipts.contains(&module.file);
-            let trees = match (&receipt, grammar_known) {
-                (Some(_), true) => FileTree::None,
-                (Some(_), false) => FileTree::Authored,
-                (None, _) => identity.tree(),
+            let grammar_known = llvm_memo.is_some() && self.grammar_receipts.contains(&module.file);
+            let trees = match (cache_hit, grammar_known) {
+                (true, true) => FileTree::None,
+                (true, false) => FileTree::Authored,
+                (false, _) => identity.tree(),
             };
             let checked = validate_file_using(&module.file, &parser.categories, trees,
                 Some(&mut work), |id, work| {
@@ -353,19 +416,21 @@ impl SourceStore {
             if !grammar_known {
                 let verification = Instant::now();
                 if !authored_grammar_matches(&module.file, &parser.categories, &checked)? {
-                    return Ok(Projection::Unsupported(Unsupported::AuthoredGrammarNotVerified));
+                    return complete(ScalarOutcome::Unsupported(Unsupported::AuthoredGrammarNotVerified), grammar_reparsed_files, grammar_verification);
                 }
                 grammar_verification += verification.elapsed();
                 grammar_reparsed_files += 1;
-                evidence.grammar.verified(&module.file);
+                if let Some((_, grammar)) = llvm_memo.as_mut() { grammar.verified(&module.file); }
             }
-            if receipt.is_some() { continue; }
+            if cache_hit { continue; }
             let owner = &owners[ordinal];
             let selected = if let Some(original) = original_owners.next() {
                 authored_sources.insert(owner.clone(), (original, AuthoredSpanMap::from_comments(&checked.comments)));
                 checked.executable.ok_or("leased source has no executable CST")?
             } else {
-                checked.authored.ok_or("leased source has no authored CST")?
+                let tree = checked.authored.ok_or("leased source has no authored CST")?;
+                authored_tree(owner, &tree)?;
+                tree
             };
             let tree = CanonicalCstRoot::new(owner.clone(), selected);
             let declarations = derive_scalar_declarations_from_cst(&tree);
@@ -396,39 +461,25 @@ impl SourceStore {
             };
             input.push((declarations, bindings));
         }
-        let project = |bytes, digest, origin| Projection::Emitted(RootedLlvmPartition {
-            source_root: root, profile, compiler_image: image, identity, origin, bytes, digest,
-            grammar_verified_files: module_count, grammar_reparsed_files, grammar_verification,
-        });
-        if let Some(receipt) = receipt {
-            if receipt.bytes.len() > output_bytes { return Err(partition_budget_error().into()); }
-            return Ok(project(receipt.bytes.to_vec(), receipt.digest, RootedLlvmOrigin::LiveExecutableReceipt));
+        let result = |outcome| complete(outcome, grammar_reparsed_files, grammar_verification);
+        if cache_hit {
+            // This branch never prepares compiler state and is available
+            // only to LLVM projection, not to historical diagnostics.
+            return result(ScalarOutcome::AlreadyEmitted);
         }
         let root_owner = owners.first().ok_or("leased source has no entry owner")?.clone();
         let authored = |diagnostics| project_authored(identity, &authored_sources, diagnostics);
-        if !extracted.is_empty() { return Ok(Projection::Rejected(Rejection::Declarations(authored(extracted)?))); }
+        if !extracted.is_empty() { return result(ScalarOutcome::Rejected(Rejection::Declarations(authored(extracted)?))); }
         let prepared = match prepare_scalar_project(input, owners, ScalarPreparationInputs { target_layout: layout }) {
             Ok(prepared) => prepared,
-            Err(rejected) => return Ok(Projection::Rejected(Rejection::Preparation(authored(rejected.into_ordered_diagnostics())?))),
+            Err(rejected) => return result(ScalarOutcome::Rejected(Rejection::Preparation(authored(rejected.into_ordered_diagnostics())?))),
         };
-        // No diagnostic cache can authorize this route: the real emitter
-        // consumes the fresh ordinary validation and its ownership facts.
         let validation = analyze_scalar_build(&prepared);
         if !validation.diagnostics().is_empty() {
-            return Ok(Projection::Rejected(Rejection::Analysis(authored(validation.diagnostics().to_vec())?)));
+            return result(ScalarOutcome::Rejected(Rejection::Analysis(authored(validation.diagnostics().to_vec())?)));
         }
-        let emission = ScalarArtifactEmission::select(
-            module_count, exports.as_ref().map(|exports| (&root_owner, exports)),
-        );
-        let partition = match emission.emit(&validation) {
-            Ok(partition) => partition,
-            Err(rejected) => return Ok(Projection::Rejected(Rejection::Emitter(rejected))),
-        };
-        let mut output = PartitionBytes { bytes: Vec::new(), limit: output_bytes };
-        partition.write_text(&mut output)?;
-        let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
-        evidence.executable = receipt_key;
-        Ok(project(output.bytes, digest, RootedLlvmOrigin::Derived))
+        result(ScalarOutcome::Value(finish(&root_owner, module_count, &validation)?))
+
     }
 }
 
@@ -564,7 +615,7 @@ mod tests {
             let expiring = open(b.clone(), Duration::from_secs(2)).await.unwrap().unwrap();
             let gate = {
                 let (tx, _read) = store.begin_source_read(a.root).unwrap().unwrap();
-                let LlvmPlanning::Ready(plan) = store.plan_ll(&tx, a.root, "dev".into(), limits, identity).unwrap()
+                let ScalarPlanning::Ready(plan) = store.plan_scalar(&tx, a.root, "dev".into(), limits, identity).unwrap()
                     else { panic!("fixture needs a valid LLVM plan"); };
                 store.llvm_flights.try_acquire_with(plan.receipt_key.unwrap(), || store.llvm_receipts.reserve_flight()).unwrap()
             };
@@ -641,7 +692,7 @@ mod tests {
                 let bb = worker.open_build_diagnostics(b.clone(), time).await.unwrap().unwrap();
                 let key = {
                     let (tx, _read) = store.begin_source_read(a.root).unwrap().unwrap();
-                    let LlvmPlanning::Ready(plan) = store.plan_ll(&tx, a.root, profile.into(), limits, identity).unwrap()
+                    let ScalarPlanning::Ready(plan) = store.plan_scalar(&tx, a.root, profile.into(), limits, identity).unwrap()
                         else { panic!("fixture needs a valid LLVM plan"); };
                     plan.receipt_key.unwrap()
                 };
