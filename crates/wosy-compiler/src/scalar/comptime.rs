@@ -93,6 +93,19 @@ pub fn derive_closed_comptime_fragment(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     parameter: impl Fn(&str) -> Option<ComptimeParameter>,
 ) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
+    with_closed_comptime_occurrence(fresh, id, layout, parameter, |fragment, _, _, _| fragment)
+}
+
+// Keep the exact Rowan occurrence with its authored root in this compiler
+// invocation. The public preview returns only a fragment, not a way to
+// substitute a value or to reattach it to another source/profile.
+fn with_closed_comptime_occurrence<R>(
+    fresh: &FreshParseResult,
+    id: &str,
+    layout: ScalarTargetLayout,
+    parameter: impl Fn(&str) -> Option<ComptimeParameter>,
+    inspect: impl FnOnce(ClosedComptimeFragment, &CanonicalCstRoot, &CstNode, &CstNode) -> R,
+) -> Result<R, ClosedComptimeRejection> {
     let parsed = fresh.result();
     if !matches!(layout, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) {
         return Err(ClosedComptimeRejection::UnsupportedLayout);
@@ -109,7 +122,7 @@ pub fn derive_closed_comptime_fragment(
     if let Some((_, duplicate)) = matches.next() {
         return Err(ClosedComptimeRejection::RepeatedSite(scope(duplicate.span)));
     }
-    let declaration = root_receiver_type(&node)
+    let (declaration, initializer) = root_receiver_and_initializer(&node)
         .ok_or_else(|| unsupported(site.span, "expected one explicit root binding"))?;
     let result_type = derive_type(&declaration);
     if !supported_type(&result_type) { return Err(unsupported(byte_span(&declaration), "result type")); }
@@ -125,7 +138,7 @@ pub fn derive_closed_comptime_fragment(
         }
     }
     let block_cst = CanonicalCstRoot::new(parsed.source.clone(), site.block.clone());
-    let (diagnostics, _) = collect_scalar_diagnostics(&block_cst, |_| {});
+    let (diagnostics, _) = collect_scalar_diagnostics(&block_cst, None, |_| {});
     if !diagnostics.is_empty() { return Err(ClosedComptimeRejection::OrdinaryDiagnostics(diagnostics)); }
     let mut body = derive_block(&site.block);
     let parameter_uses = rewrite_body(&mut body, &result_type, &scope, &parameter)?;
@@ -156,17 +169,19 @@ pub fn derive_closed_comptime_fragment(
         return Err(ClosedComptimeRejection::OrdinaryDiagnostics(build.diagnostics().to_vec()));
     }
     let llvm = emit_scalar_build_single_module_artifact_llvm(&build).map_err(ClosedComptimeRejection::Emitter)?;
-    Ok(ClosedComptimeFragment { id: id.into(), site: scope(site.span), result_type, layout, parameter_uses, llvm })
+    let fragment = ClosedComptimeFragment { id: id.into(), site: scope(site.span), result_type, layout, parameter_uses, llvm };
+    Ok(inspect(fragment, parsed.canonical_cst(), &node, &initializer))
 }
 
-fn root_receiver_type(node: &CstNode) -> Option<CstNode> {
+fn root_receiver_and_initializer(node: &CstNode) -> Option<(CstNode, CstNode)> {
     let primary = node.parent().filter(|p| p.kind() == SyntaxKind::Primary)?;
     let expression = primary.parent().filter(|p| p.kind() == SyntaxKind::Expression)?;
     let outputs = expression.parent().filter(|p| p.kind() == SyntaxKind::OutputList)?;
     let binding = outputs.parent().filter(|p| p.kind() == SyntaxKind::BindingDecl)?;
     let parent = binding.parent()?;
     let parent = if parent.kind() == SyntaxKind::Item { parent.parent()? } else { parent };
-    (parent.kind() == SyntaxKind::Root).then(|| single_binding_type(&binding)).flatten()
+    if parent.kind() != SyntaxKind::Root { return None; }
+    Some((single_binding_type(&binding)?, expression))
 }
 
 fn single_binding_type(binding: &CstNode) -> Option<CstNode> {
@@ -288,6 +303,10 @@ fn admit_pure_expression(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::{
+        derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
+        EmbeddedComptimeInitializer,
+    };
     use wosy_syntax::SourceIdentity;
 
     fn fresh(source: &str) -> FreshParseResult {
@@ -295,6 +314,118 @@ mod tests {
             SourceIdentity::new("fixture".into(), "fixture".into(), "main.w".into(), "authored".into()),
             format!("%%start\n# WHY: café ☕\n{source}\n%%end"), &["WHY".into()],
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureReturn {
+        I32(i32),
+        U32(u32),
+        Bool(bool),
+    }
+
+    // No production result ingress. This test-only adapter attaches a known
+    // scalar to the occurrence and effective inputs of the same invocation.
+    fn project_fixture_return(
+        source: &FreshParseResult,
+        layout: ScalarTargetLayout,
+        parameter: Option<ComptimeParameter>,
+        sample: impl FnOnce(&ClosedComptimeFragment) -> FixtureReturn,
+    ) -> Result<ScalarSourceDeclarations, &'static str> {
+        with_closed_comptime_occurrence(
+            source, "solve", layout, |_| parameter,
+            |fragment, canonical, site, initializer| {
+                let span = fragment.site().range;
+                let value = match (fragment.result_type(), sample(&fragment)) {
+                    (ScalarType::I32, FixtureReturn::I32(value)) =>
+                        ScalarExpression::Integer { value: value.into(), span },
+                    (ScalarType::U32, FixtureReturn::U32(value)) =>
+                        ScalarExpression::Integer { value: value.into(), span },
+                    (ScalarType::Bool, FixtureReturn::Bool(value)) =>
+                        ScalarExpression::Boolean { value, span },
+                    _ => return Err("fixture return does not match compiler result type"),
+                };
+                Ok(derive_scalar_declarations_with_embedding(canonical, Some(
+                    EmbeddedComptimeInitializer { site, initializer, value: &value },
+                )))
+            },
+        ).expect("ordinary closed fragment preparation")
+    }
+
+    fn consumer_llvm(declarations: ScalarSourceDeclarations, layout: ScalarTargetLayout) -> String {
+        let owner = declarations.source().clone();
+        let prepared = prepare_scalar_project(
+            vec![(declarations, Vec::new())],
+            vec![owner],
+            ScalarPreparationInputs { target_layout: layout },
+        ).unwrap_or_else(|refusal| panic!("{:?}", refusal.into_ordered_diagnostics()));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        emit_scalar_build_single_module_artifact_llvm(&build).unwrap().to_text()
+    }
+
+    #[test]
+    fn closed_return_embeds_in_the_same_authored_root_as_an_ordinary_literal() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let cases = [
+                ("i32", "41", None, FixtureReturn::I32(41), "41"),
+                ("i32", "41", Some(ComptimeParameter::Integer(42)), FixtureReturn::I32(42), "42"),
+                ("u32", "4294967295", None, FixtureReturn::U32(u32::MAX), "4294967295"),
+                ("bool", "true", Some(ComptimeParameter::Boolean(false)), FixtureReturn::Bool(false), "false"),
+            ];
+            for (ty, default, parameter, sample, expected) in cases {
+                let expression = format!("comptime solve {{ core.comp_param(\"value\", {default}) }}");
+                let source = fresh(&format!("{ty} result = {expression};"));
+                let canonical = source.result().canonical_cst();
+                assert_eq!(derive_scalar_declarations_from_cst(canonical).diagnostics.len(), 1);
+                let embedded = project_fixture_return(&source, layout, parameter, |fragment| {
+                    let [read] = fragment.parameter_uses() else { panic!("expected one observed read") };
+                    assert_eq!(read.name, "value");
+                    assert_eq!(&read.context, fragment.result_type());
+                    assert_eq!(matches!(read.origin, ComptimeParameterOrigin::Profile), parameter.is_some());
+                    assert_eq!(read.resolved, match sample {
+                        FixtureReturn::I32(value) => ComptimeParameterValue::Integer(value.into()),
+                        FixtureReturn::U32(value) => ComptimeParameterValue::Integer(value.into()),
+                        FixtureReturn::Bool(value) => ComptimeParameterValue::Boolean(value),
+                    });
+                    sample
+                }).unwrap();
+                assert_eq!(embedded.source(), &source.result().source);
+                let [ScalarItem::Binding(binding)] = embedded.items.as_slice() else {
+                    panic!("expected the original root binding");
+                };
+                let span = span_of(&binding.value);
+                assert_eq!(&source.result().text[span.start as usize..span.end as usize], expression);
+                assert_eq!(binding.output_values[0].value, binding.value);
+                assert_eq!(binding.output_values[0].span, span);
+                let ordinary = fresh(&format!("{ty} result = {expected};"));
+                let ordinary = derive_scalar_declarations_from_cst(ordinary.result().canonical_cst());
+                let ir = consumer_llvm(embedded, layout);
+                assert_eq!(ir, consumer_llvm(ordinary, layout));
+                assert!(!ir.contains("@evaluate"));
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_type_mismatch_and_another_authored_occurrence_do_not_embed() {
+        let source = fresh("i32 result = comptime solve { 42 };");
+        assert_eq!(project_fixture_return(&source, ScalarTargetLayout::NATIVE64, None, |_|
+            FixtureReturn::U32(42)).err(), Some("fixture return does not match compiler result type"));
+
+        let source = fresh("i32 result = comptime solve { 42 };\ni32 other = comptime pending { 43 };");
+        let canonical = source.result().canonical_cst();
+        let ordinary = derive_scalar_declarations_from_cst(canonical);
+        let [solved, pending] = ordinary.diagnostics.as_slice() else { panic!("expected two ordinary refusals"); };
+        let span = |diagnostic: &Diagnostic| {
+            let range = diagnostic.labels[0].span.range;
+            &source.result().text[range.start as usize..range.end as usize]
+        };
+        assert_eq!(span(solved), "comptime solve { 42 }");
+        assert_eq!(span(pending), "comptime pending { 43 }");
+        let projected = project_fixture_return(&source, ScalarTargetLayout::WASM32, None, |_|
+            FixtureReturn::I32(42)).unwrap();
+        assert_eq!(projected.diagnostics.as_slice(), std::slice::from_ref(pending));
+        assert!(projected.items.is_empty());
     }
 
     #[test]

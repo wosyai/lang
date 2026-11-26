@@ -2345,13 +2345,28 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
 pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
+    derive_scalar_declarations_with_embedding(canonical, None)
+}
+
+/// A compiler-internal substitution at a single authored root initializer.
+/// The ordinary declaration route never provides one.
+struct EmbeddedComptimeInitializer<'a> {
+    site: &'a CstNode,
+    initializer: &'a CstNode,
+    value: &'a ScalarExpression,
+}
+
+fn derive_scalar_declarations_with_embedding(
+    canonical: &CanonicalCstRoot,
+    embedded: Option<EmbeddedComptimeInitializer<'_>>,
+) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
     let mut struct_prefix = Vec::new();
     let mut enum_prefix = Vec::new();
     let mut struct_descendants = Vec::new();
     let mut enum_descendants = Vec::new();
-    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, |node| {
+    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, embedded.as_ref().map(|value| value.site), |node| {
         let Some(root) = source_root.as_ref() else { return };
         let (prefix, descendants) = match node.kind() {
             SyntaxKind::StructDecl => (&mut struct_prefix, &mut struct_descendants),
@@ -2387,7 +2402,7 @@ pub fn derive_scalar_declarations_from_cst(
         match node.kind() {
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
-            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
+            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, embedded.as_ref()))),
             SyntaxKind::FunctionDecl if !generic_function => {
                 items.push(ScalarItem::Function(derive_function(&node)))
             }
@@ -2410,7 +2425,7 @@ pub fn derive_scalar_declarations_from_cst(
                             items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
                         SyntaxKind::BindingDecl => {
-                            items.push(ScalarItem::Binding(derive_binding(&item)))
+                            items.push(ScalarItem::Binding(derive_binding(&item, embedded.as_ref())))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
                             items.push(ScalarItem::Function(derive_function(&item)))
@@ -2543,11 +2558,12 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    collect_scalar_diagnostics(canonical, |_| {}).0
+    collect_scalar_diagnostics(canonical, None, |_| {}).0
 }
 
 fn collect_scalar_diagnostics(
     canonical: &CanonicalCstRoot,
+    embedded_comptime_site: Option<&CstNode>,
     mut record_declaration: impl FnMut(CstNode),
 ) -> (Vec<Diagnostic>, bool) {
     let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
@@ -2609,7 +2625,8 @@ fn collect_scalar_diagnostics(
             }
             NodeOrToken::Node(node)
                 if node.kind() == SyntaxKind::InvalidTemporaryPlace
-                    || node.kind() == SyntaxKind::ComptimeExpr
+                    || (node.kind() == SyntaxKind::ComptimeExpr
+                        && embedded_comptime_site != Some(&node))
                     || (node.kind() == SyntaxKind::ValueField
                         && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
             {
@@ -3310,7 +3327,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     }
 }
 
-fn derive_binding(node: &CstNode) -> ScalarBinding {
+fn derive_binding(node: &CstNode, embedded: Option<&EmbeddedComptimeInitializer<'_>>) -> ScalarBinding {
     let receiver_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::ReceiverList)
@@ -3358,7 +3375,10 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_list
             .children()
             .filter(|child| child.kind() == SyntaxKind::Expression)
-            .map(|child| derive_expression(&child))
+            .map(|child| match embedded {
+                Some(embedded) if embedded.initializer == &child => embedded.value.clone(),
+                _ => derive_expression(&child),
+            })
             .collect::<Vec<_>>()
     });
     let value = outputs
@@ -4304,7 +4324,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
 fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
     let child = direct_nodes(node).into_iter().next().expect("block item");
     match child.kind() {
-        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
+        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child, None)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
