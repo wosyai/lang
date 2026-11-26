@@ -3019,15 +3019,109 @@ main_artifact = "main"
             core.require(false, {{ .stdout = "{label}"; .stderr = ""; .code = 11;
                 .files = [{{ .path = "{label}.txt"; .text = "{label}"; }}]; }});
         %%end"#);
+        let guarded_context = format!(r#"%%start
+            unit(u8) consume = fn(charged) {{
+                if (charged == 1) {{ core.context.credit = core.context.credit - 1; }}
+                else {{ core.context.credit = core.context.credit - 1; }};
+            }};
+            unit() entry = fn {{
+                u8 core.context.credit = 3;
+                consume(1);
+                core.require(false, {first});
+                core.require(false, {report});
+            }};
+            proof debit for consume(cost) -> (null) where (cost <= 1)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {{}}
+            entry();
+        %%end"#);
+        let mixed_context = format!(r#"%%start
+            lib = namespace app "credit.w";
+            unit() entry = fn {{
+                u8 core.context.credit = 3;
+                lib.spend();
+            }};
+            u8(u8) score = fn(value) {{ value }};
+            proof scalar_value for score(entry) -> (out) where (entry == 4) ensures (out == 3) {{}}
+            core.require(false, {first});
+            entry();
+            u8 observed = score(4);
+            core.require(observed == 4, {report});
+            core.require(false, {report});
+        %%end"#);
+        let credit = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() spend = fn { consume(); };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        let checked_loan = format!(r#"%%start
+            unit(*!u32) advance = fn(cell) {{ *cell = *cell +@ 1; }};
+            proof epoch for advance(p) -> () ensures (*p == core.old(*p) +@ 1) {{}}
+            unit() start = fn {{
+                u32 local = 4294967295;
+                advance(&!local);
+                advance(&!local);
+                core.require(local == 1, {report});
+                core.require(local == 0, {first});
+                core.require(local == 2, {report});
+            }};
+            start();
+        %%end"#);
+        let typed_array = format!(r#"%%start
+            u8[2](u8) make = fn(input) {{ if (input == 0) {{ [7, 1] }} else {{ [1, 7] }} }};
+            proof cells for make(entry) -> (items)
+                forall (u64 i where i == 0) ensures (items[i] == 8)
+            {{ core.show(items[i] == 8); }}
+            u8[2] first_array = make(0);
+            u8 head = first_array[0];
+            core.require(head == 8, {first});
+            u8[2] second_array = make(1);
+            u8 tail = second_array[1];
+            core.require(tail == 2, {report});
+        %%end"#);
+        let qualified_nested = format!(r#"%%start
+            lib = namespace app "wide.w";
+            u8(u8,u16,u8,u16) forward = fn(left, page, flag, quota) {{ lib.descend(left, page, flag, quota) }};
+            u8 actual = forward(8, 12, 1, 4);
+            core.require(actual == 7, {report});
+            core.require(false, {report});
+        %%end"#);
+        let wide = format!(r#"%%start
+            u8(u8,u16,u8,u16) descend = fn(left, page, flag, quota) {{
+                if (left < 3) {{ 7 }} else {{ descend(left - 3, page, flag, quota) }}
+            }};
+            proof rank for descend(left, page, flag, quota) -> (out)
+                where (left <= 8 && page == 12 && flag == 1 && quota == 4)
+                ensures (out == 7) decreases (left) {{
+                    if (left < 3) {{ core.show(out == 7); }} else {{ core.use(rank(left - 3, page, flag, quota)); }}
+                }}
+            core.require(false, {first});
+        %%end"#);
         let cases = [
-            ("typed-bool-startup", startup, false),
-            ("nested-binary-unit", units, false),
-            ("nominal-arm-payload", nominal, false),
-            ("named-real-invocation", named, false),
-            ("ordinary-context-restore", context, false),
-            ("affine-snapshot-actual", snapshots.replace("%%end", "inspect(1); %%end"), false),
-            ("affine-snapshot-symbolic", snapshots.to_owned(), false),
-            ("configured-transitive-dependencies", dep_app, true),
+            ("typed-bool-startup", startup, false, None),
+            ("nested-binary-unit", units, false, None),
+            ("nominal-arm-payload", nominal, false, None),
+            ("named-real-invocation", named, false, None),
+            ("ordinary-context-restore", context, false, None),
+            ("affine-snapshot-actual", snapshots.replace("%%end", "inspect(1); %%end"), false, None),
+            ("affine-snapshot-symbolic", snapshots.to_owned(), false, None),
+            ("configured-transitive-dependencies", dep_app, true, None),
+            ("contextual-guarded-debit", guarded_context.clone(), false, None),
+            ("contextual-guarded-refutation", guarded_context.replace("core.old(core.context.credit) - 1", "core.old(core.context.credit) - 2"), false, None),
+            ("mixed-contextual-named", mixed_context.clone(), false, Some(("credit.w", credit.to_owned()))),
+            ("mixed-contextual-refutation", mixed_context, false, Some(("credit.w", credit.replace("core.old(core.context.credit) - 1", "core.old(core.context.credit) - 2")))),
+            ("checked-loan-effects", checked_loan.clone(), false, None),
+            ("checked-loan-refutation", checked_loan.replace("core.old(*p) +@ 1", "core.old(*p) +@ 2"), false, None),
+            ("branching-array-proof", typed_array.clone(), false, None),
+            ("array-rank-mixed", typed_array.replace("%%end", r#"
+                u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+                proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                    if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+                }
+                u8 reached = descend(8);
+                core.require(reached == 4, { .stdout = "rank-incorrect"; .stderr = ""; .code = 29; .files = []; });
+            %%end"#), false, None),
+            ("qualified-nested-wide", qualified_nested, false, Some(("wide.w", wide))),
         ];
         let type_labels = |receipts: &[configured_check::ConfiguredCheckReceipt]| {
             use wosy_compiler::ScalarOrderedCheckerOutcome as Outcome;
@@ -3065,15 +3159,23 @@ main_artifact = "main"
             if state.exists() { fs::remove_dir_all(state).unwrap(); }
         };
         let mut samples = 0;
+        let mut classes = BTreeMap::<&str, usize>::new();
         for layout in ["native", "wasm-wasip1"] {
             for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
-                for (name, program, dependencies) in &cases {
+                for (name, program, dependencies, provider) in &cases {
                     let dependencies = *dependencies;
                     let mut primary = manifest("app", layout);
                     if dependencies { primary.push_str("\n[dependencies.dep]\npath = \"dep\"\n"); }
                     fs::create_dir_all(root.join("src")).unwrap();
                     fs::write(root.join("wosy.toml"), primary).unwrap();
                     fs::write(root.join("src/main.w"), program).unwrap();
+                    for file in ["credit.w", "wide.w"] {
+                        let path = root.join("src").join(file);
+                        if path.exists() { fs::remove_file(path).unwrap(); }
+                    }
+                    if let Some((relative, source)) = provider {
+                        fs::write(root.join("src").join(relative), source).unwrap();
+                    }
                     if dependencies {
                         for (path, suffix, backend) in [("dep", "dep", "wasm-wasip1"), ("dep/leaf", "leaf", "native")] {
                             let package = root.join(path);
@@ -3117,10 +3219,16 @@ main_artifact = "main"
                         let (observed, emit) = publish(&candidate);
                         let new_status = type_labels(&candidate);
                         let status_match = baseline.0 == observed.0;
-                        let label = if baseline.0.is_err() || baseline.0 == Ok(2) && old_status.contains(&"Invalid") {
-                            "incumbent-refused"
-                        } else if new_status.iter().any(|label| matches!(*label, "Unsupported" | "Invalid")) || observed.0.is_err() {
+                        let incumbent_refused = baseline.0.is_err() || old_status.iter().any(|label| matches!(*label, "Unsupported" | "Invalid"));
+                        let candidate_refused = observed.0.is_err() || new_status.iter().any(|label| matches!(*label, "Unsupported" | "Invalid"));
+                        if candidate_refused {
                             assert!(observed.1.is_empty() && observed.3.is_empty(), "unsupported result must be atomic");
+                        }
+                        let label = if incumbent_refused && candidate_refused {
+                            "both-refused"
+                        } else if incumbent_refused {
+                            "incumbent-refused-candidate-open"
+                        } else if candidate_refused {
                             "release-blocker"
                         } else if observed == baseline {
                             "observed-terminal-byte-parity"
@@ -3136,12 +3244,14 @@ main_artifact = "main"
                             baseline.3.iter().map(|(path, data)| (path, data.len())).collect::<Vec<_>>(),
                             observed.3.iter().map(|(path, data)| (path, data.len())).collect::<Vec<_>>(),
                             old_load.as_micros(), load.as_micros(), old_publish.as_micros(), emit.as_micros());
+                        *classes.entry(label).or_default() += 1;
                         samples += 1;
                     }
                 }
             }
         }
-        assert_eq!(samples, 64);
+        assert_eq!(samples, 136);
+        eprintln!("CHECK-MATRIX-SUMMARY {classes:?}");
         fs::remove_dir_all(root).unwrap();
     }
 
