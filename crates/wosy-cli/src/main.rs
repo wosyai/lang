@@ -3373,6 +3373,70 @@ main_artifact = "main"
                 fs::remove_file(&shared_source).unwrap();
                 fs::remove_file(&worker_source).unwrap();
 
+                let external_scalar = r#"
+                    u8(u8) score = fn(value) { value };
+                    proof scoped for score(entry) -> (out) where (entry == 4) ensures (out == 8) {}
+                    u8(u8) other_score = fn(value) { value };
+                    proof other for other_score(entry) -> (out) where (entry == 5) ensures (out == 8) {}
+                "#;
+                for separate in [false, true] {
+                    let facts_source = root.join("src/facts.w");
+                    let (namespace, qualifier) = if separate {
+                        fs::write(&facts_source, format!("%%start {external_scalar} %%end")).unwrap();
+                        fs::write(&shared_source, mixed_context_provider).unwrap();
+                        (r#"facts = namespace app "facts.w";"#, "facts")
+                    } else {
+                        fs::write(&shared_source, mixed_context_provider.replace("%%end", &format!("{external_scalar} %%end"))).unwrap();
+                        ("", "lib")
+                    };
+                    for (early, dormant) in [(4, false), (3, false), (4, true)] {
+                        let before_context = if dormant { String::new() } else {
+                            format!("u8 pre = {qualifier}.score({early}); core.require(pre == {early}, {unused_output});")
+                        };
+                        let after_context = if dormant { format!("core.require(false, {second});") } else {
+                            format!("u8 post = {qualifier}.other_score(5); core.require(post == 8, {second});")
+                        };
+                        let program = format!(r#"%%start
+                            lib = namespace app "shared.w";
+                            {namespace}
+                            unit() entry = fn {{
+                                u8 core.context.credit = 3;
+                                lib.spend();
+                            }};
+                            core.require(false, {first});
+                            {before_context}
+                            entry();
+                            {after_context}
+                        %%end"#);
+                        fs::write(&source, &program).unwrap();
+                        let old = terminal(&[legacy()], scope, false);
+                        assert_eq!(old.0, Ok(19));
+                        assert_eq!(files(), both_files);
+                        clean();
+                        let limited = selected(1);
+                        let report = limited[0].outcome.as_ref().unwrap();
+                        let preceding = usize::from(!dormant && early == 4);
+                        assert_eq!(report.mixed_context_after_scalar.as_deref(), Some(&[preceding][..]));
+                        assert_eq!(report.diagnostics.len(), if dormant { 0 } else { 1 + preceding });
+                        for diagnostic in &report.diagnostics {
+                            assert_eq!(diagnostic.invocation.call.source.path, "src/main.w");
+                            assert_eq!(diagnostic.proof.source.path, if separate { "src/facts.w" } else { "src/shared.w" });
+                        }
+                        assert_eq!(report.contextual_diagnostic.as_ref().unwrap().proof.source.path, "src/shared.w");
+                        assert_eq!(report.symbolic_diagnostic.is_some(), dormant && scope == ScalarCheckerScope::CurrentPackage);
+                        let clipped = terminal(&limited, scope, false);
+                        assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                        assert_eq!(clipped.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                        assert_eq!(files(), first_file);
+                        clean();
+                        assert_eq!(terminal(&selected(8), scope, false), old);
+                        assert_eq!(files(), both_files);
+                        clean();
+                    }
+                    if separate { fs::remove_file(&facts_source).unwrap(); }
+                }
+                fs::remove_file(&shared_source).unwrap();
+
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {

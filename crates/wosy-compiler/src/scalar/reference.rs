@@ -7054,6 +7054,21 @@ impl ProjectCallSiteResults {
             || self.modules.len() != if provider.is_some() { 2 } else { 1 }
             || provider.is_some_and(|source| source == caller || source.project != caller.project || source.package != caller.package)
         { return None; }
+        let mut sources = [caller, caller];
+        if let Some(provider) = provider { sources[1] = provider; }
+        self.owned_direct_startup_callable_uses_in(caller, &sources[..1 + usize::from(provider.is_some())], declarations, dormant_self)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn owned_direct_startup_callable_uses_in<'a>(
+        &'a self, caller: &SourceIdentity, sources: &[&SourceIdentity],
+        declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>,
+    ) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
+        if !(1..=3).contains(&sources.len()) || self.modules.len() != sources.len()
+            || sources.first().copied() != Some(caller) || (sources.len() != 1 && dormant_self.is_some())
+            || sources.iter().any(|source| source.project != caller.project || source.package != caller.package)
+            || sources.iter().copied().collect::<HashSet<_>>().len() != sources.len()
+        { return None; }
         let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), Vec::new()))
             .collect::<HashMap<_, _>>();
         let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
@@ -7065,7 +7080,7 @@ impl ProjectCallSiteResults {
         use super::checker_flow::charge_call_work;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
-            if &module.initialization.source != caller && Some(&module.initialization.source) != provider { return None; }
+            if !sources.contains(&&module.initialization.source) { return None; }
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
             charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
             if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }

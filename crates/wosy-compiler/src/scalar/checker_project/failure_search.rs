@@ -27,6 +27,7 @@ pub(super) enum Admission { Duplicate, Selected, SelectedAndStop }
 pub(super) enum StartupProofRole { Bare, Ranked, Aggregate, Cited }
 
 pub(super) struct StartupProofObservation {
+    pub(super) target: PreparedCallable,
     pub(super) site: SourceSpan,
     pub(super) directive_position: usize,
     pub(super) parameter: ScalarType,
