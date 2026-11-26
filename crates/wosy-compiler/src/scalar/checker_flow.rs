@@ -154,7 +154,7 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn imported_enum_match_position(self) -> Option<usize> { None }
     #[cfg(feature = "internal-checker")]
-    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories>> { None }
+    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { None }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -233,34 +233,51 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 }
 
 #[cfg(feature = "internal-checker")]
-#[derive(Default)]
-struct CallableHistories {
-    nodes: Vec<(usize, wosy_syntax::ByteSpan, bool)>,
-    interned: HashMap<(usize, wosy_syntax::ByteSpan, bool), usize>,
-    work: usize,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum CallableHistoryStep {
+    Branch(wosy_syntax::ByteSpan, bool),
+    Call(wosy_syntax::ByteSpan),
+    Return(wosy_syntax::ByteSpan),
+}
+
+#[cfg(feature = "internal-checker")]
+struct CallableHistories<'a> {
+    nodes: Vec<(usize, CallableHistoryStep)>,
+    interned: HashMap<(usize, CallableHistoryStep), usize>,
+    work: &'a std::cell::Cell<usize>,
+    outgoing_call: Option<Vec<CallableHistoryStep>>,
     stopped: bool,
 }
 
 #[cfg(feature = "internal-checker")]
-impl CallableHistories {
-    fn append_rows(&mut self, rows: &mut IntegerInputs, span: wosy_syntax::ByteSpan, arm: bool) -> Option<()> {
-        charge_call_work(&mut self.work, rows.0.len())?;
-        for row in &mut rows.0 {
-            let node = (row.callable_history, span, arm);
-            row.callable_history = *self.interned.entry(node).or_insert_with(|| {
-                self.nodes.push(node);
-                self.nodes.len()
-            });
-        }
+impl CallableHistories<'_> {
+    fn charge(&self, amount: usize) -> Option<()> {
+        let mut work = self.work.get();
+        charge_call_work(&mut work, amount)?;
+        self.work.set(work);
         Some(())
     }
 
-    fn steps(&mut self, mut id: usize) -> Option<Vec<(wosy_syntax::ByteSpan, bool)>> {
+    fn append(&mut self, row: &mut IntegerRow, step: CallableHistoryStep) {
+        let node = (row.callable_history, step);
+        row.callable_history = *self.interned.entry(node).or_insert_with(|| {
+            self.nodes.push(node);
+            self.nodes.len()
+        });
+    }
+
+    fn append_rows(&mut self, rows: &mut IntegerInputs, span: wosy_syntax::ByteSpan, arm: bool) -> Option<()> {
+        self.charge(rows.0.len())?;
+        for row in &mut rows.0 { self.append(row, CallableHistoryStep::Branch(span, arm)); }
+        Some(())
+    }
+
+    fn steps(&self, mut id: usize) -> Option<Vec<CallableHistoryStep>> {
         let mut reversed = Vec::new();
         while id != 0 {
-            charge_call_work(&mut self.work, 1)?;
-            let (parent, span, arm) = *self.nodes.get(id - 1)?;
-            reversed.push((span, arm));
+            self.charge(1)?;
+            let (parent, step) = *self.nodes.get(id - 1)?;
+            reversed.push(step);
             id = parent;
         }
         reversed.reverse();
@@ -270,12 +287,12 @@ impl CallableHistories {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories>);
+struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>);
 
 #[cfg(feature = "internal-checker")]
 impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     const ENABLED: bool = false;
-    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories>> { Some(self.0) }
+    fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
 }
@@ -1985,7 +2002,7 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     startup_trace: Option<(&'a wosy_syntax::SourceIdentity, Rc<std::cell::RefCell<super::checker_project::failure_search::StartUpSearch>>)>,
     #[cfg(feature = "internal-checker")]
-    callable_history: Option<&'a std::cell::RefCell<CallableHistories>>,
+    callable_history: Option<&'a std::cell::RefCell<CallableHistories<'a>>>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -3632,26 +3649,44 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) enum CallableHistoryCompletion { Exhausted(bool), LimitReached }
+pub(super) enum CallableHistoryCompletion {
+    Exhausted(bool, IntegerRequirementContinuation),
+    LimitReached,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum CallableHistoryCall {
+    Returned(ActualCallResult),
+    LimitReached,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) type CallableHistoryCallHandler<'run> = dyn FnMut(
+    &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature, NestedIntegerArgument<'_>,
+    Vec<CallableHistoryStep>,
+) -> Option<CallableHistoryCall> + 'run;
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn search_closed_callable_histories(
-    calls: &FunctionCallSites, work: &mut usize,
-    mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<(wosy_syntax::ByteSpan, bool)>) -> Option<bool>,
+    calls: &FunctionCallSites, entry: IntegerRequirementEntry<'_>, work: &std::cell::Cell<usize>,
+    mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
+    mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<CallableHistoryCompletion> {
-    let histories = std::cell::RefCell::new(CallableHistories { work: *work, ..Default::default() });
+    let histories = std::cell::RefCell::new(CallableHistories {
+        work, outgoing_call: None, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
+    });
     let mut unsupported = false;
     let mut sink = |mut failure: IntegerCheckFailure<'_>| {
         let mut seen = std::collections::HashSet::new();
         for mut row in failure.state.0.drain(..) {
             let mut trace = histories.borrow_mut();
-            if charge_call_work(&mut trace.work, 1).is_none() { unsupported = true; break; }
+            if trace.charge(1).is_none() { unsupported = true; break; }
             if !seen.insert(row.callable_history) { continue; }
             let Some(steps) = trace.steps(row.callable_history) else { unsupported = true; break; };
             row.callable_history = 0; // History is a selection key, not witness data.
             let state = IntegerInputs(vec![row]);
             let equal_axes = state.common_equal_axes();
-            if charge_call_work(&mut trace.work, failure.axes.len()).is_none() { unsupported = true; break; }
+            if trace.charge(failure.axes.len()).is_none() { unsupported = true; break; }
             let selected = select(IntegerCheckFailure {
                 directive: failure.directive, state, axes: failure.axes.clone(), equal_axes,
             }, steps);
@@ -3663,12 +3698,24 @@ pub(super) fn search_closed_callable_histories(
         }
         if unsupported { histories.borrow_mut().stopped = true; }
     };
-    let result = collect_integer_requirement_failures_in_scope(calls, IntegerRequirementEntry::Arbitrary,
-        None, false, false, &mut sink, TrackCallableHistory(&histories));
-    *work = histories.borrow().work;
+    let allow_calls = nested.is_some();
+    let mut call = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
+                    argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
+        if expected != &ScalarType::Unit { return None; }
+        let history = histories.borrow_mut().outgoing_call.take()?;
+        match nested.as_deref_mut()?(caller, site, signature, argument, history)? {
+            CallableHistoryCall::Returned(result) => Some(result),
+            CallableHistoryCall::LimitReached => {
+                histories.borrow_mut().stopped = true;
+                None
+            }
+        }
+    };
+    let result = collect_integer_requirement_failures_in_scope(calls, entry,
+        if allow_calls { Some(&mut call) } else { None }, allow_calls, false, &mut sink, TrackCallableHistory(&histories));
     if unsupported { return None; }
     if histories.borrow().stopped { return Some(CallableHistoryCompletion::LimitReached); }
-    result.map(|(active, _)| CallableHistoryCompletion::Exhausted(active))
+    result.map(|(active, continuation)| CallableHistoryCompletion::Exhausted(active, continuation))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7497,7 +7544,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             _ => return None,
                         };
                         let mut emit = |rejecting: IntegerInputs| {
-                            charge_call_work(&mut histories.borrow_mut().work, roots.axes.len().checked_add(1)?)?;
+                            histories.borrow().charge(roots.axes.len().checked_add(1)?)?;
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                 directive: expression, equal_axes: rejecting.common_equal_axes(),
                                 state: rejecting, axes: roots.axes.clone(),
@@ -7506,7 +7553,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         };
                         let charge_row = |row: &IntegerRow| {
                             let cuts = axis.and_then(|axis| row.get(axis)).map_or(0, |set| set.intervals().len());
-                            charge_call_work(&mut histories.borrow_mut().work,
+                            histories.borrow().charge(
                                 row.len().checked_add(cuts.checked_mul(2)?)?.checked_add(1)?)
                         };
                         if directive.operation == CheckerOperation::Require {
@@ -7520,7 +7567,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             // A Narrow is refuted only if none of the rows of
                             // the same structural history can satisfy it.
                             // Index groups in encounter order, not hash order.
-                            charge_call_work(&mut histories.borrow_mut().work, path.0.len())?;
+                            histories.borrow().charge(path.0.len())?;
                             let mut order = HashMap::new();
                             let mut groups = Vec::<IntegerInputs>::new();
                             for row in std::mem::take(&mut path.0) {
@@ -7537,7 +7584,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 if passing.is_unreachable() {
                                     if !failing.is_unreachable() { emit(failing)?; }
                                 } else {
-                                    charge_call_work(&mut histories.borrow_mut().work, passing.0.len())?;
+                                    histories.borrow().charge(passing.0.len())?;
                                     path.0.extend(passing.0);
                                 }
                             }
@@ -7576,6 +7623,41 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&expression)?;
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(histories) = roots.callable_history {
+                        if !COLLECT || signature.parameters.len() != 1 { return None; }
+                        let span = calls.occurrences.get(expression.0)?.span;
+                        let mut survivors = IntegerInputs::default();
+                        for mut row in std::mem::take(&mut path.0) {
+                            let mut tracker = histories.borrow_mut();
+                            tracker.charge(row.len().checked_add(3)?)?;
+                            tracker.append(&mut row, CallableHistoryStep::Call(span));
+                            tracker.outgoing_call = Some(tracker.steps(row.callable_history)?);
+                            drop(tracker);
+                            let mut exact_row = IntegerInputs(vec![row]);
+                            let argument = actual_nested_argument(calls, expression, roots, &exact_row, true, false, None);
+                            let projected = match &argument {
+                                NestedIntegerArgument::Projected(projection) => Some(projection.caller_axis),
+                                _ => None,
+                            };
+                            match handle(calls, expression, signature, argument, &ScalarType::Unit)? {
+                                ActualCallResult::Unit if projected.is_none() => {}
+                                ActualCallResult::EmptyUnit => continue,
+                                ActualCallResult::ProjectedUnit(values) => {
+                                    let axis = projected?;
+                                    let original = exact_row.0.first()?.get(axis)?;
+                                    histories.borrow().charge(original.intervals().len().checked_add(values.intervals().len())?)?;
+                                    exact_row.restrict_axis(axis, &values);
+                                }
+                                _ => return None,
+                            }
+                            let mut tracker = histories.borrow_mut();
+                            for row in &mut exact_row.0 { tracker.append(row, CallableHistoryStep::Return(span)); }
+                            survivors.0.extend(exact_row.0);
+                        }
+                        path = survivors;
+                        continue;
+                    }
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
                         nested_pair_argument(calls, expression, roots, &path, project, false, false, false, None)?

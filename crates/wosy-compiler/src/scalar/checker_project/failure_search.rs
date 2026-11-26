@@ -63,14 +63,20 @@ impl StartUpSearch {
     }
 
     pub(super) fn admit_callable(
-        &mut self, declaration: SourceSpan, history: Vec<(wosy_syntax::ByteSpan, bool)>, directive: SourceSpan,
+        &mut self, declaration: SourceSpan, history: impl IntoIterator<Item = super::super::checker_flow::CallableHistoryStep>, directive: SourceSpan,
     ) -> Option<Admission> {
-        super::super::checker_flow::charge_call_work(&mut self.work, history.len().checked_add(2)?)?;
-        let mut steps = Vec::with_capacity(history.len().checked_add(1)?);
-        steps.push(PathStep::CallableRoot(declaration));
-        steps.extend(history.into_iter().map(|(range, accepted)| PathStep::Branch {
-            condition: SourceSpan::new(directive.source.clone(), range), accepted,
-        }));
+        use super::super::checker_flow::CallableHistoryStep;
+        super::super::checker_flow::charge_call_work(&mut self.work, 2)?;
+        let mut steps = vec![PathStep::CallableRoot(declaration)];
+        for step in history {
+            super::super::checker_flow::charge_call_work(&mut self.work, 1)?;
+            let at = |range| SourceSpan::new(directive.source.clone(), range);
+            steps.push(match step {
+                CallableHistoryStep::Branch(span, accepted) => PathStep::Branch { condition: at(span), accepted },
+                CallableHistoryStep::Call(span) => PathStep::Call(at(span)),
+                CallableHistoryStep::Return(span) => PathStep::Return(at(span)),
+            });
+        }
         self.select(FailurePath { steps, directive })
     }
 
@@ -92,6 +98,11 @@ impl StartUpSearch {
             PathStep::Call(site) => Some(site.clone()),
             _ => None,
         }).collect()).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_return(&self, site: &SourceSpan) -> bool {
+        self.selected.iter().any(|path| path.steps.contains(&PathStep::Return(site.clone())))
     }
 
     #[cfg(test)]
