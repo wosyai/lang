@@ -325,14 +325,18 @@ fn grammar_checked_file(
     tx: &Transaction, file: &FileEntry, categories: &[String], tree: FileTree, work: &mut CstWork,
 ) -> Result<CheckedFile> {
     let checked = validate_file(tx, file, categories, tree, Some(work))?;
+    if !authored_grammar_matches(file, categories, &checked)? {
+        return Err("changed CST does not match canonical source grammar or provenance".into());
+    }
+    Ok(checked)
+}
+
+pub(super) fn authored_grammar_matches(file: &FileEntry, categories: &[String], checked: &CheckedFile) -> Result<bool> {
     let authored = checked.authored.as_ref().ok_or("source file has no authored CST")?;
     // Source text is reconstructed from the witnessed CST, not shipped or
     // reread from a live workspace. Use the ordinary parser as the oracle.
     let parsed = wosy_syntax::parse(file_source(file)?, authored.text().to_string(), categories);
-    if !parsed.is_valid() || !same_cst(authored, &parsed.canonical_cst().root) || parsed.comments != checked.comments {
-        return Err("changed CST does not match canonical source grammar or provenance".into());
-    }
-    Ok(checked)
+    Ok(parsed.is_valid() && same_cst(authored, &parsed.canonical_cst().root) && parsed.comments == checked.comments)
 }
 
 /// Validate and provisionally install only the full canonical graph supplied
@@ -368,7 +372,7 @@ pub(super) fn stage_reconciled_closure(
 }
 
 impl BaseCstAdmissionLimits {
-    fn cst_work(self) -> CstWork {
+    pub(super) fn cst_work(self) -> CstWork {
         CstWork::new(self.expanded_record_bytes, self.cst_occurrences, self.cst_depth, self.authored_bytes)
     }
 }
@@ -388,7 +392,7 @@ impl GraphWork {
 
 pub(super) type CstWork = CstExpansionBudget;
 
-fn take(remaining: &mut usize, amount: usize, reason: &'static str) -> Result<()> {
+pub(super) fn take(remaining: &mut usize, amount: usize, reason: &'static str) -> Result<()> {
     *remaining = remaining.checked_sub(amount).ok_or(reason)?;
     Ok(())
 }

@@ -15,10 +15,9 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_artifact_llvm,
-    emit_scalar_build_single_module_artifact_llvm, emit_scalar_build_wasm_root_exports_artifact_llvm,
+    analyze_scalar_build, derive_scalar_declarations_from_cst,
     parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
-    LlvmPartition, ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    LlvmPartition, ParseOutput, ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,
@@ -544,17 +543,16 @@ fn compile_project(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     drop(texts);
-    let llvm = if let Some((exports, source)) = root_exports {
-        emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, &source, exports)?
-    } else if graph.nodes.len() == 1 {
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.single_module_emissions += 1);
-        emit_scalar_build_single_module_artifact_llvm(&validation)?
-    } else {
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.project_emissions += 1);
-        emit_scalar_build_project_artifact_llvm(&validation)?
-    };
+    let emission = ScalarArtifactEmission::select(
+        graph.nodes.len(), root_exports.as_ref().map(|(exports, source)| (source, *exports)),
+    );
+    #[cfg(test)]
+    routing_observations::record(|counts| match emission {
+        ScalarArtifactEmission::Singleton => counts.single_module_emissions += 1,
+        ScalarArtifactEmission::Project => counts.project_emissions += 1,
+        ScalarArtifactEmission::WasmRootExports(..) => {}
+    });
+    let llvm = emission.emit(&validation)?;
     let source_observations = graph
         .nodes
         .into_iter()

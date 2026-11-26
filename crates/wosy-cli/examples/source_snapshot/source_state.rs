@@ -41,6 +41,13 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "leased-ordinary-llvm" => {
+            let profile = args.next().ok_or("expected fixture LLVM profile")?;
+            let output = args.next().ok_or("expected fixture partition byte limit")?.parse()?;
+            let source = args.next().unwrap_or_default();
+            let selected = client.acknowledged_build_source(&target)?.ok_or("fixture has no acknowledged source")?;
+            super::rooted_llvm::run(dir, selected, profile, output, &source).await?
+        }
         "current-entry-cst" | "current-entry-cst-restage" => {
             let encoding: usize = args.next().ok_or("expected fixture JSON byte limit")?.parse()?;
             let expanded: usize = args.next().ok_or("expected fixture record byte limit")?.parse()?;

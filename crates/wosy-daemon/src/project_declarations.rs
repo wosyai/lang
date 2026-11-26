@@ -97,16 +97,16 @@ impl ProjectDeclarationsView<'_> {
     }
 }
 
-struct ModuleInput {
+pub(super) struct ModuleInput {
     id: NodeId,
     key: FileKey,
-    file: FileEntry,
-    imports: Vec<SourceNodeId>,
+    pub(super) file: FileEntry,
+    pub(super) imports: Vec<SourceNodeId>,
 }
 
-struct RootedOrder {
+pub(super) struct RootedOrder {
     // Ordinals assigned to the first occurrence in declared import order.
-    modules: Vec<ModuleInput>,
+    pub(super) modules: Vec<ModuleInput>,
     // Each child's projection is available before its importing module.
     postorder: Vec<usize>,
 }
@@ -118,7 +118,7 @@ impl RootedOrder {
         (Self::from_parts(entry, modules, files, module_edges), read)
     }
 
-    fn from_parts(
+    pub(super) fn from_parts(
         entry: &FileKey, modules: BTreeMap<FileKey, NodeId>, mut files: BTreeMap<FileKey, FileEntry>,
         mut module_edges: BTreeMap<FileKey, Vec<NodeId>>,
     ) -> Self {

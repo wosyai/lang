@@ -11,7 +11,7 @@ pub use llvm::{
     emit_scalar_build_project_llvm_text, emit_scalar_build_single_module_artifact_llvm,
     emit_scalar_build_single_module_llvm, emit_scalar_build_single_module_llvm_text,
     emit_scalar_build_wasm_root_exports_artifact_llvm, emit_scalar_build_wasm_root_exports_llvm_text, emit_scalar_llvm, emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition,
-    LlvmValueType,
+    LlvmValueType, ScalarArtifactEmission,
 };
 pub use scalar::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,

@@ -2,7 +2,7 @@
 use super::{
     retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
     storage_worker::QueryCancellation,
-    PreparedBaseDeclarations, Result, SourceReconciliation, SourceStorageWorker,
+    PreparedBaseDeclarations, Result, RootedLlvmProjection, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,6 +119,18 @@ impl BuildDiagnosticSession<'_> {
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         self.dispatch_analysis(request, None).await
+    }
+
+    /// Explicit local projection through a separate fresh ordinary Build
+    /// analysis. The diagnostic-only framed command cannot request this.
+    pub async fn project_ordinary_llvm(
+        &self, profile: String, source_limits: BaseCstAdmissionLimits, output_bytes: usize,
+    ) -> Result<RootedLlvmProjection> {
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.project_ll_for_lease(&lease, profile, source_limits, output_bytes)
+        }).await?
     }
 
     pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {

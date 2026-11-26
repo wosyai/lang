@@ -411,6 +411,37 @@ pub fn emit_scalar_build_single_module_artifact_llvm(
     emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])
 }
 
+/// The ordinary artifact emitter selected from the authored graph and the
+/// resolved target profile. The caller still owns diagnostic admission.
+#[derive(Clone, Copy)]
+pub enum ScalarArtifactEmission<'a> {
+    WasmRootExports(&'a wosy_syntax::SourceIdentity, &'a BTreeMap<String, String>),
+    Singleton,
+    Project,
+}
+
+impl<'a> ScalarArtifactEmission<'a> {
+    pub fn select(
+        modules: usize, root_exports: Option<(&'a wosy_syntax::SourceIdentity, &'a BTreeMap<String, String>)>,
+    ) -> Self {
+        match root_exports {
+            Some((source, exports)) => Self::WasmRootExports(source, exports),
+            None if modules == 1 => Self::Singleton,
+            None => Self::Project,
+        }
+    }
+
+    pub fn emit(self, validation: &ScalarBuildValidation<'_>) -> Result<LlvmPartition, String> {
+        match self {
+            Self::WasmRootExports(source, exports) => {
+                emit_scalar_build_wasm_root_exports_artifact_llvm(validation, source, exports)
+            }
+            Self::Singleton => emit_scalar_build_single_module_artifact_llvm(validation),
+            Self::Project => emit_scalar_build_project_artifact_llvm(validation),
+        }
+    }
+}
+
 struct WasmRootExport<'a> {
     label: &'a str,
     symbol: String,

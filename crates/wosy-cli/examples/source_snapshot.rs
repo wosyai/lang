@@ -38,6 +38,8 @@ mod proposal_admission;
 mod framed_projection;
 #[path = "source_snapshot/leased_build.rs"]
 mod leased_build;
+#[path = "source_snapshot/rooted_llvm.rs"]
+mod rooted_llvm;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

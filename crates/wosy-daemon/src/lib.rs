@@ -54,6 +54,7 @@ mod derivation_image;
 mod pins;
 mod project_declarations;
 mod prepared_project;
+mod rooted_llvm;
 mod retention_plan;
 mod source_impact;
 mod source_proposal;
@@ -71,6 +72,7 @@ pub use project_declarations::{
 pub use prepared_project::{
     BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
+pub use rooted_llvm::{RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
@@ -385,11 +387,22 @@ fn read_node(tx: &Transaction, id: NodeId) -> Result<Node> {
 }
 
 fn read_node_with(tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Result<()>) -> Result<Node> {
+    read_node_using(tx, id, |bytes| charge(bytes.len()))
+}
+
+fn read_node_using(tx: &Transaction, id: NodeId, inspect: impl FnOnce(&[u8]) -> Result<()>) -> Result<Node> {
     let bytes = tx.get(&key(NODES, id))?.ok_or("referenced source node is missing")?;
-    charge(bytes.len())?;
+    inspect(&bytes)?;
     Node::decode(&bytes).ok_or_else(|| "invalid stored source node".into())
 }
 
+fn read_verified_node_with(tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Result<()>) -> Result<Node> {
+    read_node_using(tx, id, |bytes| {
+        charge(bytes.len())?;
+        if Node::id(bytes) != id { return Err("stored source node differs from its rooted identity".into()); }
+        Ok(())
+    })
+}
 
 struct Index {
     config: NodeId,
@@ -411,10 +424,12 @@ fn unique<K: Ord, V>(entries: &mut BTreeMap<K, V>, key: K, value: V) -> Result<(
     }
 }
 
-fn read_paths(tx: &Transaction, root: NodeId) -> Result<BTreeMap<FileKey, (NodeId, NodeId)>> {
+fn read_paths_using(
+    read: &mut impl FnMut(NodeId) -> Result<Node>, root: NodeId,
+) -> Result<BTreeMap<FileKey, (NodeId, NodeId)>> {
     let mut paths = BTreeMap::new();
-    for id in read_node(tx, root)?.children {
-        let node = read_node(tx, id)?;
+    for id in read(root)?.children {
+        let node = read(id)?;
         let key = serde_json::from_slice(&node.data)?;
         let [child] = node.children.as_slice() else { return Err("invalid projection leaf".into()); };
         unique(&mut paths, key, (id, *child))?;
@@ -427,21 +442,27 @@ fn read_index(tx: &Transaction, top: Node) -> Result<Index> {
 }
 
 fn read_index_charged(
-    tx: &Transaction, top: Node, mut charge_imports: impl FnMut(usize) -> Result<()>,
+    tx: &Transaction, top: Node, charge_imports: impl FnMut(usize) -> Result<()>,
+) -> Result<Index> {
+    read_index_using(top, |id| read_node(tx, id), charge_imports)
+}
+
+fn read_index_using(
+    top: Node, mut read: impl FnMut(NodeId) -> Result<Node>, mut charge_imports: impl FnMut(usize) -> Result<()>,
 ) -> Result<Index> {
     let parts = source_preparation_parts(&top).ok_or("incomplete source preparation")?;
     let mut entries = BTreeMap::new();
     for &id in parts.files {
-        let entry = FileEntry::from_node(id, read_node(tx, id)?)?;
+        let entry = FileEntry::from_node(id, read(id)?)?;
         unique(&mut entries, FileKey::from(&entry.metadata.source), entry)?;
     }
-    let executable_paths = read_paths(tx, parts.executable)?;
-    let annotation_paths = read_paths(tx, parts.annotation)?;
+    let executable_paths = read_paths_using(&mut read, parts.executable)?;
+    let annotation_paths = read_paths_using(&mut read, parts.annotation)?;
     let by_projection: BTreeMap<_, _> = executable_paths.iter().map(|(key, (id, _))| (*id, key)).collect();
     let mut modules = BTreeMap::new();
     let mut module_edges = BTreeMap::new();
-    for id in read_node(tx, parts.dependencies)?.children {
-        let node = read_node(tx, id)?;
+    for id in read(parts.dependencies)?.children {
+        let node = read(id)?;
         let [local, imports @ ..] = node.children.as_slice() else {
             return Err("missing local module executable".into());
         };
@@ -639,20 +660,27 @@ struct CheckedFile {
 
 fn validate_file(
     tx: &Transaction, file: &FileEntry, configured: &[String], tree: FileTree,
+    work: Option<&mut source_proposal::CstWork>,
+) -> Result<CheckedFile> {
+    validate_file_using(file, configured, tree, work, |id, charge| {
+        read_node_with(tx, id, |bytes| charge.map_or(Ok(()), |work| work.read(bytes)))
+    })
+}
+
+fn validate_file_using(
+    file: &FileEntry, configured: &[String], tree: FileTree,
     mut work: Option<&mut source_proposal::CstWork>,
+    mut read: impl FnMut(NodeId, Option<&mut source_proposal::CstWork>) -> Result<Node>,
 ) -> Result<CheckedFile> {
     let bounded = work.is_some();
     if let Some(work) = work.as_mut() {
         work.file(file.metadata.bytes as usize)?;
     }
-    let read = |id, work: &mut Option<&mut source_proposal::CstWork>| {
-        read_node_with(tx, id, |bytes| work.as_mut().map_or(Ok(()), |work| work.read(bytes)))
-    };
-    let comments: Vec<TypedComment> = serde_json::from_slice(&read(file.annotation, &mut work)?.data)?;
+    let comments: Vec<TypedComment> = serde_json::from_slice(&read(file.annotation, work.as_deref_mut())?.data)?;
     let mut position = 0u32;
     let mut hasher = blake3::Hasher::new();
     let mut next_comment = comments.iter();
-    let authored = read(file.authored, &mut work)?;
+    let authored = read(file.authored, work.as_deref_mut())?;
     if authored.kind != Kind::Syntax || syntax_kind(&authored)? != SyntaxKind::Root {
         return Err("invalid canonical Rowan root".into());
     }
@@ -676,7 +704,7 @@ fn validate_file(
                     }
                     continue;
                 };
-                let record = read(child, &mut work)?;
+                let record = read(child, work.as_deref_mut())?;
                 let projection = if record.kind == Kind::Token && syntax_kind(&record)? == SyntaxKind::TypedComment {
                     None
                 } else {
@@ -700,7 +728,7 @@ fn validate_file(
                 let projected = if projection == Some(id) {
                     node.children.clone()
                 } else {
-                    let projected = read(projection.ok_or("missing CST projection")?, &mut work)?;
+                    let projected = read(projection.ok_or("missing CST projection")?, work.as_deref_mut())?;
                     if projected.kind != Kind::Syntax || projected.data != node.data {
                         return Err("incompatible executable syntax projection".into());
                     }
