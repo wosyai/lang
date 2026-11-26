@@ -33,6 +33,10 @@ def project_view(root, *args):
     return invoke(root, "--project-declarations", *args)
 
 
+def build(root, oracle=False):
+    return invoke(root, "--typed-project", "dev", "--build-oracle" if oracle else "--build")
+
+
 def census(root):
     return invoke(root, "--source-plan", "10000")
 
@@ -43,7 +47,9 @@ def reused(view, new_modules, new_bodies):
 
 
 entry = 'leaf = namespace std "leaf.w";\nsibling = namespace std "sibling.w";\nu32 answer = leaf.value;\n'
-if phase == "seed":
+
+
+def initialize():
     template = (Path(__file__).parent /
                 "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
     (project / "src").mkdir(parents=True)
@@ -54,6 +60,10 @@ if phase == "seed":
     (project / "src/main.w").write_text(source(entry, "original ☕"))
     (deps / "leaf.w").write_text(source("u32 value = 17;\n"))
     (deps / "sibling.w").write_text(source("u32 unaffected = 29;\n"))
+
+
+if phase == "seed":
+    initialize()
     label, sha = image()
     assert label["fixture_image"] == "alpha"
     root = invoke()["snapshot"]["source_root"]
@@ -65,10 +75,16 @@ if phase == "seed":
     assert warm["modules"] == start["modules"] and warm["projection"] == start["projection"]
     warm_scope = census(root)
     assert warm_scope["nodes_visited"] > cold_scope["nodes_visited"]
+    build_cold, build_warm = build(root, True), build(root)
+    assert build_cold["analysis_origin"] == "Derived" and build_cold["receipt_written"]
+    assert build_warm["analysis_origin"] == "Stored" and not build_warm["receipt_written"]
+    assert not build_warm["reused_live"] and not build_warm["diagnostics"]
+    assert census(root)["nodes_visited"] == warm_scope["nodes_visited"] + 1
     record.write_text(json.dumps({
         "label": label, "sha": sha, "root": root, "modules": warm["modules"],
         "projection": warm["projection"], "cold_nodes": cold_scope["nodes_visited"],
         "warm_nodes": warm_scope["nodes_visited"], "epoch": warm_scope["protection_epoch"],
+        "analysis_key": build_cold["analysis_key"],
     }))
     print("image A: genuine cold/warm rooted declaration reuse", {"root": root, "sha256": sha})
 elif phase == "compare":
@@ -92,6 +108,11 @@ elif phase == "compare":
     assert census(root)["nodes_visited"] == alpha["warm_nodes"]
     prepared = invoke(root, "--typed-project", "dev", "--oracle")
     assert prepared["ready"] and not prepared["diagnostics"]
+    build_cold, build_warm = build(root, True), build(root)
+    assert build_cold["analysis_key"] != alpha["analysis_key"]
+    assert build_cold["analysis_origin"] == "Derived" and build_cold["receipt_written"]
+    assert build_warm["analysis_origin"] == "Stored" and not build_warm["receipt_written"]
+    assert census(root)["nodes_visited"] == alpha["warm_nodes"] + 1
     # Annotations alone do not rerun compiler declarations inside this image.
     (project / "src/main.w").write_text(source(entry, "nova anotação 🚀"))
     newer = invoke(root)["snapshot"]["source_root"]
@@ -99,12 +120,17 @@ elif phase == "compare":
     note = project_view(newer, "--oracle")
     reused(note, 0, 0)
     assert note["projection"] == warm["projection"]
+    note_build = build(newer, True)
+    assert note_build["analysis_origin"] == "Stored" and note_build["analysis_key"] == build_cold["analysis_key"]
     (project / "stdlib/src/leaf.w").write_text(source("u32 value = 31;\n"))
     edit = invoke(newer)["snapshot"]["source_root"]
     selected = project_view(edit, "--oracle")
     reused(selected, 2, 1)
     assert selected["projection"] != warm["projection"]
     assert selected["modules"][2] == warm["modules"][2]
+    changed = build(edit, True)
+    assert changed["analysis_origin"] == "Derived" and changed["analysis_key"] != build_cold["analysis_key"]
+    assert build(root)["analysis_origin"] == "Stored"
     historical = project_view(root)
     reused(historical, 0, 0)
     assert historical["modules"] == alpha["modules"]
@@ -113,5 +139,14 @@ elif phase == "compare":
         "selective": selected["modules_derived"], "untouched": selected["modules_reused"],
         "cold_census": cold_scope["nodes_visited"], "warm_census": alpha["warm_nodes"],
     })
+elif phase == "receipt-unit":
+    # Give each Rust invocation its own root IDs/storage without prewarming
+    # diagnostic receipts from another invocation of the same test binary.
+    initialize()
+    root = invoke()["snapshot"]["source_root"]
+    body = project_view(root)["modules"][0]["body"]
+    (project / "stdlib/src/leaf.w").write_text(source("u32 value = 31;\n"))
+    other = invoke(root)["snapshot"]["source_root"]
+    (fixture / "unit-roots.json").write_text(json.dumps({"root": root, "other": other, "entry_body": body}))
 else:
     raise AssertionError(phase)

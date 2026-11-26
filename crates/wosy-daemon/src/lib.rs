@@ -41,6 +41,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
+mod build_receipt;
 mod derivation_image;
 mod pins;
 mod project_declarations;
@@ -54,7 +55,7 @@ pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
 pub use prepared_project::{
-    BuildAnalysisKey, BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
+    BuildAnalysisKey, BuildAnalysisOrigin, BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
@@ -179,6 +180,7 @@ impl SourceStore {
             tx,
             root,
             executable: index.executable,
+            dependencies: index.dependencies,
             annotation: index.annotation,
             config: index.config,
             modules: index.modules,
@@ -283,6 +285,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         SourcePreparation => supported_top(node),
         NamespaceFacts | BaseDeclarations => count == 1,
         ModuleDeclarations => count >= 2,
+        BuildDiagnosticReceipt => count == 4,
     };
     if good { Ok(()) } else { Err("invalid base source schema or node shape".into()) }
 }
@@ -310,6 +313,7 @@ enum Edge {
     ModuleDeclarationSource,
     ModuleDeclarationBody,
     ModuleDeclarationImport,
+    ReceiptDeclarations,
 }
 
 fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
@@ -343,6 +347,12 @@ fn child_edge(kind: Kind, i: usize) -> (Edge, Expected) {
             1 => (Edge::ModuleDeclarationBody, Exact(BaseDeclarations)),
             _ => (Edge::ModuleDeclarationImport, Exact(ModuleDeclarations)),
         },
+        BuildDiagnosticReceipt => match i {
+            0 => (Edge::Config, Exact(Config)),
+            1 => (Edge::Executable, Exact(Executables)),
+            2 => (Edge::Dependencies, Exact(Dependencies)),
+            _ => (Edge::ReceiptDeclarations, Exact(ModuleDeclarations)),
+        },
         Token | Annotations | Config => unreachable!("validated leaf"),
     }
 }
@@ -364,6 +374,7 @@ fn token_text(node: &Node) -> Result<&str> {
 struct Index {
     config: NodeId,
     executable: NodeId,
+    dependencies: NodeId,
     annotation: NodeId,
     files: BTreeMap<FileKey, FileEntry>,
     modules: BTreeMap<FileKey, NodeId>,
@@ -420,7 +431,7 @@ fn read_index_charged(
         module_edges.insert(key.clone(), imports.to_vec());
     }
     Ok(Index {
-        config: parts.config, executable: parts.executable, annotation: parts.annotation,
+        config: parts.config, executable: parts.executable, dependencies: parts.dependencies, annotation: parts.annotation,
         files: entries, modules, executable_paths, annotation_paths, module_edges,
     })
 }
@@ -648,6 +659,7 @@ pub struct SourceView {
     root: NodeId,
     pub executable: NodeId,
     pub annotation: NodeId,
+    dependencies: NodeId,
     config: NodeId,
     pub modules: BTreeMap<FileKey, NodeId>,
     module_edges: BTreeMap<FileKey, Vec<NodeId>>,

@@ -1,12 +1,14 @@
 //! Real compiler preparation and separately requested Build analysis.
 use super::{
-    base_declarations::Flights, read_comments, ProjectDeclarationModule, ProjectDeclarationsView,
-    QueryDisposition, Result, SourceStore,
+    base_declarations::Flights, build_receipt::{BuildInputs, Lookup}, read_comments,
+    ProjectDeclarationModule, ProjectDeclarationsView,
+    Result, SourceStore,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
+use tokio::sync::OnceCell;
 use wosy_compiler::{
     analyze_scalar_build, prepare_scalar_project, Diagnostic, PreparedScalarProject,
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
@@ -16,8 +18,7 @@ use wosy_project::SourceNodeId;
 use wosy_protocol::NodeId;
 use wosy_syntax::{AuthoredSpanMap, SourceIdentity};
 
-const PREPARED_PROJECT_ABI: &str = "wosy rooted typed project preparation v1";
-const BUILD_ANALYSIS_ABI: &str = "wosy rooted ordinary build diagnostics v1";
+const PREPARED_PROJECT_ABI: &str = "wosy rooted typed project preparation v2";
 
 #[derive(Default)]
 pub(super) struct PreparationCache {
@@ -49,7 +50,8 @@ struct CanonicalPreparation {
     outcome: PreparationOutcome,
     // Only a Build-analysis request initializes this projection. The weak
     // preparation registry never extends the lifetime of its diagnostics.
-    build_analysis: OnceLock<CanonicalBuildAnalysis>,
+    build_lookup: Lookup,
+    build_analysis: OnceCell<CanonicalBuildAnalysis>,
 }
 
 #[derive(Default)]
@@ -61,7 +63,7 @@ pub struct ProjectPreparationReport {
     pub reused_live_preparation: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum BuildAnalysisPhase {
     PreparationRejected,
     Analyzed,
@@ -78,8 +80,14 @@ impl BuildAnalysisKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildAnalysisOrigin {
+    Derived,
+    Live,
+    Stored,
+}
+
 struct CanonicalBuildAnalysis {
-    key: BuildAnalysisKey,
     phase: BuildAnalysisPhase,
     diagnostics: Vec<Diagnostic>,
 }
@@ -90,7 +98,9 @@ pub struct RootedBuildAnalysis {
     pub preparation: NodeId,
     pub key: BuildAnalysisKey,
     pub phase: BuildAnalysisPhase,
-    pub disposition: QueryDisposition,
+    pub origin: BuildAnalysisOrigin,
+    /// An optional receipt was committed with eventual cache durability.
+    pub receipt_written: bool,
     pub diagnostics: Vec<Diagnostic>,
     /// Time to obtain the canonical outcome, including another caller's wait.
     pub analysis_elapsed: Duration,
@@ -141,32 +151,45 @@ impl RootedPreparedProject<'_> {
         self.project_diagnostics(rejection.diagnostics.clone())
     }
 
-    /// Opt in explicitly. The exact canonical preparation is borrowed, not
-    /// rebuilt. Its diagnostic derivation is shared only by live holders of
-    /// that preparation; each holder projects its own authored revision.
-    pub fn build_analysis(&self) -> Result<RootedBuildAnalysis> {
+    /// Opt in explicitly after ordinary typed preparation. Only diagnostics
+    /// may be reused; neither a Build verdict nor any executable output is
+    /// selected. Each caller projects its own authored revision.
+    pub async fn build_analysis(&self) -> Result<RootedBuildAnalysis> {
         let start = Instant::now();
-        let mut disposition = QueryDisposition::Reused;
-        let canonical = self.canonical.build_analysis.get_or_init(|| {
-            disposition = QueryDisposition::Derived;
-            let (phase, diagnostics) = match &self.canonical.outcome {
-                PreparationOutcome::Ready(prepared) => (
-                    BuildAnalysisPhase::Analyzed, analyze_scalar_build(prepared).diagnostics().to_vec(),
-                ),
-                PreparationOutcome::Rejected(rejection) => (
-                    BuildAnalysisPhase::PreparationRejected, rejection.ordered_build_diagnostics(),
-                ),
+        let mut origin = BuildAnalysisOrigin::Live;
+        let mut receipt_written = false;
+        let canonical = self.canonical.build_analysis.get_or_init(|| async {
+            let phase = match self.canonical.outcome {
+                PreparationOutcome::Ready(_) => BuildAnalysisPhase::Analyzed,
+                PreparationOutcome::Rejected(_) => BuildAnalysisPhase::PreparationRejected,
             };
-            let key = BuildAnalysisKey(NodeId(blake3::derive_key(BUILD_ANALYSIS_ABI, &self.canonical.identity.0)));
-            CanonicalBuildAnalysis { key, phase, diagnostics }
-        });
+            let lookup = &self.canonical.build_lookup;
+            // Only this optional derivation record can fail open to ordinary
+            // analysis. Source admission, preparation and projection still
+            // follow their original error paths.
+            if let Ok(Some(diagnostics)) = self.store.read_build_receipt(lookup, phase) {
+                if diagnostics.iter().flat_map(|diagnostic| &diagnostic.labels)
+                    .all(|label| self.canonical.owners.contains_key(&label.span.source))
+                {
+                    origin = BuildAnalysisOrigin::Stored;
+                    return CanonicalBuildAnalysis { phase, diagnostics };
+                }
+            }
+            origin = BuildAnalysisOrigin::Derived;
+            let diagnostics = match &self.canonical.outcome {
+                PreparationOutcome::Ready(prepared) => analyze_scalar_build(prepared).diagnostics().to_vec(),
+                PreparationOutcome::Rejected(rejection) => rejection.ordered_build_diagnostics(),
+            };
+            receipt_written = self.store.persist_build_receipt(lookup, phase, &diagnostics).await.unwrap_or(false);
+            CanonicalBuildAnalysis { phase, diagnostics }
+        }).await;
         let analysis_elapsed = start.elapsed();
         let start = Instant::now();
         let diagnostics = self.project_diagnostics(canonical.diagnostics.clone())?;
         Ok(RootedBuildAnalysis {
             source_root: self.declarations.snapshot, preparation: self.identity(),
-            key: canonical.key, phase: canonical.phase, disposition, diagnostics,
-            analysis_elapsed, authored_projection_elapsed: start.elapsed(),
+            key: BuildAnalysisKey(self.canonical.build_lookup.digest), phase: canonical.phase,
+            origin, receipt_written, diagnostics, analysis_elapsed, authored_projection_elapsed: start.elapsed(),
         })
     }
 
@@ -200,13 +223,12 @@ fn executable_owner(module: &ProjectDeclarationModule) -> SourceIdentity {
     )
 }
 
-fn preparation_identity(projection: NodeId, config: NodeId, profile: &str) -> NodeId {
+fn preparation_identity(projection: NodeId, inputs: BuildInputs, profile: &str, layout: ScalarTargetLayout) -> NodeId {
     let mut hash = blake3::Hasher::new_derive_key(PREPARED_PROJECT_ABI);
-    hash.update(wosy_syntax::base_cst_schema())
-        .update(&projection.0)
-        .update(&config.0)
-        .update(COMPILER_IDENTITY.as_bytes())
-        .update(profile.as_bytes());
+    hash.update(wosy_syntax::base_cst_schema()).update(&projection.0);
+    for id in inputs.ids() { hash.update(&id.0); }
+    hash.update(&layout.pointer_size.to_be_bytes()).update(&layout.pointer_alignment.to_be_bytes())
+        .update(COMPILER_IDENTITY.as_bytes()).update(profile.as_bytes());
     NodeId(*hash.finalize().as_bytes())
 }
 
@@ -224,13 +246,17 @@ impl SourceStore {
             pointer_size: layout.pointer_size,
             pointer_alignment: layout.pointer_alignment,
         };
-        let config_id = snapshot.source.config;
+        let build_inputs = BuildInputs {
+            config: snapshot.source.config,
+            executable: snapshot.source.executable,
+            dependencies: snapshot.source.dependencies,
+        };
         let declarations = self.project_declarations_for_snapshot(snapshot).await?;
         let mut report = ProjectPreparationReport {
             projected_declarations: start.elapsed(),
             ..Default::default()
         };
-        let identity = preparation_identity(declarations.entry_projection, config_id, profile);
+        let identity = preparation_identity(declarations.entry_projection, build_inputs, profile, target_layout);
 
         let flight = self.prepared_projects.flights.acquire(identity);
         let _permit = flight.lock().await;
@@ -270,7 +296,9 @@ impl SourceStore {
             let owners = owners.into_iter().enumerate()
                 .map(|(ordinal, identity)| (identity, SourceNodeId(ordinal))).collect();
             let canonical = Arc::new(CanonicalPreparation {
-                identity, target_layout, owners, outcome, build_analysis: OnceLock::new(),
+                identity, target_layout, owners, outcome,
+                build_lookup: Lookup::new(self.derivation_image(), build_inputs, declarations.entry_projection, identity),
+                build_analysis: OnceCell::new(),
             });
             self.prepared_projects.remember(identity, &canonical);
             canonical

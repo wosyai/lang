@@ -127,10 +127,10 @@ fn report(view: &RootedPreparedProject<'_>, elapsed_ms: f64) -> Result<serde_jso
     }))
 }
 
-fn report_build(
+async fn report_build(
     view: &RootedPreparedProject<'_>, preparation_ms: f64, oracle: Option<(&Path, &str)>,
 ) -> Result<serde_json::Value> {
-    let analysis = view.build_analysis()?;
+    let analysis = view.build_analysis().await?;
     if let Some((project, profile)) = oracle {
         let (phase, diagnostics) = match fresh_preparation(project, profile, None)? {
             Ok(prepared) => (
@@ -144,7 +144,8 @@ fn report_build(
     }
     Ok(serde_json::json!({
         "snapshot": analysis.source_root.hex(), "prepared_identity": analysis.preparation.hex(),
-        "analysis_key": analysis.key.digest().hex(), "analysis_disposition": format!("{:?}", analysis.disposition),
+        "analysis_key": analysis.key.digest().hex(), "analysis_origin": format!("{:?}", analysis.origin),
+        "receipt_written": analysis.receipt_written,
         "target_layout": view.target_layout(), "phase": format!("{:?}", analysis.phase),
         "diagnostics": analysis.diagnostics, "preparation_diagnostics": view.authored_diagnostics()?,
         "preparation_ms": preparation_ms, "reused_live": view.report.reused_live_preparation,
@@ -175,14 +176,17 @@ pub(super) async fn run(
             first.authored_diagnostics()?;
             second.authored_diagnostics()?;
             let ready = std::sync::Barrier::new(2);
-            let (one, two) = std::thread::scope(|scope| -> Result<_> {
-                let first = scope.spawn(|| {
+            let runtime = tokio::runtime::Handle::current();
+            let (one, two) = tokio::task::block_in_place(|| {
+                std::thread::scope(|scope| -> Result<_> {
+                    let first = scope.spawn(|| {
+                        ready.wait();
+                        runtime.block_on(report_build(&first, elapsed, None))
+                    });
                     ready.wait();
-                    report_build(&first, elapsed, None)
-                });
-                ready.wait();
-                let second = report_build(&second, elapsed, None);
-                Ok((first.join().map_err(|_| "fixture Build analysis panicked")??, second?))
+                    let second = runtime.block_on(report_build(&second, elapsed, None));
+                    Ok((first.join().map_err(|_| "fixture Build analysis panicked")??, second?))
+                })
             })?;
             return Ok(serde_json::json!([one, two]));
         }
@@ -191,14 +195,14 @@ pub(super) async fn run(
     let first = store.rooted_prepared_project(root, profile).await?.ok_or("unknown rooted preparation")?;
     let elapsed = milliseconds(start);
     if mode == Some("--build-released") {
-        let first_report = report_build(&first, elapsed, None)?;
+        let first_report = report_build(&first, elapsed, None).await?;
         drop(first);
         let start = Instant::now();
         let next = store.rooted_prepared_project(root, profile).await?.ok_or("reopen rooted preparation")?;
-        return Ok(serde_json::json!([first_report, report_build(&next, milliseconds(start), None)?]));
+        return Ok(serde_json::json!([first_report, report_build(&next, milliseconds(start), None).await?]));
     }
     if matches!(mode, Some("--build" | "--build-oracle")) {
-        return report_build(&first, elapsed, (mode == Some("--build-oracle")).then_some((project, profile)));
+        return report_build(&first, elapsed, (mode == Some("--build-oracle")).then_some((project, profile))).await;
     }
     if mode == Some("--oracle") { assert_ordinary(store, &first, project, profile)?; }
     let first_report = report(&first, elapsed)?;

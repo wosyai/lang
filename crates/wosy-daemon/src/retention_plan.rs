@@ -1,14 +1,14 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, key, pins, project_declarations, published_source, read_node,
-    source_top, supported_top, Result, SourceStore, FILE_AUTHORITY, SNAPSHOT_ROOTS,
+    authority_key, base_declarations, build_receipt, edge, key, pins, project_declarations, published_source, read_node,
+    source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::sync::{Arc, Mutex};
 use surrealkv::{LSMIterator, Mode, Transaction};
-use wosy_protocol::{Kind, NodeId};
+use wosy_protocol::{FileKey, Kind, NodeId};
 
 const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
@@ -72,12 +72,19 @@ pub struct SourceRetentionInventory {
 struct Mark {
     classes: u8,
     encoded_bytes: usize,
+    is_projection: bool,
 }
 
 #[derive(Default)]
 struct Marks {
     nodes: HashMap<NodeId, Mark>,
     cas: HashMap<NodeId, u8>,
+    receipt_scopes: BTreeMap<NodeId, ReceiptScope>,
+}
+
+struct ReceiptScope {
+    inputs: build_receipt::BuildInputs,
+    classes: u8,
 }
 
 fn walk(
@@ -94,12 +101,23 @@ fn walk(
             _ => {}
         }
         let node = read_node(tx, id)?;
-        entry.or_insert_with(|| Mark { classes: 0, encoded_bytes: node.encoded_len() }).classes |= class;
+        entry.or_insert_with(|| Mark {
+            classes: 0, encoded_bytes: node.encoded_len(), is_projection: node.kind == Kind::ModuleDeclarations,
+        }).classes |= class;
 
         match node.kind {
             // Other source schemas may have different auxiliary edges.
-            Kind::SourcePreparation if !supported_top(&node) => {
-                return Err("unsupported published root in retention census".into());
+            Kind::SourcePreparation => {
+                let parts = wosy_protocol::source_preparation_parts(&node)
+                    .ok_or("unsupported published root in retention census")?;
+                if let Some(image) = image {
+                    let inputs = build_receipt::BuildInputs {
+                        config: parts.config, executable: parts.executable, dependencies: parts.dependencies,
+                    };
+                    let scope = marks.receipt_scopes.entry(inputs.scope(image))
+                        .or_insert(ReceiptScope { inputs, classes: 0 });
+                    scope.classes |= class;
+                }
             }
             Kind::File => {
                 let authority = tx.get(&authority_key(FILE_AUTHORITY, id))?
@@ -126,6 +144,68 @@ fn walk(
             _ => {}
         }
         todo.extend(node.children);
+    }
+    Ok(())
+}
+
+fn current_entry(
+    tx: &Transaction, image: NodeId, inputs: build_receipt::BuildInputs, projection: NodeId,
+    config_entry: &mut Option<FileKey>,
+) -> Result<bool> {
+    let declarations = read_node(tx, projection)?;
+    let Some(&module) = declarations.children.first() else { return Ok(false); };
+    // The exact module must occur in this dependency root, not just somewhere
+    // in the same protection class. Both links are existing indexed lookups.
+    if tx.get(&edge(EDGES_OUT, inputs.dependencies, Edge::ProjectionEntry, module))?.is_none()
+        || !tx.get(&project_declarations::projection_key(image, module))?
+            .is_some_and(|current| current.as_slice() == projection.0)
+    {
+        return Ok(false);
+    }
+    #[derive(serde::Deserialize)]
+    struct ConfigEntry { entry: FileKey }
+    let entry = match config_entry {
+        Some(entry) => entry,
+        None => {
+            let config = read_node(tx, inputs.config)?;
+            config_entry.insert(serde_json::from_slice::<ConfigEntry>(&config.data)?.entry)
+        }
+    };
+    let module = read_node(tx, module)?;
+    let Some(&local) = module.children.first() else { return Ok(false); };
+    let local = read_node(tx, local)?;
+    Ok(serde_json::from_slice::<FileKey>(&local.data)? == *entry)
+}
+
+fn mark_receipts(tx: &Transaction, image: NodeId, limit: usize, marks: &mut Marks) -> Result<()> {
+    let mut remaining = limit;
+    for (&scope, entry) in &marks.receipt_scopes {
+        let mut resolved = None;
+        let mut config_entry = None;
+        build_receipt::attached(tx, scope, entry.inputs, &mut remaining, |id, projection, encoded_bytes| {
+            let Some(prior) = marks.nodes.get(&projection).filter(|mark| mark.is_projection) else {
+                return Ok(());
+            };
+            let classes = prior.classes & entry.classes;
+            if classes == 0 { return Ok(()); }
+            // Only the exact entry projection can anchor this scope's
+            // receipt. Even an admitted sibling cannot extend its authority.
+            match resolved {
+                Some(expected) if expected != projection => return Ok(()),
+                Some(_) => {}
+                None if current_entry(tx, image, entry.inputs, projection, &mut config_entry)? => {
+                    resolved = Some(projection);
+                }
+                None => return Ok(()),
+            }
+            let at_limit = marks.nodes.len() >= limit;
+            match marks.nodes.entry(id) {
+                Entry::Occupied(mut mark) => mark.get_mut().classes |= classes,
+                Entry::Vacant(_) if at_limit => return Err("source retention plan exceeded node budget".into()),
+                Entry::Vacant(mark) => { mark.insert(Mark { classes, encoded_bytes, is_projection: false }); }
+            }
+            Ok(())
+        })?;
     }
     Ok(())
 }
@@ -272,6 +352,7 @@ impl SourceStore {
         let mut marks = Marks::default();
         walk(&tx, published.difference(&candidates).copied(), image, PROTECTED, limit, &mut marks)?;
         walk(&tx, candidates.iter().copied(), image, CANDIDATE, limit, &mut marks)?;
+        if let Some(image) = image { mark_receipts(&tx, image, limit, &mut marks)?; }
 
         let mut report = SourceRetentionPlan {
             protection_epoch: NodeId(*epoch.finalize().as_bytes()),

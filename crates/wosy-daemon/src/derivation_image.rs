@@ -74,7 +74,9 @@ mod tests {
                 assert!(base.authored_diagnostics().is_empty());
                 let project = store.rooted_prepared_project(root, profile).await.unwrap().unwrap();
                 assert!(project.prepared().is_some());
-                assert!(project.build_analysis().unwrap().diagnostics.is_empty());
+                let analysis = project.build_analysis().await.unwrap();
+                assert_eq!(analysis.origin, crate::BuildAnalysisOrigin::Derived);
+                assert!(!analysis.receipt_written && analysis.diagnostics.is_empty());
                 assert_eq!(project.declarations().report.modules_reused, 0);
                 assert_eq!(project.declarations().report.modules_derived, 3);
                 assert_eq!(project.declarations().modules()[0].body, expected_body);

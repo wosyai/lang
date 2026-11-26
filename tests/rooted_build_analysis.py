@@ -82,7 +82,7 @@ with tempfile.TemporaryDirectory() as work:
         assert verdict["phase"] == "Analyzed" and verdict["diagnostics"] == []
         assert verdict["preparation_diagnostics"] == []
         assert verdict["target_layout"]["pointer_size"] == width
-        assert verdict["analysis_disposition"] == "Derived"
+        assert verdict["analysis_origin"] == "Derived" and verdict["receipt_written"]
         accepted[profile] = verdict["prepared_identity"]
         accepted_keys[profile] = verdict["analysis_key"]
         assert accepted_keys[profile] != accepted[profile]
@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory() as work:
     assert len(set(accepted_keys.values())) == 2
     other_layout, _, _ = build(good, "dev", "--build-held", good, "native")
     assert [result["analysis_key"] for result in other_layout] == [accepted_keys["dev"], accepted_keys["native"]]
-    assert all(result["analysis_disposition"] == "Derived" for result in other_layout)
+    assert all(result["analysis_origin"] == "Stored" and not result["receipt_written"] for result in other_layout)
 
     # The established compiler test's harmless illegal move is rejected only
     # by ordinary Build analysis; parsing and preparation still succeed.
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory() as work:
     for profile in profiles:
         verdict, _, _ = build(old, profile, "--build-oracle")
         assert verdict["phase"] == "Analyzed" and verdict["preparation_diagnostics"] == []
-        assert verdict["analysis_disposition"] == "Derived"
+        assert verdict["analysis_origin"] == "Derived" and verdict["receipt_written"]
         assert verdict["analysis_key"] != accepted_keys[profile]
         moved, = verdict["diagnostics"]
         assert moved["message"] == "read or move of unavailable place"
@@ -122,25 +122,27 @@ with tempfile.TemporaryDirectory() as work:
     for profile in profiles:
         current, _, _ = build(new, profile, "--build-oracle")
         updated[profile] = current["diagnostics"]
+        assert current["analysis_origin"] == "Stored" and not current["receipt_written"]
+        assert not current["reused_live"]
         assert current["prepared_identity"] == prior[profile]["prepared_identity"]
         assert current["analysis_key"] == prior[profile]["analysis_key"]
         historical, _, _ = build(old, profile, "--build")
         assert historical["diagnostics"] == prior[profile]["diagnostics"]
         held, _, _ = build(old, profile, "--build-held", new)
         assert sum(view["reused_live"] for view in held) == 1
-        assert sorted(view["analysis_disposition"] for view in held) == ["Derived", "Reused"]
+        assert sorted(view["analysis_origin"] for view in held) == ["Live", "Stored"]
         assert all(view["analysis_key"] == current["analysis_key"] for view in held)
         assert held[0]["diagnostics"] == prior[profile]["diagnostics"]
         assert held[1]["diagnostics"] == current["diagnostics"]
         concurrent_wait_ms.extend(
-            view["analysis_ms"] for view in held if view["analysis_disposition"] == "Reused"
+            view["analysis_ms"] for view in held if view["analysis_origin"] == "Live"
         )
         for label in current["diagnostics"][0]["labels"]:
             span = label["span"]["range"]
             assert new_text.encode()[span["start"]:span["end"]] == b"next"
         assert current["diagnostics"] != historical["diagnostics"]
     released, _, _ = build(new, "dev", "--build-released")
-    assert all(view["analysis_disposition"] == "Derived" for view in released)
+    assert all(view["analysis_origin"] == "Stored" and not view["reused_live"] for view in released)
     assert released[0]["analysis_key"] == released[1]["analysis_key"] == prior["dev"]["analysis_key"]
     assert all(view["diagnostics"] == updated["dev"] for view in released)
 
@@ -150,7 +152,8 @@ with tempfile.TemporaryDirectory() as work:
     reconfigured = snapshot(new)["source_root"]
     assert new != reconfigured
     contexts, _, _ = build(new, "dev", "--build-held", reconfigured)
-    assert all(view["analysis_disposition"] == "Derived" for view in contexts)
+    assert [view["analysis_origin"] for view in contexts] == ["Stored", "Derived"]
+    assert [view["receipt_written"] for view in contexts] == [False, True]
     assert contexts[0]["analysis_key"] != contexts[1]["analysis_key"]
     assert contexts[0]["diagnostics"] == contexts[1]["diagnostics"] == updated["dev"]
 
@@ -176,6 +179,7 @@ with tempfile.TemporaryDirectory() as work:
     for profile in profiles:
         verdict, _, _ = build(mixed, profile, "--build-oracle")
         assert verdict["phase"] == "PreparationRejected"
+        assert verdict["analysis_origin"] == "Derived" and verdict["receipt_written"]
         assert [d["message"] for d in verdict["preparation_diagnostics"]] == ["missing resolved call target"]
         assert [d["message"] for d in verdict["diagnostics"]] == [
             "array elements cannot be moved individually", "missing resolved call target",
@@ -184,7 +188,7 @@ with tempfile.TemporaryDirectory() as work:
             "src/z-origin.w", "src/a-lookup.w",
         ]
         shared, _, _ = build(mixed, profile, "--build-held", mixed)
-        assert sorted(view["analysis_disposition"] for view in shared) == ["Derived", "Reused"]
+        assert sorted(view["analysis_origin"] for view in shared) == ["Live", "Stored"]
         assert all(view["diagnostics"] == verdict["diagnostics"] for view in shared)
 
     assert not (project / ".wosy/artifacts").exists()
@@ -192,11 +196,12 @@ with tempfile.TemporaryDirectory() as work:
     for _ in range(4):
         verdict, wall_ms, rss = build(new, "dev", "--build")
         assert verdict["diagnostics"] == updated["dev"]
+        assert verdict["analysis_origin"] == "Stored" and not verdict["receipt_written"]
         observations.append({k: verdict[k] for k in ("preparation_ms", "analysis_ms", "authored_projection_ms")}
                             | {"wall_ms": wall_ms, "peak_child_kib": rss})
     print("ordinary Build parity on Native64/Wasm32: accepted, post-preparation diagnostics, mixed rejection, historical UTF-8:",
           {k: round(median(sample[k] for sample in observations), 3) for k in observations[0]}, flush=True)
-    print("diagnostic-only Build uses exact live preparation, concurrent share, layout/config isolation, release and remap:",
+    print("diagnostic-only Build uses exact typed preparation, persisted reuse, live share, layout/config isolation, release and remap:",
           {"shared_request_including_wait_ms": [round(value, 3) for value in concurrent_wait_ms],
-           "fresh_request_analysis_ms": round(median(sample["analysis_ms"] for sample in observations), 3)},
+           "reopened_receipt_analysis_ms": round(median(sample["analysis_ms"] for sample in observations), 3)},
           flush=True)
