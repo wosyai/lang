@@ -2540,7 +2540,7 @@ pub use comptime::{
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
     PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput, PairStartupOccurrence,
-    PairStartupSelector,
+    PairStartupSelector, StartupArgumentOrigin,
 };
 use declarations::ScalarDeclarationEnvironment;
 mod inference;

@@ -22,7 +22,7 @@ pub use direct::{
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
     PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput, PairStartupOccurrence,
-    PairStartupSelector,
+    PairStartupSelector, StartupArgumentOrigin,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -41,7 +41,7 @@ pub use scalar::{
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
     PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput, PairStartupOccurrence,
-    PairStartupSelector,
+    PairStartupSelector, StartupArgumentOrigin,
 };
 
 mod llvm;
