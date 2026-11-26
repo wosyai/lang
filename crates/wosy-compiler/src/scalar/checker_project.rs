@@ -3784,12 +3784,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     }
                     #[cfg(feature = "internal-checker")]
                     if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
+                        let plain_unit_return = parent.plain_unit_frame && completed.plain_unit_frame
+                            && matches!(effect, ExactCallEffect::Unit(_));
+                        if plain_unit_return && matches!(&result, ActualCallResult::EmptyUnit) {
+                            // The exact child's Narrow eliminated the path.
+                            // Resume the original continuation as empty, with
+                            // no invented Return or subsequent authored work.
+                            parent.cursor.resume(effect, caller_axis, result).ok_or(ProjectCheck::Unsupported)?;
+                            continue;
+                        }
                         let trace_state = trace.borrow();
                         let qualified_scalar = trace_state.proof_free_scalar_initializers && parent.source != completed.source;
                         let cited_helper = NAMED && parent.source == completed.source
                             && self.enrolled_citation_helper(&trace_state, collection, parent.body, effect.occurrence(), target);
-                        if (!qualified_scalar && !cited_helper && trace_state.ranked_target != Some(target))
-                            || !matches!(&result, ActualCallResult::Integer(_)) {
+                        let eligible_return = if plain_unit_return {
+                            matches!(&result, ActualCallResult::Unit)
+                        } else {
+                            (qualified_scalar || cited_helper || trace_state.ranked_target == Some(target))
+                                && matches!(&result, ActualCallResult::Integer(_))
+                        };
+                        if !eligible_return {
                             return Err(ProjectCheck::Unsupported);
                         }
                         drop(trace_state);
@@ -18060,6 +18074,23 @@ mod tests {
                 assert_eq!(trace.current_path().contains(&PathStep::Return(suffix.clone())), !truncated);
                 assert_eq!(trace.current_path().contains(&PathStep::Return(outer.clone())), !truncated);
             }
+
+            let narrowed = program.replace("core.require(false,", "core.narrow(false,");
+            let prepare_narrowed = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&source, &narrowed), Vec::new())], [], vec![source.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::MainFlowOnly, Vec::new()
+            ).ok().unwrap();
+            assert_eq!(prepare_narrowed().run().unwrap().directives.len(), 1);
+            let (selected, completion, trace, _) =
+                prepare_narrowed().search_startup_authored_path(NonZeroUsize::new(3).unwrap()).unwrap();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(completion, StartupAuthoredCompletion::Exhausted);
+            assert_eq!(trace.plain_history_frames, fanout + 2);
+            let returned = trace.current_path().iter().filter_map(|step| match step {
+                PathStep::Return(span) => Some(span), _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(returned, okay.iter().collect::<Vec<_>>());
+            assert!(!trace.current_path().contains(&PathStep::Call(suffix.clone())));
         }
     }
 

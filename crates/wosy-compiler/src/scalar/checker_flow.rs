@@ -8212,7 +8212,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     #[cfg(feature = "internal-checker")]
                     if let Some(histories) = roots.callable_history {
-                        if !COLLECT || !(1..=2).contains(&signature.parameters.len()) { return None; }
+                        if !COLLECT || signature.parameters.len() > 2 { return None; }
                         let span = calls.occurrences.get(expression.0)?.span;
                         let mut survivors = IntegerInputs::default();
                         for mut row in std::mem::take(&mut path.0) {
