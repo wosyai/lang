@@ -81,7 +81,7 @@ fn init_creates_a_parseable_package_with_empty_lock_and_named_profiles() {
             ProjectContext::load_parse_target(package, None).unwrap().comment_categories,
             [
                 "INTENT", "WHY", "ASSUMPTION", "RISK", "SOURCE", "WORKAROUND", "TODO",
-                "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP", "TYPE", "REPLAY", "NOISE",
+                "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP",
             ],
         );
         assert!(!package.join("references").exists());
@@ -134,6 +134,29 @@ fn init_creates_a_parseable_package_with_empty_lock_and_named_profiles() {
         config.resolved_packages["my_library"].identity.path.as_path(),
         Path::new("src"),
     );
+}
+
+#[test]
+fn init_typed_comment_defaults_can_be_extended_explicitly() {
+    let temp = Temp::new();
+    let project = temp.directory("typed_comments");
+    pass(wosy(&project, &["init"]));
+    let source_path = project.join("src/main.w");
+    let source = fs::read_to_string(&source_path).unwrap();
+    for category in ["TYPE", "REPLAY", "NOISE"] {
+        let with_comment = source.replace("%%start", &format!("%%start\n# {category}: configured comment"));
+        assert_ne!(with_comment, source);
+        fs::write(&source_path, with_comment).unwrap();
+        assert!(!wosy(&project, &["parse"]).status.success(), "{category} was enabled by default");
+    }
+    let manifest_path = project.join("wosy.toml");
+    let mut manifest = fs::read_to_string(&manifest_path).unwrap().parse::<toml_edit::DocumentMut>().unwrap();
+    for category in ["TYPE", "REPLAY", "NOISE"] {
+        manifest["comments"]["categories"].as_array_mut().unwrap().push(category);
+    }
+    fs::write(manifest_path, manifest.to_string()).unwrap();
+    fs::write(source_path, source.replace("%%start", "%%start\n# TYPE: explicit\n# REPLAY: explicit\n# NOISE: explicit")).unwrap();
+    pass(wosy(&project, &["parse"]));
 }
 
 #[test]
