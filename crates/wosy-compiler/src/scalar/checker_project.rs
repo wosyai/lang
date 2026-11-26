@@ -3375,9 +3375,34 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     SymbolicProofRuntime { project: self.project, calls: self.calls, visits: ordered.visits },
                                     &frame.cursor,
                                 )? {
+                                    let trace = ordered.failures.borrow().startup_search.clone();
+                                    let point = if let Some(trace) = &trace {
+                                        let trace = trace.borrow();
+                                        let route = trace.pointee_route.as_ref().ok_or(ProjectCheck::Unsupported)?;
+                                        if !trace.owns_initialization(source) || route.callee != target
+                                            || !route.pending_calls.contains(&occurrence)
+                                            || !self.calls.function_body(route.caller.0, route.caller.1, None)
+                                                .is_some_and(|original| std::ptr::eq(original, body))
+                                        { return Err(ProjectCheck::Unsupported); }
+                                        Some(site.source_span.clone())
+                                    } else { None };
+                                    if let (Some(trace), Some(point)) = (&trace, &point) {
+                                        trace.borrow_mut().append(failure_search::PathStep::Call(point.clone()))
+                                            .ok_or(ProjectCheck::Unsupported)?;
+                                    }
                                     frame.cursor.resume_exact_local_updates(update.into_iter()).ok_or(ProjectCheck::Unsupported)?;
                                     self.note_reached(target);
                                     self.had_obligations = true;
+                                    if let (Some(trace), Some(point)) = (&trace, point) {
+                                        let mut trace = trace.borrow_mut();
+                                        trace.append(failure_search::PathStep::Return(point)).ok_or(ProjectCheck::Unsupported)?;
+                                        if !trace.pointee_route.as_mut().ok_or(ProjectCheck::Unsupported)?.pending_calls.remove(&occurrence) {
+                                            return Err(ProjectCheck::Unsupported);
+                                        }
+                                        if trace.remaining() == 0 && trace.cannot_continue() {
+                                            return Err(ProjectCheck::StartupAuthoredLimitReached);
+                                        }
+                                    }
                                     continue;
                                 }
                             }
@@ -4100,6 +4125,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && signature.parameters.len() == 1 && is_integer_type(expected);
             let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
                 && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
+            let matches_pointee_entry = Observer::EXACT_POINTEE_UPDATE
+                && search.pointee_route.as_ref().is_some_and(|route| route.caller == target && route.startup_site == call)
+                && search.owns_initialization(caller) && caller == &owner.source
+                && *expected == ScalarType::Unit && signature.parameters.is_empty();
+            if search.pointee_route.is_some() && !matches_pointee_entry { return Err(ProjectCheck::Unsupported); }
             // Once the named route spends its ordinary quota, only the
             // pending, top-level authenticated binding calls may run.
             if search.proof_only_continuation() && search.pending_named_startup_observation()
@@ -4115,7 +4145,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !matches_context_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_context_entry && !matches_pointee_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && !matches_pointee_entry && !plain_scalar_wrapper && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
                 || !body.structure.checker_selected_snapshots.is_empty()
                 || !body.structure.module_storage_uses.is_empty()
@@ -10642,6 +10672,12 @@ fn run_private_named_after_startup(
     for (proof_source, is_provider, definition, query, name) in &named_definitions {
         let proof_source = *proof_source;
         let selected = owner.resolve_selected_proof(definition, *query)?;
+        if pointer_proof::is_unit_target(&selected) {
+            if qualified || expected.is_some() || named_definitions.len() != 1 || proof_source != &owner.source {
+                return Err(ProjectCheck::Unsupported);
+            }
+            return pointer_proof::Plan::prepare(proof_source, selected)?.run_capped(owner, scope, cap);
+        }
         if array_quantifier::is_array_target(&selected) {
             if qualified || expected.is_some() || proof_source != &owner.source { return Err(ProjectCheck::Unsupported); }
             super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;

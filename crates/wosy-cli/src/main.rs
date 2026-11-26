@@ -2751,6 +2751,48 @@ main_artifact = "main"
                 assert_eq!(files(), first_file);
                 clean();
                 fs::remove_file(shared_source).unwrap();
+                let checked_cells = format!(r#"%%start
+                    unit(*!u32) advance = fn(cell) {{ *cell = *cell +@ 1; }};
+                    proof epoch for advance(p) -> () ensures (*p == core.old(*p) +@ 1) {{}}
+                    unit() start = fn {{
+                        u32 local = 4294967295;
+                        advance(&!local);
+                        advance(&!local);
+                        core.require(local == 1, {unused_output});
+                        core.require(local == 0, {first});
+                        core.require(local == 2, {second});
+                    }};
+                    start();
+                %%end"#);
+                fs::write(&source, &checked_cells).unwrap();
+                let old_pointer = terminal(&[legacy()], scope, false);
+                assert_eq!(old_pointer.0, Ok(19));
+                assert_eq!(files(), both_files);
+                clean();
+                let first_pointer = selected(1);
+                let report = first_pointer[0].outcome.as_ref().unwrap();
+                let [record] = report.directives.as_slice() else { panic!("selection after the two authenticated updates"); };
+                let range = record.condition;
+                assert_eq!(&checked_cells[range.start as usize..range.end as usize], "local == 0");
+                assert!(record.witness.intervals_at(0, 0).unwrap().eq([(&1.into(), &1.into())]));
+                assert_eq!(terminal(&first_pointer, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                assert_eq!(terminal(&selected(8), scope, false), old_pointer);
+                assert_eq!(files(), both_files);
+                clean();
+                let after_limit = checked_cells.replace("start();", &format!("core.require(false, {first}); start();"));
+                fs::write(&source, &after_limit).unwrap();
+                assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+                // A false theorem over otherwise valid checked loans does
+                // not justify either update, even after an earlier cap.
+                fs::write(&source, after_limit.replace("core.old(*p) +@ 1", "core.old(*p) +@ 2")).unwrap();
+                let refused = selected(1);
+                assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+
                 let aggregate = format!(r#"%%start
                     u8[2]() make = fn {{ [7, 1] }};
                     proof cells for make() -> (items)

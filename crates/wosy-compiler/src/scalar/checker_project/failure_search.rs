@@ -34,6 +34,13 @@ pub(super) struct StartupProofObservation {
     pub(super) returned: BigInt,
 }
 
+pub(super) struct PointeeRoute {
+    pub(super) startup_site: OccurrenceOrdinal,
+    pub(super) caller: PreparedCallable,
+    pub(super) callee: PreparedCallable,
+    pub(super) pending_calls: HashSet<OccurrenceOrdinal>,
+}
+
 pub(in super::super) type SharedStartupTrace = std::rc::Rc<std::cell::RefCell<StartUpSearch>>;
 
 pub(in super::super) struct StartUpSearch {
@@ -49,6 +56,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) required_sites: HashMap<OccurrenceOrdinal, (PreparedCallable, StartupProofRole)>,
     pub(super) retain_after_cutoff: bool,
     pub(super) metered_frames: bool,
+    pub(super) pointee_route: Option<PointeeRoute>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
     pub(super) contextual_observed: bool,
     pub(super) ranked_target: Option<PreparedCallable>,
@@ -60,7 +68,7 @@ pub(in super::super) struct StartUpSearch {
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
         Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, metered_frames: false,
-            contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observations: Vec::new(),
+            pointee_route: None, contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
@@ -142,7 +150,8 @@ impl StartUpSearch {
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
             && ((self.contextual_route.is_some() && !self.contextual_observed)
-                || self.pending_named_startup_observation())
+                || self.pending_named_startup_observation()
+                || self.pointee_route.as_ref().is_some_and(|route| !route.pending_calls.is_empty()))
     }
 
     pub(in super::super) fn cannot_continue(&self) -> bool {

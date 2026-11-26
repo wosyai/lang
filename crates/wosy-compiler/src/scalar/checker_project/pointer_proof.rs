@@ -142,6 +142,77 @@ impl Plan {
         )))
     }
 
+    pub(super) fn run_capped(
+        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+        let prepared = &owner.prepared;
+        let (project, calls) = prepared.parts();
+        let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let (root, ordinals) = package_startup_order(project, &project.modules)?;
+        if root != &owner.source || &self.proof.source != root || self.target.0 != 0 || self.guard.is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let leaf = calls.function_body(self.target.0, self.target.1, None).ok_or(ProjectCheck::Unsupported)?;
+        if !leaf.conditionals.is_empty() || !leaf.structure.checker_directives.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let region = calls.initialization_region(0).ok_or(ProjectCheck::Unsupported)?;
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return Err(ProjectCheck::Unsupported); };
+        let mut startup = topology.call_targets.iter();
+        let Some((&startup_site, ModuleInitializationCallTarget::Direct {
+            declaration, concrete: ConcreteCallSelection::Declaration,
+        })) = startup.next() else { return Err(ProjectCheck::Unsupported); };
+        if startup.next().is_some() || &declaration.source != root || !topology.callable_escapes.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let caller = *topology.structure.checker_direct_targets.get(&startup_site).ok_or(ProjectCheck::Unsupported)?;
+        let Some(ScalarItem::Function(function)) = module.items.get(caller.1) else { return Err(ProjectCheck::Unsupported); };
+        if caller.0 != 0 || caller == self.target || function.name_span != declaration.range
+            || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+        { return Err(ProjectCheck::Unsupported); }
+        let body = calls.function_body(caller.0, caller.1, None).ok_or(ProjectCheck::Unsupported)?;
+        if !body.checker_returns_unit() || !body.boundary.parameters.is_empty() || !body.conditionals.is_empty()
+            || !literal_history_directives(body) || !(1..=4).contains(&body.call_occurrences.len())
+            || body.structure.checker_direct_targets.len() != body.call_occurrences.len()
+        { return Err(ProjectCheck::Unsupported); }
+        let mut pending_calls = HashSet::new();
+        for edge in &body.call_occurrences {
+            if body.structure.checker_direct_targets.get(&edge.ordinal) != Some(&self.target)
+                || !pending_calls.insert(edge.ordinal)
+            { return Err(ProjectCheck::Unsupported); }
+        }
+        let count = pending_calls.len();
+        let (_, authored_roots) = package_obligation_roots(prepared, scope, 1, root)?;
+        if authored_roots.into_iter().any(|(module, items)|
+            module != caller.0 || items.into_iter().any(|item| item != caller.1))
+        { return Err(ProjectCheck::Unsupported); }
+        let mut trace = failure_search::StartUpSearch::new(root, cap);
+        trace.pointee_route = Some(failure_search::PointeeRoute { startup_site, caller, callee: self.target, pending_calls });
+        let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(trace))), ..OrderedFailures::default() };
+        let (init, _) = walk_prepared_initialization::<_, true, true>(
+            prepared, root, ordinals, self, Some(&mut effects),
+        );
+        let trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+            .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+        if trace.invalid() || trace.pointee_route.as_ref().is_none_or(|route| !route.pending_calls.is_empty())
+            || self.applied.get() != Some((caller.1, count))
+            || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+            || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+        { return Err(ProjectCheck::Unsupported); }
+        let completion = match init {
+            Ok(init) if trace.remaining() > 0 && self.complete_startup(&init.reached)? => StartupAuthoredCompletion::Exhausted,
+            Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+            Err(error) => return Err(error),
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        Ok((MainFlowProofReceipt {
+            mixed_context_after_scalar: None, active: true, directives: effects.records, diagnostics: Vec::new(),
+            contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), aggregate_diagnostics: Vec::new(),
+            symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+            pointer_effect_diagnostic: None,
+        }, completion))
+    }
+
     pub(super) fn run(
         &self, prepared: &PreparedCheckerProject, scope: ScalarCheckerScope,
     ) -> Result<MainFlowProofReceipt, ProjectCheck> {
