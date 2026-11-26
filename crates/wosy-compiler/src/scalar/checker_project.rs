@@ -1633,10 +1633,19 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
     let mut checked_items = structure.blocks[structure.root.0].items.iter();
     let mut storage = HashMap::new();
     for step in &region.steps {
-        if let ModuleInitializationStepKind::NamespaceDispatch { target, .. } = &step.kind {
+        if let ModuleInitializationStepKind::NamespaceDispatch { target, binding_span, .. } = &step.kind {
             let NamespaceTarget::Bound(target) = target else {
                 return Err(ProjectCheck::Unsupported);
             };
+            #[cfg(feature = "internal-checker")]
+            if let Some(search) = failures.as_deref_mut().and_then(|effects| effects.startup_search.as_ref()) {
+                if source.project != target.project || source.package != target.package { return Err(ProjectCheck::Unsupported); }
+                search.borrow_mut().append(failure_search::PathStep::Namespace {
+                    binding: wosy_syntax::SourceSpan::new(source.clone(), *binding_span), target: target.clone(),
+                }).ok_or(ProjectCheck::Unsupported)?;
+            }
+            #[cfg(not(feature = "internal-checker"))]
+            let _ = binding_span;
             if walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(project, calls, ordinals, visits, actual, target, failures)? == StartupLane::Empty {
                 return Ok(StartupLane::Empty);
             }
@@ -1888,6 +1897,8 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             outer: (PRIVATE_NESTED_SCALAR && depth == 0).then_some(OrderedInitializerCall { topology, occurrence: expression }),
             #[cfg(feature = "internal-checker")]
             startup_site,
+            #[cfg(feature = "internal-checker")]
+            startup_site_source: startup_site.map(|_| source),
             ..OrderedCallCollection::new(&sink, Some(visits))
         }))
     } else { None };
@@ -2078,6 +2089,7 @@ fn run_scalar_initializer_call(
     let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
         scalar_initializer: passive_binding.then_some(OrderedInitializerCall { topology, occurrence }),
         startup_site: (passive_binding && failures.borrow().startup_search.is_some()).then_some(OrderedInitializerCall { topology, occurrence }),
+        startup_site_source: (passive_binding && failures.borrow().startup_search.is_some()).then_some(source),
         ..OrderedCallCollection::new(failures, Some(visits))
     }));
     #[cfg(not(feature = "internal-checker"))]
@@ -2339,6 +2351,8 @@ struct OrderedCallCollection<'a, 'visits> {
     meter_named_legacy_unit: bool,
     #[cfg(feature = "internal-checker")]
     startup_site: Option<OrderedInitializerCall<'a>>,
+    #[cfg(feature = "internal-checker")]
+    startup_site_source: Option<&'a SourceIdentity>,
 }
 
 impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
@@ -2353,6 +2367,8 @@ impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
             meter_named_legacy_unit: false,
             #[cfg(feature = "internal-checker")]
             startup_site: None,
+            #[cfg(feature = "internal-checker")]
+            startup_site_source: None,
         }
     }
 }
@@ -3147,7 +3163,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let authored_site = if let Some((ordered, site)) = collection.and_then(|ordered| ordered.startup_site.map(|site| (ordered, site))) {
             let at = site.topology.occurrences.get(site.occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-            let at = wosy_syntax::SourceSpan::new(source.clone(), at);
+            let site_source = ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?;
+            let at = wosy_syntax::SourceSpan::new(site_source.clone(), at);
             let trace = ordered.failures.borrow().startup_search.clone().ok_or(ProjectCheck::Unsupported)?;
             trace.borrow_mut().append(failure_search::PathStep::Call(at.clone())).ok_or(ProjectCheck::Unsupported)?;
             cursor.track_startup_path(source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
@@ -3912,7 +3929,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let matches_named = search.named_target == Some(target)
                 && search.named_observation.is_none() && is_integer_type(expected)
                 && signature.parameters.len() == 1 && ordered.scalar_initializer.is_some();
-            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named) || caller != &owner.source
+            let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
+                && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
+            if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named) || (caller != &owner.source && !cross_authorized)
+                || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
                 || !body.checker_named_route_frame() || !body.call_occurrences.is_empty()
@@ -4165,7 +4185,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 return Err(ProjectCheck::Unsupported);
             }
             trace.named_observation = Some(failure_search::StartupNamedObservation {
-                site: wosy_syntax::SourceSpan::new(owner.source.clone(), at),
+                site: wosy_syntax::SourceSpan::new(ordered.startup_site_source.ok_or(ProjectCheck::Unsupported)?.clone(), at),
                 directive_position: effects.records.len(), parameter: parameter.clone(),
                 argument: (*argument).clone(), returned: value.clone(),
             });
@@ -9898,6 +9918,16 @@ impl PreparedScalarOrderedCheck {
         run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Mixed).map_err(configured_ordered_error)
     }
 
+    /// Private actual root call to a completed same-package namespace owner.
+    #[doc(hidden)]
+    pub fn search_startup_with_qualified_named(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 2 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Qualified).map_err(configured_ordered_error)
+    }
+
     /// Accepts only a proof-free owner and never drops possible dormant
     /// package obligations. Call once before sharing a command budget.
     #[doc(hidden)]
@@ -9937,19 +9967,21 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        run_startup_authored_path(&self.owner, cap, None)
+        run_startup_authored_path(&self.owner, cap, None, false)
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>,
+    owner: &PreparedCheckerProject, cap: std::num::NonZeroUsize, named_target: Option<PreparedCallable>, qualified: bool,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, _) = owner.parts();
-    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    let (root, ordinals) = package_startup_order(project, std::slice::from_ref(module))?;
+    let count = if qualified { 2 } else { 1 };
+    if project.modules.len() != count { return Err(ProjectCheck::Unsupported); }
+    let (root, ordinals) = package_startup_order(project, &project.modules)?;
     let mut search = failure_search::StartUpSearch::new(root, cap);
     search.named_target = named_target;
+    search.named_cross_source = qualified;
     let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         owner, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
@@ -9972,19 +10004,22 @@ fn run_startup_authored_path(
 }
 
 #[cfg(feature = "internal-checker")]
-enum StartupNamedMode { Dormant, Invoked, Mixed }
+enum StartupNamedMode { Dormant, Invoked, Mixed, Qualified }
 
 #[cfg(feature = "internal-checker")]
 fn run_private_named_after_startup(
     owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, mode: StartupNamedMode,
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
     let (project, calls) = owner.prepared.parts();
-    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let qualified = matches!(mode, StartupNamedMode::Qualified);
+    let startup_count = if qualified { 2 } else { 1 };
+    if project.modules.len() != startup_count { return Err(ProjectCheck::Unsupported); }
     let mut catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
     let (proof_source, catalog) = catalogs.next().ok_or(ProjectCheck::Unsupported)?;
     let count = if matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
     if catalog.definitions.len() != count || catalogs.next().is_some() || owner.context.is_some()
-        || proof_source != &owner.source || &module.source != proof_source
+        || (proof_source != &owner.source) != qualified || proof_source.project != owner.source.project
+        || proof_source.package != owner.source.package
     { return Err(ProjectCheck::Unsupported); }
     let names = catalog.definitions.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
         .collect::<Result<Vec<_>, _>>()?;
@@ -9992,10 +10027,10 @@ fn run_private_named_after_startup(
     for (index, (definition, name)) in catalog.definitions.iter().zip(&names).enumerate() {
         let selected = owner.resolve_selected_proof(definition, catalog.first_query + index)?;
         let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
-            proof_source, name.text(), selected, false,
+            proof_source, name.text(), selected, qualified,
         )?;
         let body = plan.typed.body;
-        if plan.target.0 != 0 || &plan.typed.target.source != proof_source
+        if (plan.target.0 != 0) != qualified || &plan.typed.target.source != proof_source
             || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
             || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
             || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
@@ -10008,7 +10043,7 @@ fn run_private_named_after_startup(
         plans.push(plan);
     }
     let declarations = plans.iter().map(|plan| plan.function.name_span).collect::<Vec<_>>();
-    let incoming = calls.owned_direct_startup_callable_uses(proof_source, &declarations).ok_or(ProjectCheck::Unsupported)?;
+    let incoming = calls.owned_direct_startup_callable_uses(proof_source, &owner.source, &declarations).ok_or(ProjectCheck::Unsupported)?;
     let mut invoked = None;
     for plan in &plans {
         match incoming.get(&plan.function.name_span) {
@@ -10019,7 +10054,7 @@ fn run_private_named_after_startup(
         }
     }
     if invoked.is_some() == matches!(mode, StartupNamedMode::Dormant) { return Err(ProjectCheck::Unsupported); }
-    let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, 1, &owner.source)?;
+    let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, startup_count, &owner.source)?;
     if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
     // Legacy dormant observers walk declaration order, not proof clause
     // order. Preserve it even when typed goals were authored in reverse.
@@ -10030,12 +10065,12 @@ fn run_private_named_after_startup(
         observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
     }
     observer.finish_plans(&owner.prepared, scope)?;
-    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked)?;
+    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified)?;
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
     if let Some(observed) = trace.named_observation {
-        if &observed.site.source != proof_source { return Err(ProjectCheck::Unsupported); }
+        if observed.site.source != owner.source { return Err(ProjectCheck::Unsupported); }
         observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
-            source: proof_source,
+            source: &observed.site.source,
             call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
         }), &[observed.parameter], &[&observed.argument], &observed.returned);
     }
@@ -14970,6 +15005,58 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_qualified_named_uses_actual_completed_same_package_owner() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-qualified-app");
+        let lib = source("src/lib.w", "private-qualified-lib");
+        let main = format!(r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8 actual = lib.echo(3);
+            core.require(actual == 4, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let library = r#"%%start
+            u8(u8) echo = fn(value) { if (value < 4) { value } else { 7 } };
+            proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |primary: &str, library: &str| {
+                    let parse = |source: &SourceIdentity, text: &str|
+                        crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap().1;
+                    let import = ScalarNamespaceBinding { binding: "lib".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parse(&app, primary), vec![import]), (parse(&lib, library), Vec::new())],
+                        vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    ).ok().unwrap()
+                };
+                let old = prepare(&main, library).run().unwrap();
+                for cap in [1, 3] {
+                    let (report, end) = prepare(&main, library).search_startup_with_qualified_named(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert_eq!(end, if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(report.directives.len(), cap.min(2));
+                    assert_eq!(report.directives[0].directive, old.directives[0].directive);
+                    let [failure] = report.diagnostics.as_slice() else { panic!("one actual qualified proof"); };
+                    assert_eq!(failure.proof.source, lib);
+                    assert_eq!(failure.invocation.call.source, app);
+                    assert_eq!(failure.invocation.call, old.diagnostics[0].invocation.call);
+                    let range = failure.invocation.call.range;
+                    assert_eq!(&main[range.start as usize..range.end as usize], "lib.echo(3)");
+                    assert_eq!(failure.invocation.namespaced_callable.as_ref().unwrap().source, lib);
+                    assert_eq!(failure.invocation.returned, 3.into());
+                    assert!(report.symbolic_diagnostic.is_none());
+                }
+                let satisfied = library.replace("out == 4", "out == 3");
+                assert!(prepare(&main, &satisfied).search_startup_with_qualified_named(NonZeroUsize::MIN).unwrap().0.diagnostics.is_empty());
+                let early = main.replace("lib = namespace", &format!("core.require(false, {OUTPUT}); lib = namespace"));
+                assert!(matches!(prepare(&early, library).search_startup_with_qualified_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

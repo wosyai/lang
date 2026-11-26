@@ -7,6 +7,7 @@ use super::{PreparedCallable, ScalarType};
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(in super::super) enum PathStep {
     Startup(SourceIdentity),
+    Namespace { binding: SourceSpan, target: SourceIdentity },
     Call(SourceSpan),
     Return(SourceSpan),
     Output(SourceSpan),
@@ -36,12 +37,13 @@ pub(in super::super) struct StartUpSearch {
     work: usize,
     invalid: bool,
     pub(super) named_target: Option<PreparedCallable>,
+    pub(super) named_cross_source: bool,
     pub(super) named_observation: Option<StartupNamedObservation>,
 }
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, named_target: None, named_observation: None }
+        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, named_target: None, named_cross_source: false, named_observation: None }
     }
 
     pub(in super::super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {
