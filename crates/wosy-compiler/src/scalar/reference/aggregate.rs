@@ -3354,8 +3354,11 @@ fn seal_fixed_view_backing<'a>(
         }
         let prove_uses = || {
             let (wrapper, forwarded) = incoming(key)?;
-            let (wrapper_decl, wrapper_fn) = function(wrapper)?;
-            if wrapper.2.is_none() || !crate::scalar::typecheck::is_module_private_name(&wrapper_decl.name) { return None; }
+            let (_, wrapper_fn) = function(wrapper)?;
+            // A selected concrete overload symbol can be private without
+            // changing the public source declaration. The complete typed
+            // incoming-use census above must close this exact arm.
+            if wrapper.2.is_none() { return None; }
             let wrapper_body = bodies.get(&wrapper)?;
             let wrapper_sites = wrapper_body.sites;
             if !matches!(wrapper_fn.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] if arguments.len() == parameters.len())
@@ -3367,25 +3370,76 @@ fn seal_fixed_view_backing<'a>(
             let (_, sink_fn) = function(sink)?;
             let sink_body = bodies.get(&sink)?;
             let sites = sink_body.sites;
-            let [ScalarBlockItem::LocalBinding(receiver), ScalarBlockItem::Expression(ScalarExpression::Block(read))]
+            let [ScalarBlockItem::LocalBinding(receiver), outputs @ ..]
                 = sink_fn.body.items.as_slice() else { return None; };
+            if sink_fn.body.final_output_values.len() != outputs.len() { return None; }
             let [local_result] = receiver.receivers.as_slice() else { return None; };
             if &local_result.ty != returned_ty || receiver.is_allocation
                 || !matches!(&receiver.value, ScalarExpression::Call { arguments, .. } if arguments.len() == parameters.len())
                 || !exact_fixed_view_arguments(sink_body, sink_fn, obtain, parameters)
                 || expression(sites, OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 }) != Some(obtain)
             { return None; }
-            let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })] = read.items.as_slice() else { return None; };
-            if !read.unsafe_context || arguments.len() != 1 { return None; }
-            let read = block_output(sites, block_child(sites, block_output(sites, sites.structure.root, 1)?)?, 0)?;
-            let read_site = sink_body.cfg.primary_call_point(read)?;
-            if !matches!(sink_body.cfg.points.get(read_site.0)?.kind, CfgPointKind::Call {
-                output: 0, target: ResolvedCallTarget::Core(CoreOperationId::Load), ..
-            }) || sites.structure.checked_types.expressions.get(&read) != Some(&ScalarType::U8) { return None; }
-            let view = expression(sites, OccurrenceParent::Expression(read), OccurrenceEdge::CallArgument(0))?;
-            let (read_binding, read_field) = sites.prepared_lexical_member(view)?;
-            if read_field != returned_field || &read_binding.source != sink_body.source
-                || read_binding.function_span != sink_fn.span || read_binding.declaration_span != local_result.name_span { return None; }
+            let ScalarType::Array { length, .. } = &local.ty else { return None; };
+            // Authorize reads against the initialized backing capacity.
+            // The first output is independent scalar metadata, not a bound
+            // or authority to read through the associated view.
+            let full_bytes = *length == 3 && outputs.len() == 4;
+            if outputs.len() != 1 && !full_bytes { return None; }
+            let checked_member = |value, pointer| {
+                let (binding, field) = sites.prepared_lexical_member(value)?;
+                (&binding.source == sink_body.source && binding.function_span == sink_fn.span
+                    && binding.declaration_span == local_result.name_span
+                    && field.structure == returned_field.structure
+                    && (field == returned_field) == pointer).then_some(())
+            };
+            let exact_core_call = |value, operation, result_type| {
+                let call = sink_body.cfg.primary_call_point(value)?;
+                if !matches!(sink_body.cfg.points.get(call.0)?.kind, CfgPointKind::Call {
+                    output: 0, target: ResolvedCallTarget::Core(actual), ..
+                } if actual == operation)
+                    || sites.structure.checked_types.expressions.get(&value) != Some(&result_type)
+                { return None; }
+                Some(())
+            };
+            let mut bytes = BTreeSet::new();
+            let raw_byte = ScalarType::RawPointer(Box::new(ScalarType::U8));
+            for (ordinal, piece) in outputs.iter().enumerate() {
+                let root_output = expression(sites, OccurrenceParent::Block(sites.structure.root),
+                    OccurrenceEdge::FinalOutput { item: ordinal + 1, output: ordinal })?;
+                let ScalarBlockItem::Expression(value) = piece else { return None; };
+                if full_bytes && ordinal == 0 {
+                    if sites.structure.checked_types.expressions.get(&root_output) != Some(&ScalarType::U64) {
+                        return None;
+                    }
+                    checked_member(root_output, false)?;
+                    continue;
+                }
+                let ScalarExpression::Block(read) = value else { return None; };
+                let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, .. })]
+                    = read.items.as_slice() else { return None; };
+                if !read.unsafe_context || read.final_output_values.len() != 1 { return None; }
+                let read_block = block_child(sites, root_output)?;
+                let output = block_output(sites, read_block, 0)?;
+                let [address] = arguments.as_slice() else { return None; };
+                exact_core_call(output, CoreOperationId::Load, ScalarType::U8)?;
+                let view = expression(sites, OccurrenceParent::Expression(output), OccurrenceEdge::CallArgument(0))?;
+                let (member, index) = if let ScalarExpression::Call { arguments, .. } = address {
+                    if !full_bytes { return None; }
+                    let [_, ScalarExpression::Integer { value, .. }] = arguments.as_slice() else { return None; };
+                    let index = u64::try_from(value).ok()?;
+                    exact_core_call(view, CoreOperationId::Offset, raw_byte.clone())?;
+                    let index_expression = expression(sites, OccurrenceParent::Expression(view), OccurrenceEdge::CallArgument(1))?;
+                    if !matches!(sites.structure.checked_types.expressions.get(&index_expression), Some(ScalarType::I64)) {
+                        return None;
+                    }
+                    (expression(sites, OccurrenceParent::Expression(view), OccurrenceEdge::CallArgument(0))?, index)
+                } else {
+                    (view, 0)
+                };
+                if index >= *length || !bytes.insert(index) { return None; }
+                checked_member(member, true)?;
+            }
+            if full_bytes && !bytes.iter().copied().eq(0..*length) { return None; }
             Some((wrapper, forwarded, sink, obtain, local.name_span, local.ty.clone()))
         };
         let (wrapper, forwarded, sink, obtain, binding, array) = prove_uses()
@@ -7592,6 +7646,13 @@ fn closed_aggregates<'a>(
         let fixed_view_candidate = match (arm, body.body.items.as_slice()) {
             (None, [ScalarBlockItem::LocalBinding(_), .., ScalarBlockItem::Expression(ScalarExpression::StructLiteral { .. })])
             | (None, [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(ScalarExpression::Block(_))])
+            | (None, [
+                ScalarBlockItem::LocalBinding(_),
+                ScalarBlockItem::Expression(ScalarExpression::Member { .. }),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+                ScalarBlockItem::Expression(ScalarExpression::Block(_)),
+            ])
             | (Some(_), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })]) => true,
             _ => false,
         };
