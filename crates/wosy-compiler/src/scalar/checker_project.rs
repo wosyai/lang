@@ -10530,7 +10530,7 @@ fn closed_startup_scalar_history(body: &FunctionCallSites) -> bool {
         && matches!(body.boundary.results.as_slice(), [result] if is_integer_type(&result.ty))
         && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
-        && witness_history_directives(body)
+        && witness_history_directives(body, false)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10559,11 +10559,13 @@ fn literal_history_directives(body: &FunctionCallSites) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
-fn witness_history_directives(body: &FunctionCallSites) -> bool {
+fn witness_history_directives(body: &FunctionCallSites, compound: bool) -> bool {
     use super::checker_directive::{CheckerStateSelection, CheckerStateType};
-    body.structure.checker_directives.values().all(|directive| matches!(directive.operation,
+    body.structure.checker_directives.iter().all(|(site, directive)| matches!(directive.operation,
         CheckerOperation::Require | CheckerOperation::Narrow)
-        && matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+        && (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+            || (compound && body.structure.checker_ordinary_booleans.get(site)
+                .is_some_and(super::checker_flow::call_free_history_boolean)))
         && !directive.output.has_module_values
         && matches!(directive.output.code_value, CheckerCode::Literal(_) | CheckerCode::Binding(..))
         && directive.output.state_files.iter().all(|file|
@@ -10588,7 +10590,7 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
                 || body.structure.checker_ordinary_booleans.get(condition)
                     .is_some_and(super::checker_flow::call_free_history_boolean)
         })
-        && witness_history_directives(body)
+        && witness_history_directives(body, true)
 }
 
 #[cfg(feature = "internal-checker")]

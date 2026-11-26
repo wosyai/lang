@@ -8201,6 +8201,16 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     }
                 }
             }
+            #[cfg(feature = "internal-checker")]
+            if self.structure.checker_ordinary_booleans.get(&ordinal)
+                .is_some_and(super::checker_flow::call_free_history_boolean)
+            {
+                // The ordinary checker has already type-checked this
+                // condition. Retain its real operand occurrences only in
+                // the supported pure tree, not authored output expressions.
+                self.expression_at(condition, names, types, OccurrenceParent::Expression(ordinal),
+                    OccurrenceEdge::CallArgument(0))?;
+            }
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {

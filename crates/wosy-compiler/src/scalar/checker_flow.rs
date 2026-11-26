@@ -7295,6 +7295,79 @@ enum GuardProgress {
 }
 
 #[cfg(feature = "internal-checker")]
+fn group_callable_rows<T>(
+    rows: impl IntoIterator<Item = T>, history: impl Fn(&T) -> usize,
+    count: usize, tracker: &std::cell::RefCell<CallableHistories<'_>>,
+) -> Option<Vec<Vec<T>>> {
+    tracker.borrow().charge(count.checked_mul(2)?)?;
+    let mut order = HashMap::new();
+    let mut groups = Vec::<Vec<T>>::new();
+    for row in rows {
+        let group = *order.entry(history(&row)).or_insert_with(|| {
+            let index = groups.len();
+            groups.push(Vec::new());
+            index
+        });
+        groups[group].push(row);
+    }
+    Some(groups)
+}
+
+#[cfg(feature = "internal-checker")]
+fn project_callable_compound_directive<'a>(
+    calls: &'a FunctionCallSites, roots: &mut IntegerRoots<'a>, path: &mut IntegerInputs,
+    site: OccurrenceOrdinal, tree: &super::reference::CheckerOrdinaryBoolean,
+    operation: CheckerOperation, failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
+) -> Option<()> {
+    let tracker = roots.callable_history?;
+    let OccurrenceNode::Expression(condition) = calls.structure.edges.get(&(
+        OccurrenceParent::Expression(site), OccurrenceEdge::CallArgument(0),
+    ))? else { return None; };
+    let require = operation == CheckerOperation::Require;
+    // Group the pre-directive structural histories before evaluating any
+    // predicate. A Narrow can fail only when *all* its group's rows fail.
+    let mut survivors = IntegerInputs::default();
+    for group in group_callable_rows(&path.0, |row| row.callable_history, path.0.len(), tracker)? {
+        let mut work = tracker.borrow().work.get();
+        let before = IntegerInputs(group.into_iter().map(|row| {
+            charge_call_work(&mut work, row.len().checked_add(1)?)?;
+            Some(row.clone())
+        }).collect::<Option<Vec<_>>>()?);
+        let [rejecting, passing] = before.ordinary_boolean(tree, roots, [require, !require],
+            &mut work, Some((calls, *condition, tracker)))?;
+        tracker.borrow().work.set(work);
+        let rejected = if require {
+            // The assertion must not affect subsequent flow. Only its
+            // selected failure packets carry the evaluated operand paths.
+            let count = rejecting.0.len();
+            group_callable_rows(rejecting.0, |row| row.callable_history, count, tracker)?
+        } else if passing.is_unreachable() {
+            // Report the authentic pre-Narrow witness exactly once, without
+            // promoting hypothetical rejection candidates to continuations.
+            vec![before.0]
+        } else {
+            tracker.borrow().charge(passing.0.len())?;
+            survivors.0.extend(passing.0);
+            Vec::new()
+        };
+        for rows in rejected {
+            let witness = IntegerInputs(rows);
+            let mut work = tracker.borrow().work.get();
+            charge_call_work(&mut work, roots.axes.len().checked_add(1)?)?;
+            let equal_axes = witness.common_equal_axes_bounded(&mut work)?;
+            tracker.borrow().work.set(work);
+            (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                directive: site, state: witness, axes: roots.axes.clone(), equal_axes,
+            });
+            roots.after_startup_candidate()?;
+        }
+    }
+    if !require { *path = survivors; }
+    roots.reached_obligation = true;
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn call_free_history_boolean(condition: &super::reference::CheckerOrdinaryBoolean) -> bool {
     use super::reference::CheckerOrdinaryBoolean as Boolean;
     fn valid(node: &Boolean) -> bool {
@@ -7692,6 +7765,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             continue;
                         }
                     }
+                    #[cfg(feature = "internal-checker")]
+                    if COLLECT && roots.callable_history.is_some() {
+                        if let Some(tree) = structure.checker_ordinary_booleans.get(&expression).filter(|tree|
+                            call_free_history_boolean(tree))
+                        {
+                            project_callable_compound_directive(calls, roots, &mut path, expression, tree, directive.operation, failures)?;
+                            continue;
+                        }
+                    }
                     let predicate = directive.predicate.as_ref()?;
                     #[cfg(feature = "internal-checker")]
                     if roots.projected_narrow_integer {
@@ -7754,18 +7836,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         if directive.operation == CheckerOperation::Require {
                             // Index already materialized rows in encounter
                             // order; never project a later path after cutoff.
-                            histories.borrow().charge(path.0.len().checked_mul(2)?)?;
-                            let mut order = HashMap::new();
-                            let mut groups = Vec::<Vec<&IntegerRow>>::new();
-                            for row in &path.0 {
-                                let group = *order.entry(row.callable_history).or_insert_with(|| {
-                                    let index = groups.len();
-                                    groups.push(Vec::new());
-                                    index
-                                });
-                                groups[group].push(row);
-                            }
-                            for group in groups {
+                            for group in group_callable_rows(&path.0, |row| row.callable_history, path.0.len(), histories)? {
                                 let mut rejecting = IntegerInputs::default();
                                 for row in group {
                                     charge_row(row)?;

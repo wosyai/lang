@@ -3897,6 +3897,75 @@ main_artifact = "main"
                     assert!(duplicate.0.is_err() && duplicate.1.is_empty() && duplicate.2.is_empty() && !state.exists());
                 }
 
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let compared = r#"%%start
+                        unit(u8, u8) report = fn(left, right) {
+                            core.require(left != 0 && right != 0,
+                                { .stdout = "require"; .stderr = ""; .code = 0; .files = []; });
+                            core.require(false, { .stdout = "after"; .stderr = ""; .code = 9; .files = []; });
+                        };
+                    %%end"#;
+                    fs::write(&source, compared).unwrap();
+                    assert_eq!(terminal(&[legacy()], scope, false), (Ok(9), b"requireafter".to_vec(), Vec::new()));
+                    let observed = selected(3);
+                    let report = observed[0].outcome.as_ref().unwrap();
+                    let [left, right, after] = report.directives.as_slice() else { panic!("two false operand paths and one original continuation"); };
+                    assert_eq!(left.directive, right.directive);
+                    assert_ne!(right.directive, after.directive);
+                    let bounds = |failure: &wosy_compiler::ScalarOrderedCheckerFailure, axis| {
+                        failure.witness.intervals_at(0, axis).unwrap()
+                            .map(|(lo, hi)| (lo.to_string(), hi.to_string())).collect::<Vec<_>>()
+                    };
+                    assert_eq!(bounds(left, 0), [("0".to_owned(), "0".to_owned())]);
+                    assert_eq!(bounds(right, 0), [("1".to_owned(), "255".to_owned())]);
+                    assert_eq!(bounds(right, 1), [("0".to_owned(), "0".to_owned())]);
+                    assert_eq!(bounds(after, 0), [("0".to_owned(), "255".to_owned())]);
+                    assert_eq!(bounds(after, 1), [("0".to_owned(), "255".to_owned())]);
+                    for (cap, expected, status) in [(1, "require", 0), (2, "requirerequire", 0), (3, "requirerequireafter", 9)] {
+                        assert_eq!(terminal(&selected(cap), scope, false), (Ok(status), expected.as_bytes().to_vec(), Vec::new()));
+                    }
+
+                    let narrowed = compared.replace("core.require(left != 0 && right != 0,", "core.narrow(left == 0 || right == 0,");
+                    fs::write(&source, narrowed).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old, (Ok(9), b"after".to_vec(), Vec::new()));
+                    let survived = selected(3);
+                    let report = survived[0].outcome.as_ref().unwrap();
+                    let [left, right] = report.directives.as_slice() else { panic!("two genuine passing narrowing decisions"); };
+                    assert_eq!(left.directive, right.directive);
+                    assert_eq!(bounds(left, 0), [("0".to_owned(), "0".to_owned())]);
+                    assert_eq!(bounds(left, 1), [("0".to_owned(), "255".to_owned())]);
+                    assert_eq!(bounds(right, 0), [("1".to_owned(), "255".to_owned())]);
+                    assert_eq!(bounds(right, 1), [("0".to_owned(), "0".to_owned())]);
+                    assert_eq!(terminal(&survived, scope, false), (Ok(9), b"afterafter".to_vec(), Vec::new()));
+
+                    let empty = r#"%%start
+                        unit(u8, u8) report = fn(left, right) {
+                            core.narrow(right != 0, { .stdout = "unexpected"; .stderr = ""; .code = 1; .files = []; });
+                            core.narrow(left == 0 && right == 0, {
+                                .stdout = "empty"; .stderr = ""; .code = 7;
+                                .files = [{ .path = "before.json"; .state = left; }];
+                            });
+                            core.require(false, { .stdout = "unreachable"; .stderr = ""; .code = 9; .files = []; });
+                        };
+                    %%end"#;
+                    fs::write(&source, empty).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old, (Ok(7), b"empty".to_vec(), Vec::new()));
+                    let old_files = files();
+                    clean();
+                    for cap in [1, 3] {
+                        let refused = selected(cap);
+                        let report = refused[0].outcome.as_ref().unwrap();
+                        let [failure] = report.directives.as_slice() else { panic!("one failed incoming structural history"); };
+                        assert_eq!(bounds(failure, 0), [("0".to_owned(), "255".to_owned())]);
+                        assert_eq!(bounds(failure, 1), [("1".to_owned(), "255".to_owned())]);
+                        assert_eq!(terminal(&refused, scope, false), old);
+                        assert_eq!(files(), old_files);
+                        clean();
+                    }
+                }
+
                 let startup_witness = r#"%%start
                     i8 status = -37;
                     bool ready = true;
