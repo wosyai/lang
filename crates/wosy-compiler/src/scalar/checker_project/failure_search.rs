@@ -86,7 +86,7 @@ pub(in super::super) struct StartUpSearch {
     work: usize,
     invalid: bool,
     pub(super) proof_free_scalar_initializers: bool,
-    pub(super) named_target: Option<PreparedCallable>,
+    pub(super) has_bare_startup: bool,
     pub(super) named_cross_source: bool,
     pub(super) named_observations: Vec<StartupProofObservation>,
     pub(super) required_sites: HashMap<OccurrenceOrdinal, (PreparedCallable, StartupProofRole)>,
@@ -111,7 +111,7 @@ impl StartUpSearch {
     }
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
-        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
+        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
             pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
@@ -186,7 +186,10 @@ impl StartUpSearch {
         super::super::checker_flow::charge_call_work(&mut self.work, sites.len())?;
         // At least one actual observation means the existing required-site
         // continuation, not the dormant-only lane, owns the stopping point.
-        if !sites.is_empty() { self.finish_dormant_startup = false; }
+        if !sites.is_empty() {
+            self.finish_dormant_startup = false;
+            self.has_bare_startup |= role == StartupProofRole::Bare;
+        }
         for &site in sites {
             if self.required_sites.insert(site, (target, role)).is_some() { return None; }
         }

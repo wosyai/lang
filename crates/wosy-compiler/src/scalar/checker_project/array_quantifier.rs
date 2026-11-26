@@ -422,7 +422,6 @@ impl<'a> Cohort<'a> {
                     }
                     if !invoked_scalars.insert(target) { return Err(ProjectCheck::Unsupported); }
                     scalar_observations = scalar_observations.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
-                    trace.named_target = Some(target);
                 }
                 Ranked => {
                     let plan = rank.filter(|plan| plan.target == target).ok_or(ProjectCheck::Unsupported)?;

@@ -1698,7 +1698,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     .and_then(|effects| effects.startup_search.as_ref())
                     .is_some_and(|search| {
                         let search = search.borrow();
-                        search.named_target.is_some() || search.ranked_target.is_some() || search.proof_free_scalar_initializers
+                        search.has_bare_startup || search.ranked_target.is_some() || search.proof_free_scalar_initializers
                             || (search.owns_initialization(source) && search.required_sites.get(&outputs.primary)
                                 .is_some_and(|(_, role)| *role == failure_search::StartupProofRole::Cited))
                             || (COLLECT && actual.can_initialize_fixed_arrays()
@@ -10849,19 +10849,20 @@ impl PreparedStartupAuthoredCheck {
     fn run_path(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
-        run_startup_authored_path(&self.owner, Some(cap), None, false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None)
+        run_startup_authored_path(&self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None)
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path(
-    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: Option<(PreparedCallable, &[OccurrenceOrdinal])>, qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>,
+    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if proof_free_scalars.is_some() { project.initialization_order.len() }
         else if qualified { 2 } else { 1 };
-    if named.is_some_and(|(_, sites)| sites.is_empty() || project.modules.len() != count || (qualified && sites.len() != 1))
-        || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.is_none())
+    if (!named.is_empty() && project.modules.len() != count)
+        || named.iter().any(|(_, sites)| sites.is_empty())
+        || ranked.is_some_and(|(_, sites)| sites.is_empty() || qualified || named.len() != 1)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -10875,16 +10876,18 @@ fn run_startup_authored_path(
         None => failure_search::StartUpSearch::formal_only(root),
     };
     search.proof_free_scalar_initializers = proof_free_scalars.is_some();
-    search.named_target = named.map(|(target, _)| target);
     search.named_cross_source = qualified;
     search.ranked_target = ranked.map(|(target, _)| target);
-    search.metered_frames = [named, ranked].into_iter().flatten().any(|(_, sites)| sites.len() > 1);
-    search.retain_after_cutoff = cap.is_none() || (!qualified && (search.metered_frames || ranked.is_some()));
+    let bare_activations = named.iter().try_fold(0usize, |total, (_, sites)| total.checked_add(sites.len()))
+        .ok_or(ProjectCheck::Unsupported)?;
+    search.metered_frames = bare_activations > 1 || ranked.is_some_and(|(_, sites)| sites.len() > 1);
+    search.retain_after_cutoff = cap.is_none() || bare_activations > 1 || (!qualified && ranked.is_some());
     use failure_search::StartupProofRole::{Bare, Ranked};
-    for (role, target) in [(Bare, named), (Ranked, ranked)] {
-        if let Some((target, sites)) = target {
-            search.enroll_proof_sites(target, role, sites).ok_or(ProjectCheck::Unsupported)?;
-        }
+    for &(target, sites) in named {
+        search.enroll_proof_sites(target, Bare, sites).ok_or(ProjectCheck::Unsupported)?;
+    }
+    if let Some((target, sites)) = ranked {
+        search.enroll_proof_sites(target, Ranked, sites).ok_or(ProjectCheck::Unsupported)?;
     }
     let mut effects = OrderedFailures { startup_search: Some(Rc::new(RefCell::new(search))), ..OrderedFailures::default() };
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
@@ -11275,7 +11278,6 @@ fn run_private_mixed_root_context(
         let sites = incoming.get(&(plan.proof_source, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
         if sites.is_empty() { continue; }
         observation_count = observation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
-        trace.named_target = Some(plan.target);
         trace.enroll_proof_sites(plan.target, StartupProofRole::Bare, sites).ok_or(ProjectCheck::Unsupported)?;
         required.insert(plan.target);
     }
@@ -11343,7 +11345,7 @@ fn run_private_mixed_root_context(
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, InvokedAndDormantRank, InvokedAndReachedRank }
+enum StartupNamedMode { Dormant, Invoked, RepeatedInvoked, Mixed, Qualified, BareRoster, InvokedAndDormantRank, InvokedAndReachedRank }
 
 /// Check cited premises on real bounded startup returns, or on a genuinely
 /// zero-incoming symbolic source root. The authored graph is never used as a
@@ -11478,10 +11480,6 @@ fn run_private_named_after_startup(
         let is_provider = Some(proof_source) == provider;
         if (proof_source != &owner.source && !is_provider) || proof_source.project != owner.source.project
             || proof_source.package != owner.source.package
-            // One real provider activation and up to one independent dormant
-            // theorem per owner, without changing the evaluated call family.
-            || (!qualified && !named_definitions.is_empty())
-            || (qualified && catalog.definitions.len() > if is_provider { 2 } else { 1 })
         { return Err(ProjectCheck::Unsupported); }
         for (index, definition) in catalog.definitions.iter().enumerate() {
             let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
@@ -11534,7 +11532,6 @@ fn run_private_named_after_startup(
         }
         return run_private_citation_catalog(owner, scope, cap, &plans);
     }
-    if !qualified && plans.len() > 2 { return Err(ProjectCheck::Unsupported); }
     let mut targets = HashSet::with_capacity(plans.len());
     let mut names = HashSet::with_capacity(plans.len());
     for plan in &plans {
@@ -11558,26 +11555,29 @@ fn run_private_named_after_startup(
     let ranked_sites = ranked.as_ref().map(|plan| incoming.get(&(plan.proof_source, plan.function.name_span))
         .map(Vec::as_slice).ok_or(ProjectCheck::Unsupported)).transpose()?.unwrap_or_default();
     let reached_rank = !ranked_sites.is_empty();
-    let mut invoked = None;
+    let mut invoked = Vec::new();
+    let mut activation_count = 0usize;
     for plan in &plans {
         let sites = incoming.get(&(plan.proof_source, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
         if sites.is_empty() { continue; }
-        if invoked.is_some() || (qualified && Some(plan.proof_source) != provider)
-            || (sites.len() != 1 && (qualified || plans.len() != 1))
-            || !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty))
-        { return Err(ProjectCheck::Unsupported); }
-        invoked = Some((plan.target, sites.as_slice()));
+        if !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty)) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        activation_count = activation_count.checked_add(sites.len()).ok_or(ProjectCheck::Unsupported)?;
+        invoked.push((plan.target, sites.as_slice()));
     }
-    // Classify only from the typed declarations and this one complete
-    // incoming-edge census. No speculative run of another proof route.
-    let mode = match (qualified, ranked.is_some(), reached_rank, invoked.map_or(0, |(_, sites)| sites.len()), plans.len()) {
-        (true, false, false, 1, _) => StartupNamedMode::Qualified,
+    // The old exact named adapters keep their explicit route assertions,
+    // while the common automatic path can authenticate a whole bare roster.
+    let mode = match (qualified, ranked.is_some(), reached_rank, activation_count, plans.len()) {
+        (true, false, false, 1, _) if invoked.first().is_some_and(|(owner, _)|
+            project.modules.get(owner.0).map(|module| &module.source) == provider) => StartupNamedMode::Qualified,
         (false, false, false, 0, 1) => StartupNamedMode::Dormant,
         (false, false, false, 1, 1) => StartupNamedMode::Invoked,
         (false, false, false, 2.., 1) => StartupNamedMode::RepeatedInvoked,
         (false, false, false, 1, 2) => StartupNamedMode::Mixed,
         (false, true, false, 1.., 1) => StartupNamedMode::InvokedAndDormantRank,
         (false, true, true, 1.., 1) => StartupNamedMode::InvokedAndReachedRank,
+        (false, false, false, _, _) | (true, false, false, 1.., _) => StartupNamedMode::BareRoster,
         _ => return Err(ProjectCheck::Unsupported),
     };
     if expected.is_some_and(|expected| expected != mode) { return Err(ProjectCheck::Unsupported); }
@@ -11595,20 +11595,28 @@ fn run_private_named_after_startup(
     }
     observer.finish_plans(&owner.prepared, scope)?;
     let mut verified_rank = reached_rank.then(|| prepare_capped_ranked_receipts(ranked.as_ref().ok_or(ProjectCheck::Unsupported)?)).transpose()?;
-    let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked, qualified,
+    let (records, end, mut trace, mut active) = run_startup_authored_path(&owner.prepared, cap, &invoked, qualified,
         &[], None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)))?;
     if let Some(rank) = &mut verified_rank {
         check_capped_ranked_receipts(rank, &mut trace, &owner.source)?;
         active = true;
     }
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
-    let invoked = invoked.map(|(target, _)| target);
-    observe_capped_bare_receipts(&mut observer, &mut trace, invoked, &owner.source)?;
+    if trace.named_observations.len() != activation_count { return Err(ProjectCheck::Unsupported); }
+    let invoked = invoked.into_iter().map(|(target, _)| target).collect::<HashSet<_>>();
+    if invoked.len() <= 1 && (activation_count <= 1 || plans.len() == 1) {
+        observe_capped_bare_receipts(&mut observer, &mut trace, invoked.iter().copied().next(), &owner.source)?;
+    } else {
+        for observed in std::mem::take(&mut trace.named_observations) {
+            observe_capped_bare_receipt(&mut observer, &mut trace, &invoked, &owner.source, observed)?;
+        }
+        if !observer.complete(&invoked) { return Err(ProjectCheck::Unsupported); }
+    }
     active |= observer.active;
     let evidence = NamedOrderedEvidence { observed: observer };
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
         let mut proof = evidence.symbolic();
-        for plan in plans.iter().filter(|plan| Some(plan.target) != invoked) {
+        for plan in plans.iter().filter(|plan| !invoked.contains(&plan.target)) {
             // No invented completion/dependency access, only the original
             // closed dormant theorem allowed by the resolved-edge census.
             active |= proof.try_collect(plan.target, plan.typed.body, plan.function, plan.proof_source, &mut effects,
@@ -16637,6 +16645,72 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn private_bare_roster_keeps_all_authentic_root_and_qualified_receipts_after_cap() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-roster-root");
+        let lib = source("src/lib.w", "private-roster-provider");
+        let zero = OUTPUT.replace(".code = 1", ".code = 0");
+        let main = format!(r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8(u8) local = fn(value) {{ value }};
+            u8(u8) dormant = fn(value) {{ value }};
+            proof dormant_only for dormant(entry) -> (out) where (entry == 7) ensures (out == 8) {{}}
+            proof root_live for local(entry) -> (out) where (entry >= 3) ensures (out == 9) {{}}
+            core.require(false, {zero});
+            u8 first = lib.echo(3);
+            core.require(first == 9, {OUTPUT});
+            u8 second = local(4);
+            core.require(second == 9, {OUTPUT});
+            u8 third = lib.echo(5);
+            core.require(third == 9, {OUTPUT});
+        %%end"#);
+        let library = r#"%%start
+            u8(u8) echo = fn(value) { if (value < 4) { value } else { 7 } };
+            proof provider_live for echo(entry) -> (out) where (entry >= 3) ensures (out == 9) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |program: &str| {
+                    let parse = |source: &SourceIdentity, text: &str|
+                        crate::parse_proof_source(source.clone(), text.to_owned(), &[]).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics)).1;
+                    let import = ScalarNamespaceBinding { binding: "lib".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parse(&app, program), vec![import]), (parse(&lib, library), Vec::new())],
+                        vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    ).unwrap()
+                };
+                let old = prepare(&main).run().unwrap();
+                assert_eq!(old.directives.len(), 4);
+                assert_eq!(old.diagnostics.len(), 3);
+                for limit in [1, 2, 4, 5] {
+                    let (next, end) = prepare(&main).run_private_authored_root(NonZeroUsize::new(limit).unwrap()).unwrap();
+                    assert_eq!(next.directives, old.directives[..limit.min(4)]);
+                    assert_eq!(end, Some(if limit <= 4 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted }));
+                    assert_eq!(next.diagnostics.len(), 3);
+                    for ((actual, prior), (site, proof, returned)) in next.diagnostics.iter().zip(&old.diagnostics)
+                        .zip([("lib.echo(3)", &lib, 3), ("local(4)", &app, 4), ("lib.echo(5)", &lib, 7)])
+                    {
+                        assert_eq!(&actual.proof.source, proof);
+                        assert_eq!(actual.proof, prior.proof);
+                        assert_eq!(actual.invocation.call, prior.invocation.call);
+                        assert_eq!(actual.invocation.call.source, app);
+                        let span = actual.invocation.call.range;
+                        assert_eq!(&main[span.start as usize..span.end as usize], site);
+                        assert_eq!(actual.invocation.returned, BigInt::from(returned));
+                    }
+                    assert_eq!(next.symbolic_diagnostic.is_some(), scope == ScalarCheckerScope::CurrentPackage);
+                    assert_eq!(next.symbolic_diagnostic.as_ref().map(|proof| &proof.proof),
+                        old.symbolic_diagnostic.as_ref().map(|proof| &proof.proof));
+                }
+                let post_cap = prepare(&main).run_private_proofs_after_command_cap().unwrap();
+                assert!(post_cap.directives.is_empty());
+                assert_eq!(post_cap.diagnostics.len(), 3);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_qualified_named_uses_actual_completed_same_package_owner() {
         use std::num::NonZeroUsize;
         let app = source("src/main.w", "private-qualified-app");
@@ -16741,7 +16815,7 @@ mod tests {
                     let rank = target("descend");
                     let bare_sites = test_exact_startup_sites(&owner, bare.1, false);
                     let rank_sites = test_exact_startup_sites(&owner, rank.1, true);
-                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), Some((bare, &bare_sites)), false,
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), &[(bare, &bare_sites)], false,
                         &[], None, Some((rank, &rank_sites))).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
                     assert_eq!(trace.ranked_observations[0].returned, BigInt::from(4));
@@ -16777,7 +16851,7 @@ mod tests {
                     let rank_target = target("descend");
                     let bare_sites = test_exact_startup_sites(&owner, bare_target.1, false);
                     let rank_sites = test_exact_startup_sites(&owner, rank_target.1, true);
-                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), Some((bare_target, &bare_sites)),
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), &[(bare_target, &bare_sites)],
                         false, &[], None, Some((rank_target, &rank_sites))).unwrap();
                     assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
                     let bare = trace.named_observations.into_iter().next().unwrap();
@@ -16810,7 +16884,7 @@ mod tests {
                 let rank = target("descend");
                 let bare_sites = test_exact_startup_sites(&owner, bare.1, false);
                 let rank_sites = test_exact_startup_sites(&owner, rank.1, true);
-                let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), Some((bare, &bare_sites)),
+                let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::MIN), &[(bare, &bare_sites)],
                     false, &[], None, Some((rank, &rank_sites))).unwrap();
                 assert_eq!(trace.ranked_entries, [8, 5, 2, 5, 2].map(BigInt::from));
                 assert_eq!(trace.ranked_observations.iter().map(|receipt| (
@@ -16999,7 +17073,7 @@ mod tests {
                     let target = project.modules[0].items.iter().position(|item|
                         matches!(item, ScalarItem::Function(function) if function.name == "echo")).unwrap();
                     let sites = test_exact_startup_sites(&owner, target, false);
-                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), Some(((0, target), &sites)),
+                    let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(limit), &[((0, target), &sites)],
                         false, &[], None, None).unwrap();
                     let expected_sites = [first.invocation.call.clone(), second.invocation.call.clone()];
                     assert_eq!(trace.named_observations.iter().map(|entry| &entry.site).collect::<Vec<_>>(),
