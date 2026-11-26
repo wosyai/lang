@@ -22,7 +22,7 @@ pub use anchored::GitDirectory;
 pub use init::init_project;
 pub use lifecycle::{snapshot_dependencies, update_dependencies};
 pub use patches::PatchStackId;
-pub use git_sync::sync_dependencies;
+pub use git_sync::{observe_installed_git_base, sync_dependencies, InstalledGitBase};
 
 const LOCKFILE: &str = "wosy.lock";
 const DEPS: &str = "deps";

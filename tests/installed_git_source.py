@@ -11,7 +11,7 @@ import tempfile
 import time
 
 
-compiler, example = [Path(arg).resolve() for arg in sys.argv[1:]]
+compiler, example, *older = [Path(arg).resolve() for arg in sys.argv[1:]]
 here = Path(__file__).parent
 template = (here / "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
 manifest = template.replace('[dependencies.std]\npath = "stdlib"\n\n', '')
@@ -93,11 +93,46 @@ with tempfile.TemporaryDirectory() as directory:
     assert installed.read_bytes() == peer_source.read_bytes() == pristine.encode()
     initial_workspace, peer_workspace = workspace_evidence(app), workspace_evidence(peer)
 
+    # The read-only observation needs no Git executable or reachable origin.
+    # The true package tree is an already verified output of ordinary sync.
+    revision = capture("git", "rev-parse", "HEAD", cwd=origin).strip()
+    tree = capture("git", "rev-parse", "HEAD:packages/remote_lib", cwd=origin).strip()
+    seal_a = app / "deps/.wosy-pins/remote_lib"
+    sealed = json.loads(seal_a.read_text())
+    assert (sealed["version"], sealed["verified_base"]["version"], sealed["verified_base"]["tree"]) == (1, 1, tree)
+    read_env = {**env, "PATH": str(work / "no-programs")}
+    if older:
+        subprocess.run([older[0], "dep", "sync"], cwd=app, env=read_env, check=True, capture_output=True)
+        assert workspace_evidence(app) == initial_workspace
+    def observe(project, refusal=None):
+        result = subprocess.run([example, project, store, "--observe-installed-git-base", "remote_lib"],
+                                text=True, capture_output=True, env=read_env)
+        if refusal:
+            assert result.returncode and refusal in result.stderr, result.stderr
+            return
+        result.check_returncode()
+        return json.loads(result.stdout)
+    observed = observe(app)
+    pristine_base = observed["base"]
+    assert pristine_base == observe(peer)["base"]
+    assert (pristine_base["revision"], pristine_base["tree"], pristine_base["package_path"]) == (
+        revision, tree, "packages/remote_lib",
+    )
+    assert pristine_base["source_hash"].encode() in lock
+    assert not store.exists()
+    permissions = installed.stat().st_mode & 0o777
+    try:
+        installed.chmod(permissions ^ 0o100)
+        observe(app, refusal="unsnapshotted edits")
+    finally:
+        installed.chmod(permissions)
+
     first, cold_wall, cold_rss = snapshot(app, store)
     first = first["snapshot"]
     initial = first["source_root"]
     assert (first["parsed"], first["reused"]) == (3, 0)
     selection = snapshot(app, store, initial, "--installed-git")[0]["remote_lib"]
+    assert pristine_base["locked"] == selection["locked"]
     old_typed = snapshot(app, store, initial, "--typed-project", "dev", "--oracle")[0]
     old_modules = snapshot(app, store, initial, "--project-declarations")[0]["modules"]
     assert old_typed["ready"] and old_typed["modules"][1]["structs"][0]["layout"]["size"] == 4
@@ -119,6 +154,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     installed.write_text(edited)
     dirty_workspace = workspace_evidence(app)
+    observe(app, refusal="unsnapshotted edits")
     dirty, dirty_wall, dirty_rss = snapshot(app, store, initial)
     dirty = dirty["snapshot"]
     authored = dirty["source_root"]
@@ -131,6 +167,9 @@ with tempfile.TemporaryDirectory() as directory:
     assert (app / "wosy.lock").read_bytes() == lock and installed.read_bytes() == edited.encode()
     assert len(list((app / "patches/remote_lib").glob("*.patch"))) == 1
     overlay_workspace = workspace_evidence(app)
+    assert observe(app)["base"] is None
+    assert json.loads(seal_a.read_text())["verified_base"]["tree"] == tree
+    assert observe(peer)["base"] == pristine_base
     overlay, patch_wall, patch_rss = snapshot(app, store, authored)
     overlay = overlay["snapshot"]
     patched = overlay["source_root"]
@@ -180,5 +219,7 @@ with tempfile.TemporaryDirectory() as directory:
         "publish_writes": [state["written"] for state in (first, warm, dirty, overlay)],
         "peak_child_kib": [cold_rss, warm_rss, dirty_rss, patch_rss], "observed_files": 3,
         "peer_warm_ms": round(peer_wall, 3), "peer_warm_peak_kib": peer_rss,
+        "verified_git_base_ms": round(observed["observe_ms"], 3),
+        "older_release_reader": bool(older),
         "sizes_A_B_A_historical": [8, 4, 8, 4],
     }, flush=True)

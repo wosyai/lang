@@ -75,7 +75,7 @@ pub fn snapshot_dependencies(root: &Path) -> Result<(), String> {
         let old_stack = stack.identity();
         let id = stack.append(delta)?;
         let receipt = overlay_receipt(
-            &git.directory, &installed.checkout, &name, pin, stack.identity(), frozen.working, &routes,
+            &git.directory, &installed.checkout, &name, pin, stack.identity(), frozen.working, &routes, Some(&pristine.tree),
         )?;
         let stage = staging.workspace(&git)?;
         drafts.push(stage_patch(stage, name, installed.checkout, old_stack, id, stack.bytes(id), &receipt)?);
@@ -247,7 +247,7 @@ pub fn update_dependencies(root: &Path) -> Result<(), String> {
                     // replacing working bytes already at this pin and stack.
                     if current.routes.as_ref() != Some(&routes) {
                         new.refresh_receipt(
-                            git, name, &pin, &stack, current.checkout.clone(), working, &routes,
+                            git, name, &pin, &stack, current.checkout.clone(), working, &routes, Some(&pristine.tree),
                         )?;
                     }
                 } else {
@@ -265,7 +265,7 @@ pub fn update_dependencies(root: &Path) -> Result<(), String> {
                     } else {
                         None
                     };
-                    new.prepare_install(git, name, &pin, &stack, candidate, working, previous, &routes)?;
+                    new.prepare_install(git, name, &pin, &stack, candidate, working, previous, &routes, &pristine.tree)?;
                 }
                 pins.packages.insert(name.to_owned(), pin);
                 Ok(loaded)

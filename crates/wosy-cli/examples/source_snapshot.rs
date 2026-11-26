@@ -192,6 +192,18 @@ async fn main() -> Result<()> {
     let project = PathBuf::from(args.next().ok_or("expected project path")?);
     let dir = PathBuf::from(args.next().ok_or("expected store path")?);
     let selection = args.next();
+    if selection.as_deref() == Some("--observe-installed-git-base") {
+        let package = args.next().ok_or("expected installed Git package")?;
+        let start = Instant::now();
+        let result = wosy_project::packages::observe_installed_git_base(&project, &package)?.map(|base| {
+            serde_json::json!({
+                "locked": NodeId(*base.locked().as_bytes()).hex(), "revision": base.revision(),
+                "package_path": base.package_path(), "tree": base.tree(), "source_hash": base.source_hash(),
+            })
+        });
+        println!("{}", serde_json::json!({ "base": result, "observe_ms": milliseconds(start) }));
+        return Ok(());
+    }
     if selection.as_deref() == Some("--fixture-compiler-image") {
         println!("{}", serde_json::json!({
             "compiler_version": wosy_compiler::COMPILER_IDENTITY,

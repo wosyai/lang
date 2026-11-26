@@ -44,6 +44,12 @@ impl GitTreeOid {
         GitOid::from_rev_parse(record).map(Self)
     }
 
+    /// Only after verifying the installation receipt derived from a tree
+    /// whose actual type was checked during ordinary materialization.
+    pub(super) fn from_installation_receipt(oid: GitOid) -> Self {
+        Self(oid)
+    }
+
     pub(super) fn as_str(&self) -> &str {
         self.0.as_str()
     }

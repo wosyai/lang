@@ -49,12 +49,13 @@ pub fn sync_dependencies(root: &Path) -> Result<(), String> {
                     }
                     if stack_changed {
                         let before = PreviousCheckout { checkout: installed.checkout, baseline: actual.working };
-                        let (checkout, working) = if let Some(pristine) = pristine {
-                            downloads.replay(git, name, &pristine, &stack)?
+                        let (checkout, working, tree) = if let Some(pristine) = pristine {
+                            let (checkout, working) = downloads.replay(git, name, &pristine, &stack)?;
+                            (checkout, working, pristine.tree)
                         } else {
                             downloads.overlay(git, name, pin, &stack)?
                         };
-                        install = Some((working, Some(before)));
+                        install = Some((working, tree, Some(before)));
                         checkout
                     } else {
                         let checkout = installed.checkout.clone();
@@ -62,18 +63,18 @@ pub fn sync_dependencies(root: &Path) -> Result<(), String> {
                         checkout
                     }
                 } else {
-                    let (checkout, working) = downloads.overlay(git, name, pin, &stack)?;
-                    install = Some((working, None));
+                    let (checkout, working, tree) = downloads.overlay(git, name, pin, &stack)?;
+                    install = Some((working, tree, None));
                     checkout
                 };
                 let loaded = load_git(root, declaration, checkout.clone(), pin, None)?;
                 let routes = FrozenRoutes::capture(&loaded.dependencies);
-                if let Some((working, previous)) = install {
-                    downloads.prepare_install(git, name, pin, &stack, checkout, working, previous, &routes)?;
+                if let Some((working, tree, previous)) = install {
+                    downloads.prepare_install(git, name, pin, &stack, checkout, working, previous, &routes, &tree)?;
                 } else if let Some(live) = live {
                     if let Some(baseline) = live.baseline {
                         if live.routes.as_ref() != Some(&routes) {
-                            downloads.refresh_receipt(git, name, pin, &stack, live.checkout, baseline, &routes)?;
+                            downloads.refresh_receipt(git, name, pin, &stack, live.checkout, baseline, &routes, live.base_tree.as_ref())?;
                         }
                     }
                 }
@@ -166,8 +167,9 @@ impl Staging {
         working: WorkingTreeId,
         previous_checkout: Option<PreviousCheckout>,
         routes: &FrozenRoutes,
+        tree: &GitTreeOid,
     ) -> Result<(), String> {
-        self.prepare(git, name, pin, stack, checkout, working, previous_checkout, routes, false)
+        self.prepare(git, name, pin, stack, checkout, working, previous_checkout, routes, Some(tree), false)
     }
 
     pub(super) fn refresh_receipt(
@@ -179,8 +181,9 @@ impl Staging {
         checkout: GitDirectory,
         baseline: WorkingTreeId,
         routes: &FrozenRoutes,
+        tree: Option<&GitTreeOid>,
     ) -> Result<(), String> {
-        self.prepare(git, name, pin, stack, checkout, baseline, None, routes, true)
+        self.prepare(git, name, pin, stack, checkout, baseline, None, routes, tree, true)
     }
 
     fn prepare(
@@ -193,13 +196,14 @@ impl Staging {
         working: WorkingTreeId,
         previous_checkout: Option<PreviousCheckout>,
         routes: &FrozenRoutes,
+        tree: Option<&GitTreeOid>,
         receipt_only: bool,
     ) -> Result<(), String> {
         let staging = self.workspace(git)?;
         let receipt = staging.path.join(DEPS).join(PINS).join(name);
         fs::create_dir_all(receipt.parent().expect("receipt staging parent"))
             .map_err(|error| format!("cannot create provenance staging directory: {error}"))?;
-        let expected_receipt = overlay_receipt(&git.directory, &checkout, name, pin, stack.identity(), working, routes)?;
+        let expected_receipt = overlay_receipt(&git.directory, &checkout, name, pin, stack.identity(), working, routes, tree)?;
         fs::write(&receipt, &expected_receipt)
             .map_err(|error| format!("cannot stage provenance for {name}: {error}"))?;
         self.pending.push(PendingInstall {
@@ -234,9 +238,10 @@ impl Staging {
         slot: &str,
         pin: &LockedPackage,
         stack: &PatchStack,
-    ) -> Result<(GitDirectory, WorkingTreeId), String> {
+    ) -> Result<(GitDirectory, WorkingTreeId, GitTreeOid), String> {
         let pristine = self.pristine(git, slot, pin)?;
-        self.replay(git, slot, &pristine, stack)
+        let (checkout, working) = self.replay(git, slot, &pristine, stack)?;
+        Ok((checkout, working, pristine.tree))
     }
 
     pub(super) fn replay(
@@ -772,6 +777,7 @@ pub(super) struct Installation {
     pub(super) stack: PatchStackId,
     pub(super) baseline: Option<WorkingTreeId>,
     pub(super) routes: Option<FrozenRoutes>,
+    pub(super) base_tree: Option<GitTreeOid>,
 }
 
 impl Installation {
@@ -791,6 +797,30 @@ struct OverlayReceipt {
     baseline: WorkingTreeId,
     routes: FrozenRoutes,
     seal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "optional_verified_base")]
+    verified_base: Option<VerifiedBaseReceipt>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedBaseReceipt {
+    version: u8,
+    tree: String,
+    seal: String,
+}
+
+fn optional_verified_base<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<VerifiedBaseReceipt>, D::Error> {
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+fn verified_base_seal(legacy_seal: &str, tree: &str) -> String {
+    let mut digest = blake3::Hasher::new_derive_key("wosy installed verified Git base receipt v1");
+    // The parent is an already-verified, fixed-length legacy digest. No
+    // second scan or serialization of the selected installation is needed.
+    digest.update(legacy_seal.as_bytes());
+    digest.update(tree.as_bytes());
+    digest.finalize().to_hex().to_string()
 }
 
 pub(super) fn overlay_receipt(
@@ -801,14 +831,22 @@ pub(super) fn overlay_receipt(
     stack: PatchStackId,
     baseline: WorkingTreeId,
     routes: &FrozenRoutes,
+    base_tree: Option<&GitTreeOid>,
 ) -> Result<String, String> {
     let evidence = InstallEvidence::new(project, checkout, name, pin);
+    let seal = evidence.seal(Some((stack, baseline, routes)));
+    let verified_base = base_tree.map(|tree| VerifiedBaseReceipt {
+        version: 1,
+        tree: tree.as_str().to_owned(),
+        seal: verified_base_seal(&seal, tree.as_str()),
+    });
     let record = OverlayReceipt {
         version: 1,
         stack,
         baseline,
         routes: routes.clone(),
-        seal: evidence.seal(Some((stack, baseline, routes))),
+        seal,
+        verified_base,
     };
     serde_json::to_string(&record).map_err(|error| error.to_string())
 }
@@ -828,23 +866,85 @@ pub(super) fn verify_installed(
             if record.version == 1
                 && record.seal == evidence.seal(Some((record.stack, record.baseline, &record.routes)))
             {
+                let base_tree = record.verified_base.and_then(|base| {
+                    if base.version != 1 { return None; }
+                    let tree = GitOid::parse(&base.tree).ok()?;
+                    (tree.as_str().len() == pin.revision.as_str().len()
+                        && base.seal == verified_base_seal(&record.seal, tree.as_str()))
+                        .then(|| GitTreeOid::from_installation_receipt(tree))
+                });
                 return Ok(Some(Installation {
                     checkout,
                     stack: record.stack,
                     baseline: Some(record.baseline),
                     routes: Some(record.routes),
+                    base_tree,
                 }));
             }
         } else if receipt == evidence.receipt() {
             // Phase 5 proved original bytes but did not record a mode-aware
             // baseline. Preserve the empty stack until a real base is needed.
-            return Ok(Some(Installation { checkout, stack: PatchStack::empty().identity(), baseline: None, routes: None }));
+            return Ok(Some(Installation { checkout, stack: PatchStack::empty().identity(), baseline: None, routes: None, base_tree: None }));
         }
     }
     Err(format!(
         "dependency {name} is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
         root.join(DEPS).join(name).display()
     ))
+}
+
+/// A base previously materialized at the exact selected pin. This
+/// receipt identifies a Git tree, not a live filesystem or a compiler root.
+pub struct InstalledGitBase {
+    locked: LockedInputId,
+    revision: GitOid,
+    package_path: String,
+    tree: GitTreeOid,
+    source_hash: String,
+}
+
+impl InstalledGitBase {
+    pub fn locked(&self) -> &LockedInputId { &self.locked }
+    pub fn revision(&self) -> &str { self.revision.as_str() }
+    pub fn package_path(&self) -> &str { &self.package_path }
+    pub fn tree(&self) -> &str { self.tree.as_str() }
+    pub fn source_hash(&self) -> &str { &self.source_hash }
+}
+
+/// Verify a direct installed package against its original Git source. No Git
+/// process, fetch, receipt migration, or new install occurs on this path.
+/// Legacy receipts and patched packages remain usable by the ordinary resolver
+/// but have no pristine capture here. Only this observation is verified; it is
+/// not a lock against subsequent external edits.
+pub fn observe_installed_git_base(root: &Path, name: &str) -> Result<Option<InstalledGitBase>, String> {
+    let snapshot = ProjectSnapshot::reader(root)?;
+    let git = snapshot.git_project()?;
+    let manifest = git.directory.read_text(Path::new(super::snapshot::MANIFEST))?
+        .ok_or("installed Git base observation requires wosy.toml")?;
+    let document = toml_edit::ImDocument::parse(manifest).map_err(|_| "invalid manifest for installed Git base observation")?;
+    let package = document.get("package").and_then(Item::as_table).ok_or("package is missing")?;
+    let package = scalar_string(package, "name")?;
+    let dependencies = project_dependencies(snapshot.root(), &package, &document)
+        .map_err(|_| "invalid dependencies for installed Git base observation")?;
+    let Some(DependencyDeclaration { source: DependencySource::Git(source), .. }) = dependencies.get(name) else {
+        return Ok(None);
+    };
+    let requirement = graph::GitRequirement { source: source.clone(), revision: None };
+    let pin = snapshot.pin_for(name, &requirement)
+        .map_err(|_| "installed Git dependency does not match a valid lock entry")?;
+    let Some(installed) = git.installed(name, pin)? else { return Ok(None) };
+    let stack = PatchStack::load(&git.directory, name)?;
+    installed.require_stack(name, stack.identity())?;
+    if !stack.is_empty() { return Ok(None) }
+    let (Some(tree), Some(baseline)) = (installed.base_tree, installed.baseline) else { return Ok(None) };
+    let actual = tree_identity(&installed.checkout)?;
+    if actual.working != baseline || actual.original_v1 != pin.source_hash {
+        return Err(dirty_checkout(&git, name));
+    }
+    Ok(Some(InstalledGitBase {
+        locked: pin.input_identity(), revision: pin.revision.clone(), package_path: pin.source.package_path.clone(),
+        tree, source_hash: pin.source_hash.clone(),
+    }))
 }
 
 /// Physical installation evidence is distinct from the portable locked input.
@@ -1244,6 +1344,45 @@ fn identity_from_files(files: &BTreeMap<String, (blake3::Hash, bool)>) -> TreeId
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_receipts_keep_legacy_readers_and_bind_the_exact_verified_tree() {
+        let mut stage = None;
+        let (temp, project) = GitDirectory::project(&std::env::temp_dir()).unwrap();
+        let fixture = get_stage(&mut stage, &temp, &project).unwrap();
+        let root = &fixture.handle;
+        let package = "sample";
+        let checkout_path = fixture.path.join("deps/sample");
+        fs::create_dir_all(&checkout_path).unwrap();
+        fs::create_dir_all(fixture.path.join("deps/.wosy-pins")).unwrap();
+        let receipt_path = fixture.path.join("deps/.wosy-pins/sample");
+        let checkout = root.directory(Path::new("deps/sample")).unwrap().unwrap();
+        let pin = LockedPackage {
+            source: GitSource { origin: "local-fixture".to_owned(), package_path: ".".to_owned() },
+            revision: GitOid::parse(&"1".repeat(40)).unwrap(), source_hash: "2".repeat(64),
+        };
+        let tree = GitTreeOid::from_cat_file_type(GitOid::parse(&"3".repeat(40)).unwrap(), b"tree\n").unwrap();
+        let stack = PatchStack::empty().identity();
+        let baseline = WorkingTreeId([4; 32]);
+        let routes = FrozenRoutes::capture(&BTreeMap::new());
+        let observe = || verify_installed(&fixture.display, root, package, &pin);
+        fs::write(&receipt_path, InstallEvidence::new(root, &checkout, package, &pin).receipt()).unwrap();
+        let plain = observe().unwrap().unwrap();
+        assert!(plain.base_tree.is_none() && plain.baseline.is_none());
+        let v1 = overlay_receipt(root, &checkout, package, &pin, stack, baseline, &routes, None).unwrap();
+        fs::write(&receipt_path, &v1).unwrap();
+        let legacy = observe().unwrap().unwrap();
+        assert!(legacy.base_tree.is_none() && legacy.baseline == Some(baseline));
+        let extended = overlay_receipt(root, &checkout, package, &pin, stack, baseline, &routes, Some(&tree)).unwrap();
+        let extended_parent: serde_json::Value = serde_json::from_str(&extended).unwrap();
+        let legacy_parent: serde_json::Value = serde_json::from_str(&v1).unwrap();
+        assert_eq!(extended_parent["version"], legacy_parent["version"]);
+        assert_eq!(extended_parent["seal"], legacy_parent["seal"]);
+        fs::write(&receipt_path, &extended).unwrap();
+        assert_eq!(observe().unwrap().unwrap().base_tree.unwrap().as_str(), tree.as_str());
+        fs::write(&receipt_path, extended.replace(tree.as_str(), &"9".repeat(40))).unwrap();
+        assert!(observe().unwrap().unwrap().base_tree.is_none());
+    }
 
     #[test]
     fn stage_and_sync_lock_follow_the_open_project_not_its_reused_path() {
