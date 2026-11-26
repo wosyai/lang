@@ -829,3 +829,41 @@ fn check_cap_process_preserves_prepared_zero_obligations_without_skipping_select
         }
     }
 }
+
+#[test]
+fn check_cap_process_initializes_prepared_passive_float_array_but_refuses_unknown_consumers() {
+    for layout in ["native", "wasm-wasip1"] {
+        let project = Fixture::new();
+        let mut literals = vec!["0.6205"; 113];
+        literals[1] = "-0.0";
+        literals[112] = "0.42";
+        let binding = format!("f64[113] profile = [{}];", literals.join(", "));
+        let authored = require("reachable", 13, "selected.txt");
+        let program = format!("%%start {binding} {authored} %%end");
+        project.package("", layout, "dev", "", &program);
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for mode in [&[][..], &["--all-errors"][..]] {
+                let mut flags = vec![scope];
+                flags.extend(mode);
+                assert_terminal(&project.run(&flags), 13, b"reachable", b"[reachable]");
+                assert_eq!(fs::read(project.output().join("selected.txt")).unwrap(), b"reachable");
+                project.clear();
+            }
+        }
+        let source = project.0.join("src/main.w");
+        for change in [
+            format!("{binding} f64 sample = profile[0];"),
+            format!("{binding} f64[113] replica = profile;"),
+            "f64[2] profile = [0.5 + 0.25, 0.75];".to_owned(),
+        ] {
+            fs::write(&source, format!("%%start {change} {authored} %%end")).unwrap();
+            for mode in [&[][..], &["--all-errors"][..]] {
+                let mut flags = vec!["--main-flow-only"];
+                flags.extend(mode);
+                assert_terminal(&project.run(&flags), 2, b"",
+                    b"wosy: check: unsupported analysis; no result published\n");
+                assert!(!project.output().exists());
+            }
+        }
+    }
+}

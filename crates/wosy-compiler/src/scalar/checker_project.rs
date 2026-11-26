@@ -1691,7 +1691,14 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             let BindingInitialization::Outputs(outputs) = &checked.initialization
                 else { return Err(ProjectCheck::Unsupported); };
             #[cfg(feature = "internal-checker")]
-            if startup_trace_requested(failures)
+            let passive_float_literal = COLLECT && !binding.is_allocation
+                && matches!((checked.receivers(), &binding.value),
+                    ([receiver], ScalarExpression::ArrayLiteral { .. })
+                        if receiver.contextual_storage.is_none()
+                            && matches!(&receiver.ty, ScalarType::Array { element, .. }
+                                if matches!(element.as_ref(), ScalarType::F32 | ScalarType::F64)));
+            #[cfg(feature = "internal-checker")]
+            if startup_trace_requested(failures) && !passive_float_literal
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
                 && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
@@ -1737,6 +1744,13 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
+                #[cfg(feature = "internal-checker")]
+                (ty, ScalarExpression::ArrayLiteral { elements, .. }) if passive_float_literal => {
+                    let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::PassiveFixedFloatArray(passive_float_array_literal(
+                        topology, outputs.primary, ty, elements, &mut effects.passive_literal_work,
+                    ).ok_or(ProjectCheck::Unsupported)?)
+                }
                 #[cfg(feature = "internal-checker")]
                 (ScalarType::Char, ScalarExpression::Char { value, .. })
                     if COLLECT && actual.observer.enables_character_initializers() =>
@@ -2334,6 +2348,36 @@ enum InitializerValue<'a> {
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
     #[cfg(feature = "internal-checker")]
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
+    // This typed initialization owns the exact cells. There is currently
+    // no float-array read, transfer, predicate or escape consumer in the
+    // startup evaluator, so none can extract arbitrary authority from it.
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)]
+    PassiveFixedFloatArray(Box<[ranked_float::Atom]>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn passive_float_array_literal(
+    topology: &ModuleInitializationTopology, at: OccurrenceOrdinal, ty: &ScalarType, elements: &[ScalarExpression], work: &mut usize,
+) -> Option<Box<[ranked_float::Atom]>> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
+    let structure = &topology.structure;
+    let ScalarType::Array { element, length, .. } = ty else { return None; };
+    if !matches!(element.as_ref(), ScalarType::F32 | ScalarType::F64)
+        || elements.is_empty() || u64::try_from(elements.len()).ok()? != *length
+        || !super::scalar_type_equal(structure.checked_types.expressions.get(&at)?, ty)
+    { return None; }
+    super::checker_flow::charge_call_work(work, elements.len().checked_add(1)?)?;
+    let exact = elements.iter().enumerate().map(|(index, literal)| {
+        let OccurrenceNode::Expression(cell) = structure.edges.get(&(
+            OccurrenceParent::Expression(at), OccurrenceEdge::AggregateElement(index),
+        ))? else { return None; };
+        if structure.checked_types.expressions.get(cell)? != element.as_ref()
+            || topology.occurrences.get(cell.0)?.span != super::typecheck::expression_span(literal)
+        { return None; }
+        ranked_float::Atom::literal(literal, element)
+    }).collect::<Option<Vec<_>>>()?;
+    Some(exact.into_boxed_slice())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5299,6 +5343,8 @@ struct OrderedFailures {
     has_selected_code: bool,
     #[cfg(feature = "internal-checker")]
     startup_output_work: usize,
+    #[cfg(feature = "internal-checker")]
+    passive_literal_work: usize,
     #[cfg(feature = "internal-checker")]
     contextual_call_work: usize,
     #[cfg(feature = "internal-checker")]
@@ -18071,6 +18117,38 @@ mod tests {
                 assert_eq!(prepare().run().unwrap().directives.len(), 2);
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn prepared_passive_float_literals_keep_ieee_bits_and_checked_extent() {
+        use ranked_float::Atom;
+        let file = source("src/main.w", "typed-float-startup-bits");
+        let text = "%%start f32[2] first = [-0.0, 0.1]; f64[2] second = [-0.0, 0.1]; %%end";
+        let prepared = prepare_checker_project(
+            vec![(declarations(&file, text), Vec::new())], vec![file.clone()], inputs(),
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let region = calls.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { panic!("typed initialization") };
+        let mut work = 0;
+        let mut values = Vec::new();
+        for step in &region.steps {
+            let ScalarItem::Binding(binding) = &project.modules[0].items[step.item] else { continue; };
+            let ScalarExpression::ArrayLiteral { elements, .. } = &binding.value else { panic!("literal") };
+            let item = topology.structure.blocks[topology.structure.root.0].items.iter()
+                .find(|item| item.position == step.item).unwrap();
+            let BlockItemKind::Binding(checked) = &item.kind else { panic!("binding") };
+            let BindingInitialization::Outputs(outputs) = &checked.initialization else { panic!("bound output") };
+            let [slot] = checked.receivers() else { panic!("one slot") };
+            assert!(passive_float_array_literal(topology, outputs.primary, &slot.ty, &elements[..1], &mut work).is_none());
+            values.push(passive_float_array_literal(topology, outputs.primary, &slot.ty, elements, &mut work).unwrap());
+        }
+        assert_eq!(values.iter().map(|cells| cells.as_ref()).collect::<Vec<_>>(), [
+            &[Atom::Single((-0.0f32).to_bits()), Atom::Single(0.1f32.to_bits())][..],
+            &[Atom::Double((-0.0f64).to_bits()), Atom::Double(0.1f64.to_bits())][..],
+        ]);
+        assert_eq!(work, 6);
     }
 
     #[cfg(feature = "internal-checker")]
