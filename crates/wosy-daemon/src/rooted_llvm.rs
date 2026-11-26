@@ -226,6 +226,21 @@ impl SourceStore {
         Ok(result)
     }
 
+    /// The framed authored projection is a no-publication route. Even
+    /// newly parsed grammar evidence is not installed by this request.
+    pub(super) fn project_framed_authored_ll(
+        &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits,
+        output_bytes: usize, check_active: impl Fn() -> Result<()>,
+    ) -> Result<RootedLlvmProjection> {
+        let grant = lease.grant();
+        let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
+            .ok_or(BuildRequestRejection::Expired)?;
+        let answer = self.project_ll(&tx, grant.root, profile, limits, output_bytes, RootedLlvmIdentity::Authored,
+            &mut ProjectionEvidence::default())?;
+        lease.finish_current(check_active).ok_or(BuildRequestRejection::Expired)??;
+        Ok(answer)
+    }
+
     fn finish_ll(
         &self, lease: &SourceLease, result: &RootedLlvmProjection, evidence: ProjectionEvidence,
     ) -> Result<Option<Arc<ExecutableLlvmReceipt>>> {

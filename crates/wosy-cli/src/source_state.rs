@@ -18,7 +18,10 @@ mod pins;
 mod pin_reconciliation;
 pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
-pub use diagnostic_report::{AcknowledgedBuildDiagnostics, ProjectDiagnosticExchange, RootedDiagnosticReport};
+pub use diagnostic_report::{
+    AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryLlvm,
+    ProjectDiagnosticExchange, RootedDiagnosticReport,
+};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 pub use pin_reconciliation::{PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 

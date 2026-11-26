@@ -1,7 +1,8 @@
 //! Route one bounded byte stream through the existing diagnostic session.
 use super::{
     build_session::BuildRequestRejection, encode_session_frame, BaseCstAdmissionLimits,
-    BuildDiagnosticSession, BuildSourceOpening, PreparedBaseDeclarations, Result, SessionFrameError, SessionFrameReader,
+    BuildDiagnosticSession, BuildSourceOpening, PreparedBaseDeclarations, Result, RootedLlvmProjection,
+    SessionFrameError, SessionFrameReader,
     SourceStorageWorker, StorageAdmissionError,
 };
 use std::time::{Duration, Instant};
@@ -13,7 +14,8 @@ use wosy_protocol::{
     BuildDiagnosticResponse, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
     BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
     write_encoded_session_frame, BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
-    BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
+    OrdinaryLlvmProjection, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 
 type Reply = BuildSessionReply<Diagnostic>;
@@ -39,9 +41,15 @@ struct ProjectionScope {
     declaration_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+struct OrdinaryLlvmScope {
+    limits: BaseCstAdmissionLimits,
+    bytes: usize,
+}
+
 enum Opening {
     Ordinary(Option<ProjectionScope>),
-    Recoverable { replay: Option<Delta>, limits: BaseCstAdmissionLimits },
+    Recoverable { replay: Option<Delta>, limits: BaseCstAdmissionLimits, ordinary_llvm: Option<OrdinaryLlvmScope> },
 }
 
 enum Opened<'a> {
@@ -53,11 +61,13 @@ enum Opened<'a> {
 enum Operation<'a> {
     Analyze(BuildDiagnosticRequest),
     Project(&'a ProjectionScope, BaseCstProposal),
+    OrdinaryLlvm(OrdinaryLlvmScope, String),
 }
 
 enum Completed {
     Analysis(BuildDiagnosticResponse<Diagnostic>),
     Projection(PreparedBaseDeclarations),
+    OrdinaryLlvm(RootedLlvmProjection),
 }
 
 impl SourceStorageWorker {
@@ -92,7 +102,20 @@ impl SourceStorageWorker {
         &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
-        self.serve_selected_session(stream, selected, lifetime, Opening::Recoverable { replay, limits }, None).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Recoverable { replay, limits, ordinary_llvm: None }, None).await
+    }
+
+    /// Explicit developer/local adapter capability on the same existing
+    /// recoverable session. The adapter selects the source and all work
+    /// limits out of band. NativeKnown and the ordinary diagnostic sessions
+    /// do not get this capability. Does not supply any listener or builder.
+    pub async fn serve_recoverable_ordinary_llvm_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        let ordinary_llvm = Some(OrdinaryLlvmScope { limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES) });
+        self.serve_selected_session(stream, selected, lifetime,
+            Opening::Recoverable { replay, limits, ordinary_llvm }, None).await
     }
 
     /// Only the NativeKnown host passes a non-renewable authority cut.
@@ -105,7 +128,7 @@ impl SourceStorageWorker {
             cst_occurrences: 0, cst_depth: 0, authored_bytes: 0,
         };
         self.serve_selected_session(stream, selected, lifetime,
-            Opening::Recoverable { replay: None, limits: NO_REPLAY }, Some(cutoff)).await
+            Opening::Recoverable { replay: None, limits: NO_REPLAY, ordinary_llvm: None }, Some(cutoff)).await
     }
 
     async fn serve_selected_session<T: AsyncRead + AsyncWrite + Unpin>(
@@ -138,9 +161,9 @@ impl SourceStorageWorker {
         }
         if Instant::now() >= start_deadline { return Ok(BuildSessionEnd::Expired); }
         let source_root = selected.root;
-        let (projection, recovery) = match opening {
-            Opening::Ordinary(projection) => (projection, None),
-            Opening::Recoverable { replay, limits } => (None, Some((replay, limits))),
+        let (projection, recovery, ordinary_llvm) = match opening {
+            Opening::Ordinary(projection) => (projection, None, None),
+            Opening::Recoverable { replay, limits, ordinary_llvm } => (None, Some((replay, limits)), ordinary_llvm),
         };
         let opened: Result<Opened<'_>> = tokio::select! {
             biased;
@@ -186,7 +209,7 @@ impl SourceStorageWorker {
             Reply::Started { version: BUILD_DIAGNOSTIC_VERSION, source_root }
         };
         if !send(&mut output, deadline.min(start_deadline), hard_deadline, id, started).await? { return Ok(BuildSessionEnd::Expired); }
-        let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref()).await;
+        let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref(), ordinary_llvm).await;
         let deadline = session.deadline();
         session.release();
         if cutoff_reached(hard_deadline) { return Ok(BuildSessionEnd::Expired); }
@@ -208,7 +231,7 @@ impl SourceStorageWorker {
 
 async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     session: &BuildDiagnosticSession<'_>, frames: &mut SessionFrameReader, input: &mut R,
-    output: &mut W, projection: Option<&ProjectionScope>,
+    output: &mut W, projection: Option<&ProjectionScope>, ordinary_llvm: Option<OrdinaryLlvmScope>,
 ) -> Result<Close> {
     let mut owner = None;
     let cutoff = session.hard_deadline();
@@ -243,6 +266,20 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 }
                 continue;
             }
+            Some(Command { id, request: Request::ProjectOrdinaryLlvm { version, profile } }) => {
+                if let Some(scope) = ordinary_llvm.filter(|_| {
+                    version == ORDINARY_LLVM_PROJECTION_VERSION && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES
+                }) {
+                    (id, Operation::OrdinaryLlvm(scope, profile))
+                } else {
+                    let reason = if version != ORDINARY_LLVM_PROJECTION_VERSION { Refusal::UnsupportedVersion }
+                        else { Refusal::OrdinaryLlvmUnavailable };
+                    if !send(output, deadline, cutoff, id, Reply::Refused { reason }).await? {
+                        return Ok(Close::Deadline);
+                    }
+                    continue;
+                }
+            }
             request => {
                 if let Some(end) = control(session, request, output).await? { return Ok(end); }
                 continue;
@@ -262,6 +299,7 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let failure = match &operation {
         Operation::Analyze(_) => Refusal::AnalysisUnavailable,
         Operation::Project(..) => Refusal::BaseProjectionUnavailable,
+        Operation::OrdinaryLlvm(..) => Refusal::OrdinaryLlvmUnavailable,
     };
     let job = async {
         match operation {
@@ -269,6 +307,8 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             Operation::Project(scope, proposal) => session.project_base_declarations(
                 scope.binding.clone(), proposal, scope.admission_limits, scope.declaration_bytes,
             ).await.map(Completed::Projection),
+            Operation::OrdinaryLlvm(scope, profile) =>
+                session.project_ordinary_llvm_framed(profile, scope.limits, scope.bytes).await.map(Completed::OrdinaryLlvm),
         }
     };
     tokio::pin!(job);
@@ -293,6 +333,14 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         *owner = Some(prepared);
                         Reply::BaseDeclarationProjection { projection }
                     }
+                    Ok(Completed::OrdinaryLlvm(RootedLlvmProjection::Emitted(partition))) =>
+                        Reply::OrdinaryLlvmProjection { projection: OrdinaryLlvmProjection {
+                            version: ORDINARY_LLVM_PROJECTION_VERSION,
+                            source_root: partition.source_root, profile: partition.profile,
+                            compiler_image: partition.compiler_image, digest: partition.digest,
+                            partition: String::from_utf8(partition.bytes)?,
+                        }},
+                    Ok(Completed::OrdinaryLlvm(_)) => Reply::Refused { reason: Refusal::OrdinaryLlvmUnavailable },
                     Err(error) => {
                         if matches!(error.downcast_ref::<BuildRequestRejection>(), Some(BuildRequestRejection::Expired)) {
                             return Ok(Some(Close::Deadline));
@@ -328,7 +376,8 @@ async fn control<W: AsyncWrite + Unpin>(
     let reply = match request {
         Request::Disconnect => return Ok(Some(Close::Request(id))),
         Request::Start { .. } | Request::StartRecoverable { .. } => Reply::Refused { reason: Refusal::AlreadyStarted },
-        Request::Analyze { .. } | Request::ProjectBaseDeclarations { .. } => Reply::Refused { reason: Refusal::Busy },
+        Request::Analyze { .. } | Request::ProjectBaseDeclarations { .. } | Request::ProjectOrdinaryLlvm { .. } =>
+            Reply::Refused { reason: Refusal::Busy },
         Request::Renew => {
             if !session.renew() { return Ok(Some(Close::Deadline)); }
             Reply::Renewed

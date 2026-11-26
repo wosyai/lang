@@ -30,6 +30,8 @@ mod pin_catalog;
 mod source_reconciliation;
 #[path = "source_snapshot/framed_reconciliation.rs"]
 mod framed_reconciliation;
+#[path = "source_snapshot/framed_ordinary_llvm.rs"]
+mod framed_ordinary_llvm;
 #[path = "source_snapshot/prepared_proposal.rs"]
 mod prepared_proposal;
 #[path = "source_snapshot/proposal_admission.rs"]

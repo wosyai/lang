@@ -51,6 +51,15 @@ pub(super) async fn run(
             let selected = client.acknowledged_build_source(&target)?.ok_or("fixture has no acknowledged source")?;
             super::saved_diagnostic::run(dir, selected, &name, profile.as_deref(), limit, mode.ends_with("-exit")).await?
         }
+        "framed-ordinary-llvm" | "framed-ordinary-llvm-stale" => {
+            let profile = args.next().ok_or("expected fixture LLVM profile")?;
+            let control = args.next().ok_or("expected fixture control or source")?;
+            if mode.ends_with("-stale") {
+                super::framed_ordinary_llvm::stale(&mut client, project, dir, &target, &profile, control).await?
+            } else {
+                super::framed_ordinary_llvm::run(&mut client, dir, &target, &profile, &control).await?
+            }
+        }
         "leased-ordinary-llvm" => {
             let profile = args.next().ok_or("expected fixture LLVM profile")?;
             let output = args.next().ok_or("expected fixture partition byte limit")?.parse()?;

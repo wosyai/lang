@@ -173,6 +173,18 @@ impl BuildDiagnosticSession<'_> {
         }).await?
     }
 
+    pub(super) async fn project_ordinary_llvm_framed(
+        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize,
+    ) -> Result<RootedLlvmProjection> {
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
+        self.worker.spawn_reserved_query(slot, Some(cancellation.clone()), move |worker| async move {
+            worker.phase(None, move |store| store.project_framed_authored_ll(&lease, profile, limits,
+                output_bytes, || QueryCancellation::check(Some(&cancellation)))).await
+        }).await?
+    }
+
     pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         self.dispatch(request).await
     }

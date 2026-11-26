@@ -5,6 +5,8 @@ use super::{BaseCstProposal, NodeId};
 pub const BUILD_DIAGNOSTIC_VERSION: u16 = 1;
 pub const BASE_DECLARATION_PROJECTION_VERSION: u16 = 1;
 pub const BUILD_RECONCILIATION_VERSION: u16 = 1;
+pub const ORDINARY_LLVM_PROJECTION_VERSION: u16 = 1;
+pub const MAX_ORDINARY_LLVM_PROFILE_BYTES: usize = 1024;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a
 /// wire authorization or a way for a request to switch roots.
@@ -83,6 +85,8 @@ pub enum BuildSessionRequest {
     StartRecoverable { version: u16 },
     Analyze { request: BuildDiagnosticRequest },
     ProjectBaseDeclarations { version: u16, proposal: BaseCstProposal },
+    /// Available only on a host-authorized ordinary LLVM projection session.
+    ProjectOrdinaryLlvm { version: u16, profile: String },
     Renew,
     Disconnect,
 }
@@ -99,6 +103,7 @@ pub enum BuildSessionRefusal {
     BaseProjectionUnavailable,
     BaseProjectionAlreadyHeld,
     ResponseTooLarge,
+    OrdinaryLlvmUnavailable,
 }
 
 /// Ordinal of the issued lease within the hosting store instance. A client
@@ -121,6 +126,20 @@ pub struct BaseDeclarationProjection {
     pub entry_projection: NodeId,
 }
 
+/// Authored partition bytes from the ordinary emitter for one leased
+/// revision/profile. This is not an artifact key, permission to run a
+/// builder, a final Build verdict, or executable-identity memo evidence.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrdinaryLlvmProjection {
+    pub version: u16,
+    pub source_root: NodeId,
+    pub profile: String,
+    pub compiler_image: NodeId,
+    pub digest: NodeId,
+    pub partition: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BuildSessionReply<D> {
@@ -131,6 +150,7 @@ pub enum BuildSessionReply<D> {
     BaseDeclarationSessionStarted { version: u16, source_root: NodeId, connection: BaseDeclarationConnectionId },
     Analysis { response: BuildDiagnosticResponse<D> },
     BaseDeclarationProjection { projection: BaseDeclarationProjection },
+    OrdinaryLlvmProjection { projection: OrdinaryLlvmProjection },
     Renewed,
     Closed,
     Refused { reason: BuildSessionRefusal },

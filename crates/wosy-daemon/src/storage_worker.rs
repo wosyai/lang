@@ -162,7 +162,7 @@ impl QueryCancellation {
 
     fn stopped() -> super::Error { "framed Build analysis no longer has an observer".into() }
 
-    fn check(cancellation: Option<&Self>) -> Result<()> {
+    pub(super) fn check(cancellation: Option<&Self>) -> Result<()> {
         if let Some(signal) = cancellation {
             signal.check_cutoff()?;
             if signal.stopped.has_changed().is_err() { return Err(Self::stopped()); }

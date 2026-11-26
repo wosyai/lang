@@ -7,8 +7,8 @@ use wosy_compiler::Diagnostic;
 use wosy_protocol::{
     encode_session_frame, write_encoded_session_frame, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSessionCommand,
     BuildSessionCommandId, BuildSessionRefusal, BuildSessionReply, BuildSessionRequest,
-    BuildSessionResponse, BuildSourceSelection, SessionFrameReader, BUILD_DIAGNOSTIC_VERSION,
-    BUILD_RECONCILIATION_VERSION,
+    BuildSessionResponse, BuildSourceSelection, OrdinaryLlvmProjection, SessionFrameReader, BUILD_DIAGNOSTIC_VERSION,
+    BUILD_RECONCILIATION_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 
 #[derive(Clone)]
@@ -24,6 +24,24 @@ pub enum DiagnosticExchange {
     ReplayRequired(RequiredSourceReplay),
     Refused(BuildSessionRefusal),
     Diagnostics(BuildDiagnosticResponse<Diagnostic>),
+}
+
+pub(super) enum CommandExchange<T> {
+    StaleSelection,
+    ReplayRequired(RequiredSourceReplay),
+    Refused(BuildSessionRefusal),
+    Answer(T),
+}
+
+impl From<CommandExchange<BuildDiagnosticResponse<Diagnostic>>> for DiagnosticExchange {
+    fn from(exchange: CommandExchange<BuildDiagnosticResponse<Diagnostic>>) -> Self {
+        match exchange {
+            CommandExchange::StaleSelection => Self::StaleSelection,
+            CommandExchange::ReplayRequired(replay) => Self::ReplayRequired(replay),
+            CommandExchange::Refused(reason) => Self::Refused(reason),
+            CommandExchange::Answer(response) => Self::Diagnostics(response),
+        }
+    }
 }
 
 pub(super) fn diagnostic_deadline(timeout: Duration) -> Result<Instant> {
@@ -90,15 +108,72 @@ impl CapturedBuildDiagnostics {
     }
 
     pub(super) async fn converse_current<T: AsyncRead + AsyncWrite + Unpin + 'static>(
-        &self, local: &mut SqliteSourceState, mut stream: T, deadline: Instant,
+        &self, local: &mut SqliteSourceState, stream: T, deadline: Instant,
     ) -> Result<DiagnosticExchange> {
-        if !self.is_current(local)? { return Ok(DiagnosticExchange::StaleSelection); }
-        let answer = self.converse(&mut stream, deadline).await?;
+        self.converse_command(local, stream, deadline, Self::analysis_request, Self::accept_analysis)
+            .await.map(Into::into)
+    }
+
+    pub(super) fn analysis_request(&self) -> BuildSessionRequest {
+        BuildSessionRequest::Analyze { request: BuildDiagnosticRequest::BuildDiagnostics {
+            version: BUILD_DIAGNOSTIC_VERSION, profile: self.profile.clone(),
+        }}
+    }
+
+    pub(super) fn accept_analysis(&self, reply: BuildSessionReply<Diagnostic>)
+        -> Result<BuildDiagnosticResponse<Diagnostic>> {
+        let BuildSessionReply::Analysis { response } = reply else {
+            return Err("diagnostic request did not receive an analysis or refusal".into());
+        };
+        let BuildDiagnosticResponse::BuildDiagnostics { version, source_root, profile, .. } = &response;
+        if *version != BUILD_DIAGNOSTIC_VERSION || *source_root != self.selection().root || profile != &self.profile {
+            return Err("diagnostic reply does not match the captured source or profile".into());
+        }
+        Ok(response)
+    }
+
+    pub(super) fn ordinary_llvm_request(&self) -> BuildSessionRequest {
+        BuildSessionRequest::ProjectOrdinaryLlvm {
+            version: ORDINARY_LLVM_PROJECTION_VERSION, profile: self.profile.clone(),
+        }
+    }
+
+    pub(super) fn accept_ordinary_llvm(
+        &self, reply: BuildSessionReply<Diagnostic>, max_bytes: usize,
+    ) -> Result<OrdinaryLlvmProjection> {
+        let BuildSessionReply::OrdinaryLlvmProjection { projection } = reply else {
+            return Err("ordinary LLVM request did not receive a projection".into());
+        };
+        if projection.version != ORDINARY_LLVM_PROJECTION_VERSION || projection.source_root != self.selection().root
+            || projection.profile != self.profile {
+            return Err("ordinary LLVM reply did not match the captured source and profile".into());
+        }
+        if projection.partition.len() > max_bytes {
+            return Err("ordinary LLVM partition exceeds the client byte budget".into());
+        }
+        if blake3::hash(projection.partition.as_bytes()).as_bytes() != &projection.digest.0 {
+            return Err("ordinary LLVM partition does not match its digest".into());
+        }
+        Ok(projection)
+    }
+
+    pub(super) async fn converse_command<Stream, Answer>(
+        &self, local: &mut SqliteSourceState, mut stream: Stream, deadline: Instant,
+        command: impl FnOnce(&Self) -> BuildSessionRequest,
+        verify: impl FnOnce(&Self, BuildSessionReply<Diagnostic>) -> Result<Answer>,
+    ) -> Result<CommandExchange<Answer>>
+    where Stream: AsyncRead + AsyncWrite + Unpin + 'static {
+        if !self.is_current(local)? { return Ok(CommandExchange::StaleSelection); }
+        let answer = self.converse(&mut stream, deadline, command, verify).await?;
         require_diagnostic_time(deadline)?;
         Ok(answer)
     }
 
-    async fn converse<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut T, deadline: Instant) -> Result<DiagnosticExchange> {
+    async fn converse<T: AsyncRead + AsyncWrite + Unpin, Answer>(
+        &self, stream: &mut T, deadline: Instant,
+        command: impl FnOnce(&Self) -> BuildSessionRequest,
+        verify: impl FnOnce(&Self, BuildSessionReply<Diagnostic>) -> Result<Answer>,
+    ) -> Result<CommandExchange<Answer>> {
         let mut frames = SessionFrameReader::default();
         send(stream, deadline, 1, BuildSessionRequest::StartRecoverable { version: BUILD_RECONCILIATION_VERSION }).await?;
         match receive(stream, &mut frames, 1).await? {
@@ -106,29 +181,20 @@ impl CapturedBuildDiagnostics {
                 if source_root == self.selection().root =>
             {
                 terminal(stream, &mut frames).await?;
-                return Ok(DiagnosticExchange::ReplayRequired(RequiredSourceReplay(self.clone())));
+                return Ok(CommandExchange::ReplayRequired(RequiredSourceReplay(self.clone())));
             }
             BuildSessionReply::RecoverableStarted { version: BUILD_RECONCILIATION_VERSION, source_root }
                 if source_root == self.selection().root => {}
             BuildSessionReply::Refused { reason } => {
                 terminal(stream, &mut frames).await?;
-                return Ok(DiagnosticExchange::Refused(reason));
+                return Ok(CommandExchange::Refused(reason));
             }
             _ => return Err("diagnostic session did not select the captured source".into()),
         }
-        send(stream, deadline, 2, BuildSessionRequest::Analyze { request: BuildDiagnosticRequest::BuildDiagnostics {
-            version: BUILD_DIAGNOSTIC_VERSION, profile: self.profile.clone(),
-        }}).await?;
+        send(stream, deadline, 2, command(self)).await?;
         let result = match receive(stream, &mut frames, 2).await? {
-            BuildSessionReply::Analysis { response } => {
-                let BuildDiagnosticResponse::BuildDiagnostics { version, source_root, profile, .. } = &response;
-                if *version != BUILD_DIAGNOSTIC_VERSION || *source_root != self.selection().root || profile != &self.profile {
-                    return Err("diagnostic reply does not match the captured source or profile".into());
-                }
-                DiagnosticExchange::Diagnostics(response)
-            }
-            BuildSessionReply::Refused { reason } => DiagnosticExchange::Refused(reason),
-            _ => return Err("diagnostic request did not receive an analysis or refusal".into()),
+            BuildSessionReply::Refused { reason } => CommandExchange::Refused(reason),
+            reply => CommandExchange::Answer(verify(self, reply)?),
         };
         send(stream, deadline, 3, BuildSessionRequest::Disconnect).await?;
         if !matches!(receive(stream, &mut frames, 3).await?, BuildSessionReply::Closed) {

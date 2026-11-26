@@ -14,8 +14,9 @@ mod build_diagnostics;
 pub use build_diagnostics::{
     BaseDeclarationConnectionId, BaseDeclarationProjection, BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest,
     BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
-    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse,
+    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, OrdinaryLlvmProjection,
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
 pub mod native_diagnostics;

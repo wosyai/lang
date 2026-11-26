@@ -1,7 +1,7 @@
 //! Render a verified diagnostic response against its immutable local source.
-use super::diagnostics::{diagnostic_deadline, require_diagnostic_time, within_diagnostic_deadline};
+use super::diagnostics::{diagnostic_deadline, require_diagnostic_time, within_diagnostic_deadline, CommandExchange};
 use super::{
-    checked_file_key, load_usage, read_selection, CapturedBuildDiagnostics, DiagnosticExchange,
+    checked_file_key, load_usage, read_selection, AcknowledgedSourceGeneration, CapturedBuildDiagnostics, DiagnosticExchange,
     RequiredSourceReplay, Result, SourceReplay, SqliteSourceState, StoredNodes,
 };
 use crate::{project_sources::LiveSourceReader, source_preparation::matches_live_source};
@@ -14,7 +14,8 @@ use wosy_compiler::Diagnostic;
 use wosy_project::PackageRelativePath;
 use wosy_protocol::{
     walk_cst, BuildDiagnosticResponse, BuildSessionRefusal, CstEvent, CstExpansionBudget,
-    BuildSourceSelection, FileEntry, FileKey,
+    BuildSessionReply, BuildSessionRequest, BuildSourceSelection, FileEntry, FileKey, OrdinaryLlvmProjection,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -35,6 +36,52 @@ pub enum AcknowledgedBuildDiagnostics {
     NativeReplayRequired,
     Refused(BuildSessionRefusal),
     Report(RootedDiagnosticReport),
+}
+
+/// A fresh verified LLVM partition for the still-acknowledged generation.
+/// Do not treat these bytes as artifact/build permission or a verdict.
+pub struct AcknowledgedLlvmPartition {
+    captured: AcknowledgedSourceGeneration,
+    projection: OrdinaryLlvmProjection,
+}
+
+impl AcknowledgedLlvmPartition {
+    pub fn source(&self) -> &AcknowledgedSourceGeneration { &self.captured }
+    pub fn projection(&self) -> &OrdinaryLlvmProjection { &self.projection }
+}
+
+pub enum AcknowledgedOrdinaryLlvm {
+    NotAcknowledged,
+    StaleSelection,
+    WorkspaceChanged,
+    ProfileNotSelected,
+    ReplayNotAccepted,
+    Refused(BuildSessionRefusal),
+    Partition(AcknowledgedLlvmPartition),
+}
+
+enum LiveCaptureRefusal { NotAcknowledged, StaleSelection, WorkspaceChanged, ProfileNotSelected }
+
+impl From<LiveCaptureRefusal> for AcknowledgedBuildDiagnostics {
+    fn from(refusal: LiveCaptureRefusal) -> Self {
+        match refusal {
+            LiveCaptureRefusal::NotAcknowledged => Self::NotAcknowledged,
+            LiveCaptureRefusal::StaleSelection => Self::StaleSelection,
+            LiveCaptureRefusal::WorkspaceChanged => Self::WorkspaceChanged,
+            LiveCaptureRefusal::ProfileNotSelected => Self::ProfileNotSelected,
+        }
+    }
+}
+
+impl From<LiveCaptureRefusal> for AcknowledgedOrdinaryLlvm {
+    fn from(refusal: LiveCaptureRefusal) -> Self {
+        match refusal {
+            LiveCaptureRefusal::NotAcknowledged => Self::NotAcknowledged,
+            LiveCaptureRefusal::StaleSelection => Self::StaleSelection,
+            LiveCaptureRefusal::WorkspaceChanged => Self::WorkspaceChanged,
+            LiveCaptureRefusal::ProfileNotSelected => Self::ProfileNotSelected,
+        }
+    }
 }
 
 enum Recovery {
@@ -102,7 +149,7 @@ impl SqliteSourceState {
         let deadline = diagnostic_deadline(timeout)?;
         let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
             Ok(capture) => capture,
-            Err(outcome) => return Ok(outcome),
+            Err(outcome) => return Ok(outcome.into()),
         };
         self.diagnostics_for_capture(captured, deadline, budget, open, Recovery::LocalAdapter).await
     }
@@ -119,17 +166,59 @@ impl SqliteSourceState {
         let deadline = diagnostic_deadline(timeout)?;
         let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
             Ok(capture) => capture,
-            Err(outcome) => return Ok(outcome),
+            Err(outcome) => return Ok(outcome.into()),
         };
         self.diagnostics_for_capture(captured, deadline, budget, |_, _| async move {
             Ok(wosy_protocol::native_diagnostics::connect(directory).await?)
         }, Recovery::NativeKnown).await
     }
 
+    /// Explicit local-adapter request for ordinary authored LLVM (not an
+    /// incremental Build verdict). The adapter owns its dedicated stream
+    /// and grants the separate server capability for exactly this source.
+    /// One expiry covers live capture, one optional replay, and close.
+    /// Memory read/framing budgets are distinct from the partition byte
+    /// limit. Recovery can restore the already selected source only. This
+    /// never stages new source, writes an artifact, or builds or runs code.
+    pub async fn live_ordinary_llvm<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        max_partition_bytes: usize, open: Open,
+    ) -> Result<AcknowledgedOrdinaryLlvm>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        use AcknowledgedOrdinaryLlvm as Outcome;
+        if profile.len() > MAX_ORDINARY_LLVM_PROFILE_BYTES { return Err("ordinary LLVM profile exceeds the byte budget".into()); }
+        let deadline = diagnostic_deadline(timeout)?;
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
+            Ok(capture) => capture,
+            Err(outcome) => return Ok(outcome.into()),
+        };
+        let output = max_partition_bytes.min(MAX_SESSION_FRAME_BYTES);
+        let answer = self.exchange_for_capture(&captured, deadline, open, true,
+            CapturedBuildDiagnostics::ordinary_llvm_request,
+            |capture, reply| capture.accept_ordinary_llvm(reply, output),
+        ).await?;
+        require_diagnostic_time(deadline)?;
+        let current = captured.is_current(self)?;
+        require_diagnostic_time(deadline)?;
+        if !current { return Ok(Outcome::StaleSelection); }
+        Ok(match answer {
+            CommandExchange::StaleSelection => Outcome::StaleSelection,
+            CommandExchange::ReplayRequired(_) => Outcome::ReplayNotAccepted,
+            CommandExchange::Refused(reason) => Outcome::Refused(reason),
+            CommandExchange::Answer(projection) => Outcome::Partition(AcknowledgedLlvmPartition {
+                captured: captured.source, projection,
+            }),
+        })
+    }
+
     fn capture_live(
         &mut self, target: &str, profile: &str, deadline: Instant, max_authored_source_bytes: usize,
-    ) -> Result<std::result::Result<CapturedBuildDiagnostics, AcknowledgedBuildDiagnostics>> {
-        use AcknowledgedBuildDiagnostics as Outcome;
+    ) -> Result<std::result::Result<CapturedBuildDiagnostics, LiveCaptureRefusal>> {
+        use LiveCaptureRefusal as Outcome;
         require_diagnostic_time(deadline)?;
         let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
             return Ok(Err(Outcome::NotAcknowledged));
@@ -166,7 +255,7 @@ impl SqliteSourceState {
     }
 
     async fn diagnostics_for_capture<Open, Opening, Stream>(
-        &mut self, captured: CapturedBuildDiagnostics, deadline: Instant, budget: CstExpansionBudget, mut open: Open,
+        &mut self, captured: CapturedBuildDiagnostics, deadline: Instant, budget: CstExpansionBudget, open: Open,
         recovery: Recovery,
     ) -> Result<AcknowledgedBuildDiagnostics>
     where
@@ -175,15 +264,15 @@ impl SqliteSourceState {
         Stream: AsyncRead + AsyncWrite + Unpin + 'static,
     {
         use AcknowledgedBuildDiagnostics as Outcome;
-        let answer = within_diagnostic_deadline(deadline, async {
-            let first = open_exchange(self, &captured, deadline, None, &mut open).await?;
-            let DiagnosticExchange::ReplayRequired(challenge) = first else { return Ok(first) };
+        let replay = match recovery {
+            Recovery::LocalAdapter => true,
             #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
-            if matches!(recovery, Recovery::NativeKnown) { return Ok(DiagnosticExchange::ReplayRequired(challenge)); }
-            let Some(replay) = challenge.prepare(self)? else { return Ok(DiagnosticExchange::StaleSelection) };
-            open_exchange(self, &captured, deadline, Some(replay), &mut open).await
-        }).await?;
-        Ok(match captured.finish_project_exchange(self, answer, budget)? {
+            Recovery::NativeKnown => false,
+        };
+        let answer = self.exchange_for_capture(&captured, deadline, open, replay,
+            CapturedBuildDiagnostics::analysis_request, CapturedBuildDiagnostics::accept_analysis,
+        ).await?;
+        Ok(match captured.finish_project_exchange(self, answer.into(), budget)? {
             ProjectDiagnosticExchange::StaleSelection => Outcome::StaleSelection,
             ProjectDiagnosticExchange::ReplayRequired(_) => match recovery {
                 Recovery::LocalAdapter => Outcome::ReplayNotAccepted,
@@ -194,12 +283,32 @@ impl SqliteSourceState {
             ProjectDiagnosticExchange::Report(report) => Outcome::Report(report),
         })
     }
+    async fn exchange_for_capture<Open, Opening, Stream, Answer>(
+        &mut self, captured: &CapturedBuildDiagnostics, deadline: Instant, mut open: Open, allow_replay: bool,
+        command: impl Fn(&CapturedBuildDiagnostics) -> BuildSessionRequest + Copy,
+        verify: impl Fn(&CapturedBuildDiagnostics, BuildSessionReply<Diagnostic>) -> Result<Answer> + Copy,
+    ) -> Result<CommandExchange<Answer>>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        within_diagnostic_deadline(deadline, async {
+            let first = open_stream(captured, deadline, None, &mut open).await?;
+            let first = captured.converse_command(self, first, deadline, command, verify).await?;
+            let CommandExchange::ReplayRequired(challenge) = first else { return Ok(first); };
+            if !allow_replay { return Ok(CommandExchange::ReplayRequired(challenge)); }
+            let Some(replay) = challenge.prepare(self)? else { return Ok(CommandExchange::StaleSelection); };
+            let stream = open_stream(captured, deadline, Some(replay), &mut open).await?;
+            captured.converse_command(self, stream, deadline, command, verify).await
+        }).await
+    }
 }
 
-async fn open_exchange<Open, Opening, Stream>(
-    local: &mut SqliteSourceState, captured: &CapturedBuildDiagnostics, deadline: Instant,
+async fn open_stream<Open, Opening, Stream>(
+    captured: &CapturedBuildDiagnostics, deadline: Instant,
     replay: Option<SourceReplay>, open: &mut Open,
-) -> Result<DiagnosticExchange>
+) -> Result<Stream>
 where
     Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
     Opening: Future<Output = Result<Stream>>,
@@ -212,7 +321,7 @@ where
         Err(expired) => Poll::Ready(Err(expired)),
     }).await?;
     require_diagnostic_time(deadline)?;
-    captured.converse_current(local, stream, deadline).await
+    Ok(stream)
 }
 
 /// Renderable diagnostics from one opened source-only session. The owned
