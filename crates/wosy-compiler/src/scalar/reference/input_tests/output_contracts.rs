@@ -473,7 +473,7 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         let mut liveness = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         liveness.checked_installs = Some(&installs);
         liveness.owner_subset = Some(LexicalOwnerSubset {
-            return_edges: &return_edges, installs: &installs, owners: Default::default(),
+            return_edges: &return_edges, installs: &installs, copies: &[], owners: Default::default(),
         });
         let stage = liveness.owner_subset.as_ref().unwrap();
         let CfgPointKind::Borrow { place, .. } = &points[expected.0].kind else { panic!("typed root loan"); };
@@ -489,7 +489,7 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         let unknown_edges = checked_return_argument_edges(points, &unknown, &proof.resolved_checked_call_outputs);
         assert!(unknown_edges.is_empty());
         let unchecked_stage = LexicalOwnerSubset { return_edges: &unknown_edges,
-            installs: &installs, owners: Default::default() };
+            installs: &installs, copies: &[], owners: Default::default() };
         assert!(unchecked_stage.roots(points, binding).is_none());
         let checked = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
@@ -540,7 +540,7 @@ fn checked_lexical_install_retires_only_the_version_on_its_branch() {
         let new_owner = root_of(rhs);
         let mut staged = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         staged.checked_installs = Some(&installs);
-        staged.owner_subset = Some(LexicalOwnerSubset { return_edges: &return_edges, installs: &installs,
+        staged.owner_subset = Some(LexicalOwnerSubset { return_edges: &return_edges, installs: &installs, copies: &[],
             owners: Default::default() });
         assert_eq!(staged.owner_subset.as_ref().unwrap().roots(points, first.holder).unwrap(),
             &HashSet::from([old_owner, new_owner]));
@@ -553,6 +553,67 @@ fn checked_lexical_install_retires_only_the_version_on_its_branch() {
         }
         assert!(staged.lexical_after(*bind, first.holder), "the other branch keeps the original value");
         assert!(staged.lexical_after(replace, first.holder), "access at the replacement sees its new value");
+        let checked = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+    }
+}
+
+
+#[test]
+fn lexical_owner_subset_propagates_typed_shared_copies_after_join() {
+    let text = "%%start\nunit(bool) examine = fn(change) { u8 value = 7; u8 other = 9; *u8 held = &value; if (change) { held = &other; }; *u8 copy = held; *u8 leaf = copy; leaf; };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (provisional, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let caller = &provisional[0].1;
+        let points = &caller.cfg.initial_points;
+        let proof = &caller.proof_points;
+        let mut installs = HashMap::new();
+        let mut copies = Vec::new();
+        for &(bind, value) in &proof.checked_binding_initializers {
+            if let Some(install) = checked_lexical_install(points, bind, value, &[]) {
+                installs.insert(bind, install);
+            }
+            if proof.checked_shared_copy_installs.binary_search(&bind).is_ok() {
+                copies.push(checked_shared_copy_edge(points, bind, value).unwrap());
+            }
+        }
+        for point in points {
+            if let CfgPointKind::Assign { rhs_point, .. } = &point.kind {
+                if let Some(install) = checked_lexical_install(points, point.id, *rhs_point, &[]) {
+                    installs.insert(point.id, install);
+                }
+            }
+        }
+        let [(held, copy), (carrier, leaf)] = copies.as_slice() else { panic!("two genuine typed copy edges"); };
+        assert_eq!(copy, carrier);
+        let mut staged = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        let baseline = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        staged.checked_installs = Some(&installs);
+        let return_edges = HashMap::new();
+        staged.owner_subset = Some(LexicalOwnerSubset { return_edges: &return_edges, installs: &installs,
+            copies: &copies, owners: Default::default() });
+        let stage = staged.owner_subset.as_ref().unwrap();
+        let roots = stage.roots(points, held).unwrap();
+        assert_eq!(roots.len(), 2);
+        for descendant in [copy, leaf] {
+            assert_eq!(stage.roots(points, descendant), Some(roots));
+            for point in points {
+                for &root in roots {
+                    assert_eq!(staged.lexical_loan_after(point.id, descendant, root),
+                        baseline.lexical_after(point.id, descendant));
+                }
+            }
+        }
         let checked = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
     }

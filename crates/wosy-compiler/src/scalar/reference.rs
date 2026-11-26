@@ -5368,6 +5368,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || frozen == &self.cfg.points[value.0].possible_origins
                         {
                             self.proof_points.checked_binding_initializers.push((bind, value));
+                            if receiver == 0 && matches!(ty, ScalarType::CheckedReference {
+                                mutability: ScalarReferenceMutability::Shared, ..
+                            }) && matches!(&self.cfg.points[value.0].kind, CfgPointKind::Read { binding: source }
+                                if matches!(self.binding_types.get(source), Some(ScalarType::CheckedReference {
+                                    mutability: ScalarReferenceMutability::Shared, ..
+                                })))
+                            {
+                                self.proof_points.checked_shared_copy_installs.push(bind);
+                            }
                             if self.has_joined_root_reborrow && receiver == 0
                                 && self.joined_mutable_child.is_none()
                                 && matches!(ty, ScalarType::CheckedReference {
@@ -8310,9 +8319,25 @@ impl ProjectedCarrierReads {
     }
 }
 
+fn checked_shared_copy_edge(
+    points: &[ReferenceFlowPoint], bind: CfgPointId, value: CfgPointId,
+) -> Option<(&ReferenceBindingId, &ReferenceBindingId)> {
+    let read = points.get(value.0)?;
+    let write = points.get(bind.0)?;
+    let CfgPointKind::Read { binding: source } = &read.kind else { return None; };
+    let CfgPointKind::Bind { binding: destination } = &write.kind else { return None; };
+    (value < bind && read.id == value && write.id == bind && read.scope == write.scope
+        && read.successors.as_slice() == [bind] && source != destination
+        && matches!(destination.kind, ReferenceBindingKind::Declared)
+        && source.source == read.source_span.source && destination.source == write.source_span.source
+        && source.function_span == destination.function_span)
+        .then_some((source, destination))
+}
+
 struct LexicalOwnerSubset<'a> {
     return_edges: &'a HashMap<CfgPointId, CheckedReturnArgumentEdge>,
     installs: &'a HashMap<CfgPointId, CheckedLexicalInstall<'a>>,
+    copies: &'a [(&'a ReferenceBindingId, &'a ReferenceBindingId)],
     owners: std::cell::OnceCell<HashMap<&'a ReferenceBindingId, HashSet<&'a ReferenceBindingId>>>,
 }
 
@@ -8337,6 +8362,29 @@ impl<'a> LexicalOwnerSubset<'a> {
                     // Union issuance across the entire body, ignoring kills,
                     // arm order and duplicate introductions of the same root.
                     rows.entry(install.holder).or_default().insert(&place.binding);
+                }
+            }
+            if self.copies.is_empty() { return rows; }
+            let mut subscribers = HashMap::<_, HashSet<_>>::new();
+            for &(source, destination) in self.copies {
+                subscribers.entry(source).or_default().insert(destination);
+            }
+            let mut pending = std::collections::VecDeque::new();
+            for (&carrier, roots) in &rows {
+                pending.extend(roots.iter().map(|&root| (carrier, root)));
+            }
+            // Bound work even for dense fans or cycles. On exhaustion
+            // discard the optimization entirely rather than keep an order-dependent subset.
+            let mut budget = points.len().saturating_mul(2);
+            while let Some((source, root)) = pending.pop_front() {
+                if let Some(destinations) = subscribers.get(source) {
+                    if destinations.len() > budget { return HashMap::new(); }
+                    budget -= destinations.len();
+                    for &destination in destinations {
+                        if rows.entry(destination).or_default().insert(root) {
+                            pending.push_back((destination, root));
+                        }
+                    }
                 }
             }
             rows
@@ -9976,6 +10024,7 @@ struct ReferenceTransferCfg<'a> {
     guarded_runtime_moves: Option<&'a BTreeMap<CfgPointId, GuardedRuntimeMove>>,
     guarded_releases: Option<&'a BTreeMap<CfgPointId, ReferenceBindingId>>,
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
+    checked_shared_copy_installs: &'a [CfgPointId],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
     joined_reborrow_descendants: &'a [CfgPointId],
@@ -10021,6 +10070,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             guarded_runtime_moves: proof.map(|proof| &proof.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
             guarded_releases: proof.map(|proof| &proof.guarded_releases).filter(|releases| !releases.is_empty()),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
+            checked_shared_copy_installs: proof.map_or(&[], |proof| &proof.checked_shared_copy_installs),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
             joined_reborrow_descendants: proof.map_or(&[], |proof| &proof.joined_reborrow_descendants),
@@ -11674,10 +11724,16 @@ fn transfer_reference_facts(
             .collect::<HashMap<_, _>>();
         (children, parents)
     });
+    let mut checked_shared_copies = Vec::new();
     for &(bind, value) in cfg.checked_binding_initializers {
         last_use[value.0] = last_use[value.0].max(bind.0);
         if let Some(install) = checked_lexical_install(original_points, bind, value, cfg.resolved_checked_call_outputs) {
             checked_installs.insert(bind, install);
+        }
+        if cfg.checked_shared_copy_installs.binary_search(&bind).is_ok() {
+            if let Some(copy) = checked_shared_copy_edge(original_points, bind, value) {
+                checked_shared_copies.push(copy);
+            }
         }
         if let Some((children, parents)) = &mut runtime_child_installs {
             if let Some(child) = children.get_mut(&value) { *child = Some(bind); }
@@ -11718,7 +11774,7 @@ fn transfer_reference_facts(
     if !checked_installs.is_empty() { liveness.checked_installs = Some(&checked_installs); }
     if strictly_forward && !checked_installs.is_empty() {
         liveness.owner_subset = Some(LexicalOwnerSubset {
-            return_edges: &return_edges, installs: &checked_installs, owners: Default::default(),
+            return_edges: &return_edges, installs: &checked_installs, copies: &checked_shared_copies, owners: Default::default(),
         });
     }
     let mut forward_cursor = 0;
@@ -18755,6 +18811,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     guarded_runtime_moves: Some(&template_result.proof_points.guarded_runtime_moves).filter(|moves| !moves.is_empty()),
                     guarded_releases: Some(&template_result.proof_points.guarded_releases).filter(|releases| !releases.is_empty()),
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
+                    checked_shared_copy_installs: &template_result.proof_points.checked_shared_copy_installs,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
                     joined_reborrow_descendants: &template_result.proof_points.joined_reborrow_descendants,
