@@ -3582,6 +3582,43 @@ main_artifact = "main"
                         }
                     }
                 }
+                let sparse_exists = format!(r#"%%start
+                    u8(u8) identity = fn(value) {{ value }};
+                    proof sparse for identity(entry) -> (out) where (entry == 3)
+                        ensures (exists (u8 chosen where chosen == 2 || chosen == 4) {{ out == chosen }}) {{}}
+                    core.require(false, {first});
+                    u8 actual = identity(3);
+                    core.require(actual == 3, {unused_output});
+                    core.require(false, {second});
+                %%end"#);
+                fs::write(&source, sparse_exists).unwrap();
+                let baseline = legacy();
+                let old = baseline.outcome.as_ref().unwrap();
+                assert_eq!(old.directives.len(), 2);
+                let complete = terminal(std::slice::from_ref(&baseline), scope, false);
+                assert_eq!(complete.0, Ok(19));
+                assert_eq!(complete.1, b"firstsecond");
+                assert_eq!(files(), both_files);
+                clean();
+                for cap in [1, 2, 3] {
+                    let receipts = selected(cap);
+                    let report = receipts[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives, old.directives[..cap.min(2)]);
+                    let [failure] = report.diagnostics.as_slice() else { panic!("one exact sparse existential refutation"); };
+                    assert_eq!(failure.invocation.call, old.diagnostics[0].invocation.call);
+                    assert_eq!(failure.invocation.returned, 3.into());
+                    assert_eq!(failure.invocation.directive_position, 1);
+                    let shown = terminal(&receipts, scope, false);
+                    if cap == 1 {
+                        assert_eq!((shown.0, shown.1), (Ok(1), b"first".to_vec()));
+                        assert_eq!(files(), first_file);
+                    } else {
+                        assert_eq!(shown, complete);
+                        assert_eq!(files(), both_files);
+                    }
+                    clean();
+                }
+
                 // Do not silently enable this newly enrolled goal in a provider catalog.
                 fs::write(&source, &roster_root).unwrap();
                 fs::write(&shared_source, provider(&first).replace("out == 8", "out >= 8")).unwrap();

@@ -11634,17 +11634,28 @@ fn run_private_named_after_startup(
         let body = plan.typed.body;
         let unary_bound = matches!(body.boundary.parameters.as_slice(),
             [entry] if &entry.ty == plan.typed.result_type);
-        let goal_supported = match &plan.typed.goal {
-            TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. } => true,
+        let plain_unary = ordinary_relations && unary_bound;
+        let (goal_supported, typed_witness) = match &plan.typed.goal {
+            TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. } => (true, false),
             TypedProofGoal::Literal { .. }
                 | TypedProofGoal::EntryComparison { slot: 0, .. }
-                | TypedProofGoal::EntryAffine { slot: 0, .. } => ordinary_relations && unary_bound,
-            _ => false,
+                | TypedProofGoal::EntryAffine { slot: 0, .. }
+                | TypedProofGoal::Universal { .. }
+                | TypedProofGoal::UniversalConjunction(_)
+                | TypedProofGoal::UniversalNotEqual(_)
+                | TypedProofGoal::InferredExistential(..) => (plain_unary, false),
+            TypedProofGoal::Existential { .. }
+                | TypedProofGoal::EntryWitness { .. }
+                | TypedProofGoal::ConjunctiveExistential(_)
+                | TypedProofGoal::DependentWitness(_) => (plain_unary, true),
+            _ => (false, false),
         };
         // The existing typed observer checks these independent relations
         // against original returned/entry values. They never stand in for
         // an ordinary call or drive any authored state transition.
-        if !goal_supported || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
+        // MainFlowProofCase::prepare, before any ordinary walk,
+        // authenticates the exact typed witness and sole permitted step.
+        if !goal_supported || (!typed_witness && !plan.has_no_authored_steps()) || !valid_arbitrary_proof_body(body)
             || !body.structure.checker_direct_targets.is_empty()
             || !targets.insert(plan.target) || !names.insert((plan.proof_source, plan.name))
         { return Err(ProjectCheck::Unsupported); }
@@ -16883,6 +16894,82 @@ mod tests {
                 assert!(matches!(prepare(&foreign, scope, layout)
                     .and_then(|owner| owner.run_private_authored_root(NonZeroUsize::MIN)),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_closed_named_quantifiers_keep_original_witnesses_after_cap() {
+        use std::num::NonZeroUsize;
+        let root = source("src/main.w", "private-closed-named-quantifiers");
+        let cases = [
+            ("i8", "-3", -3, "value < 0", r#"
+                where (entry == -3)
+                forall (i8 forbidden where forbidden == -3 || forbidden == 0)
+                ensures (out != forbidden) {}"#, None),
+            ("u8", "3", 3, "value == 3", r#"
+                where (entry == 3)
+                ensures (exists (u8 chosen where chosen == 2 || chosen == 4) { out == chosen }) {}"#, None),
+            ("u8", "4", 4, "value == 4", r#"
+                where (entry == 4)
+                ensures (exists (u8 chosen where chosen == 2 || chosen == 4) { out <= chosen })
+                { core.witness(3); }"#, Some("core.witness(3)")),
+            ("u8", "4", 4, "value == 4", r#"
+                where (entry == 4)
+                ensures (exists (u8 chosen where chosen == 2 || chosen == 4) { out < chosen })
+                { core.witness(2); }"#, None),
+        ];
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, catalog) = crate::parse_proof_source(root.clone(), text.to_owned(), &[])
+                        .unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(catalog, Vec::new())], vec![root.clone()], ScalarPreparationInputs { target_layout: layout },
+                        scope, Vec::new()).unwrap()
+                };
+                for (ty, input, returned, condition, contract, failing_step) in cases {
+                    let declaration = format!("{ty}({ty}) check = fn(entry) {{ entry }}; proof q for check(entry) -> (out) {contract}");
+                    let call = format!("check({input})");
+                    let actual_source = format!(
+                        "%%start {declaration} core.require(false, {OUTPUT}); {ty} value = {call}; core.require({condition}, {OUTPUT}); core.require(false, {OUTPUT}); %%end");
+                    let old = prepare(&actual_source).run().unwrap_or_else(|error| panic!("incumbent {contract}: {error:?}"));
+                    assert_eq!(old.directives.len(), 2);
+                    let [baseline] = old.diagnostics.as_slice() else { panic!("one real quantified refutation: {contract}"); };
+                    let check_actual = |diagnostics: &[MainFlowProofDiagnostic], position| {
+                        let [observed] = diagnostics else { panic!("one observed quantified refutation: {contract}"); };
+                        assert_eq!((&observed.proof, &observed.goal, &observed.invocation.call),
+                            (&baseline.proof, &baseline.goal, &baseline.invocation.call));
+                        assert_eq!(observed.invocation.directive_position, position);
+                        assert_eq!(observed.invocation.returned, returned.into());
+                        let text = |span: &wosy_syntax::SourceSpan| &actual_source[span.range.start as usize..span.range.end as usize];
+                        assert_eq!(text(&observed.invocation.call), call);
+                        assert_eq!(observed.failed_step.as_ref().map(text), failing_step);
+                    };
+                    for cap in [1, 2, 3] {
+                        let (report, end) = prepare(&actual_source).run_private_authored_root(NonZeroUsize::new(cap).unwrap())
+                            .unwrap_or_else(|error| panic!("private {contract} cap {cap}: {error:?}"));
+                        assert_eq!(report.directives, old.directives[..cap.min(2)]);
+                        assert_eq!(end, Some(if cap <= 2 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted }));
+                        check_actual(&report.diagnostics, 1);
+                    }
+                    let formal = prepare(&actual_source).run_private_proofs_after_command_cap().unwrap();
+                    assert!(formal.directives.is_empty());
+                    check_actual(&formal.diagnostics, 0);
+                    let dormant = format!("%%start {declaration} core.require(false, {OUTPUT}); %%end");
+                    let incumbent = prepare(&dormant).run().unwrap();
+                    let (private, _) = prepare(&dormant).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                    assert_eq!(private.directives, incumbent.directives);
+                    assert!(private.diagnostics.is_empty());
+                    assert_eq!(private.symbolic_diagnostic.is_some(), scope == ScalarCheckerScope::CurrentPackage);
+                    if let Some(observed) = private.symbolic_diagnostic {
+                        let old = incumbent.symbolic_diagnostic.unwrap();
+                        assert_eq!((observed.proof, observed.goal, observed.failed_step, observed.returned, observed.quantified_witness),
+                            (old.proof, old.goal, old.failed_step, old.returned, old.quantified_witness));
+                        assert_eq!(observed.directive_position, 1);
+                    }
+                }
             }
         }
     }
