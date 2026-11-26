@@ -100,8 +100,15 @@ fn observe_project<T>(
     let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
     let mut remaining = CLOSED_COMPTIME_MAX_SOURCE_BYTES;
+    let mut is_entry = true;
     let mut authored = BTreeMap::new();
     let graph = project_sources::load_with_reader(&root, &context, &configuration, |path, opened| {
+        // Only the selected authored evaluator needs the closed-site limit.
+        // In the P1 lane, imported declarations (including the real stdlib)
+        // follow the same authorized source reads as ordinary project Build.
+        if wasip1 && !std::mem::replace(&mut is_entry, false) {
+            return project_sources::read_source(path, opened).map_err(ClosedComptimePlanError::Project);
+        }
         let (revision, text) = project_sources::read_bounded_regular_source(path, opened, remaining)
             .map_err(ClosedComptimePlanError::Project)?;
         remaining -= text.len();

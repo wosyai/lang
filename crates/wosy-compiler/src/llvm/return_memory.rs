@@ -310,7 +310,9 @@ fn capture_inline_return<'ctx>(
         return Err("invalid fixed copy return arity".into());
     };
     let expected = storage_type(context, &output.ty, state.layouts, state.target_layout)?;
-    if !matches!(output.ty, ScalarType::Struct(_)) || expected != BasicTypeEnum::ArrayType(bytes) {
+    if !matches!(output.ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+        || expected != BasicTypeEnum::ArrayType(bytes)
+    {
         return Err("inline return value does not match its declared struct layout".into());
     }
     match take_basic(value)? {

@@ -650,3 +650,104 @@ Report result = comptime prepare {
         Expr::Integer { value, .. } if i64::try_from(&value) == Ok(14)));
     assert!(!project.join(".wosy").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn wasip1_stdout_captures_authored_text_from_real_standard_library() {
+    use std::{os::unix::process::ExitStatusExt, process::ExitStatus};
+    use wosy_cli::comptime_fragment::prepare_project_comptime_wasip1_stdout_evaluator;
+    use wosy_compiler::{ClosedComptimeRejection, ScalarExpression as Expr};
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let source = project.join("src/main.w");
+    let standard = fixture.0.join("std");
+    fs::create_dir_all(standard.join("src/wasi")).unwrap();
+    for (path, text) in [
+        ("wosy.toml", include_str!("../../../stdlib/wosy.toml")),
+        ("src/bootstrap.w", include_str!("../../../stdlib/src/bootstrap.w")),
+        ("src/wasi/preview1.w", include_str!("../../../stdlib/src/wasi/preview1.w")),
+    ] {
+        fs::write(standard.join(path), text).unwrap();
+    }
+    fixture.manifest(&format!("{}\n[dependencies.std]\npath=\"../std\"\n",
+        MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")));
+    let assemble = |maximum| prepare_project_comptime_wasip1_stdout_evaluator(
+        &project, "app", "override", "prepare", maximum,
+    );
+    let ok = ExitStatus::from_raw(0);
+    let aggregate = r#"%%start
+std = namespace std "bootstrap.w";
+struct Report { std.utf8 label; u32[2] buckets; }
+Report result = comptime prepare {
+    std.utf8 text = "olá\n\t\r\"ok\\\0";
+    u32 base = 7;
+    { .buckets = [base, base ^ 9]; .label = text; }
+};
+%%end
+"#;
+    let direct = r#"%%start
+std = namespace std "bootstrap.w";
+std.utf8 result = comptime prepare {
+    std.utf8 first = "olá\n\t\r\"ok\\\0";
+    first
+};
+%%end
+"#;
+    let arrays = r#"%%start
+std = namespace std "bootstrap.w";
+std.utf8[2] result = comptime prepare {
+    std.utf8 first = "olá\n\t\r\"ok\\\0";
+    std.utf8 second = "";
+    [first, second]
+};
+%%end
+"#;
+    for (authored, expected, scalar) in [
+        (aggregate, "[\"olá\\n\\t\\r\\\"ok\\\\\\u0000\",[7,14]]\n", Some("xor i32")),
+        (direct, "\"olá\\n\\t\\r\\\"ok\\\\\\u0000\"\n", None),
+        (arrays, "[\"olá\\n\\t\\r\\\"ok\\\\\\u0000\",\"\"]\n", None),
+    ] {
+        fs::write(&source, authored).unwrap();
+        assert!(matches!(assemble(3), Err(ClosedComptimePlanError::Fragment(ClosedComptimeRejection::Emitter(message)))
+            if message == "comptime stdout shape exceeds the selected byte budget"));
+        let staged = assemble(256).unwrap_or_else(|error| panic!("selected authored WASI text: {error:?}\n{authored}"));
+        assert_eq!(staged.layout(), ScalarTargetLayout::WASM32);
+        let mut bytes = Vec::new();
+        staged.write_evaluator_ir(&mut bytes, 1 << 16).unwrap();
+        let ir = std::str::from_utf8(&bytes).unwrap();
+        let entry = ir.lines().find(|line| line.starts_with("define [") && line.contains("__6576616c75617465("))
+            .unwrap_or_else(|| panic!("missing by-value selected evaluator:\n{ir}"));
+        let region = ir.split_once(entry).unwrap().1.split_once("\n}").unwrap().0;
+        assert!(region.contains("ret [") && !region.contains("ret ptr"));
+        if let Some(operation) = scalar { assert!(region.contains(operation), "{region}"); }
+        let root = ir.split_once("define i32 @main(").unwrap().1.split_once("\n}").unwrap().0;
+        assert_eq!(root.matches("__6576616c75617465(").count(), 1);
+        assert!(root.contains("load i64") && root.contains("inttoptr i32") && root.contains("call void @__wosy_ct_quote_utf8"));
+        let quoted = ir.split_once("define internal void @__wosy_ct_quote_utf8(").unwrap().1.split_once("\n}").unwrap().0;
+        assert!(quoted.contains("switch i8") && quoted.contains("utf8.control") && quoted.contains("utf8.nibble.low"));
+        assert!(root.contains("call i32 @fd_write(i32 1,"));
+        assert!(!ir.contains("@fd_read") && !ir.contains("@printf"));
+        // The emitted assembly has not executed. Exercise its nominal
+        // compiler-selected result shape with an independent host oracle.
+        let value = staged.read_stdout(ok, expected.as_bytes(), 256).unwrap();
+        let actual_text = match value {
+            Expr::Utf8 { value, .. } => value,
+            Expr::StructLiteral { fields, .. } => match &fields[0].value {
+                Expr::Utf8 { value, .. } => value.clone(),
+                _ => panic!("ordinary UTF-8 field"),
+            },
+            Expr::ArrayLiteral { elements, .. } => match &elements[..] {
+                [Expr::Utf8 { value, .. }, Expr::Utf8 { value: empty, .. }] if empty.is_empty() => value.clone(),
+                _ => panic!("ordinary fixed pair of UTF-8 values"),
+            },
+            _ => panic!("ordinary declared text result"),
+        };
+        assert_eq!(actual_text, "olá\n\t\r\"ok\\\0".as_bytes());
+    }
+    // The old authored-site cap still applies to the exact entry file,
+    // not to the ordinary installed dependency bytes proved above.
+    fs::write(&source, format!("{}{}", " ".repeat(1 << 16), direct)).unwrap();
+    assert!(matches!(assemble(256), Err(ClosedComptimePlanError::Project(message))
+        if message == "preview source exceeds the authored byte budget"));
+    assert!(!project.join(".wosy").exists());
+}

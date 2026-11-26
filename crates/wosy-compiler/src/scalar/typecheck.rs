@@ -9563,7 +9563,7 @@ fn check_expression_type_expected(
     }
 }
 
-fn is_null_expression(expression: &ScalarExpression) -> bool {
+pub(super) fn is_null_expression(expression: &ScalarExpression) -> bool {
     match expression {
         ScalarExpression::Name { name, .. } => name == "null",
         ScalarExpression::If {

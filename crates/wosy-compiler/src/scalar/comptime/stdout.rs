@@ -8,9 +8,10 @@ use super::{
 };
 use super::super::{
     derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
-    EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject, ScalarStructId, ScalarStructLiteralField,
+    typecheck::is_null_expression, EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject,
+    ScalarStructFieldId, ScalarStructId, ScalarStructLiteralField,
 };
-use crate::llvm::emit_scalar_build_wasip1_comptime_stdout;
+use crate::llvm::{emit_scalar_build_wasip1_comptime_stdout, Wasip1ComptimeOutput};
 use crate::{
     emit_scalar_build_project_artifact_llvm, emit_scalar_build_single_module_artifact_llvm, LlvmPartition,
     ScalarBlock, ScalarFunction, ScalarOutput, ScalarOutputSequence, UnaryOperator,
@@ -69,8 +70,8 @@ pub fn prepare_comptime_stdout(
 }
 
 /// The compiler-issued standalone evaluator and the stdout type from that
-/// same ordinary preparation. It neither serializes an evaluated value
-/// inside the module yet nor launches a builder, module, or runner.
+/// same ordinary preparation. The explicitly selected preview1 variant
+/// includes the compiler's stdout entry; this type never launches a tool.
 pub struct PreparedComptimeStdoutEvaluator {
     output: PreparedComptimeStdout,
     llvm: LlvmPartition,
@@ -135,10 +136,14 @@ fn prepare(
     }
     let Some((entry, _)) = sources.first() else { return Err(Error::InvalidParse); };
     let mut bytes = 0usize;
-    for (fresh, _) in &sources {
+    for (ordinal, (fresh, _)) in sources.iter().enumerate() {
         if !fresh.result().is_valid() { return Err(Error::InvalidParse); }
-        bytes = bytes.saturating_add(fresh.result().text.len());
-        if bytes > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
+        // For P1 the closed body is selected from the entry; imported
+        // declarations are read through the ordinary project graph.
+        if ordinal == 0 || !matches!(delivery, Delivery::Wasip1(_)) {
+            bytes = bytes.saturating_add(fresh.result().text.len());
+            if bytes > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
+        }
     }
     let parsed = (*entry).result();
     let qualify = |span| SourceSpan::new(parsed.source.clone(), span);
@@ -169,9 +174,10 @@ fn prepare(
     if block.final_expressions().count() != 1 || !matches!(block.items.last(), Some(ScalarBlockItem::Expression(_))) {
         return Err(unsupported("expected one final comptime value"));
     }
-    if emit && !closed_evaluator_body(&block) {
-        return Err(unsupported("not a closed authored scalar/aggregate evaluator body"));
-    }
+    let body_facts = if emit {
+        Some(closed_evaluator_body(&block).ok_or_else(||
+            unsupported("not a closed authored scalar/aggregate evaluator body"))?)
+    } else { None };
     let block_span = block.span;
     let value = ScalarExpression::Block(block);
     let modules = sources.into_iter().enumerate().map(|(index, (fresh, namespaces))| {
@@ -258,7 +264,8 @@ fn prepare(
         };
         (&binding.declared_type, literal_body)
     };
-    let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), 0)
+    let mut text_fields = matches!(delivery, Delivery::Wasip1(_)).then(HashMap::new);
+    let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), &mut text_fields, 0)
         .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
     let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, value));
     let llvm = match delivery {
@@ -268,25 +275,45 @@ fn prepare(
         } else {
             emit_scalar_build_project_artifact_llvm(&build)
         }.map_err(Error::Emitter)?),
-        Delivery::Wasip1(maximum) => Some(
-            emit_scalar_build_wasip1_comptime_stdout(&build, result_type, maximum).map_err(Error::Emitter)?,
-        ),
+        Delivery::Wasip1(max_stdout) => {
+            let text_fields = text_fields.expect("selected WASI output shape");
+            let facts = body_facts.expect("selected closed WASI body");
+            if !text_fields.is_empty() && (facts.allocates || facts.has_null) {
+                return Err(unsupported("WASI text results require literal-backed closed values"));
+            }
+            Some(emit_scalar_build_wasip1_comptime_stdout(&build, Wasip1ComptimeOutput {
+                site: &scope, ty: result_type, max_stdout, text_fields: &text_fields,
+                max_text_bytes: facts.max_text_bytes,
+            }).map_err(Error::Emitter)?)
+        }
     };
     Ok((PreparedComptimeStdout { site: scope, result_type: result_type.clone(), shape, literal }, llvm))
 }
 
-fn closed_evaluator_body(body: &ScalarBlock) -> bool {
-    if body.unsafe_context { return false; }
-    let Some((ScalarBlockItem::Expression(tail), locals)) = body.items.split_last() else { return false; };
+#[derive(Default)]
+struct ClosedBodyFacts {
+    allocates: bool,
+    has_null: bool,
+    max_text_bytes: u32,
+}
+
+fn closed_evaluator_body(body: &ScalarBlock) -> Option<ClosedBodyFacts> {
+    if body.unsafe_context { return None; }
+    let (ScalarBlockItem::Expression(tail), locals) = body.items.split_last()? else { return None; };
+    let mut facts = ClosedBodyFacts::default();
     let mut values = vec![tail];
     for item in locals {
-        let ScalarBlockItem::LocalBinding(binding) = item else { return false; };
+        let ScalarBlockItem::LocalBinding(binding) = item else { return None; };
+        facts.allocates |= binding.is_allocation;
         values.push(&binding.value);
     }
     while let Some(value) = values.pop() {
         match value {
+            ScalarExpression::Name { .. } if is_null_expression(value) => facts.has_null = true,
             ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } |
-            ScalarExpression::Name { .. } | ScalarExpression::Utf8 { .. } => {},
+            ScalarExpression::Name { .. } => {},
+            ScalarExpression::Utf8 { value, .. } =>
+                facts.max_text_bytes = facts.max_text_bytes.max(u32::try_from(value.len()).ok()?),
             ScalarExpression::Unary { operator, operand, .. }
                 if audited_closed_unary(operator) ||
                    (*operator == UnaryOperator::Negate && matches!(operand.as_ref(), ScalarExpression::Integer { .. })) =>
@@ -295,21 +322,23 @@ fn closed_evaluator_body(body: &ScalarBlock) -> bool {
                 values.extend([left.as_ref(), right.as_ref()]),
             ScalarExpression::ArrayLiteral { elements, .. } => values.extend(elements.iter()),
             ScalarExpression::StructLiteral { fields, .. } => values.extend(fields.iter().map(|field| &field.value)),
-            _ => return false,
+            _ => return None,
         }
     }
-    true
+    Some(facts)
 }
 
-fn shape_for(
-    project: &ScalarProject, ty: &ScalarType,
-    memo: &mut HashMap<ScalarStructId, (Arc<Shape>, usize)>, depth: usize,
+fn shape_for<'a>(
+    project: &'a ScalarProject, ty: &ScalarType,
+    memo: &mut HashMap<ScalarStructId, (Arc<Shape>, usize)>,
+    text_fields: &mut Option<HashMap<ScalarStructId, [&'a ScalarStructFieldId; 2]>>,
+    depth: usize,
 ) -> Option<(Arc<Shape>, usize)> {
     if depth > MAX_VALUE_DEPTH { return None; }
     if let Some(shape) = Shape::scalar(ty) { return Some((Arc::new(shape), 0)); }
     let (kind, height) = match ty {
         ScalarType::Array { element, length, .. } => {
-            let (element, child_height) = shape_for(project, element, memo, depth + 1)?;
+            let (element, child_height) = shape_for(project, element, memo, text_fields, depth + 1)?;
             (Shape::Array { count: usize::try_from(*length).ok()?, element }, child_height + 1)
         }
         ScalarType::Struct(id) => {
@@ -326,12 +355,15 @@ fn shape_for(
                     || !matches!(&data.ty, ScalarType::RawPointer(element) if **element == ScalarType::U8)
                     || length.ty != ScalarType::U64
                 { return None; }
+                if let Some(fields) = text_fields {
+                    fields.insert(id.clone(), [&data.id, &length.id]);
+                }
                 (Shape::Utf8, 0)
             } else {
                 let mut height = 0;
                 let mut fields = Vec::with_capacity(structure.fields.len());
                 for field in &structure.fields {
-                    let (shape, child_height) = shape_for(project, &field.ty, memo, depth + 1)?;
+                    let (shape, child_height) = shape_for(project, &field.ty, memo, text_fields, depth + 1)?;
                     height = height.max(child_height + 1);
                     fields.push((field.name.clone(), shape));
                 }

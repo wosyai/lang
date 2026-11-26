@@ -395,11 +395,12 @@ fn emit_scalar_llvm_with_metadata(
 }
 
 mod comptime_stdout;
+pub(crate) use comptime_stdout::Wasip1ComptimeOutput;
 
 pub(crate) fn emit_scalar_build_wasip1_comptime_stdout(
-    validation: &ScalarBuildValidation<'_>, result: &ScalarType, max_stdout: usize,
+    validation: &ScalarBuildValidation<'_>, output: Wasip1ComptimeOutput<'_>,
 ) -> Result<LlvmPartition, String> {
-    let plan = Some((result, max_stdout));
+    let plan = Some(output);
     if validation.prepared().project().modules.len() == 1 {
         emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[], plan)
     } else {
@@ -588,7 +589,7 @@ fn emit_scalar_build_single_module_with_metadata(
     validation: &ScalarBuildValidation<'_>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
-    comptime_result: Option<(&ScalarType, usize)>,
+    comptime_result: Option<Wasip1ComptimeOutput<'_>>,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -639,7 +640,7 @@ fn emit_single_module_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
-    comptime_result: Option<(&ScalarType, usize)>,
+    comptime_result: Option<Wasip1ComptimeOutput<'_>>,
 ) -> Result<LlvmPartition, String> {
     let prepared_render = generic_input.prepared_render();
     let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
@@ -748,17 +749,25 @@ fn emit_single_module_llvm<'a>(
     }
     let aggregates = close_aggregates(&reservations)?;
     for &(function, cfg, _, item_ordinal, _) in &definitions {
+        let captured = match comptime_result {
+            Some(output) => output.captured_type(&context, &layouts, target_layout, source, function, cfg)?,
+            None => None,
+        };
         let value = module.add_function(
             &function.name,
-            aggregate_transfer::definition_type(
-                &context,
-                function,
-                cfg,
-                target_layout,
-                &inline_results,
-                &layouts,
-                aggregates.body(0, item_ordinal, None),
-            )?,
+            if let Some(captured) = captured {
+                captured
+            } else {
+                aggregate_transfer::definition_type(
+                    &context,
+                    function,
+                    cfg,
+                    target_layout,
+                    &inline_results,
+                    &layouts,
+                    aggregates.body(0, item_ordinal, None),
+                )?
+            },
             aggregate_transfer::linkage(aggregates.body(0, item_ordinal, None)),
         );
         for (index, name) in function.parameters.iter().enumerate() {
@@ -904,10 +913,10 @@ fn emit_single_module_llvm<'a>(
             target_layout,
         )?;
     }
-    if let Some((ty, cap)) = comptime_result {
+    if let Some(output) = comptime_result {
         let entry = *functions.get("evaluate").ok_or("missing selected comptime evaluator")?;
         let main = *functions.get("main").ok_or("missing main")?;
-        comptime_stdout::emit(&context, &module, &layouts, &structs, target_layout, main, entry, ty, cap)?;
+        comptime_stdout::emit(&context, &module, &layouts, &structs, target_layout, main, entry, output)?;
     } else {
         emit_main(
             prepared_render,
@@ -997,7 +1006,7 @@ fn emit_scalar_build_project_with_policy(
     policy: EmissionPolicy,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
-    comptime_result: Option<(&ScalarType, usize)>,
+    comptime_result: Option<Wasip1ComptimeOutput<'_>>,
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -1036,7 +1045,7 @@ fn emit_project_llvm<'a>(
     project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
-    comptime_result: Option<(&ScalarType, usize)>,
+    comptime_result: Option<Wasip1ComptimeOutput<'_>>,
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -1249,18 +1258,27 @@ fn emit_project_llvm<'a>(
     for declaration in declarations {
         match declaration {
             Declaration::Ordinary(index) => {
-                let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let (module_ordinal, source, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let captured = match comptime_result {
+                    Some(output) =>
+                        output.captured_type(&context, &layouts, target_layout, &source.source, function, cfg)?,
+                    None => None,
+                };
                 let value = module.add_function(
                     &name,
-                    aggregate_transfer::definition_type(
-                        &context,
-                        function,
-                        cfg,
-                        target_layout,
-                        &inline_results,
-                        &layouts,
-                        aggregates.body(module_ordinal, item_ordinal, None),
-                    )?,
+                    if let Some(captured) = captured {
+                        captured
+                    } else {
+                        aggregate_transfer::definition_type(
+                            &context,
+                            function,
+                            cfg,
+                            target_layout,
+                            &inline_results,
+                            &layouts,
+                            aggregates.body(module_ordinal, item_ordinal, None),
+                        )?
+                    },
                     aggregate_transfer::linkage(aggregates.body(
                         module_ordinal,
                         item_ordinal,
@@ -1453,12 +1471,12 @@ fn emit_project_llvm<'a>(
             target_layout,
         )?;
     }
-    if let Some((ty, cap)) = comptime_result {
+    if let Some(output) = comptime_result {
         let root = project.modules.first().ok_or("missing selected comptime module")?;
         let symbol = project_function_name(&root.source, "evaluate");
         let entry = *functions.get(&symbol).ok_or("missing selected comptime evaluator")?;
         let main = *functions.get("main").ok_or("missing main")?;
-        comptime_stdout::emit(&context, &module, &layouts, &all_structs, target_layout, main, entry, ty, cap)?;
+        comptime_stdout::emit(&context, &module, &layouts, &all_structs, target_layout, main, entry, output)?;
     } else {
         emit_project_main(
             prepared_render,
