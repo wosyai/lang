@@ -19835,3 +19835,53 @@ fn configured_checked_access_positive_selection_retains_authored_helpers() {
         }
     }
 }
+
+#[test]
+fn direct_checked_return_matrix_retains_guard_and_target_abi() {
+    for (family, declaration, actual, use_alias, true_value) in [
+        ("exclusive", "*!u8(*!u8) _forward = fn(input) { input };", "&!value",
+            "*held = 9;", 9),
+        ("reborrow", "*!u8(*!u8) _forward = fn(input) { &!(*input) };", "&!value",
+            "*held = 9;", 9),
+        ("recursive", "*u8(*u8, u64) _forward = fn(input, steps) { if (steps == 0) { input } else { _forward(input, steps - 1) } };",
+            "&value, 2", "u8 observed = *held; if (observed != 7) { core.system_panic(); };", 7),
+        ("lexical", "*u8(*u8) _forward = fn(input) { input };", "source",
+            "u8 observed = *held; if (observed != 7) { core.system_panic(); };", 7),
+    ] {
+        let qualifier = if true_value == 9 { "*!" } else { "*" };
+        let setup = if family == "lexical" { "*u8 source = &value;" } else { "" };
+        let text = format!("%%start\n{declaration}
+u8(bool) examine = fn(use_return) {{
+    u8 value = 7;
+    {setup}
+    {qualifier}u8 held = _forward({actual});
+    if (use_return) {{ {use_alias} }} else {{ value = 8; }};
+    value
+}};
+if (examine(true) != {true_value} || examine(false) != 8) {{ core.system_panic(); }};
+%%end");
+        for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+            let parsed = parse_source(source.clone(), text.clone().into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{family}: {:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{family}: {:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{family}: {:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap_or_else(|error| panic!("{family}: {error}")).to_text();
+            let width = if target == ScalarTargetLayout::NATIVE64 { "i64" } else { "i32" };
+            let caller = self_tail_test_body(&ir, "i8", &project_function_name(&source, "examine"));
+            let call = format!("call {width} @{}(", project_function_name(&source, "_forward"));
+            let helper_source = prepared.checked_access_source().unwrap();
+            let guard = format!("call void @{}(", project_function_name(helper_source, "check_non_null_address"));
+            let forwarded = caller.find(&call).unwrap_or_else(|| panic!("{family}: {caller}"));
+            let guarded = caller.find(&guard).unwrap_or_else(|| panic!("{family}: {caller}"));
+            let dereference = caller[guarded..].find("inttoptr").map(|offset| guarded + offset)
+                .unwrap_or_else(|| panic!("{family}: {caller}"));
+            assert!(forwarded < guarded && guarded < dereference, "{family}: {caller}");
+        }
+    }
+}
