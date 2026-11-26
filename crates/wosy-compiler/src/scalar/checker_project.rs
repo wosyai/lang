@@ -3479,8 +3479,21 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         let traced_rank = trace.borrow().ranked_target;
                         let target = child.target.map(|target| target.0);
                         let rank_self = traced_rank.is_some() && target == traced_rank && std::ptr::eq(frame.body, child.body);
-                        let context_leaf = trace.borrow().contextual_route.is_some_and(|(_, leaf)| target == Some(leaf))
-                            && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_));
+                        let context_edge = {
+                            let trace = trace.borrow();
+                            trace.contextual_route.is_some_and(|(entry, leaf)| {
+                                let original = |target: PreparedCallable, body: &FunctionCallSites|
+                                    self.calls.function_body(target.0, target.1, None).is_some_and(|actual| std::ptr::eq(actual, body));
+                                if let Some(mixed) = &trace.mixed_context {
+                                    (target == Some(mixed.bridge) && call.occurrence() == mixed.entry_site
+                                        && original(entry, frame.body))
+                                    || (target == Some(leaf) && call.occurrence() == mixed.bridge_site
+                                        && original(mixed.bridge, frame.body))
+                                } else {
+                                    target == Some(leaf) && frame.source == child.source
+                                }
+                            }) && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_))
+                        };
                         // prepare_exact_child already authenticated the
                         // resolved edge and completed namespace owner.
                         let qualified_scalar = trace.borrow().proof_free_scalar_initializers && frame.source != child.source
@@ -3489,7 +3502,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             && closed_startup_scalar_history(child.body)
                             && child.body.structure.checker_directives.is_empty()
                             && child.body.contextual_formal().is_none();
-                        if !qualified_scalar && ((!rank_self && !context_leaf) || frame.source != child.source) {
+                        if !(qualified_scalar || context_edge || (rank_self && frame.source == child.source)) {
                             return Err(ProjectCheck::Unsupported);
                         }
                         let span = frame.body.occurrences.get(call.occurrence().0)
@@ -3569,6 +3582,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     (parent.source, effect.occurrence(), span), &entry, &exit, completed.contextual_explicit.as_ref(), reused)?;
                                 if !previously_refuted && proof.refutation.is_some() {
                                     effects.contextual_proofs.refutations.push(target);
+                                    if let Some(trace) = &effects.startup_search {
+                                        let mut trace = trace.borrow_mut();
+                                        let earlier = trace.named_observations.len();
+                                        if let Some(mixed) = &mut trace.mixed_context {
+                                            if mixed.refuted_after_named.replace(earlier).is_some() {
+                                                return Err(ProjectCheck::Unsupported);
+                                            }
+                                        }
+                                    }
                                     if let Some(tap) = &mut effects.mixed_startup {
                                         super::checker_flow::charge_call_work(&mut tap.work, 1).ok_or(ProjectCheck::Unsupported)?;
                                         tap.events.push(MixedStartupEvent::Contextual);
@@ -3580,11 +3602,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             .ok_or(ProjectCheck::Unsupported)?;
                         if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
                             let mut trace = trace.borrow_mut();
-                            if !trace.contextual_route.is_some_and(|(_, leaf)| leaf == target) || trace.contextual_observed {
+                            if trace.contextual_route.is_some_and(|(_, leaf)| leaf == target) && !trace.contextual_observed {
+                                trace.contextual_observed = true;
+                                if trace.remaining() == 0 && trace.mixed_context.is_none() {
+                                    return Err(ProjectCheck::StartupAuthoredLimitReached);
+                                }
+                            } else if !(trace.contextual_observed && trace.mixed_context.as_ref().is_some_and(|route|
+                                route.bridge == target && route.entry_site == effect.occurrence())) {
                                 return Err(ProjectCheck::Unsupported);
                             }
-                            trace.contextual_observed = true;
-                            if trace.remaining() == 0 { return Err(ProjectCheck::StartupAuthoredLimitReached); }
                             let span = parent.body.occurrences.get(effect.occurrence().0)
                                 .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
                             trace.append(failure_search::PathStep::Return(
@@ -4155,7 +4181,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && caller == &owner.source && ordered.scalar_initializer.is_some()
                 && signature.parameters.len() == 1 && is_integer_type(expected);
             let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
-                && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
+                && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty()
+                && search.mixed_context.as_ref().is_none_or(|route| route.root_site == call && !route.finished);
             let matches_pointee_entry = Observer::EXACT_POINTEE_UPDATE
                 && search.pointee_route.as_ref().is_some_and(|route| route.caller == target && route.startup_site == call)
                 && search.owns_initialization(caller) && caller == &owner.source
@@ -4164,7 +4191,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             // Once the named route spends its ordinary quota, only the
             // pending, top-level authenticated binding calls may run.
             if search.proof_only_continuation() && search.pending_named_startup_observation()
-                && !(matches_named || matches_ranked || matches_aggregate)
+                && !(matches_named || matches_ranked || matches_aggregate || matches_context_entry)
             { return Err(ProjectCheck::Unsupported); }
             let ordinary_qualified = search.proof_free_scalar_initializers
                 && (matches_plain_scalar || (*expected == ScalarType::Unit
@@ -4486,6 +4513,20 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let result = self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None);
                 self.active_depth -= 1;
                 self.active.remove(&target);
+                #[cfg(feature = "internal-checker")]
+                if matches!(result, Ok(ActualCallResult::Unit)) {
+                    if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
+                        let mut trace = trace.borrow_mut();
+                        if trace.contextual_route.is_some_and(|(entry, _)| entry == target)
+                            && trace.mixed_context.as_ref().is_some_and(|route| route.root_site == call) {
+                            if !trace.contextual_observed { return Err(ProjectCheck::Unsupported); }
+                            trace.mixed_context.as_mut().ok_or(ProjectCheck::Unsupported)?.finished = true;
+                            if trace.remaining() == 0 && trace.cannot_continue() {
+                                return Err(ProjectCheck::StartupAuthoredLimitReached);
+                            }
+                        }
+                    }
+                }
                 if result.is_ok() { self.note_reached(target); }
                 return result;
             }
@@ -10256,6 +10297,9 @@ impl PreparedScalarOrderedCheck {
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
                 run_private_guarded_context(&owner, effects, self.scope, cap).map_err(configured_ordered_error),
+            PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2, configured_root: true } =>
+                run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, cap)
+                    .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             _ => Err(ScalarOrderedCheckerOutcome::Unsupported),
         }
     }
@@ -10707,6 +10751,124 @@ fn run_private_guarded_context(
         pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None,
         additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
     }, selected))
+}
+
+/// The previously admitted configured app/provider mixed cohort, with
+/// one ordinary theorem and one independently authenticated context debit.
+#[cfg(feature = "internal-checker")]
+fn run_private_mixed_root_context(
+    owner: &PreparedProofModule, ordinary_source: &SourceIdentity, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
+    scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
+    use failure_search::{MixedContextStartup, StartupProofRole, StartUpSearch};
+    let (project, calls) = owner.prepared.parts();
+    let [app, provider] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    if root != &app.source || root != ordinary_source
+        || provider.source.project != root.project || provider.source.package != root.package
+        || !matches!(headers.as_slice(), [(source, _)] if source == &provider.source)
+    { return Err(ProjectCheck::Unsupported); }
+
+    let catalog = owner.proofs.get(root).ok_or(ProjectCheck::MissingRoot)?;
+    let [definition] = catalog.definitions.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
+    let selected = owner.resolve_selected_proof(definition, catalog.first_query)?;
+    let plan = owner.plan_resolved_module_proof::<false, false, false>(root, name.text(), selected)?;
+    if plan.target.0 != 0 || !plan.has_no_authored_steps() || plan.typed.measure.is_some()
+        || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        || !valid_arbitrary_proof_body(plan.typed.body)
+        || !qualified_integer_proof_leaf(plan.typed.body, plan.typed.result_type)
+        || !plan.typed.body.structure.module_storage_uses.is_empty()
+        || !plan.typed.body.callable_escapes.is_empty()
+    { return Err(ProjectCheck::Unsupported); }
+    let mut observer = MainFlowProofObserver::from_first_plan(scope, root, &plan)?;
+    observer.finish_plans(&owner.prepared, scope)?;
+    let transport = owner.context.as_ref().ok_or(ProjectCheck::Unsupported)?;
+    let mut effects = prepare_contextual_effects(&owner.prepared, transport, headers, 2, false)?;
+    let mut entries = effects.contextual_proofs.entries.values();
+    let theorem = entries.next().ok_or(ProjectCheck::Unsupported)?;
+    let leaf = theorem.target;
+    if entries.next().is_some() || leaf.0 != 1 { return Err(ProjectCheck::Unsupported); }
+
+    let region = calls.initialization_region(0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let ModuleInitializationDetail::Occurrences(topology) = &region.detail
+        else { return Err(ProjectCheck::MissingRootOccurrences); };
+    if topology.call_targets.len() != 2 || !topology.callable_escapes.is_empty() { return Err(ProjectCheck::Unsupported); }
+    let entry = topology.structure.checker_direct_targets.iter().find_map(|(&site, &target)|
+        (target != plan.target && target.0 == 0).then_some((site, target))).ok_or(ProjectCheck::Unsupported)?;
+    let Some(ScalarItem::Function(entry_declaration)) = app.items.get(entry.1.1) else { return Err(ProjectCheck::Unsupported); };
+    let incoming = calls.owned_direct_startup_callable_uses(root, Some(&provider.source),
+        [(root, entry_declaration.name_span), (root, plan.function.name_span)], None).ok_or(ProjectCheck::Unsupported)?;
+    let [root_site] = incoming.get(&(root, entry_declaration.name_span)).ok_or(ProjectCheck::Unsupported)?.as_slice()
+        else { return Err(ProjectCheck::Unsupported); };
+    let [named_site] = incoming.get(&(root, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?.as_slice()
+        else { return Err(ProjectCheck::Unsupported); };
+    if *root_site != entry.0 { return Err(ProjectCheck::Unsupported); }
+    let entry = entry.1;
+    let entry_body = calls.function_body(entry.0, entry.1, None).ok_or(ProjectCheck::Unsupported)?;
+    let edge_to = |body: &FunctionCallSites| -> Result<(OccurrenceOrdinal, PreparedCallable), ProjectCheck> {
+        let [site] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if !body.checker_returns_unit() || !body.boundary.parameters.is_empty() || !body.arms.is_empty()
+            || !body.allocation_length_calls.is_empty() || !body.callable_escapes.is_empty()
+            // This slice does not admit authored paths inside the contextual
+            // frames, which could rely on a refuted postcondition.
+            || !body.structure.checker_directives.is_empty() || body.contextual_argument(site.ordinal).is_none()
+        { return Err(ProjectCheck::Unsupported); }
+        Ok((site.ordinal, *body.structure.checker_direct_targets.get(&site.ordinal).ok_or(ProjectCheck::Unsupported)?))
+    };
+    let (entry_site, bridge) = edge_to(entry_body)?;
+    if bridge.0 != 1 || bridge == leaf || entry_body.contextual_formal().is_some()
+        || entry_body.structure.checker_contextual_declarations.len() != 1
+    { return Err(ProjectCheck::Unsupported); }
+    let bridge_body = calls.function_body(bridge.0, bridge.1, None).ok_or(ProjectCheck::Unsupported)?;
+    let (bridge_site, forwarded) = edge_to(bridge_body)?;
+    let leaf_body = calls.function_body(leaf.0, leaf.1, None).ok_or(ProjectCheck::Unsupported)?;
+    if forwarded != leaf || bridge_body.contextual_formal().is_none()
+        || !leaf_body.call_occurrences.is_empty() || !leaf_body.structure.checker_directives.is_empty()
+    { return Err(ProjectCheck::Unsupported); }
+    let (_, roots) = package_obligation_roots(&owner.prepared, scope, 2, root)?;
+    if !roots.is_empty() { return Err(ProjectCheck::Unsupported); }
+
+    let mut trace = StartUpSearch::new(root, cap);
+    trace.retain_after_cutoff = true;
+    trace.named_target = Some(plan.target);
+    trace.contextual_route = Some((entry, leaf));
+    trace.mixed_context = Some(MixedContextStartup {
+        root_site: *root_site, entry_site, bridge, bridge_site, finished: false, refuted_after_named: None,
+    });
+    trace.enroll_proof_sites(plan.target, StartupProofRole::Bare, &[*named_site]).ok_or(ProjectCheck::Unsupported)?;
+    effects.startup_search = Some(Rc::new(RefCell::new(trace)));
+    let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
+        &owner.prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+    );
+    let mut trace = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+        .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+    let completed = trace.mixed_context.take().ok_or(ProjectCheck::Unsupported)?;
+    if trace.invalid() || !completed.finished || !trace.contextual_observed || !trace.required_sites.is_empty()
+        || trace.named_observations.len() != 1 || effects.has_authored_state || effects.has_selected_code
+        || !effects.snapshot_records.is_empty() || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+    { return Err(ProjectCheck::Unsupported); }
+    let end = match outcome {
+        Ok(_) if trace.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
+        Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+        Err(error) => return Err(error),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    let theorem = effects.contextual_proofs.entries.get(&leaf).ok_or(ProjectCheck::Unsupported)?;
+    if !theorem.saw_proved_occurrence && theorem.refutation.is_none() { return Err(ProjectCheck::Unsupported); }
+    observe_capped_bare_receipts(&mut observer, &mut trace, Some(plan.target), root)?;
+    let mut contextual = ordered_contextual_diagnostics(effects.contextual_proofs)?.into_iter();
+    let contextual_diagnostic = contextual.next();
+    if contextual_diagnostic.is_some() != completed.refuted_after_named.is_some() || contextual.next().is_some() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let order = completed.refuted_after_named.map_or_else(Vec::new, |count| vec![count.min(observer.diagnostics.len())]);
+    Ok((MainFlowProofReceipt {
+        active: true, mixed_context_after_scalar: Some(order), directives: effects.records,
+        diagnostics: observer.diagnostics, contextual_diagnostic, additional_contextual_diagnostics: Vec::new(),
+        pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None,
+        additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+    }, end))
 }
 
 #[cfg(feature = "internal-checker")]

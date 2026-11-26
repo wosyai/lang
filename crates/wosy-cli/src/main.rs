@@ -3054,6 +3054,61 @@ main_artifact = "main"
                     }
                 }
                 fs::remove_file(&shared_source).unwrap();
+                // The configured app-owned scalar and a contextual debit
+                // through the completed provider share one startup cursor.
+                let mixed_context_provider = r#"%%start
+                    unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                    unit() spend = fn { consume(); };
+                    proof debit for consume() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 0) {}
+                %%end"#;
+                for scalar_first in [false, true] {
+                    let score = "u8 scored = score(4);";
+                    let (a, b) = if scalar_first { (score, "entry();") } else { ("entry();", score) };
+                    let context_root = format!(r#"%%start
+                        lib = namespace app "shared.w";
+                        unit() entry = fn {{
+                            u8 core.context.credit = 3;
+                            lib.spend();
+                        }};
+                        u8(u8) score = fn(value) {{ value }};
+                        proof scalar_value for score(entry) -> (out) where (entry == 4) ensures (out == 3) {{}}
+                        core.require(false, {first});
+                        {a} {b}
+                        core.require(scored == 3, {second});
+                    %%end"#);
+                    fs::write(&source, &context_root).unwrap();
+                    fs::write(&shared_source, mixed_context_provider).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert_eq!(report.directives.len(), 1);
+                    assert_eq!(report.mixed_context_after_scalar.as_deref(), Some(&[usize::from(scalar_first)][..]));
+                    let [ordinary] = report.diagnostics.as_slice() else { panic!("independent actual scalar"); };
+                    assert_eq!(ordinary.invocation.returned, 4.into());
+                    let context = report.contextual_diagnostic.as_ref().unwrap();
+                    assert_eq!(context.proof.source.path, "src/shared.w");
+                    assert_eq!(context.call.source.path, "src/shared.w");
+                    assert_eq!(context.supplying_call.source.path, "src/main.w");
+                    assert_eq!((&context.entry, &context.exit), (&3.into(), &2.into()));
+                    let clipped = terminal(&limited, scope, false);
+                    assert_eq!((clipped.0, clipped.1), (Ok(1), b"first".to_vec()));
+                    assert_eq!(clipped.2.strip_prefix(b"[first]"), old.2.strip_prefix(b"[first][second]"));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+                    fs::write(&source, context_root.replace("lib.spend();", &format!(
+                        "lib.spend(); core.require(core.context.credit == 1, {unused_output});"))).unwrap();
+                    let refused = selected(1);
+                    assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                    assert!(!state.exists());
+                }
+                fs::remove_file(&shared_source).unwrap();
                 let rank_definition = r#"
                     u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
                     proof descent for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {

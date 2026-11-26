@@ -41,6 +41,15 @@ pub(super) struct PointeeRoute {
     pub(super) pending_calls: HashSet<OccurrenceOrdinal>,
 }
 
+pub(super) struct MixedContextStartup {
+    pub(super) root_site: OccurrenceOrdinal,
+    pub(super) entry_site: OccurrenceOrdinal,
+    pub(super) bridge: PreparedCallable,
+    pub(super) bridge_site: OccurrenceOrdinal,
+    pub(super) finished: bool,
+    pub(super) refuted_after_named: Option<usize>,
+}
+
 pub(in super::super) type SharedStartupTrace = std::rc::Rc<std::cell::RefCell<StartUpSearch>>;
 
 pub(in super::super) struct StartUpSearch {
@@ -60,6 +69,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) pointee_route: Option<PointeeRoute>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
     pub(super) contextual_observed: bool,
+    pub(super) mixed_context: Option<MixedContextStartup>,
     pub(super) ranked_target: Option<PreparedCallable>,
     pub(super) ranked_observations: Vec<StartupProofObservation>,
     #[cfg(test)]
@@ -73,7 +83,7 @@ impl StartUpSearch {
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
         Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false,
-            pointee_route: None, contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observations: Vec::new(),
+            pointee_route: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
@@ -169,6 +179,7 @@ impl StartUpSearch {
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
             && (self.finish_dormant_startup || (self.contextual_route.is_some() && !self.contextual_observed)
+                || self.mixed_context.as_ref().is_some_and(|route| !route.finished)
                 || self.pending_named_startup_observation()
                 || self.pointee_route.as_ref().is_some_and(|route| !route.pending_calls.is_empty()))
     }
