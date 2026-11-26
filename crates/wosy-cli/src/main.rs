@@ -2777,6 +2777,74 @@ start();
                 assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !root.join(".wosy").exists());
             }
         }
+        let left_provider = root.join("leaf/src/left.w");
+        let right_provider = root.join("leaf/src/right.w");
+        let leaf_roster = r#"%%start
+left = namespace leaf "left.w";
+right = namespace leaf "right.w";
+u8 x = left.echo(3);
+u8 y = right.echo(5);
+core.require(x == 3, { .stdout = "wrong left"; .stderr = ""; .code = 9; .files = []; });
+core.require(y == 5, { .stdout = "wrong right"; .stderr = ""; .code = 9; .files = []; });
+core.require(false, { .stdout = "leafroot"; .stderr = ""; .code = 6; .files = []; });
+%%end"#;
+        let make_provider = |name| format!(r#"%%start
+u8(u8) echo = fn(value) {{ value }};
+proof exact for echo(entry) -> (out) where (entry <= 5) ensures (out == 8) {{}}
+core.require(false, {{ .stdout = "{name}"; .stderr = ""; .code = 6; .files = []; }});
+%%end"#);
+        let left_text = make_provider("left");
+        fs::write(&leaf_source, leaf_roster).unwrap();
+        fs::write(&right_provider, make_provider("right")).unwrap();
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                fs::write(&left_provider, &left_text).unwrap();
+                let run = |cap| configured_check::check_targets_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                ).ok().unwrap();
+                let original = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                let old = original.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap().outcome.as_ref().unwrap();
+                assert_eq!(old.directives.len(), 3);
+                for (cap, count, shown) in [
+                    (1, 0, &b"app"[..]), (3, 0, &b"appab"[..]), (4, 1, &b"appableft"[..]),
+                    (8, 3, &b"appableftrightleafroot"[..]),
+                ] {
+                    let receipts = run(cap);
+                    let leaf = receipts.iter().find(|receipt| receipt.root == root.join("leaf")).unwrap();
+                    let report = leaf.outcome.as_ref().unwrap();
+                    assert_eq!(report.directives, old.directives[..count]);
+                    assert_eq!(report.diagnostics.len(), 2);
+                    for (index, (diagnostic, (path, returned))) in report.diagnostics.iter().zip([
+                        ("src/left.w", 3), ("src/right.w", 5),
+                    ]).enumerate() {
+                        assert_eq!(diagnostic.proof.source.path, path);
+                        assert_eq!(diagnostic.invocation.call, old.diagnostics[index].invocation.call);
+                        assert_eq!(diagnostic.invocation.call.source.path, "src/primary.w");
+                        assert_eq!(diagnostic.invocation.returned, returned.into());
+                        assert_eq!(diagnostic.invocation.directive_position, count.min(2));
+                    }
+                    let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                    assert_eq!(publish_configured_check_receipts(&receipts, scope, true, &mut stdout, &mut stderr), Ok(3));
+                    assert_eq!(stdout, shown);
+                    assert!(!stderr.as_slice().is_empty() && !root.join(".wosy").exists());
+                }
+                // The candidate is invoked outside the selected package root
+                // as well. That is not one of the authenticated startup sites.
+                fs::write(&left_provider, left_text.replace("%%end", r#"u8 side = echo(3);
+core.require(side == 3, { .stdout = "unexpected"; .stderr = ""; .code = 9; .files = []; });
+%%end"#)).unwrap();
+                let refused = run(1);
+                let [failure] = refused.as_slice() else { panic!("whole publication refused"); };
+                assert_eq!(failure.root, root.join("leaf"));
+                assert!(matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                assert!(publish_configured_check_receipts(&refused, scope, true, &mut stdout, &mut stderr).is_err());
+                assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !root.join(".wosy").exists());
+            }
+        }
+        fs::remove_file(&left_provider).unwrap();
+        fs::remove_file(&right_provider).unwrap();
         fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();
         fs::write(&leaf_source, body("leaf", 6)).unwrap();
 

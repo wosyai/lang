@@ -16830,6 +16830,50 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn private_multi_provider_bare_roster_refuses_foreign_owner() {
+        use std::num::NonZeroUsize;
+        let root = source("src/main.w", "private-multi-provider-root");
+        let left = source("src/left.w", "private-multi-provider-left");
+        let right = source("src/right.w", "private-multi-provider-right");
+        let foreign = SourceIdentity { project: "another-project".into(), ..right.clone() };
+        let main = format!(r#"%%start
+            left = namespace demo "src/left.w";
+            right = namespace demo "src/right.w";
+            u8 first = left.echo(3);
+            u8 second = right.echo(5);
+            core.require(first == 8, {OUTPUT});
+            core.require(second == 8, {OUTPUT});
+        %%end"#);
+        let provider = r#"%%start
+            u8(u8) echo = fn(value) { value };
+            proof exact for echo(entry) -> (out) where (entry <= 5) ensures (out == 8) {}
+        %%end"#;
+        let prepare = |right: &SourceIdentity, scope, target_layout| {
+            let proof = |source: &SourceIdentity| crate::parse_proof_source(
+                source.clone(), provider.to_owned(), &[]).unwrap_or_else(|error| panic!("{:?}", error.diagnostics)).1;
+            let namespace = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+                binding: binding.into(), target: target.clone(), span: ByteSpan::new(0, 0),
+            };
+            prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&root, &main), vec![namespace("left", &left), namespace("right", right)])],
+                [(proof(&left), Vec::new()), (proof(right), Vec::new())],
+                vec![root.clone(), left.clone(), right.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            )
+        };
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let (legitimate, _) = prepare(&right, scope, layout).unwrap()
+                    .run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(legitimate.diagnostics.len(), 2);
+                assert!(matches!(prepare(&foreign, scope, layout)
+                    .and_then(|owner| owner.run_private_authored_root(NonZeroUsize::MIN)),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_qualified_named_uses_actual_completed_same_package_owner() {
         use std::num::NonZeroUsize;
         let app = source("src/main.w", "private-qualified-app");
