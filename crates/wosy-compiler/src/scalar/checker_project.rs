@@ -3589,7 +3589,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             let enrolled = trace.contextual_roster.as_ref().is_some_and(|roster| {
                                 let parent = frame.target.map_or(roster.entry, |parent| parent.0);
                                 target.is_some_and(|child_target| roster.expects(parent, call.occurrence(), child_target))
-                                    && original(parent, frame.body) && frame.source == child.source
+                                    && original(parent, frame.body)
+                                    && (frame.source == child.source || target.is_some_and(|target|
+                                        completed_namespace_owner(frame.source, child.source, target.0,
+                                            active_collection.and_then(|ordered| ordered.visits))))
                             });
                             (enrolled || trace.contextual_route.is_some_and(|(entry, leaf)| {
                                 if let Some(mixed) = &trace.mixed_context {
@@ -10530,7 +10533,7 @@ impl PreparedScalarOrderedCheck {
     pub fn search_startup_with_guarded_context(
         self, cap: std::num::NonZeroUsize,
     ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
-        let PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } = self.owner
+        let PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 | 2 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
         run_private_contextual_startup(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error)
     }
@@ -10587,7 +10590,7 @@ impl PreparedScalarOrderedCheck {
                 if (1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) =>
                 run_private_named_after_startup(&owner, self.scope, Some(cap), None)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
-            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
+            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 | 2 } =>
                 run_private_contextual_startup(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
                 run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, Some(cap), configured_root)
@@ -11229,8 +11232,8 @@ fn run_startup_authored_path(
 
 #[cfg(feature = "internal-checker")]
 fn prepare_private_contextual_roster(
-    calls: &ProjectCallSiteResults, entry: PreparedCallable, root_site: OccurrenceOrdinal,
-    proofs: &ContextualProofCohort,
+    project: &ScalarProject, calls: &ProjectCallSiteResults, entry: PreparedCallable,
+    root_site: OccurrenceOrdinal, proofs: &ContextualProofCohort,
 ) -> Result<failure_search::ContextualStartupRoster, ProjectCheck> {
     use super::checker_flow::charge_call_work;
     let mut pending = HashMap::<_, (PreparedCallable, usize)>::new();
@@ -11265,7 +11268,24 @@ fn prepare_private_contextual_roster(
             if let BlockItemKind::Evaluation { expression } = item.kind {
                 let Some(&child) = body.structure.checker_direct_targets.get(&expression) else { continue; };
                 let signature = body.checked_call_signatures.get(&expression).ok_or(ProjectCheck::Unsupported)?;
-                if !sites.insert(expression) || child.0 != entry.0 || chain.contains(&child)
+                let caller = project.modules.get(parent.0).ok_or(ProjectCheck::Unsupported)?;
+                let provider = project.modules.get(child.0).ok_or(ProjectCheck::Unsupported)?;
+                if child.0 != parent.0 {
+                    let resolved = body.resolved_call_site(expression).ok_or(ProjectCheck::Unsupported)?;
+                    let ResolvedCallTarget::ModuleCallable {
+                        source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                    } = &resolved.target else { return Err(ProjectCheck::Unsupported); };
+                    // A cross-owner edge can only enter the completed
+                    // same-package provider from the original app entry.
+                    // The original executable cursor checks completion
+                    // and the live contextual supply again at traversal.
+                    if parent != entry || child.0 == entry.0 || source != &provider.source
+                        || caller.source.project != source.project || caller.source.package != source.package
+                        || !matches!(provider.items.get(child.1), Some(ScalarItem::Function(function))
+                            if function.name_span == *declaration_span)
+                    { return Err(ProjectCheck::Unsupported); }
+                }
+                if !sites.insert(expression) || chain.contains(&child)
                     || chain.len() >= MAX_ACTUAL_CALL_DEPTH
                     || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
                     || body.contextual_argument(expression).is_none()
@@ -11294,9 +11314,12 @@ fn run_private_contextual_startup(
     cap: Option<std::num::NonZeroUsize>,
 ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ProjectCheck> {
     let (project, calls) = prepared.parts();
-    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let startup_count = project.modules.len();
+    if !(1..=2).contains(&startup_count) { return Err(ProjectCheck::Unsupported); }
     let (root, ordinals) = package_startup_order(project, &project.modules)?;
-    let region = calls.initialization_region(0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let root_ordinal = *ordinals.get(root).ok_or(ProjectCheck::MissingRoot)?;
+    let module = project.modules.get(root_ordinal).ok_or(ProjectCheck::MissingRoot)?;
+    let region = calls.initialization_region(root_ordinal).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let ModuleInitializationDetail::Occurrences(topology) = &region.detail
         else { return Err(ProjectCheck::MissingRootOccurrences); };
     let mut startup = topology.call_targets.iter();
@@ -11307,11 +11330,11 @@ fn run_private_contextual_startup(
         return Err(ProjectCheck::Unsupported);
     }
     let &entry = topology.structure.checker_direct_targets.get(&root_site).ok_or(ProjectCheck::Unsupported)?;
-    if entry.0 != 0 || !module.items.get(entry.1).is_some_and(|item| matches!(item,
+    if entry.0 != root_ordinal || !module.items.get(entry.1).is_some_and(|item| matches!(item,
         ScalarItem::Function(function) if function.name_span == declaration.range
             && function.generic_parameters.is_empty() && function.overload_arms.is_empty()))
     { return Err(ProjectCheck::Unsupported); }
-    let (_, roots) = package_obligation_roots(prepared, scope, 1, root)?;
+    let (_, roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
     if roots.into_iter().any(|(owner, items)| owner != entry.0 || items.into_iter().any(|candidate| candidate != entry.1)) {
         return Err(ProjectCheck::Unsupported);
     }
@@ -11319,7 +11342,7 @@ fn run_private_contextual_startup(
         Some(cap) => failure_search::StartUpSearch::new(root, cap),
         None => failure_search::StartUpSearch::formal_only(root),
     };
-    search.contextual_roster = Some(prepare_private_contextual_roster(calls, entry, root_site, &effects.contextual_proofs)?);
+    search.contextual_roster = Some(prepare_private_contextual_roster(project, calls, entry, root_site, &effects.contextual_proofs)?);
     effects.startup_search = Some(Rc::new(RefCell::new(search)));
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
         prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
@@ -28926,6 +28949,65 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(at(root, diagnostic.binding.range).trim_end(), "core.context.credit");
             let nonempty_initializer = child.replace("%%end", "relay(); %%end");
             assert!(matches!(run(root, &nonempty_initializer, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_two_owner_contextual_cap_keeps_exact_provider_proof() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "private-contextual-root");
+        let leaf = source("src/calc.w", "private-contextual-provider");
+        let root = format!(r#"%%start
+            lib = namespace app "src/calc.w";
+            unit() entry = fn {{
+                u8 core.context.credit = 3;
+                core.require(false, {});
+                lib.relay();
+                core.require(false, {});
+            }};
+            entry();
+        %%end"#, OUTPUT.replace(".code = 1", ".code = 0"), OUTPUT.replace(".code = 1", ".code = 76"));
+        let child = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() relay = fn { consume(); };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let prepare = |provider: &str| {
+                    let root_proof = crate::parse_proof_source(app.clone(), root.clone(), &[]).ok().unwrap().1;
+                    let leaf_proof = crate::parse_proof_source(leaf.clone(), provider.to_owned(), &[]).ok().unwrap().1;
+                    let edge = ScalarNamespaceBinding { binding: "lib".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0) };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(leaf_proof, Vec::new()), (root_proof, vec![edge])], vec![app.clone(), leaf.clone()],
+                        ScalarPreparationInputs { target_layout }, scope, Vec::new())
+                };
+                let incumbent = prepare(child).unwrap().run().unwrap();
+                assert!(incumbent.contextual_diagnostic.is_none());
+                assert_eq!(incumbent.directives.iter().map(|record| record.code().clone()).collect::<Vec<_>>(),
+                    [0.into(), 76.into()]);
+                for cap in [1, 2, 3] {
+                    let (report, completion) = prepare(child).unwrap().run_private_authored_root(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert!(report.contextual_diagnostic.is_none());
+                    assert_eq!(report.directives, incumbent.directives[..cap.min(2)]);
+                    assert_eq!(completion, Some(if cap <= 2 { StartupAuthoredCompletion::LimitReached }
+                        else { StartupAuthoredCompletion::Exhausted }));
+                }
+                let wrong = child.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+                let (report, completion) = prepare(&wrong).unwrap().run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert!(completion.is_none() && report.directives.is_empty());
+                let failure = report.contextual_diagnostic.unwrap();
+                assert_eq!((failure.entry, failure.exit), (3.into(), 3.into()));
+                assert_eq!((&failure.goal.source, &failure.call.source, &failure.supplying_call.source, &failure.binding.source),
+                    (&leaf, &leaf, &app, &app));
+                assert_eq!(&wrong[failure.call.range.start as usize..failure.call.range.end as usize], "consume()");
+                assert_eq!(&root[failure.supplying_call.range.start as usize..failure.supplying_call.range.end as usize], "lib.relay()");
+                let nonempty_provider = child.replace("%%end", "relay(); %%end");
+                assert!(matches!(prepare(&nonempty_provider).and_then(|owner| owner.run_private_authored_root(NonZeroUsize::MIN)),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 

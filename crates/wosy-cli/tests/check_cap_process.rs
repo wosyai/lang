@@ -222,3 +222,64 @@ fn check_cap_process_keeps_late_formal_analysis_and_never_falls_back() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_keeps_original_two_owner_contextual_proof_after_cutoff() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            let project = Fixture::new();
+            let root = format!(
+                r#"%%start
+                    lib = namespace app "credit.w";
+                    unit() entry = fn {{
+                        u8 core.context.credit = 3;
+                        {}
+                        lib.relay();
+                        {}
+                    }};
+                    entry();
+                %%end"#,
+                require("first", 0, "first.txt"),
+                require("second", 76, "second.txt"),
+            );
+            let provider = r#"%%start
+                unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                unit() relay = fn { consume(); };
+                proof debit for consume() -> (null)
+                    ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+            %%end"#;
+            project.package("", layout, "dev", "", &root);
+            let credit = project.0.join("src/credit.w");
+            fs::write(&credit, provider).unwrap();
+            let old = project.run(&[scope]);
+            assert_terminal(&old, 76, b"firstsecond", b"[first][second]");
+            let first = fs::read(project.output().join("first.txt")).unwrap();
+            let second = fs::read(project.output().join("second.txt")).unwrap();
+            project.clear();
+
+            assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 0, b"first", b"[first]");
+            assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first);
+            assert!(!project.output().join("second.txt").exists());
+            project.clear();
+
+            for cap in ["2", "3"] {
+                assert_terminal(&project.run(&[scope, "--max-errors", cap]), 76, &old.stdout, &old.stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), first);
+                assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), second);
+                project.clear();
+            }
+
+            let wrong = provider.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+            fs::write(&credit, wrong).unwrap();
+            let old = project.run(&[scope]);
+            let capped = project.run(&[scope, "--max-errors", "1"]);
+            assert_terminal(&old, 1, b"", &capped.stderr);
+            assert_terminal(&capped, 1, b"", &old.stderr);
+            let diagnostic = String::from_utf8_lossy(&capped.stderr);
+            assert!(diagnostic.contains("proof obligation failed") && diagnostic.contains("credit.w")
+                && diagnostic.contains("lib.relay()") && diagnostic.contains("consume()"), "{diagnostic}");
+            assert!(!project.output().exists());
+        }
+    }
+}
