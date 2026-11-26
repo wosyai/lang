@@ -220,6 +220,7 @@ impl SourceStore {
 enum Plan {
     ReplayRequired,
     Superseded,
+    NameHeldByDirectPin,
     Confirmed,
     Commit { transaction: Transaction, _read: Option<SourceRead> },
 }
@@ -247,6 +248,7 @@ impl SourceStorageWorker {
                 match plan {
                     Plan::ReplayRequired => return Ok(SourcePinReflection::ReplayRequired),
                     Plan::Superseded => return Ok(SourcePinReflection::Superseded),
+                    Plan::NameHeldByDirectPin => return Ok(SourcePinReflection::NameHeldByDirectPin),
                     Plan::Confirmed => break,
                     Plan::Commit { mut transaction, _read } => match transaction.commit().await {
                         Ok(()) => break,
@@ -279,7 +281,7 @@ fn plan_reflection(
         let pin = owner.stored(bytes)?;
         // A legacy name has independent direct retention and no local
         // generation. Never infer permission to replace or release it.
-        let known = pin.reflection.ok_or("source pin name is already held by direct retention")?;
+        let Some(known) = pin.reflection else { return Ok(Plan::NameHeldByDirectPin); };
         if known.generation > intent.generation { return Ok(Plan::Superseded); }
         if known.generation == intent.generation {
             if pin.root != source.root || known.target != source.target {

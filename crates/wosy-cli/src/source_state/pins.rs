@@ -2,7 +2,8 @@
 //! caller reflects a local pin to the daemon separately; there is no atomic
 //! commit across the project client and a daemon store.
 use super::{read_selection, Result, SourceReplay, SqliteSourceState};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use super::pin_reconciliation::{advance_catalog, catalog_revision};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use wosy_protocol::{BuildSourceSelection, NodeId, SourcePinIntent, SourcePinReflection, SourcePinRetention};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -54,6 +55,7 @@ impl SqliteSourceState {
              SET target = excluded.target, root = excluded.root, generation = excluded.generation, released_root = NULL",
             params![name, target, root.0, generation],
         )?;
+        advance_catalog(&tx)?;
         tx.commit()?;
         Ok(LocalSourcePin { name: name.to_owned(), target: target.to_owned(), root, generation })
     }
@@ -82,11 +84,15 @@ impl SqliteSourceState {
     /// so an earlier release cannot clear a later pin of the same source.
     /// This neither removes source bytes nor mutates the daemon's own pins.
     pub fn unpin_local_source(&self, pin: &LocalSourcePin) -> Result<bool> {
-        Ok(self.db.execute(
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let released = tx.execute(
             "UPDATE source_pins SET released_root = root, root = NULL
              WHERE name = ?1 AND target = ?2 AND root = ?3 AND generation = ?4",
             params![pin.name, pin.target, pin.root.0, pin.generation],
-        )? == 1)
+        )? == 1;
+        if released { advance_catalog(&tx)?; }
+        tx.commit()?;
+        Ok(released)
     }
 
     pub fn source_pin_intent(&self, name: &str) -> Result<Option<SourcePinIntent>> {
@@ -96,10 +102,19 @@ impl SqliteSourceState {
     /// Only replay the exact current retained intent, not a tombstone or
     /// a previous use of the name. The local read ends before daemon work.
     pub fn replay_source_pin_intent(&mut self, intent: &SourcePinIntent) -> Result<Option<SourceReplay>> {
+        self.replay_pin_at_revision(intent, None)
+    }
+
+    pub(super) fn replay_pin_at_revision(
+        &mut self, intent: &SourcePinIntent, revision: Option<i64>,
+    ) -> Result<Option<SourceReplay>> {
         if intent.retention != SourcePinRetention::Retained
             || self.project.to_str() != Some(intent.source.project.as_str())
         { return Ok(None); }
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        if let Some(revision) = revision {
+            if catalog_revision(&tx)? != revision { return Ok(None); }
+        }
         if read_intent(&tx, &intent.source.project, &intent.name)?.as_ref() != Some(intent) {
             return Ok(None);
         }
@@ -119,16 +134,21 @@ impl SqliteSourceState {
 
 fn read_intent(sql: &Connection, project: &str, name: &str) -> Result<Option<SourcePinIntent>> {
     Ok(sql.query_row(
-        "SELECT target, COALESCE(root, released_root), generation, root IS NOT NULL
-         FROM source_pins WHERE name = ?1 AND (root IS NOT NULL OR released_root IS NOT NULL)",
-        [name], |row| Ok(SourcePinIntent {
-            source: BuildSourceSelection {
-                root: NodeId(row.get(1)?), project: project.into(), target: row.get(0)?,
-            },
-            name: name.into(), generation: row.get(2)?,
-            retention: if row.get(3)? { SourcePinRetention::Retained } else { SourcePinRetention::Released },
-        }),
-    ).optional()?)
+        "SELECT name, target, COALESCE(root, released_root), generation, root IS NOT NULL
+         FROM source_pins WHERE name = ?1",
+        [name], |row| intent_from_row(row, project),
+    ).optional()?.flatten())
+}
+
+pub(super) fn intent_from_row(row: &Row<'_>, project: &str) -> rusqlite::Result<Option<SourcePinIntent>> {
+    let Some(root) = row.get::<_, Option<[u8; 32]>>(2)? else { return Ok(None); };
+    Ok(Some(SourcePinIntent {
+        source: BuildSourceSelection {
+            root: NodeId(root), project: project.into(), target: row.get(1)?,
+        },
+        name: row.get(0)?, generation: row.get(3)?,
+        retention: if row.get(4)? { SourcePinRetention::Retained } else { SourcePinRetention::Released },
+    }))
 }
 
 fn read_pin(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSourcePin> {

@@ -59,7 +59,7 @@ pub(super) async fn order(
     direct.publish(direct_root, &unrelated.source.delta).await?;
     direct.pin_source(direct_root, name).await?;
     let direct_service = worker(&direct)?;
-    assert!(direct_service.reflect_source_pin(old.clone(), None, limits).await.is_err());
+    assert_eq!(direct_service.reflect_source_pin(old.clone(), None, limits).await?, SourcePinReflection::NameHeldByDirectPin);
     let store = Arc::new(SourceStore::open(path, 8 << 20)?);
     let service = worker(&store)?;
     {
@@ -83,7 +83,7 @@ pub(super) async fn order(
     assert!(!local.confirms_source_pin_reflection(&ack)?);
     assert!(local.replay_source_pin_intent(&old)?.is_none());
     assert!(local.replay_source_pin_intent(&release)?.is_none());
-    assert!(direct_service.reflect_source_pin(release.clone(), None, limits).await.is_err());
+    assert_eq!(direct_service.reflect_source_pin(release.clone(), None, limits).await?, SourcePinReflection::NameHeldByDirectPin);
     assert!(direct.snapshot(root)?.is_none());
     assert_eq!(direct.source_pins(direct_root)?[0].root, direct_root);
     let (closed, replay) = apply(&service, local, &release).await?;
@@ -112,7 +112,7 @@ pub(super) async fn order(
     let next = local.source_pin_intent(name)?.ok_or("fixture failed to create a newer pin intent")?;
     assert!(repinned.generation > old.generation);
     assert_ne!(next.source.root, root);
-    assert!(direct_service.reflect_source_pin(next.clone(), None, limits).await.is_err());
+    assert_eq!(direct_service.reflect_source_pin(next.clone(), None, limits).await?, SourcePinReflection::NameHeldByDirectPin);
     assert_eq!(direct.source_pins(direct_root)?[0].root, direct_root);
     drop(direct_service);
     Arc::try_unwrap(direct).ok().expect("fixture owns direct catalog").close().await?;

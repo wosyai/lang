@@ -40,6 +40,7 @@ pub enum SourcePinRetention {
 pub enum SourcePinReflection {
     ReplayRequired,
     Superseded,
+    NameHeldByDirectPin,
     Durable(SourcePinIntent),
 }
 

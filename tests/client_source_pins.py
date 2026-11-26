@@ -74,7 +74,7 @@ with tempfile.TemporaryDirectory() as directory:
     # acknowledged selection and canonical bytes must survive migration.
     a_db = a / ".wosy/client.sqlite"
     with sqlite3.connect(a_db) as connection:
-        connection.executescript("ALTER TABLE source_targets DROP COLUMN selected_generation; DROP TABLE source_pins; PRAGMA user_version=2;")
+        connection.executescript("DROP TABLE source_pin_catalog; ALTER TABLE source_targets DROP COLUMN selected_generation; DROP TABLE source_pins; PRAGMA user_version=2;")
     first = local(a, original, "pin-local", name)
     assert first["result"] == {"name": name, "target": "app", "root": a_root, "generation": 1}
     assert first["selected"] == a_root

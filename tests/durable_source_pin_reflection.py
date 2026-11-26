@@ -1,4 +1,4 @@
-"""Prepare a real owned v4 client, then reflect and recover named source under v5."""
+"""Prepare a real owned v4 client, then reflect and recover named source under the current schema."""
 import json
 from pathlib import Path
 import sqlite3
@@ -67,7 +67,7 @@ elif mode == "verify":
     cold = state(replacement, "reflect-durable-source-pin-exit", name)["result"]
     assert cold["root"] == a and cold["generation"] == 1 and cold["retained"]
     assert cold["replayed_nodes"] > 0
-    assert version() == 5 and main.read_text() == second
+    assert version() == 6 and main.read_text() == second
     retained = call(replacement, a, "--source-pins")["pins"]
     assert retained == [{"name": name, "root": a}]
     restored = call(replacement, a, "app", "src/main.w")

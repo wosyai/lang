@@ -13,9 +13,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 mod diagnostics;
 mod delta;
 mod pins;
+mod pin_reconciliation;
 pub use delta::{PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
+pub use pin_reconciliation::{PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 
 pub struct SqliteSourceState {
     project: PathBuf,
@@ -117,7 +119,7 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 1;
                  PRAGMA cst.user_version = 1;",
             )?,
-            (1..=5, 1) => {}
+            (1..=6, 1) => {}
             _ => return Err("incompatible local source state schema".into()),
         }
         if version < 2 {
@@ -152,6 +154,7 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 5;",
             )?;
         }
+        if version < 6 { pin_reconciliation::initialize(&tx)?; }
         tx.commit()?;
         Ok(Self { project, db, limits })
     }

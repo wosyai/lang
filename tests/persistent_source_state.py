@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory() as directory:
     # Reproduce the actual v1 schema on this owned SQLite pair, preserving
     # the confirmed selection and every canonical CST row.
     with sqlite3.connect(db) as client_db:
-        client_db.executescript("ALTER TABLE source_targets DROP COLUMN selected_generation; DROP TABLE source_pins; DROP TABLE source_root_usage; PRAGMA user_version=1;")
+        client_db.executescript("DROP TABLE source_pin_catalog; ALTER TABLE source_targets DROP COLUMN selected_generation; DROP TABLE source_pins; DROP TABLE source_root_usage; PRAGMA user_version=1;")
     migrated = invoke(root, primary, "app", "stage")
     assert migrated["selected"] == initial_root and migrated["pending"] is None
     assert migrated["result"]["parsed"] == 0 and migrated["result"]["new_nodes"] == 0

@@ -184,6 +184,9 @@ pub(super) async fn run(
             let pins = client.local_source_pins()?;
             serde_json::json!(pins.iter().map(local_pin).collect::<Vec<_>>())
         }
+        "reconcile-pin-catalog" | "reconcile-pin-catalog-collision" => super::pin_catalog::run(
+            &mut client, project, dir, &target, mode.ends_with("-collision"),
+        ).await?,
         "reflect-durable-source-pin" | "reflect-durable-source-pin-exit" | "reflect-durable-source-pin-order" => {
             let name = args.next().ok_or("expected fixture pin name")?;
             match mode.as_str() {

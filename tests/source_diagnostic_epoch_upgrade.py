@@ -54,7 +54,7 @@ elif mode == "verify":
     assert observed["initial_generation"] == issued and observed["final_generation"] == issued + 1
     assert observed["pending_retained_selection"] and observed["delayed_reply_refused"]
     assert observed["old_terminal_replay_refused"]
-    assert sqlite_state(5) == (a, "", issued + 1, issued + 1)
+    assert sqlite_state(6) == (a, "", issued + 1, issued + 1)
     assert main.read_text() == initial
     print("v3 migrated to current schema, exact B attempt kept, re-acknowledged identical A has a fresh epoch")
 else:

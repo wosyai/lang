@@ -22,6 +22,8 @@ mod storage_worker;
 mod source_state;
 #[path = "source_snapshot/pin_reflection.rs"]
 mod pin_reflection;
+#[path = "source_snapshot/pin_catalog.rs"]
+mod pin_catalog;
 #[path = "source_snapshot/source_reconciliation.rs"]
 mod source_reconciliation;
 #[path = "source_snapshot/framed_reconciliation.rs"]
