@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use super::NodeId;
+use super::{BaseCstProposal, NodeId};
 
 pub const BUILD_DIAGNOSTIC_VERSION: u16 = 1;
+pub const BASE_DECLARATION_PROJECTION_VERSION: u16 = 1;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a
 /// wire authorization or a way for a request to switch roots.
@@ -77,6 +78,7 @@ pub struct BuildSessionResponse<D> {
 pub enum BuildSessionRequest {
     Start { version: u16 },
     Analyze { request: BuildDiagnosticRequest },
+    ProjectBaseDeclarations { version: u16, proposal: BaseCstProposal },
     Renew,
     Disconnect,
 }
@@ -90,14 +92,38 @@ pub enum BuildSessionRefusal {
     Busy,
     SourceUnavailable,
     AnalysisUnavailable,
+    BaseProjectionUnavailable,
+    BaseProjectionAlreadyHeld,
     ResponseTooLarge,
+}
+
+/// Ordinal of the issued lease within the hosting store instance. A client
+/// learns it on the same live stream; it is not a durable restart token.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BaseDeclarationConnectionId(pub u64);
+
+/// Observation of the connection's ordinary base declaration owner. Not a
+/// source acknowledgement, secondary lease, lookup token, or semantic Prepared.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaseDeclarationProjection {
+    pub version: u16,
+    pub connection: BaseDeclarationConnectionId,
+    pub base: NodeId,
+    pub proposed: NodeId,
+    pub attempt: i64,
+    pub preparation: NodeId,
+    pub entry_projection: NodeId,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BuildSessionReply<D> {
     Started { version: u16, source_root: NodeId },
+    BaseDeclarationSessionStarted { version: u16, source_root: NodeId, connection: BaseDeclarationConnectionId },
     Analysis { response: BuildDiagnosticResponse<D> },
+    BaseDeclarationProjection { projection: BaseDeclarationProjection },
     Renewed,
     Closed,
     Refused { reason: BuildSessionRefusal },

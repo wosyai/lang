@@ -7,8 +7,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use std::collections::BTreeMap;
 use std::path::Path;
 use wosy_protocol::{
-    partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BuildSourceSelection, CstAddition, CstDelta, NodeId,
-    SourceIndexAddition, BASE_CST_DELTA_VERSION,
+    partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId,
+    BaseDeclarationProjection,
+    BuildSessionCommandId, BuildSessionReply, BuildSessionResponse, BuildSourceSelection, CstAddition,
+    CstDelta, NodeId, SourceIndexAddition, BASE_CST_DELTA_VERSION, BASE_DECLARATION_PROJECTION_VERSION,
 };
 
 impl SqliteSourceState {
@@ -56,6 +58,33 @@ impl SqliteSourceState {
         Ok((binding, BaseCstProposal {
             version: BASE_CST_DELTA_VERSION, base, root, attempt: attempt.generation(), files, source_index,
         }))
+    }
+
+    /// Consume only the receipt from the still-addressed local connection
+    /// and original command/source attempt,
+    /// while that same predecessor and pending attempt are still selected in
+    /// one SQLite read. This is a local freshness cut, not a publication ack
+    /// or proof of continuing freshness beyond this call.
+    pub fn consume_base_declaration_projection<D>(
+        &self, captured: &BaseCstProposalBinding, connection: BaseDeclarationConnectionId,
+        command: BuildSessionCommandId, received: BuildSessionResponse<D>,
+    ) -> Result<Option<BaseDeclarationProjection>> {
+        let BuildSessionReply::BaseDeclarationProjection { projection } = received.reply else {
+            return Ok(None);
+        };
+        if received.id != command || projection.connection != connection
+            || projection.version != BASE_DECLARATION_PROJECTION_VERSION
+            || projection.base != captured.selected.root || projection.proposed != captured.proposed
+            || projection.attempt != captured.attempt || captured.attempt <= 0
+            || Path::new(&captured.selected.project) != self.project
+        {
+            return Ok(None);
+        }
+        // A single SQL statement observes target, base, digest and generation
+        // together. No transaction is held across a daemon request.
+        let state = read_selection(&self.db, &captured.selected.target)?;
+        let attempt = SourceAttempt::new(captured.proposed, captured.attempt);
+        Ok((state.selected == Some(captured.selected.root) && state.pending == Some(attempt)).then_some(projection))
     }
 }
 

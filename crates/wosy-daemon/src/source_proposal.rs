@@ -55,7 +55,7 @@ pub struct PreparedBaseDeclarations {
     identity: PreparedBaseIdentity,
     admission: BaseCstAdmission,
     declarations: UnpublishedDeclarations,
-    lease: SourceLease,
+    lease: Arc<SourceLease>,
     _read: SourceRead,
     _allocation: PreparedAllocation,
     // A held owner belongs to the same store and quota even after its
@@ -96,6 +96,11 @@ fn prepared_identity(
     PreparedBaseIdentity(NodeId(*hash.finalize().as_bytes()))
 }
 
+pub(super) enum AdmissionLease {
+    Open(Duration),
+    Connection(Arc<SourceLease>),
+}
+
 impl SourceStorageWorker {
     /// Check only the authenticated local adapter's selected/pending pair.
     /// The proposal cannot open a lease or pick an unrelated base. Nothing
@@ -104,7 +109,7 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<BaseCstAdmission> {
-        let (admission, _, _) = self.with_cst_admission(binding, proposal, limits, lifetime, |_, _, valid| {
+        let (admission, _, _) = self.with_cst_admission(binding, proposal, limits, AdmissionLease::Open(lifetime), |_, _, valid| {
             Ok(valid.admission)
         }).await?;
         Ok(admission)
@@ -116,7 +121,14 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lifetime: Duration,
     ) -> Result<PreparedBaseDeclarations> {
-        let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lifetime,
+        self.prepare_base_cst_with_lease(binding, proposal, limits, declaration_bytes, AdmissionLease::Open(lifetime)).await
+    }
+
+    pub(super) async fn prepare_base_cst_with_lease(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
+    ) -> Result<PreparedBaseDeclarations> {
+        let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease,
             move |store, tx, valid| {
                 let ValidatedProposal { admission, entry, index, mut work } = valid;
                 let mut allocation = store.source_reads.reserve_preparation()?;
@@ -136,9 +148,9 @@ impl SourceStorageWorker {
 
     async fn with_cst_admission<T: Send + 'static>(
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
-        limits: BaseCstAdmissionLimits, lifetime: Duration,
+        limits: BaseCstAdmissionLimits, admission_lease: AdmissionLease,
         use_validated: impl FnOnce(&SourceStore, &Transaction, ValidatedProposal) -> Result<T> + Send + 'static,
-    ) -> Result<(T, SourceLease, SourceRead)> {
+    ) -> Result<(T, Arc<SourceLease>, SourceRead)> {
         if proposal.version != BASE_CST_DELTA_VERSION {
             return Err("unsupported base CST proposal version".into());
         }
@@ -150,8 +162,12 @@ impl SourceStorageWorker {
         }
         let slot = self.try_slot()?;
         self.spawn_reserved(slot, move |store| {
-            let lease = store.lease_build_source(binding.selected.clone(), lifetime)?
-                .ok_or("bound base CST predecessor is not published")?;
+            let lease = match admission_lease {
+                AdmissionLease::Open(lifetime) => Arc::new(store.lease_build_source(binding.selected.clone(), lifetime)?
+                    .ok_or("bound base CST predecessor is not published")?),
+                AdmissionLease::Connection(lease) if lease.grant().root == binding.selected.root => lease,
+                AdmissionLease::Connection(_) => return Err("base CST scope does not match the connection lease".into()),
+            };
             let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
             let validated = validate(&mut tx, &binding, &proposal, limits)?;

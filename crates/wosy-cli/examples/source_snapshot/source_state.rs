@@ -41,6 +41,11 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "framed-base-projection" => {
+            let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;
+            let generation = args.next().ok_or("expected fixture attempt")?.parse()?;
+            super::framed_projection::verify(dir, &mut client, &target, SourceAttempt::new(root, generation)).await?
+        }
         "proposal" | "proposal-oracle" | "proposal-limited" | "proposal-admission" | "proposal-stale"
         | "proposal-preparation" => {
             let root = NodeId::parse_hex(&args.next().ok_or("expected fixture proposal")?)?;

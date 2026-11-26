@@ -12,8 +12,10 @@ pub use source_delta::{
 
 mod build_diagnostics;
 pub use build_diagnostics::{
-    BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
-    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, BUILD_DIAGNOSTIC_VERSION,
+    BaseDeclarationConnectionId, BaseDeclarationProjection, BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest,
+    BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
+    BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse,
+    BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

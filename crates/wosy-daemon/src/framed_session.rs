@@ -1,7 +1,8 @@
 //! Route one bounded byte stream through the existing diagnostic session.
 use super::{
-    build_session::BuildRequestRejection, encode_session_frame, BuildDiagnosticSession, Result,
-    SessionFrameError, SessionFrameReader, SourceStorageWorker, StorageAdmissionError,
+    build_session::BuildRequestRejection, encode_session_frame, BaseCstAdmissionLimits,
+    BuildDiagnosticSession, PreparedBaseDeclarations, Result, SessionFrameError, SessionFrameReader,
+    SourceStorageWorker, StorageAdmissionError,
 };
 use std::future::poll_fn;
 use std::task::Poll;
@@ -10,9 +11,11 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::{sleep_until, Instant as TokioInstant};
 use wosy_compiler::Diagnostic;
 use wosy_protocol::{
-    BuildDiagnosticRequest, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
-    BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request, BuildSessionResponse,
-    BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION,
+    BaseCstProposal, BaseCstProposalBinding, BaseDeclarationProjection, BuildDiagnosticRequest,
+    BuildDiagnosticResponse, BuildSessionCommand as Command, BuildSessionCommandId as CommandId,
+    BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
+    BuildSessionResponse, BuildSourceSelection, BASE_DECLARATION_PROJECTION_VERSION,
+    BUILD_DIAGNOSTIC_VERSION,
 };
 
 type Reply = BuildSessionReply<Diagnostic>;
@@ -31,12 +34,47 @@ enum Close {
     Request(CommandId),
 }
 
+struct ProjectionScope {
+    binding: BaseCstProposalBinding,
+    admission_limits: BaseCstAdmissionLimits,
+    declaration_bytes: usize,
+}
+
+enum Operation<'a> {
+    Analyze(BuildDiagnosticRequest),
+    Project(&'a ProjectionScope, BaseCstProposal),
+}
+
+enum Completed {
+    Analysis(BuildDiagnosticResponse<Diagnostic>),
+    Projection(PreparedBaseDeclarations),
+}
+
 impl SourceStorageWorker {
     /// Serve one host-selected connection on a Tokio runtime with its time
     /// driver enabled. The adapter supplies the acknowledged selection;
     /// wire commands never change roots. This does not provide a listener.
     pub async fn serve_build_session<T: AsyncRead + AsyncWrite + Unpin>(
         &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        self.serve_selected_session(stream, selected, lifetime, None).await
+    }
+
+    /// Only the trusted local adapter may bind a pending source attempt to
+    /// this connection. The same lease still selects diagnostics from the
+    /// published predecessor. This is not a Unix listener or publication.
+    pub async fn serve_base_declaration_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, binding: BaseCstProposalBinding, admission_limits: BaseCstAdmissionLimits,
+        declaration_bytes: usize, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        let selected = binding.selected.clone();
+        let scope = ProjectionScope { binding, admission_limits, declaration_bytes };
+        self.serve_selected_session(stream, selected, lifetime, Some(scope)).await
+    }
+
+    async fn serve_selected_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
+        projection: Option<ProjectionScope>,
     ) -> Result<BuildSessionEnd> {
         let start_deadline = Instant::now().checked_add(lifetime).ok_or("Build session start timeout is out of range")?;
         let (mut input, mut output) = io::split(stream);
@@ -70,10 +108,15 @@ impl SourceStorageWorker {
             }
         };
         let Some(deadline) = session.deadline() else { return Ok(BuildSessionEnd::Expired); };
-        if !send(&mut output, deadline, id, Reply::Started { version: BUILD_DIAGNOSTIC_VERSION, source_root }).await? {
-            return Ok(BuildSessionEnd::Expired);
-        }
-        let end = run(&session, &mut frames, &mut input, &mut output).await?;
+        let started = if projection.is_some() {
+            Reply::BaseDeclarationSessionStarted {
+                version: BUILD_DIAGNOSTIC_VERSION, source_root, connection: session.connection_id(),
+            }
+        } else {
+            Reply::Started { version: BUILD_DIAGNOSTIC_VERSION, source_root }
+        };
+        if !send(&mut output, deadline, id, started).await? { return Ok(BuildSessionEnd::Expired); }
+        let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref()).await?;
         let deadline = session.deadline();
         session.release();
         Ok(match end {
@@ -88,8 +131,10 @@ impl SourceStorageWorker {
 }
 
 async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    session: &BuildDiagnosticSession<'_>, frames: &mut SessionFrameReader, input: &mut R, output: &mut W,
+    session: &BuildDiagnosticSession<'_>, frames: &mut SessionFrameReader, input: &mut R,
+    output: &mut W, projection: Option<&ProjectionScope>,
 ) -> Result<Close> {
+    let mut owner = None;
     loop {
         let Some(deadline) = session.deadline() else { return Ok(Close::Deadline); };
         let request = tokio::select! {
@@ -97,22 +142,56 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             _ = sleep_until(TokioInstant::from_std(deadline)) => return Ok(Close::Deadline),
             request = frames.read::<_, Command>(input) => request?,
         };
-        match request {
-            Some(Command { id, request: Request::Analyze { request } }) => {
-                if let Some(end) = analyze(session, id, request, frames, input, output).await? { return Ok(end); }
+        let (id, operation) = match request {
+            Some(Command { id, request: Request::Analyze { request } }) => (id, Operation::Analyze(request)),
+            Some(Command { id, request: Request::ProjectBaseDeclarations { version, proposal } }) => {
+                let refusal = if version != BASE_DECLARATION_PROJECTION_VERSION {
+                    Refusal::UnsupportedVersion
+                } else if owner.is_some() {
+                    Refusal::BaseProjectionAlreadyHeld
+                } else if let Some(scope) = projection {
+                    if let Some(end) = drive(session, id, Operation::Project(scope, proposal),
+                        frames, input, output, &mut owner).await?
+                    {
+                        return Ok(end);
+                    }
+                    continue;
+                } else {
+                    Refusal::BaseProjectionUnavailable
+                };
+                if !send(output, deadline, id, Reply::Refused { reason: refusal }).await? {
+                    return Ok(Close::Deadline);
+                }
+                continue;
             }
             request => {
                 if let Some(end) = control(session, request, output).await? { return Ok(end); }
+                continue;
             }
+        };
+        if let Some(end) = drive(session, id, operation, frames, input, output, &mut owner).await? {
+            return Ok(end);
         }
     }
 }
 
-async fn analyze<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    session: &BuildDiagnosticSession<'_>, id: CommandId, request: BuildDiagnosticRequest,
+async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    session: &BuildDiagnosticSession<'_>, id: CommandId, operation: Operation<'_>,
     frames: &mut SessionFrameReader, input: &mut R, output: &mut W,
+    owner: &mut Option<PreparedBaseDeclarations>,
 ) -> Result<Option<Close>> {
-    let job = session.dispatch(request);
+    let failure = match &operation {
+        Operation::Analyze(_) => Refusal::AnalysisUnavailable,
+        Operation::Project(..) => Refusal::BaseProjectionUnavailable,
+    };
+    let job = async {
+        match operation {
+            Operation::Analyze(request) => session.dispatch(request).await.map(Completed::Analysis),
+            Operation::Project(scope, proposal) => session.project_base_declarations(
+                scope.binding.clone(), proposal, scope.admission_limits, scope.declaration_bytes,
+            ).await.map(Completed::Projection),
+        }
+    };
     tokio::pin!(job);
     loop {
         let Some(deadline) = session.deadline() else { return Ok(Some(Close::Deadline)); };
@@ -121,12 +200,22 @@ async fn analyze<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             _ = sleep_until(TokioInstant::from_std(deadline)) => return Ok(Some(Close::Deadline)),
             response = &mut job => {
                 let reply = match response {
-                    Ok(response) => Reply::Analysis { response },
+                    Ok(Completed::Analysis(response)) => Reply::Analysis { response },
+                    Ok(Completed::Projection(prepared)) => {
+                        let scope = prepared.admission();
+                        let projection = BaseDeclarationProjection {
+                            version: BASE_DECLARATION_PROJECTION_VERSION, connection: session.connection_id(),
+                            base: scope.base, proposed: scope.proposed, attempt: scope.attempt, preparation: prepared.identity().digest(),
+                            entry_projection: prepared.entry_projection(),
+                        };
+                        *owner = Some(prepared);
+                        Reply::BaseDeclarationProjection { projection }
+                    }
                     Err(error) => {
                         if matches!(error.downcast_ref::<BuildRequestRejection>(), Some(BuildRequestRejection::Expired)) {
                             return Ok(Some(Close::Deadline));
                         }
-                        Reply::Refused { reason: refusal(&error, Refusal::AnalysisUnavailable) }
+                        Reply::Refused { reason: refusal(&error, failure) }
                     }
                 };
                 let written = match send(output, deadline, id, reply).await {
@@ -154,7 +243,7 @@ async fn control<W: AsyncWrite + Unpin>(
     let reply = match request {
         Request::Disconnect => return Ok(Some(Close::Request(id))),
         Request::Start { .. } => Reply::Refused { reason: Refusal::AlreadyStarted },
-        Request::Analyze { .. } => Reply::Refused { reason: Refusal::Busy },
+        Request::Analyze { .. } | Request::ProjectBaseDeclarations { .. } => Reply::Refused { reason: Refusal::Busy },
         Request::Renew => {
             if !session.renew() { return Ok(Some(Close::Deadline)); }
             Reply::Renewed

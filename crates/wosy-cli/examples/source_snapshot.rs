@@ -24,6 +24,8 @@ mod source_state;
 mod prepared_proposal;
 #[path = "source_snapshot/proposal_admission.rs"]
 mod proposal_admission;
+#[path = "source_snapshot/framed_projection.rs"]
+mod framed_projection;
 #[path = "source_snapshot/leased_build.rs"]
 mod leased_build;
 

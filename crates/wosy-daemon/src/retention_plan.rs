@@ -84,6 +84,13 @@ pub(super) struct SourceLease {
 impl SourceLease {
     pub fn grant(&self) -> LeaseGrant { self.grant }
 
+    pub fn ordinal(&self) -> u64 { self.grant.id }
+
+    pub fn release(&self) {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        reads.sessions.remove(&self.grant.id);
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         let reads = self.reads.lock().expect("source reader registry");
         reads.sessions.get(&self.grant.id).map(|(_, expires)| *expires)
@@ -104,10 +111,7 @@ impl SourceLease {
 }
 
 impl Drop for SourceLease {
-    fn drop(&mut self) {
-        let mut reads = self.reads.lock().expect("source reader registry");
-        reads.sessions.remove(&self.grant.id);
-    }
+    fn drop(&mut self) { self.release(); }
 }
 
 #[derive(Clone)]

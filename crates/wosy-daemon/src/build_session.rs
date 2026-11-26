@@ -1,14 +1,26 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
-use super::{retention_plan::SourceLease, Result, SourceStorageWorker};
+use super::{
+    retention_plan::SourceLease, BaseCstAdmissionLimits, PreparedBaseDeclarations, Result, SourceStorageWorker,
+};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wosy_compiler::Diagnostic;
-use wosy_protocol::{BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION};
+use wosy_protocol::{
+    BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId, BuildDiagnosticRequest, BuildDiagnosticResponse,
+    BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION,
+};
 
 /// Bound to one published source selected by a trusted local adapter. No
 /// index, compiler artifact or raw node access can be requested by the client.
 pub struct BuildDiagnosticSession<'a> {
     worker: &'a SourceStorageWorker,
-    lease: SourceLease,
+    lease: Arc<SourceLease>,
+}
+
+impl Drop for BuildDiagnosticSession<'_> {
+    // A queued operation or passive owner may still hold the Arc, but only
+    // this connection owns continued lease authority.
+    fn drop(&mut self) { self.lease.release(); }
 }
 
 impl SourceStorageWorker {
@@ -20,7 +32,7 @@ impl SourceStorageWorker {
         let slot = self.try_slot()?;
         let lease = self.spawn_reserved(slot, move |store| store.lease_build_source(selected, lifetime))
             .await??;
-        Ok(lease.map(|lease| BuildDiagnosticSession { worker: self, lease }))
+        Ok(lease.map(|lease| BuildDiagnosticSession { worker: self, lease: Arc::new(lease) }))
     }
 }
 
@@ -30,8 +42,20 @@ impl BuildDiagnosticSession<'_> {
 
     pub(super) fn deadline(&self) -> Option<Instant> { self.lease.deadline() }
 
+    pub(super) fn connection_id(&self) -> BaseDeclarationConnectionId {
+        BaseDeclarationConnectionId(self.lease.ordinal())
+    }
+
     /// Drop the client session; already started reads retain their own roots.
     pub fn release(self) {}
+
+    pub(super) async fn project_base_declarations(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, declaration_bytes: usize,
+    ) -> Result<PreparedBaseDeclarations> {
+        self.worker.prepare_base_cst_with_lease(binding, proposal, limits, declaration_bytes,
+            super::source_proposal::AdmissionLease::Connection(Arc::clone(&self.lease))).await
+    }
 
     pub async fn dispatch(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         let BuildDiagnosticRequest::BuildDiagnostics { version, profile } = request;
