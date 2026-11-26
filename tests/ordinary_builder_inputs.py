@@ -123,6 +123,19 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
         assert not (sandbox / "artifact-manifest.json").exists()
         timing[name] = round(selected["elapsed_ms"], 3)
 
+    for held, sibling in (("dev", "wasm"), ("wasm", "dev")):
+        output = base / f"cancel-{held}-keep-{sibling}"
+        isolated = plan(sibling, output)
+        observed = call("ordinary-builder-inputs-cancel", held, sibling, output, example)
+        assert observed["selected"] == pending and observed["pending"] is None
+        concurrent = observed["result"]
+        assert concurrent["canceled"] == "PeerClosed" and concurrent["sibling"] == "Disconnected"
+        assert not output.exists() and not output.with_suffix(".held").exists()
+        assert ({key: value for key, value in isolated.items() if key != "elapsed_ms"} ==
+                {key: value for key, value in concurrent["plan"].items() if key != "elapsed_ms"})
+
     assert before == [(project / child).read_bytes() for child in (".wosy/client.sqlite", ".wosy/cst/nodes.sqlite")]
     print("V2 no-cache plan equals ordinary pending manifest, argv and both IR inputs; valid disposable Native64/WASI builder and runner,"
           " independent known-image refusal, no unknown-source replay, no opt-in write or publication.", timing)
+    print("Cancel after the real LLVM reply is held: Native64 and WASI in both roles, same lease scope and unchanged SQLite,"
+          " surviving plan byte-equal to isolated, actual PeerClosed plus Disconnected, no output.")

@@ -57,6 +57,15 @@ pub(super) async fn run(
             let expected = args.next().ok_or("expected independently owned fixture image")?;
             super::ordinary_builder_inputs::run(&mut client, dir, &target, &profile, output, Path::new(&expected)).await?
         }
+        "ordinary-builder-inputs-cancel" => {
+            let held = args.next().ok_or("expected held fixture profile")?;
+            let sibling = args.next().ok_or("expected sibling fixture profile")?;
+            let output = args.next().ok_or("expected fixture output directory")?.into();
+            let expected = args.next().ok_or("expected independently owned fixture image")?;
+            super::ordinary_builder_inputs::cancel_concurrent(
+                &mut client, project, dir, &target, &held, &sibling, output, Path::new(&expected),
+            ).await?
+        }
         "framed-ordinary-llvm" | "framed-ordinary-llvm-stale" => {
             let profile = args.next().ok_or("expected fixture LLVM profile")?;
             let control = args.next().ok_or("expected fixture control or source")?;
