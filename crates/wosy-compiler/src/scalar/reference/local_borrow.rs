@@ -171,12 +171,13 @@ impl Author {
                     let aggregate = matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
                         && self.last_literal_aggregate.is_some_and(|value| value.0.checked_add(1) == Some(id.0));
                     if (!aggregate && !aggregate::ordinary_value(ty)) || self.pending_loan.is_some() { return false; }
-                    // Deferred reborrow enrollment intentionally excludes bodies
-                    // with calls. This sealed author independently sees the
-                    // actual typed root declaration and scope at its Bind.
+                    // The exact preceding aggregate literal also certifies
+                    // its local storage when no-call metadata records the
+                    // scope for deferred reborrows.
                     if scope == ReferenceScopeId(0)
                         && matches!(binding.kind, ReferenceBindingKind::Declared)
-                        && types.0.get(binding).is_some_and(|entry| entry.local_reborrow_scope.is_none())
+                        && types.0.get(binding).is_some_and(|entry| entry.local_reborrow_scope.is_none()
+                            || (aggregate && entry.local_reborrow_scope == Some(scope)))
                     {
                         self.authored_roots.insert(binding.clone());
                     }
