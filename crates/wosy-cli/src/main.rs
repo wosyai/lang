@@ -2299,6 +2299,7 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
     #[cfg(feature = "internal-checker")]
     #[test]
     fn configured_dependency_check_uses_one_graph_and_one_ordered_publication() {
+        use codespan_reporting::term::termcolor::Buffer;
         use configured_check::{check_target_with_dependencies, plan_publication_for, CheckPublicationError, ConfiguredCheckLoadError};
         let options = Arguments::try_parse_from(["wosy", "check", "--main-flow-only", "--dependencies"]).unwrap();
         assert!(matches!(options.command, Command::Check { main_flow_only: true, dependencies: true, .. }));
@@ -2561,6 +2562,132 @@ core.require(cell == 7, { .stdout = "not selected"; .stderr = ""; .code = 9; .fi
                     if failure.root == root.join("leaf") && matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_)))));
                 assert!(checked_publication_reports(&invalid).is_err());
                 assert!(!root.join(".wosy").exists());
+            }
+        }
+        let guarded_leaf = r#"%%start
+unit(u8) consume = fn(charged) {
+    if (charged == 1) { core.context.credit = core.context.credit - 1; }
+    else { core.context.credit = core.context.credit - 1; };
+};
+unit() entry = fn {
+    u8 core.context.credit = 3;
+    core.require(false, { .stdout = "guarded"; .stderr = ""; .code = 6; .files = []; });
+    consume(1);
+};
+proof debit for consume(cost) -> (null) where (cost <= 1)
+    ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+entry();
+%%end"#;
+        let split_leaf = r#"%%start
+lib = namespace leaf "credit.w";
+unit() entry = fn {
+    u8 core.context.credit = 3;
+    lib.spend();
+};
+u8(u8) score = fn(value) { value };
+proof scalar_value for score(entry) -> (out) where (entry == 4) ensures (out == 3) {}
+core.require(false, { .stdout = "guarded"; .stderr = ""; .code = 6; .files = []; });
+entry();
+u8 observed = score(4);
+core.require(observed == 4, { .stdout = "not selected"; .stderr = ""; .code = 9; .files = []; });
+%%end"#;
+        let credit_provider = r#"%%start
+unit() consume = fn { core.context.credit = core.context.credit - 1; };
+unit() spend = fn { consume(); };
+proof debit for consume() -> (null)
+    ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+%%end"#;
+        let credit_source = root.join("leaf/src/credit.w");
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let run = |cap| configured_check::check_targets_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                ).ok().unwrap();
+                for (mixed, refuted) in [(false, false), (false, true), (true, false), (true, true)] {
+                    let proof = |text: &str| if refuted {
+                        text.replace("core.old(core.context.credit) - 1", "core.old(core.context.credit) - 0")
+                    } else { text.to_owned() };
+                    if mixed { fs::write(&credit_source, proof(credit_provider)).unwrap(); }
+                    let actual = if mixed { split_leaf.to_owned() } else { proof(guarded_leaf) };
+                    fs::write(&leaf_source, &actual).unwrap();
+                    let mut legacy = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                    if !mixed {
+                        // Legacy rejects a typed where. The only actual
+                        // cost, 1, satisfies this case's guard. Substitute
+                        // an unguarded oracle without moving source offsets.
+                        assert!(matches!(legacy.last().unwrap().outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                        let guard = " where (cost <= 1)";
+                        let unguarded = actual.replace(guard, &" ".repeat(guard.len()));
+                        assert_ne!(unguarded, actual);
+                        fs::write(&leaf_source, unguarded).unwrap();
+                        legacy = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                        fs::write(&leaf_source, &actual).unwrap();
+                    }
+                    let last = legacy.last().unwrap();
+                    let legacy_diagnostics = ordered_check_diagnostics(last.outcome.as_ref().unwrap(), &last.texts).unwrap();
+                    assert_eq!(legacy_diagnostics.len(), usize::from(refuted) + usize::from(mixed));
+                    for cap in [1, 4, 8] {
+                        let receipts = run(cap);
+                        let reports = checked_publication_reports(&receipts)
+                            .unwrap_or_else(|receipt| panic!("bounded contextual dependency refused: {:?}", receipt.outcome.as_ref().err()));
+                        let leaf = receipts.last().unwrap();
+                        assert_eq!(leaf.root, root.join("leaf"));
+                        let formal = reports.last().unwrap();
+                        let selected_leaf = cap != 1 && (mixed || !refuted);
+                        assert_eq!(formal.directives.len(), usize::from(selected_leaf));
+                        assert_eq!(formal.diagnostics.len(), usize::from(mixed));
+                        let diagnostics = ordered_check_diagnostics(formal, &leaf.texts).unwrap();
+                        if mixed {
+                            assert_eq!(diagnostics, legacy_diagnostics);
+                        } else {
+                            assert_eq!(diagnostics.len(), legacy_diagnostics.len());
+                            for (observed, expected) in diagnostics.iter().zip(&legacy_diagnostics) {
+                                assert_eq!((&observed.message, &observed.notes), (&expected.message, &expected.notes));
+                                assert_eq!(observed.labels.len(), expected.labels.len());
+                                for (observed, expected) in observed.labels.iter().zip(&expected.labels) {
+                                    assert_eq!((&observed.kind, &observed.message, &observed.span.source.path, observed.span.range),
+                                        (&expected.kind, &expected.message, &expected.span.source.path, expected.span.range));
+                                }
+                            }
+                        }
+                        if refuted {
+                            let failure = formal.contextual_diagnostic.as_ref().unwrap();
+                            assert_eq!(failure.proof.source.package, "leaf");
+                            assert_eq!((&failure.entry, &failure.exit), (&3.into(), &2.into()));
+                            assert_eq!(failure.supplying_call.source.path, "src/primary.w");
+                            assert_eq!(failure.call.source.path, if mixed { "src/credit.w" } else { "src/primary.w" });
+                        } else {
+                            assert!(formal.contextual_diagnostic.is_none());
+                        }
+                        let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                        assert_eq!(publish_configured_check_receipts(&receipts, scope, true, &mut stdout, &mut stderr), Ok(3));
+                        let expected: &[u8] = if cap == 1 { b"app" }
+                            else if selected_leaf { b"appabguarded" } else { b"appab" };
+                        assert_eq!(stdout, expected);
+                        assert_eq!(stderr.as_slice().is_empty(), !refuted && !mixed);
+                        assert!(!root.join(".wosy").exists());
+                    }
+                    if mixed { fs::remove_file(&credit_source).unwrap(); }
+                }
+                // A valid but currently unmodelled condition before the
+                // formal call cannot silently authorize its continued reach.
+                fs::write(&leaf_source, guarded_leaf.replace("core.require(false,", "core.require(false || true,")).unwrap();
+                let unsupported = run(1);
+                assert!(matches!(unsupported.as_slice(), [failure] if failure.root == root.join("leaf")
+                    && matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported))));
+                let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                assert!(publish_configured_check_receipts(&unsupported, scope, true, &mut stdout, &mut stderr).is_err());
+                assert!(stdout.is_empty() && stderr.as_slice().is_empty() && !root.join(".wosy").exists());
+                // Separate static input validation from the exact
+                // contextual transport's conservative Unsupported lane.
+                fs::write(&leaf_source, "%%start u8 bad = true; %%end").unwrap();
+                let invalid = run(1);
+                assert!(matches!(invalid.as_slice(), [failure] if failure.root == root.join("leaf")
+                    && matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_)))));
+                let (mut stdout, mut stderr) = (Vec::new(), Buffer::no_color());
+                assert_eq!(publish_configured_check_receipts(&invalid, scope, true, &mut stdout, &mut stderr), Ok(2));
+                assert!(stdout.is_empty() && !stderr.as_slice().is_empty() && !root.join(".wosy").exists());
             }
         }
         fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();

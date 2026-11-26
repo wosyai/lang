@@ -10300,7 +10300,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_private_guarded_context(&owner, effects, self.scope, cap).map_err(configured_ordered_error)
+        run_private_guarded_context(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error)
     }
 
     /// One real bare scalar startup activation and one independent ranked
@@ -10355,36 +10355,49 @@ impl PreparedScalarOrderedCheck {
                 run_private_named_after_startup(&owner, self.scope, Some(cap), None)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
-                run_private_guarded_context(&owner, effects, self.scope, cap).map_err(configured_ordered_error),
+                run_private_guarded_context(&owner, effects, self.scope, Some(cap)).map_err(configured_ordered_error),
             PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
-                run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, cap, configured_root)
+                run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, Some(cap), configured_root)
                     .map(|(report, completion)| (report, Some(completion))).map_err(configured_ordered_error),
             _ => Err(ScalarOrderedCheckerOutcome::Unsupported),
         }
     }
 
-    /// Classify a dependency that must use the same bounded proof-bearing
-    /// startup machinery as the primary. Detailed coverage is authenticated
-    /// by that machinery, not by this ownership discriminator.
+    /// Use only the already supported bounded owner profiles. Detailed
+    /// proof coverage is authenticated by the same walk in both budget modes.
     #[doc(hidden)]
-    pub fn supports_private_named_authored_dependency(&self) -> bool {
-        matches!(&self.owner, PreparedConfiguredCheck::Named { owner, startup_count: 1 | 2 }
-            if owner.context.is_none() && owner.proofs.values().any(|catalog| !catalog.definitions.is_empty()))
+    pub fn supports_private_proof_authored_dependency(&self) -> bool {
+        match &self.owner {
+            PreparedConfiguredCheck::Named { owner, startup_count: 1 | 2 } =>
+                owner.context.is_none() && owner.proofs.values().any(|catalog| !catalog.definitions.is_empty()),
+            PreparedConfiguredCheck::Contextual { startup_count: 1, .. }
+                | PreparedConfiguredCheck::Mixed { startup_count: 2 | 3, .. } => true,
+            _ => false,
+        }
     }
 
     /// Complete independent proofs with no remaining authored command
     /// budget. An unknown or uncovered route remains a transaction failure.
     #[doc(hidden)]
-    pub fn run_private_named_after_command_cap(self) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
-        if !self.supports_private_named_authored_dependency() {
+    pub fn run_private_proofs_after_command_cap(self) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
+        if !self.supports_private_proof_authored_dependency() {
             return Err(ScalarOrderedCheckerOutcome::Unsupported);
         }
-        let PreparedConfiguredCheck::Named { owner, .. } = self.owner else {
-            return Err(ScalarOrderedCheckerOutcome::Unsupported);
-        };
-        let (report, _) = run_private_named_after_startup(&owner, self.scope, None, None)
-            .map_err(configured_ordered_error)?;
-        if !report.directives.is_empty() { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
+        let (report, completion) = match self.owner {
+            PreparedConfiguredCheck::Named { owner, .. } =>
+                run_private_named_after_startup(&owner, self.scope, None, None)
+                    .map(|(report, completion)| (report, Some(completion))),
+            PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } =>
+                run_private_guarded_context(&owner, effects, self.scope, None),
+            PreparedConfiguredCheck::Mixed { owner, ordinary_source, headers, startup_count: 2 | 3, configured_root } =>
+                run_private_mixed_root_context(&owner, &ordinary_source, headers, self.scope, None, configured_root)
+                    .map(|(report, completion)| (report, Some(completion))),
+            _ => return Err(ScalarOrderedCheckerOutcome::Unsupported),
+        }.map_err(configured_ordered_error)?;
+        if !report.directives.is_empty()
+            || (completion != Some(StartupAuthoredCompletion::LimitReached)
+                && !(completion.is_none() && report.contextual_diagnostic.is_some()))
+        { return Err(ScalarOrderedCheckerOutcome::Unsupported); }
         Ok(report)
     }
 
@@ -10849,7 +10862,7 @@ fn run_startup_authored_path(
 #[cfg(feature = "internal-checker")]
 fn run_private_guarded_context(
     prepared: &PreparedCheckerProject, mut effects: OrderedFailures, scope: ScalarCheckerScope,
-    cap: std::num::NonZeroUsize,
+    cap: Option<std::num::NonZeroUsize>,
 ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -10888,7 +10901,10 @@ fn run_private_guarded_context(
     if roots.into_iter().any(|(owner, items)| owner != 0 || items.into_iter().any(|candidate| candidate != item)) {
         return Err(ProjectCheck::Unsupported);
     }
-    let mut search = failure_search::StartUpSearch::new(root, cap);
+    let mut search = match cap {
+        Some(cap) => failure_search::StartUpSearch::new(root, cap),
+        None => failure_search::StartUpSearch::formal_only(root),
+    };
     search.contextual_route = Some(((0, item), target));
     effects.startup_search = Some(Rc::new(RefCell::new(search)));
     let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
@@ -10896,10 +10912,11 @@ fn run_private_guarded_context(
     );
     let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
         .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
-    if search.invalid() || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-        || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
+    if search.invalid() || !search.contextual_observed || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+        || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len())
     { return Err(ProjectCheck::Unsupported); }
     let completion = match outcome {
+        Ok(_) if cap.is_none() => StartupAuthoredCompletion::LimitReached,
         Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
         Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
         Err(error) => return Err(error),
@@ -10992,9 +11009,9 @@ fn mixed_context_entry_requires(
 #[cfg(feature = "internal-checker")]
 fn run_private_mixed_root_context(
     owner: &PreparedProofModule, ordinary_source: &SourceIdentity, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
-    scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, configured_root: bool,
+    scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>, configured_root: bool,
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
-    use failure_search::{MixedContextStartup, StartupProofRole, StartUpSearch};
+    use failure_search::{MixedContextStartup, StartupProofRole};
     let (project, calls) = owner.prepared.parts();
     let startup_count = project.modules.len();
     let (root, ordinals) = package_startup_order(project, &project.modules)?;
@@ -11091,7 +11108,10 @@ fn run_private_mixed_root_context(
         return Err(ProjectCheck::Unsupported);
     }
 
-    let mut trace = StartUpSearch::new(root, cap);
+    let mut trace = match cap {
+        Some(cap) => failure_search::StartUpSearch::new(root, cap),
+        None => failure_search::StartUpSearch::formal_only(root),
+    };
     trace.retain_after_cutoff = true;
     trace.named_cross_source = ordinary_ordinal != root_ordinal;
     trace.contextual_route = Some((entry, leaf));
@@ -11119,9 +11139,10 @@ fn run_private_mixed_root_context(
     let completed = trace.mixed_context.take().ok_or(ProjectCheck::Unsupported)?;
     if trace.invalid() || !completed.finished || !trace.contextual_observed || !trace.required_sites.is_empty()
         || trace.named_observations.len() != observation_count || effects.has_authored_state || effects.has_selected_code
-        || !effects.snapshot_records.is_empty() || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+        || !effects.snapshot_records.is_empty() || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(trace.remaining()) != Some(effects.records.len())
     { return Err(ProjectCheck::Unsupported); }
     let end = match outcome {
+        Ok(_) if cap.is_none() => StartupAuthoredCompletion::LimitReached,
         Ok(_) if trace.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
         Err(ProjectCheck::StartupAuthoredLimitReached) if trace.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
         Err(error) => return Err(error),
