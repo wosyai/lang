@@ -9874,7 +9874,7 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_independent_named_after_startup(&owner, self.scope, cap, false).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Dormant).map_err(configured_ordered_error)
     }
 
     /// Private exact single direct returning named activation before cap.
@@ -9884,7 +9884,18 @@ impl PreparedScalarOrderedCheck {
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
         let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
             else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
-        run_independent_named_after_startup(&owner, self.scope, cap, true).map_err(configured_ordered_error)
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Invoked).map_err(configured_ordered_error)
+    }
+
+    /// Private pair: one original direct returning theorem activation and
+    /// one independently authenticated dormant theorem on the same owner.
+    #[doc(hidden)]
+    pub fn search_startup_with_mixed_named(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Mixed).map_err(configured_ordered_error)
     }
 
     /// Accepts only a proof-free owner and never drops possible dormant
@@ -9961,66 +9972,89 @@ fn run_startup_authored_path(
 }
 
 #[cfg(feature = "internal-checker")]
-fn run_independent_named_after_startup(
-    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, invoked: bool,
+enum StartupNamedMode { Dormant, Invoked, Mixed }
+
+#[cfg(feature = "internal-checker")]
+fn run_private_named_after_startup(
+    owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize, mode: StartupNamedMode,
 ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
     let (project, calls) = owner.prepared.parts();
     let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let mut catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
     let (proof_source, catalog) = catalogs.next().ok_or(ProjectCheck::Unsupported)?;
-    let [definition] = catalog.definitions.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    if catalogs.next().is_some() || owner.context.is_some() || proof_source != &owner.source || &module.source != proof_source {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
-    let selected = owner.resolve_selected_proof(definition, catalog.first_query)?;
-    let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
-        proof_source, name.text(), selected, false,
-    )?;
-    let body = plan.typed.body;
-    if plan.target.0 != 0 || &plan.typed.target.source != proof_source
-        || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
-        || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
-        || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
-        || !body.checker_pure_calling_frame() || !body.structure.checker_direct_targets.is_empty()
-        || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
-        || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
-        || !plan.function.overload_arms.is_empty()
-        || calls.owned_direct_startup_callable_uses(proof_source, plan.function.name_span) != Some(usize::from(invoked))
-        || (invoked && !matches!(body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty)))
+    let count = if matches!(mode, StartupNamedMode::Mixed) { 2 } else { 1 };
+    if catalog.definitions.len() != count || catalogs.next().is_some() || owner.context.is_some()
+        || proof_source != &owner.source || &module.source != proof_source
     { return Err(ProjectCheck::Unsupported); }
+    let names = catalog.definitions.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut plans = Vec::with_capacity(count);
+    for (index, (definition, name)) in catalog.definitions.iter().zip(&names).enumerate() {
+        let selected = owner.resolve_selected_proof(definition, catalog.first_query + index)?;
+        let plan = owner.plan_resolved_module_proof_with_qualified_entry::<true, false, false>(
+            proof_source, name.text(), selected, false,
+        )?;
+        let body = plan.typed.body;
+        if plan.target.0 != 0 || &plan.typed.target.source != proof_source
+            || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)
+            || !body.checker_pure_calling_frame() || !body.structure.checker_direct_targets.is_empty()
+            || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
+            || body.contextual_formal().is_some() || !plan.function.generic_parameters.is_empty()
+            || !plan.function.overload_arms.is_empty()
+            || plans.iter().any(|previous: &PlannedModuleProof<'_>| previous.target == plan.target || previous.name == plan.name)
+        { return Err(ProjectCheck::Unsupported); }
+        plans.push(plan);
+    }
+    let declarations = plans.iter().map(|plan| plan.function.name_span).collect::<Vec<_>>();
+    let incoming = calls.owned_direct_startup_callable_uses(proof_source, &declarations).ok_or(ProjectCheck::Unsupported)?;
+    let mut invoked = None;
+    for plan in &plans {
+        match incoming.get(&plan.function.name_span) {
+            Some(0) => {},
+            Some(1) if invoked.is_none() && matches!(plan.typed.body.boundary.parameters.as_slice(),
+                [entry] if is_integer_type(&entry.ty)) => { invoked = Some(plan.target); },
+            _ => return Err(ProjectCheck::Unsupported),
+        }
+    }
+    if invoked.is_some() == matches!(mode, StartupNamedMode::Dormant) { return Err(ProjectCheck::Unsupported); }
     let (_, authored_roots) = package_obligation_roots(&owner.prepared, scope, 1, &owner.source)?;
     if !authored_roots.is_empty() { return Err(ProjectCheck::Unsupported); }
-    let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, &plan)?;
+    // Legacy dormant observers walk declaration order, not proof clause
+    // order. Preserve it even when typed goals were authored in reverse.
+    plans.sort_unstable_by_key(|plan| plan.target.1);
+    let [first, rest @ ..] = plans.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let mut observer = MainFlowProofObserver::from_first_plan(scope, &owner.source, first)?;
+    for plan in rest {
+        observer.insert(scope, false, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
+    }
     observer.finish_plans(&owner.prepared, scope)?;
-    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked.then_some(plan.target))?;
+    let (records, end, trace, mut active) = run_startup_authored_path(&owner.prepared, cap, invoked)?;
     let mut effects = OrderedFailures { records, ..OrderedFailures::default() };
     if let Some(observed) = trace.named_observation {
         if &observed.site.source != proof_source { return Err(ProjectCheck::Unsupported); }
-        observer.observe_initializer(plan.target, Some(InitializerProofSite {
+        observer.observe_initializer(invoked.ok_or(ProjectCheck::Unsupported)?, Some(InitializerProofSite {
             source: proof_source,
             call: InitializerProofOrigin::CapturedDirect { call: observed.site.range, directive_position: observed.directive_position },
         }), &[observed.parameter], &[&observed.argument], &observed.returned);
-        if !observer.complete(&HashSet::from([plan.target])) { return Err(ProjectCheck::Unsupported); }
-        active |= observer.active;
-        return Ok((MainFlowProofReceipt {
-            active, directives: effects.records, diagnostics: observer.diagnostics, contextual_diagnostic: None,
-            additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
-            aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
-        }, end));
     }
+    if !observer.complete(&invoked.into_iter().collect()) { return Err(ProjectCheck::Unsupported); }
+    active |= observer.active;
+    let evidence = NamedOrderedEvidence { observed: observer };
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
-        let evidence = NamedOrderedEvidence { observed: observer };
         let mut proof = evidence.symbolic();
-        // No invented completion or dependency access. The graph certificate
-        // above permits only this closed local dormant theorem.
-        active |= proof.try_collect(plan.target, body, plan.function, proof_source, &mut effects,
-            SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+        for plan in plans.iter().filter(|plan| Some(plan.target) != invoked) {
+            // No invented completion/dependency access, only the original
+            // closed dormant theorem allowed by the resolved-edge census.
+            active |= proof.try_collect(plan.target, plan.typed.body, plan.function, proof_source, &mut effects,
+                SymbolicProofRuntime { project, calls, visits: None })?.ok_or(ProjectCheck::Unsupported)?;
+        }
         proof.complete()?;
         NamedOrderedEvidence::finish_symbolic(proof)
     } else { (None, Vec::new()) };
     Ok((MainFlowProofReceipt {
-        active, directives: effects.records, diagnostics: Vec::new(), contextual_diagnostic: None,
+        active, directives: effects.records, diagnostics: evidence.observed.diagnostics, contextual_diagnostic: None,
         additional_contextual_diagnostics: Vec::new(), mixed_context_after_scalar: None, pointer_effect_diagnostic: None,
         aggregate_diagnostics: Vec::new(), symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: None,
     }, end))
@@ -14936,6 +14970,58 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_mixed_named_preserves_invoked_and_independent_proof_diagnostics() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-mixed-named");
+        let program = format!(r#"%%start
+            u8(u8) sleep = fn(value) {{ value }};
+            u8(u8) echo = fn(value) {{ if (value < 4) {{ value }} else {{ 7 }} }};
+            proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {{}}
+            proof dormant for sleep(entry) -> (out) where (entry == 5) ensures (out == 6) {{}}
+            u8 actual = echo(3);
+            core.require(actual == 4, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout },
+                        scope, Vec::new()).ok().unwrap()
+                };
+                let old = prepare(&program).run().unwrap();
+                let at = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+                for cap in [1, 3] {
+                    let cap = NonZeroUsize::new(cap).unwrap();
+                    let (report, end) = prepare(&program).search_startup_with_mixed_named(cap).unwrap();
+                    assert_eq!(end, if cap.get() == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                    assert_eq!(report.directives.len(), cap.get().min(2));
+                    assert_eq!(at(report.directives[0].condition), "actual == 4");
+                    assert_eq!(report.directives[0].directive, old.directives[0].directive);
+                    let [failure] = report.diagnostics.as_slice() else { panic!("original reached theorem"); };
+                    assert_eq!(failure.invocation.call, old.diagnostics[0].invocation.call);
+                    assert_eq!(at(failure.invocation.call.range), "echo(3)");
+                    assert_eq!(failure.invocation.returned, 3.into());
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        let dormant = report.symbolic_diagnostic.unwrap();
+                        let before = old.symbolic_diagnostic.as_ref().unwrap();
+                        assert_eq!(at(dormant.goal.range), "out == 6");
+                        assert_eq!((dormant.proof, dormant.goal, dormant.returned),
+                            (before.proof.clone(), before.goal.clone(), 5.into()));
+                        assert_eq!(dormant.witness, before.witness);
+                    } else { assert!(report.symbolic_diagnostic.is_none()); }
+                    assert!(report.additional_symbolic_diagnostics.is_empty());
+                }
+                let unexpected_use = program.replace("%%end", "u8 alternate = sleep(5); %%end");
+                assert!(matches!(prepare(&unexpected_use).search_startup_with_mixed_named(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

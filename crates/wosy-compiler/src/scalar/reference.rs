@@ -7049,28 +7049,29 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owned_direct_startup_callable_uses(&self, source: &SourceIdentity, declaration: ByteSpan) -> Option<usize> {
+    pub(super) fn owned_direct_startup_callable_uses(&self, source: &SourceIdentity, declarations: &[ByteSpan]) -> Option<HashMap<ByteSpan, usize>> {
         let [module] = self.modules.as_slice() else { return None; };
         let module = module.as_ref().ok()?;
         if &module.initialization.source != source { return None; }
         let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
-        let target = SourceSpan::new(source.clone(), declaration);
+        let mut startup_uses = declarations.iter().map(|span| (*span, 0usize)).collect::<HashMap<_, _>>();
+        let candidate = |span: &SourceSpan| &span.source == source && declarations.contains(&span.range);
         let resolved = |call: &ResolvedCallTarget| matches!(call, ResolvedCallTarget::ModuleCallable {
             source: owner, declaration_span, ..
-        } if owner == source && *declaration_span == declaration);
+        } if owner == source && declarations.contains(declaration_span));
         let mut work = 0;
         use super::checker_flow::charge_call_work;
         charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
-        if startup.callable_escapes.contains(&target) { return None; }
-        let mut startup_uses = 0usize;
+        if startup.callable_escapes.iter().any(candidate) { return None; }
         for call in startup.call_targets.values() {
             match call {
-                ModuleInitializationCallTarget::Direct { declaration, concrete } if declaration == &target => {
+                ModuleInitializationCallTarget::Direct { declaration, concrete } if candidate(declaration) => {
                     if *concrete != ConcreteCallSelection::Declaration { return None; }
-                    startup_uses = startup_uses.checked_add(1)?;
+                    let count = startup_uses.get_mut(&declaration.range)?;
+                    *count = count.checked_add(1)?;
                 }
                 ModuleInitializationCallTarget::Generic { declaration, .. }
-                    | ModuleInitializationCallTarget::CallableBinding(declaration) if declaration == &target => return None,
+                    | ModuleInitializationCallTarget::CallableBinding(declaration) if candidate(declaration) => return None,
                 _ => {},
             }
         }
@@ -7080,7 +7081,7 @@ impl ProjectCallSiteResults {
             for body in std::iter::once(function).chain(&function.arms) {
                 charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
                     .checked_add(body.callable_escapes.len())?)?;
-                if body.callable_escapes.contains(&target)
+                if body.callable_escapes.iter().any(candidate)
                     || body.sites.iter().any(|site| resolved(&site.target))
                     || body.allocation_length_call_targets.values().any(resolved)
                 { return None; }
