@@ -2532,7 +2532,10 @@ pub use comptime::{derive_closed_comptime_fragment, derive_first_source_initiali
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES};
-pub use comptime::{inspect_direct_function_comptime, DirectComptimeArgument, InspectedDirectComptimeCall};
+pub use comptime::{
+    derive_direct_function_comptime_fragment, inspect_direct_function_comptime, DirectComptimeArgument,
+    DirectFunctionComptimeFragment, InspectedDirectComptimeCall,
+};
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};

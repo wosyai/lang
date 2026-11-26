@@ -1,6 +1,7 @@
-//! A non-emitting inspection of one directly called authored comptime tail.
+//! Inspect one direct authored comptime call and emit only its detached evaluator.
 use super::{
-    analyze_scalar_build, derive_block, prepare_scalar_project, span_of, ClosedComptimeRejection,
+    analyze_scalar_build, derive_block, emit_closed_evaluator, prepare_scalar_project, span_of,
+    ClosedComptimeFragment, ClosedComptimeRejection, ScalarBlock,
     ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs, ScalarTargetLayout,
     ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
@@ -9,7 +10,7 @@ use super::super::{
     derive_scalar_declarations_with_embedding, ConcreteCallSelection, EmbeddedComptimeExpression,
 };
 use rowan::NodeOrToken;
-use wosy_syntax::{byte_span, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
+use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectComptimeArgument {
@@ -51,6 +52,57 @@ impl InspectedDirectComptimeCall {
 pub fn inspect_direct_function_comptime(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<InspectedDirectComptimeCall, ClosedComptimeRejection> {
+    with_verified_direct_call(fresh, id, layout, |facts, _, _| Ok(facts))
+}
+
+/// Exact typed facts and the detached evaluator for this one concrete input.
+/// Not an executed result, selected profile, manifest, or cache key.
+pub struct DirectFunctionComptimeFragment {
+    facts: InspectedDirectComptimeCall,
+    evaluator: ClosedComptimeFragment,
+}
+
+impl DirectFunctionComptimeFragment {
+    pub fn facts(&self) -> &InspectedDirectComptimeCall { &self.facts }
+    pub fn evaluator(&self) -> &ClosedComptimeFragment { &self.evaluator }
+}
+
+/// Derive evaluator LLVM from the compiler-observed concrete argument. No
+/// API accepts a value or allows an inspected fact from another source to
+/// be applied here. Neither the analytical project nor the caller is emitted.
+pub fn derive_direct_function_comptime_fragment(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+) -> Result<DirectFunctionComptimeFragment, ClosedComptimeRejection> {
+    with_verified_direct_call(fresh, id, layout, |facts, authored_body, name_span| {
+        let mut body = authored_body.clone();
+        let ([ScalarBlockItem::Expression(item)], [expression], [output]) = (
+            body.items.as_mut_slice(), body.expressions.as_mut_slice(), body.final_output_values.as_mut_slice(),
+        ) else {
+            return Err(ClosedComptimeRejection::Emitter("verified evaluator body lost its sole output".into()));
+        };
+        let span = facts.read.range;
+        let value = match facts.value {
+            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
+        };
+        *item = value.clone();
+        *expression = value.clone();
+        output.value = value;
+        output.ty = facts.result.clone();
+        let evaluator = emit_closed_evaluator(
+            id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body,
+        )?;
+        Ok(DirectFunctionComptimeFragment { facts, evaluator })
+    })
+}
+
+// No prepared project or caller-supplied value can escape this boundary.
+// The private continuation sees only the authenticated detached body.
+fn with_verified_direct_call<T>(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
+    observe: impl FnOnce(InspectedDirectComptimeCall, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
+) -> Result<T, ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     let parsed = fresh.result();
     if !matches!(layout, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) {
@@ -159,10 +211,10 @@ pub fn inspect_direct_function_comptime(
     {
         return Err(unsupported("authored read does not select the exact ordinary formal"));
     }
-    Ok(InspectedDirectComptimeCall {
+    observe(InspectedDirectComptimeCall {
         site: scope(site.span), function: declaration, call: scope(span_of(call)), argument: scope(span_of(argument)),
         formal: scope(formal.declaration_span), read: scope(span_of(read)), value, result: result.ty.clone(),
-    })
+    }, body, super::super::token_span(&site.id))
 }
 
 fn only<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -246,6 +298,45 @@ mod tests {
                 assert_eq!(&diagnostic.labels[0].span, fact.site());
                 assert!(ordinary.items.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn direct_comptime_evaluator_emits_only_the_compiler_bound_argument() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let mut i32_evaluators = Vec::new();
+            for (ty, literal, value) in [
+                ("i32", "7", DirectComptimeArgument::I32(7)),
+                ("i32", "9", DirectComptimeArgument::I32(9)),
+                ("u32", "4294967295", DirectComptimeArgument::U32(u32::MAX)),
+                ("bool", "false", DirectComptimeArgument::Bool(false)),
+                ("bool", "true", DirectComptimeArgument::Bool(true)),
+            ] {
+                let direct = fresh(&format!(
+                    "{ty}({ty}) solve = fn(input) {{ comptime value {{ input }} }};\n{ty} answer = solve({literal});"
+                ));
+                let exact = derive_direct_function_comptime_fragment(&direct, "value", layout)
+                    .unwrap_or_else(|error| panic!("typed evaluator {ty} on {layout:?}: {error:?}"));
+                let ordinary = fresh(&format!("{ty} answer = comptime value {{ {literal} }};"));
+                let expected = super::super::derive_closed_comptime_fragment(&ordinary, "value", layout, |_| None)
+                    .unwrap_or_else(|error| panic!("literal oracle {ty}: {error:?}"));
+                assert_eq!(exact.facts().value(), value);
+                assert_eq!(spelling(&direct, exact.facts().argument()), literal);
+                assert_eq!(exact.facts().site(), exact.evaluator().site());
+                assert_eq!(exact.facts().result(), exact.evaluator().result_type());
+                assert_eq!(exact.evaluator().layout(), layout);
+                assert!(exact.evaluator().parameter_uses().is_empty());
+                let actual = exact.evaluator().llvm().to_text();
+                assert_eq!(actual, expected.llvm().to_text());
+                assert!(!actual.contains("@solve("), "analytical program leaked into evaluator");
+                if ty == "i32" { i32_evaluators.push(actual); }
+            }
+            assert_eq!(i32_evaluators.len(), 2);
+            assert_ne!(i32_evaluators[0], i32_evaluators[1]);
+
+            let unbound = fresh("i32(i32) solve = fn(input) { comptime value { input } };\ni32 answer = solve(1 | 2);");
+            assert!(matches!(derive_direct_function_comptime_fragment(&unbound, "value", layout),
+                Err(ClosedComptimeRejection::Unsupported { feature: "argument must be an exact scalar literal", .. })));
         }
     }
 

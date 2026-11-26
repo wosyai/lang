@@ -14,7 +14,10 @@ pub const CLOSED_COMPTIME_MAX_SOURCE_BYTES: usize = 1 << 16;
 const FUNCTION: &str = "evaluate";
 
 mod direct;
-pub use direct::{inspect_direct_function_comptime, DirectComptimeArgument, InspectedDirectComptimeCall};
+pub use direct::{
+    derive_direct_function_comptime_fragment, inspect_direct_function_comptime, DirectComptimeArgument,
+    DirectFunctionComptimeFragment, InspectedDirectComptimeCall,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComptimeParameter {
@@ -176,10 +179,24 @@ fn with_closed_comptime_occurrence<R>(
     if !diagnostics.is_empty() { return Err(ClosedComptimeRejection::OrdinaryDiagnostics(diagnostics)); }
     let mut body = derive_block(&site.block);
     let parameter_uses = rewrite_body(&mut body, &result_type, &scope, &parameter)?;
-    let output_span = body.final_output_values[0].span;
-    let name_span = super::token_span(&site.id);
+    let fragment = emit_closed_evaluator(
+        id, scope(site.span), super::token_span(&site.id), layout, result_type, parameter_uses, body,
+    )?;
+    Ok(inspect(fragment, parsed.canonical_cst(), &node, &initializer))
+}
+
+// Every caller supplies a detached scalar body already bound to its exact
+// authored inputs. Only this body enters the ordinary evaluator emitter.
+fn emit_closed_evaluator(
+    id: &str, site: SourceSpan, name_span: ByteSpan, layout: ScalarTargetLayout,
+    result_type: ScalarType, parameter_uses: Vec<ComptimeParameterUse>, body: ScalarBlock,
+) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
+    let [output] = body.final_output_values.as_slice() else {
+        return Err(ClosedComptimeRejection::Emitter("closed evaluator must have one output".into()));
+    };
+    let output_span = output.span;
     let function = ScalarFunction {
-        name: FUNCTION.into(), name_span, span: site.span,
+        name: FUNCTION.into(), name_span, span: site.range,
         signature: ScalarType::Callable {
             parameters: Vec::new(),
             outputs: ScalarOutputSequence {
@@ -191,11 +208,11 @@ fn with_closed_comptime_occurrence<R>(
         overload_arms: Vec::new(), body, reference_cfg: ScalarReferenceCfg::default(),
     };
     let declarations = ScalarSourceDeclarations {
-        source: parsed.source.clone(), items: vec![ScalarItem::Function(function)],
+        source: site.source.clone(), items: vec![ScalarItem::Function(function)],
         structs: Vec::new(), enums: Vec::new(), diagnostics: Vec::new(),
     };
     let prepared = prepare_scalar_project(
-        vec![(declarations, Vec::new())], vec![parsed.source.clone()],
+        vec![(declarations, Vec::new())], vec![site.source.clone()],
         ScalarPreparationInputs { target_layout: layout },
     ).map_err(|refusal| ClosedComptimeRejection::OrdinaryDiagnostics(refusal.into_ordered_diagnostics()))?;
     let build = analyze_scalar_build(&prepared);
@@ -203,8 +220,7 @@ fn with_closed_comptime_occurrence<R>(
         return Err(ClosedComptimeRejection::OrdinaryDiagnostics(build.diagnostics().to_vec()));
     }
     let llvm = emit_scalar_build_single_module_artifact_llvm(&build).map_err(ClosedComptimeRejection::Emitter)?;
-    let fragment = ClosedComptimeFragment { id: id.into(), site: scope(site.span), result_type, layout, parameter_uses, llvm };
-    Ok(inspect(fragment, parsed.canonical_cst(), &node, &initializer))
+    Ok(ClosedComptimeFragment { id: id.into(), site, result_type, layout, parameter_uses, llvm })
 }
 
 struct RootInitializer {
