@@ -2714,11 +2714,19 @@ main_artifact = "main"
                 assert_eq!(files(), both_files);
                 clean();
 
-                // Adding a second bare call to a ranked owner is still
-                // outside the admitted receipt family.
-                let two_bare = ranked.replace("u8 actual = echo(7);",
-                    "u8 actual = echo(7); u8 second_actual = echo(7);");
-                fs::write(&source, two_bare).unwrap();
+                let mixed_roster = ranked.replace("core.require(actual == 8,",
+                    "u8 rerank = descend(5); u8 more = echo(7); u8 last = echo(7); core.require(actual == 8,");
+                fs::write(&source, &mixed_roster).unwrap();
+                let mixed = selected(1);
+                assert_eq!(mixed[0].outcome.as_ref().unwrap().diagnostics.len(), 3);
+                let emitted = terminal(&mixed, scope, false);
+                assert_eq!((emitted.0, emitted.1), (Ok(1), b"first".to_vec()));
+                assert_eq!(files(), first_file);
+                clean();
+
+                // A real later rank outside the verified guard vetoes
+                // the whole private outcome despite the earlier ordinary cap.
+                fs::write(&source, mixed_roster.replace("rerank = descend(5)", "rerank = descend(9)")).unwrap();
                 let refused = selected(1);
                 let [refused] = refused.as_slice() else { panic!("one unsupported owner"); };
                 assert!(matches!(refused.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));

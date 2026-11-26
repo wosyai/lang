@@ -7049,16 +7049,16 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), usize>> {
+    pub(super) fn owned_direct_startup_callable_uses<'a>(&'a self, caller: &SourceIdentity, provider: Option<&SourceIdentity>, declarations: impl IntoIterator<Item = (&'a SourceIdentity, ByteSpan)>, dormant_self: Option<(usize, ByteSpan)>) -> Option<HashMap<(&'a SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>> {
         if (provider.is_some() && dormant_self.is_some())
             || self.modules.len() != if provider.is_some() { 2 } else { 1 }
             || provider.is_some_and(|source| source == caller || source.project != caller.project || source.package != caller.package)
         { return None; }
-        let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), 0usize))
+        let mut startup_uses = declarations.into_iter().map(|(owner, span)| ((owner, span), Vec::new()))
             .collect::<HashMap<_, _>>();
-        let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), usize>|
+        let candidate = |span: &SourceSpan, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
             uses.contains_key(&(&span.source, span.range));
-        let resolved = |call: &ResolvedCallTarget, uses: &HashMap<(&SourceIdentity, ByteSpan), usize>|
+        let resolved = |call: &ResolvedCallTarget, uses: &HashMap<(&SourceIdentity, ByteSpan), Vec<OccurrenceOrdinal>>|
             matches!(call, ResolvedCallTarget::ModuleCallable { source, declaration_span, .. }
                 if uses.contains_key(&(source, *declaration_span)));
         let mut work = 0;
@@ -7069,12 +7069,11 @@ impl ProjectCallSiteResults {
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
             charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
             if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }
-            for call in startup.call_targets.values() {
+            for (&site, call) in &startup.call_targets {
                 match call {
                     ModuleInitializationCallTarget::Direct { declaration, concrete } if candidate(declaration, &startup_uses) => {
                         if &module.initialization.source != caller || *concrete != ConcreteCallSelection::Declaration { return None; }
-                        let count = startup_uses.get_mut(&(&declaration.source, declaration.range))?;
-                        *count = count.checked_add(1)?;
+                        startup_uses.get_mut(&(&declaration.source, declaration.range))?.push(site);
                     }
                     ModuleInitializationCallTarget::Generic { declaration, .. }
                         | ModuleInitializationCallTarget::CallableBinding(declaration) if candidate(declaration, &startup_uses) => return None,
