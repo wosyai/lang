@@ -11130,19 +11130,19 @@ fn run_startup_authored_path(
     owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool, wide_rank: Option<Rc<ranked::CappedTailRecipe>>,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     run_startup_authored_path_with_binary(owner, cap, named, qualified, callable_roots, proof_free_scalars,
-        ranked, retain_single_bare, wide_rank, &[])
+        ranked, retain_single_bare, wide_rank, &[], false)
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_startup_authored_path_with_binary(
-    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool, wide_rank: Option<Rc<ranked::CappedTailRecipe>>, binary_bare: &[PreparedCallable],
+    owner: &PreparedCheckerProject, cap: Option<std::num::NonZeroUsize>, named: &[(PreparedCallable, &[OccurrenceOrdinal])], qualified: bool, callable_roots: &[PreparedCallable], proof_free_scalars: Option<&[PreparedCallable]>, ranked: Option<(PreparedCallable, &[OccurrenceOrdinal])>, retain_single_bare: bool, wide_rank: Option<Rc<ranked::CappedTailRecipe>>, binary_bare: &[PreparedCallable], allow_dormant: bool,
 ) -> Result<(Vec<ScalarOrderedCheckerFailure>, StartupAuthoredCompletion, failure_search::StartUpSearch, bool), ProjectCheck> {
     let (project, calls) = owner.parts();
     let count = if proof_free_scalars.is_some() || qualified { project.initialization_order.len() }
         else { 1 };
     if wide_rank.as_ref().is_some_and(|recipe| !named.is_empty() || (qualified && count != 2)
         || ranked.is_none_or(|(target, _)| target != recipe.target))
-        || (!named.is_empty() && project.modules.len() != count)
+        || (!named.is_empty() && project.modules.len() != count && !allow_dormant)
         || named.iter().any(|(_, sites)| sites.is_empty())
         || ranked.is_some_and(|(_, sites)| sites.is_empty() || named.len() > 1 || (qualified && !named.is_empty()))
     {
@@ -11900,10 +11900,15 @@ fn run_private_named_after_startup(
     let startup_count = project.initialization_order.len();
     let qualified = startup_count > 1;
     let wide_bare = startup_count > 2;
-    if !(1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count) || project.modules.len() != startup_count
+    let startup = project.modules.get(..startup_count).ok_or(ProjectCheck::Unsupported)?;
+    let dormant = &project.modules[startup_count..];
+    let has_dormant = !dormant.is_empty();
+    if !(1..=MAX_ACTUAL_CALL_DEPTH).contains(&startup_count)
         || (wide_bare && expected.is_some())
+        || (has_dormant && (startup_count != 1 || dormant.len() != 1
+            || scope != ScalarCheckerScope::CurrentPackage || expected.is_some()))
     { return Err(ProjectCheck::Unsupported); }
-    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    let (root, ordinals) = package_startup_order(project, startup)?;
     if root != &owner.source { return Err(ProjectCheck::Unsupported); }
     let catalogs = owner.proofs.iter().filter(|(_, catalog)| !catalog.definitions.is_empty());
     let provider = if startup_count == 2 {
@@ -11915,7 +11920,8 @@ fn run_private_named_after_startup(
     for (proof_source, catalog) in catalogs {
         super::checker_flow::charge_call_work(&mut catalog_work, catalog.definitions.len()).ok_or(ProjectCheck::Unsupported)?;
         let is_provider = proof_source != root && ordinals.contains_key(proof_source);
-        if (proof_source != &owner.source && !is_provider) || proof_source.project != owner.source.project
+        let local_dormant = dormant.first().is_some_and(|module| &module.source == proof_source);
+        if (proof_source != &owner.source && !is_provider && !local_dormant) || proof_source.project != owner.source.project
             || proof_source.package != owner.source.package
         { return Err(ProjectCheck::Unsupported); }
         for (index, definition) in catalog.definitions.iter().enumerate() {
@@ -11971,8 +11977,22 @@ fn run_private_named_after_startup(
             plans.push(plan);
         }
     }
+    let mut dormant_target = None;
+    if has_dormant {
+        let mut selected = plans.iter().filter(|plan| !ordinals.contains_key(plan.proof_source));
+        let plan = selected.next().ok_or(ProjectCheck::Unsupported)?;
+        if selected.next().is_some() || !plans.iter().any(|plan| plan.proof_source == root)
+            || !arrays.is_empty() || ranked.is_some()
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            || !plan.has_no_authored_steps()
+            || !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if &entry.ty == plan.typed.result_type)
+            || !qualified_integer_proof_leaf(plan.typed.body, plan.typed.result_type)
+            || ordered_symbolic_callers(project, calls, root, None)?.contains_key(&plan.target)
+        { return Err(ProjectCheck::Unsupported); }
+        dormant_target = Some(plan.target);
+    }
     if plans.iter().any(|plan| plan.public_calling_citation().is_some()) {
-        if qualified || expected.is_some() || !arrays.is_empty() || ranked.is_some() {
+        if qualified || expected.is_some() || !arrays.is_empty() || ranked.is_some() || has_dormant {
             return Err(ProjectCheck::Unsupported);
         }
         return run_private_citation_catalog(owner, scope, cap, &plans);
@@ -12037,7 +12057,8 @@ fn run_private_named_after_startup(
     } else { None };
     let sources = project.initialization_order.iter().collect::<Vec<_>>();
     let incoming = calls.owned_startup_callable_uses_with_forwarder(root, &sources,
-        plans.iter().chain(ranked.iter()).map(|plan| (plan.proof_source, plan.function.name_span))
+        plans.iter().chain(ranked.iter()).filter(|plan| dormant_target != Some(plan.target))
+            .map(|plan| (plan.proof_source, plan.function.name_span))
             .chain(forwarder.iter().map(|(_, span, _)| (root, *span))),
         ranked.as_ref().map(|plan| (plan.proof_source, plan.target.1, plan.function.name_span)),
         forwarder.map(|(wrapper, _, site)| (wrapper.1, site))).ok_or(ProjectCheck::Unsupported)?;
@@ -12054,6 +12075,7 @@ fn run_private_named_after_startup(
     let mut reached_scalar_relation = false;
     let mut activation_count = 0usize;
     for plan in &plans {
+        if dormant_target == Some(plan.target) { continue; }
         let sites = incoming.get(&(plan.proof_source, plan.function.name_span)).ok_or(ProjectCheck::Unsupported)?;
         if sites.is_empty() { continue; }
         if !matches!(plan.typed.body.boundary.parameters.as_slice(), [entry] if is_integer_type(&entry.ty))
@@ -12092,7 +12114,7 @@ fn run_private_named_after_startup(
     let authored = if cap.is_some() { callable_roots.as_slice() } else { &[] };
     // Legacy dormant observers walk declaration order, not proof clause
     // order. Preserve it even when typed goals were authored in reverse.
-    let owner_order = project.initialization_order.iter().enumerate()
+    let owner_order = project.initialization_order.iter().chain(dormant.iter().map(|module| &module.source)).enumerate()
         .map(|(position, source)| (source, position)).collect::<HashMap<_, _>>();
     plans.sort_unstable_by_key(|plan| (owner_order[plan.proof_source], plan.target.1));
     let mut observer = if let [first, rest @ ..] = plans.as_slice() {
@@ -12113,7 +12135,7 @@ fn run_private_named_after_startup(
         } else { (Some(prepare_capped_ranked_receipts(plan)?), None) }
     } else { (None, None) };
     let (records, end, mut trace, mut active) = run_startup_authored_path_with_binary(&owner.prepared, cap, &invoked, qualified,
-        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)), reached_scalar_relation, wide_rank, &binary_bare)?;
+        authored, None, verified_rank.as_ref().map(|rank| (rank.target, ranked_sites)), reached_scalar_relation, wide_rank, &binary_bare, has_dormant)?;
     if let Some(rank) = &mut verified_rank {
         if trace.wide_rank_recipe.is_some() {
             if !trace.ranked_observations.is_empty() || trace.wide_rank_observations.len() != ranked_sites.len() {

@@ -605,3 +605,55 @@ fn check_cap_process_preserves_the_existing_binary_entry_comparison() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for proof in ["out != 7", "out >= 0"] {
+                for early in [false, true] {
+                    let project = Fixture::new();
+                    let first = if early { require("first", 0, "first.txt") } else { String::new() };
+                    let source = format!(r#"%%start
+                        i16(i16, i16) choose = fn(left, right) {{ if (right < 0) {{ left }} else {{ right }} }};
+                        proof identity for choose(entry, selector) -> (out)
+                            where (entry >= -5) ensures (out == core.old(entry)) {{}}
+                        {first}
+                        i16 answer = choose(2, -3);
+                        %%end"#);
+                    let dormant = format!(r#"%%start
+                        u8(u8) fallback = fn(value) {{ value }};
+                        proof every_return for fallback(entry) -> (out) ensures ({proof}) {{}}
+                        {}
+                        %%end"#, require("must not emit", 71, "must-not-create.txt"));
+                    project.package("", layout, "dev", "", &source);
+                    fs::write(project.0.join("src/fallback.w"), dormant).unwrap();
+                    let old = project.run(&[scope]);
+                    let refuted = scope == "--declared-package" && proof == "out != 7";
+                    let expected = if early { b"first".as_slice() } else { b"".as_slice() };
+                    assert_eq!(old.status.code(), Some(i32::from(refuted)), "{old:?}");
+                    assert_eq!(old.stdout, expected);
+                    let diagnostic = String::from_utf8_lossy(&old.stderr);
+                    if refuted {
+                        assert_eq!(diagnostic.matches("proof obligation failed").count(), 1);
+                        for expected in ["src/fallback.w", "out != 7", "unused function checked symbolically", "symbolic call can return 7"] {
+                            assert!(diagnostic.contains(expected), "{diagnostic}");
+                        }
+                    } else {
+                        assert_eq!(old.stderr, if early { b"[first]".as_slice() } else { b"".as_slice() });
+                    }
+                    if early { project.clear(); }
+                    let limited = project.run(&[scope, "--max-errors", "1"]);
+                    assert_terminal(&limited, i32::from(refuted), &old.stdout, &old.stderr);
+                    if early {
+                        assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+                        assert!(!project.output().join("must-not-create.txt").exists());
+                    } else {
+                        assert!(!project.output().exists());
+                    }
+                }
+            }
+        }
+    }
+}
