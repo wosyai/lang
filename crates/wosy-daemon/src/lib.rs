@@ -317,7 +317,7 @@ fn validate_shape(node: &Node) -> Result<()> {
         Token => count == 0 && syntax_kind(node).is_ok() && token_text(node).is_ok(),
         Syntax => node.data.len() == 2 && syntax_kind(node).is_ok(),
         File => count == 3,
-        Module => count >= 1 && node.data.is_empty(),
+        Module => module_parts(node).is_ok(),
         Config | Annotations => count == 0,
         ExecutableFile | AnnotationFile => count == 1,
         Executables | AnnotationTree | Dependencies => node.data.is_empty(),
@@ -438,15 +438,27 @@ fn unique<K: Ord, V>(entries: &mut BTreeMap<K, V>, key: K, value: V) -> Result<(
     }
 }
 
+fn module_parts(node: &Node) -> Result<(NodeId, &[NodeId])> {
+    let [local, imports @ ..] = node.children.as_slice() else {
+        return Err("missing local module executable".into());
+    };
+    if node.kind != Kind::Module || !node.data.is_empty() { return Err("invalid source module shape".into()); }
+    Ok((*local, imports))
+}
+
+fn projection_file_parts(node: &Node, kind: Kind) -> Result<(FileKey, NodeId)> {
+    let [child] = node.children.as_slice() else { return Err("invalid projection leaf".into()); };
+    Expected::Exact(kind).check(node.kind)?;
+    Ok((serde_json::from_slice(&node.data)?, *child))
+}
+
 fn read_paths_using(
-    read: &mut impl FnMut(NodeId) -> Result<Node>, root: NodeId,
+    read: &mut impl FnMut(NodeId) -> Result<Node>, root: NodeId, leaf_kind: Kind,
 ) -> Result<BTreeMap<FileKey, (NodeId, NodeId)>> {
     let mut paths = BTreeMap::new();
     for id in read(root)?.children {
-        let node = read(id)?;
-        let key = serde_json::from_slice(&node.data)?;
-        let [child] = node.children.as_slice() else { return Err("invalid projection leaf".into()); };
-        unique(&mut paths, key, (id, *child))?;
+        let (key, child) = projection_file_parts(&read(id)?, leaf_kind)?;
+        unique(&mut paths, key, (id, child))?;
     }
     Ok(paths)
 }
@@ -470,18 +482,16 @@ fn read_index_using(
         let entry = FileEntry::from_node(id, read(id)?)?;
         unique(&mut entries, FileKey::from(&entry.metadata.source), entry)?;
     }
-    let executable_paths = read_paths_using(&mut read, parts.executable)?;
-    let annotation_paths = read_paths_using(&mut read, parts.annotation)?;
+    let executable_paths = read_paths_using(&mut read, parts.executable, Kind::ExecutableFile)?;
+    let annotation_paths = read_paths_using(&mut read, parts.annotation, Kind::AnnotationFile)?;
     let by_projection: BTreeMap<_, _> = executable_paths.iter().map(|(key, (id, _))| (*id, key)).collect();
     let mut modules = BTreeMap::new();
     let mut module_edges = BTreeMap::new();
     for id in read(parts.dependencies)?.children {
         let node = read(id)?;
-        let [local, imports @ ..] = node.children.as_slice() else {
-            return Err("missing local module executable".into());
-        };
+        let (local, imports) = module_parts(&node)?;
         charge_imports(imports.len())?;
-        let key = *by_projection.get(local).ok_or("module outside executable paths")?;
+        let key = *by_projection.get(&local).ok_or("module outside executable paths")?;
         unique(&mut modules, key.clone(), id)?;
         module_edges.insert(key.clone(), imports.to_vec());
     }
@@ -846,7 +856,16 @@ fn read_cst_with(
 }
 
 fn read_source_config(tx: &Transaction, id: NodeId) -> Result<SourceConfig> {
-    Ok(serde_json::from_slice(&read_node(tx, id)?.data)?)
+    read_source_config_charged(tx, id, |_| Ok(()))
+}
+
+fn read_source_config_charged(
+    tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Result<()>,
+) -> Result<SourceConfig> {
+    let node = read_verified_node_with(tx, id, charge)?;
+    Expected::Exact(Kind::Config).check(node.kind)?;
+    validate_shape(&node)?;
+    Ok(serde_json::from_slice(&node.data)?)
 }
 
 impl SourceView {

@@ -1,9 +1,9 @@
 //! Ordered base declarations over the admitted executable import graph.
 use super::{
-    base_declarations::authored_declaration_diagnostics, child_edge, file_source, key, read_node,
+    base_declarations::authored_declaration_diagnostics, child_edge, file_source, key,
     read_node_with, retention_plan::SourceRead, source_proposal::CstWork,
     storage_worker::{QueryPhases, QueryWorker}, write_edge, write_node, BaseDeclarationsView,
-    ConfiguredSourceView, Index, QueryDisposition, Result, SourceStore, SourceView, INTERN,
+    ConfiguredSourceView, Index, QueryDisposition, Result, SourceStore, SourceView, INTERN, NODES,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -162,20 +162,39 @@ pub(super) fn projection_key(image: NodeId, module: NodeId) -> [u8; 33] {
     key(MODULE_DECLARATION_QUERIES, NodeId(*hasher.finalize().as_bytes()))
 }
 
+pub(super) struct ProjectionParts {
+    pub source: NodeId,
+    body: NodeId,
+    import_count: usize,
+}
+
+/// One canonical interpretation of a query node for the compiler and
+/// retention. A missing or incompatible optional node does not confer authority.
+pub(super) fn verified_projection_parts(
+    tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Result<()>,
+) -> Result<Option<ProjectionParts>> {
+    let Some(bytes) = tx.get(&key(NODES, id))? else { return Ok(None); };
+    charge(bytes.len())?;
+    if Node::id(&bytes) != id { return Ok(None); }
+    let Some(node) = Node::decode(&bytes) else { return Ok(None); };
+    let [source, body, imports @ ..] = node.children.as_slice() else { return Ok(None); };
+    if node.kind != Kind::ModuleDeclarations || node.data != MODULE_DECLARATION_ABI.as_bytes() {
+        return Ok(None);
+    }
+    Ok(Some(ProjectionParts { source: *source, body: *body, import_count: imports.len() }))
+}
+
+impl ProjectionParts {
+    pub fn has_import_arity(&self, import_count: usize) -> bool { self.import_count == import_count }
+}
+
 fn read_projection(tx: &Transaction, image: NodeId, module: &ModuleInput) -> Result<Option<Projection>> {
     let Some(id) = tx.get(&projection_key(image, module.id))? else { return Ok(None); };
     let id = NodeId(id.as_slice().try_into()?);
-    let node = read_node(tx, id)?;
-    let [source, body, imports @ ..] = node.children.as_slice() else {
-        return Err("incomplete module declaration projection".into());
-    };
-    if node.kind != Kind::ModuleDeclarations || node.data != MODULE_DECLARATION_ABI.as_bytes()
-        || *source != module.id
-        || imports.len() != module.imports.len()
-    {
-        return Err("invalid module declaration projection".into());
-    }
-    Ok(Some(Projection { id, body: *body }))
+    let parts = verified_projection_parts(tx, id, |_| Ok(()))?
+        .filter(|parts| parts.source == module.id && parts.has_import_arity(module.imports.len()))
+        .ok_or("invalid module declaration projection")?;
+    Ok(Some(Projection { id, body: parts.body }))
 }
 
 fn compose_projection(

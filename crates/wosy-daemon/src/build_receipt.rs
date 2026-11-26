@@ -87,11 +87,11 @@ impl SourceStore {
         let Some(index) = lookup.index_key() else { return Ok(None); };
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
         let Some(pointer) = tx.get(&index)? else { return Ok(None); };
-        let Some(receipt) = stored_receipt(&tx, &pointer, lookup.digest, &lookup.children[..3])? else {
+        let Some(receipt) = stored_receipt(&tx, &pointer, lookup.digest, &lookup.children[..3], |_| Ok(()))? else {
             return Ok(None);
         };
-        Ok((receipt.payload.phase == phase && receipt.projection == lookup.children[3])
-            .then_some(receipt.payload.diagnostics))
+        if receipt.projection != lookup.children[3] { return Ok(None); }
+        Ok(receipt.payload().filter(|payload| payload.phase == phase).map(|payload| payload.diagnostics))
     }
 
     pub(super) async fn persist_build_receipt(
@@ -152,9 +152,9 @@ struct ReceiptWrite {
     bytes: Vec<u8>,
 }
 
-pub(super) fn attached(
-    tx: &Transaction, scope: NodeId, inputs: BuildInputs, remaining: &mut usize,
-    mut visit: impl FnMut(NodeId, NodeId, usize) -> Result<()>,
+pub(super) fn attached_rows(
+    tx: &Transaction, scope: NodeId, remaining: &mut usize,
+    mut visit: impl FnMut(NodeId, &[u8]) -> Result<()>,
 ) -> Result<()> {
     let prefix = key(BUILD_RECEIPTS, scope);
     let mut rows = tx.range(prefix.as_slice(), [BUILD_RECEIPTS + 1].as_slice())?;
@@ -163,35 +163,46 @@ pub(super) fn attached(
         *remaining = remaining.checked_sub(1).ok_or("source retention plan exceeded attached receipt budget")?;
         let index = rows.key();
         if let Ok(digest) = index.user_key()[prefix.len()..].try_into().map(NodeId) {
-            if let Some(receipt) = stored_receipt(tx, &rows.value()?, digest, &inputs.ids())? {
-                visit(receipt.id, receipt.projection, receipt.encoded_bytes)?;
-            }
+            visit(digest, &rows.value()?)?;
         }
         rows.next()?;
     }
     Ok(())
 }
 
-struct StoredReceipt {
-    id: NodeId,
-    projection: NodeId,
-    encoded_bytes: usize,
-    payload: Payload<Vec<Diagnostic>>,
+pub(super) struct AttachedReceipt {
+    pub id: NodeId,
+    pub digest: NodeId,
+    pub projection: NodeId,
+    pub encoded_bytes: usize,
+    data: Vec<u8>,
 }
 
-fn stored_receipt(
+impl AttachedReceipt {
+    fn payload(&self) -> Option<Payload<Vec<Diagnostic>>> {
+        serde_json::from_slice(&self.data[32..]).ok()
+    }
+
+    pub fn has_payload(&self) -> bool { self.payload().is_some() }
+}
+
+pub(super) fn stored_receipt(
     tx: &Transaction, pointer: &[u8], digest: NodeId, inputs: &[NodeId],
-) -> Result<Option<StoredReceipt>> {
+    charge: impl FnOnce(usize) -> Result<()>,
+) -> Result<Option<AttachedReceipt>> {
     let Ok(id) = pointer.try_into().map(NodeId) else { return Ok(None); };
     let Some(bytes) = tx.get(&key(NODES, id))? else { return Ok(None); };
-    if bytes.len() > 9 + MAX_DATA + 4 * 32 || Node::id(&bytes) != id { return Ok(None); }
+    if bytes.len() > 9 + MAX_DATA + 4 * 32 { return Ok(None); }
+    charge(bytes.len())?;
+    if Node::id(&bytes) != id { return Ok(None); }
     let Some(node) = Node::decode(&bytes) else { return Ok(None); };
     if node.kind != Kind::BuildDiagnosticReceipt || node.children.len() != 4 || node.children[..3] != *inputs {
         return Ok(None);
     }
-    let Some(body) = node.data.strip_prefix(&digest.0) else { return Ok(None); };
-    let Ok(payload) = serde_json::from_slice(body) else { return Ok(None); };
-    Ok(Some(StoredReceipt { id, projection: node.children[3], encoded_bytes: bytes.len(), payload }))
+    if !node.data.starts_with(&digest.0) { return Ok(None); }
+    Ok(Some(AttachedReceipt {
+        id, digest, projection: node.children[3], encoded_bytes: bytes.len(), data: node.data,
+    }))
 }
 
 #[cfg(test)]
@@ -315,6 +326,100 @@ mod tests {
         });
     }
     #[test]
+    #[ignore = "requires four published source revisions in one disposable store"]
+    fn census_requires_exact_configured_profile_layout_key() {
+        use crate::{prepared_project::SelectedBuildProfile, BuildAnalysisOrigin, RootedBuildAnalysis};
+        let (dir, entry) = store_fixture();
+        let root = |key| NodeId::parse_hex(&std::env::var(key).unwrap()).unwrap();
+        let annotation = root("WOSY_SEMANTIC_CENSUS_ANNOTATION");
+        let dependency = root("WOSY_SEMANTIC_CENSUS_DEPENDENCY");
+        let configuration = root("WOSY_SEMANTIC_CENSUS_CONFIGURATION");
+
+        async fn analyze(store: &SourceStore, root: NodeId, profile: &str) -> RootedBuildAnalysis {
+            store.rooted_prepared_project(root, profile).await.unwrap().unwrap().build_analysis().await.unwrap()
+        }
+
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let store = SourceStore::open(&dir, 8 << 20).unwrap();
+            let image = store.derivation_image().expect("verified compiler image");
+            let inputs = inputs(&store, entry);
+            let layout_before = store.snapshot(entry).unwrap().unwrap().configured().unwrap().config;
+            let wasm = &layout_before.profiles["dev"];
+            let native = &layout_before.profiles["native"];
+            let projection = store.rooted_prepared_project(entry, "dev").await.unwrap().unwrap()
+                .declarations().entry_projection;
+            let lookup_for = |name, profile| SelectedBuildProfile::configured(name, profile).unwrap()
+                .identity(Some(image), inputs, projection).1;
+            let wasm_key = lookup_for("dev", wasm);
+            let native_key = lookup_for("native", native);
+            let initial = analyze(&store, entry, "dev").await;
+            let same_source_other_layout = analyze(&store, entry, "native").await;
+            assert_eq!(initial.key.digest(), wasm_key.digest);
+            assert_eq!(same_source_other_layout.key.digest(), native_key.digest);
+            assert_ne!(wasm_key.digest, native_key.digest);
+            assert!(initial.receipt_written && same_source_other_layout.receipt_written);
+            assert!(!initial.diagnostics.is_empty() && !same_source_other_layout.diagnostics.is_empty());
+            let authored = analyze(&store, annotation, "dev").await;
+            assert_eq!((authored.key, authored.origin), (initial.key, BuildAnalysisOrigin::Stored));
+            assert_ne!(authored.diagnostics[0].labels[0].span, initial.diagnostics[0].labels[0].span);
+            let changed_dep = analyze(&store, dependency, "dev").await;
+            let changed_cfg = analyze(&store, configuration, "dev").await;
+            assert_ne!(changed_dep.key, initial.key);
+            assert_ne!(changed_cfg.key, changed_dep.key);
+            assert!(changed_dep.receipt_written && changed_cfg.receipt_written);
+
+            // Use the same fixed read-only census selection for all controls.
+            let census = || store.plan_source_retention(entry, &[annotation, dependency, configuration], &[], 20_000).unwrap();
+            let baseline = census();
+            let (source_node, source_id, source_pointer, native_pointer) = {
+                let tx = store.tree.begin_with_mode(Mode::ReadOnly).unwrap();
+                let pointer = tx.get(&wasm_key.index_key().unwrap()).unwrap().unwrap();
+                let native_pointer = tx.get(&native_key.index_key().unwrap()).unwrap().unwrap();
+                let id = NodeId(pointer.as_slice().try_into().unwrap());
+                let receipt = Node::decode(&tx.get(&key(NODES, id)).unwrap().unwrap()).unwrap();
+                (receipt, id, pointer, native_pointer)
+            };
+            crate::retention_plan::assert_bounded_semantic_census_read(&store, entry, inputs.config, source_id);
+            let mut tx = store.tree.begin().unwrap();
+            for lookup in [lookup_for("absent-profile", wasm), lookup_for("dev", native), lookup_for("unsupported", wasm)] {
+                let mut unused = source_node.clone();
+                unused.data[..32].copy_from_slice(&lookup.digest.0);
+                let bytes = unused.encode();
+                let id = Node::id(&bytes);
+                tx.set(&key(NODES, id), &bytes).unwrap();
+                tx.set(&lookup.index_key().unwrap(), &id.0).unwrap();
+            }
+            let malformed = lookup_for("uncached", wasm);
+            let mut incomplete = source_node;
+            incomplete.data.truncate(32);
+            incomplete.data[..32].copy_from_slice(&malformed.digest.0);
+            let bytes = incomplete.encode();
+            let id = Node::id(&bytes);
+            tx.set(&key(NODES, id), &bytes).unwrap();
+            tx.set(&malformed.index_key().unwrap(), &id.0).unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(census(), baseline);
+            assert!(store.rooted_prepared_project(entry, "unsupported").await.is_err());
+
+            let mut tx = store.tree.begin().unwrap();
+            tx.set(&wasm_key.index_key().unwrap(), &[]).unwrap();
+            tx.set(&native_key.index_key().unwrap(), &[]).unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(census().nodes_visited, baseline.nodes_visited - 2);
+            let mut tx = store.tree.begin().unwrap();
+            tx.set(&wasm_key.index_key().unwrap(), source_pointer.as_slice()).unwrap();
+            tx.set(&native_key.index_key().unwrap(), native_pointer.as_slice()).unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(census(), baseline);
+            let repaired = analyze(&store, entry, "uncached").await;
+            assert_eq!(repaired.origin, BuildAnalysisOrigin::Derived);
+            assert!(repaired.receipt_written && !repaired.diagnostics.is_empty());
+            assert_eq!(census().nodes_visited, baseline.nodes_visited + 1);
+            store.close().await.unwrap();
+        });
+    }
+
+    #[test]
     #[ignore = "requires a disposable store and two admitted release fixture scopes"]
     fn census_shares_attachment_budget() {
         let (dir, root) = store_fixture();
@@ -353,14 +458,16 @@ mod tests {
             let read = store.tree.begin_with_mode(Mode::ReadOnly).unwrap();
             let mut remaining = 5;
             let mut found = 0;
-            attached(&read, root_scope, root_inputs, &mut remaining, |_, _, _| {
-                found += 1;
-                Ok(())
-            }).unwrap();
-            attached(&read, other_scope, other_inputs, &mut remaining, |_, _, _| {
-                found += 1;
-                Ok(())
-            }).unwrap();
+            for (scope, inputs) in [(root_scope, root_inputs), (other_scope, other_inputs)] {
+                attached_rows(&read, scope, &mut remaining, |digest, pointer| {
+                    if stored_receipt(&read, pointer, digest, &inputs.ids(), |_| Ok(()))?
+                        .is_some_and(|receipt| receipt.has_payload())
+                    {
+                        found += 1;
+                    }
+                    Ok(())
+                }).unwrap();
+            }
             assert_eq!((found, remaining), (1, 2));
             drop(read);
             assert_eq!(store.plan_source_retention(root, &[], &[], limit).unwrap().nodes_visited, limit);

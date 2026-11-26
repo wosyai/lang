@@ -15,7 +15,7 @@ use wosy_compiler::{
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
     ScalarTargetLayout, COMPILER_IDENTITY,
 };
-use wosy_project::SourceNodeId;
+use wosy_project::{ArtifactProfile, SourceNodeId};
 use wosy_protocol::NodeId;
 use wosy_syntax::{AuthoredSpanMap, SourceIdentity};
 
@@ -240,6 +240,28 @@ fn executable_owner(module: &ProjectDeclarationModule) -> SourceIdentity {
     )
 }
 
+/// The compiler and the retention census must derive the same key from
+/// a real rooted profile. This is not a result or proof/check authority.
+pub(super) struct SelectedBuildProfile<Name> {
+    name: Name,
+    layout: ScalarTargetLayout,
+}
+
+impl<Name: AsRef<str>> SelectedBuildProfile<Name> {
+    pub fn configured(name: Name, profile: &ArtifactProfile) -> Result<Self> {
+        let layout = profile.target_layout()?;
+        Ok(Self {
+            name,
+            layout: ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment },
+        })
+    }
+
+    pub fn identity(&self, image: Option<NodeId>, inputs: BuildInputs, projection: NodeId) -> (NodeId, Lookup) {
+        let identity = preparation_identity(projection, inputs, self.name.as_ref(), self.layout);
+        (identity, Lookup::new(image, inputs, projection, identity))
+    }
+}
+
 fn preparation_identity(projection: NodeId, inputs: BuildInputs, profile: &str, layout: ScalarTargetLayout) -> NodeId {
     let mut hash = blake3::Hasher::new_derive_key(PREPARED_PROJECT_ABI);
     hash.update(wosy_syntax::base_cst_schema()).update(&projection.0);
@@ -261,13 +283,9 @@ impl SourceStore {
         &self, snapshot: ConfiguredSourceView, profile: &str, worker: Option<&QueryWorker>,
     ) -> Result<RootedPreparedProject<'_>> {
         let start = Instant::now();
-        let layout = snapshot.config.profiles.get(profile)
-            .ok_or("artifact profile is not present in the rooted source configuration")?
-            .target_layout()?;
-        let target_layout = ScalarTargetLayout {
-            pointer_size: layout.pointer_size,
-            pointer_alignment: layout.pointer_alignment,
-        };
+        let selected_profile = SelectedBuildProfile::configured(profile, snapshot.config.profiles.get(profile)
+            .ok_or("artifact profile is not present in the rooted source configuration")?)?;
+        let target_layout = selected_profile.layout;
         let build_inputs = BuildInputs {
             config: snapshot.source.config,
             executable: snapshot.source.executable,
@@ -279,7 +297,7 @@ impl SourceStore {
             projected_declarations: start.elapsed(),
             ..Default::default()
         };
-        let identity = preparation_identity(declarations.entry_projection, build_inputs, profile, target_layout);
+        let (identity, build_lookup) = selected_profile.identity(declarations.image, build_inputs, declarations.entry_projection);
 
         let flight = self.prepared_projects.flights.acquire(identity);
         let _permit = phases.lock(&flight).await?;
@@ -321,7 +339,7 @@ impl SourceStore {
                 .map(|(ordinal, identity)| (identity, SourceNodeId(ordinal))).collect();
             let canonical = Arc::new(CanonicalPreparation {
                 identity, target_layout, owners, outcome,
-                build_lookup: Lookup::new(declarations.image, build_inputs, declarations.entry_projection, identity),
+                build_lookup,
                 build_analysis: AsyncMutex::new(None),
             });
             phases.check_cutoff()?;

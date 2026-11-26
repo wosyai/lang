@@ -1,9 +1,10 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
     authority_key, base_declarations, build_receipt, build_session::BuildRequestRejection, check_source_marker,
-    edge, key, pins, project_declarations, published_source, read_node,
+    key, module_parts, pins, prepared_project::SelectedBuildProfile, project_declarations, projection_file_parts,
+    read_node_with, read_source_config_charged, read_verified_node_with, validate_shape, Expected,
     source_reconciliation::checked_published_source_header_with_top,
-    source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
+    Result, SourceStore, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -17,6 +18,7 @@ const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
 const SHARED: u8 = PROTECTED | CANDIDATE;
 const MAX_BUILD_SESSIONS: usize = 64;
+const MAX_CENSUS_ENCODED_BYTES: usize = 64 << 20;
 const MAX_LIVE_BASE_PREPARATIONS: usize = 8;
 pub(super) const MAX_RETAINED_DECLARATION_BYTES: usize = 16 << 20;
 
@@ -208,127 +210,293 @@ struct ReceiptScope {
     classes: u8,
 }
 
+/// One MVCC view meters encoded bytes before all Wosy graph/config decodes.
+/// The engine's raw fetch allocation and total RSS are not part of this cap.
+struct CensusRead<'a> {
+    tx: &'a Transaction,
+    remaining_bytes: usize,
+    remaining_profiles: usize,
+    configs: HashMap<NodeId, Arc<CensusConfig>>,
+    admitted_roots: HashMap<NodeId, CensusRoot>,
+}
+
+struct CensusConfig {
+    encoded_bytes: usize,
+    entry: FileKey,
+    owner: String,
+    profiles: Vec<SelectedBuildProfile<String>>,
+}
+
+struct CensusRoot {
+    encoded_bytes: usize,
+    inputs: build_receipt::BuildInputs,
+    children: Vec<NodeId>,
+}
+
+impl<'a> CensusRead<'a> {
+    fn new(tx: &'a Transaction, limit: usize) -> Self {
+        Self { tx, remaining_bytes: MAX_CENSUS_ENCODED_BYTES, remaining_profiles: limit,
+            configs: HashMap::new(), admitted_roots: HashMap::new() }
+    }
+
+    fn record(&mut self, id: NodeId) -> Result<Node> {
+        read_node_with(self.tx, id, |bytes| charge_bytes(&mut self.remaining_bytes, bytes))
+    }
+
+    fn verified(&mut self, id: NodeId) -> Result<Node> {
+        read_verified_node_with(self.tx, id, |bytes| charge_bytes(&mut self.remaining_bytes, bytes))
+    }
+
+    fn config(&mut self, id: NodeId) -> Result<Arc<CensusConfig>> {
+        match self.configs.entry(id) {
+            Entry::Occupied(cached) => Ok(Arc::clone(cached.get())),
+            Entry::Vacant(slot) => {
+                let mut encoded_bytes = 0;
+                let config = read_source_config_charged(self.tx, id, |length| {
+                    charge_bytes(&mut self.remaining_bytes, length)?;
+                    encoded_bytes = length;
+                    Ok(())
+                })?;
+                self.remaining_profiles = self.remaining_profiles.checked_sub(config.profiles.len())
+                    .ok_or("source retention plan exceeded configured profile budget")?;
+                let owner = pins::workspace_of_source_config(&config)?.to_owned();
+                let profiles = config.profiles.into_iter().filter_map(|(name, profile)|
+                    SelectedBuildProfile::configured(name, &profile).ok()).collect();
+                let candidate = Arc::new(CensusConfig { encoded_bytes, owner, entry: config.entry, profiles });
+                slot.insert(Arc::clone(&candidate));
+                Ok(candidate)
+            }
+        }
+    }
+
+    fn load_root(&mut self, id: NodeId) -> Result<CensusRoot> {
+        let node = self.verified(id)?;
+        let parts = wosy_protocol::source_preparation_parts(&node)
+            .ok_or("unsupported published root in retention census")?;
+        let inputs = build_receipt::BuildInputs {
+            config: parts.config, executable: parts.executable, dependencies: parts.dependencies,
+        };
+        let encoded_bytes = node.encoded_len();
+        Ok(CensusRoot { encoded_bytes, inputs, children: node.children })
+    }
+
+    fn root_owner(&mut self, id: NodeId) -> Result<Arc<CensusConfig>> {
+        let config = if let Some(root) = self.admitted_roots.get(&id) {
+            root.inputs.config
+        } else {
+            let root = self.load_root(id)?;
+            let config = root.inputs.config;
+            self.admitted_roots.insert(id, root);
+            config
+        };
+        self.config(config)
+    }
+
+    fn root_for_walk(&mut self, id: NodeId) -> Result<CensusRoot> {
+        match self.admitted_roots.remove(&id) { Some(root) => Ok(root), None => self.load_root(id) }
+    }
+}
+
+fn charge_bytes(remaining: &mut usize, bytes: usize) -> Result<()> {
+    *remaining = remaining.checked_sub(bytes).ok_or("source retention plan exceeded encoded node read budget")?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum WalkOrigin {
+    Published,
+    Config,
+    Graph,
+}
+
 fn walk(
-    tx: &Transaction, roots: impl IntoIterator<Item = NodeId>, image: Option<NodeId>, class: u8,
-    limit: usize, marks: &mut Marks,
+    reader: &mut CensusRead<'_>, roots: impl IntoIterator<Item = (NodeId, WalkOrigin)>,
+    image: Option<NodeId>, class: u8, limit: usize, marks: &mut Marks,
 ) -> Result<()> {
     let mut todo: Vec<_> = roots.into_iter().collect();
-    while let Some(id) = todo.pop() {
+    while let Some((id, origin)) = todo.pop() {
         let at_limit = marks.nodes.len() >= limit;
         let entry = marks.nodes.entry(id);
-        match &entry {
-            Entry::Occupied(existing) if existing.get().classes & class != 0 => continue,
-            Entry::Vacant(_) if at_limit => return Err("source retention plan exceeded node budget".into()),
-            _ => {}
-        }
-        let node = read_node(tx, id)?;
-        entry.or_insert_with(|| Mark {
-            classes: 0, encoded_bytes: node.encoded_len(), is_projection: node.kind == Kind::ModuleDeclarations,
-        }).classes |= class;
-
-        match node.kind {
-            // Other source schemas may have different auxiliary edges.
-            Kind::SourcePreparation => {
-                let parts = wosy_protocol::source_preparation_parts(&node)
-                    .ok_or("unsupported published root in retention census")?;
+        if matches!(&entry, Entry::Occupied(existing) if existing.get().classes & class != 0) { continue; }
+        let (encoded_bytes, is_projection) = match origin {
+            WalkOrigin::Config => (reader.config(id)?.encoded_bytes, false),
+            WalkOrigin::Published => {
+                let root = reader.root_for_walk(id)?;
                 if let Some(image) = image {
-                    let inputs = build_receipt::BuildInputs {
-                        config: parts.config, executable: parts.executable, dependencies: parts.dependencies,
-                    };
-                    let scope = marks.receipt_scopes.entry(inputs.scope(image))
-                        .or_insert(ReceiptScope { inputs, classes: 0 });
+                    let scope = marks.receipt_scopes.entry(root.inputs.scope(image))
+                        .or_insert(ReceiptScope { inputs: root.inputs, classes: 0 });
                     scope.classes |= class;
                 }
+                todo.extend(root.children.into_iter().skip(1).map(|child| (child, WalkOrigin::Graph)));
+                todo.push((root.inputs.config, WalkOrigin::Config));
+                (root.encoded_bytes, false)
             }
-            Kind::File => {
-                let authority = tx.get(&authority_key(FILE_AUTHORITY, id))?
-                    .ok_or("missing namespace authority for source retention")?;
-                todo.push(decode_id(authority.as_ref())?);
-                if let Some(image) = image {
-                    if let Some(body) = tx.get(&base_declarations::query_key(image, node.children[1]))? {
-                        todo.push(decode_id(body.as_ref())?);
+            WalkOrigin::Graph => {
+                let node = reader.record(id)?;
+                match node.kind {
+                    // A generic link can never mark or follow a receipt or
+                    // confer the more specific authority of a root or config.
+                    Kind::BuildDiagnosticReceipt | Kind::SourcePreparation | Kind::Config => continue,
+                    Kind::File => {
+                        let authority = reader.tx.get(&authority_key(FILE_AUTHORITY, id))?
+                            .ok_or("missing namespace authority for source retention")?;
+                        todo.push((decode_id(authority.as_ref())?, WalkOrigin::Graph));
+                        let [_, executable, _] = node.children.as_slice() else { return Err("invalid retained file shape".into()); };
+                        if let Some(image) = image {
+                            if let Some(body) = reader.tx.get(&base_declarations::query_key(image, *executable))? {
+                                todo.push((decode_id(body.as_ref())?, WalkOrigin::Graph));
+                            }
+                        }
                     }
-                }
-            }
-            Kind::Module => {
-                if let Some(image) = image {
-                    if let Some(context) = tx.get(&project_declarations::projection_key(image, id))? {
-                        todo.push(decode_id(context.as_ref())?);
+                    Kind::Module => {
+                        if let Some(image) = image {
+                            if let Some(context) = reader.tx.get(&project_declarations::projection_key(image, id))? {
+                                todo.push((decode_id(context.as_ref())?, WalkOrigin::Graph));
+                            }
+                        }
                     }
+                    Kind::BaseDeclarations => {
+                        if let Some(blob) = base_declarations::cas_digest(&node.data)? {
+                            *marks.cas.entry(blob).or_default() |= class;
+                        }
+                    }
+                    _ => {}
                 }
+                let encoded_bytes = node.encoded_len();
+                todo.extend(node.children.into_iter().map(|child| (child, WalkOrigin::Graph)));
+                (encoded_bytes, node.kind == Kind::ModuleDeclarations)
             }
-            Kind::BaseDeclarations => {
-                if let Some(blob) = base_declarations::cas_digest(&node.data)? {
-                    *marks.cas.entry(blob).or_default() |= class;
-                }
-            }
-            _ => {}
+        };
+        if matches!(&entry, Entry::Vacant(_) if at_limit) {
+            return Err("source retention plan exceeded node budget".into());
         }
-        todo.extend(node.children);
+        entry.or_insert_with(|| Mark { classes: 0, encoded_bytes, is_projection }).classes |= class;
     }
     Ok(())
 }
 
-fn current_entry(
-    tx: &Transaction, image: NodeId, inputs: build_receipt::BuildInputs, projection: NodeId,
-    config_entry: &mut Option<FileKey>,
-) -> Result<bool> {
-    let declarations = read_node(tx, projection)?;
-    let Some(&module) = declarations.children.first() else { return Ok(false); };
-    // The exact module must occur in this dependency root, not just somewhere
-    // in the same protection class. Both links are existing indexed lookups.
-    if tx.get(&edge(EDGES_OUT, inputs.dependencies, Edge::ProjectionEntry, module))?.is_none()
-        || !tx.get(&project_declarations::projection_key(image, module))?
-            .is_some_and(|current| current.as_slice() == projection.0)
-    {
-        return Ok(false);
-    }
-    #[derive(serde::Deserialize)]
-    struct ConfigEntry { entry: FileKey }
-    let entry = match config_entry {
-        Some(entry) => entry,
-        None => {
-            let config = read_node(tx, inputs.config)?;
-            config_entry.insert(serde_json::from_slice::<ConfigEntry>(&config.data)?.entry)
-        }
-    };
-    let module = read_node(tx, module)?;
-    let Some(&local) = module.children.first() else { return Ok(false); };
-    let local = read_node(tx, local)?;
-    Ok(serde_json::from_slice::<FileKey>(&local.data)? == *entry)
+struct ReceiptAuthority {
+    config: Arc<CensusConfig>,
+    modules: BTreeSet<NodeId>,
+    executable_files: BTreeSet<NodeId>,
 }
 
-fn mark_receipts(tx: &Transaction, image: NodeId, limit: usize, marks: &mut Marks) -> Result<()> {
-    let mut remaining = limit;
+impl ReceiptAuthority {
+    fn read(reader: &mut CensusRead<'_>, inputs: build_receipt::BuildInputs) -> Result<Self> {
+        let config = reader.config(inputs.config)?;
+        let mut members = |id, kind| -> Result<BTreeSet<NodeId>> {
+            let node = reader.verified(id)?;
+            Expected::Exact(kind).check(node.kind)?;
+            validate_shape(&node)?;
+            Ok(node.children.into_iter().collect())
+        };
+        let modules = members(inputs.dependencies, Kind::Dependencies)?;
+        let executable_files = members(inputs.executable, Kind::Executables)?;
+        Ok(Self { config, modules, executable_files })
+    }
+
+    fn current_entry(&self, reader: &mut CensusRead<'_>, image: NodeId, projection: NodeId) -> Result<bool> {
+        let Some(parts) = project_declarations::verified_projection_parts(reader.tx, projection,
+            |bytes| charge_bytes(&mut reader.remaining_bytes, bytes))? else { return Ok(false); };
+        if !self.modules.contains(&parts.source)
+            || !reader.tx.get(&project_declarations::projection_key(image, parts.source))?
+                .is_some_and(|current| current.as_slice() == projection.0)
+        {
+            return Ok(false);
+        }
+        let module = reader.verified(parts.source)?;
+        let (local, imports) = module_parts(&module)?;
+        if !self.executable_files.contains(&local) || !parts.has_import_arity(imports.len()) { return Ok(false); }
+        let local = reader.verified(local)?;
+        let (key, _) = projection_file_parts(&local, Kind::ExecutableFile)?;
+        Ok(key == self.config.entry)
+    }
+}
+
+fn mark_receipts(reader: &mut CensusRead<'_>, image: NodeId, limit: usize, marks: &mut Marks) -> Result<()> {
+    let mut remaining_rows = limit;
+    let mut remaining_profile_keys = limit;
     for (&scope, entry) in &marks.receipt_scopes {
         let mut resolved = None;
-        let mut config_entry = None;
-        build_receipt::attached(tx, scope, entry.inputs, &mut remaining, |id, projection, encoded_bytes| {
+        let mut authority = None;
+        let mut rejected = BTreeSet::new();
+        build_receipt::attached_rows(reader.tx, scope, &mut remaining_rows, |digest, pointer| {
+            let Some(receipt) = build_receipt::stored_receipt(reader.tx, pointer, digest, &entry.inputs.ids(),
+                |bytes| charge_bytes(&mut reader.remaining_bytes, bytes))? else { return Ok(()); };
+            let projection = receipt.projection;
             let Some(prior) = marks.nodes.get(&projection).filter(|mark| mark.is_projection) else {
                 return Ok(());
             };
             let classes = prior.classes & entry.classes;
             if classes == 0 { return Ok(()); }
-            // Only the exact entry projection can anchor this scope's
-            // receipt. Even an admitted sibling cannot extend its authority.
-            match resolved {
-                Some(expected) if expected != projection => return Ok(()),
-                Some(_) => {}
-                None if current_entry(tx, image, entry.inputs, projection, &mut config_entry)? => {
-                    resolved = Some(projection);
+            if let Some((expected, _)) = &resolved {
+                if *expected != projection { return Ok(()); }
+            } else {
+                if rejected.contains(&projection) { return Ok(()); }
+                let authority = match authority.as_ref() {
+                    Some(authority) => authority,
+                    None => authority.insert(ReceiptAuthority::read(reader, entry.inputs)?),
+                };
+                if !authority.current_entry(reader, image, projection)? {
+                    rejected.insert(projection);
+                    return Ok(());
                 }
-                None => return Ok(()),
+                remaining_profile_keys = remaining_profile_keys.checked_sub(authority.config.profiles.len())
+                    .ok_or("source retention plan exceeded receipt profile key budget")?;
+                let keys = authority.config.profiles.iter().map(|profile|
+                    profile.identity(Some(image), entry.inputs, projection).1.digest)
+                    .collect::<BTreeSet<_>>();
+                resolved = Some((projection, keys));
             }
+            let (_, keys) = resolved.as_ref().expect("entry confirmed above");
+            if !keys.contains(&receipt.digest) || !receipt.has_payload() { return Ok(()); }
             let at_limit = marks.nodes.len() >= limit;
-            match marks.nodes.entry(id) {
+            match marks.nodes.entry(receipt.id) {
                 Entry::Occupied(mut mark) => mark.get_mut().classes |= classes,
                 Entry::Vacant(_) if at_limit => return Err("source retention plan exceeded node budget".into()),
-                Entry::Vacant(mark) => { mark.insert(Mark { classes, encoded_bytes, is_projection: false }); }
+                Entry::Vacant(mark) => {
+                    mark.insert(Mark { classes, encoded_bytes: receipt.encoded_bytes, is_projection: false });
+                }
             }
             Ok(())
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn assert_bounded_semantic_census_read(store: &SourceStore, root: NodeId, config: NodeId, receipt: NodeId) {
+    let tx = store.tree.begin_with_mode(Mode::ReadOnly).unwrap();
+    let length = |id| tx.get(&key(super::NODES, id)).unwrap().unwrap().len();
+    let config_bytes = length(config);
+    let root_bytes = length(root);
+
+    let mut reader = CensusRead::new(&tx, 100);
+    reader.remaining_bytes = root_bytes + config_bytes - 1;
+    assert!(reader.root_owner(root).err().unwrap().to_string().contains("encoded node read budget"));
+    assert!(reader.configs.is_empty());
+    assert_eq!(reader.remaining_bytes, config_bytes - 1);
+
+    let mut reader = CensusRead::new(&tx, 100);
+    reader.remaining_bytes = root_bytes + config_bytes;
+    let first = reader.root_owner(root).unwrap();
+    let profiles = reader.remaining_profiles;
+    assert_eq!(first.encoded_bytes, config_bytes);
+    assert!(Arc::ptr_eq(&first, &reader.config(config).unwrap()));
+    assert!(Arc::ptr_eq(&first, &reader.root_owner(root).unwrap()));
+    assert_eq!(reader.root_for_walk(root).unwrap().encoded_bytes, root_bytes);
+    assert_eq!(reader.remaining_profiles, profiles);
+    assert_eq!(reader.remaining_bytes, 0);
+    assert!(reader.record(receipt).unwrap_err().to_string().contains("encoded node read budget"));
+
+    // A genuine receipt record is not itself an ordinary graph authority.
+    // Exercise the graph walker on this existing immutable node; no store
+    // corruption or mutable links are needed for this invariant.
+    reader.remaining_bytes = length(receipt);
+    let mut marks = Marks::default();
+    walk(&mut reader, [(receipt, WalkOrigin::Graph)], None, PROTECTED, 100, &mut marks).unwrap();
+    assert_eq!(reader.remaining_bytes, 0);
+    assert!(marks.nodes.is_empty());
 }
 
 fn decode_id(bytes: &[u8]) -> Result<NodeId> {
@@ -522,8 +690,6 @@ impl SourceStore {
             }
             (tx, active)
         };
-        let scope_top = published_source(&tx, scope)?.ok_or("unknown source retention scope")?;
-        let owner = pins::workspace_of_config(&tx, scope_top.children[0])?;
         if nominated.len().max(keep.len()) > limit {
             return Err("source retention selection exceeded root budget".into());
         }
@@ -550,6 +716,7 @@ impl SourceStore {
             framed_hash(&mut epoch, value);
             Ok(())
         })?;
+        if !published.contains(&scope) { return Err("unknown source retention scope".into()); }
         if !keep.is_subset(&published) || !nominated.is_subset(&published) {
             return Err("retention selection names an unpublished root".into());
         }
@@ -568,10 +735,11 @@ impl SourceStore {
             Ok(())
         })?;
 
+        let mut reader = CensusRead::new(&tx, limit);
+        let owner = reader.root_owner(scope)?;
         let mut candidates = BTreeSet::new();
         for &root in &nominated {
-            let top = source_top(&tx, root)?.ok_or("unsupported retention candidate")?;
-            if pins::workspace_of_config(&tx, top.children[0])? != owner {
+            if reader.root_owner(root)?.owner != owner.owner {
                 return Err("retention candidate belongs to another workspace".into());
             }
             if !keep.contains(&root) && !pinned.contains(&root) && !active.contains(&root) {
@@ -580,9 +748,11 @@ impl SourceStore {
         }
 
         let mut marks = Marks::default();
-        walk(&tx, published.difference(&candidates).copied(), image, PROTECTED, limit, &mut marks)?;
-        walk(&tx, candidates.iter().copied(), image, CANDIDATE, limit, &mut marks)?;
-        if let Some(image) = image { mark_receipts(&tx, image, limit, &mut marks)?; }
+        walk(&mut reader, published.difference(&candidates).map(|&root| (root, WalkOrigin::Published)),
+            image, PROTECTED, limit, &mut marks)?;
+        walk(&mut reader, candidates.iter().map(|&root| (root, WalkOrigin::Published)),
+            image, CANDIDATE, limit, &mut marks)?;
+        if let Some(image) = image { mark_receipts(&mut reader, image, limit, &mut marks)?; }
 
         let mut report = SourceRetentionPlan {
             protection_epoch: NodeId(*epoch.finalize().as_bytes()),
