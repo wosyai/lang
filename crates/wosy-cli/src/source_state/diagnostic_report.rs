@@ -31,8 +31,16 @@ pub enum AcknowledgedBuildDiagnostics {
     WorkspaceChanged,
     ProfileNotSelected,
     ReplayNotAccepted,
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    NativeReplayRequired,
     Refused(BuildSessionRefusal),
     Report(RootedDiagnosticReport),
+}
+
+enum Recovery {
+    LocalAdapter,
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    NativeKnown,
 }
 
 impl SqliteSourceState {
@@ -60,7 +68,7 @@ impl SqliteSourceState {
         let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
             return Ok(Outcome::NotAcknowledged);
         };
-        self.diagnostics_for_capture(captured, deadline, budget, open).await
+        self.diagnostics_for_capture(captured, deadline, budget, open, Recovery::LocalAdapter).await
     }
 
     /// Opt in only for a command observing the live workspace. A fresh
@@ -91,16 +99,45 @@ impl SqliteSourceState {
         Opening: Future<Output = Result<Stream>>,
         Stream: AsyncRead + AsyncWrite + Unpin + 'static,
     {
-        use AcknowledgedBuildDiagnostics as Outcome;
         let deadline = diagnostic_deadline(timeout)?;
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
+            Ok(capture) => capture,
+            Err(outcome) => return Ok(outcome),
+        };
+        self.diagnostics_for_capture(captured, deadline, budget, open, Recovery::LocalAdapter).await
+    }
+
+    /// Use the already acknowledged live source and a protected one-shot
+    /// Linux Unix endpoint. The endpoint's trust is the local activator and
+    /// same effective uid. This never sends replay data, stages source, or
+    /// changes the ordinary CLI; a missing daemon root is explicit.
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    pub async fn native_known_build_diagnostics(
+        &mut self, directory: &std::path::Path, target: &str, profile: &str, timeout: Duration,
+        max_authored_source_bytes: usize, budget: CstExpansionBudget,
+    ) -> Result<AcknowledgedBuildDiagnostics> {
+        let deadline = diagnostic_deadline(timeout)?;
+        let captured = match self.capture_live(target, profile, deadline, max_authored_source_bytes)? {
+            Ok(capture) => capture,
+            Err(outcome) => return Ok(outcome),
+        };
+        self.diagnostics_for_capture(captured, deadline, budget, |_, _| async move {
+            Ok(wosy_protocol::native_diagnostics::connect(directory).await?)
+        }, Recovery::NativeKnown).await
+    }
+
+    fn capture_live(
+        &mut self, target: &str, profile: &str, deadline: Instant, max_authored_source_bytes: usize,
+    ) -> Result<std::result::Result<CapturedBuildDiagnostics, AcknowledgedBuildDiagnostics>> {
+        use AcknowledgedBuildDiagnostics as Outcome;
         require_diagnostic_time(deadline)?;
         let Some(captured) = self.capture_build_diagnostics(target, profile)? else {
-            return Ok(Outcome::NotAcknowledged);
+            return Ok(Err(Outcome::NotAcknowledged));
         };
         let selected = captured.selection();
         let (files, profile_selected) = {
             let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            if !captured.source.matches(read_selection(&tx, target)?) { return Ok(Outcome::StaleSelection); }
+            if !captured.source.matches(read_selection(&tx, target)?) { return Ok(Err(Outcome::StaleSelection)); }
             let mut read = StoredNodes::new(&tx)?;
             // Bound selected metadata before decoding or copying SQLite
             // values. This is not a bound on the ordinary live file reader.
@@ -122,14 +159,15 @@ impl SqliteSourceState {
             LiveSourceReader::new(max_authored_source_bytes, deadline));
         require_diagnostic_time(deadline)?;
         let matches = probe?;
-        if !matches { return Ok(Outcome::WorkspaceChanged); }
-        if !captured.is_current(self)? { return Ok(Outcome::StaleSelection); }
-        if !profile_selected { return Ok(Outcome::ProfileNotSelected); }
-        self.diagnostics_for_capture(captured, deadline, budget, open).await
+        if !matches { return Ok(Err(Outcome::WorkspaceChanged)); }
+        if !captured.is_current(self)? { return Ok(Err(Outcome::StaleSelection)); }
+        if !profile_selected { return Ok(Err(Outcome::ProfileNotSelected)); }
+        Ok(Ok(captured))
     }
 
     async fn diagnostics_for_capture<Open, Opening, Stream>(
         &mut self, captured: CapturedBuildDiagnostics, deadline: Instant, budget: CstExpansionBudget, mut open: Open,
+        recovery: Recovery,
     ) -> Result<AcknowledgedBuildDiagnostics>
     where
         Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
@@ -140,12 +178,18 @@ impl SqliteSourceState {
         let answer = within_diagnostic_deadline(deadline, async {
             let first = open_exchange(self, &captured, deadline, None, &mut open).await?;
             let DiagnosticExchange::ReplayRequired(challenge) = first else { return Ok(first) };
+            #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+            if matches!(recovery, Recovery::NativeKnown) { return Ok(DiagnosticExchange::ReplayRequired(challenge)); }
             let Some(replay) = challenge.prepare(self)? else { return Ok(DiagnosticExchange::StaleSelection) };
             open_exchange(self, &captured, deadline, Some(replay), &mut open).await
         }).await?;
         Ok(match captured.finish_project_exchange(self, answer, budget)? {
             ProjectDiagnosticExchange::StaleSelection => Outcome::StaleSelection,
-            ProjectDiagnosticExchange::ReplayRequired(_) => Outcome::ReplayNotAccepted,
+            ProjectDiagnosticExchange::ReplayRequired(_) => match recovery {
+                Recovery::LocalAdapter => Outcome::ReplayNotAccepted,
+                #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+                Recovery::NativeKnown => Outcome::NativeReplayRequired,
+            },
             ProjectDiagnosticExchange::Refused(reason) => Outcome::Refused(reason),
             ProjectDiagnosticExchange::Report(report) => Outcome::Report(report),
         })

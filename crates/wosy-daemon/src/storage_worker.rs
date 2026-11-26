@@ -139,22 +139,35 @@ impl SourceStorageWorker {
 /// Only the framed request owns the sender; it sends no values. Dropping
 /// it both signals blocking phase boundaries and wakes async gate waiters.
 #[derive(Clone)]
-pub(super) struct QueryCancellation(watch::Receiver<()>);
+pub(super) struct QueryCancellation {
+    stopped: watch::Receiver<()>,
+    cutoff: Option<Instant>,
+}
 
 impl QueryCancellation {
-    pub fn observe() -> (watch::Sender<()>, Self) {
+    pub fn observe() -> (watch::Sender<()>, Self) { Self::observe_before(None) }
+
+    pub fn observe_before(cutoff: Option<Instant>) -> (watch::Sender<()>, Self) {
         let (observer, stopped) = watch::channel(());
-        (observer, Self(stopped))
+        (observer, Self { stopped, cutoff })
+    }
+
+    pub fn check_cutoff(&self) -> Result<()> {
+        if self.cutoff.is_some_and(|time| Instant::now() >= time) {
+            Err(super::build_session::BuildRequestRejection::Expired.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn stopped() -> super::Error { "framed Build analysis no longer has an observer".into() }
 
     fn check(cancellation: Option<&Self>) -> Result<()> {
-        if cancellation.is_some_and(|stop| stop.0.has_changed().is_err()) {
-            Err(Self::stopped())
-        } else {
-            Ok(())
+        if let Some(signal) = cancellation {
+            signal.check_cutoff()?;
+            if signal.stopped.has_changed().is_err() { return Err(Self::stopped()); }
         }
+        Ok(())
     }
 }
 
@@ -238,11 +251,31 @@ impl<'a> QueryPhases<'a> {
         };
         // Select only over acquiring the existing FIFO gate, never work
         // performed under its guard or a handed-off storage transaction.
-        let mut stopped = signal.0.clone();
+        let mut stopped = signal.stopped.clone();
+        signal.check_cutoff()?;
+        let cutoff = async {
+            match signal.cutoff {
+                Some(time) => tokio::time::sleep_until(tokio::time::Instant::from_std(time)).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             biased;
+            _ = cutoff => Err(super::build_session::BuildRequestRejection::Expired.into()),
             _ = stopped.changed() => Err(QueryCancellation::stopped()),
-            guard = acquire => Ok(guard),
+            guard = acquire => {
+                signal.check_cutoff()?;
+                Ok(guard)
+            },
+        }
+    }
+
+    /// Check the optional NativeKnown cutoff before starting an async commit.
+    /// A transaction that already started drains under its existing rules.
+    pub fn check_cutoff(self) -> Result<()> {
+        match self.worker.and_then(|worker| worker.cancellation.as_ref()) {
+            Some(signal) => signal.check_cutoff(),
+            None => Ok(()),
         }
     }
 
@@ -261,6 +294,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::mpsc;
+
+    #[test]
+    fn native_work_cutoff_checks_the_clock_with_a_live_observer() {
+        let (_observer, signal) = QueryCancellation::observe_before(Some(Instant::now()));
+        let rejected = QueryCancellation::check(Some(&signal)).unwrap_err();
+        assert!(matches!(rejected.downcast_ref::<crate::build_session::BuildRequestRejection>(),
+            Some(crate::build_session::BuildRequestRejection::Expired)));
+        let (_observer, ordinary) = QueryCancellation::observe();
+        QueryCancellation::check(Some(&ordinary)).unwrap();
+    }
 
     #[test]
     #[ignore = "requires a disposable store with two admitted source fixture roots"]

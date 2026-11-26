@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+native-diagnostics = ["wosy-protocol/native-diagnostics"]
+
+[[example]]
+name = "native_known_diagnostics_server"
+required-features = ["native-diagnostics"]
+
 [lib]
 path = "src/lib.rs"
 

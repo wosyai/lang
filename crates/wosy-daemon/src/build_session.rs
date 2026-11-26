@@ -52,7 +52,7 @@ impl SourceStorageWorker {
             if base.project().to_str() != Some(selected.project.as_str()) {
                 return Err(super::InstalledGitScopeRejection::Ownership.into());
             }
-            store.lease_build_source_inspect(selected, lifetime, None, |tx, top, config| {
+            store.lease_build_source_inspect(selected, lifetime, None, None, |tx, top, config| {
                 super::installed_git_scope::verify(tx, top, config, &base, limits)
             })
         }).await??;
@@ -78,12 +78,12 @@ impl SourceStorageWorker {
         &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
         lifetime: Duration,
     ) -> Result<BuildSourceOpening<'_>> {
-        self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, None).await
+        self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, None, None).await
     }
 
     pub(super) async fn open_recoverable_build_diagnostics_before(
         &self, selected: BuildSourceSelection, replay: Option<Delta>, limits: BaseCstAdmissionLimits,
-        lifetime: Duration, start_deadline: Option<Instant>,
+        lifetime: Duration, start_deadline: Option<Instant>, hard_deadline: Option<Instant>,
     ) -> Result<BuildSourceOpening<'_>> {
         let slot = self.try_slot()?;
         let root = selected.root;
@@ -91,7 +91,7 @@ impl SourceStorageWorker {
             let selected = Arc::new(selected);
             let initial = Arc::clone(&selected);
             if let Some(lease) = worker.phase(None, move |store| {
-                store.lease_build_source_before(initial.as_ref().clone(), lifetime, start_deadline)
+                store.lease_build_source_with_cutoff(initial.as_ref().clone(), lifetime, start_deadline, hard_deadline)
             }).await? {
                 return Ok::<_, super::Error>(Some((lease, None)));
             }
@@ -103,7 +103,7 @@ impl SourceStorageWorker {
                 SourceReconciliation::ReplayRequired { .. } => return Err("acknowledged replay was not admitted".into()),
             };
             let lease = worker.phase(None, move |store| {
-                store.lease_build_source_before(selected.as_ref().clone(), lifetime, start_deadline)
+                store.lease_build_source_with_cutoff(selected.as_ref().clone(), lifetime, start_deadline, hard_deadline)
             }).await?.ok_or("restored source is no longer available for a lease")?;
             Ok(Some((lease, restored)))
         }).await??;
@@ -121,6 +121,8 @@ impl BuildDiagnosticSession<'_> {
     pub fn renew(&self) -> bool { self.lease.renew() }
 
     pub(super) fn deadline(&self) -> Option<Instant> { self.lease.deadline() }
+
+    pub(super) fn hard_deadline(&self) -> Option<Instant> { self.lease.hard_deadline() }
 
     pub(super) fn connection_id(&self) -> BaseDeclarationConnectionId {
         BaseDeclarationConnectionId(self.lease.ordinal())
@@ -170,7 +172,7 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
-        let (_observer, cancellation) = QueryCancellation::observe();
+        let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
         self.dispatch_analysis(request, Some(cancellation)).await
     }
 
@@ -179,6 +181,7 @@ impl BuildDiagnosticSession<'_> {
     ) -> Result<BuildDiagnosticResponse<Diagnostic>> {
         let BuildDiagnosticRequest::BuildDiagnostics { version, profile } = request;
         if version != BUILD_DIAGNOSTIC_VERSION { return Err(BuildRequestRejection::Version.into()); }
+        if let Some(signal) = &cancellation { signal.check_cutoff()?; }
         let slot = self.worker.try_slot()?;
         let grant = self.lease.grant();
         self.worker.spawn_reserved_query(slot, cancellation, move |worker| async move {

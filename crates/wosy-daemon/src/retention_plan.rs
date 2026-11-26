@@ -81,12 +81,15 @@ pub(super) struct SourceLease {
     reads: Arc<Mutex<ReadRegistry>>,
     grant: LeaseGrant,
     lifetime: Duration,
+    hard_deadline: Option<Instant>,
 }
 
 impl SourceLease {
     pub fn grant(&self) -> LeaseGrant { self.grant }
 
     pub fn ordinal(&self) -> u64 { self.grant.id }
+
+    pub fn hard_deadline(&self) -> Option<Instant> { self.hard_deadline }
 
     pub fn release(&self) {
         let mut reads = self.reads.lock().expect("source reader registry");
@@ -118,7 +121,7 @@ impl SourceLease {
             return false;
         }
         let Some(next) = now.checked_add(self.lifetime) else { return false; };
-        *expires = next;
+        *expires = self.hard_deadline.map_or(next, |cutoff| cutoff.min(next));
         true
     }
 }
@@ -358,14 +361,22 @@ impl SourceStore {
     pub(super) fn lease_build_source_before(
         &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
     ) -> Result<Option<SourceLease>> {
-        self.lease_build_source_inspect(selection, lifetime, start_deadline, |_, _, _| Ok(()))
+        self.lease_build_source_with_cutoff(selection, lifetime, start_deadline, None)
+    }
+
+    pub(super) fn lease_build_source_with_cutoff(
+        &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
+        hard_deadline: Option<Instant>,
+    ) -> Result<Option<SourceLease>> {
+        self.lease_build_source_inspect(selection, lifetime, start_deadline, hard_deadline, |_, _, _| Ok(()))
     }
 
     pub(super) fn lease_build_source_inspect(
         &self, selection: BuildSourceSelection, lifetime: Duration, start_deadline: Option<Instant>,
-        inspect: impl FnOnce(&Transaction, &Node, &SourceConfig) -> Result<()>,
+        hard_deadline: Option<Instant>, inspect: impl FnOnce(&Transaction, &Node, &SourceConfig) -> Result<()>,
     ) -> Result<Option<SourceLease>> {
         if lifetime.is_zero() { return Err("a Build diagnostic lease must have a positive lifetime".into()); }
+        let start_deadline = start_deadline.into_iter().chain(hard_deadline).min();
         if start_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(BuildRequestRejection::Expired.into());
         }
@@ -392,8 +403,9 @@ impl SourceStore {
             let id = reads.next_session.checked_add(1).ok_or("Build diagnostic lease IDs exhausted")?;
             reads.next_session = id;
             let grant = LeaseGrant { id, root };
+            let expires = hard_deadline.map_or(expires, |cutoff| cutoff.min(expires));
             reads.sessions.insert(id, (root, expires));
-            SourceLease { reads: Arc::clone(&self.source_reads.0), grant, lifetime }
+            SourceLease { reads: Arc::clone(&self.source_reads.0), grant, lifetime, hard_deadline }
         };
         // The ordinary read prevents a gap between validating the identity
         // and registering the expiring session under the same retention gate.
@@ -602,6 +614,25 @@ impl SourceStore {
 mod lease_tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn native_lease_renewal_never_extends_the_absolute_cut() {
+        let reads = Arc::new(Mutex::new(ReadRegistry::default()));
+        let root = NodeId([1; 32]);
+        let grant = LeaseGrant { root, id: 1 };
+        let now = Instant::now();
+        let cutoff = now + Duration::from_secs(10);
+        reads.lock().unwrap().sessions.insert(grant.id, (root, cutoff));
+        let mut lease = SourceLease { reads, grant, lifetime: Duration::from_secs(30), hard_deadline: Some(cutoff) };
+        assert!(lease.renew());
+        assert_eq!(lease.deadline(), Some(cutoff));
+        // Model the same non-renewable authority just after its cutoff,
+        // without a real socket, timer sleep or mutable user store.
+        lease.hard_deadline = Some(now);
+        lease.reads.lock().unwrap().sessions.insert(grant.id, (root, now));
+        assert!(!lease.renew());
+        assert_eq!(lease.deadline(), None);
+    }
 
     #[test]
     fn passive_preparation_charges_share_the_live_store_budget() {

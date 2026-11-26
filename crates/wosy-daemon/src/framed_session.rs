@@ -67,7 +67,7 @@ impl SourceStorageWorker {
     pub async fn serve_build_session<T: AsyncRead + AsyncWrite + Unpin>(
         &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
-        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(None)).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(None), None).await
     }
 
     /// Only the trusted local adapter may bind a pending source attempt to
@@ -79,7 +79,7 @@ impl SourceStorageWorker {
     ) -> Result<BuildSessionEnd> {
         let selected = binding.selected.clone();
         let scope = ProjectionScope { binding, admission_limits, declaration_bytes };
-        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(Some(scope))).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Ordinary(Some(scope)), None).await
     }
 
     /// Opt-in diagnostic handshake for the trusted adapter's acknowledged
@@ -92,22 +92,40 @@ impl SourceStorageWorker {
         &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
-        self.serve_selected_session(stream, selected, lifetime, Opening::Recoverable { replay, limits }).await
+        self.serve_selected_session(stream, selected, lifetime, Opening::Recoverable { replay, limits }, None).await
+    }
+
+    /// Only the NativeKnown host passes a non-renewable authority cut.
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    pub(super) async fn serve_known_build_session_before<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, lifetime: Duration, cutoff: Instant,
+    ) -> Result<BuildSessionEnd> {
+        const NO_REPLAY: BaseCstAdmissionLimits = BaseCstAdmissionLimits {
+            records: 0, record_bytes: 0, graph_edges: 0, expanded_record_bytes: 0,
+            cst_occurrences: 0, cst_depth: 0, authored_bytes: 0,
+        };
+        self.serve_selected_session(stream, selected, lifetime,
+            Opening::Recoverable { replay: None, limits: NO_REPLAY }, Some(cutoff)).await
     }
 
     async fn serve_selected_session<T: AsyncRead + AsyncWrite + Unpin>(
         &self, stream: T, selected: BuildSourceSelection, lifetime: Duration,
-        opening: Opening,
+        opening: Opening, hard_deadline: Option<Instant>,
     ) -> Result<BuildSessionEnd> {
-        let start_deadline = Instant::now().checked_add(lifetime).ok_or("Build session start timeout is out of range")?;
+        let start_deadline = match hard_deadline {
+            Some(cutoff) => cutoff,
+            None => Instant::now().checked_add(lifetime).ok_or("Build session start timeout is out of range")?,
+        };
+        if cutoff_reached(hard_deadline) { return Ok(BuildSessionEnd::Expired); }
         let (mut input, mut output) = io::split(stream);
         let mut frames = SessionFrameReader::default();
         let start = tokio::select! {
             biased;
             _ = sleep_until(TokioInstant::from_std(start_deadline)) => return Ok(BuildSessionEnd::Expired),
-            event = frames.read::<_, Command>(&mut input) => event?,
+            event = frames.read::<_, Command>(&mut input) => event,
         };
-        let Some(Command { id, request }) = start else { return Ok(BuildSessionEnd::PeerClosed); };
+        if cutoff_reached(hard_deadline) { return Ok(BuildSessionEnd::Expired); }
+        let Some(Command { id, request }) = start? else { return Ok(BuildSessionEnd::PeerClosed); };
         let recoverable = matches!(opening, Opening::Recoverable { .. });
         let refused = match (recoverable, request) {
             (false, Request::Start { version }) if version == BUILD_DIAGNOSTIC_VERSION => None,
@@ -116,7 +134,7 @@ impl SourceStorageWorker {
             _ => Some(Refusal::ExpectedStart),
         };
         if let Some(reason) = refused {
-            return refuse_start(&mut output, start_deadline, id, reason).await;
+            return refuse_start(&mut output, start_deadline, hard_deadline, id, reason).await;
         }
         if Instant::now() >= start_deadline { return Ok(BuildSessionEnd::Expired); }
         let source_root = selected.root;
@@ -129,7 +147,7 @@ impl SourceStorageWorker {
             _ = sleep_until(TokioInstant::from_std(start_deadline)) => return Ok(BuildSessionEnd::Expired),
             opened = async {
                 if let Some((replay, limits)) = recovery {
-                    Ok(match self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, Some(start_deadline)).await? {
+                    Ok(match self.open_recoverable_build_diagnostics_before(selected, replay, limits, lifetime, Some(start_deadline), hard_deadline).await? {
                         BuildSourceOpening::Opened { session, .. } => Opened::Session(session),
                         BuildSourceOpening::ReplayRequired { .. } => Opened::ReplayRequired,
                     })
@@ -139,12 +157,13 @@ impl SourceStorageWorker {
                 }
             } => opened,
         };
+        if cutoff_reached(hard_deadline) { return Ok(BuildSessionEnd::Expired); }
         let session = match opened {
             Ok(Opened::Session(session)) => session,
-            Ok(Opened::Unavailable) => return refuse_start(&mut output, start_deadline, id, Refusal::SourceUnavailable).await,
+            Ok(Opened::Unavailable) => return refuse_start(&mut output, start_deadline, hard_deadline, id, Refusal::SourceUnavailable).await,
             Ok(Opened::ReplayRequired) => {
                 let reply = Reply::ReplayRequired { version: BUILD_RECONCILIATION_VERSION, source_root };
-                return Ok(if send(&mut output, start_deadline, id, reply).await? {
+                return Ok(if send(&mut output, start_deadline, hard_deadline, id, reply).await? {
                     BuildSessionEnd::ReplayRequired
                 } else { BuildSessionEnd::Expired });
             }
@@ -153,7 +172,7 @@ impl SourceStorageWorker {
                     return Ok(BuildSessionEnd::Expired);
                 }
                 let reason = refusal(&error, Refusal::SourceUnavailable);
-                return refuse_start(&mut output, start_deadline, id, reason).await;
+                return refuse_start(&mut output, start_deadline, hard_deadline, id, reason).await;
             }
         };
         let Some(deadline) = session.deadline() else { return Ok(BuildSessionEnd::Expired); };
@@ -166,13 +185,19 @@ impl SourceStorageWorker {
         } else {
             Reply::Started { version: BUILD_DIAGNOSTIC_VERSION, source_root }
         };
-        if !send(&mut output, deadline.min(start_deadline), id, started).await? { return Ok(BuildSessionEnd::Expired); }
-        let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref()).await?;
+        if !send(&mut output, deadline.min(start_deadline), hard_deadline, id, started).await? { return Ok(BuildSessionEnd::Expired); }
+        let end = run(&session, &mut frames, &mut input, &mut output, projection.as_ref()).await;
         let deadline = session.deadline();
         session.release();
-        Ok(match end {
+        if cutoff_reached(hard_deadline) { return Ok(BuildSessionEnd::Expired); }
+        Ok(match end? {
             Close::Request(id) => {
-                if let Some(deadline) = deadline { send(&mut output, deadline, id, Reply::Closed).await?; }
+                if let Some(deadline) = deadline {
+                    let written = send(&mut output, deadline, hard_deadline, id, Reply::Closed).await?;
+                    if !written && hard_deadline.is_some() { return Ok(BuildSessionEnd::Expired); }
+                } else if hard_deadline.is_some() {
+                    return Ok(BuildSessionEnd::Expired);
+                }
                 BuildSessionEnd::Disconnected
             }
             Close::Peer => BuildSessionEnd::PeerClosed,
@@ -186,14 +211,17 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     output: &mut W, projection: Option<&ProjectionScope>,
 ) -> Result<Close> {
     let mut owner = None;
+    let cutoff = session.hard_deadline();
     loop {
+        if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
         let Some(deadline) = session.deadline() else { return Ok(Close::Deadline); };
         let request = tokio::select! {
             biased;
             _ = sleep_until(TokioInstant::from_std(deadline)) => return Ok(Close::Deadline),
-            request = frames.read::<_, Command>(input) => request?,
+            request = frames.read::<_, Command>(input) => request,
         };
-        let (id, operation) = match request {
+        if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
+        let (id, operation) = match request? {
             Some(Command { id, request: Request::Analyze { request } }) => (id, Operation::Analyze(request)),
             Some(Command { id, request: Request::ProjectBaseDeclarations { version, proposal } }) => {
                 let refusal = if version != BASE_DECLARATION_PROJECTION_VERSION {
@@ -210,7 +238,7 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 } else {
                     Refusal::BaseProjectionUnavailable
                 };
-                if !send(output, deadline, id, Reply::Refused { reason: refusal }).await? {
+                if !send(output, deadline, cutoff, id, Reply::Refused { reason: refusal }).await? {
                     return Ok(Close::Deadline);
                 }
                 continue;
@@ -244,12 +272,15 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
     };
     tokio::pin!(job);
+    let cutoff = session.hard_deadline();
     loop {
+        if cutoff_reached(cutoff) { return Ok(Some(Close::Deadline)); }
         let Some(deadline) = session.deadline() else { return Ok(Some(Close::Deadline)); };
         tokio::select! {
             biased;
             _ = sleep_until(TokioInstant::from_std(deadline)) => return Ok(Some(Close::Deadline)),
             response = &mut job => {
+                if cutoff_reached(cutoff) { return Ok(Some(Close::Deadline)); }
                 let reply = match response {
                     Ok(Completed::Analysis(response)) => Reply::Analysis { response },
                     Ok(Completed::Projection(prepared)) => {
@@ -269,14 +300,15 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         Reply::Refused { reason: refusal(&error, failure) }
                     }
                 };
-                let written = match send(output, deadline, id, reply).await {
+                let written = match send(output, deadline, cutoff, id, reply).await {
                     Err(SessionFrameError::TooLarge) =>
-                        send(output, deadline, id, Reply::Refused { reason: Refusal::ResponseTooLarge }).await?,
+                        send(output, deadline, cutoff, id, Reply::Refused { reason: Refusal::ResponseTooLarge }).await?,
                     result => result?,
                 };
                 return Ok((!written).then_some(Close::Deadline));
             }
             request = frames.read::<_, Command>(input) => {
+                if cutoff_reached(cutoff) { return Ok(Some(Close::Deadline)); }
                 let request = request?;
                 if request.as_ref().is_some_and(|command| command.id == id) {
                     return Err("framed Build command ID is already outstanding".into());
@@ -290,6 +322,8 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 async fn control<W: AsyncWrite + Unpin>(
     session: &BuildDiagnosticSession<'_>, command: Option<Command>, output: &mut W,
 ) -> Result<Option<Close>> {
+    let cutoff = session.hard_deadline();
+    if cutoff_reached(cutoff) { return Ok(Some(Close::Deadline)); }
     let Some(Command { id, request }) = command else { return Ok(Some(Close::Peer)); };
     let reply = match request {
         Request::Disconnect => return Ok(Some(Close::Request(id))),
@@ -301,11 +335,19 @@ async fn control<W: AsyncWrite + Unpin>(
         }
     };
     let Some(deadline) = session.deadline() else { return Ok(Some(Close::Deadline)); };
-    Ok((!send(output, deadline, id, reply).await?).then_some(Close::Deadline))
+    Ok((!send(output, deadline, cutoff, id, reply).await?).then_some(Close::Deadline))
 }
 
-async fn refuse_start<W: AsyncWrite + Unpin>(output: &mut W, until: Instant, id: CommandId, reason: Refusal) -> Result<BuildSessionEnd> {
-    Ok(if send(output, until, id, Reply::Refused { reason }).await? { BuildSessionEnd::Refused } else { BuildSessionEnd::Expired })
+async fn refuse_start<W: AsyncWrite + Unpin>(
+    output: &mut W, until: Instant, cutoff: Option<Instant>, id: CommandId, reason: Refusal,
+) -> Result<BuildSessionEnd> {
+    Ok(if send(output, until, cutoff, id, Reply::Refused { reason }).await? {
+        BuildSessionEnd::Refused
+    } else { BuildSessionEnd::Expired })
+}
+
+fn cutoff_reached(cutoff: Option<Instant>) -> bool {
+    cutoff.is_some_and(|time| Instant::now() >= time)
 }
 
 fn refusal(error: &super::Error, otherwise: Refusal) -> Refusal {
@@ -319,9 +361,16 @@ fn refusal(error: &super::Error, otherwise: Refusal) -> Refusal {
 }
 
 async fn send<W: AsyncWrite + Unpin>(
-    output: &mut W, until: Instant, id: CommandId, reply: Reply,
+    output: &mut W, until: Instant, cutoff: Option<Instant>, id: CommandId, reply: Reply,
 ) -> std::result::Result<bool, SessionFrameError> {
-    let bytes = encode_session_frame(&BuildSessionResponse { id, reply })?;
+    // The ordinary route has no hard cutoff. On NativeKnown, check before
+    // potentially expensive encode; the writer checks the same absolute
+    // bound again before any first byte, including after a pending poll.
+    if cutoff_reached(cutoff) { return Ok(false); }
+    let until = cutoff.map_or(until, |strict| until.min(strict));
+    let bytes = encode_session_frame(&BuildSessionResponse { id, reply });
+    if cutoff_reached(cutoff) { return Ok(false); }
+    let bytes = bytes?;
     tokio::select! {
         biased;
         _ = sleep_until(TokioInstant::from_std(until)) => Ok(false),
@@ -368,14 +417,91 @@ mod tests {
         use tokio::io::AsyncReadExt;
         Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
             let (mut server, mut client) = io::duplex(1);
-            assert!(!send(&mut server, Instant::now(), CommandId(1), Reply::Renewed).await.unwrap());
+            assert!(!send(&mut server, Instant::now(), None, CommandId(1), Reply::Renewed).await.unwrap());
+            assert!(!send(&mut server, Instant::now() + Duration::from_secs(30), Some(Instant::now()),
+                CommandId(3), Reply::Renewed).await.unwrap());
             server.write_all(&[42]).await.unwrap();
             let until = Instant::now() + Duration::from_millis(10);
-            assert!(!send(&mut server, until, CommandId(2), Reply::Renewed).await.unwrap());
+            assert!(!send(&mut server, until, None, CommandId(2), Reply::Renewed).await.unwrap());
             drop(server);
             let mut received = Vec::new();
             client.read_to_end(&mut received).await.unwrap();
             assert_eq!(received, [42]);
+        });
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    #[test]
+    #[ignore = "requires an owned source fixture and its empty replacement store"]
+    fn native_known_frames_renew_analyze_and_refuse_source_replay() {
+        let path = |variable: &str| PathBuf::from(std::env::var_os(variable).unwrap());
+        let project = path("WOSY_NATIVE_KNOWN_PROJECT").canonicalize().unwrap();
+        let root = NodeId::parse_hex(&std::env::var("WOSY_NATIVE_KNOWN_ROOT").unwrap()).unwrap();
+        let selected = BuildSourceSelection { root, project: project.to_str().unwrap().into(), target: "app".into() };
+        Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+            let lifetime = Duration::from_secs(30);
+            let recoverable_start = || Request::StartRecoverable { version: BUILD_RECONCILIATION_VERSION };
+            let unit = NonZeroUsize::new(1).unwrap();
+
+            let store = Arc::new(SourceStore::open(&path("WOSY_NATIVE_KNOWN_STORE"), 8 << 20).unwrap());
+            assert!(store.snapshot(root).unwrap().is_some());
+            let worker = SourceStorageWorker::new(Arc::clone(&store), Handle::current(), unit, unit, unit).unwrap();
+            for profile in ["dev", "native"] {
+                let (mut client, stream) = io::duplex(256);
+                let (end, ()) = tokio::join!(
+                    worker.serve_known_build_session_before(stream, selected.clone(), lifetime, Instant::now() + lifetime),
+                    async move {
+                        let mut frames = SessionFrameReader::default();
+                        send_request(&mut client, 1, recoverable_start()).await;
+                        assert!(matches!(receive(&mut client, &mut frames, 1).await,
+                            Reply::RecoverableStarted { version: BUILD_RECONCILIATION_VERSION, source_root }
+                            if source_root == root));
+                        send_request(&mut client, 2, Request::Renew).await;
+                        assert!(matches!(receive(&mut client, &mut frames, 2).await, Reply::Renewed));
+                        send_request(&mut client, 3, Request::Analyze { request: BuildDiagnosticRequest::BuildDiagnostics {
+                            version: BUILD_DIAGNOSTIC_VERSION, profile: profile.into(),
+                        }}).await;
+                        let Reply::Analysis { response: BuildDiagnosticResponse::BuildDiagnostics {
+                            version, source_root, profile: actual_profile, diagnostics, .. } }
+                            = receive(&mut client, &mut frames, 3).await else { panic!("expected ordinary diagnostics"); };
+                        assert_eq!((version, source_root, actual_profile.as_str()), (BUILD_DIAGNOSTIC_VERSION, root, profile));
+                        assert!(!diagnostics.is_empty());
+                        send_request(&mut client, 4, Request::Disconnect).await;
+                        assert!(matches!(receive(&mut client, &mut frames, 4).await, Reply::Closed));
+                        assert!(frames.read::<_, BuildSessionResponse<Diagnostic>>(&mut client).await.unwrap().is_none());
+                    },
+                );
+                assert_eq!(end.unwrap(), BuildSessionEnd::Disconnected);
+            }
+            drop(worker);
+            Arc::into_inner(store).unwrap().close().await.unwrap();
+
+            let missing = Arc::new(SourceStore::open(&path("WOSY_NATIVE_KNOWN_EMPTY_STORE"), 8 << 20).unwrap());
+            assert!(missing.snapshot(root).unwrap().is_none());
+            let worker = SourceStorageWorker::new(Arc::clone(&missing), Handle::current(), unit, unit, unit).unwrap();
+            let (mut client, stream) = io::duplex(256);
+            let (end, ()) = tokio::join!(
+                worker.serve_known_build_session_before(stream, selected.clone(), lifetime, Instant::now() + lifetime),
+                async move {
+                    let mut frames = SessionFrameReader::default();
+                    send_request(&mut client, 1, recoverable_start()).await;
+                    assert!(matches!(receive(&mut client, &mut frames, 1).await,
+                        Reply::ReplayRequired { version: BUILD_RECONCILIATION_VERSION, source_root } if source_root == root));
+                    assert!(frames.read::<_, BuildSessionResponse<Diagnostic>>(&mut client).await.unwrap().is_none());
+                },
+            );
+            assert_eq!(end.unwrap(), BuildSessionEnd::ReplayRequired);
+            assert!(missing.snapshot(root).unwrap().is_none());
+
+            // A ready, valid start cannot regain authority at an expired cut.
+            let (mut client, stream) = io::duplex(256);
+            send_request(&mut client, 1, recoverable_start()).await;
+            let end = worker.serve_known_build_session_before(stream, selected, lifetime, Instant::now()).await.unwrap();
+            assert_eq!(end, BuildSessionEnd::Expired);
+            assert!(SessionFrameReader::default().read::<_, BuildSessionResponse<Diagnostic>>(&mut client)
+                .await.unwrap().is_none());
+            drop(worker);
+            Arc::into_inner(missing).unwrap().close().await.unwrap();
         });
     }
 

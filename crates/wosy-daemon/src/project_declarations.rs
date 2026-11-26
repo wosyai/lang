@@ -327,6 +327,7 @@ impl SourceStore {
                 store.projection_transaction(image, &step)
             ).await?;
             let Some(mut tx) = tx else { return Ok((projections, derived)); };
+            phases.check_cutoff()?;
             match tx.commit().await {
                 Ok(()) => return Ok((projections, derived)),
                 Err(surrealkv::Error::TransactionWriteConflict) => continue,

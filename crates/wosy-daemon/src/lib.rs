@@ -1,4 +1,4 @@
-//! Internal source-preparation store. No socket or build/check query yet.
+//! Internal source-preparation store and rooted compiler diagnostic operations.
 use rowan::GreenNodeBuilder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,10 @@ mod base_declarations;
 mod build_receipt;
 mod build_session;
 mod framed_session;
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+mod native_diagnostics;
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+pub use native_diagnostics::NativeKnownDiagnostics;
 mod grammar_receipts;
 mod installed_git_scope;
 mod derivation_image;

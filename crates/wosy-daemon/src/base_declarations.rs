@@ -300,6 +300,7 @@ impl SourceStore {
                         let _active = active;
                         store.base_transaction(&batch)
                     }).await? else { break; };
+                    phases.check_cutoff()?;
                     match tx.commit().await {
                         Ok(()) => break,
                         Err(surrealkv::Error::TransactionWriteConflict) => continue,

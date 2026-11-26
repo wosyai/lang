@@ -114,6 +114,7 @@ impl SourceStore {
         }).await?;
         let Some((plan, mut tx)) = encoded else { return Ok(false); };
         while let Some(mut pending) = tx {
+            phases.check_cutoff()?;
             match pending.commit().await {
                 Ok(()) => return Ok(true),
                 Err(surrealkv::Error::TransactionWriteConflict) => {

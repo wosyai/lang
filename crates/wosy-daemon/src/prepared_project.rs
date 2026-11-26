@@ -156,6 +156,7 @@ impl RootedPreparedProject<'_> {
                 (canonical.clone(), BuildAnalysisOrigin::Live, false)
             } else {
                 let (canonical, origin, written) = self.analyze_canonical(phases).await?;
+                phases.check_cutoff()?;
                 *stored = Some(canonical.clone());
                 (canonical, origin, written)
             }
@@ -323,6 +324,7 @@ impl SourceStore {
                 build_lookup: Lookup::new(declarations.image, build_inputs, declarations.entry_projection, identity),
                 build_analysis: AsyncMutex::new(None),
             });
+            phases.check_cutoff()?;
             self.prepared_projects.remember(identity, &canonical);
             canonical
         };

@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+native-diagnostics = ["wosy-protocol/native-diagnostics"]
+
+[[example]]
+name = "native_known_diagnostics_client"
+required-features = ["native-diagnostics"]
+
 [dependencies]
 rowan.workspace = true
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }

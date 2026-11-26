@@ -17,6 +17,9 @@ pub use build_diagnostics::{
     BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse,
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
 };
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+pub mod native_diagnostics;
+
 mod session_frame;
 pub use session_frame::{encode_session_frame, write_encoded_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
 mod cst_walk;

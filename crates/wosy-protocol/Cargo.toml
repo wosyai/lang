@@ -3,6 +3,12 @@ name = "wosy-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+native-diagnostics = ["tokio/net", "dep:rustix"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "=1.1.6", optional = true, features = ["process"] }
 [dependencies]
 blake3.workspace = true
 bytes = "1"
