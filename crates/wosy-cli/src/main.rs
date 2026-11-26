@@ -3966,6 +3966,49 @@ main_artifact = "main"
                     }
                 }
 
+                // A Unit return may carry two real surviving branches.
+                // The parent must not flatten them into one scalar domain.
+                let branch_leaf = r#"
+                    unit(u8) leaf = fn(value) {
+                        if (value < 128) {
+                            core.require(true, { .stdout = "unexpected"; .stderr = ""; .code = 7; .files = []; });
+                        } else {
+                            core.narrow(value > 128, { .stdout = "unexpected"; .stderr = ""; .code = 8; .files = []; });
+                        };
+                    };
+                "#;
+                for qualified in [false, true] {
+                    let (declarations, leaf) = if qualified {
+                        fs::write(&shared_source, format!("%%start {branch_leaf} %%end")).unwrap();
+                        (r#"lib = namespace app "shared.w";"#, "lib.leaf")
+                    } else { (branch_leaf, "leaf") };
+                    let main = format!(r#"%%start
+                        {declarations}
+                        unit(u8) second = fn(value) {{ {leaf}(value); }};
+                        unit(u8) first = fn(value) {{ second(value); }};
+                        unit(u8) report = fn(value) {{
+                            first(value);
+                            core.require(false, {{ .stdout = "after"; .stderr = ""; .code = 9; .files = []; }});
+                        }};
+                    %%end"#);
+                    fs::write(&source, &main).unwrap();
+                    if scope == ScalarCheckerScope::CurrentPackage {
+                        let observed = selected(3);
+                        let report = observed[0].outcome.as_ref().unwrap();
+                        let [left, right] = report.directives.as_slice() else { panic!("two original branch continuations, no Narrow failure"); };
+                        assert_eq!(left.directive, right.directive);
+                        assert!(left.witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &127.into())]));
+                        assert!(right.witness.intervals_at(0, 0).unwrap().eq([(&129.into(), &255.into())]));
+                        for (cap, stream) in [(1, &b"after"[..]), (2, &b"afterafter"[..]), (8, &b"afterafter"[..])] {
+                            assert_eq!(terminal(&selected(cap), scope, false), (Ok(9), stream.to_vec(), Vec::new()));
+                            assert!(!state.exists());
+                        }
+                    } else {
+                        assert_eq!(terminal(&selected(8), scope, false), terminal(&[legacy()], scope, false));
+                    }
+                    if qualified { fs::remove_file(&shared_source).unwrap(); }
+                }
+
                 let startup_witness = r#"%%start
                     i8 status = -37;
                     bool ready = true;

@@ -144,15 +144,17 @@ impl StartUpSearch {
     ) -> Option<Admission> {
         use super::super::checker_flow::CallableHistoryStep;
         super::super::checker_flow::charge_call_work(&mut self.work, 2)?;
+        let root = declaration.source.clone();
+        if directive.source.project != root.project || directive.source.package != root.package { return None; }
         let mut steps = vec![PathStep::CallableRoot(declaration)];
         for step in history {
             super::super::checker_flow::charge_call_work(&mut self.work, 1)?;
-            let at = |range| SourceSpan::new(directive.source.clone(), range);
+            let at = |range| SourceSpan::new(root.clone(), range);
             let provider_at = |owner, range| -> Option<SourceSpan> {
                 let module: &super::ScalarModule = modules.get(owner)?;
                 let source = &module.source;
-                if source.project != directive.source.project || source.package != directive.source.package
-                    || source == &directive.source { return None; }
+                if source.project != root.project || source.package != root.package
+                    || source == &root { return None; }
                 Some(SourceSpan::new(source.clone(), range))
             };
             steps.push(match step {
