@@ -8310,28 +8310,37 @@ impl ProjectedCarrierReads {
     }
 }
 
-struct CallAliasStage<'a> {
+struct LexicalOwnerSubset<'a> {
     return_edges: &'a HashMap<CfgPointId, CheckedReturnArgumentEdge>,
     installs: &'a HashMap<CfgPointId, CheckedLexicalInstall<'a>>,
-    holders: std::cell::OnceCell<HashSet<&'a ReferenceBindingId>>,
+    owners: std::cell::OnceCell<HashMap<&'a ReferenceBindingId, HashSet<&'a ReferenceBindingId>>>,
 }
 
-impl<'a> CallAliasStage<'a> {
-    fn holds(&self, points: &'a [ReferenceFlowPoint], binding: &ReferenceBindingId) -> bool {
-        self.holders.get_or_init(|| self.installs.values().filter_map(|install| {
-            let edge = self.return_edges.get(&install.producer)?;
-            let binding = install.holder;
-            let actual = points.get(edge.argument.0)?;
-            // The definite transfer and the conservative holder subset
-            // consume the same typed call edge. This particular holder slice
-            // remains limited to a fresh direct shared loan.
-            if edge.mode != ScalarReferenceMutability::Shared
-                || !matches!(&actual.kind, CfgPointKind::Borrow { loan, place }
-                    if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
-                        && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. }))
-            { return None; }
-            Some(binding)
-        }).collect()).contains(binding)
+impl<'a> LexicalOwnerSubset<'a> {
+    fn roots(&self, points: &'a [ReferenceFlowPoint], holder: &ReferenceBindingId)
+        -> Option<&HashSet<&'a ReferenceBindingId>>
+    {
+        self.owners.get_or_init(|| {
+            let mut rows = HashMap::<_, HashSet<_>>::new();
+            for install in self.installs.values() {
+                let issued = if let Some(edge) = self.return_edges.get(&install.producer) {
+                    if edge.mode != ScalarReferenceMutability::Shared { continue; }
+                    edge.argument
+                } else {
+                    install.producer
+                };
+                let CfgPointKind::Borrow { loan, place } = &points[issued.0].kind else { continue };
+                if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+                    && place == &loan.origin_place && place.projections.is_empty()
+                    && matches!(place.place, ScalarPlace::Name { .. })
+                {
+                    // Union issuance across the entire body, ignoring kills,
+                    // arm order and duplicate introductions of the same root.
+                    rows.entry(install.holder).or_default().insert(&place.binding);
+                }
+            }
+            rows
+        }).get(holder)
     }
 }
 
@@ -8340,7 +8349,7 @@ struct ConflictLiveness<'a> {
     scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     strictly_forward: bool,
     lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
-    call_aliases: Option<CallAliasStage<'a>>,
+    owner_subset: Option<LexicalOwnerSubset<'a>>,
     checked_installs: Option<&'a HashMap<CfgPointId, CheckedLexicalInstall<'a>>>,
     projected: std::cell::OnceCell<ProjectedCarrierReads>,
 }
@@ -8352,7 +8361,7 @@ impl<'a> ConflictLiveness<'a> {
         strictly_forward: bool,
         branched: bool,
     ) -> Self {
-        Self { points, scope_exits, strictly_forward, call_aliases: None, checked_installs: None, projected: Default::default(),
+        Self { points, scope_exits, strictly_forward, owner_subset: None, checked_installs: None, projected: Default::default(),
             lexical: (strictly_forward && branched).then(Default::default) }
     }
 
@@ -8375,13 +8384,22 @@ impl<'a> ConflictLiveness<'a> {
             from, &place.binding, Some(place))
     }
 
-    fn lexical_after(&self, from: CfgPointId, binding: &ReferenceBindingId) -> bool {
-        if self.strictly_forward && self.call_aliases.as_ref().is_some_and(|stage| stage.holds(self.points, binding))
-            && !self.carrier_summary().bindings.get(binding).and_then(|row| row.whole)
+    fn lexical_loan_after(&self, from: CfgPointId, holder: &ReferenceBindingId, owner: &ReferenceBindingId) -> bool {
+        // Missing roots are not proof of absence: unresolved producers remain
+        // handled by the incumbent exact path. A known pair can only use the
+        // existing coarse no-future-read filter before precise refinement.
+        if self.owner_subset.as_ref()
+            .and_then(|subset| subset.roots(self.points, holder))
+            .is_some_and(|roots| roots.contains(owner))
+            && !self.carrier_summary().bindings.get(holder).and_then(|row| row.whole)
                 .is_some_and(|point| point > from)
         {
             return false;
         }
+        self.lexical_after(from, holder)
+    }
+
+    fn lexical_after(&self, from: CfgPointId, binding: &ReferenceBindingId) -> bool {
         let Some(lexical) = &self.lexical else {
             return reference_read_reachable(self.points, self.scope_exits, self.strictly_forward, from, binding);
         };
@@ -8920,7 +8938,7 @@ fn conflicting_live_loan(
                 continue;
             };
             if !reachable {
-                if !liveness.lexical_after(point, binding) {
+                if !liveness.lexical_loan_after(point, binding, &loan.origin_place.binding) {
                     break;
                 }
                 reachable = true;
@@ -11698,9 +11716,9 @@ fn transfer_reference_facts(
     let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
     let mut liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
     if !checked_installs.is_empty() { liveness.checked_installs = Some(&checked_installs); }
-    if strictly_forward && !return_edges.is_empty() && !checked_installs.is_empty() {
-        liveness.call_aliases = Some(CallAliasStage {
-            return_edges: &return_edges, installs: &checked_installs, holders: Default::default(),
+    if strictly_forward && !checked_installs.is_empty() {
+        liveness.owner_subset = Some(LexicalOwnerSubset {
+            return_edges: &return_edges, installs: &checked_installs, owners: Default::default(),
         });
     }
     let mut forward_cursor = 0;

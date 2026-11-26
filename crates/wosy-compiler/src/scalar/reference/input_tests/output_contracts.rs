@@ -472,23 +472,25 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         let installs = HashMap::from([(*bind, install)]);
         let mut liveness = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         liveness.checked_installs = Some(&installs);
-        liveness.call_aliases = Some(CallAliasStage {
-            return_edges: &return_edges, installs: &installs, holders: Default::default(),
+        liveness.owner_subset = Some(LexicalOwnerSubset {
+            return_edges: &return_edges, installs: &installs, owners: Default::default(),
         });
-        let stage = liveness.call_aliases.as_ref().unwrap();
-        assert!(stage.holds(points, binding));
+        let stage = liveness.owner_subset.as_ref().unwrap();
+        let CfgPointKind::Borrow { place, .. } = &points[expected.0].kind else { panic!("typed root loan"); };
+        let root = &place.binding;
+        assert_eq!(stage.roots(points, binding).unwrap(), &HashSet::from([root]));
         let write = points.iter().find(|point| matches!(point.kind, CfgPointKind::Assign { .. })).unwrap();
         let read = points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding: actual } if actual == binding)).unwrap();
         assert!(read.id > write.id, "coarse typed alias candidate survives a sibling read");
-        assert!(!liveness.lexical_after(write.id, binding));
+        assert!(!liveness.lexical_loan_after(write.id, binding, root));
         assert!(liveness.lexical.as_ref().unwrap().borrow().rows.contains_key(binding));
-        assert!(!liveness.lexical_after(read.id, binding));
+        assert!(!liveness.lexical_loan_after(read.id, binding, root));
         let unknown = HashMap::from([(*call, CallOriginTransfer::WholeFormal(0))]);
         let unknown_edges = checked_return_argument_edges(points, &unknown, &proof.resolved_checked_call_outputs);
         assert!(unknown_edges.is_empty());
-        let unchecked_stage = CallAliasStage { return_edges: &unknown_edges,
-            installs: &installs, holders: Default::default() };
-        assert!(!unchecked_stage.holds(points, binding));
+        let unchecked_stage = LexicalOwnerSubset { return_edges: &unknown_edges,
+            installs: &installs, owners: Default::default() };
+        assert!(unchecked_stage.roots(points, binding).is_none());
         let checked = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
     }
@@ -524,11 +526,30 @@ fn checked_lexical_install_retires_only_the_version_on_its_branch() {
         assert!(second.kind == LexicalInstallKind::Replace && second.holder == first.holder);
         assert!(checked_lexical_install(points, replace, *producer, &proof.resolved_checked_call_outputs).is_none());
         let installs = HashMap::from([(*bind, first), (replace, second)]);
+        let callee = &provisional[0].1.cfg;
+        let ret = callee.points.iter().find(|point| matches!(point.kind,
+            CfgPointKind::ReturnOutput { output: 0, checked: true, .. })).unwrap();
+        let origin = &callee.facts[ret.possible_origins.as_ref().unwrap().first().unwrap().0];
+        let contracts = HashMap::from([(*producer, CallOriginTransfer::Explicit(std::slice::from_ref(origin)))]);
+        let return_edges = checked_return_argument_edges(points, &contracts, &proof.resolved_checked_call_outputs);
+        let root_of = |issued: CfgPointId| {
+            let CfgPointKind::Borrow { place, .. } = &points[issued.0].kind else { panic!("typed root"); };
+            &place.binding
+        };
+        let old_owner = root_of(return_edges[producer].argument);
+        let new_owner = root_of(rhs);
         let mut staged = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         staged.checked_installs = Some(&installs);
+        staged.owner_subset = Some(LexicalOwnerSubset { return_edges: &return_edges, installs: &installs,
+            owners: Default::default() });
+        assert_eq!(staged.owner_subset.as_ref().unwrap().roots(points, first.holder).unwrap(),
+            &HashSet::from([old_owner, new_owner]));
         let baseline = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
         for point in points {
-            assert_eq!(staged.lexical_after(point.id, first.holder), baseline.lexical_after(point.id, first.holder));
+            for root in [old_owner, new_owner] {
+                assert_eq!(staged.lexical_loan_after(point.id, first.holder, root),
+                    baseline.lexical_after(point.id, first.holder));
+            }
         }
         assert!(staged.lexical_after(*bind, first.holder), "the other branch keeps the original value");
         assert!(staged.lexical_after(replace, first.holder), "access at the replacement sees its new value");
