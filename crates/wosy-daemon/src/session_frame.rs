@@ -1,10 +1,19 @@
-//! Bounded length-delimited Serde frames for the local diagnostic protocol.
+//! Bounded Serde frames delimited by the shared Tokio codec.
+use bytes::BytesMut;
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::codec::length_delimited::Builder;
+use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec, LengthDelimitedCodecError};
 
 const HEADER_LEN: usize = 4;
 pub const MAX_SESSION_FRAME_BYTES: usize = 1 << 20;
+
+fn frame_codec() -> Builder {
+    let mut builder = LengthDelimitedCodec::builder();
+    builder.big_endian().length_field_type::<u32>().max_frame_length(MAX_SESSION_FRAME_BYTES);
+    builder
+}
 
 #[derive(Debug)]
 pub enum SessionFrameError {
@@ -33,14 +42,23 @@ impl From<io::Error> for SessionFrameError {
     fn from(error: io::Error) -> Self { Self::Io(error) }
 }
 
+fn codec_error(error: io::Error) -> SessionFrameError {
+    if error.get_ref().is_some_and(|source| source.is::<LengthDelimitedCodecError>()) {
+        SessionFrameError::TooLarge
+    } else {
+        error.into()
+    }
+}
+
 /// Encodes a complete frame before any bytes reach the transport. The four
 /// byte unsigned big-endian length excludes the prefix itself.
-pub fn encode_session_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, SessionFrameError> {
-    struct FrameBuffer { bytes: Vec<u8>, too_large: bool }
+pub fn encode_session_frame<T: Serialize>(message: &T) -> Result<BytesMut, SessionFrameError> {
+    #[derive(Default)]
+    struct FramePayload { bytes: BytesMut, too_large: bool }
 
-    impl Write for FrameBuffer {
+    impl Write for FramePayload {
         fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-            if input.len() > MAX_SESSION_FRAME_BYTES + HEADER_LEN - self.bytes.len() {
+            if input.len() > MAX_SESSION_FRAME_BYTES - self.bytes.len() {
                 self.too_large = true;
                 return Err(io::Error::other("diagnostic frame bound"));
             }
@@ -51,58 +69,52 @@ pub fn encode_session_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, Sessio
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
     }
 
-    let mut buffer = FrameBuffer { bytes: vec![0; HEADER_LEN], too_large: false };
-    if let Err(error) = serde_json::to_writer(&mut buffer, message) {
-        return Err(if buffer.too_large { SessionFrameError::TooLarge } else { SessionFrameError::Encode(error) });
+    let mut payload = FramePayload::default();
+    if let Err(error) = serde_json::to_writer(&mut payload, message) {
+        return Err(if payload.too_large { SessionFrameError::TooLarge } else { SessionFrameError::Encode(error) });
     }
-    let len = (buffer.bytes.len() - HEADER_LEN) as u32;
-    if len == 0 { return Err(SessionFrameError::Empty); }
-    buffer.bytes[..HEADER_LEN].copy_from_slice(&len.to_be_bytes());
-    Ok(buffer.bytes)
+    if payload.bytes.is_empty() { return Err(SessionFrameError::Empty); }
+    let mut complete = BytesMut::new();
+    frame_codec().new_codec().encode(payload.bytes.as_ref(), &mut complete).map_err(codec_error)?;
+    Ok(complete)
 }
 
-/// Resumable decoder: a canceled wait does not lose a prefix or body
-/// fragment. Clean EOF is distinct from EOF inside an accepted frame.
-#[derive(Default)]
+/// The retained decoder and input buffer resume across a canceled read.
 pub struct SessionFrameReader {
-    header: [u8; HEADER_LEN],
-    header_used: usize,
-    payload: Vec<u8>,
-    payload_used: usize,
+    codec: LengthDelimitedCodec,
+    input: BytesMut,
+}
+
+impl Default for SessionFrameReader {
+    fn default() -> Self {
+        // Keep the prefix in an incomplete frame. EOF just after a valid
+        // prefix is still truncation, not the end of an empty stream.
+        let codec = frame_codec().length_adjustment(HEADER_LEN as isize).num_skip(0).new_codec();
+        Self { codec, input: BytesMut::new() }
+    }
 }
 
 impl SessionFrameReader {
     pub async fn read<R: AsyncRead + Unpin, T: DeserializeOwned>(
         &mut self, input: &mut R,
     ) -> Result<Option<T>, SessionFrameError> {
-        while self.header_used < HEADER_LEN {
-            let received = input.read(&mut self.header[self.header_used..]).await?;
-            if received == 0 {
-                return if self.header_used == 0 { Ok(None) } else { Err(truncated()) };
+        loop {
+            if let Some(frame) = self.codec.decode(&mut self.input).map_err(codec_error)? {
+                let payload = &frame[HEADER_LEN..];
+                if payload.is_empty() { return Err(SessionFrameError::Empty); }
+                return serde_json::from_slice(payload).map(Some).map_err(SessionFrameError::Decode);
             }
-            self.header_used += received;
+            let remaining = MAX_SESSION_FRAME_BYTES + HEADER_LEN - self.input.len();
+            let received = (&mut *input).take(remaining as u64).read_buf(&mut self.input).await?;
+            if received == 0 {
+                return if self.input.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated diagnostic frame").into())
+                };
+            }
         }
-        if self.payload.is_empty() {
-            let len = u32::from_be_bytes(self.header) as usize;
-            if len == 0 { return Err(SessionFrameError::Empty); }
-            if len > MAX_SESSION_FRAME_BYTES { return Err(SessionFrameError::TooLarge); }
-            self.payload.resize(len, 0);
-        }
-        while self.payload_used < self.payload.len() {
-            let received = input.read(&mut self.payload[self.payload_used..]).await?;
-            if received == 0 { return Err(truncated()); }
-            self.payload_used += received;
-        }
-        let result = serde_json::from_slice(&self.payload).map_err(SessionFrameError::Decode);
-        self.header_used = 0;
-        self.payload_used = 0;
-        self.payload.clear();
-        result.map(Some)
     }
-}
-
-fn truncated() -> SessionFrameError {
-    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated diagnostic frame").into()
 }
 
 #[cfg(test)]
@@ -119,6 +131,7 @@ mod tests {
             let (mut tx, mut rx) = duplex(256);
             let first = encode_session_frame(&"first").unwrap();
             let second = encode_session_frame(&"second").unwrap();
+            assert_eq!(first.as_ref(), b"\x00\x00\x00\x07\"first\"");
             for partial in [0..2, 2..6] {
                 tx.write_all(&first[partial]).await.unwrap();
                 let mut interrupted = Box::pin(frames.read::<_, String>(&mut rx));
@@ -136,10 +149,15 @@ mod tests {
             assert!(matches!(encode_session_frame(&(exact + "b")), Err(SessionFrameError::TooLarge)));
             let mut over = &((MAX_SESSION_FRAME_BYTES as u32) + 1).to_be_bytes()[..];
             assert!(matches!(frames.read::<_, String>(&mut over).await, Err(SessionFrameError::TooLarge)));
-            assert!(frames.payload.is_empty());
-            let mut incomplete = &first[..first.len() - 1];
-            let err = SessionFrameReader::default().read::<_, String>(&mut incomplete).await.unwrap_err();
-            assert!(matches!(err, SessionFrameError::Io(io) if io.kind() == io::ErrorKind::UnexpectedEof));
+            assert_eq!(frames.input.len(), HEADER_LEN);
+            for tail in [2, HEADER_LEN, first.len() - 1] {
+                let mut incomplete = &first[..tail];
+                let err = SessionFrameReader::default().read::<_, String>(&mut incomplete).await.unwrap_err();
+                assert!(matches!(err, SessionFrameError::Io(io) if io.kind() == io::ErrorKind::UnexpectedEof));
+            }
+            let mut empty = &[0; HEADER_LEN][..];
+            assert!(matches!(SessionFrameReader::default().read::<_, String>(&mut empty).await,
+                Err(SessionFrameError::Empty)));
         });
     }
 }
