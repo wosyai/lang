@@ -320,8 +320,78 @@ impl RankLane {
     }
 }
 
+/// Captures only authenticated runtime operands, never a proved result.
+pub(super) struct CappedTailRecipe {
+    pub(super) target: PreparedCallable,
+    pub(super) site: OccurrenceOrdinal,
+    operations: Vec<IntegerTailOperand>,
+    rank_axes: Vec<usize>,
+    domains: Vec<IntegerSet>,
+}
+
+enum IntegerTailOperand { Entry, Offset(bool, BigInt), Literal(BigInt) }
+
+impl CappedTailRecipe {
+    pub(super) fn work(&self) -> Option<usize> {
+        self.domains.iter().try_fold(self.operations.len(), |n, d| n.checked_add(d.interval_count().checked_add(1)?))
+    }
+
+    pub(super) fn accepts(&self, tuple: &[&BigInt]) -> bool {
+        self.domains.len() == tuple.len() && self.domains.iter().zip(tuple).all(|(domain, v)| domain.contains(v))
+    }
+
+    pub(super) fn compute(
+        &self, body: &FunctionCallSites, cursor: &ExactCallCursor<'_>, types: &[ScalarType],
+    ) -> Option<Vec<BigInt>> {
+        let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
+        if self.operations.len() != types.len() || bindings.len() != types.len() || body.boundary.parameters.len() != types.len() {
+            return None;
+        }
+        let old = types.iter().zip(bindings).zip(&body.boundary.parameters).map(|((ty, binding), slot)| {
+            if &slot.ty != ty || !is_integer_type(ty) { return None; }
+            cursor.contextual_singleton(binding, ty)
+        }).collect::<Option<Vec<_>>>()?;
+        if !self.accepts(&old) { return None; }
+        let next = self.operations.iter().zip(&old).zip(types).map(|((op, &value), ty)| {
+            let new = match op {
+                IntegerTailOperand::Entry => value.clone(),
+                IntegerTailOperand::Offset(true, amount) => value + amount,
+                IntegerTailOperand::Offset(false, amount) => value - amount,
+                IntegerTailOperand::Literal(value) => value.clone(),
+            };
+            integer_literal_fits_type(&new, ty).then_some(new)
+        }).collect::<Option<Vec<_>>>()?;
+        let strict = self.rank_axes.iter().find_map(|&slot| {
+            let before = *old.get(slot)?;
+            let after = next.get(slot)?;
+            (before != after).then(|| after.sign() != num_bigint::Sign::Minus && after < before)
+        });
+        (strict == Some(true) && self.domains.iter().zip(&next).all(|(domain, value)| domain.contains(value))).then_some(next)
+    }
+}
+
+pub(super) fn verify_capped_wide<'a>(
+    plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>,
+) -> Result<CappedTailRecipe, ProjectCheck> {
+    if !(3..=MAX_RANKED_INTEGER_AXES).contains(&rank.entries().count()) || rank.float_entry().is_some() || rank.sum {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let mut captured = None;
+    if !matches!(verify_impl(plan, rank, Some(&mut captured))?, RankedInductionOutcome::Premise(InductionPremise::Established)) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    captured.ok_or(ProjectCheck::Unsupported)
+}
+
 pub(super) fn verify<'a>(
     plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>,
+) -> Result<RankedInductionOutcome<'a>, ProjectCheck> {
+    verify_impl(plan, rank, None)
+}
+
+fn verify_impl<'a>(
+    plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>,
+    mut capture: Option<&mut Option<CappedTailRecipe>>,
 ) -> Result<RankedInductionOutcome<'a>, ProjectCheck> {
     let typed = &plan.typed;
     let body = typed.body;
@@ -486,6 +556,20 @@ pub(super) fn verify<'a>(
             check_tail(plan, rank, output, runtime, &args)?;
             matched_calls += 1;
             let next = path.transition(&entry, rank, &args, &mut work)?;
+            if let Some(capture) = &mut capture {
+                let RankLane::Integers(entry) = &entry else { return Err(ProjectCheck::Unsupported); };
+                if capture.is_some() { return Err(ProjectCheck::Unsupported); }
+                charge(&mut work, args.len())?;
+                for domain in &entry.0 { charge(&mut work, domain.interval_count())?; }
+                let operations = args.iter().map(|op| Ok(match op {
+                    Coordinate::Entry => IntegerTailOperand::Entry,
+                    Coordinate::Offset { add, magnitude } => IntegerTailOperand::Offset(*add, (*magnitude).clone()),
+                    Coordinate::Literal(v) => IntegerTailOperand::Literal(v.clone().into_owned()),
+                    _ => return Err(ProjectCheck::Unsupported),
+                })).collect::<Result<Vec<_>, _>>()?;
+                **capture = Some(CappedTailRecipe { target: plan.target, site: output, operations,
+                    rank_axes: rank.axes().map(|(axis, _)| axis.ordinal).collect(), domains: entry.0.clone() });
+            }
             if let Some((equation, context)) = rewrite {
                 let TypedProofGoal::Literal { operator: operator @ BinaryOperator::Equal, bound, .. } = &typed.goal
                     else { return Err(ProjectCheck::Unsupported); };

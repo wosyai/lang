@@ -1,5 +1,5 @@
 //! Run-local authored path budget. No values form part of structural identity.
-use std::{collections::{HashMap, HashSet}, num::NonZeroUsize};
+use std::{rc::Rc, collections::{HashMap, HashSet}, num::NonZeroUsize};
 use wosy_syntax::{SourceIdentity, SourceSpan};
 use num_bigint::BigInt;
 use super::{OccurrenceOrdinal, PreparedCallable, ScalarType};
@@ -33,6 +33,13 @@ pub(super) struct StartupProofObservation {
     pub(super) directive_position: usize,
     pub(super) parameter: ScalarType,
     pub(super) argument: BigInt,
+    pub(super) returned: BigInt,
+}
+
+pub(super) struct WideRankObservation {
+    pub(super) target: PreparedCallable,
+    pub(super) site: SourceSpan,
+    pub(super) arguments: Vec<BigInt>,
     pub(super) returned: BigInt,
 }
 
@@ -101,6 +108,8 @@ pub(in super::super) struct StartUpSearch {
     pub(super) mixed_context: Option<MixedContextStartup>,
     pub(super) ranked_target: Option<PreparedCallable>,
     pub(super) ranked_observations: Vec<StartupProofObservation>,
+    pub(super) wide_rank_recipe: Option<Rc<super::ranked::CappedTailRecipe>>,
+    pub(super) wide_rank_observations: Vec<WideRankObservation>,
     #[cfg(test)]
     pub(super) ranked_entries: Vec<BigInt>,
 }
@@ -112,7 +121,7 @@ impl StartUpSearch {
 
     fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
         Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, has_bare_startup: false, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false, cited_routes: HashMap::new(),
-            pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(),
+            pointee_route: None, contextual_roster: None, contextual_route: None, contextual_observed: false, mixed_context: None, ranked_target: None, ranked_observations: Vec::new(), wide_rank_recipe: None, wide_rank_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
