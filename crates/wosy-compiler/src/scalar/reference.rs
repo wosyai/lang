@@ -14370,14 +14370,14 @@ fn exact_joined_conditional_reader(
     Some(())
 }
 
-// The single self edge takes the same checked formal and a literal false:
-// after entering the recursive arm it must select the direct read arm.
-fn exact_bounded_recursive_scalar_reader(
-    source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+// Record a local rank edge separately from its certified false-entry read.
+// Whole-call effects are published only after every local entry is prepared.
+fn exact_ranked_scalar_reader_edge(
+    source: &SourceIdentity, calls: &FunctionCallSites,
     expression: &ScalarExpression, output: OccurrenceOrdinal, guard: &ParameterSlot,
     parameter: &ParameterSlot, inner: &ScalarType,
     formal_name: &impl Fn(OccurrenceOrdinal, ByteSpan) -> bool,
-) -> Option<()> {
+) -> Option<ByteSpan> {
     let ScalarExpression::If { condition, then_branch, else_branch, .. } = expression else { return None; };
     let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, type_arguments, .. })] =
         then_branch.items.as_slice() else { return None; };
@@ -14408,13 +14408,13 @@ fn exact_bounded_recursive_scalar_reader(
     };
     let recursive = branch_output(OccurrenceEdge::ThenBranch)?;
     let [call] = calls.call_occurrences.as_slice() else { return None; };
-    if call.ordinal != recursive || calls.declared_unsafe_calls.contains(&recursive.0)
-        || !matches!(&calls.sites.get(call.site)?.target, ResolvedCallTarget::ModuleCallable {
-            source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
-        } if callee == source && *declaration_span == function.name_span)
-    {
+    if call.ordinal != recursive || calls.declared_unsafe_calls.contains(&recursive.0) {
         return None;
     }
+    let ResolvedCallTarget::ModuleCallable {
+        source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
+    } = &calls.sites.get(call.site)?.target else { return None; };
+    if callee != source { return None; }
     let signature = calls.checked_call_signatures.get(&recursive)?;
     let [guard_ty, parameter_ty] = signature.parameters.as_slice() else { return None; };
     let [result] = signature.outputs.outputs.as_slice() else { return None; };
@@ -14435,12 +14435,14 @@ fn exact_bounded_recursive_scalar_reader(
         return None;
     }
     exact_joined_conditional_reader(base, branch_output(OccurrenceEdge::ElseBranch)?,
-        structure, parameter, None, inner, formal_name, 2)
+        structure, parameter, None, inner, formal_name, 2)?;
+    Some(*declaration_span)
 }
 
 impl SharedScalarReadEffect {
     fn prepare(
         source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+        ranked_entries: &mut HashMap<ByteSpan, ByteSpan>,
     ) -> Option<Self> {
         let (scalar, parameter) = match calls.boundary.parameters.as_slice() {
             [parameter] => (None, parameter),
@@ -14482,11 +14484,11 @@ impl SharedScalarReadEffect {
             return None;
         }
         if let Some(guard) = scalar.filter(|guard| guard.ty == ScalarType::Bool) {
-            if exact_bounded_recursive_scalar_reader(source, function, calls, expression, output,
-                guard, parameter, inner, &formal_name).is_some()
+            if let Some(target) = exact_ranked_scalar_reader_edge(source, calls, expression,
+                output, guard, parameter, inner, &formal_name)
             {
-                return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: true,
-                    bool_prefix: true, returns_formal: false, staged_local_forward: true });
+                ranked_entries.insert(function.name_span, target);
+                return None;
             }
         }
         if scalar.is_none_or(|formal| formal.ty == ScalarType::Bool)
@@ -17271,6 +17273,7 @@ fn resolve_module_call_sites(
     stage_observations::record_call_sites();
     let mut functions = BTreeMap::new();
     let mut shared_scalar_read_effects = HashMap::new();
+    let mut ranked_reader_entries = HashMap::new();
     let mut exclusive_scalar_writers = HashSet::new();
     let mut shared_reader_forwarders = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -17288,7 +17291,7 @@ fn resolve_module_call_sites(
                 if exact_exclusive_scalar_writer(function, &calls) {
                     exclusive_scalar_writers.insert(function.name_span);
                 }
-                if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
+                if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls, &mut ranked_reader_entries) {
                     shared_scalar_read_effects.insert(function.name_span, effect);
                 } else if let Some((target, kind)) = shared_scalar_reader_forward_target(source, function, &calls) {
                     shared_reader_forwarders.push((function.name_span, target, kind));
@@ -17298,6 +17301,17 @@ fn resolve_module_call_sites(
         }
     }
     if select_executable_calls {
+        // Every certified transition goes from the true entry to a
+        // separately prepared false entry, which contains no call. Declaration
+        // cycles do not provide or require a same-rank assumption.
+        for (&declaration, target) in &ranked_reader_entries {
+            if ranked_reader_entries.contains_key(target) {
+                shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
+                    parameter: 1, descriptor: false, joined_only: true,
+                    bool_prefix: true, returns_formal: false, staged_local_forward: true,
+                });
+            }
+        }
         for calls in functions.values_mut() {
             close_local_shared_call_families(source, calls, &shared_scalar_read_effects);
             attach_local_exclusive_writers(calls, source, &exclusive_scalar_writers);

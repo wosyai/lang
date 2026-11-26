@@ -1929,6 +1929,75 @@ unit() examine = fn {
     }
 
     #[test]
+    fn authored_mutual_ranked_readers_require_each_target_base_entry() {
+        let text = "%%start
+struct Pair { u16 left; u16 right; }
+u16(bool, *u16) first = fn(again, input) {
+    if (again) { second(false, input) } else { *input }
+};
+u16(bool, *u16) second = fn(again, input) {
+    if (again) { first(false, input) } else { *input }
+};
+unit() examine = fn {
+    Pair owner = { .left = 7; .right = 9; };
+    *u16 held = &owner.left;
+    owner.right = 3;
+    u16 observed = first(true, held);
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "ranked-mutual.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let mut calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = |calls: &ModuleCallSites| {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().last().unwrap().1
+            };
+            assert_eq!(calls.shared_scalar_read_effects.values().filter(|effect| effect.staged_local_forward).count(), 2);
+            let mut staged = prepared(&calls);
+            for effect in calls.shared_scalar_read_effects.values_mut() {
+                effect.staged_local_forward = false;
+            }
+            let mut incumbent = prepared(&calls);
+            assert!(incumbent.proof_points.local_borrow.is_none());
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("locally ranked mutual graph");
+            assert!(sealed.identity_calls.is_empty(), "scalar readers do not mint return loans");
+            let points = &staged.cfg.initial_points;
+            let call = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call { .. })).unwrap();
+            assert!(matches!(&call.kind, CfgPointKind::Call { argument_points, .. } if argument_points.len() == 2));
+            assert!(sealed.holders.iter().any(|holder| holder.holder.reads.last() == Some(&call.id)));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[8] > 0, "sibling store must use staged refinement: {counts:?}");
+
+            let unprepared_target = text.replace(
+                "if (again) { first(false, input) } else { *input }", "*input",
+            );
+            let source = SourceIdentity::new("p".into(), "local".into(), "ranked-target-fallback.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, unprepared_target.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let calls = resolve_program_call_sites_with_occurrences(&typed.program, occurrences).unwrap();
+            assert!(!calls.shared_scalar_read_effects.values().any(|effect| effect.staged_local_forward),
+                "the caller's true edge alone cannot certify an unprepared target's false entry");
+        }
+    }
+
+    #[test]
     fn authored_nested_branch_graph_keeps_bypass_and_exact_incumbent_labels() {
         for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
             for overwrite_bypass in [true, false] {
