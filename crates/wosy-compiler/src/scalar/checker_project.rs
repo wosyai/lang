@@ -3333,6 +3333,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let traced_rank = false;
             #[cfg(feature = "internal-checker")]
             let mut guarded_nonreturn = false;
+            #[cfg(feature = "internal-checker")]
+            let startup_context_entry = active_collection.is_some_and(|ordered| {
+                let effects = ordered.failures.borrow();
+                effects.startup_search.as_ref().is_some_and(|trace| {
+                    let trace = trace.borrow();
+                    trace.mixed_context.is_some() && trace.contextual_route.is_some_and(|(entry, _)|
+                        self.calls.function_body(entry.0, entry.1, None).is_some_and(|actual| std::ptr::eq(actual, body)))
+                })
+            });
             let mut sink = |failure: IntegerCheckFailure<'_>| {
                 #[cfg(feature = "internal-checker")]
                 if frame.contextual_explicit.is_some()
@@ -3348,6 +3357,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     #[cfg(feature = "internal-checker")]
                     if let Some(trace) = &effects.startup_search {
                         let mut trace = trace.borrow_mut();
+                        if startup_context_entry && trace.mixed_context.as_ref().is_some_and(|route|
+                            route.dependent_requires.contains(&failure.directive))
+                        {
+                            if !trace.contextual_observed { trace.invalidate(); return; }
+                            if trace.mixed_context.as_ref().is_some_and(|route| route.refuted_after_named.is_some()) {
+                                // This row's snapshot came from the very
+                                // theorem that refuted. It cannot buy a slot
+                                // or hide a later independent failure.
+                                return;
+                            }
+                        }
                         let decision = body.occurrences.get(failure.directive.0)
                             .and_then(|site| trace.admit(wosy_syntax::SourceSpan::new(source.clone(), site.span)));
                         match decision {
@@ -10753,6 +10773,71 @@ fn run_private_guarded_context(
     }, selected))
 }
 
+/// Seal only flat, independently reachable obligations in the app Unit
+/// entry. Literal Requires are independent; an integer Require may consult
+/// only an immutable read of the exact returned contextual place.
+#[cfg(feature = "internal-checker")]
+fn mixed_context_entry_requires(
+    body: &FunctionCallSites, call: OccurrenceOrdinal,
+) -> Result<HashSet<OccurrenceOrdinal>, ProjectCheck> {
+    if body.structure.checker_directives.is_empty() { return Ok(HashSet::new()); }
+    let structure = &body.structure;
+    if !body.conditionals.is_empty() || !body.assignments.is_empty()
+        || !structure.checker_selected_snapshots.is_empty()
+    { return Err(ProjectCheck::Unsupported); }
+    let (place, ty) = body.contextual_argument(call).ok_or(ProjectCheck::Unsupported)?;
+    let block = structure.blocks.get(structure.root.0).ok_or(ProjectCheck::Unsupported)?;
+    let mut work = 0;
+    super::checker_flow::charge_call_work(&mut work, block.items.len()).ok_or(ProjectCheck::Unsupported)?;
+    let mut after_call = false;
+    let mut reads = HashSet::new();
+    let mut dependent = HashSet::new();
+    let mut directives = 0usize;
+    for item in &block.items {
+        match &item.kind {
+            BlockItemKind::Binding(binding) => {
+                let key = (structure.root, item.position);
+                let [receiver] = binding.receivers() else { return Err(ProjectCheck::Unsupported); };
+                if structure.checker_contextual_declarations.contains(&key) {
+                    if after_call || receiver.contextual_storage.as_ref() != Some(place) || &receiver.ty != ty {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    continue;
+                }
+                let BindingInitialization::Outputs(output) = &binding.initialization else { return Err(ProjectCheck::Unsupported); };
+                let read = structure.checker_contextual_read_locals.get(&key).ok_or(ProjectCheck::Unsupported)?;
+                if !after_call || receiver.contextual_storage.is_some() || &receiver.ty != ty || !output.secondary.is_empty()
+                    || structure.checked_types.expressions.get(&output.primary) != Some(ty)
+                    || !structure.checker_contextual_occurrences.contains(&output.primary)
+                    || !matches!(body.prepared_plain_name(output.primary), Some(super::reference::PlainNameIdentity::Lexical(bound)) if bound == place)
+                { return Err(ProjectCheck::Unsupported); }
+                reads.insert(read);
+            }
+            BlockItemKind::Evaluation { expression } if *expression == call => {
+                if after_call { return Err(ProjectCheck::Unsupported); }
+                after_call = true;
+            }
+            BlockItemKind::Evaluation { expression } => {
+                let directive = structure.checker_directives.get(expression).ok_or(ProjectCheck::Unsupported)?;
+                if directive.operation != CheckerOperation::Require || directive.output.has_module_values
+                    || !directive.output.state_files.is_empty() || !matches!(directive.output.code_value, CheckerCode::Literal(_))
+                { return Err(ProjectCheck::Unsupported); }
+                match &directive.predicate {
+                    Some(CheckerPredicate::Boolean(_)) => {},
+                    Some(CheckerPredicate::Integer(predicate)) if &predicate.ty == ty && reads.contains(&predicate.binding) => {
+                        dependent.insert(*expression);
+                    }
+                    _ => return Err(ProjectCheck::Unsupported),
+                }
+                directives = directives.checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        }
+    }
+    if !after_call || directives != structure.checker_directives.len() { return Err(ProjectCheck::Unsupported); }
+    Ok(dependent)
+}
+
 /// The previously admitted configured app/provider mixed cohort, with
 /// one ordinary theorem and one independently authenticated context debit.
 #[cfg(feature = "internal-checker")]
@@ -10810,9 +10895,7 @@ fn run_private_mixed_root_context(
         let [site] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
         if !body.checker_returns_unit() || !body.boundary.parameters.is_empty() || !body.arms.is_empty()
             || !body.allocation_length_calls.is_empty() || !body.callable_escapes.is_empty()
-            // This slice does not admit authored paths inside the contextual
-            // frames, which could rely on a refuted postcondition.
-            || !body.structure.checker_directives.is_empty() || body.contextual_argument(site.ordinal).is_none()
+            || body.contextual_argument(site.ordinal).is_none()
         { return Err(ProjectCheck::Unsupported); }
         Ok((site.ordinal, *body.structure.checker_direct_targets.get(&site.ordinal).ok_or(ProjectCheck::Unsupported)?))
     };
@@ -10824,17 +10907,27 @@ fn run_private_mixed_root_context(
     let (bridge_site, forwarded) = edge_to(bridge_body)?;
     let leaf_body = calls.function_body(leaf.0, leaf.1, None).ok_or(ProjectCheck::Unsupported)?;
     if forwarded != leaf || bridge_body.contextual_formal().is_none()
+        || !bridge_body.structure.checker_directives.is_empty()
         || !leaf_body.call_occurrences.is_empty() || !leaf_body.structure.checker_directives.is_empty()
     { return Err(ProjectCheck::Unsupported); }
+    let dependent_requires = mixed_context_entry_requires(entry_body, entry_site)?;
+    if !dependent_requires.is_empty() {
+        let bridge_root = bridge_body.structure.blocks.get(bridge_body.structure.root.0).ok_or(ProjectCheck::Unsupported)?;
+        if !matches!(bridge_root.items.as_slice(), [item]
+            if matches!(&item.kind, BlockItemKind::Evaluation { expression } if *expression == bridge_site))
+        { return Err(ProjectCheck::Unsupported); }
+    }
     let (_, roots) = package_obligation_roots(&owner.prepared, scope, 2, root)?;
-    if !roots.is_empty() { return Err(ProjectCheck::Unsupported); }
+    if roots.into_iter().any(|(module, items)| module != entry.0 || items.into_iter().any(|item| item != entry.1)) {
+        return Err(ProjectCheck::Unsupported);
+    }
 
     let mut trace = StartUpSearch::new(root, cap);
     trace.retain_after_cutoff = true;
     trace.named_target = Some(plan.target);
     trace.contextual_route = Some((entry, leaf));
     trace.mixed_context = Some(MixedContextStartup {
-        root_site: *root_site, entry_site, bridge, bridge_site, finished: false, refuted_after_named: None,
+        root_site: *root_site, entry_site, bridge, bridge_site, finished: false, refuted_after_named: None, dependent_requires,
     });
     trace.enroll_proof_sites(plan.target, StartupProofRole::Bare, &[*named_site]).ok_or(ProjectCheck::Unsupported)?;
     effects.startup_search = Some(Rc::new(RefCell::new(trace)));

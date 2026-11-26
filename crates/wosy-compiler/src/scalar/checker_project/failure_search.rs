@@ -48,6 +48,7 @@ pub(super) struct MixedContextStartup {
     pub(super) bridge_site: OccurrenceOrdinal,
     pub(super) finished: bool,
     pub(super) refuted_after_named: Option<usize>,
+    pub(super) dependent_requires: HashSet<OccurrenceOrdinal>,
 }
 
 pub(in super::super) type SharedStartupTrace = std::rc::Rc<std::cell::RefCell<StartUpSearch>>;

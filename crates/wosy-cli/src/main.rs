@@ -3107,6 +3107,50 @@ main_artifact = "main"
                     let refused = selected(1);
                     assert!(matches!(refused[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
                     assert!(!state.exists());
+
+                    // The same real debit can support an ordinary Require
+                    // on an authenticated immutable post-effect read.
+                    let snapshot_root = context_root.replace(&format!("core.require(false, {first});"), "")
+                        .replace("lib.spend();", &format!(
+                            "lib.spend(); u8 observed_credit = core.context.credit; core.require(observed_credit == 1, {first});"))
+                        .replace("ensures (out == 3)", "ensures (out == 4)");
+                    assert_ne!(snapshot_root, context_root);
+                    fs::write(&source, &snapshot_root).unwrap();
+                    fs::write(&shared_source, mixed_context_provider.replace("credit) - 0", "credit) - 1")).unwrap();
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old.0, Ok(19));
+                    assert_eq!(files(), both_files);
+                    clean();
+                    let limited = selected(1);
+                    let report = limited[0].outcome.as_ref().unwrap();
+                    assert!(report.contextual_diagnostic.is_none() && report.diagnostics.is_empty());
+                    let [failure] = report.directives.as_slice() else { panic!("confirmed dependent Require consumes first slot"); };
+                    let range = failure.condition;
+                    assert_eq!(&snapshot_root[range.start as usize..range.end as usize], "observed_credit == 1");
+                    let (axis, _) = failure.witness.axes().enumerate().find(|(_, (binding, _))|
+                        &snapshot_root[binding.declaration_span.start as usize..binding.declaration_span.end as usize] == "observed_credit").unwrap();
+                    assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&2.into(), &2.into())]));
+                    assert_eq!(terminal(&limited, scope, false), (Ok(0), b"first".to_vec(), b"[first]".to_vec()));
+                    assert_eq!(files(), first_file);
+                    clean();
+                    assert_eq!(terminal(&selected(8), scope, false), old);
+                    assert_eq!(files(), both_files);
+                    clean();
+
+                    // A refuted authority cannot spend the cap on that
+                    // snapshot; the independent original failure is next.
+                    fs::write(&shared_source, mixed_context_provider).unwrap();
+                    let retained = selected(1);
+                    let checked = retained[0].outcome.as_ref().unwrap();
+                    assert!(checked.contextual_diagnostic.is_some());
+                    let [failure] = checked.directives.as_slice() else { panic!("the independent Require still counts"); };
+                    let range = failure.condition;
+                    assert_eq!(&snapshot_root[range.start as usize..range.end as usize], "scored == 3");
+                    let retained = terminal(&retained, scope, false);
+                    assert_eq!((retained.0, retained.1), (Ok(19), b"second".to_vec()));
+                    assert!(retained.2.starts_with(b"[second]"));
+                    assert_eq!(files(), BTreeMap::from([("second.txt".to_owned(), b"file:second".to_vec())]));
+                    clean();
                 }
                 fs::remove_file(&shared_source).unwrap();
                 let rank_definition = r#"
