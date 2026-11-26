@@ -654,9 +654,19 @@ fn check_cap_process_preserves_the_existing_declared_dormant_fallback_proof() {
                         assert!(!project.output().exists());
                     }
                     if !early && refuted {
-                        // The dormant initializer is not authoritative,
-                        // even when its call is well-typed in its own source.
+                        // A typed initializer in an inspected dormant
+                        // source remains nonexecuting. Do not use its 8
+                        // as the theorem witness instead of symbolic 7.
                         fs::write(&deferred_owner, dormant.replace("%%end", "u8 staged = fallback(8); %%end")).unwrap();
+                        let old = project.run(&[scope]);
+                        assert_eq!(old.status.code(), Some(1), "{old:?}");
+                        assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));
+                        assert_terminal(&project.run(&[scope, "--max-errors", "1"]), 1, b"", &old.stderr);
+                        assert!(!project.output().exists());
+
+                        // A valid lexical caller is not the inspected
+                        // initializer exception and remains refused.
+                        fs::write(&deferred_owner, dormant.replace("%%end", "u8() caller = fn { fallback(8) }; %%end")).unwrap();
                         let old = project.run(&[scope]);
                         assert_eq!(old.status.code(), Some(1), "{old:?}");
                         assert!(String::from_utf8_lossy(&old.stderr).contains("symbolic call can return 7"));

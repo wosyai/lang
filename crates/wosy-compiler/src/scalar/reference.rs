@@ -7119,7 +7119,8 @@ impl ProjectCallSiteResults {
         let mut saw_dormant = false;
         for module in &self.modules {
             let module = module.as_ref().ok()?;
-            if !source_set.contains(&module.initialization.source) {
+            let is_dormant = !source_set.contains(&module.initialization.source);
+            if is_dormant {
                 if dormant != Some(&module.initialization.source) || std::mem::replace(&mut saw_dormant, true) {
                     return None;
                 }
@@ -7130,6 +7131,14 @@ impl ProjectCallSiteResults {
             for (&site, call) in &startup.call_targets {
                 match call {
                     ModuleInitializationCallTarget::Direct { declaration, concrete } if candidate(declaration, &startup_uses) => {
+                        // This typed local site belongs to the separately
+                        // inspected owner, so its initializer cannot run
+                        // in this plan. It does not enroll or authenticate
+                        // an actual invocation. Lexical references below
+                        // remain subject to the independent proof fence.
+                        if is_dormant && declaration.source == module.initialization.source
+                            && *concrete == ConcreteCallSelection::Declaration
+                        { continue; }
                         if &module.initialization.source != caller || *concrete != ConcreteCallSelection::Declaration { return None; }
                         startup_uses.get_mut(&(&declaration.source, declaration.range))?.push(site);
                     }
