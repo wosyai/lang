@@ -703,6 +703,8 @@ struct ReachedContextualProof {
     saw_guarded_nonreturn: bool,
     reached_at_startup: bool,
     examined_symbolic_root: bool,
+    typed_where: Option<CheckerPredicate>,
+    saw_excluded_occurrence: bool,
     refutation: Option<ContextualProofOccurrence>,
     reusable_body: Option<*const FunctionCallSites>,
     verified: Option<VerifiedContextualOutcome>,
@@ -744,6 +746,18 @@ impl ReachedContextualProof {
             || binding.source.project != formal.source.project || binding.source.package != formal.source.package
         {
             return Err(ProjectCheck::Unsupported);
+        }
+        if let Some(CheckerPredicate::Integer(guard)) = &self.typed_where {
+            let (_, value) = explicit.ok_or(ProjectCheck::Unsupported)?;
+            if !IntegerRelation::from_operator(&guard.operator).ok_or(ProjectCheck::Unsupported)?
+                .accepts(value.cmp(&guard.bound))
+            {
+                // A real ordinary return, but no theorem application and no
+                // reusable postcondition authority outside its typed domain.
+                if reused { return Err(ProjectCheck::Unsupported); }
+                self.saw_excluded_occurrence = true;
+                return Ok(());
+            }
         }
         let proved = if reused {
             if self.reusable_exit(self.target, body, binding, ty, site, entry, explicit.map(|(_, value)| value)) != Some(exit) {
@@ -807,6 +821,7 @@ struct ContextualProofHeader {
     goal: ByteSpan,
     add: bool,
     amount: super::contextual::ContextualProofAmount,
+    where_declaration: Option<CstNode>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -828,7 +843,7 @@ fn contextual_proof_headers(canonical: &CanonicalCstRoot, allow_explicit: bool) 
 
 #[cfg(feature = "internal-checker")]
 fn contextual_proof_header(declaration: &CstNode, allow_explicit: bool) -> Result<ContextualProofHeader, ProjectCheck> {
-    if declaration.children().any(|node| matches!(node.kind(), SyntaxKind::ProofWhere | SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
+    if declaration.children().any(|node| matches!(node.kind(), SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
         || child(&declaration, SyntaxKind::Block)?.children().next().is_some()
     {
         return Err(ProjectCheck::Unsupported);
@@ -865,8 +880,10 @@ fn contextual_proof_header(declaration: &CstNode, allow_explicit: bool) -> Resul
     if let super::contextual::ContextualProofAmount::EntryParameter(parameter) = &amount {
         if explicit.as_deref() != Some(parameter.text()) { return Err(ProjectCheck::Unsupported); }
     }
+    let guarded = declaration.children().any(|node| node.kind() == SyntaxKind::ProofWhere);
+    if guarded && (!allow_explicit || explicit.is_none()) { return Err(ProjectCheck::Unsupported); }
     Ok(ContextualProofHeader { name, explicit, place, proof: wosy_syntax::byte_span(&declaration),
-        goal: wosy_syntax::byte_span(&goal), add, amount })
+        goal: wosy_syntax::byte_span(&goal), add, amount, where_declaration: guarded.then(|| declaration.clone()) })
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -918,6 +935,9 @@ fn run_contextual_check(
     prepared: &PreparedCheckerProject, effects: OrderedFailures, startup_count: usize,
     scope: ScalarCheckerScope, retain_observations: bool,
 ) -> Result<PreparedOrderedRun<ProofFreeOrderedEvidence>, ProjectCheck> {
+    if effects.contextual_proofs.entries.values().any(|proof| proof.typed_where.is_some()) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let mut report = run_prepared_ordered_check_with_effects(prepared, scope, startup_count,
         OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, effects)?;
     complete_contextual_effects(&mut report, scope, retain_observations)?;
@@ -959,12 +979,19 @@ fn prepare_contextual_effects(
         if header.place.text() != context.name.as_ref() || !valid_amount {
             return Err(ProjectCheck::Unsupported);
         }
+        let typed_where = if let Some(declaration) = &header.where_declaration {
+            let formal_name = header.explicit.as_ref().ok_or(ProjectCheck::Unsupported)?;
+            let filters = prepare_proof_entry_filter_in_scope(declaration, &proof_source, module.target_layout,
+                std::slice::from_ref(formal_name), body, false)?.ok_or(ProjectCheck::Unsupported)?;
+            let [predicate @ CheckerPredicate::Integer(_)] = filters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            Some(predicate.clone())
+        } else { None };
         let target = (module_index, item);
         if contextual_proofs.entries.insert(target, ReachedContextualProof {
             source: proof_source, proof: header.proof, target, formal: formal.clone(), ty: ty.clone(), goal: header.goal,
             add: header.add, amount: header.amount, observations: Vec::new(),
             retain_observations, explicit: header.explicit, saw_proved_occurrence: false, saw_guarded_nonreturn: false, reached_at_startup: false,
-            examined_symbolic_root: false, refutation: None,
+            examined_symbolic_root: false, refutation: None, typed_where, saw_excluded_occurrence: false,
             reusable_body: (startup_count == 1 && super::checker_flow::exact_contextual_summary_leaf(body))
                 .then_some(std::ptr::from_ref(body)),
             verified: None,
@@ -3336,16 +3363,20 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     #[cfg(feature = "internal-checker")]
                     if let Some(trace) = active_collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
                         let traced_rank = trace.borrow().ranked_target;
-                        if traced_rank.is_none() || child.target.map(|target| target.0) != traced_rank
-                            || !std::ptr::eq(frame.body, child.body) || frame.source != child.source
-                        { return Err(ProjectCheck::Unsupported); }
+                        let target = child.target.map(|target| target.0);
+                        let rank_self = traced_rank.is_some() && target == traced_rank && std::ptr::eq(frame.body, child.body);
+                        let context_leaf = trace.borrow().contextual_route.is_some_and(|(_, leaf)| target == Some(leaf))
+                            && child.contextual_origin.is_some() && matches!(call, ExactCallEffect::Unit(_));
+                        if (!rank_self && !context_leaf) || frame.source != child.source {
+                            return Err(ProjectCheck::Unsupported);
+                        }
                         let span = frame.body.occurrences.get(call.occurrence().0)
                             .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
                         trace.borrow_mut().append(failure_search::PathStep::Call(
                             wosy_syntax::SourceSpan::new(frame.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
                         child.cursor.track_startup_path(child.source, Rc::clone(&trace)).ok_or(ProjectCheck::Unsupported)?;
                         #[cfg(test)]
-                        trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?);
+                        if rank_self { trace.borrow_mut().ranked_entries.push(child.entry.clone().ok_or(ProjectCheck::Unsupported)?); }
                     }
                     frames.push(child);
                 }
@@ -3425,6 +3456,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         }
                         parent.cursor.resume_exact_local_update(binding, ty, entry, exit)
                             .ok_or(ProjectCheck::Unsupported)?;
+                        if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
+                            if !trace.borrow().contextual_route.is_some_and(|(_, leaf)| leaf == target) {
+                                return Err(ProjectCheck::Unsupported);
+                            }
+                            let span = parent.body.occurrences.get(effect.occurrence().0)
+                                .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                            trace.borrow_mut().append(failure_search::PathStep::Return(
+                                wosy_syntax::SourceSpan::new(parent.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
+                        }
                         continue;
                     }
                     #[cfg(feature = "internal-checker")]
@@ -3976,6 +4016,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let matches_ranked = search.ranked_target == Some(target) && search.ranked_observation.is_none()
                 && caller == &owner.source && ordered.scalar_initializer.is_some()
                 && signature.parameters.len() == 1 && is_integer_type(expected);
+            let matches_context_entry = search.contextual_route.is_some_and(|(entry, _)| target == entry)
+                && caller == &owner.source && *expected == ScalarType::Unit && signature.parameters.is_empty();
             let cross_authorized = search.named_cross_source && matches_named && caller != &owner.source
                 && self.completed_namespace_call(caller, owner, target.0, body, signature, expected, ordered.visits);
             if !ACTUAL_STARTUP || (*expected != ScalarType::Unit && !matches_named && !matches_plain_scalar && !matches_ranked)
@@ -3983,7 +4025,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || ordered.startup_site_source != Some(caller)
                 || !ordered.startup_site.is_some_and(|site|
                     std::ptr::eq(&site.topology.structure, structure) && site.occurrence == call)
-                || (!matches_plain_scalar && !body.checker_named_route_frame()) || (!matches_ranked && (!body.call_occurrences.is_empty()
+                || (!matches_plain_scalar && !matches_context_entry && !body.checker_named_route_frame()) || (!matches_ranked && !matches_context_entry && (!body.call_occurrences.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()))
                 || !body.structure.checker_selected_snapshots.is_empty()
                 || !body.structure.module_storage_uses.is_empty()
@@ -9580,6 +9622,9 @@ fn prepare_mixed_scalar_contextual(
     initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
     inputs: ScalarPreparationInputs, configured_root: bool,
 ) -> Result<PreparedConfiguredCheck, ProjectCheck> {
+    if headers.iter().any(|(_, header)| header.where_declaration.is_some()) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let [catalog] = ordinary.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let [root, ..] = initialization_order.as_slice() else { return Err(ProjectCheck::MissingRoot); };
     let [(context_owner, _), ..] = headers.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -9969,6 +10014,17 @@ impl PreparedScalarOrderedCheck {
         run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Mixed).map_err(configured_ordered_error)
     }
 
+    /// Private guarded contextual startup with one original reached proof
+    /// and ordinary capped search. No ordinary publication on proof veto.
+    #[doc(hidden)]
+    pub fn search_startup_with_guarded_context(
+        self, cap: std::num::NonZeroUsize,
+    ) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Contextual { owner, effects, startup_count: 1 } = self.owner
+            else { return Err(ScalarOrderedCheckerOutcome::Unsupported); };
+        run_private_guarded_context(&owner, effects, self.scope, cap).map_err(configured_ordered_error)
+    }
+
     /// One real bare scalar startup activation and one independent ranked
     /// theorem, without using a ranked certificate as an authored path.
     #[doc(hidden)]
@@ -10292,6 +10348,82 @@ fn run_startup_authored_path(
         || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
     { return Err(ProjectCheck::Unsupported); }
     Ok((effects.records, completion, search, active))
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_private_guarded_context(
+    prepared: &PreparedCheckerProject, mut effects: OrderedFailures, scope: ScalarCheckerScope,
+    cap: std::num::NonZeroUsize,
+) -> Result<(MainFlowProofReceipt, Option<StartupAuthoredCompletion>), ProjectCheck> {
+    let (project, calls) = prepared.parts();
+    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let (root, ordinals) = package_startup_order(project, &project.modules)?;
+    let mut proofs = effects.contextual_proofs.entries.values();
+    let proof = proofs.next().ok_or(ProjectCheck::Unsupported)?;
+    let target = proof.target;
+    if proofs.next().is_some() || proof.typed_where.is_none() || target.0 != 0 {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let region = calls.initialization_region(0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let ModuleInitializationDetail::Occurrences(topology) = &region.detail
+        else { return Err(ProjectCheck::MissingRootOccurrences); };
+    let mut startup = topology.call_targets.values();
+    // Builtin directives are not resolved module targets. No unclassified
+    // callable edge can execute a second contextual activation at or after N.
+    let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
+        = startup.next().ok_or(ProjectCheck::Unsupported)? else { return Err(ProjectCheck::Unsupported); };
+    if startup.next().is_some() || &declaration.source != root || !topology.callable_escapes.is_empty() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let item = module.items.iter().position(|item| matches!(item, ScalarItem::Function(function)
+        if function.name_span == declaration.range && function.generic_parameters.is_empty() && function.overload_arms.is_empty()))
+        .ok_or(ProjectCheck::Unsupported)?;
+    let entry = calls.function_body(0, item, None).ok_or(ProjectCheck::Unsupported)?;
+    let leaf = calls.function_body(0, target.1, None).ok_or(ProjectCheck::Unsupported)?;
+    let [site] = entry.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if item == target.1 || entry.contextual_formal().is_some() || !entry.checker_returns_unit()
+        || !entry.boundary.parameters.is_empty() || !entry.arms.is_empty() || !entry.callable_escapes.is_empty()
+        || !entry.allocation_length_calls.is_empty() || entry.structure.checker_direct_targets.get(&site.ordinal) != Some(&target)
+        || entry.contextual_argument(site.ordinal).is_none()
+        || !leaf.call_occurrences.is_empty() || !leaf.arms.is_empty() || !leaf.callable_escapes.is_empty()
+        || !leaf.structure.checker_directives.is_empty() || !literal_history_directives(entry)
+    { return Err(ProjectCheck::Unsupported); }
+    let (_, roots) = package_obligation_roots(prepared, scope, 1, root)?;
+    if roots.into_iter().any(|(owner, items)| owner != 0 || items.into_iter().any(|candidate| candidate != item)) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let mut search = failure_search::StartUpSearch::new(root, cap);
+    search.contextual_route = Some(((0, item), target));
+    effects.startup_search = Some(Rc::new(RefCell::new(search)));
+    let outcome = check_package_initialization_observing_with_policy::<_, true, true>(
+        prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+    );
+    let search = Rc::try_unwrap(effects.startup_search.take().ok_or(ProjectCheck::Unsupported)?)
+        .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
+    if search.invalid() || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
+        || cap.get().checked_sub(search.remaining()) != Some(effects.records.len())
+    { return Err(ProjectCheck::Unsupported); }
+    let completion = match outcome {
+        Ok(_) if search.remaining() > 0 => StartupAuthoredCompletion::Exhausted,
+        Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => StartupAuthoredCompletion::LimitReached,
+        Err(error) => return Err(error),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    let proof = effects.contextual_proofs.entries.get(&target).ok_or(ProjectCheck::Unsupported)?;
+    if !proof.saw_proved_occurrence && !proof.saw_excluded_occurrence && proof.refutation.is_none() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let mut diagnostic = ordered_contextual_diagnostics(effects.contextual_proofs)?.into_iter();
+    let contextual_diagnostic = diagnostic.next();
+    // Preserve the existing contextual diagnostic priority. A veto is not
+    // authored exhaustion; expose no quota completion or staged payload.
+    let selected = contextual_diagnostic.is_none().then_some(completion);
+    Ok((MainFlowProofReceipt {
+        active: true, mixed_context_after_scalar: None, directives: if selected.is_some() { effects.records } else { Vec::new() },
+        diagnostics: Vec::new(), contextual_diagnostic, additional_contextual_diagnostics: diagnostic.collect(),
+        pointer_effect_diagnostic: None, aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None,
+        additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
+    }, selected))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -26661,6 +26793,65 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         }
         let missing = false_proof.replace("%%end", "unchanged(); %%end");
         assert!(matches!(run(&missing, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_guarded_context_keeps_proof_and_ordinary_domains_distinct() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-guarded-context");
+        let zero = OUTPUT.replace(".code = 1", ".code = 0");
+        let later = OUTPUT.replace(".code = 1", ".code = 19");
+        let program = format!(r#"%%start
+            unit(u8) consume = fn(charged) {{
+                if (charged == 1) {{ core.context.credit = core.context.credit - 1; }}
+                else {{ core.context.credit = core.context.credit - 1; }};
+            }};
+            unit() entry = fn {{
+                u8 core.context.credit = 3;
+                consume(1);
+                core.require(false, {zero});
+                core.require(false, {later});
+            }};
+            proof debit for consume(cost) -> (null) where (cost <= 1)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {{}}
+            entry();
+        %%end"#);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |text: &str| {
+                    let (_, parsed) = crate::parse_configured_proof_source(source.clone(), text.to_owned(), &[]).ok().unwrap();
+                    prepare_loaded_scalar_ordered_local_proof_contexts(Vec::new(),
+                        [(parsed, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                        scope, Vec::new()).ok().unwrap()
+                };
+                let unguarded = program.replace(" where (cost <= 1)", "");
+                let ordinary = prepare(&unguarded).run().unwrap();
+                assert!(matches!(prepare(&program).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                for cap in [1, 3] {
+                    let (report, completion) = prepare(&program).search_startup_with_guarded_context(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    assert!(report.contextual_diagnostic.is_none());
+                    assert_eq!(report.directives, ordinary.directives[..cap.min(2)]);
+                    assert_eq!(completion, Some(if cap == 1 { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted }));
+                }
+                let wrong = program.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+                let (refuted, completion) = prepare(&wrong).search_startup_with_guarded_context(NonZeroUsize::MIN).unwrap();
+                assert!(completion.is_none() && refuted.directives.is_empty());
+                let proof = refuted.contextual_diagnostic.unwrap();
+                assert_eq!((proof.entry, proof.exit), (3.into(), 3.into()));
+                assert_eq!(proof.explicit_entry, Some(("cost".into(), 1.into())));
+                assert_eq!(&wrong[proof.call.range.start as usize..proof.call.range.end as usize], "consume(1)");
+                let outside = wrong.replace("consume(1)", "consume(2)");
+                let (ordinary_only, completion) = prepare(&outside).search_startup_with_guarded_context(NonZeroUsize::MIN).unwrap();
+                assert!(ordinary_only.contextual_diagnostic.is_none());
+                assert_eq!(completion, Some(StartupAuthoredCompletion::LimitReached));
+                assert_eq!(ordinary_only.directives.len(), 1);
+                assert_eq!(ordinary_only.directives[0].code(), &BigInt::from(0));
+                let after_cap = program.replace("consume(1);", &format!("core.require(false, {zero}); consume(1);"));
+                assert!(matches!(prepare(&after_cap).search_startup_with_guarded_context(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]
