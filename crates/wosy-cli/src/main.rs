@@ -3510,6 +3510,82 @@ main_artifact = "main"
                 fs::remove_file(&shared_source).unwrap();
                 fs::remove_file(&additional_source).unwrap();
 
+                let scalar_relations = format!(r#"%%start
+                    i8(i8) signed = fn(value) {{ value }};
+                    u8(u8) unsigned = fn(value) {{ value }};
+                    u8(u8) advance = fn(value) {{ u8 next = value + 1; next }};
+                    u8(u8) shift = fn(value) {{ u8 next = value + 1; next }};
+                    u8(u8) unused = fn(value) {{ value }};
+                    proof sign_bound for signed(entry) -> (out) where (entry >= -4) ensures (out >= -1) {{}}
+                    proof exclusion for unsigned(entry) -> (out) where (entry == 5) ensures (out != 5) {{}}
+                    proof same_entry for advance(entry) -> (out) where (entry <= 8) ensures (out == core.old(entry)) {{}}
+                    proof increment for shift(entry) -> (out) where (entry <= 8) ensures (out == core.old(entry) + 2) {{}}
+                    proof deferred for unused(entry) -> (out) where (entry == 6) ensures (out <= 5) {{}}
+                    core.require(false, {first});
+                    i8 a = signed(-2);
+                    u8 b = unsigned(5);
+                    u8 c = advance(7);
+                    u8 d = shift(8);
+                    core.require(a < 0, {unused_output});
+                    core.require(b == 5, {unused_output});
+                    core.require(c == 8, {unused_output});
+                    core.require(d == 9, {unused_output});
+                    core.require(false, {second});
+                %%end"#);
+                fs::write(&source, &scalar_relations).unwrap();
+                let baseline = legacy();
+                let old = baseline.outcome.as_ref().unwrap();
+                assert_eq!(old.directives.len(), 2);
+                assert_eq!(old.diagnostics.len(), 4);
+                let before = terminal(std::slice::from_ref(&baseline), scope, false);
+                assert_eq!(before.0, Ok(19));
+                assert_eq!(before.1, b"firstsecond");
+                assert_eq!(files(), both_files);
+                clean();
+                for cap in [1, 2, 3] {
+                    let receipts = selected(cap);
+                    let actual = receipts[0].outcome.as_ref().unwrap();
+                    assert_eq!(actual.directives, old.directives[..cap.min(2)]);
+                    assert_eq!(actual.diagnostics.len(), 4);
+                    for ((new, prior), (call, value)) in actual.diagnostics.iter().zip(&old.diagnostics)
+                        .zip([("signed(-2)", -2), ("unsigned(5)", 5), ("advance(7)", 8), ("shift(8)", 9)])
+                    {
+                        assert_eq!(new.proof, prior.proof);
+                        assert_eq!(new.goal, prior.goal);
+                        assert_eq!(new.invocation.call, prior.invocation.call);
+                        assert_eq!(new.invocation.returned, value.into());
+                        let span = new.invocation.call.range;
+                        assert_eq!(&scalar_relations[span.start as usize..span.end as usize], call);
+                    }
+                    let observed = actual.symbolic_diagnostic.as_ref();
+                    assert_eq!(observed.is_some(), scope == ScalarCheckerScope::CurrentPackage);
+                    if let Some(observed) = observed {
+                        let prior = old.symbolic_diagnostic.as_ref().unwrap();
+                        assert_eq!((&observed.proof, &observed.goal, &observed.returned),
+                            (&prior.proof, &prior.goal, &prior.returned));
+                        assert_eq!(observed.directive_position, cap.min(2));
+                    }
+                    let printed = terminal(&receipts, scope, false);
+                    if cap == 1 {
+                        assert_eq!(printed.0, Ok(1));
+                        assert_eq!(printed.1, b"first");
+                        assert_eq!(files(), first_file);
+                    } else {
+                        assert_eq!(printed, before);
+                        assert_eq!(files(), both_files);
+                    }
+                    clean();
+                }
+                // Do not silently enable this newly enrolled goal in a provider catalog.
+                fs::write(&source, &roster_root).unwrap();
+                fs::write(&shared_source, provider(&first).replace("out == 8", "out >= 8")).unwrap();
+                fs::write(&additional_source, provider(&second)).unwrap();
+                let outside = selected(1);
+                assert!(matches!(outside[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
+                fs::remove_file(&shared_source).unwrap();
+                fs::remove_file(&additional_source).unwrap();
+
                 let aggregate = format!(r#"%%start
                     u8[2]() make = fn {{ [7, 1] }};
                     proof cells for make() -> (items)
@@ -3598,6 +3674,10 @@ main_artifact = "main"
                     u8 returned = echo(7);
                     core.require(returned == 8, {second});
                 %%end"#);
+                fs::write(&source, mixed_catalog.replace("ensures (out == 8)", "ensures (out >= 8)")).unwrap();
+                let excluded_relation = selected(1);
+                assert!(matches!(excluded_relation[0].outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(!state.exists());
                 for proof_scope in [0, 1, 2] {
                     let both = match proof_scope {
                         1 => mixed_catalog.replace("u8 returned = echo(7);", "u8 returned = 7;"),

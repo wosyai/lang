@@ -11627,12 +11627,24 @@ fn run_private_named_after_startup(
         }
         return run_private_citation_catalog(owner, scope, cap, &plans);
     }
+    let ordinary_relations = !qualified && expected.is_none() && arrays.is_empty() && ranked.is_none();
     let mut targets = HashSet::with_capacity(plans.len());
     let mut names = HashSet::with_capacity(plans.len());
     for plan in &plans {
         let body = plan.typed.body;
-        if !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
-            || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
+        let unary_bound = matches!(body.boundary.parameters.as_slice(),
+            [entry] if &entry.ty == plan.typed.result_type);
+        let goal_supported = match &plan.typed.goal {
+            TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. } => true,
+            TypedProofGoal::Literal { .. }
+                | TypedProofGoal::EntryComparison { slot: 0, .. }
+                | TypedProofGoal::EntryAffine { slot: 0, .. } => ordinary_relations && unary_bound,
+            _ => false,
+        };
+        // The existing typed observer checks these independent relations
+        // against original returned/entry values. They never stand in for
+        // an ordinary call or drive any authored state transition.
+        if !goal_supported || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body)
             || !body.structure.checker_direct_targets.is_empty()
             || !targets.insert(plan.target) || !names.insert((plan.proof_source, plan.name))
         { return Err(ProjectCheck::Unsupported); }
