@@ -613,11 +613,13 @@ fn initializer_local_scalar_extent_follows_dominated_blocks_and_refuses_address_
 }
 
 #[test]
-fn initializer_indexed_shared_address_needs_its_immediate_scalar_read() {
+fn initializer_indexed_shared_address_needs_only_dominated_scalar_reads() {
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        for (statement, enrolled) in [
-            ("u16 observed = *(&data[0]);", true),
-            ("*u16 held = &data[0]; u16 observed = *held;", false),
+        for (statement, enrolled, immediate) in [
+            ("u16 observed = *(&data[0]);", true, true),
+            ("*u16 held = &data[0]; u16 observed = *held;", true, false),
+            ("*u16 held = &data[0]; *u16 other = held; u16 observed = *other;", false, false),
+            ("*u16 held = &data[0]; data[1] = 8; u16 observed = *held;", false, false),
         ] {
             let text = format!("%%start\nu8 selected = if (true) {{ u64 count = 4; u16[count] data; data[0] = 7; {statement} 1 }} else {{ 2 }};\n%%end");
             let source = SourceIdentity::new("p".into(), "app".into(), "element-reference.w".into(), "r1".into());
@@ -633,7 +635,7 @@ fn initializer_indexed_shared_address_needs_its_immediate_scalar_read() {
             let ScalarBlockItem::LocalBinding(data) = &then_branch.items[1] else { unreachable!() };
             assert_eq!(nodes.checked_local_array(data), enrolled);
             let ScalarBlockItem::LocalBinding(observed) = &then_branch.items[3] else { unreachable!() };
-            let address = if enrolled {
+            let address = if immediate {
                 let ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. } = &observed.value
                     else { unreachable!("exact immediate checked address consumer"); };
                 pointer.as_ref()
@@ -643,7 +645,7 @@ fn initializer_indexed_shared_address_needs_its_immediate_scalar_read() {
             let ScalarExpression::CheckedAddress { place, .. } = address else { unreachable!() };
             let ScalarPlace::Index { base, .. } = place else { unreachable!() };
             assert_eq!(nodes.checked_local_index(place, base), enrolled.then_some(data.receivers[0].name_span));
-            assert_eq!(nodes.checked_immediate_element_address_type(address), enrolled.then_some(&ScalarType::CheckedReference {
+            assert_eq!(nodes.checked_immediate_element_address_type(address), immediate.then_some(&ScalarType::CheckedReference {
                 mutability: crate::scalar::ScalarReferenceMutability::Shared,
                 inner: Box::new(ScalarType::U16),
             }));
