@@ -20,7 +20,8 @@ pub use direct::{
     derive_pair_startup_call_graph_comptime_plan, inspect_direct_function_comptime,
     DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
-    PairStartupCallGraphComptimePlan, PairStartupCallHop, PairStartupCallPath, PairStartupForwarding, PairStartupHopInput,
+    PairStartupBranchSelection, PairStartupCallGraphComptimePlan, PairStartupCallHop, PairStartupCallPath,
+    PairStartupForwarding, PairStartupHopInput, PairStartupSelector,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
