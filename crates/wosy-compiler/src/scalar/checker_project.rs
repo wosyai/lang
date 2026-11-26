@@ -2494,6 +2494,8 @@ struct OrderedCallCollection<'a, 'visits> {
     startup_site: Option<OrderedInitializerCall<'a>>,
     #[cfg(feature = "internal-checker")]
     startup_site_source: Option<&'a SourceIdentity>,
+    #[cfg(feature = "internal-checker")]
+    plain_unit_root: bool,
 }
 
 impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
@@ -2510,6 +2512,8 @@ impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
             startup_site: None,
             #[cfg(feature = "internal-checker")]
             startup_site_source: None,
+            #[cfg(feature = "internal-checker")]
+            plain_unit_root: false,
         }
     }
 }
@@ -2584,6 +2588,8 @@ struct ExactCallActivation<'a> {
     named_site: Option<NamedStackSite<'a>>,
     #[cfg(feature = "internal-checker")]
     named_nested_scalars: bool,
+    #[cfg(feature = "internal-checker")]
+    plain_unit_frame: bool,
     #[cfg(feature = "internal-checker")]
     contextual_origin: Option<(&'a ReferenceBindingId, ByteSpan)>,
     #[cfg(feature = "internal-checker")]
@@ -3350,6 +3356,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             #[cfg(feature = "internal-checker")]
             named_nested_scalars: named_root.is_some_and(|root| root.nested_scalars),
             #[cfg(feature = "internal-checker")]
+            plain_unit_frame: !NAMED && ACTUAL_STARTUP && collection.is_some_and(|ordered| ordered.plain_unit_root),
+            #[cfg(feature = "internal-checker")]
             contextual_origin: None,
             #[cfg(feature = "internal-checker")]
             contextual_explicit: None,
@@ -3622,12 +3630,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         // original typed call and checked its completed namespace.
                         // This proof-free lane uses the same live DFS frames;
                         // it neither invokes the symbolic cursor nor replays calls.
-                        let plain_unit_edge = trace.borrow().proof_free_scalar_initializers
-                            && ACTUAL_STARTUP && !NAMED && matches!(call, ExactCallEffect::Unit(_))
-                            && closed_actual_unit_history_frame(frame.body)
+                        let plain_unit_edge = frame.plain_unit_frame
+                            && matches!(call, ExactCallEffect::Unit(_))
                             && closed_actual_unit_history_frame(child.body);
                         if plain_unit_edge {
                             trace.borrow_mut().charge_plain_history_frame(child.body).ok_or(ProjectCheck::Unsupported)?;
+                            child.plain_unit_frame = true;
                         }
                         if !(qualified_scalar || context_edge || cited_helper || wide_forward || plain_unit_edge || (rank_self && frame.source == child.source)) {
                             return Err(ProjectCheck::Unsupported);
@@ -4216,6 +4224,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 #[cfg(feature = "internal-checker")]
                 named_nested_scalars: false,
                 #[cfg(feature = "internal-checker")]
+                plain_unit_frame: false,
+                #[cfg(feature = "internal-checker")]
                 contextual_origin: None,
                 #[cfg(feature = "internal-checker")]
                 contextual_explicit: None,
@@ -4359,6 +4369,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             #[cfg(feature = "internal-checker")]
             named_nested_scalars: ordinary_named,
             #[cfg(feature = "internal-checker")]
+            plain_unit_frame: false,
+            #[cfg(feature = "internal-checker")]
             contextual_origin,
             #[cfg(feature = "internal-checker")]
             contextual_explicit,
@@ -4384,7 +4396,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
         #[cfg(feature = "internal-checker")]
-        let (startup_named, startup_plain_scalar, startup_ranked, startup_cited, startup_wide_rank) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
+        let (startup_named, startup_plain_scalar, startup_ranked, startup_cited, startup_wide_rank, plain_unit_root) = if let Some((caller, ordered)) = collection.filter(|(_, ordered)| ordered.failures.borrow().startup_search.is_some()) {
             let effects = ordered.failures.borrow();
             let mut search = effects.startup_search.as_ref().ok_or(ProjectCheck::Unsupported)?.borrow_mut();
             use failure_search::StartupProofRole::{Aggregate, Bare, Cited, Ranked};
@@ -4463,8 +4475,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             if plain_unit_tree {
                 search.charge_plain_history_frame(body).ok_or(ProjectCheck::Unsupported)?;
             }
-            (matches_named, matches_plain_scalar, matches_ranked, matches_cited, matches_wide_rank)
-        } else { (false, false, false, false, false) };
+            (matches_named, matches_plain_scalar, matches_ranked, matches_cited, matches_wide_rank, plain_unit_tree)
+        } else { (false, false, false, false, false, false) };
+        #[cfg(feature = "internal-checker")]
+        let collection = collection.map(|(caller, ordered)| (caller, OrderedCallCollection { plain_unit_root, ..ordered }));
         #[cfg(feature = "internal-checker")]
         if body.contextual_formal().is_some() {
             // Only the exact child activation path can install a formal.
@@ -17993,6 +18007,58 @@ mod tests {
                 }
                 if cap == 3 { assert!(histories[1][0].range.start < histories[1][1].range.start); }
                 assert_eq!(prepare().run().unwrap().directives.len(), 2);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_wide_actual_unit_history_checks_each_admitted_frame_once() {
+        use failure_search::PathStep;
+        use std::num::NonZeroUsize;
+
+        let source = source("src/main.w", "private-wide-actual-unit");
+        let fanout = 64;
+        let program = format!(r#"%%start
+            unit() okay = fn {{ core.require(true, {OUTPUT}); }};
+            unit() errors = fn {{ core.require(false, {OUTPUT}); core.require(false, {OUTPUT}); }};
+            unit() relay = fn {{ {} errors(); okay(); }};
+            relay();
+        %%end"#, "okay(); ".repeat(fanout));
+        let occurrences = |name: &str| program.match_indices(name).map(|(offset, _)| {
+            let start = offset as u32;
+            wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + name.len() as u32))
+        }).collect::<Vec<_>>();
+        let outer = occurrences("relay()").pop().unwrap();
+        let failure_call = occurrences("errors()").pop().unwrap();
+        let mut okay = occurrences("okay()");
+        let suffix = okay.pop().unwrap();
+        assert_eq!(okay.len(), fanout);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&source, &program), Vec::new())], [], vec![source.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::MainFlowOnly, Vec::new()
+            ).ok().unwrap();
+            assert_eq!(prepare().run().unwrap().directives.len(), 2);
+            for cap in [1, 3] {
+                let (selected, completion, trace, _) =
+                    prepare().search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                let truncated = cap == 1;
+                assert_eq!(selected.len(), if truncated { 1 } else { 2 });
+                assert_eq!(completion, if truncated { StartupAuthoredCompletion::LimitReached } else { StartupAuthoredCompletion::Exhausted });
+                assert_eq!(trace.plain_history_frames, fanout + 2 + usize::from(!truncated));
+                let first = trace.selected_steps().next().unwrap();
+                let calls = first.iter().filter_map(|step| match step {
+                    PathStep::Call(span) => Some(span), _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(calls, std::iter::once(&outer).chain(&okay).chain(std::iter::once(&failure_call)).collect::<Vec<_>>());
+                let returns = first.iter().filter_map(|step| match step {
+                    PathStep::Return(span) => Some(span), _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(returns, okay.iter().collect::<Vec<_>>());
+                assert!(!trace.contains_return(&failure_call));
+                assert_eq!(trace.current_path().contains(&PathStep::Return(suffix.clone())), !truncated);
+                assert_eq!(trace.current_path().contains(&PathStep::Return(outer.clone())), !truncated);
             }
         }
     }
