@@ -19,6 +19,8 @@ pub use build_diagnostics::{
 };
 mod session_frame;
 pub use session_frame::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
+mod cst_walk;
+pub use cst_walk::{syntax_kind, token_text, walk_cst, CstEvent, CstExpansionBudget};
 
 /// Trusted local adapter data, not a wire command or an authorization token.
 /// This describes named base source, not a final semantic SnapshotRoot pin.

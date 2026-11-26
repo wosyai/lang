@@ -176,6 +176,10 @@ pub(super) async fn run(
             let selected = client.acknowledged_build_source(&target)?.ok_or("fixture must have an acknowledged source")?;
             super::leased_build::run(project, dir, selected, &profile, oracle, framed).await?
         }
+        "leased-build-report" | "leased-build-report-limited" => {
+            let profile = args.next().ok_or("expected Build profile")?;
+            super::leased_build::report(&mut client, dir, &target, &profile, mode.ends_with("-limited")).await?
+        }
         "pin-local" => {
             let name = args.next().ok_or("expected local fixture pin name")?;
             local_pin(&client.pin_selected_source(&target, &name)?)

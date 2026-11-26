@@ -742,41 +742,15 @@ fn render_project_diagnostics(
     texts: &BTreeMap<ProjectSourceIdentity, String>,
 ) {
     for diagnostic in diagnostics {
-        let mut files = SimpleFiles::new();
-        let labels = diagnostic
-            .labels
-            .iter()
-            .filter_map(|label| {
-                let source = ProjectSourceIdentity::new(
-                    label.span.source.project.clone(),
-                    label.span.source.package.clone(),
-                    PackageRelativePath::new(label.span.source.path.clone().into()).ok()?,
-                );
-                let text = texts.get(&source)?;
-                let file_id = files.add(&label.span.source.path, text.as_str());
-                let range = label.span.range.start as usize..label.span.range.end as usize;
-                Some(
-                    match label.kind {
-                        wosy_compiler::DiagnosticLabelKind::Primary => {
-                            Label::primary(file_id, range)
-                        }
-                        wosy_compiler::DiagnosticLabelKind::Secondary => {
-                            Label::secondary(file_id, range)
-                        }
-                    }
-                    .with_message(label.message.clone()),
-                )
-            })
-            .collect();
-        let report = Report::error()
-            .with_code(diagnostic.code.clone())
-            .with_message(diagnostic.message.clone())
-            .with_labels(labels)
-            .with_notes(diagnostic.notes.clone());
-        let config = term::Config::default();
         let stream = StandardStream::stderr(ColorChoice::Auto);
         let mut stream_lock = stream.lock();
-        let _ = term::emit(&mut stream_lock, &config, &files, &report);
+        let _ = wosy_cli::diagnostic_output::emit_project_diagnostic(&mut stream_lock, diagnostic, |source| {
+            let key = ProjectSourceIdentity::new(
+                source.project.clone(), source.package.clone(),
+                PackageRelativePath::new(source.path.clone().into()).ok()?,
+            );
+            texts.get(&key).map(String::as_str)
+        });
     }
 }
 

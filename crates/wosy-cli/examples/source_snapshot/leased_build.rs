@@ -95,3 +95,36 @@ async fn through_codec(
     assert_eq!(end?, BuildSessionEnd::Disconnected);
     response
 }
+
+pub(super) async fn report(
+    local: &mut wosy_cli::source_state::SqliteSourceState, dir: &Path, target: &str, profile: &str,
+    limited: bool,
+) -> Result<serde_json::Value> {
+    use codespan_reporting::term::termcolor::Buffer;
+    use wosy_cli::source_state::ProjectDiagnosticExchange;
+    use wosy_protocol::CstExpansionBudget;
+
+    let captured = local.capture_build_diagnostics(target, profile)?.ok_or("fixture has no acknowledged source")?;
+    let store = Arc::new(SourceStore::open(dir, 8 << 20)?);
+    let bound = |n| NonZeroUsize::new(n).unwrap();
+    let worker = SourceStorageWorker::new(
+        Arc::clone(&store), tokio::runtime::Handle::current(), bound(1), bound(2), bound(20_000),
+    )?;
+    let (client, peer) = io::duplex(256);
+    let budget = CstExpansionBudget::new(16 << 20, 200_000, 1024, if limited { 1 } else { 8 << 20 });
+    let start = Instant::now();
+    let (end, report) = tokio::join!(
+        worker.serve_recoverable_build_session(peer, captured.selection().clone(), None,
+            super::source_reconciliation::admission_limits(false), Duration::from_secs(30)),
+        captured.exchange_project_diagnostics(local, client, Duration::from_secs(10), budget),
+    );
+    let ProjectDiagnosticExchange::Report(report) = report? else { return Err("fixture expected a verified report".into()); };
+    assert_eq!(end?, BuildSessionEnd::Disconnected);
+    let prepare_ms = milliseconds(start);
+    let mut buffer = Buffer::no_color();
+    report.emit_to(&mut buffer)?;
+    let rendered = std::str::from_utf8(buffer.as_slice())?;
+    drop(worker);
+    Arc::try_unwrap(store).ok().expect("fixture owns its catalog").close().await?;
+    Ok(serde_json::json!({ "response": report.response(), "rendered": rendered, "prepare_report_ms": prepare_ms }))
+}

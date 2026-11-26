@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
-    imports_from_cst, source_preparation_parts, source_preparation_schema, Delta, FileEntry,
+    imports_from_cst, source_preparation_parts, source_preparation_schema, syntax_kind, token_text, walk_cst, CstEvent,
+    Delta, FileEntry,
     FileKey, Import, InstalledGitSelection, Kind, Node, NodeId, SourceConfig, SourceUpdate,
 };
 use wosy_syntax::{
@@ -389,14 +390,6 @@ fn read_node_with(tx: &Transaction, id: NodeId, charge: impl FnOnce(usize) -> Re
     Node::decode(&bytes).ok_or_else(|| "invalid stored source node".into())
 }
 
-fn syntax_kind(node: &Node) -> Result<SyntaxKind> {
-    let raw = node.data.first_chunk::<2>().ok_or("missing syntax kind")?;
-    SyntaxKind::try_from_raw(u16::from_be_bytes(*raw)).ok_or_else(|| "unknown syntax kind".into())
-}
-
-fn token_text(node: &Node) -> Result<&str> {
-    Ok(std::str::from_utf8(node.data.get(2..).ok_or("missing token kind")?)?)
-}
 
 struct Index {
     config: NodeId,
@@ -793,27 +786,21 @@ fn read_cst_with(
     tx: &Transaction, root: NodeId, mut work: Option<&mut source_proposal::CstWork>,
 ) -> Result<CstNode> {
     if let Some(work) = work.as_mut() { work.start_tree()?; }
-    let mut green = GreenNodeBuilder::new();
-    let mut stack = vec![Some((root, 1))];
-    while let Some(id) = stack.pop() {
-        let Some((id, depth)) = id else {
-            green.finish_node();
-            continue;
-        };
-        let node = read_node_with(tx, id, |bytes| work.as_mut().map_or(Ok(()), |work| work.read(bytes)))?;
-        let kind = rowan::SyntaxKind(syntax_kind(&node)? as u16);
-        match node.kind {
-            Kind::Syntax => {
-                if let Some(work) = work.as_mut() { work.children(depth, node.children.len())?; }
-                green.start_node(kind);
-                stack.push(None);
-                stack.extend(node.children.into_iter().rev().map(|id| Some((id, depth + 1))));
+    let mut state = (work, GreenNodeBuilder::new());
+    walk_cst(root, &mut state, |(work, _), id| {
+        read_node_with(tx, id, |bytes| work.as_mut().map_or(Ok(()), |work| work.read(bytes)))
+    }, |(work, green), event| {
+        match event {
+            CstEvent::Start { kind, depth, children } => {
+                if let Some(work) = work { work.children(depth, children)?; }
+                green.start_node(rowan::SyntaxKind(kind as u16));
             }
-            Kind::Token => green.token(kind, token_text(&node)?),
-            _ => return Err("invalid CST child".into()),
+            CstEvent::Token { kind, text } => green.token(rowan::SyntaxKind(kind as u16), text),
+            CstEvent::Finish => green.finish_node(),
         }
-    }
-    Ok(CstNode::new_root(green.finish()))
+        Ok(())
+    })?;
+    Ok(CstNode::new_root(state.1.finish()))
 }
 
 fn read_source_config(tx: &Transaction, id: NodeId) -> Result<SourceConfig> {

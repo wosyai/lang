@@ -11,11 +11,13 @@ use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, N
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 mod diagnostics;
+mod diagnostic_report;
 mod delta;
 mod pins;
 mod pin_reconciliation;
 pub use delta::{PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
+pub use diagnostic_report::{ProjectDiagnosticExchange, RootedDiagnosticReport};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 pub use pin_reconciliation::{PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 
@@ -308,9 +310,15 @@ impl SqliteSourceState {
     }
 
     fn header(project: &Path, read: &mut StoredNodes<'_>, target: &str, root: NodeId) -> Result<(SourceConfig, Vec<NodeId>)> {
-        let top = read.record(root)?;
+        Self::header_using(project, target, root, |id| read.record(id))
+    }
+
+    fn header_using(
+        project: &Path, target: &str, root: NodeId, mut record: impl FnMut(NodeId) -> Result<Node>,
+    ) -> Result<(SourceConfig, Vec<NodeId>)> {
+        let top = record(root)?;
         let parts = source_preparation_parts(&top).ok_or("unsupported persisted source schema")?;
-        let config = read.record(parts.config)?;
+        let config = record(parts.config)?;
         if config.kind != Kind::Config { return Err("expected persisted source configuration".into()); }
         let config: SourceConfig = serde_json::from_slice(&config.data)?;
         if config.target != target || top.data != config.schema()
@@ -388,20 +396,32 @@ impl<'a> StoredNodes<'a> {
         Ok(record)
     }
 
+    /// Charge the raw byte length before hashing, decoding or taking a
+    /// retained copy. Both SQLite's row view and memo hits are borrowed.
+    fn charged_record(&mut self, id: NodeId, memoize: bool, charge: impl FnOnce(usize) -> Result<()>) -> Result<Node> {
+        let decode = |bytes: &[u8]| Node::decode(bytes).ok_or("invalid persisted source record");
+        if let Some(bytes) = self.checked.nodes.get(&id) {
+            charge(bytes.len())?;
+            return Ok(decode(bytes)?);
+        }
+        self.count += 1;
+        let mut rows = self.query.query([id.0])?;
+        let row = rows.next()?.ok_or("persisted source generation is not closed")?;
+        let bytes = row.get_ref(0)?.as_blob()?;
+        charge(bytes.len())?;
+        if Node::id(bytes) != id { return Err("persisted source node hash mismatch".into()); }
+        let record = decode(bytes)?;
+        if memoize { self.checked.nodes.insert(id, bytes.to_vec()); }
+        Ok(record)
+    }
+
     fn file_index(&mut self, config: &SourceConfig, entries: Vec<NodeId>) -> Result<Files> {
         let parser = config.parser.id();
         let mut files = Files::new();
         for id in entries {
             let file = FileEntry::from_node(id, self.record(id)?)?;
-            let key = FileKey::from(&file.metadata.source);
-            if file.metadata.policy != parser
-                || config.namespaces.get(&key.package).is_none_or(|namespace| {
-                    namespace.project != file.metadata.source.project
-                })
-                || files.insert(key, file).is_some()
-            {
-                return Err("invalid persisted source file index".into());
-            }
+            let key = checked_file_key(config, parser, &file)?;
+            if files.insert(key, file).is_some() { return Err("invalid persisted source file index".into()); }
         }
         if !files.contains_key(&config.entry) { return Err("persisted entry file is missing".into()); }
         Ok(files)
@@ -421,6 +441,18 @@ impl<'a> StoredNodes<'a> {
             None => self.fetch(id),
         }, keep)
     }
+}
+
+fn checked_file_key(config: &SourceConfig, parser: NodeId, file: &FileEntry) -> Result<FileKey> {
+    let key = FileKey::from(&file.metadata.source);
+    if file.metadata.policy != parser
+        || config.namespaces.get(&key.package).is_none_or(|namespace| {
+            namespace.project != file.metadata.source.project
+        })
+    {
+        return Err("invalid persisted source file index".into());
+    }
+    Ok(key)
 }
 
 fn usage_digest(root: NodeId, counts: [u8; 16]) -> [u8; 32] {

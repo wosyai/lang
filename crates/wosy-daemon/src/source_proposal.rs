@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use surrealkv::{Mode, Transaction};
 use wosy_protocol::{
     imports_from_cst, partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BuildSourceSelection,
-    Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, BASE_CST_DELTA_VERSION,
+    CstExpansionBudget, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, BASE_CST_DELTA_VERSION,
 };
 use wosy_syntax::CstNode;
 
@@ -309,8 +309,7 @@ pub(super) fn stage_reconciled_closure(
 
 impl BaseCstAdmissionLimits {
     fn cst_work(self) -> CstWork {
-        CstWork { expanded_record_bytes: self.expanded_record_bytes, occurrences: self.cst_occurrences,
-            max_depth: self.cst_depth, authored_bytes: self.authored_bytes }
+        CstWork::new(self.expanded_record_bytes, self.cst_occurrences, self.cst_depth, self.authored_bytes)
     }
 }
 
@@ -327,34 +326,7 @@ impl GraphWork {
     }
 }
 
-pub(super) struct CstWork {
-    expanded_record_bytes: usize,
-    occurrences: usize,
-    max_depth: usize,
-    authored_bytes: usize,
-}
-
-impl CstWork {
-    pub(super) fn read(&mut self, bytes: usize) -> Result<()> {
-        take(&mut self.expanded_record_bytes, bytes, "base CST validation exceeds the expanded record read budget")
-    }
-
-    pub(super) fn file(&mut self, bytes: usize) -> Result<()> {
-        take(&mut self.authored_bytes, bytes, "base CST validation exceeds the authored byte budget")?;
-        self.start_tree()
-    }
-
-    pub(super) fn start_tree(&mut self) -> Result<()> {
-        take(&mut self.occurrences, 1, "base CST validation exceeds the occurrence budget")
-    }
-
-    pub(super) fn children(&mut self, depth: usize, count: usize) -> Result<()> {
-        if depth > self.max_depth || (depth == self.max_depth && count > 0) {
-            return Err("base CST validation exceeds the syntax depth budget".into());
-        }
-        take(&mut self.occurrences, count, "base CST validation exceeds the occurrence budget")
-    }
-}
+pub(super) type CstWork = CstExpansionBudget;
 
 fn take(remaining: &mut usize, amount: usize, reason: &'static str) -> Result<()> {
     *remaining = remaining.checked_sub(amount).ok_or(reason)?;

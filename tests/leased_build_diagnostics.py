@@ -8,6 +8,7 @@ import tempfile
 
 
 example = Path(sys.argv[1]).resolve()
+ordinary_cli = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 manifest = (Path(__file__).parent /
             "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
 manifest = manifest.replace("categories = []", 'categories = ["WHY"]')
@@ -78,11 +79,31 @@ with tempfile.TemporaryDirectory() as temp:
         assert answer["phase"] == "Analyzed" and answer["version"] == 1 and answer["profile"] == profile
         return answer, out["result"]["dispatch_ms"]
 
+    def ordinary_report(profile):
+        proc = subprocess.run([ordinary_cli, "build", "app", "--profile", profile],
+                              cwd=project, capture_output=True, check=False, timeout=30)
+        tail = b"wosy: build rejected by semantic diagnostics\n"
+        assert proc.returncode == 1 and not proc.stdout and proc.stderr.endswith(tail), proc.stderr
+        return proc.stderr[:-len(tail)].decode()
+
+    def client_report(profile):
+        return call(project, store, "leased-build-report", profile)["result"]
+
     orig, _ = run()
     native, _ = run("native")
     assert orig["origin"] == native["origin"] == "Derived"
     assert orig["receipt"] != native["receipt"]
     assert orig["diagnostics"] == native["diagnostics"]
+    expected_print = {}
+    if ordinary_cli:
+        for profile in ("dev", "native"):
+            expected_print[profile] = ordinary_report(profile)
+            report = client_report(profile)
+            assert report["response"]["profile"] == profile
+            assert report["rendered"] == expected_print[profile] and report["rendered"]
+        limited = subprocess.run([example, project, store, "--persistent-source", "app",
+                                  "leased-build-report-limited", "dev"], capture_output=True, timeout=30)
+        assert limited.returncode and not limited.stdout and b"authored byte budget" in limited.stderr
     direct, _ = run(framed=False)
     assert direct["origin"] == "Stored"
     assert {k: v for k, v in direct.items() if k != "origin"} == {k: v for k, v in orig.items() if k != "origin"}
@@ -108,6 +129,11 @@ with tempfile.TemporaryDirectory() as temp:
     still_old, _ = run(oracle=False)
     assert still_old["origin"] == "Stored" and still_old["diagnostics"] == orig["diagnostics"]
     assert still_old["source_root"] == orig["source_root"] and staged["pending"] != staged["selected"]
+    if ordinary_cli:
+        for profile in ("dev", "native"):
+            report = client_report(profile)
+            assert report["response"]["source_root"] == orig["source_root"]
+            assert report["rendered"] == expected_print[profile]
     updated = call(project, store, "submit-pending", "app", "src/main.w")
     assert updated["selected"] == staged["pending"]
     remapped, warm_ms = run()
@@ -122,9 +148,12 @@ with tempfile.TemporaryDirectory() as temp:
     call(project, store, "submit-pending", "app", "src/main.w")
     fixed, _ = run()
     assert fixed["origin"] == "Derived" and not fixed["diagnostics"] and fixed["receipt"] != orig["receipt"]
+    if ordinary_cli:
+        assert client_report("dev")["rendered"] == ""
     assert not (project / ".wosy/artifacts").exists()
     print("acknowledged SQLite root → real framed in-process leased worker → ordinary compiler diagnostics", {
         "warm_dispatch_ms": round(warm_ms, 3), "resolved_profiles": ["dev", "native"],
         "historic_UTF8": True, "newer_pending_not_selected": True, "cas_rebuilt": True,
         "rooted_files": 19, "cas_bytes": only_blob.stat().st_size,
+        "ordinary_renderer_bytes_match_both_profiles": bool(ordinary_cli),
     })

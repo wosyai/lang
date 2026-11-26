@@ -12,8 +12,8 @@ use wosy_protocol::{
 
 #[derive(Clone)]
 pub struct CapturedBuildDiagnostics {
-    selected: BuildSourceSelection,
-    generation: i64,
+    pub(super) selected: BuildSourceSelection,
+    pub(super) generation: i64,
     profile: String,
 }
 
@@ -46,7 +46,7 @@ impl CapturedBuildDiagnostics {
 
     pub fn generation(&self) -> i64 { self.generation }
 
-    fn is_current(&self, local: &SqliteSourceState) -> Result<bool> {
+    pub(super) fn is_current(&self, local: &SqliteSourceState) -> Result<bool> {
         if local.project.to_str() != Some(self.selected.project.as_str()) { return Ok(false); }
         let state = local.selection(&self.selected.target)?;
         Ok(state.selected == Some(self.selected.root) && state.selected_generation == Some(self.generation))
@@ -57,14 +57,22 @@ impl CapturedBuildDiagnostics {
     /// lookup travels on this diagnostic stream. Dropping the operation
     /// discards the stream. This does not provide or select a listener.
     pub async fn exchange<T: AsyncRead + AsyncWrite + Unpin + 'static>(
+        &self, local: &mut SqliteSourceState, stream: T, timeout: Duration,
+    ) -> Result<DiagnosticExchange> {
+        let result = self.exchange_unprojected(local, stream, timeout).await?;
+        // One local read after the exchange. No SQLite transaction spans
+        // the asynchronous conversation or makes a cross-store guarantee.
+        if !matches!(result, DiagnosticExchange::StaleSelection) && !self.is_current(local)? {
+            return Ok(DiagnosticExchange::StaleSelection);
+        }
+        Ok(result)
+    }
+
+    pub(super) async fn exchange_unprojected<T: AsyncRead + AsyncWrite + Unpin + 'static>(
         &self, local: &mut SqliteSourceState, mut stream: T, timeout: Duration,
     ) -> Result<DiagnosticExchange> {
         if !self.is_current(local)? { return Ok(DiagnosticExchange::StaleSelection); }
-        let result = tokio::time::timeout(timeout, self.converse(&mut stream)).await??;
-        // One local read after the exchange. No SQLite transaction spans
-        // the asynchronous conversation or makes a cross-store guarantee.
-        if !self.is_current(local)? { return Ok(DiagnosticExchange::StaleSelection); }
-        Ok(result)
+        Ok(tokio::time::timeout(timeout, self.converse(&mut stream)).await??)
     }
 
     async fn converse<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: &mut T) -> Result<DiagnosticExchange> {
