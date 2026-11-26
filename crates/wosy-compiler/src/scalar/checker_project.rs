@@ -1837,10 +1837,17 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
     #[cfg(not(feature = "internal-checker"))]
     let allow_authored_startup = false;
     if let Some(directive) = structure.checker_directives.get(&expression) {
+        #[cfg(feature = "internal-checker")]
+        let proof_only = failures.as_ref().and_then(|effects| effects.startup_search.as_ref())
+            .is_some_and(|trace| trace.borrow().proof_only_continuation());
         let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
         if startup_trace_requested(failures) && !startup_trace_atomic(predicate) { return Err(ProjectCheck::Unsupported); }
+        #[cfg(feature = "internal-checker")]
+        if proof_only && directive.operation == CheckerOperation::Require { return Ok(StartupLane::Feasible); }
         let value = evaluate_initializer_predicate(predicate, storage, allow_authored_startup).ok_or(ProjectCheck::Unsupported)?;
+        #[cfg(feature = "internal-checker")]
+        if proof_only { return Ok(if value { StartupLane::Feasible } else { StartupLane::Empty }); }
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -1878,7 +1885,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             #[cfg(not(feature = "internal-checker"))]
             effects.push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
             #[cfg(feature = "internal-checker")]
-            if capped { return Err(ProjectCheck::StartupAuthoredLimitReached); }
+            if capped && effects.startup_search.as_ref().is_some_and(|trace| trace.borrow().cannot_continue()) { return Err(ProjectCheck::StartupAuthoredLimitReached); }
             if directive.operation == CheckerOperation::Narrow {
                 return Ok(StartupLane::Empty);
             }
@@ -3227,7 +3234,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         if let Some((site, trace)) = authored_site {
             if trace.borrow().invalid() { return Err(ProjectCheck::Unsupported); }
-            if trace.borrow().remaining() == 0 { return Err(ProjectCheck::StartupAuthoredLimitReached); }
+            if trace.borrow().remaining() == 0 && trace.borrow().cannot_continue() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
             if matches!(result, Ok(ActualCallResult::Unit | ActualCallResult::Integer(_))) {
                 trace.borrow_mut().append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
             }
@@ -3457,12 +3464,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         parent.cursor.resume_exact_local_update(binding, ty, entry, exit)
                             .ok_or(ProjectCheck::Unsupported)?;
                         if let Some(trace) = collection.and_then(|ordered| ordered.failures.borrow().startup_search.clone()) {
-                            if !trace.borrow().contextual_route.is_some_and(|(_, leaf)| leaf == target) {
+                            let mut trace = trace.borrow_mut();
+                            if !trace.contextual_route.is_some_and(|(_, leaf)| leaf == target) || trace.contextual_observed {
                                 return Err(ProjectCheck::Unsupported);
                             }
+                            trace.contextual_observed = true;
+                            if trace.remaining() == 0 { return Err(ProjectCheck::StartupAuthoredLimitReached); }
                             let span = parent.body.occurrences.get(effect.occurrence().0)
                                 .ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-                            trace.borrow_mut().append(failure_search::PathStep::Return(
+                            trace.append(failure_search::PathStep::Return(
                                 wosy_syntax::SourceSpan::new(parent.source.clone(), span))).ok_or(ProjectCheck::Unsupported)?;
                         }
                         continue;
@@ -26847,9 +26857,34 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert_eq!(completion, Some(StartupAuthoredCompletion::LimitReached));
                 assert_eq!(ordinary_only.directives.len(), 1);
                 assert_eq!(ordinary_only.directives[0].code(), &BigInt::from(0));
-                let after_cap = program.replace("consume(1);", &format!("core.require(false, {zero}); consume(1);"));
-                assert!(matches!(prepare(&after_cap).search_startup_with_guarded_context(NonZeroUsize::MIN),
+                let prefix = format!("core.require(false, {zero}); core.require(false, {later});");
+                let after_cap = program.replace("consume(1);", &format!("{prefix} consume(1);"));
+                let top_level_cap = program.replace("entry();", &format!("{prefix} entry();"));
+                let opaque = program.replace("entry();", &format!(
+                    "core.require(false, {zero}); core.require(false || true, {later}); entry();"));
+                assert!(matches!(prepare(&opaque).search_startup_with_guarded_context(NonZeroUsize::MIN),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                for crossed in [after_cap, top_level_cap] {
+                    let (selected, completion) = prepare(&crossed).search_startup_with_guarded_context(NonZeroUsize::MIN).unwrap();
+                    assert!(selected.contextual_diagnostic.is_none());
+                    assert_eq!(completion, Some(StartupAuthoredCompletion::LimitReached));
+                    assert_eq!(selected.directives.len(), 1);
+                    assert_eq!(selected.directives[0].code(), &BigInt::from(0));
+                    let failed = crossed.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+                    let (selected, completion) = prepare(&failed).search_startup_with_guarded_context(NonZeroUsize::MIN).unwrap();
+                    assert!(completion.is_none() && selected.directives.is_empty());
+                    let evidence = selected.contextual_diagnostic.unwrap();
+                    assert_eq!((evidence.entry, evidence.exit), (3.into(), 3.into()));
+                    assert_eq!(&failed[evidence.call.range.start as usize..evidence.call.range.end as usize], "consume(1)");
+                    let excluded = failed.replace("consume(1)", "consume(2)");
+                    let (selected, completion) = prepare(&excluded).search_startup_with_guarded_context(NonZeroUsize::MIN).unwrap();
+                    assert!(selected.contextual_diagnostic.is_none());
+                    assert_eq!(completion, Some(StartupAuthoredCompletion::LimitReached));
+                    assert_eq!(selected.directives.len(), 1);
+                    let pruned = crossed.replace("consume(1);", &format!("core.narrow(false, {later}); consume(1);"));
+                    assert!(matches!(prepare(&pruned).search_startup_with_guarded_context(NonZeroUsize::MIN),
+                        Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
             }
         }
     }

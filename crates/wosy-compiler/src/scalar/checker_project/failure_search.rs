@@ -42,6 +42,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) named_cross_source: bool,
     pub(super) named_observation: Option<StartupNamedObservation>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
+    pub(super) contextual_observed: bool,
     pub(super) ranked_target: Option<PreparedCallable>,
     pub(super) ranked_observation: Option<StartupNamedObservation>,
     #[cfg(test)]
@@ -51,7 +52,7 @@ pub(in super::super) struct StartUpSearch {
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
         Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observation: None,
-            contextual_route: None, ranked_target: None, ranked_observation: None,
+            contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observation: None,
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
@@ -99,7 +100,13 @@ impl StartUpSearch {
 
     pub(super) fn remaining(&self) -> usize { self.remaining }
     pub(super) fn invalidate(&mut self) { self.invalid = true; }
-    pub(in super::super) fn cannot_continue(&self) -> bool { self.invalid || self.remaining == 0 }
+    pub(in super::super) fn proof_only_continuation(&self) -> bool {
+        !self.invalid && self.remaining == 0 && self.contextual_route.is_some() && !self.contextual_observed
+    }
+
+    pub(in super::super) fn cannot_continue(&self) -> bool {
+        self.invalid || (self.remaining == 0 && !self.proof_only_continuation())
+    }
     pub(super) fn invalid(&self) -> bool { self.invalid }
 
     #[cfg(test)]

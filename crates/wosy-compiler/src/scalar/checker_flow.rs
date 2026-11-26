@@ -7380,6 +7380,20 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         };
         next += 1;
         let tail = if branches.is_empty() { root_tail } else { None };
+        // A closed contextual owner may retain a required proof observation
+        // after the authored search has stopped. A Require cannot change the
+        // feasible typed row; a Narrow still must prune it before the call.
+        #[cfg(feature = "internal-checker")]
+        if roots.startup_trace.as_ref().is_some_and(|(_, trace)| trace.borrow().proof_only_continuation()) {
+            if let BlockItemKind::Evaluation { expression } = item.kind {
+                if let Some(directive) = structure.checker_directives.get(&expression) {
+                    let predicate = directive.predicate.as_ref()?;
+                    if !matches!(predicate, CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)) { return None; }
+                    if directive.operation == CheckerOperation::Narrow { path = path.split(roots, predicate)?.0; }
+                    continue;
+                }
+            }
+        }
         #[cfg(feature = "internal-checker")]
         let mut evaluated_guard = {
             let mut result = (None, None);
