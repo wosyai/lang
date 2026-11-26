@@ -3623,11 +3623,11 @@ pub(super) enum IntegerRequirementEntry<'a> {
     Exact(&'a [&'a BigInt]),
     Projected { slot: usize, values: Rc<IntegerSet>, fixed: Option<&'a BigInt> },
     #[cfg(feature = "internal-checker")]
-    UnitHistory(UnitHistoryEntry),
+    UnitHistory(CallableHistoryEntry),
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) struct UnitHistoryEntry(IntegerRow);
+pub(super) struct CallableHistoryEntry(IntegerRow);
 
 pub(super) enum IntegerRequirementContinuation {
     Feasible,
@@ -3690,6 +3690,7 @@ pub(super) struct UnitHistoryPiece {
 pub(super) enum CallableHistoryCall {
     UnitPartitions(Vec<UnitHistoryPiece>),
     ScalarPartitions(Vec<IntegerReturnPartition>, Vec<Vec<CallableHistoryStep>>),
+    ScalarPairPartitions(ProjectedIntegerPair, Vec<Vec<CallableHistoryStep>>),
     LimitReached,
 }
 
@@ -3715,6 +3716,12 @@ fn accept_callable_history_return(
             if trace.scalar_return_steps.is_some() { return None; }
             trace.scalar_return_steps = Some(steps);
             Some(ActualCallResult::PartitionedInteger(pieces))
+        }
+        CallableHistoryCall::ScalarPairPartitions(pair, steps) if is_integer_type(expected) && pair.pieces.len() == steps.len() => {
+            let mut trace = histories.borrow_mut();
+            if trace.scalar_return_steps.is_some() { return None; }
+            trace.scalar_return_steps = Some(steps);
+            Some(ActualCallResult::PartitionedIntegerPair(pair))
         }
         CallableHistoryCall::LimitReached => {
             histories.borrow_mut().stopped = true;
@@ -3825,15 +3832,26 @@ pub(super) fn test_first_complete_history_packet(
 /// exact input row; extraction reads only the already retained return rows.
 #[cfg(feature = "internal-checker")]
 pub(super) fn trace_closed_projected_scalar_return(
-    calls: &FunctionCallSites, entry: Rc<IntegerSet>, expected: &ScalarType, step_owner: Option<usize>, work: &std::cell::Cell<usize>,
+    calls: &FunctionCallSites, entry: CallableHistoryEntry, expected: &ScalarType, step_owner: Option<usize>, work: &std::cell::Cell<usize>,
     mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
 ) -> Option<CallableHistoryCall> {
     let histories = std::cell::RefCell::new(CallableHistories {
         work, outgoing_call: None, scalar_return_steps: None, step_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
         unit_return_arity: None, unit_return_paths: None, received_unit_paths: None,
     });
-    histories.borrow().charge(calls.occurrences.len().checked_add(entry.interval_count())?)?;
-    let mut cursor = ExactCallCursor::projected(calls, Rc::clone(&entry), expected)?;
+    histories.borrow().charge(calls.occurrences.len())?;
+    let CallableHistoryEntry(mut row) = entry;
+    let inputs = row.cells.clone();
+    let mut cursor = match inputs.as_slice() {
+        [domain] => ExactCallCursor::projected(calls, Rc::clone(domain), expected)?,
+        [_, _] => {
+            // The only input row is the authenticated original call's
+            // independent rectangle. Pair receipts retain its local anchor.
+            row.projected_from = 1;
+            ExactCallCursor::with_rows(calls, expected, IntegerInputs(vec![row]), None, Some([0, 1]))?
+        }
+        _ => return None,
+    };
     cursor.roots.callable_history = Some(&histories);
     let allow_nested = nested.is_some();
     let mut call = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
@@ -3842,25 +3860,43 @@ pub(super) fn trace_closed_projected_scalar_return(
         let returned = nested.as_deref_mut()?(caller, site, signature, argument, history)?;
         accept_callable_history_return(&histories, returned, expected)
     };
-    let ExactCallProgress::Done { active: false, result: ActualCallResult::PartitionedInteger(pieces) } =
+    let ExactCallProgress::Done { active: false, result } =
         cursor.advance::<false>(calls, allow_nested.then_some(&mut call), false, false, false, false, &mut |_| {})?
     else { return None; };
     let mut receipt_work = work.get();
-    if !unary_partitions_cover(&pieces, &entry, &mut receipt_work)? { return None; }
-    work.set(receipt_work);
     let tracker = histories.borrow();
-    // In this lane ordinary computed returns are disabled; the stable
-    // native partition rows and these retained actual rows are one-to-one.
-    let mut steps = Vec::with_capacity(pieces.len());
-    for (returned, piece) in cursor.returned.iter().flat_map(|returned|
-        returned.state.0.iter().map(move |row| (returned.span, row))).zip(&pieces) {
-        let (span, row) = returned;
-        tracker.charge(1)?;
-        if span != piece.span || !Rc::ptr_eq(row.entry_domain(0), &piece.input) { return None; }
-        steps.push(tracker.steps(row.callable_history)?);
-    }
-    if steps.len() != pieces.len() { return None; }
-    Some(CallableHistoryCall::ScalarPartitions(pieces, steps))
+    let rows = || cursor.returned.iter().flat_map(|returned|
+        returned.state.0.iter().map(move |row| (returned.span, row)));
+    // This route only admits original return rows, not independently
+    // computed or synthetic receipts.
+    let result = match (result, inputs.as_slice()) {
+        (ActualCallResult::PartitionedInteger(pieces), [entry]) => {
+            if !unary_partitions_cover(&pieces, entry, &mut receipt_work)? { return None; }
+            work.set(receipt_work);
+            let steps = rows().zip(&pieces).map(|((span, row), piece)| {
+                tracker.charge(1)?;
+                if span != piece.span || !Rc::ptr_eq(row.entry_domain(0), &piece.input) { return None; }
+                tracker.steps(row.callable_history)
+            }).collect::<Option<Vec<_>>>()?;
+            if steps.len() != pieces.len() { return None; }
+            CallableHistoryCall::ScalarPartitions(pieces, steps)
+        }
+        (ActualCallResult::PartitionedIntegerPair(pair), [left, right]) => {
+            if !covers_pair_inputs(&pair, [left, right], 1, &mut receipt_work)? { return None; }
+            work.set(receipt_work);
+            let steps = rows().zip(&pair.pieces).map(|((span, row), piece)| {
+                tracker.charge(1)?;
+                if span != piece.span || row.projected_from != piece.anchor
+                    || !piece.inputs.iter().zip(&row.cells).all(|(input, cell)| Rc::ptr_eq(input, cell))
+                { return None; }
+                tracker.steps(row.callable_history)
+            }).collect::<Option<Vec<_>>>()?;
+            if steps.len() != pair.pieces.len() { return None; }
+            CallableHistoryCall::ScalarPairPartitions(pair, steps)
+        }
+        _ => return None,
+    };
+    Some(result)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4190,7 +4226,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
         IntegerRequirementEntry::Arbitrary => (ordinary_tail_type(calls, ordinary), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
         #[cfg(feature = "internal-checker")]
-        IntegerRequirementEntry::UnitHistory(UnitHistoryEntry(row)) => {
+        IntegerRequirementEntry::UnitHistory(CallableHistoryEntry(row)) => {
             // No projected continuation is exported from the generic driver.
             // The history tracker retains each full returning rectangle.
             if scope.callable_history().is_none() || !calls.checker_returns_unit() || row.iter().any(|domain| domain.is_empty()) {
@@ -4386,11 +4422,17 @@ pub(super) fn covers_all_named_pair_inputs(
 ) -> Option<bool> {
     let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return None; };
     if pair.caller_axes != [0, 1] { return None; }
-    let (minimum, maximum) = full[0].extremes()?;
+    covers_pair_inputs(pair, [&full[0], &full[1]], 0, work)
+}
+
+#[cfg(feature = "internal-checker")]
+fn covers_pair_inputs(pair: &ProjectedIntegerPair, full: [&IntegerSet; 2], anchor: u16, work: &mut usize) -> Option<bool> {
+    if pair.caller_axes != [0, 1] || full.iter().any(|axis| axis.is_empty()) { return None; }
+    let [first_count, second_count] = full.map(IntegerSet::interval_count);
     charge_call_work(work, pair.pieces.len())?;
     let mut cost = [0usize; 2];
     for piece in &pair.pieces {
-        if piece.anchor != 0 { return None; }
+        if piece.anchor != anchor { return None; }
         for (total, axis) in cost.iter_mut().zip(&piece.inputs) {
             *total = total.checked_add(axis.interval_count())?;
         }
@@ -4399,13 +4441,24 @@ pub(super) fn covers_all_named_pair_inputs(
         let depth = (usize::BITS - count.leading_zeros()) as usize;
         count.checked_mul(depth.checked_mul(2)?.checked_add(4)?)
     };
-    let cuts = cost[0].checked_mul(2)?.checked_add(2)?;
+    let scoped = anchor != 0;
+    let base_cuts = if scoped { first_count.checked_mul(2)? } else { 2 };
+    let cuts = cost[0].checked_mul(2)?.checked_add(base_cuts)?;
     charge_call_work(work, sort_work(cuts)?.checked_add(cost[0])?.checked_add(cost[1])?)?;
     let mut starts = Vec::with_capacity(cuts);
-    starts.push(minimum.clone());
-    starts.push(maximum + 1);
+    if scoped {
+        charge_call_work(work, pair.pieces.len().checked_mul(first_count.checked_add(second_count)?)?)?;
+        for (lower, upper) in full[0].intervals() {
+            starts.push(lower.clone());
+            starts.push(upper + 1);
+        }
+    } else {
+        let (minimum, maximum) = full[0].extremes()?;
+        starts.push(minimum.clone());
+        starts.push(maximum + 1);
+    }
     for piece in &pair.pieces {
-        if !piece.inputs[0].is_subset_of(&full[0]) || !piece.inputs[1].is_subset_of(&full[1]) { return None; }
+        if !piece.inputs[0].is_subset_of(full[0]) || !piece.inputs[1].is_subset_of(full[1]) { return None; }
         for (lower, upper) in piece.inputs[0].intervals() {
             starts.push(lower.clone());
             starts.push(upper + 1);
@@ -4417,9 +4470,14 @@ pub(super) fn covers_all_named_pair_inputs(
     // cannot change. Check its actual second-axis union in each slab.
     let mut active = Vec::new();
     for slab in starts.windows(2) {
-        charge_call_work(work, pair.pieces.len().checked_add(cost[0])?.checked_add(sort_work(cost[1])?)?)?;
-        active.clear();
         let first = &slab[0];
+        if scoped {
+            charge_call_work(work, 1usize.checked_add(first_count)?)?;
+            if !full[0].contains(first) { continue; }
+        }
+        charge_call_work(work, pair.pieces.len().checked_add(cost[0])?.checked_add(sort_work(cost[1])?)?
+            .checked_add(if scoped { second_count } else { 0 })?)?;
+        active.clear();
         let last = &slab[1] - 1;
         for piece in &pair.pieces {
             if piece.inputs[0].covers_closed(first, &last) { active.push(piece.inputs[1].as_ref()); }
@@ -4901,15 +4959,15 @@ pub(super) enum NestedIntegerArgument<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-enum UnitHistoryOperand<'a> {
+enum CallableHistoryOperand<'a> {
     Exact(ExactIntegerArgument<'a>),
     Axis(&'a ScalarType, usize),
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> NestedIntegerArgument<'a> {
-    fn unit_history_operands(&self) -> Option<[Option<UnitHistoryOperand<'a>>; 2]> {
-        use UnitHistoryOperand::{Axis, Exact};
+    fn callable_history_operands(&self) -> Option<[Option<CallableHistoryOperand<'a>>; 2]> {
+        use CallableHistoryOperand::{Axis, Exact};
         Some(match self {
             Self::Single(Some(arg)) | Self::RootLexical(arg) => [Some(Exact(*arg)), None],
             Self::Pair(left, right) => [Some(Exact(*left)), Some(Exact(*right))],
@@ -4933,11 +4991,11 @@ impl<'a> NestedIntegerArgument<'a> {
         })
     }
 
-    pub(super) fn unit_history_entry(&self, parameters: &[ScalarType], work: &std::cell::Cell<usize>)
-        -> Option<IntegerRequirementEntry<'a>>
+    pub(super) fn callable_history_entry(&self, parameters: &[ScalarType], work: &std::cell::Cell<usize>)
+        -> Option<CallableHistoryEntry>
     {
-        use UnitHistoryOperand::{Axis, Exact};
-        let operands = self.unit_history_operands()?;
+        use CallableHistoryOperand::{Axis, Exact};
+        let operands = self.callable_history_operands()?;
         if operands.iter().flatten().count() != parameters.len() { return None; }
         let mut charged = work.get();
         charge_call_work(&mut charged, parameters.len())?;
@@ -4960,7 +5018,7 @@ impl<'a> NestedIntegerArgument<'a> {
             domains.push(domain);
         }
         work.set(charged);
-        Some(IntegerRequirementEntry::UnitHistory(UnitHistoryEntry(IntegerRow::new(domains))))
+        Some(CallableHistoryEntry(IntegerRow::new(domains)))
     }
 }
 
@@ -8057,9 +8115,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             } else {
                                 actual_nested_argument(calls, expression, roots, &input, true, false, None)
                             };
-                            let operands = argument.unit_history_operands()?;
+                            let operands = argument.callable_history_operands()?;
                             let domains_count = operands.iter().flatten().count();
-                            let is_projected = operands.iter().flatten().any(|arg| matches!(arg, UnitHistoryOperand::Axis(..)));
+                            let is_projected = operands.iter().flatten().any(|arg| matches!(arg, CallableHistoryOperand::Axis(..)));
                             if !matches!(handle(calls, expression, signature, argument, &ScalarType::Unit)?, ActualCallResult::Unit) {
                                 return None;
                             }
@@ -8075,7 +8133,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 for (operand, domain) in operands.into_iter().flatten().zip(piece.domains) {
                                     tracker.charge(domain.interval_count().checked_add(1)?)?;
                                     match operand {
-                                        UnitHistoryOperand::Axis(_, axis) => {
+                                        CallableHistoryOperand::Axis(_, axis) => {
                                             let entry = original.get(axis)?;
                                             let mut cost = entry.interval_count();
                                             original.charge_affine_replacement(axis, domain.interval_count(), &mut cost)?;
@@ -8083,7 +8141,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                             if domain.is_empty() || !domain.is_subset_of(entry) { return None; }
                                             next.replace_domain(axis, domain);
                                         }
-                                        UnitHistoryOperand::Exact((_, value)) if domain.singleton_value() == Some(value) => {}
+                                        CallableHistoryOperand::Exact((_, value)) if domain.singleton_value() == Some(value) => {}
                                         _ => return None,
                                     }
                                 }
@@ -8793,7 +8851,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
                     #[cfg(feature = "internal-checker")]
                     if let Some(histories) = roots.callable_history {
-                        if contextual || signature.parameters.len() != 1 { return None; }
+                        if contextual || !(1..=2).contains(&signature.parameters.len()) { return None; }
                         let span = calls.occurrences.get(origin.call.0)?.span;
                         let mut survivors = IntegerInputs::default();
                         for mut row in std::mem::take(&mut path.0) {
@@ -8804,17 +8862,50 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             tracker.outgoing_call = Some(tracker.steps(row.callable_history)?);
                             drop(tracker);
                             let exact = IntegerInputs(vec![row]);
-                            let argument = actual_nested_argument(calls, origin.call, roots, &exact, true, false, None);
-                            let (axis, value) = match &argument {
-                                NestedIntegerArgument::Projected(projection) => (Some(projection.caller_axis), None),
-                                NestedIntegerArgument::Single(Some((_, value))) | NestedIntegerArgument::RootLexical((_, value)) =>
-                                    (None, Some((*value).clone())),
-                                _ => return None,
+                            let argument = if signature.parameters.len() == 2 {
+                                nested_pair_argument(calls, origin.call, roots, &exact, true, false, true, false, None)?
+                            } else {
+                                actual_nested_argument(calls, origin.call, roots, &exact, true, false, None)
                             };
-                            let ActualCallResult::PartitionedInteger(pieces) =
-                                handle(calls, origin.call, signature, argument, &receiver.ty)? else { return None; };
+                            let operands = argument.callable_history_operands()?;
+                            let result = handle(calls, origin.call, signature, argument, &receiver.ty)?;
                             let mut tracker = histories.borrow_mut();
                             let steps = tracker.scalar_return_steps.take()?;
+                            if let [Some(first), Some(second)] = operands {
+                                let ActualCallResult::PartitionedIntegerPair(pair) = result else { return None; };
+                                let axes = [first, second].map(|operand| match operand {
+                                    CallableHistoryOperand::Axis(_, axis) => Some(axis), CallableHistoryOperand::Exact(_) => None,
+                                });
+                                if pair.caller_axes != [0, 1] || pair.pieces.len() != steps.len()
+                                    || (axes == [None, None] && steps.len() != 1)
+                                { return None; }
+                                let types = [&signature.parameters[0], &signature.parameters[1]];
+                                let original = exact.0.first()?;
+                                for (piece, steps) in pair.pieces.into_iter().zip(steps) {
+                                    if piece.anchor != 1 { return None; }
+                                    tracker.charge(steps.len().checked_add(1)?)?;
+                                    let mut work = tracker.work.get();
+                                    let mut output = ScalarOutputRows::Bound(IntegerInputs::default());
+                                    let affine = attach_pair_return(original, axes, types, &receiver.ty,
+                                        piece.inputs, &piece.output, &mut output, &mut work)?;
+                                    tracker.work.set(work);
+                                    if affine { roots.affine_work.get_or_insert(0); }
+                                    let ScalarOutputRows::Bound(rows) = output else { return None; };
+                                    for mut row in rows.0 {
+                                        for step in &steps { tracker.append(&mut row, *step); }
+                                        let returned = tracker.boundary(span, true);
+                                        tracker.append(&mut row, returned);
+                                        survivors.0.push(row);
+                                    }
+                                }
+                                continue;
+                            }
+                            let (axis, value) = match operands {
+                                [Some(CallableHistoryOperand::Axis(_, axis)), None] => (Some(axis), None),
+                                [Some(CallableHistoryOperand::Exact((_, value))), None] => (None, Some(value)),
+                                _ => return None,
+                            };
+                            let ActualCallResult::PartitionedInteger(pieces) = result else { return None; };
                             if pieces.len() != steps.len() || (axis.is_none() && pieces.len() != 1) { return None; }
                             for (piece, steps) in pieces.into_iter().zip(steps) {
                                 tracker.charge(steps.len().checked_add(1)?)?;
@@ -8828,7 +8919,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     rows
                                 } else {
                                     let literal = singleton_return_from_partitions(std::slice::from_ref(&piece),
-                                        value.as_ref()?, &receiver.ty, &mut work)?;
+                                        value?, &receiver.ty, &mut work)?;
                                     charge_call_work(&mut work, exact.0.first()?.len())?;
                                     let mut rows = IntegerInputs(exact.0.clone());
                                     rows.append_local(IntegerSet::singleton(&literal));

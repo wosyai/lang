@@ -10636,8 +10636,8 @@ fn symbolic_history_call_target(
     let (owner, item) = *body.structure.checker_direct_targets.get(&site)?;
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
     if (owner == module && caller == item)
-        || !(if output.ty == ScalarType::Unit { (1..=2).contains(&signature.parameters.len()) }
-            else { is_integer_type(&output.ty) && signature.parameters.len() == 1 })
+        || !(output.ty == ScalarType::Unit || is_integer_type(&output.ty))
+        || !(1..=2).contains(&signature.parameters.len())
         || !signature.parameters.iter().all(is_integer_type)
     { return None; }
     let source = project.modules.get(owner)?;
@@ -10673,9 +10673,9 @@ fn projected_history_scalar_height(
     if !active.insert(target) { return None; }
     let body = calls.function_body(target.0, target.1, None)?;
     super::checker_flow::charge_call_work(work, body.occurrences.len())?;
-    let [parameter] = body.boundary.parameters.as_slice() else { return None; };
     let [output] = body.boundary.results.as_slice() else { return None; };
-    if !is_integer_type(&parameter.ty) || !is_integer_type(&output.ty) || !body.checker_pure_calling_frame()
+    if !(1..=2).contains(&body.boundary.parameters.len())
+        || !body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty)) || !is_integer_type(&output.ty) || !body.checker_pure_calling_frame()
         || body.contextual_formal().is_some() || !body.structure.module_storage_uses.is_empty() || !body.callable_escapes.is_empty()
         || !body.structure.checker_directives.is_empty()
         || !body.conditionals.values().all(|region| matches!(region, ConditionalRegion::Value { condition, .. }
@@ -10713,17 +10713,9 @@ fn check_projected_history_scalar_return(
 ) -> Option<super::checker_flow::CallableHistoryCall> {
     if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
     let body = calls.function_body(target.0, target.1, None)?;
-    let [parameter] = signature.parameters.as_slice() else { return None; };
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
     if !is_integer_type(&output.ty) { return None; }
-    let domain = match argument {
-        NestedIntegerArgument::Single(Some((ty, value))) | NestedIntegerArgument::RootLexical((ty, value))
-            if ty == parameter && integer_literal_fits_type(value, ty) => Rc::new(IntegerSet::singleton(value)),
-        NestedIntegerArgument::Projected(projection) if projection.slot == 0
-            && projection.ty == parameter && matches!(projection.companion, ProjectedCompanion::Unary) =>
-            projection.materialize()?,
-        _ => return None,
-    };
+    let entry = argument.callable_history_entry(&signature.parameters, work)?;
     let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
         actual: NestedIntegerArgument<'_>, _steps| {
         if !std::ptr::eq(body, caller) { return None; }
@@ -10734,7 +10726,7 @@ fn check_projected_history_scalar_return(
     let nested = (!body.call_occurrences.is_empty())
         .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
     let step_owner = (target.0 != origin_module).then_some(target.0);
-    super::checker_flow::trace_closed_projected_scalar_return(body, domain, &output.ty, step_owner, work, nested)
+    super::checker_flow::trace_closed_projected_scalar_return(body, entry, &output.ty, step_owner, work, nested)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10810,7 +10802,7 @@ impl ClosedAuthoredHistories<'_> {
                 return check_projected_history_scalar_return(self.project, self.calls, child, argument, signature,
                     origin, self.visits, self.work, depth + 1);
             }
-            let entry = argument.unit_history_entry(&signature.parameters, self.work)?;
+            let entry = IntegerRequirementEntry::UnitHistory(argument.callable_history_entry(&signature.parameters, self.work)?);
             let mut meter = self.work.get();
             super::checker_flow::charge_call_work(&mut meter, prefix.len().checked_add(steps.len())?)?;
             self.work.set(meter);
@@ -18387,6 +18379,66 @@ mod tests {
 
         let assigns = program.replace("if (tag < 0) { n }", "tag = 0; if (tag < 0) { n }");
         assert!(matches!(run("symbolic-pair-result-write-denied", &assigns), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_binary_scalar_history_transfers_real_swapped_return_aliases() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "private-binary-scalar-history");
+        let text = format!(r#"%%start
+            i8(i8, i8) choose = fn(left, right) {{
+                if (left < 0) {{ right }} else {{ left }}
+            }};
+            i8(i8, i8) wrapper = fn(other, key) {{ i8 result = choose(key, other); result }};
+            unit(i8, i8) caller = fn(key, other) {{
+                i8 result = wrapper(other, key);
+                if (result == 2) {{ core.require(false, {OUTPUT}); }};
+            }};
+        %%end"#);
+        let at = |snippet: &str| {
+            let start = text.find(snippet).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(source.clone(), ByteSpan::new(start, start + snippet.len() as u32))
+        };
+        let outer = at("wrapper(other, key)");
+        let inner = at("choose(key, other)");
+        let branch = at("left < 0");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&source, text), Vec::new())], [], vec![source.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new()).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let old = prepare(&text, scope).run().unwrap();
+                for cap in [1, 2, 3] {
+                    let (records, end, trace, _) = prepare(&text, scope)
+                        .search_startup_authored_path(NonZeroUsize::new(cap).unwrap()).unwrap();
+                    if scope == ScalarCheckerScope::MainFlowOnly {
+                        assert!(records.is_empty() && old.directives.is_empty());
+                        assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+                        continue;
+                    }
+                    assert!(old.active && !old.directives.is_empty());
+                    assert_eq!(records.len(), cap.min(2));
+                    assert_eq!(end, if cap == 3 { StartupAuthoredCompletion::Exhausted } else { StartupAuthoredCompletion::LimitReached });
+                    assert!(trace.contains_branch(branch.clone(), true));
+                    assert_eq!(trace.contains_branch(branch.clone(), false), cap >= 2);
+                    assert!(trace.contains_return(&outer) && trace.contains_return(&inner));
+                    assert!(trace.call_paths().into_iter().all(|path| path == [outer.clone(), inner.clone()]));
+                    for (failure, domains) in records.iter().zip([
+                        [(-128, -1), (2, 2), (2, 2)], [(2, 2), (-128, 127), (2, 2)],
+                    ]) {
+                        assert_eq!(failure.witness.row_count(), 1);
+                        for (axis, (lo, hi)) in domains.into_iter().enumerate() {
+                            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&lo.into(), &hi.into())]));
+                        }
+                    }
+                }
+            }
+            let linked = text.replace("wrapper(other, key)", "wrapper(key, key)")
+                .replace("if (result == 2)", "if (other == 2 && result == 2)");
+            assert!(matches!(prepare(&linked, ScalarCheckerScope::CurrentPackage)
+                .search_startup_authored_path(NonZeroUsize::new(3).unwrap()), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
