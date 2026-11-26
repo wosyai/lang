@@ -344,14 +344,20 @@ fn run_private_prepared_owners(
     enum Owner {
         ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
         QualifiedNamed(PreparedScalarOrderedCheck),
+        DependencyProofOnly(PreparedScalarOrderedCheck),
     }
     let mut owners = Vec::with_capacity(prepared.len());
     for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
-        let owner = match if index == 0 && matches!(primary, PrivateAuthoredPrimary::QualifiedNamed) {
-            check.map(Owner::QualifiedNamed)
-        } else {
-            check.and_then(PreparedScalarOrderedCheck::into_startup_authored_owner).map(Owner::ProofFree)
-        } {
+        let classified = check.and_then(|check| {
+            if index == 0 && matches!(primary, PrivateAuthoredPrimary::QualifiedNamed) {
+                Ok(Owner::QualifiedNamed(check))
+            } else if index != 0 && check.is_private_named_without_authored_paths()? {
+                Ok(Owner::DependencyProofOnly(check))
+            } else {
+                check.into_startup_authored_owner().map(Owner::ProofFree)
+            }
+        });
+        let owner = match classified {
             Ok(owner) => owner,
             Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
         };
@@ -360,7 +366,19 @@ fn run_private_prepared_owners(
     let mut remaining = limit.get();
     let mut selected = Vec::new();
     for (root, texts, owner) in owners {
-        let Some(cap) = std::num::NonZeroUsize::new(remaining) else { break; };
+        let owner = match owner {
+            Owner::DependencyProofOnly(check) => {
+                let outcome = check.run().and_then(|report| {
+                    if report.directives.is_empty() { Ok(report) }
+                    else { Err(ScalarOrderedCheckerOutcome::Unsupported) }
+                });
+                if outcome.is_err() { return vec![ConfiguredCheckReceipt { root, outcome, texts }]; }
+                selected.push(ConfiguredCheckReceipt { root, outcome, texts });
+                continue;
+            }
+            authored => authored,
+        };
+        let Some(cap) = std::num::NonZeroUsize::new(remaining) else { continue; };
         let (report, completion) = match match owner {
             Owner::ProofFree(owner) => owner.run(cap).map(|(directives, completion, active)| (
                 MainFlowProofReceipt {
@@ -371,6 +389,7 @@ fn run_private_prepared_owners(
                 }, completion,
             )),
             Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap),
+            Owner::DependencyProofOnly(_) => unreachable!("formal owners do not use the authored quota"),
         } {
             Ok(report) => report,
             Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],

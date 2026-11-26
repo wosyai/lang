@@ -9928,6 +9928,21 @@ impl PreparedScalarOrderedCheck {
         run_private_named_after_startup(&owner, self.scope, cap, StartupNamedMode::Qualified).map_err(configured_ordered_error)
     }
 
+    /// Positively classify a prepared named owner which cannot publish an
+    /// ordinary authored failure. This does not execute its proofs.
+    #[doc(hidden)]
+    pub fn is_private_named_without_authored_paths(&self) -> Result<bool, ScalarOrderedCheckerOutcome> {
+        let PreparedConfiguredCheck::Named { owner, startup_count } = &self.owner else { return Ok(false); };
+        if owner.context.is_some() || owner.proofs.values().all(|catalog| catalog.definitions.is_empty()) {
+            return Ok(false);
+        }
+        // Need a complete canonical scan of selected startup and callable
+        // obligations, even for a dependency consulted after the quota.
+        let (potential, _) = package_obligation_roots(&owner.prepared, self.scope, *startup_count, &owner.source)
+            .map_err(configured_ordered_error)?;
+        Ok(!potential)
+    }
+
     /// Accepts only a proof-free owner and never drops possible dormant
     /// package obligations. Call once before sharing a command budget.
     #[doc(hidden)]

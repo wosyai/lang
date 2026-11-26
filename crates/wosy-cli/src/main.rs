@@ -2435,6 +2435,60 @@ unit(u8) unseen = fn(value) {
             assert!(!root.join(".wosy").exists());
         }
 
+        let proof_only_leaf = r#"%%start
+u8(u8) echo = fn(value) { value };
+proof leaf_contract for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
+%%end"#;
+        let leaf_dormant = root.join("leaf/src/dormant.w");
+        let old_dormant = fs::read_to_string(&leaf_dormant).unwrap();
+        fs::remove_file(&leaf_dormant).unwrap();
+        fs::write(&leaf_source, proof_only_leaf).unwrap();
+        let leaf_manifest = root.join("leaf/wosy.toml");
+        let saved_leaf_manifest = fs::read_to_string(&leaf_manifest).unwrap();
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let legacy = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                let last = legacy.last().unwrap();
+                let legacy_diagnostics = ordered_check_diagnostics(last.outcome.as_ref().ok().unwrap(), &last.texts).unwrap();
+                assert_eq!(legacy_diagnostics.len(), 1);
+                for (cap, expected, package_order) in [
+                    (1, &b"app"[..], &["app", "leaf"][..]),
+                    (2, &b"appa"[..], &["app", "a", "leaf"][..]),
+                ] {
+                    let receipts = configured_check::check_targets_with_private_authored_limit(
+                        root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                        configured_check::PrivateAuthoredPrimary::ProofFree,
+                    ).ok().unwrap();
+                    let reports = checked_publication_reports(&receipts).ok().unwrap();
+                    let actual_order = receipts.iter().map(|r|
+                        if &r.root == root { "app" } else { r.root.file_name().unwrap().to_str().unwrap() }
+                    ).collect::<Vec<_>>();
+                    assert_eq!(actual_order, package_order);
+                    let leaf = receipts.last().unwrap();
+                    let formal = reports.last().unwrap();
+                    assert!(formal.directives.is_empty());
+                    let proof = formal.symbolic_diagnostic.as_ref().unwrap();
+                    assert_eq!(proof.proof.source.package, "leaf");
+                    assert_eq!(proof.returned, 3.into());
+                    assert_eq!(ordered_check_diagnostics(formal, &leaf.texts).unwrap(), legacy_diagnostics);
+                    let checked = plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()).unwrap();
+                    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                    assert_eq!(checked.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), 3);
+                    assert_eq!(stdout, expected);
+                    assert!(stderr.is_empty() && !root.join(".wosy").exists());
+                }
+            }
+        }
+        fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();
+        fs::write(&leaf_source, proof_only_leaf.replace("%%end", r#"core.require(false, { .stdout = "leaf"; .stderr = ""; .code = 6; .files = []; }); %%end"#)).unwrap();
+        let refused = private(1);
+        let [rejected] = refused.as_slice() else { panic!("mixed owner cannot disappear behind cap"); };
+        assert_eq!(rejected.root, root.join("leaf"));
+        assert!(matches!(rejected.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+        fs::write(&leaf_source, body("leaf", 6)).unwrap();
+        fs::write(&leaf_dormant, old_dormant).unwrap();
+
         let root_dormant = root.join("src/more.w");
         let dormant_program = fs::read_to_string(root.join("leaf/src/dormant.w")).unwrap();
         fs::write(&root_dormant, &dormant_program).unwrap();
