@@ -4136,7 +4136,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{private_runtime_copy_child_store_signature, private_runtime_copy_read_signature, private_runtime_copy_write_signature, private_runtime_read_signature, private_runtime_write_signature, mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
+pub(crate) use reference::aggregate::{exclusive_runtime_relay_signature, private_runtime_copy_child_store_signature, private_runtime_copy_read_signature, private_runtime_copy_write_signature, private_runtime_read_signature, private_runtime_write_signature, mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReceiptGate, RecommittedArrayExtent, ReplacementArrayExtent, ReturnedArrayAddress};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,

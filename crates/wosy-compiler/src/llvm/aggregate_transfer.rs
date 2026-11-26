@@ -357,6 +357,55 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     let nodes = state.body_call_nodes.ok_or("private runtime array call lacks prepared occurrences")?;
     let Some(occurrence) = nodes.expression_ordinal(expression) else { return Ok(None) };
     let Some(site) = plan.private_runtime_access_calls.get(&occurrence) else { return Ok(None) };
+    if site.inherited {
+        let Some((first, tail)) = arguments.split_first() else {
+            return Err("missing exclusive forwarding argument".into());
+        };
+        let formal = match first {
+            place @ ScalarExpression::Name { .. } => place,
+            ScalarExpression::CheckedAddress {
+                mutability: crate::scalar::ScalarReferenceMutability::Mutable,
+                place: ScalarPlace::Dereference { pointer, .. }, ..
+            } => pointer.as_ref(),
+            _ => return Err("exclusive runtime relay changed its exact formal use".into()),
+        };
+        if nodes.lexical_expression_declaration(formal) != Some(site.owner)
+            || plan.private_runtime_access_formal != Some(site.owner) || !plan.private_runtime_exclusive_relay
+        {
+            return Err("exclusive runtime relay lost its exact formal origin".into());
+        }
+        let (_, count) = state.aggregate.as_ref().and_then(|aggregate| aggregate.private_runtime_access_pair)
+            .ok_or("exclusive runtime relay lacks incoming pair")?;
+        let first_value = super::expression::emit_contextual_arguments(context, state, std::slice::from_ref(first),
+            &parameters[..1], project)?;
+        let [EmitValue::Basic(BasicValueEnum::IntValue(address))] = first_value.as_slice() else {
+            return Err("exclusive runtime relay lost its checked reference lowering".into());
+        };
+        let descriptor = borrowed_extent_type(context, state.target_layout);
+        let pair = state.builder.build_insert_value(descriptor.get_undef(), *address, 0, "exclusive_forward_address")
+            .map_err(builder_error)?.into_struct_value();
+        let pair = state.builder.build_insert_value(pair, count, 1, "exclusive_forward_pair")
+            .map_err(builder_error)?.into_struct_value();
+        let function = *state.functions.get(symbol).ok_or("missing exclusive runtime relay target")?;
+        let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
+            return Err("exclusive runtime relay lost its exact output".into());
+        };
+        if !crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs)
+            || function.get_linkage() != Linkage::Internal || function.get_type().get_return_type().is_some()
+            || function.count_params() as usize != parameters.len()
+            || function.get_type().get_param_types().first() != Some(&descriptor.into())
+        {
+            return Err("exclusive runtime relay changed its sealed unit ABI".into());
+        }
+        let values = super::expression::emit_contextual_arguments(context, state, tail, &parameters[1..], project)?;
+        let mut args = vec![BasicMetadataValueEnum::from(pair)];
+        for value in values {
+            let EmitValue::Basic(value) = value else { return Err("missing exclusive relay scalar".into()); };
+            args.push(value.into());
+        }
+        state.builder.build_call(function, &args, "").map_err(builder_error)?;
+        return Ok(Some(EmitValue::Unit));
+    }
     let declaration = site.owner;
     let portable = plan.private_runtime_portable_calls.contains(&occurrence);
     if portable && (site.portable_birth.is_none() || !state.project_names.is_some_and(|names|
@@ -415,6 +464,12 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
             function_type.get_param_types().as_slice()
                 == [descriptor.into(), context.i64_type().into(), basic_type(context, &parameters[2], state.target_layout)?.into()]
                 && function_type.get_return_type() == Some(basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
+        } else if mutable && crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs) {
+            let mut types = vec![descriptor.into()];
+            for parameter in scalar_parameters {
+                types.push(basic_type(context, parameter, state.target_layout)?.into());
+            }
+            function_type.get_param_types() == types && function_type.get_return_type().is_none()
         } else if mutable && (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
             || crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs)) {
             function_type.get_param_types().as_slice()
@@ -810,6 +865,16 @@ pub(super) fn definition_type<'ctx>(
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("private runtime array reader is not callable".into());
         };
+        if plan.is_some_and(|body| body.private_runtime_exclusive_relay) {
+            if !crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs) {
+                return Err("invalid exclusive runtime relay signature".into());
+            }
+            let mut args = vec![borrowed_extent_type(context, layout).into()];
+            for parameter in &parameters[1..] {
+                args.push(basic_type(context, parameter, layout)?.into());
+            }
+            return Ok(context.void_type().fn_type(&args, false));
+        }
         if crate::scalar::private_runtime_copy_child_store_signature(parameters, &outputs.outputs)
             && plan.is_some_and(|body| body.private_runtime_copy_child_store && body.private_runtime_copy_borrows.len() == 1
                 && body.private_runtime_writes.is_empty() && body.private_runtime_reads.is_empty()
@@ -1688,7 +1753,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
-        || plan.array_descriptor_observer.is_some() || plan.grouped_owning_extent.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
+        || plan.array_descriptor_observer.is_some() || plan.private_runtime_exclusive_relay || plan.grouped_owning_extent.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 

@@ -3116,6 +3116,7 @@ pub(crate) struct ClosedBody {
     pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(crate) private_runtime_access_formal: Option<ByteSpan>,
     pub(crate) private_runtime_read_forward: Option<usize>,
+    pub(crate) private_runtime_exclusive_relay: bool,
     pub(crate) private_runtime_reads: HashSet<usize>,
     pub(crate) private_runtime_copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     pub(crate) private_runtime_copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
@@ -3185,6 +3186,7 @@ impl ClosedBody {
 pub(crate) struct PrivateRuntimePairCall {
     pub(crate) owner: ByteSpan,
     pub(crate) target: BodyKey,
+    pub(crate) inherited: bool,
     pub(crate) portable_birth: Option<(CfgPointId, CfgPointId)>, // exact (call, first borrow)
 }
 
@@ -9713,6 +9715,7 @@ pub(in crate::scalar) struct PrivateRuntimeReadPlans {
 struct PrivateRuntimeReadPlan {
     formal: Option<ByteSpan>,
     forward: Option<usize>,
+    exclusive_relay: bool,
     accesses: HashSet<usize>,
     copy_fields: HashMap<usize, (usize, ScalarStructFieldId)>,
     copy_writes: HashMap<usize, (usize, ScalarStructFieldId)>,
@@ -9753,6 +9756,8 @@ impl ClosedAggregates {
             }
             if !std::mem::replace(&mut plan.private_runtime_portable_formal, true) {
                 pending.extend(plan.private_runtime_access_relay_target);
+                pending.extend(plan.private_runtime_access_calls.values()
+                    .filter(|site| site.inherited).map(|site| site.target));
             }
         }
         Ok(())
@@ -9776,6 +9781,7 @@ impl ClosedAggregates {
             }
             body.private_runtime_access_formal = plan.formal;
             body.private_runtime_read_forward = plan.forward;
+            body.private_runtime_exclusive_relay = plan.exclusive_relay;
             body.private_runtime_reads.clone_from(&plan.accesses);
             body.private_runtime_copy_fields.clone_from(&plan.copy_fields);
             body.private_runtime_copy_writes.clone_from(&plan.copy_writes);
@@ -9890,6 +9896,7 @@ enum PrivateRuntimeAccessRoute {
     Borrow(ByteSpan),
     ChildStore(ByteSpan),
     Write(ByteSpan),
+    ExclusiveRelay(ByteSpan),
     Forward { formal: ByteSpan, call: OccurrenceOrdinal, target: Option<BodyKey> },
 }
 
@@ -10065,6 +10072,134 @@ fn private_shared_index_forward(
     Some((view.span, call, call_site.id))
 }
 
+pub(crate) fn exclusive_runtime_relay_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
+    matches!(parameters, [ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Mutable, inner,
+    }, rest @ ..] if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. } if ordinary_value(element))
+        && rest.iter().all(ordinary_value))
+        && (outputs.is_empty() || matches!(outputs, [output] if output.ty == ScalarType::Unit))
+}
+
+fn exact_exclusive_runtime_relay(
+    cfg: &ScalarReferenceCfg, sites: &FunctionCallSites, function: &ScalarFunction,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    raw_exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
+) -> Option<(ByteSpan, Vec<(usize, PrivateRuntimePairCall)>)> {
+    let ScalarType::Callable { parameters, outputs } = &function.signature else { return None };
+    if !exclusive_runtime_relay_signature(parameters, &outputs.outputs)
+        || function.body.unsafe_context || !raw_exposures.is_empty()
+        || !sites.declared_unsafe_calls.is_empty() || !sites.callable_escapes.is_empty()
+        || !sites.allocation_length_call_targets.is_empty() || !sites.structure.module_storage_uses.is_empty()
+        || !cfg.allocations.is_empty()
+    { return None; }
+    let formal = sites.boundary.parameters.first()?.span;
+    let entry = cfg.points.first()?;
+    let original = entry.source_span.range;
+    let [entry_bind] = entry.successors.as_slice() else { return None; };
+    let bound = cfg.points.get(entry_bind.0)?;
+    let CfgPointKind::Bind { binding: formal_binding } = &bound.kind else { return None; };
+    if formal_binding.declaration_span != formal || formal_binding.function_span != original
+        || bound.scope != ReferenceScopeId(0) || !matches!(entry.kind, CfgPointKind::Entry)
+    { return None; }
+    let singleton_formal_loan = |point: &ReferenceFlowPoint| -> Option<&ReferenceLoanId> {
+        let origins = point.possible_origins.as_ref()?;
+        if origins.len() != 1 { return None; }
+        let ReferenceOrigin::BorrowedFrom { parameter: 0, loan } = cfg.facts.get(origins.first()?.0)?
+            else { return None; };
+        (loan.mode == ScalarReferenceMutability::Mutable
+            && &loan.origin_place.binding == formal_binding
+            && loan.origin_place.projections.is_empty() && loan.parent.is_none()).then_some(loan)
+    };
+    singleton_formal_loan(bound)?;
+    let mut predecessors = HashMap::new();
+    for point in &cfg.points {
+        for &next in &point.successors {
+            predecessors.entry(next).and_modify(|prior: &mut Option<CfgPointId>| *prior = None)
+                .or_insert(Some(point.id));
+        }
+    }
+    let mut exact = HashSet::from([*entry_bind]);
+    let mut calls = Vec::new();
+    for occurrence in &sites.call_occurrences {
+        let ordinal = occurrence.ordinal;
+        let call = cfg.primary_call_point(ordinal)?;
+        let target = target_body(declarations, cfg, call)?;
+        let signature = sites.checked_call_signatures.get(&ordinal)?;
+        if !exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs)
+            || scalar_type_identity(signature.parameters.first()?) != scalar_type_identity(parameters.first()?)
+        { return None; }
+        let CfgPointKind::Call {
+            target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. },
+            expression: ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
+        } = &cfg.points.get(call.0)?.kind else { return None; };
+        let first = *argument_points.first()?;
+        let actual = cfg.points.get(first.0)?;
+        let OccurrenceNode::Expression(argument) = *sites.structure.edges.get(&(
+            OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(0),
+        ))? else { return None; };
+        let checked_type = sites.structure.checked_types.expressions.get(&argument)?;
+        // Runtime-array types retain authored spans. Match the checked shape
+        // across declarations, then authenticate the exact argument and loan.
+        if actual.scope != cfg.points.get(call.0)?.scope
+            || actual.source_span.range != sites.occurrences.get(argument.0)?.span
+            || scalar_type_identity(checked_type) != scalar_type_identity(&signature.parameters[0])
+        { return None; }
+        let plain = sites.prepared_plain_name(argument);
+        if argument_points.len() != signature.parameters.len() || arguments.len() != argument_points.len() {
+            return None;
+        }
+        let read = match (&actual.kind, arguments.first()?) {
+            (CfgPointKind::Read { binding }, ScalarExpression::Name { .. }) if binding == formal_binding
+                && matches!(plain, Some(PlainNameIdentity::Lexical(lexical)) if lexical == binding) => {
+                singleton_formal_loan(actual)?;
+                let [moved] = actual.successors.as_slice() else { return None; };
+                if !exact_call_argument_move(&cfg.points[first.0], cfg.points.get(moved.0)?, binding, &parameters[0]) {
+                    return None;
+                }
+                exact.insert(*moved);
+                first
+            }
+            (CfgPointKind::Borrow { place, loan }, ScalarExpression::CheckedAddress {
+                mutability: ScalarReferenceMutability::Mutable, place: authored @ ScalarPlace::Dereference {
+                    pointer, ..
+                }, ..
+            }) => {
+                let ScalarExpression::Name { span: pointer_span, .. } = pointer.as_ref() else { return None; };
+                if plain.is_some() || authored != &place.place
+                    || loan.mode != ScalarReferenceMutability::Mutable || &place.binding != formal_binding
+                    || loan.origin_place != *place
+                { return None; }
+                let predecessor = predecessors.get(&first).copied().flatten()?;
+                let read = cfg.points.get(predecessor.0)?;
+                let CfgPointKind::Read { binding } = &read.kind else { return None; };
+                let parent = singleton_formal_loan(read)?;
+                if binding != formal_binding || read.successors.as_slice() != [first]
+                    || read.scope != actual.scope || read.source_span.range != *pointer_span
+                    || loan.parent.as_deref() != Some(parent)
+                    || !matches!(place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(projected)] if projected.as_ref() == parent)
+                    || !actual.possible_origins.as_ref().is_some_and(|origins| origins.len() == 1
+                        && origins.iter().all(|id| matches!(cfg.facts.get(id.0),
+                            Some(ReferenceOrigin::BorrowedFrom { parameter: 0, loan: child }) if child == loan)))
+                    || !matches!(actual.successors.as_slice(), [next] if first < *next && *next <= call)
+                { return None; }
+                predecessor
+            }
+            _ => return None,
+        };
+        exact.extend([call, first, read]);
+        calls.push((ordinal.0, PrivateRuntimePairCall { owner: formal, target, inherited: true, portable_birth: None }));
+    }
+    if calls.is_empty() || !cfg.points.iter().all(|point| exact.contains(&point.id) || match &point.kind {
+        CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Branch { .. }
+        | CfgPointKind::Join | CfgPointKind::Return | CfgPointKind::ReturnOutput { checked: false, .. } => true,
+        CfgPointKind::Evaluate(value) => neutral_scalar_evaluation(value),
+        CfgPointKind::Read { binding } => binding.declaration_span != formal,
+        _ => false,
+    }) { return None; }
+    Some((formal, calls))
+}
+
 impl ProjectReferenceResults {
     pub(in crate::scalar) fn finalize_private_runtime_reads(
         &self, project: &ScalarProject, calls: &ProjectCallSiteResults, checked_access: bool,
@@ -10102,6 +10237,7 @@ impl ProjectReferenceResults {
         let mut declarations = HashMap::new();
         let mut routes = BTreeMap::new();
         let mut possible_relays = Vec::new();
+        let mut exclusive_edges = BTreeMap::new();
         let function = |module: usize, item: usize| match project.modules.get(module)?.items.get(item)? {
             ScalarItem::Function(function) => Some(function),
             _ => None,
@@ -10230,6 +10366,19 @@ impl ProjectReferenceResults {
                     routes.insert(key, PrivateRuntimeAccessRoute::Forward { formal, call, target });
                     census.transport_uses.insert(key, Some(Vec::new()));
                 }
+                for (&key @ (module, item, arm), &normal) in &reservations.bodies {
+                    if !normal || arm.is_some() || routes.contains_key(&key) { continue; }
+                    let Some(function) = function(module, item) else { continue };
+                    if !crate::scalar::typecheck::is_module_private_name(&function.name) { continue; }
+                    let Some(result) = self.function_result(module, item, arm) else { continue };
+                    let Some(sites) = module_at(module).and_then(|input| input.calls.function_body(item, arm)) else { continue };
+                    let Some((formal, calls)) = exact_exclusive_runtime_relay(
+                        &result.cfg, sites, function, &declarations, &result.proof_points.raw_address_exposures,
+                    ) else { continue };
+                    routes.insert(key, PrivateRuntimeAccessRoute::ExclusiveRelay(formal));
+                    exclusive_edges.insert(key, calls);
+                    census.transport_uses.insert(key, Some(Vec::new()));
+                }
                 census.census(&reservations, &module_at, &declarations);
             }
         }
@@ -10250,7 +10399,8 @@ impl ProjectReferenceResults {
                 let ordinal = OccurrenceOrdinal(occurrence);
                 let signature = sites.checked_call_signatures.get(&ordinal)?;
                 let child_store = matches!(routes[&target], PrivateRuntimeAccessRoute::ChildStore(_));
-                let mutable = child_store || matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
+                let exclusive_relay = matches!(routes[&target], PrivateRuntimeAccessRoute::ExclusiveRelay(_));
+                let mutable = child_store || exclusive_relay || matches!(routes[&target], PrivateRuntimeAccessRoute::Write(_));
                 let copy_fields = private_runtime_copy_read_signature(&signature.parameters, &signature.outputs.outputs)
                     || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs)
                     || child_store;
@@ -10261,6 +10411,8 @@ impl ProjectReferenceResults {
                 let mode = if mutable { ScalarReferenceMutability::Mutable } else { ScalarReferenceMutability::Shared };
                 let exact_signature = if child_store {
                     private_runtime_copy_child_store_signature(&signature.parameters, &signature.outputs.outputs)
+                } else if exclusive_relay {
+                    exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs)
                 } else if mutable {
                     private_runtime_write_signature(&signature.parameters, &signature.outputs.outputs)
                         || private_runtime_copy_write_signature(&signature.parameters, &signature.outputs.outputs)
@@ -10276,14 +10428,14 @@ impl ProjectReferenceResults {
                 if target_body(&declarations, cfg, call) != Some(target) { return None; }
                 let call_site = cfg.points.get(call.0)?;
                 let CfgPointKind::Call { argument_points, .. } = &call_site.kind else { return None };
-                if argument_points.len() != if mutable { 3 } else { 2 } { return None; }
+                if argument_points.len() != signature.parameters.len() { return None; }
                 let borrow = argument_points[0];
                 if mutable {
                     // Borrowing is the first actual. The remaining exact
                     // scalar actuals must neither touch a projected place
                     // nor run a call during the temporary exclusive loan.
                     let points = &cfg.initial_points;
-                    if points.get(borrow.0)?.successors.as_slice() != [argument_points[1]] {
+                    if points.get(borrow.0)?.successors.as_slice() != [argument_points.get(1).copied().unwrap_or(call)] {
                         return None;
                     }
                     for (slot, &argument) in argument_points.iter().enumerate().skip(1) {
@@ -10356,7 +10508,7 @@ impl ProjectReferenceResults {
                         }).collect()
                     }).contains(&place.binding)).then_some((call, borrow));
                 immutable.contains(&place.binding).then_some(PrivateRuntimePairCall {
-                    owner: place.binding.declaration_span, target, portable_birth,
+                    owner: place.binding.declaration_span, target, inherited: false, portable_birth,
                 })
             };
             for &(caller, occurrence) in uses {
@@ -10365,11 +10517,65 @@ impl ProjectReferenceResults {
                 }
             }
         }
-        let sealed = closed_descriptor_routes(&census, &routes, |_| true, |_, route| match *route {
+        let mut sealed: BTreeSet<_> = closed_descriptor_routes(&census, &routes,
+            |key| !exclusive_edges.contains_key(&key), |_, route| match *route {
             PrivateRuntimeAccessRoute::Read(_) | PrivateRuntimeAccessRoute::Write(_) | PrivateRuntimeAccessRoute::Borrow(_)
-                | PrivateRuntimeAccessRoute::ChildStore(_) => None,
+                | PrivateRuntimeAccessRoute::ChildStore(_) | PrivateRuntimeAccessRoute::ExclusiveRelay(_) => None,
             PrivateRuntimeAccessRoute::Forward { call, target, .. } => Some((call, target)),
-        }, |caller, call| local_sites.get(&(caller, call)).map(|site| site.target));
+        }, |caller, call| local_sites.get(&(caller, call)).map(|site| site.target)).into_iter().collect();
+        let mut linked = HashMap::<BodyKey, Vec<BodyKey>>::new();
+        let inherited: HashMap<_, _> = exclusive_edges.iter().flat_map(|(&source, calls)|
+            calls.iter().map(move |&(call, site)| ((source, call), site))).collect();
+        for (&(from, _), site) in &inherited {
+            linked.entry(from).or_default().push(site.target);
+            linked.entry(site.target).or_default().push(from);
+        }
+        let mut seen = HashSet::new();
+        let mut confirmed_edges = HashSet::new();
+        for &start in exclusive_edges.keys() {
+            let mut pending = vec![start];
+            let mut component = Vec::new();
+            let mut eligible = true;
+            let mut roots = Vec::new();
+            let mut writer = false;
+            while let Some(key) = pending.pop() {
+                if !seen.insert(key) { continue; }
+                component.push(key);
+                match routes.get(&key) {
+                    Some(PrivateRuntimeAccessRoute::ExclusiveRelay(_)) => {}
+                    Some(PrivateRuntimeAccessRoute::Write(_)) => writer = true,
+                    _ => eligible = false,
+                }
+                if let Some(Some(users)) = census.transport_uses.get(&key) {
+                    for &(caller, call) in users {
+                        if local_sites.get(&(caller, call)).is_some_and(|site| site.target == key) {
+                            roots.push(key);
+                        } else {
+                            if inherited.get(&(caller, call)).is_some_and(|site| site.target == key) {
+                                confirmed_edges.insert((caller, call));
+                            } else {
+                                eligible = false;
+                            }
+                        }
+                    }
+                } else { eligible = false; }
+                pending.extend(linked.get(&key).into_iter().flatten().copied());
+            }
+            if !eligible || !writer { continue; }
+            let mut reached = HashSet::new();
+            while let Some(key) = roots.pop() {
+                if !reached.insert(key) { continue; }
+                for &(ordinal, site) in exclusive_edges.get(&key).into_iter().flatten() {
+                    if !confirmed_edges.contains(&(key, ordinal)) {
+                        eligible = false;
+                    }
+                    roots.push(site.target);
+                }
+            }
+            if eligible && reached.len() == component.len() {
+                sealed.extend(component);
+            }
+        }
         for target in sealed {
             let plan = plans.bodies.entry(target).or_default();
             match routes[&target] {
@@ -10399,6 +10605,11 @@ impl ProjectReferenceResults {
                             plan.copy_writes.insert(leaf.0, (prefix.0, field.clone()));
                         }
                     }
+                }
+                PrivateRuntimeAccessRoute::ExclusiveRelay(formal) => {
+                    plan.formal = Some(formal);
+                    plan.exclusive_relay = true;
+                    plan.calls.extend(exclusive_edges[&target].iter().copied());
                 }
                 PrivateRuntimeAccessRoute::Forward { formal, call, target } => {
                     plan.formal = Some(formal);
