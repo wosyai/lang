@@ -1983,7 +1983,8 @@ unit() examine = fn {
             assert!(counts[8] > 0, "sibling store must use staged refinement: {counts:?}");
 
             let unprepared_target = text.replace(
-                "if (again) { first(false, input) } else { *input }", "*input",
+                "if (again) { first(false, input) } else { *input }",
+                "if (again) { *input } else { *input }",
             );
             let source = SourceIdentity::new("p".into(), "local".into(), "ranked-target-fallback.w".into(), "r1".into());
             let parsed = crate::parse_source(source, unprepared_target.into(), &[]);
