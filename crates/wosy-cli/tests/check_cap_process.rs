@@ -446,3 +446,54 @@ fn check_cap_process_keeps_mixed_contextual_header_encounter_order() {
         }
     }
 }
+
+#[cfg(feature = "private-check-cap-process")]
+#[test]
+fn check_cap_process_preserves_exact_mixed_literal_inequality() {
+    for layout in ["native", "wasm-wasip1"] {
+        for scope in ["--main-flow-only", "--declared-package"] {
+            for (predicate, refuted) in [("out > 3", false), ("out > 4", true), ("out != 4", true)] {
+                let project = Fixture::new();
+                let root = format!(r#"%%start
+                    lib = namespace app "credit.w";
+                    unit() entry = fn {{ u8 core.context.credit = 3; lib.spend(); }};
+                    u8(u8) score = fn(value) {{ value }};
+                    proof scalar_value for score(input) -> (out) where (input == 4) ensures ({predicate}) {{}}
+                    {}
+                    entry();
+                    u8 scored = score(4);
+                    core.require(scored == 5, {{ .stdout = "second"; .stderr = "[second]"; .code = 19;
+                        .files = [{{ .path = "second.txt"; .text = "second"; }}]; }});
+                %%end"#, require("first", 0, "first.txt"));
+                let provider = r#"%%start
+                    unit() consume = fn { core.context.credit = core.context.credit - 1; };
+                    unit() spend = fn { consume(); };
+                    proof debit_goal for consume() -> (null)
+                        ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+                %%end"#;
+                project.package("", layout, "dev", "", &root);
+                fs::write(project.0.join("src/credit.w"), provider).unwrap();
+                let old = project.run(&[scope]);
+                assert_eq!(old.status.code(), Some(19), "{old:?}");
+                assert_eq!(old.stdout, b"firstsecond");
+                let expected = old.stderr.strip_prefix(b"[first][second]").unwrap();
+                let text = String::from_utf8_lossy(expected);
+                if refuted {
+                    assert!(text.contains(predicate) && text.contains("call returned 4"), "{text}");
+                } else {
+                    assert!(text.is_empty());
+                }
+                project.clear();
+                let mut stderr = b"[first]".to_vec();
+                stderr.extend(expected);
+                assert_terminal(&project.run(&[scope, "--max-errors", "1"]), i32::from(refuted), b"first", &stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+                assert!(!project.output().join("second.txt").exists());
+                project.clear();
+                assert_terminal(&project.run(&[scope, "--max-errors", "3"]), 19, &old.stdout, &old.stderr);
+                assert_eq!(fs::read(project.output().join("first.txt")).unwrap(), b"first");
+                assert_eq!(fs::read(project.output().join("second.txt")).unwrap(), b"second");
+            }
+        }
+    }
+}

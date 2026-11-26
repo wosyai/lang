@@ -11550,9 +11550,18 @@ fn run_private_mixed_root_context(
     for (index, (definition, name)) in catalog.definitions.iter().zip(&proof_names).enumerate() {
         let selected = owner.resolve_selected_proof(definition, catalog.first_query + index)?;
         let plan = owner.plan_resolved_module_proof::<false, false, false>(ordinary_source, name.text(), selected)?;
+        // The original scalar call and the existing exact observer own
+        // the result. For a non-equality literal bound retain the same
+        // unary type fence as the existing capped ordinary relation lane.
+        let literal = match &plan.typed.goal {
+            TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. } => true,
+            TypedProofGoal::Literal { .. } => matches!(plan.typed.body.boundary.parameters.as_slice(),
+                [entry] if &entry.ty == plan.typed.result_type),
+            _ => false,
+        };
         if plan.target.0 != ordinary_ordinal || &plan.typed.target.source != ordinary_source
             || !targets.insert(plan.target) || !names.insert(plan.name) || !plan.has_no_authored_steps() || plan.typed.measure.is_some()
-            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            || !literal
             || !valid_arbitrary_proof_body(plan.typed.body)
             || !qualified_integer_proof_leaf(plan.typed.body, plan.typed.result_type)
             || !plan.typed.body.structure.module_storage_uses.is_empty()
