@@ -3316,6 +3316,49 @@ main_artifact = "main"
                                     Some("verified-distinct-affine-duplicate-refusal")
                                 }
                             }
+                            ("ordinary-context-restore", ScalarCheckerScope::MainFlowOnly) => {
+                                assert_eq!(baseline, (Ok(0), Vec::new(), Vec::new(), BTreeMap::new()));
+                                assert_eq!(observed, baseline, "uninvoked caller is outside main flow");
+                                None
+                            }
+                            ("ordinary-context-restore", ScalarCheckerScope::CurrentPackage) => {
+                                let records = &candidate[0].outcome.as_ref().unwrap().directives;
+                                let old = &incumbent[0].outcome.as_ref().unwrap().directives;
+                                let [inner, restored] = old.as_slice() else { panic!("both original lexical paths"); };
+                                assert_eq!(baseline, (Ok(51), b"innerrestored".to_vec(), Vec::new(), BTreeMap::new()));
+                                assert_eq!(records.as_slice(), &old[..if cap == 1 { 1 } else { 2 }]);
+                                let function = program.find("unit(i8) caller").unwrap();
+                                let branch = program.find("if (input == 2)").unwrap();
+                                let inner_decl = program.find("i8 core.context.count = core.context.count").unwrap();
+                                let outer_decl = program.find("i8 core.context.count = input").unwrap();
+                                let assert_context_axis = |row: &wosy_compiler::ScalarOrderedCheckerFailure,
+                                    declaration: usize, value: i32| {
+                                    let at = declaration as u32..(declaration + "i8 core.context.count".len()) as u32;
+                                    let (axis, _) = row.witness.axes().enumerate().find(|(_, (binding, _))|
+                                        binding.source == row.source && at.contains(&binding.declaration_span.start))
+                                        .expect("exact contextual binding witness");
+                                    assert!(row.witness.intervals_at(0, axis).unwrap().eq([(&value.into(), &value.into())]));
+                                };
+                                for (row, condition, code) in [(inner, "core.context.count == 2", 51), (restored, "core.context.count == 7", 52)] {
+                                    assert_eq!(row.source.path, "src/main.w");
+                                    assert!(function < branch && branch < row.condition.start as usize);
+                                    assert_eq!(&program[row.condition.start as usize..row.condition.end as usize], condition);
+                                    assert_eq!(row.code(), &code.into());
+                                    assert_eq!(row.witness.row_count(), 1);
+                                    assert!(row.witness.intervals_at(0, 0).unwrap().eq([(&2.into(), &2.into())]));
+                                    assert_context_axis(row, outer_decl, 2);
+                                }
+                                assert_context_axis(inner, inner_decl, 7);
+                                assert!(!restored.witness.axes().any(|(binding, _)|
+                                    (inner_decl..inner_decl + "i8 core.context.count".len()).contains(&(binding.declaration_span.start as usize))));
+                                if cap == 1 {
+                                    assert_eq!(observed, (Ok(51), b"inner".to_vec(), Vec::new(), BTreeMap::new()));
+                                    Some("verified-first-context-restore")
+                                } else {
+                                    assert_eq!(observed, baseline);
+                                    None
+                                }
+                            }
                             _ => None,
                         };
                         // A known first authored path explains the terminal
