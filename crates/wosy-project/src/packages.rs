@@ -9,6 +9,7 @@ mod add;
 mod anchored;
 #[cfg(target_os = "linux")]
 mod comptime_scratch;
+mod comptime_watches;
 mod git_sync;
 mod git_wire;
 mod graph;
@@ -23,6 +24,7 @@ pub use add::add_dependency;
 pub use anchored::GitDirectory;
 #[cfg(target_os = "linux")]
 pub use comptime_scratch::ComptimeScratch;
+pub use comptime_watches::{observe_comptime_watches, ComptimeWatchLimits, WatchedComptimeFile, WatchRoot};
 pub use init::init_project;
 pub use lifecycle::{snapshot_dependencies, update_dependencies};
 pub use patches::PatchStackId;

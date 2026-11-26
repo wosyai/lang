@@ -4,12 +4,15 @@ use crate::{artifact_inputs::{project_configuration_identity, ObservedBuilderBas
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::BTreeMap;
 use std::path::Path;
-use wosy_project::{ProjectConfiguration, ProjectContext, SourceGraph};
+use wosy_project::{
+    packages::{observe_comptime_watches, ComptimeWatchLimits, WatchedComptimeFile},
+    ProjectConfiguration, ProjectContext, SourceGraph,
+};
 use wosy_protocol::{
     imports_from_cst, Delta, FileEntry, FileKey, FileMetadata, InstalledGitSelection, Kind,
     Namespace, NodeId, ParserPolicy, SourceConfig,
 };
-use wosy_syntax::{CstNode, SyntaxKind};
+use wosy_syntax::{ComptimeCst, CstNode, SourceSpan, SyntaxKind};
 
 pub type Files = BTreeMap<FileKey, FileEntry>;
 
@@ -64,6 +67,7 @@ fn parse_file(
     text: String,
     categories: &[String],
     delta: &mut Delta,
+    observe: impl FnOnce(&wosy_syntax::ParseResult) -> Result<(), String>,
 ) -> Result<FileEntry, String> {
     let path = metadata.source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
     let source = wosy_syntax::SourceIdentity::new(
@@ -77,6 +81,7 @@ fn parse_file(
     if !diagnostics.is_empty() {
         return Err(format!("{}:{}: {diagnostics:?}", result.source.package, result.source.path));
     }
+    observe(result)?;
     let metadata = FileMetadata {
         imports: imports_from_cst(&result.canonical_cst().root)?,
         ..metadata
@@ -115,11 +120,59 @@ pub fn prepare(root: &Path, target: Option<&str>, base: Option<&Files>) -> Resul
     Ok(prepare_with_files(root, target, base)?.0)
 }
 
+/// Watches are client inputs for one exact selected authored occurrence.
+/// They do not alter SourcePreparation, publish a result, or grant mounts.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedComptimeWatches {
+    pub target: String,
+    pub profile: String,
+    pub id: String,
+    pub site: SourceSpan,
+    pub files: Vec<WatchedComptimeFile>,
+}
+
+struct WatchSelection<'a> {
+    profile: &'a str,
+    owner: &'a str,
+    id: &'a str,
+    limits: ComptimeWatchLimits,
+    site: Option<SourceSpan>,
+}
+
+impl WatchSelection<'_> {
+    fn observe(&mut self, parsed: &wosy_syntax::ParseResult) -> Result<(), String> {
+        if parsed.source.package != self.owner { return Ok(()); }
+        for occurrence in parsed.root.descendants().filter_map(|node| ComptimeCst::from_node(&node)) {
+            if occurrence.id.text() != self.id { continue; }
+            if self.site.is_some() {
+                return Err("comptime watch id is repeated in the reachable owning package".into());
+            }
+            self.site = Some(SourceSpan::new(parsed.source.clone(), occurrence.span));
+        }
+        Ok(())
+    }
+}
+
+/// Reuse the ordinary resolver and its actual fresh authored CST; no
+/// duplicate parser, cache, evaluator launch or claim of specialization.
+pub fn prepare_comptime_watches(
+    root: &Path, target: &str, profile: &str, owner: &str, id: &str, limits: ComptimeWatchLimits,
+) -> Result<(PreparedSources, PreparedComptimeWatches), String> {
+    let selected = WatchSelection { profile, owner, id, limits, site: None };
+    match prepare_from_observation(root, Some(target), None, None, None, Some(selected)) {
+        Ok((prepared, _, _, Some(watches))) => Ok((prepared, watches)),
+        Ok(_) => unreachable!("successful selection produces watch observation"),
+        Err(ObservationError::Source(error)) => Err(error),
+        Err(ObservationError::LiveRead(_) | ObservationError::Changed) =>
+            unreachable!("watch observation takes the fresh source path"),
+    }
+}
+
 pub(crate) fn prepare_with_files(
     root: &Path, target: Option<&str>, base: Option<&Files>,
 ) -> Result<(PreparedSources, Files), String> {
-    match prepare_from_observation(root, target, base, None, None) {
-        Ok((prepared, files, _)) => Ok((prepared, files)),
+    match prepare_from_observation(root, target, base, None, None, None) {
+        Ok((prepared, files, _, _)) => Ok((prepared, files)),
         Err(ObservationError::Source(error)) => Err(error),
         Err(ObservationError::LiveRead(_)) => unreachable!("fresh preparation uses the ordinary reader"),
         Err(ObservationError::Changed) => unreachable!("preparation accepts fresh ordinary source"),
@@ -136,8 +189,8 @@ pub(crate) fn verify_live_source(
     root: &Path, target: &str, base: &Files, selected: NodeId, reader: LiveSourceReader,
     observe_builder: bool,
 ) -> Result<Option<LiveSourceVerification>, Box<dyn std::error::Error + Send + Sync>> {
-    match prepare_from_observation(root, Some(target), Some(base), Some(reader), observe_builder.then_some(selected)) {
-        Ok((observed, _, builder)) if observed.root == selected => Ok(Some(LiveSourceVerification { builder })),
+    match prepare_from_observation(root, Some(target), Some(base), Some(reader), observe_builder.then_some(selected), None) {
+        Ok((observed, _, builder, _)) if observed.root == selected => Ok(Some(LiveSourceVerification { builder })),
         Ok(_) | Err(ObservationError::Changed) => Ok(None),
         Err(ObservationError::Source(error)) => Err(error.into()),
         Err(ObservationError::LiveRead(error)) => Err(error.into()),
@@ -160,8 +213,8 @@ impl From<&str> for ObservationError {
 
 fn prepare_from_observation(
     root: &Path, target: Option<&str>, base: Option<&Files>, mut live: Option<LiveSourceReader>,
-    builder_source: Option<NodeId>,
-) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>), ObservationError> {
+    builder_source: Option<NodeId>, mut watch: Option<WatchSelection<'_>>,
+) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>, Option<PreparedComptimeWatches>), ObservationError> {
     let check_time = |live: &Option<LiveSourceReader>| {
         live.as_ref().map_or(Ok(()), LiveSourceReader::check_time).map_err(ObservationError::LiveRead)
     };
@@ -173,6 +226,12 @@ fn prepare_from_observation(
     let (cfg, manifest) = configuration?;
     let target = cfg.resolve_target(target)?;
     let ctx = ProjectContext::from_manifest(&project, &target, manifest.as_table())?;
+    if let Some(watch) = &watch {
+        cfg.artifact_profile(&target, watch.profile)?;
+        if watch.owner != ctx.package && !cfg.resolved_packages.contains_key(watch.owner) {
+            return Err("comptime watch owner is not in the resolved project".into());
+        }
+    }
 
     // A source preparation is not an artifact key or a completed SnapshotRoot.
     let parser = ParserPolicy {
@@ -222,7 +281,9 @@ fn prepare_from_observation(
             let metadata = FileMetadata {
                 source: source.clone(), revision, policy, imports: Vec::new(), bytes: text.len() as u32,
             };
-            parse_file(metadata, text, &ctx.comment_categories, &mut delta)?
+            parse_file(metadata, text, &ctx.comment_categories, &mut delta, |parsed| {
+                watch.as_mut().map_or(Ok(()), |watch| watch.observe(parsed))
+            })?
         } else {
             return Err(ObservationError::Changed);
         };
@@ -235,6 +296,11 @@ fn prepare_from_observation(
         crate::project_sources::Error::Observe(error) => error,
         crate::project_sources::Error::Graph(error) => ObservationError::Source(format!("{error:?}")),
     })?;
+    let watches = if let Some(watch) = watch {
+        let site = watch.site.ok_or("comptime watch id does not name a reachable authored site")?;
+        let files = observe_comptime_watches(&project, &ctx.package, &cfg, &manifest, watch.owner, watch.id, watch.limits)?;
+        Some(PreparedComptimeWatches { target: target.clone(), profile: watch.profile.into(), id: watch.id.into(), site, files })
+    } else { None };
     let profiles = cfg.targets[&target].profiles.keys().filter_map(|profile| {
         cfg.artifact_profile(&target, profile).ok().map(|(_, _, artifact, _)| {
             (profile.clone(), artifact.clone())
@@ -269,5 +335,5 @@ fn prepare_from_observation(
             source: project_sources::observations(graph),
         })
     } else { None };
-    Ok((PreparedSources { root, delta, parsed, reused }, files, builder))
+    Ok((PreparedSources { root, delta, parsed, reused }, files, builder, watches))
 }
