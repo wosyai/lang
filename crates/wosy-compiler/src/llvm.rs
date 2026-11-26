@@ -3284,7 +3284,8 @@ fn emit_function<'ctx, 'module>(
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
-                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                let indexed = aggregate_plan.is_some_and(|plan| plan.array_descriptor_index_observer);
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), indexed));
                 backing
             } else {
                 argument
@@ -3660,7 +3661,8 @@ fn emit_project_function<'ctx, 'module>(
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
-                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                let indexed = aggregate_plan.is_some_and(|plan| plan.array_descriptor_index_observer);
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), indexed));
                 backing
             } else {
                 argument

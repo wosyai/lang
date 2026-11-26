@@ -3131,6 +3131,7 @@ pub(crate) struct ClosedBody {
     pub(crate) borrowed_current_widened_extents: BTreeMap<usize, ByteSpan>,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
+    pub(crate) array_descriptor_index_observer: bool,
     pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
     pub(crate) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
@@ -5947,11 +5948,22 @@ fn enroll_literal_array_pair(
 
 // This is deliberately an effect-free whole formal identity, not a
 // constructor. Its return is the incoming descriptor bit-for-bit.
-fn array_descriptor_identity(body: &Body<'_>) -> Option<Option<ByteSpan>> {
+fn array_descriptor_identity(body: &Body<'_>) -> Option<(Option<ByteSpan>, bool)> {
     let facts = body.facts?;
     let ([formal], [output]) = (body.sites.boundary.parameters.as_slice(), body.sites.boundary.results.as_slice())
     else { return None };
-    let observing = facts.array_formal_extent_required;
+    // Only a singleton direct read of zero on the incoming byte-array owner.
+    // Nonzero/dynamic offsets and writes need a separate signed-domain proof.
+    let direct_index = |point: &ReferenceFlowPoint| matches!(&point.kind,
+        CfgPointKind::ReadPlace { pointer_point: None, candidates, .. }
+            if matches!(candidates.as_slice(), [place]
+                if place.binding.declaration_span == formal.span
+                    && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(
+                        ScalarExpression::Integer { value, .. })] if *value == 0.into())));
+    let indexed = matches!(&formal.ty, ScalarType::RuntimeArray { element, .. }
+        if **element == ScalarType::U8)
+        && body.cfg.initial_points.iter().filter(|point| direct_index(point)).count() == 1;
+    let observing = facts.array_formal_extent_required || indexed;
     (body.is_monomorphic && body.cfg.initial_points.len() <= if observing { 24 } else { 8 }
         && same_runtime_array_type(&formal.ty, &output.ty)
         && !facts.array_invalid && facts.array_calls.is_empty()
@@ -5978,19 +5990,20 @@ fn array_descriptor_identity(body: &Body<'_>) -> Option<Option<ByteSpan>> {
                 if observing => argument_points.is_empty(),
             CfgPointKind::Branch { .. } | CfgPointKind::Join if observing => true,
             CfgPointKind::Evaluate(value) if observing => neutral_scalar_evaluation(value),
+            CfgPointKind::ReadPlace { .. } if indexed => direct_index(point),
             _ => false,
-        })).then_some(observing.then_some(formal.span))
+        })).then_some((observing.then_some(formal.span), indexed))
 }
 
 #[derive(Clone, Copy)]
 enum ArrayDescriptorRoute {
-    Identity(Option<ByteSpan>),
+    Identity(Option<ByteSpan>, bool),
     Forward { call: OccurrenceOrdinal, point: CfgPointId },
 }
 
 fn array_descriptor_route(body: &Body<'_>) -> Option<ArrayDescriptorRoute> {
-    if let Some(observer) = array_descriptor_identity(body) {
-        return Some(ArrayDescriptorRoute::Identity(observer));
+    if let Some((observer, indexed)) = array_descriptor_identity(body) {
+        return Some(ArrayDescriptorRoute::Identity(observer, indexed));
     }
     let facts = body.facts?;
     let ([formal], [output]) = (body.sites.boundary.parameters.as_slice(), body.sites.boundary.results.as_slice())
@@ -6069,14 +6082,17 @@ fn seal_array_descriptor_identities(
     }
     if candidates.is_empty() { return; }
     let sealed = closed_descriptor_routes(ordinary, routes, |key| !result.bodies.contains_key(&key), |key, route| match *route {
-        ArrayDescriptorRoute::Identity(_) => None,
+        ArrayDescriptorRoute::Identity(..) => None,
         ArrayDescriptorRoute::Forward { call, point } => Some((call, target_body(declarations, bodies[&key].cfg, point))),
     }, |caller, call| candidates.get(&(caller, call)).map(|(target, ..)| *target));
     for key in sealed {
         let definition = result.bodies.entry(key).or_default();
         definition.array_descriptor_identity = true;
         match routes[&key] {
-            ArrayDescriptorRoute::Identity(observer) => definition.array_descriptor_observer = observer,
+            ArrayDescriptorRoute::Identity(observer, indexed) => {
+                definition.array_descriptor_observer = observer;
+                definition.array_descriptor_index_observer = indexed;
+            }
             ArrayDescriptorRoute::Forward { call, .. } => definition.array_descriptor_forward = Some(call.0),
         }
         let uses = ordinary.transport_uses[&key].as_ref().expect("complete descriptor call census");

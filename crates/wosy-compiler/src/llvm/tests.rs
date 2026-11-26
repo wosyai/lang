@@ -12310,6 +12310,34 @@ if (scoped(false) != 33) { core.system_panic(); };
 }
 
 #[test]
+fn closed_owning_array_descriptor_guards_first_byte_read() {
+    let text = "%%start
+u8[](u8[]) inspect = fn(values) {
+    if (values[0] != 11) { core.system_panic(); };
+    values
+};
+u64() length = fn() {
+    u8[] bytes = [11, 13];
+    bytes = inspect(bytes);
+    core.array_len(&bytes)
+};
+if (length() != 2) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let symbol = self_tail_test_symbol(&prepared.project().modules[0].source, true, "inspect");
+        let function = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{symbol}("))
+            .unwrap_or_else(|| panic!("missing private owning callee: {llvm}")).1.split_once("\n}").unwrap().0;
+        assert!(function.contains("array_formal_extent") && function.contains("load i8")
+            && function.contains("ret { ptr, i64 } %values"), "{function}");
+        assert!(!function.contains("@__wosy_core_free("), "{function}");
+    }
+}
+
+#[test]
 fn widened_owning_array_roundtrip_preserves_qualified_original_pair() {
     let text = "%%start
 u8[](u8[]) identity = fn(values) { values };

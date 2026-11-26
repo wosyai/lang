@@ -509,6 +509,10 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 return Err("runtime array indexing requires its authenticated backing extent".into());
             }
             let local_extent = runtime_extent.and_then(|_| state.local_runtime_extents.get(&base_pointer));
+            let indexed_owning_formal = runtime_extent.is_some() && matches!(base.as_ref(),
+                crate::ScalarPlace::Name { name, .. } if state.storage.get(name)
+                    .and_then(|(slot, _)| state.local_runtime_extents.get(slot))
+                    .is_some_and(|(_, extent, checked)| *checked && matches!(extent, LocalRuntimeExtent::OwningFormal(_))));
             let checked_lexical_descriptor = local_extent.is_some_and(|(_, extent, _)| matches!(extent,
                 LocalRuntimeExtent::OrdinaryDescriptor { .. } | LocalRuntimeExtent::WidenedLiteral { .. }));
             let runtime_offset = matches!(base_type, ScalarType::RuntimeArray { .. }).then(||
@@ -568,7 +572,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
                     }
                 }
                 if let Some(extent) = runtime_extent {
-                    if checked_lexical_descriptor {
+                    if checked_lexical_descriptor || indexed_owning_formal {
                         check_array_extent(context, state, index, extent, Some((
                             "ordinary_array_index_out_of_bounds", "ordinary_array_index_panic", "ordinary_array_index_continue",
                         )))?;
@@ -905,9 +909,18 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
             Ok(Some(*length))
         }
 
-        LocalRuntimeExtent::OwningFormal(length)
-            if !for_index && *storage == address && state.runtime_array_allocations.get(name) == Some(&false) =>
-                Ok(Some(*length)),
+        LocalRuntimeExtent::OwningFormal(length) if state.runtime_array_allocations.get(name) == Some(&false) => {
+            // Extent observation uses the slot; address formation uses its exact
+            // loaded backing. Only the sealed route enables the latter use.
+            let exact_backing = address.as_instruction_value().is_some_and(|instruction|
+                instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
+                    && instruction.get_operand(0).and_then(|operand| operand.value()) == Some((*storage).into()));
+            if (!for_index && *storage == address) || (for_index && exact_backing) {
+                Ok(Some(*length))
+            } else {
+                Err("owning formal index lost its descriptor backing".into())
+            }
+        }
         LocalRuntimeExtent::ManagedLengthSlot(length_slot)
             if state.runtime_array_allocations.get(name) == Some(&false)
                 && state.runtime_array_lengths.get(name) == Some(length_slot) =>
