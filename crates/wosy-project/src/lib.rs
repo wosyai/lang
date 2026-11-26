@@ -543,12 +543,15 @@ pub struct ProjectConfiguration {
     pub resolved_packages: BTreeMap<String, ResolvedPackage>,
 }
 
+/// The existing immutable manifest parse paired with project configuration.
+pub type ParsedProjectManifest = toml_edit::ImDocument<String>;
+
 impl ProjectConfiguration {
     pub fn load(root: &Path) -> Result<Self, String> {
         Self::load_with_manifest(root).map(|(configuration, _)| configuration)
     }
 
-    pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
+    pub fn load_with_manifest(root: &Path) -> Result<(Self, ParsedProjectManifest), String> {
         let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
             toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;

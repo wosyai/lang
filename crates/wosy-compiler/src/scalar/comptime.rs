@@ -17,8 +17,8 @@ mod direct;
 mod stdout;
 pub use stdout::{
     prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
-    ComptimeStdoutError,
-    PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
+    prepare_wasip1_comptime_continuation, ComptimeStdoutError,
+    PreparedComptimeStdout, PreparedComptimeStdoutEvaluator, PreparedWasip1ComptimeContinuation,
 };
 pub use direct::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,

@@ -17,6 +17,7 @@ pub struct WatchedComptimeFile {
 
 /// Counts shared across the two selected roots, including irrelevant entries
 /// scanned by a wildcard. Limits do not bound the ordinary source parser.
+#[derive(Clone, Copy)]
 pub struct ComptimeWatchLimits {
     pub entries: usize,
     pub files: usize,

@@ -20,6 +20,12 @@ use wosy_protocol::{
 use wosy_syntax::{ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
 mod comptime_inputs;
+mod wasip1_inputs;
+pub use wasip1_inputs::{
+    prepare_wasip1_comptime_inputs, ComptimeInputsFreshness, PreparedWasip1ComptimeInputs,
+    Wasip1ComptimeInputSelection,
+};
+use wasip1_inputs::Wasip1InputsBasis;
 pub use comptime_inputs::{
     ClosedComptimeInputFacts, ClosedComptimeInputSelection, ForwardedPairComptimeInputFacts,
     ForwardedPairComptimeInputSelection, PairCallGraphComptimeInputFacts, StartupComptimeInputSelection,
@@ -80,7 +86,7 @@ fn parse_file(
     delta: &mut Delta,
     singleton: bool,
     observe: impl FnOnce(&FreshParseResult) -> Result<(), String>,
-) -> Result<FileEntry, String> {
+) -> Result<(FileEntry, FreshParseResult), String> {
     let path = metadata.source.path.as_path().to_str().ok_or("source path is not UTF-8")?;
     let source = wosy_syntax::SourceIdentity::new(
         metadata.source.project.clone(),
@@ -107,7 +113,7 @@ fn parse_file(
     let (authored, executable) = pack_cst(&result.canonical_cst().root, delta);
     let annotation = delta.add(Kind::Annotations, json(&result.comments), vec![]);
     let file = delta.add(Kind::File, json(&metadata), vec![authored, executable, annotation]);
-    Ok(FileEntry { metadata, file, authored, executable, annotation })
+    Ok((FileEntry { metadata, file, authored, executable, annotation }, fresh))
 }
 
 /// The compiler's resolved module graph has already established reachability,
@@ -237,6 +243,7 @@ enum ComptimeAttachment {
     Closed(ClosedComptimeInputFacts),
     Forwarded(ForwardedPairComptimeInputFacts),
     Graph(PairCallGraphComptimeInputFacts),
+    Wasip1(Wasip1InputsBasis),
 }
 
 /// Reuse the ordinary resolver and its actual fresh authored CST; no
@@ -245,7 +252,7 @@ pub fn prepare_comptime_watches(
     root: &Path, target: &str, profile: &str, owner: &str, id: &str, limits: ComptimeWatchLimits,
 ) -> Result<(PreparedSources, PreparedComptimeWatches), String> {
     let selected = WatchSelection { profile, owner: Some(owner), id, limits, site: None, input: None };
-    match prepare_from_observation(root, Some(target), None, None, None, Some(selected)) {
+    match prepare_from_observation(root, Some(target), None, None, None, Some(selected), None) {
         Ok((prepared, _, _, Some(ComptimeAttachment::Watches(watches)))) => Ok((prepared, watches)),
         Ok(_) => unreachable!("successful selection produces watch observation"),
         Err(ObservationError::Source(error)) => Err(error),
@@ -267,7 +274,7 @@ pub fn prepare_closed_comptime_input_facts(
             selected_profile: None, observed: None,
         }),
     };
-    match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected)) {
+    match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected), None) {
         Ok((prepared, _, _, Some(ComptimeAttachment::Closed(facts)))) => Ok((prepared, facts)),
         Ok(_) => unreachable!("successful attachment produces closed input facts"),
         Err(ObservationError::Source(error)) => Err(error),
@@ -313,7 +320,7 @@ fn prepare_startup_comptime_inputs(
             kind, layout: scope.evaluator_layout, ir_limit: scope.max_ir_bytes, selected_profile: None, observed: None,
         }),
     };
-    match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected)) {
+    match prepare_from_observation(root, Some(scope.target), None, None, None, Some(selected), None) {
         Ok((prepared, _, _, Some(facts))) => Ok((prepared, facts)),
         Ok(_) => unreachable!("successful startup observation produces input facts"),
         Err(ObservationError::Source(error)) => Err(error),
@@ -325,7 +332,7 @@ fn prepare_startup_comptime_inputs(
 pub(crate) fn prepare_with_files(
     root: &Path, target: Option<&str>, base: Option<&Files>,
 ) -> Result<(PreparedSources, Files), String> {
-    match prepare_from_observation(root, target, base, None, None, None) {
+    match prepare_from_observation(root, target, base, None, None, None, None) {
         Ok((prepared, files, _, _)) => Ok((prepared, files)),
         Err(ObservationError::Source(error)) => Err(error),
         Err(ObservationError::LiveRead(_)) => unreachable!("fresh preparation uses the ordinary reader"),
@@ -343,7 +350,7 @@ pub(crate) fn verify_live_source(
     root: &Path, target: &str, base: &Files, selected: NodeId, reader: LiveSourceReader,
     observe_builder: bool,
 ) -> Result<Option<LiveSourceVerification>, Box<dyn std::error::Error + Send + Sync>> {
-    match prepare_from_observation(root, Some(target), Some(base), Some(reader), observe_builder.then_some(selected), None) {
+    match prepare_from_observation(root, Some(target), Some(base), Some(reader), observe_builder.then_some(selected), None, None) {
         Ok((observed, _, builder, _)) if observed.root == selected => Ok(Some(LiveSourceVerification { builder })),
         Ok(_) | Err(ObservationError::Changed) => Ok(None),
         Err(ObservationError::Source(error)) => Err(error.into()),
@@ -368,6 +375,7 @@ impl From<&str> for ObservationError {
 fn prepare_from_observation(
     root: &Path, target: Option<&str>, base: Option<&Files>, mut live: Option<LiveSourceReader>,
     builder_source: Option<NodeId>, mut watch: Option<WatchSelection<'_>>,
+    wasip1: Option<Wasip1ComptimeInputSelection<'_>>,
 ) -> Result<(PreparedSources, Files, Option<ObservedBuilderBasis>, Option<ComptimeAttachment>), ObservationError> {
     let check_time = |live: &Option<LiveSourceReader>| {
         live.as_ref().map_or(Ok(()), LiveSourceReader::check_time).map_err(ObservationError::LiveRead)
@@ -392,6 +400,16 @@ fn prepare_from_observation(
             )?);
         }
     }
+
+    let wasm_tools = wasip1.map(|selection| {
+        let (_, _, artifact, _) = cfg.artifact_profile(&target, selection.profile)?;
+        if artifact.backend != "llvm" || artifact.output != "wasm-wasip1" {
+            return Err("computed stdout stage requires an explicit llvm/wasm-wasip1 profile".to_owned());
+        }
+        ObservedClosedComptimeProfile::observe_input_declarations(
+            &cfg, &manifest, &target, selection.profile,
+        ).map(ObservedClosedComptimeProfile::into_tools)
+    }).transpose()?;
 
     // A source preparation is not an artifact key or a completed SnapshotRoot.
     let parser = ParserPolicy {
@@ -425,9 +443,24 @@ fn prepare_from_observation(
     let mut delta = Delta::default();
     let (mut parsed, mut reused) = (0, 0);
     let mut files = Files::new();
+    let mut wasm_fresh = wasip1.map(|_| BTreeMap::new());
+    let mut wasm_remaining = wasip1.map(|selection| (selection.max_authored_source_bytes, true));
     let singleton = watch.as_ref().is_some_and(|selection| selection.owner.is_none());
     let graph = project_sources::load_with_reader(&project, &ctx, &cfg, |path, opened| match live.as_mut() {
         Some(reader) => reader.observe(path, opened).map(|id| (id, None)).map_err(ObservationError::LiveRead),
+        None if wasm_remaining.is_some() => {
+            #[cfg(target_os = "linux")]
+            {
+                let (remaining, entry) = wasm_remaining.as_mut().expect("WASI source observation");
+                let limit = if std::mem::take(entry) { (*remaining).min(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES) }
+                    else { *remaining };
+                let (revision, text) = project_sources::read_bounded_regular_source(path, opened, limit)?;
+                *remaining -= text.len();
+                Ok((revision, Some(text)))
+            }
+            #[cfg(not(target_os = "linux"))]
+            { Err("WASI comptime observation requires Linux regular source reads".into()) }
+        }
         None if singleton => {
             #[cfg(target_os = "linux")]
             {
@@ -453,9 +486,11 @@ fn prepare_from_observation(
             let metadata = FileMetadata {
                 source: source.clone(), revision, policy, imports: Vec::new(), bytes: text.len() as u32,
             };
-            parse_file(metadata, text, &ctx.comment_categories, &mut delta, singleton, |parsed| {
+            let (file, fresh) = parse_file(metadata, text, &ctx.comment_categories, &mut delta, singleton, |parsed| {
                 watch.as_mut().map_or(Ok(()), |watch| watch.observe(parsed, &key, &ctx.package))
-            })?
+            })?;
+            if let Some(wasm_fresh) = &mut wasm_fresh { wasm_fresh.insert(key.clone(), fresh); }
+            file
         } else {
             return Err(ObservationError::Changed);
         };
@@ -500,6 +535,14 @@ fn prepare_from_observation(
     let dependencies = delta.add(Kind::Dependencies, vec![], by_location.values().map(|v| modules[v.0]).collect());
     let roots = [config, executable, annotation, dependencies].into_iter().chain(files.values().map(|f| f.file)).collect();
     let root = delta.add(Kind::SourcePreparation, schema.to_vec(), roots);
+    if let Some(selection) = wasip1 {
+        let authored_cst = files[&FileKey::from(&graph.nodes[0].source)].authored;
+        let inputs = Wasip1InputsBasis::assemble(
+            project, cfg, manifest, ctx.package, root, authored_cst, graph, wasm_fresh.expect("fresh WASI graph"),
+            wasm_tools.expect("selected WASI profile"), selection,
+        )?;
+        return Ok((PreparedSources { root, delta, parsed, reused }, files, None, Some(ComptimeAttachment::Wasip1(inputs))));
+    }
     let comptime = if let Some((watches, captured, input)) = watches {
         if let Some(input) = input {
             let authored = files.get(&captured).expect("compiler observed this exact file in the source assembly").authored;

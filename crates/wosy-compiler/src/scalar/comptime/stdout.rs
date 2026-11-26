@@ -17,7 +17,7 @@ use crate::{
     ScalarBlock, ScalarFunction, ScalarOutput, ScalarOutputSequence, UnaryOperator,
 };
 use std::{collections::HashMap, fmt, io::{self, Write}, sync::Arc};
-use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, FreshParseResult, SourceSpan, SyntaxKind};
+use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceIdentity, SourceSpan, SyntaxKind};
 
 // Bound recursive AST representation as well as the parser's stack.
 const MAX_VALUE_DEPTH: usize = 64;
@@ -66,7 +66,7 @@ pub fn prepare_comptime_stdout(
     id: &str,
     layout: ScalarTargetLayout,
 ) -> Result<PreparedComptimeStdout, ClosedComptimeRejection> {
-    prepare(sources, initialization_order, id, layout, Delivery::Observe).map(|(output, _)| output)
+    prepare(sources, initialization_order, id, layout, Delivery::Observe, false).map(|(output, _, _)| output)
 }
 
 /// The compiler-issued standalone evaluator and the stdout type from that
@@ -110,6 +110,51 @@ pub fn prepare_comptime_wasip1_stdout_evaluator(
         Delivery::Wasip1 { max_authored_source_bytes, max_stdout })
 }
 
+/// Exact ordinary authored input held for a later comptime continuation.
+/// Neither a result receipt nor permission to execute or substitute a value.
+pub struct PreparedWasip1ComptimeContinuation {
+    evaluator: PreparedComptimeStdoutEvaluator,
+    sources: Vec<(FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    order: Vec<SourceIdentity>,
+    occurrence: OrdinaryOccurrence,
+}
+
+struct OrdinaryOccurrence {
+    site: CstNode,
+    initializer: CstNode,
+}
+
+impl PreparedWasip1ComptimeContinuation {
+    pub fn evaluator(&self) -> &PreparedComptimeStdoutEvaluator { &self.evaluator }
+    pub fn authored_sources(&self) -> impl ExactSizeIterator<Item = &SourceIdentity> {
+        self.sources.iter().map(|(fresh, _)| &fresh.result().source)
+    }
+    pub fn initialization_order(&self) -> &[SourceIdentity] { &self.order }
+    pub fn initializer_span(&self) -> ByteSpan { wosy_syntax::byte_span(&self.occurrence.initializer) }
+    pub fn occurrence_span(&self) -> ByteSpan { wosy_syntax::byte_span(&self.occurrence.site) }
+}
+
+/// Keep the exact selected CST handles used by the ordinary evaluator.
+/// Only the caller-selected source graph is retained; no parser is invoked.
+pub fn prepare_wasip1_comptime_continuation(
+    sources: Vec<(FreshParseResult, Vec<ScalarNamespaceBinding>)>,
+    order: Vec<SourceIdentity>,
+    id: &str,
+    max_authored_source_bytes: usize,
+    max_stdout: usize,
+) -> Result<PreparedWasip1ComptimeContinuation, ClosedComptimeRejection> {
+    let borrowed = sources.iter().map(|(source, namespaces)| (source, namespaces.clone())).collect();
+    let layout = ScalarTargetLayout::WASM32;
+    let (output, llvm, occurrence) = prepare(borrowed, order.clone(), id, layout,
+        Delivery::Wasip1 { max_authored_source_bytes, max_stdout }, true)?;
+    let evaluator = PreparedComptimeStdoutEvaluator {
+        layout, output, llvm: llvm.expect("WASI continuation emits the evaluator"),
+    };
+    Ok(PreparedWasip1ComptimeContinuation {
+        evaluator, sources, order, occurrence: occurrence.expect("retained ordinary occurrence requested"),
+    })
+}
+
 fn prepare_evaluator(
     sources: Vec<(&FreshParseResult, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<wosy_syntax::SourceIdentity>,
@@ -117,7 +162,7 @@ fn prepare_evaluator(
     layout: ScalarTargetLayout,
     delivery: Delivery,
 ) -> Result<PreparedComptimeStdoutEvaluator, ClosedComptimeRejection> {
-    let (output, llvm) = prepare(sources, initialization_order, id, layout, delivery)?;
+    let (output, llvm, _) = prepare(sources, initialization_order, id, layout, delivery, false)?;
     let llvm = llvm.ok_or_else(|| ClosedComptimeRejection::Emitter("prepared evaluator is missing".into()))?;
     Ok(PreparedComptimeStdoutEvaluator { output, llvm, layout })
 }
@@ -135,7 +180,8 @@ fn prepare(
     id: &str,
     layout: ScalarTargetLayout,
     delivery: Delivery,
-) -> Result<(PreparedComptimeStdout, Option<LlvmPartition>), ClosedComptimeRejection> {
+    retain_occurrence: bool,
+) -> Result<(PreparedComptimeStdout, Option<LlvmPartition>, Option<OrdinaryOccurrence>), ClosedComptimeRejection> {
     use ClosedComptimeRejection as Error;
     let emit = !matches!(delivery, Delivery::Observe);
     if !matches!(layout, ScalarTargetLayout::NATIVE64 | ScalarTargetLayout::WASM32) {
@@ -294,7 +340,8 @@ fn prepare(
             }).map_err(Error::Emitter)?)
         }
     };
-    Ok((PreparedComptimeStdout { site: scope, result_type: result_type.clone(), shape, literal }, llvm))
+    let occurrence = retain_occurrence.then_some(OrdinaryOccurrence { site: node, initializer });
+    Ok((PreparedComptimeStdout { site: scope, result_type: result_type.clone(), shape, literal }, llvm, occurrence))
 }
 
 #[derive(Default)]
@@ -570,5 +617,80 @@ fn hex(value: u8) -> Option<u8> {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::Diagnostic;
+
+    const SITE: &str = "comptime solve { u32 left = 7; { .first = left; .second = left ^ 9; } }";
+    const LITERAL: &str = "{ .first = 7; .second = 14; }";
+
+    fn authored(text: String) -> FreshParseResult {
+        // A controlled single-module oracle keeps the authored diagnostic
+        // source identity and LLVM module path identical. No live source
+        // observation claims these different input bytes share a revision.
+        let source = SourceIdentity::new("fixture".into(), "app".into(), "main.w".into(), "fixture".into());
+        let parsed = wosy_syntax::parse_with_snapshot(source, text, &[]);
+        assert!(parsed.result().is_valid(), "{:?}", parsed.result().errors);
+        parsed
+    }
+
+    fn analyze(
+        declarations: Vec<(super::super::super::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        order: Vec<SourceIdentity>,
+    ) -> Result<LlvmPartition, Vec<Diagnostic>> {
+        let prepared = prepare_scalar_project(declarations, order, ScalarPreparationInputs {
+            target_layout: ScalarTargetLayout::WASM32,
+        }).map_err(|error| error.into_ordered_diagnostics())?;
+        let build = analyze_scalar_build(&prepared);
+        if !build.diagnostics().is_empty() { return Err(build.diagnostics().to_vec()); }
+        Ok(emit_scalar_build_single_module_artifact_llvm(&build).expect("ordinary fixture emitter"))
+    }
+
+    #[test]
+    fn retained_wasip1_fixture_value_reenters_ordinary_build_with_exact_ir_and_diagnostics() {
+        for bad in [false, true] {
+            let later = if bad { "u32() peek = fn { unresolved_read };" }
+                else { "u32() peek = fn { result.second };" };
+            let original = format!("%%start\nstruct copy Pair {{ u32 first; u32 second; }}\nPair result = {SITE};\n{later}\n%%end\n");
+            let control = original.replacen(SITE, &format!("{LITERAL:width$}", width=SITE.len()), 1);
+            let fresh = authored(original);
+            let identity = fresh.result().source.clone();
+            let plan = prepare_wasip1_comptime_continuation(vec![(fresh, Vec::new())],
+                vec![identity.clone()], "solve", 1 << 16, 256).expect("once-parsed evaluator");
+            assert_eq!(plan.initialization_order(), &[identity.clone()]);
+            assert_eq!(plan.authored_sources().count(), 1);
+            assert_eq!(plan.occurrence_span(), plan.evaluator().output().site().range);
+            assert_eq!(plan.initializer_span(), plan.occurrence_span());
+
+            // Only this trusted test supplies bytes. They are decoded once
+            // by the original expected type, then embedded at the original
+            // exact Rowan occurrence without reparsing the source.
+            let value = plan.evaluator().output().parse_stdout(b"[7,14]\n", 256).expect("approved fixture oracle");
+            let mut declarations = Vec::with_capacity(plan.sources.len());
+            for (index, (fresh, namespaces)) in plan.sources.into_iter().enumerate() {
+                let embedding = (index == 0).then_some(EmbeddedComptimeExpression {
+                    site: &plan.occurrence.site, expression: &plan.occurrence.initializer, value: &value,
+                });
+                declarations.push((derive_scalar_declarations_with_embedding(fresh.result().canonical_cst(), embedding), namespaces));
+            }
+            let retained = analyze(declarations, plan.order);
+            let known = analyze(vec![(derive_scalar_declarations_from_cst(authored(control).result().canonical_cst()),
+                Vec::new())], vec![identity]);
+            if bad {
+                let actual = retained.err().expect("ordinary later diagnostics");
+                let expected = known.err().expect("ordinary literal diagnostics");
+                assert!(!actual.is_empty());
+                assert_eq!(actual, expected);
+            } else {
+                let actual = retained.expect("ordinary resumed LLVM").to_text();
+                let expected = known.expect("ordinary authored LLVM").to_text();
+                assert_eq!(actual, expected);
+                assert!(actual.contains("store i32 14") && !actual.contains("@fd_write"));
+            }
+        }
     }
 }

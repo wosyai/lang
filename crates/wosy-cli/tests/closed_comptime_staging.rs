@@ -763,3 +763,74 @@ std.utf8[2] result = comptime prepare {
         if message == "preview source exceeds the authored byte budget"));
     assert!(!project.join(".wosy").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_wasip1_watch_inputs_distinguish_source_and_watch_changes() {
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use wosy_cli::source_preparation::{prepare, prepare_wasip1_comptime_inputs,
+        ComptimeInputsFreshness::{SourceOrConfigurationChanged, Unchanged, WatchesChanged},
+        Wasip1ComptimeInputSelection};
+    use wosy_cli::comptime_fragment::prepare_project_comptime_wasip1_stdout_evaluator;
+    use wosy_project::packages::ComptimeWatchLimits;
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let manifest = format!("{}\n[comptime.prepare]\nwatch = [\"assets/*.txt\"]\n",
+        MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\""));
+    fixture.manifest(&manifest);
+    let src = project.join("src/main.w");
+    let text = "%%start\nu32 value = comptime prepare { u32 seed = 7; seed ^ 9 };\n%%end\n";
+    fs::write(&src, text).unwrap();
+    let assets = project.join("assets");
+    fs::create_dir(&assets).unwrap();
+    let watched = assets.join("input.txt");
+    fs::write(&watched, "first").unwrap();
+    let selection = Wasip1ComptimeInputSelection {
+        target: "app", profile: "override", id: "prepare", max_authored_source_bytes: 1 << 17,
+        max_stdout_bytes: 256, watch_limits: ComptimeWatchLimits::default(),
+    };
+    let (prepared, inputs) = prepare_wasip1_comptime_inputs(&project, selection).unwrap();
+    let ordinary = prepare(&project, Some("app"), None).unwrap();
+    assert_eq!((prepared.parsed, prepared.reused), (1, 0));
+    assert_eq!(prepared.root, inputs.source_root());
+    assert_eq!(prepared.root, ordinary.root);
+    assert_eq!(prepared.delta.nodes, ordinary.delta.nodes);
+    assert_eq!(inputs.continuation().authored_sources().count(), 1);
+    assert_eq!((inputs.declared_tools().target(), inputs.declared_tools().profile()), ("app", "override"));
+    assert_eq!(inputs.watches().files.len(), 1);
+    let mut captured = Vec::new();
+    let observed = inputs.write_evaluator_ir(&mut captured, 1 << 16).unwrap();
+    let mut direct = Vec::new();
+    let single = prepare_project_comptime_wasip1_stdout_evaluator(
+        &project, "app", "override", "prepare", 1 << 17, 256).unwrap();
+    assert_eq!(single.write_evaluator_ir(&mut direct, 1 << 16).unwrap(), observed);
+    assert_eq!(captured, direct);
+
+    let current = || inputs.observe_current(Instant::now()+Duration::from_secs(5)).unwrap();
+    assert_eq!(current(), Unchanged);
+    fs::write(assets.join("irrelevant.bin"), "irrelevant bytes").unwrap();
+    assert_eq!(current(), Unchanged);
+    fs::write(&watched, "second").unwrap();
+    assert_eq!(current(), WatchesChanged);
+    fs::write(&watched, "first").unwrap();
+    assert_eq!(current(), Unchanged);
+    let added = assets.join("added.txt");
+    fs::write(&added, "additional match").unwrap();
+    assert_eq!(current(), WatchesChanged);
+    fs::remove_file(added).unwrap();
+    assert_eq!(current(), Unchanged);
+    fs::remove_file(&watched).unwrap();
+    assert_eq!(current(), WatchesChanged);
+    fs::write(&watched, "first").unwrap();
+    assert_eq!(current(), Unchanged);
+
+    // Do not attempt to parse a changed live revision to decide freshness.
+    fs::write(&src, "not a Wosy module").unwrap();
+    assert_eq!(current(), SourceOrConfigurationChanged);
+    fs::write(&src, text).unwrap();
+    assert_eq!(current(), Unchanged);
+    fixture.manifest(&manifest.replace("selected evaluator toolchain", "changed tool declaration"));
+    assert_eq!(current(), SourceOrConfigurationChanged);
+    assert!(!project.join(".wosy").exists());
+}

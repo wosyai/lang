@@ -2530,8 +2530,8 @@ mod declarations;
 mod comptime;
 pub use comptime::{
     prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
-    ComptimeStdoutError,
-    PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
+    prepare_wasip1_comptime_continuation, ComptimeStdoutError,
+    PreparedComptimeStdout, PreparedComptimeStdoutEvaluator, PreparedWasip1ComptimeContinuation,
 };
 pub use comptime::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
     ClosedComptimeRejection,

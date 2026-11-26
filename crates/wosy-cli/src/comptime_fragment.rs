@@ -245,7 +245,7 @@ pub(crate) fn write_compiler_evaluator_ir(
     write_comptime_partition_ir(fragment.llvm(), output, max_bytes)
 }
 
-fn write_comptime_partition_ir(
+pub(crate) fn write_comptime_partition_ir(
     partition: &wosy_compiler::LlvmPartition, output: &mut impl Write, max_bytes: usize,
 ) -> io::Result<StagedEvaluatorIr> {
     let limit = max_bytes.min(1 << 20);
