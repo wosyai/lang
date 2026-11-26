@@ -296,12 +296,19 @@ fn map_dependency_owners<T>(
     Ok(receipts)
 }
 
-/// Private configured proof-free dependency tranche. The default command
-/// still uses the legacy operation; no fallback from a failed bounded owner.
+#[cfg(test)]
+pub(crate) enum PrivateAuthoredPrimary {
+    ProofFree,
+    QualifiedNamed,
+}
+
+/// Private configured fixture routes, never legacy fallback. The named
+/// route is explicit and primary-only; no formal work can be skipped in
+/// a later proof-free dependency when the budget is exhausted.
 #[cfg(test)]
 pub(crate) fn check_targets_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
-    limit: std::num::NonZeroUsize,
+    limit: std::num::NonZeroUsize, primary: PrivateAuthoredPrimary,
 ) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
     let prepared = map_dependency_owners(root, target, profile, scope, std::convert::identity)?;
     // Input failures precede selection and any staged output, even if a
@@ -310,9 +317,17 @@ pub(crate) fn check_targets_with_private_authored_limit(
         let receipt = prepared.into_iter().nth(index).expect("found prepared failure");
         return Ok(vec![receipt.run()]);
     }
+    enum Owner {
+        ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
+        QualifiedNamed(PreparedScalarOrderedCheck),
+    }
     let mut owners = Vec::with_capacity(prepared.len());
-    for PreparedConfiguredCheckReceipt { root, texts, check } in prepared {
-        let owner = match check.and_then(PreparedScalarOrderedCheck::into_startup_authored_owner) {
+    for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
+        let owner = match if index == 0 && matches!(primary, PrivateAuthoredPrimary::QualifiedNamed) {
+            check.map(Owner::QualifiedNamed)
+        } else {
+            check.and_then(PreparedScalarOrderedCheck::into_startup_authored_owner).map(Owner::ProofFree)
+        } {
             Ok(owner) => owner,
             Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
         };
@@ -322,22 +337,26 @@ pub(crate) fn check_targets_with_private_authored_limit(
     let mut selected = Vec::new();
     for (root, texts, owner) in owners {
         let Some(cap) = std::num::NonZeroUsize::new(remaining) else { break; };
-        let (directives, completion, active) = match owner.run(cap) {
+        let (report, completion) = match match owner {
+            Owner::ProofFree(owner) => owner.run(cap).map(|(directives, completion, active)| (
+                MainFlowProofReceipt {
+                    active, mixed_context_after_scalar: None, directives, diagnostics: Vec::new(),
+                    contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
+                    aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
+                    entry_evidence: None,
+                }, completion,
+            )),
+            Owner::QualifiedNamed(owner) => owner.search_startup_with_qualified_named(cap),
+        } {
             Ok(report) => report,
             Err(error) => return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }]),
         };
-        let Some(next) = remaining.checked_sub(directives.len()).filter(|next|
+        let Some(next) = remaining.checked_sub(report.directives.len()).filter(|next|
             (*next == 0) == (completion == wosy_compiler::StartupAuthoredCompletion::LimitReached))
         else {
             return Ok(vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }]);
         };
         remaining = next;
-        let report = MainFlowProofReceipt {
-            active, mixed_context_after_scalar: None, directives, diagnostics: Vec::new(),
-            contextual_diagnostic: None, additional_contextual_diagnostics: Vec::new(), pointer_effect_diagnostic: None,
-            aggregate_diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
-            entry_evidence: None,
-        };
         selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
     }
     Ok(selected)

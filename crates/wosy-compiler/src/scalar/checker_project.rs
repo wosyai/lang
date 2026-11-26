@@ -10030,7 +10030,11 @@ fn run_private_named_after_startup(
             proof_source, name.text(), selected, qualified,
         )?;
         let body = plan.typed.body;
-        if (plan.target.0 != 0) != qualified || &plan.typed.target.source != proof_source
+        // Prepared module ordinals follow the loaded declaration order, not the
+        // startup order. Authenticate the target's actual owner instead of
+        // assuming that the root was loaded at ordinal zero.
+        if project.modules.get(plan.target.0).map(|module| &module.source) != Some(proof_source)
+            || &plan.typed.target.source != proof_source
             || plan.typed.measure.is_some() || !plan.has_no_authored_steps()
             || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
             || !is_integer_type(plan.typed.result_type) || !valid_arbitrary_proof_body(body)

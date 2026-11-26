@@ -2325,6 +2325,7 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
         use std::num::NonZeroUsize;
         let private = |cap| configured_check::check_targets_with_private_authored_limit(
             root, None, "dev", ScalarCheckerScope::MainFlowOnly, NonZeroUsize::new(cap).unwrap(),
+            configured_check::PrivateAuthoredPrimary::ProofFree,
         ).ok().unwrap();
         fs::write(root.join("src/primary.w"), body("app", 0)).unwrap();
         for (cap, expected, status) in [(1, &b"app"[..], 0), (2, &b"appa"[..], 4), (8, &b"appableaf"[..], 4)] {
@@ -2347,6 +2348,52 @@ core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files 
         assert!(!root.join(".wosy").exists());
         fs::write(&leaf_source, body("leaf", 6)).unwrap();
         fs::write(root.join("src/primary.w"), body("app", 3)).unwrap();
+
+        let named_primary = r#"%%start
+lib = namespace app "lib.w";
+u8 actual = lib.echo(3);
+core.require(actual == 4, { .stdout = "app"; .stderr = ""; .code = 0; .files = []; });
+%%end"#;
+        let named_lib = r#"%%start
+u8(u8) echo = fn(value) { if (value < 4) { value } else { 7 } };
+proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
+%%end"#;
+        fs::write(root.join("src/primary.w"), named_primary).unwrap();
+        fs::write(root.join("src/lib.w"), named_lib).unwrap();
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            for primary_layout in ["native", "wasm-wasip1"] {
+                let configured = app.replace("output = \"native\"", &format!("output = \"{primary_layout}\""));
+                fs::write(root.join("wosy.toml"), configured).unwrap();
+                let run = |cap| configured_check::check_targets_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                    configured_check::PrivateAuthoredPrimary::QualifiedNamed,
+                ).ok().unwrap();
+                for (cap, expected, status) in [(1, &b"app"[..], 0), (2, &b"appa"[..], 4)] {
+                    let receipts = run(cap);
+                    let reports = checked_publication_reports(&receipts).ok().unwrap();
+                    let [proof] = &reports[0].diagnostics[..] else { panic!("original invoked qualified proof remains independent"); };
+                    assert_eq!(proof.invocation.call.source.path, "src/primary.w");
+                    assert_eq!(proof.proof.source.path, "src/lib.w");
+                    assert_eq!(proof.invocation.returned, 3.into());
+                    assert_eq!(proof.invocation.namespaced_callable.as_ref().unwrap().source, proof.proof.source);
+                    let plan = plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()).unwrap();
+                    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                    assert_eq!(plan.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), status);
+                    assert_eq!(stdout, expected);
+                    assert!(stderr.is_empty() && !root.join(".wosy").exists());
+                }
+                fs::write(&leaf_source, "%%start u8 bad = true; %%end").unwrap();
+                let blocked = run(1);
+                let [failure] = blocked.as_slice() else { panic!("later static diagnostic suppresses all prior staging"); };
+                assert_eq!(failure.root, root.join("leaf"));
+                assert!(matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_))));
+                assert!(checked_publication_reports(&blocked).is_err() && !root.join(".wosy").exists());
+                fs::write(&leaf_source, body("leaf", 6)).unwrap();
+            }
+        }
+        fs::write(root.join("wosy.toml"), &app).unwrap();
+        fs::write(root.join("src/primary.w"), body("app", 3)).unwrap();
+        fs::remove_file(root.join("src/lib.w")).unwrap();
 
         fs::write(root.join("leaf/src/dormant.w"), r#"%%start
 unit(u8) unseen = fn(value) {
