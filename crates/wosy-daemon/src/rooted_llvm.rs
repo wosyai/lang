@@ -1,6 +1,7 @@
 //! Opt-in projection of ordinary LLVM from a leased authored source root.
 use super::{
     build_session::BuildRequestRejection, file_source, project_declarations::RootedOrder,
+    grammar_receipts::VerifiedGrammarBatch,
     read_index_using, read_verified_node_with, retention_plan::SourceLease,
     source_proposal::{authored_grammar_matches, take},
     validate_file_using, BaseCstAdmissionLimits, FileTree, Result, SourceStore,
@@ -48,7 +49,9 @@ pub struct RootedLlvmPartition {
     pub compiler_image: NodeId,
     pub bytes: Vec<u8>,
     pub digest: NodeId,
+    /// All files with verified grammar, counting a reused exact receipt.
     pub grammar_verified_files: usize,
+    pub grammar_reparsed_files: usize,
     pub grammar_verification: Duration,
 }
 
@@ -59,16 +62,20 @@ impl SourceStore {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let result = self.project_ll(&tx, grant.root, profile, limits, output_bytes)?;
+        let mut grammar = VerifiedGrammarBatch::default();
+        let result = self.project_ll(&tx, grant.root, profile, limits, output_bytes, &mut grammar)?;
         if lease.deadline().is_none_or(|deadline| Instant::now() >= deadline) {
             return Err(BuildRequestRejection::Expired.into());
+        }
+        if matches!(result, RootedLlvmProjection::Emitted(_)) {
+            self.grammar_receipts.accept(grammar);
         }
         Ok(result)
     }
 
     fn project_ll(
         &self, tx: &surrealkv::Transaction, root: NodeId, profile: String,
-        limits: BaseCstAdmissionLimits, output_bytes: usize,
+        limits: BaseCstAdmissionLimits, output_bytes: usize, grammar: &mut VerifiedGrammarBatch,
     ) -> Result<RootedLlvmProjection> {
         use RootedLlvmProjection as Projection;
         use RootedLlvmRejection as Rejection;
@@ -103,8 +110,12 @@ impl SourceStore {
         // The admitted index fixes the same first-discovery order and
         // ordered destinations as the ordinary project source loader.
         let order = RootedOrder::from_parts(&config.entry, index.modules, index.files, index.module_edges);
+        let parser = config.parser.id();
         let mut owners = Vec::with_capacity(order.modules.len());
         for module in &order.modules {
+            if module.file.metadata.policy != parser {
+                return Err("LLVM file does not match the selected parser policy".into());
+            }
             if module.file.metadata.source.path.as_path().to_str().is_none_or(|path| path.contains('\\')) {
                 // Legacy ordinary Build rewrites the display path. This is
                 // not the same identity as the rooted native path.
@@ -118,18 +129,23 @@ impl SourceStore {
         let mut input = Vec::with_capacity(order.modules.len());
         let mut extracted = Vec::new();
         let mut grammar_verification = Duration::ZERO;
+        let mut grammar_reparsed_files = 0;
         for (module, owner) in order.modules.into_iter().zip(&owners) {
             let checked = validate_file_using(&module.file, &config.parser.categories, FileTree::Authored,
                 Some(&mut work), |id, work| {
                     read_verified_node_with(tx, id, |bytes| work.expect("bounded authored expansion").read(bytes))
                 })?;
-            // A published legacy root attests source structure, not the
-            // ordinary grammar. Use the same oracle as sparse admission.
-            let verification = Instant::now();
-            if !authored_grammar_matches(&module.file, &config.parser.categories, &checked)? {
-                return Ok(Projection::Unsupported(Unsupported::AuthoredGrammarNotVerified));
+            // Hash, authored closure and budgets must pass even on receipt
+            // hits. A generic published marker carries no grammar witness.
+            if !self.grammar_receipts.contains(&module.file) {
+                let verification = Instant::now();
+                if !authored_grammar_matches(&module.file, &config.parser.categories, &checked)? {
+                    return Ok(Projection::Unsupported(Unsupported::AuthoredGrammarNotVerified));
+                }
+                grammar_verification += verification.elapsed();
+                grammar_reparsed_files += 1;
+                grammar.verified(&module.file);
             }
-            grammar_verification += verification.elapsed();
             let authored = checked.authored.ok_or("leased source has no authored CST")?;
             let tree = CanonicalCstRoot::new(owner.clone(), authored);
             let declarations = derive_scalar_declarations_from_cst(&tree);
@@ -170,7 +186,7 @@ impl SourceStore {
         let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
         Ok(Projection::Emitted(RootedLlvmPartition {
             source_root: root, profile, compiler_image: image, bytes: output.bytes, digest,
-            grammar_verified_files: module_count, grammar_verification,
+            grammar_verified_files: module_count, grammar_reparsed_files, grammar_verification,
         }))
     }
 }

@@ -7,6 +7,7 @@ use super::{
     CheckedFile, Expected, FileTree, Index, PreparedBaseModule, PublishReport, Result,
     SourceStorageWorker, SourceStore, INTERN, NODES, SNAPSHOT_ROOTS,
 };
+use super::grammar_receipts::VerifiedGrammarBatch;
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -85,6 +86,7 @@ struct ValidatedProposal {
     entry: FileKey,
     index: Index,
     work: CstWork,
+    grammar: VerifiedGrammarBatch,
 }
 
 fn prepared_identity(
@@ -127,7 +129,7 @@ impl SourceStorageWorker {
             for conflicts in 0..=1 {
                 let binding = Arc::clone(&binding);
                 let proposal = Arc::clone(&proposal);
-                let (mut tx, _read, result) = worker.phase(None, move |store| {
+                let (mut tx, _read, result, grammar) = worker.phase(None, move |store| {
                     let (mut tx, read) = store.begin_leased_source(grant, Mode::ReadWrite)?
                         .ok_or("base CST predecessor lease expired")?;
                     tx.set_durability(Durability::Eventual);
@@ -144,13 +146,16 @@ impl SourceStorageWorker {
                     Ok((tx, read, SourceDeltaCommit {
                         binding: binding.as_ref().clone(), validated_files: validated.admission.validated_files,
                         written_records: report.written, already_present, conflicts,
-                    }))
+                    }, validated.grammar))
                 }).await?;
                 if lease.deadline().is_none_or(|deadline| Instant::now() >= deadline) {
                     return Err("base CST predecessor lease expired".into());
                 }
                 match tx.commit().await {
-                    Ok(()) => return Ok(SourceDeltaPublication::Committed(result)),
+                    Ok(()) => {
+                        worker.store.grammar_receipts.accept(grammar);
+                        return Ok(SourceDeltaPublication::Committed(result));
+                    }
                     Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -187,7 +192,7 @@ impl SourceStorageWorker {
     ) -> Result<PreparedBaseDeclarations> {
         let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease,
             move |store, tx, valid| {
-                let ValidatedProposal { admission, entry, index, mut work } = valid;
+                let ValidatedProposal { admission, entry, index, mut work, .. } = valid;
                 let mut allocation = store.source_reads.reserve_preparation()?;
                 let declarations = store.prepare_unpublished_declarations(tx, &entry, index, &mut work,
                     declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
@@ -277,6 +282,7 @@ fn validate(
     let previous = read_index(tx, super::read_node(tx, proposal.base)?)?;
     let mut work = limits.cst_work();
     let mut validated_files = 0;
+    let mut grammar = VerifiedGrammarBatch::default();
     let (current, config) = validate_snapshot_with(tx, proposal.root, |config| {
         if !matches_source_scope(config, &binding.selected) {
             return Err("proposed source does not match the bound workspace and target".into());
@@ -291,6 +297,7 @@ fn validate(
         let checked = grammar_checked_file(tx, file, categories, tree, &mut work)?;
         if let Some(report) = publish.as_deref_mut() {
             admit_checked_namespace_authority(tx, file, checked, report)?;
+            grammar.verified(file);
         } else if imports_from_cst(&checked.authored.ok_or("missing checked authored CST")?)? != file.metadata.imports {
             return Err("changed CST does not match canonical namespace provenance".into());
         }
@@ -313,7 +320,7 @@ fn validate(
         base: proposal.base, proposed: proposal.root, attempt: proposal.attempt,
         base_records: prior.len(), novel_records: supplied.len(), validated_files,
     };
-    Ok(ValidatedProposal { admission, entry: config.entry, index: current, work })
+    Ok(ValidatedProposal { admission, entry: config.entry, index: current, work, grammar })
 }
 
 pub(super) fn matches_source_scope(config: &SourceConfig, selected: &BuildSourceSelection) -> bool {

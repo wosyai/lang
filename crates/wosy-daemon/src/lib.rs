@@ -50,6 +50,7 @@ mod base_declarations;
 mod build_receipt;
 mod build_session;
 mod framed_session;
+mod grammar_receipts;
 mod derivation_image;
 mod pins;
 mod project_declarations;
@@ -87,6 +88,7 @@ pub struct SourceStore {
     project_commit: tokio::sync::Mutex<()>,
     prepared_projects: prepared_project::PreparationCache,
     source_reads: retention_plan::SourceReads,
+    grammar_receipts: grammar_receipts::GrammarReceipts,
     #[cfg(test)]
     test_without_derivation_image: bool,
 }
@@ -130,6 +132,7 @@ impl SourceStore {
             tree, blobs: dir.join("cas"), base_flights: Default::default(),
             project_commit: Default::default(),
             prepared_projects: Default::default(), source_reads: Default::default(),
+            grammar_receipts: Default::default(),
             #[cfg(test)]
             test_without_derivation_image: false,
         })

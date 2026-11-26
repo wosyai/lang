@@ -45,14 +45,26 @@ main_artifact = "main"
 main_artifact = "main"
 """
 profiles = ("dev", "native")
+peers = 8
+files = peers + 2
 
 
 def entry(note, erroneous=""):
+    imports = "".join(f'peer{n} = namespace std "peer{n}.w";\n' for n in range(peers))
     return f'''%%start
 # WHY: {note}
 dep = namespace std "value.w";
-i32() answer = fn {{ dep.value() }};
+{imports}i32() answer = fn {{ dep.value() }};
 {erroneous}%%end
+'''
+
+
+def provider(note):
+    return f'''%%start
+# WHY: {note}
+i32() value = fn {{ 42 }};
+i32() dependency_only = fn {{ 7 }};
+%%end
 '''
 
 
@@ -70,8 +82,12 @@ with tempfile.TemporaryDirectory() as temporary:
     for script in ("build-native", "run-native"):
         (project / "scripts" / script).write_bytes((native / "scripts" / script).read_bytes())
     (project / "stdlib/wosy.toml").write_text('[package]\nname="std"\nsource_root="src"\n')
-    (project / "stdlib/src/value.w").write_text(
-        "%%start\ni32() value = fn { 42 };\ni32() dependency_only = fn { 7 };\n%%end\n")
+    library = project / "stdlib/src"
+    leaf = library / "value.w"
+    leaf.write_text(provider("proveniência original ☕"))
+    for n in range(peers):
+        values = "".join(f"i32() value{k} = fn {{ {n + k} }};\n" for k in range(75))
+        (library / f"peer{n}.w").write_text(f"%%start\n{values}%%end\n")
     authored = project / "src/main.w"
 
     def state(*args, refusal=None):
@@ -112,7 +128,7 @@ with tempfile.TemporaryDirectory() as temporary:
         result = projection(profile)
         view = result["answer"]
         assert view["kind"] == "llvm" and view["root"] == selected and view["profile"] == profile
-        assert view["grammar_verified_files"] == 2
+        assert view["grammar_verified_files"] == view["grammar_reparsed_files"] == files
         assert len(bytes.fromhex(view["image"])) == 32
         expected, digest = ordinary_build(profile)
         assert expected == view["llvm"].encode() and digest == view["digest"]
@@ -121,7 +137,7 @@ with tempfile.TemporaryDirectory() as temporary:
 
     authored.write_text(entry("proveniência original ☕"))
     a = state("stage")
-    assert (a["result"]["parsed"], a["result"]["reused"]) == (2, 0)
+    assert (a["result"]["parsed"], a["result"]["reused"]) == (files, 0)
     root_a = acknowledge(a)
     assert not (project / ".wosy/artifacts").exists()
     assert projection("dev", control="wrong-project")["kind"] == "scope-refused"
@@ -135,22 +151,29 @@ with tempfile.TemporaryDirectory() as temporary:
     assert not (project / ".wosy/artifacts").exists()
     before = {profile: require_parity(root_a, profile) for profile in profiles}
 
-    authored.write_text(entry("somente uma anotação mais longa 🚀"))
+    leaf.write_text(provider("somente uma anotação mais longa 🚀"))
     b = state("stage")
-    assert (b["result"]["parsed"], b["result"]["reused"]) == (1, 1)
+    assert (b["result"]["parsed"], b["result"]["reused"]) == (1, files - 1)
     assert b["selected"] == root_a and b["pending"] != root_a
     offline = authored.with_suffix(".fixture")
     authored.rename(offline)
     for profile in profiles:
         assert projection(profile)["answer"] == before[profile][0]
     offline.rename(authored)
-    root_b = acknowledge(b)
+    memo = state("leased-llvm-grammar-memo")["result"]
+    root_b = memo["root"]
+    assert root_b == b["pending"] and memo["files"] == files
+    assert memo["hot_admission_reparsed"] == 1
     after = {profile: require_parity(root_b, profile) for profile in profiles}
+    assert memo["wasi_digest"] == after["dev"][0]["digest"]
+    assert memo["native_digest"] == after["native"][0]["digest"]
     assert all(after[profile][0]["digest"] != before[profile][0]["digest"] for profile in profiles)
     impact = subprocess.run([example, project, catalog, root_a, "--source-impact", root_b],
                             capture_output=True, check=True, timeout=30)
     effect = json.loads(impact.stdout)
     assert effect["annotation_tree_changed"] and not effect["executable_tree_changed"]
+    policy = state("leased-llvm-grammar-policy")["result"]
+    assert policy == {"new_policy_reparsed": files, "rollback_did_not_seed": True}
 
     # An existing ordinary ownership diagnostic must still prevent emission.
     authored.write_text(entry("reject before LLVM", "struct Item { u8 value; }\n"
@@ -166,4 +189,7 @@ with tempfile.TemporaryDirectory() as temporary:
                       "annotation_only_changes_current_ordinary_llvm": True,
                       "retained_accepted_source_without_live_entry": True, "errors_emit_no_bytes": True,
                       "projection_ms": {key: [before[key][1], after[key][1]] for key in profiles},
-                      "grammar_ms": {key: [before[key][2], after[key][2]] for key in profiles}}))
+                      "grammar_ms": {key: [before[key][2], after[key][2]] for key in profiles},
+                      "same_process_grammar_memo": {key: memo[key] for key in
+                          ("files", "hot_admission_reparsed", "cold_a", "warm_a", "hot_b", "reopened_b")},
+                      "policy_change_and_rollback": policy}))
