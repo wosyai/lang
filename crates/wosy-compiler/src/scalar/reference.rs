@@ -2485,13 +2485,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }) = (&mut self.local_borrow, &call) {
                     // An exact effect body and the later checked output edge
                     // are both needed. A return contract alone grants no call effects.
-                    if source == &self.source && !calls.declared_unsafe_calls.contains(&ordinal.0)
-                        && checked_call_output
-                        && shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects)
-                            .is_some_and(|effect| effect.returns_formal && !effect.joined_only && effect.parameter == 0)
-                    {
-                        if let [argument] = argument_points.as_slice() {
-                            author.prepare_shared_identity(CfgPointId(self.cfg.points.len()), *argument);
+                    if source == &self.source && !calls.declared_unsafe_calls.contains(&ordinal.0) {
+                        if let (Some(effect), [argument]) = (
+                            shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects),
+                            argument_points.as_slice(),
+                        ) {
+                            let call_point = CfgPointId(self.cfg.points.len());
+                            if checked_call_output && effect.returns_formal && !effect.joined_only
+                                && effect.parameter == 0
+                            {
+                                author.prepare_shared_identity(call_point, *argument);
+                            } else if !checked_call_output && effect.staged_local_forward
+                                && read_effect_argument.is_some_and(|(read, local, _, returns)| read == *argument && local && !returns)
+                            {
+                                author.prepare_scalar_read(call_point, *argument, &self.cfg.points);
+                            }
                         }
                     }
                 }
@@ -10142,7 +10150,7 @@ fn shared_scalar_read_effect(
 ) -> Option<SharedScalarReadEffect> {
     if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
         return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
-            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false });
+            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false, staged_local_forward: false });
     }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
@@ -14273,6 +14281,7 @@ struct SharedScalarReadEffect {
     joined_only: bool,
     bool_prefix: bool,
     returns_formal: bool,
+    staged_local_forward: bool,
 }
 
 // A small, total structural pass for one typed conditional-reader body.
@@ -14384,7 +14393,7 @@ impl SharedScalarReadEffect {
             && formal_name(output, parameter.span)
             && structure.checked_types.expressions.get(&output) == Some(&result.ty)
         {
-            return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true });
+            return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true, staged_local_forward: false });
         }
         if if descriptor { !aggregate::ordinary_value(&result.ty) || !calls.call_occurrences.is_empty() }
             else { &result.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
@@ -14398,7 +14407,7 @@ impl SharedScalarReadEffect {
             exact_joined_conditional_reader(expression, output, structure, parameter, scalar,
                 inner, &formal_name, MAX_CONDITIONAL_READER_NODES)?;
             return Some(Self { parameter: parameter.ordinal, descriptor: false,
-                joined_only: true, bool_prefix: scalar.is_some(), returns_formal: false });
+                joined_only: true, bool_prefix: scalar.is_some(), returns_formal: false, staged_local_forward: false });
         }
         if scalar.is_some_and(|scalar| &scalar.ty != inner.as_ref() || !aggregate::ordinary_value(&scalar.ty)) {
             return None;
@@ -14471,7 +14480,7 @@ impl SharedScalarReadEffect {
         (formal_name(pointer, parameter.span)
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
             && structure.checked_types.expressions.get(&read) == Some(&result.ty))
-            .then_some(Self { parameter: parameter.ordinal, descriptor, joined_only: false, bool_prefix: false, returns_formal: false })
+            .then_some(Self { parameter: parameter.ordinal, descriptor, joined_only: false, bool_prefix: false, returns_formal: false, staged_local_forward: false })
     }
 }
 
@@ -17088,19 +17097,21 @@ fn ground_shared_reader_forwarders<'a>(
         }
         grounded.extend(calls.shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)| {
             (effect.parameter == 0 && !effect.descriptor).then_some((index, declaration,
-                if effect.returns_formal { SharedForwardKind::ReturnedFormal } else { SharedForwardKind::ScalarRead }))
+                if effect.returns_formal { SharedForwardKind::ReturnedFormal } else { SharedForwardKind::ScalarRead },
+                !effect.joined_only && !effect.returns_formal))
         }));
     }
-    // Seed only exact unary leaves so cycles, failed rows and same-offset
-    // declarations from another source cannot grant forwarding authority.
+    // Cycles cannot ground themselves. The staged lane also requires
+    // each hop to reach an exact leaf in the same module.
     while let Some(target) = grounded.pop() {
-        if let Some(callers) = reverse.remove(&target) {
+        if let Some(callers) = reverse.remove(&(target.0, target.1, target.2)) {
             for (index, declaration) in callers {
+                let staged_local_forward = target.3 && index == target.0;
                 rows[index].1.shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
                     parameter: 0, descriptor: false, joined_only: true, bool_prefix: false,
-                    returns_formal: target.2 == SharedForwardKind::ReturnedFormal,
+                    returns_formal: target.2 == SharedForwardKind::ReturnedFormal, staged_local_forward,
                 });
-                grounded.push((index, declaration, target.2));
+                grounded.push((index, declaration, target.2, staged_local_forward));
             }
         }
     }

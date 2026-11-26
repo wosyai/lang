@@ -899,8 +899,8 @@ fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
     assert_eq!(
         reader_call_sites.shared_scalar_read_effects,
         HashMap::from([
-            (reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false }),
-            (identity_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true }),
+            (reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false, staged_local_forward: false }),
+            (identity_span, SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true, staged_local_forward: false }),
         ]),
     );
     assert!(calls.has_closed_shared_scalar_reader(0, reader_span));

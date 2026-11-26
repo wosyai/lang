@@ -98,6 +98,7 @@ pub(crate) struct Author {
     child_parents: HashMap<CfgPointId, CfgPointId>,
     last_literal_aggregate: Option<CfgPointId>,
     identity_calls: Vec<(CfgPointId, CfgPointId)>,
+    pending_scalar_read: Option<(CfgPointId, CfgPointId)>,
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
     authored_roots: HashSet<ReferenceBindingId>,
@@ -137,6 +138,7 @@ impl Author {
         points: &[ReferenceFlowPoint],
     ) -> bool {
         let child_hint = self.prepared_child.take();
+        let scalar_read = self.pending_scalar_read.take();
         if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
             && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. })
             && !matches!(kind, CfgPointKind::Call { .. } if self.pending_rhs == Some(id)))
@@ -145,7 +147,8 @@ impl Author {
         }
         match kind {
             CfgPointKind::Call { argument_points, output: 0, .. } => self.identity_calls.last()
-                .is_some_and(|&(call, argument)| call == id && argument_points.as_slice() == [argument]),
+                .is_some_and(|&(call, argument)| call == id && argument_points.as_slice() == [argument])
+                || scalar_read.is_some_and(|(call, argument)| call == id && argument_points.as_slice() == [argument]),
             CfgPointKind::Branch { .. } => {
                 if self.open_forks.last().is_some_and(|top| top.join.is_some())
                     || (self.open_forks.is_empty() && scope != ReferenceScopeId(0))
@@ -283,6 +286,22 @@ impl Author {
 
     pub(super) fn prepare_named_child(&mut self, child: CfgPointId, parent: CfgPointId) {
         self.prepared_child = Some((child, parent));
+    }
+
+    pub(super) fn prepare_scalar_read(
+        &mut self, call: CfgPointId, argument: CfgPointId, points: &[ReferenceFlowPoint],
+    ) {
+        if self.last_holder_read != Some(argument) || argument.0.checked_add(1) != Some(call.0)
+            || self.pending_loan.is_some()
+        {
+            return;
+        }
+        let Some(CfgPointKind::Read { binding }) = points.get(argument.0).map(|point| &point.kind)
+            else { return; };
+        let arm = self.arm();
+        let Some(holder) = self.holders.get_mut(binding) else { return; };
+        holder.record_read(call, arm);
+        self.pending_scalar_read = Some((call, argument));
     }
 
     pub(super) fn prepare_shared_identity(
@@ -1692,6 +1711,57 @@ unit() examine = fn {
             assert_eq!(actual, definitive(&mut incumbent));
             assert!(actual.is_empty(), "{actual:?}");
             assert!(counts[8] > 0, "actual transfer must refine the sibling store: {counts:?}");
+        }
+    }
+
+    #[test]
+    fn authored_local_nonleaf_reader_uses_prepared_grounded_chain() {
+        let text = "%%start
+struct Pair { u16 left; u16 right; }
+u16(*u16) leaf = fn(input) { *input };
+u16(*u16) relay = fn(input) { leaf(input) };
+unit() examine = fn {
+    Pair owner = { .left = 7; .right = 9; };
+    *u16 held = &owner.left;
+    owner.right = 3;
+    u16 observed = relay(held);
+    observed;
+};
+%%end";
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("p".into(), "local".into(), "relay.w".into(), "r1".into());
+            let parsed = crate::parse_source(source, text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+            let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, layout);
+            assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+            let program = typed.program;
+            let mut calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+            let prepared = |calls: &ModuleCallSites| {
+                let (results, errors) = derive_module_reference_origins(
+                    &program.source, &program.items, calls, &program.structs, &program.enums, false,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                results.into_iter().last().unwrap().1
+            };
+            assert_eq!(calls.shared_scalar_read_effects.values().filter(|effect| effect.staged_local_forward).count(), 1);
+            let mut staged = prepared(&calls);
+            for effect in calls.shared_scalar_read_effects.values_mut() {
+                effect.staged_local_forward = false;
+            }
+            let mut incumbent = prepared(&calls);
+            assert!(incumbent.proof_points.local_borrow.is_none());
+            let sealed = staged.proof_points.local_borrow.as_ref().expect("locally grounded nonleaf graph");
+            assert!(sealed.identity_calls.is_empty(), "scalar readers do not mint return loans");
+            let points = &staged.cfg.initial_points;
+            let call = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call { .. })).unwrap();
+            assert!(sealed.holders.iter().any(|holder| holder.holder.reads.last() == Some(&call.id)));
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let actual = definitive(&mut staged);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(actual, definitive(&mut incumbent));
+            assert!(actual.is_empty(), "{actual:?}");
+            assert!(counts[8] > 0, "sibling store must use staged refinement: {counts:?}");
         }
     }
 
