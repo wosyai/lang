@@ -6,42 +6,13 @@ import subprocess
 import sys
 import tempfile
 
+from native_known_fixture import write_project
 
 example, unit_tests = (Path(arg).resolve() for arg in sys.argv[1:3])
-manifest = (Path(__file__).parent /
-            "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
-manifest += """
-[builders.native]
-command = ["unused"]
-args = []
-toolchain_identity = "native-fixture"
-[runners.native]
-command = ["unused"]
-args = []
-
-[targets.app.artifacts.main.profiles.native]
-backend = "llvm"
-output = "native"
-builder = "native"
-run_runner = "native"
-
-[targets.app.profiles.native]
-main_artifact = "main"
-"""
 with tempfile.TemporaryDirectory() as path:
     temp = Path(path).resolve()
     project, store, missing = (temp / sub for sub in ("project", "source", "empty"))
-    (project / "src").mkdir(parents=True)
-    (project / "stdlib/src").mkdir(parents=True)
-    (project / "wosy.toml").write_text(manifest)
-    (project / "stdlib/wosy.toml").write_text('[package]\nname="std"\nsource_root="src"\n')
-    (project / "stdlib/src/value.w").write_text("%%start\nu32 value = 1;\n%%end\n")
-    (project / "src/main.w").write_text('''%%start
-dep = namespace std "value.w";
-struct Item { u8 value; }
-Item(Item) take = fn(input) { next = input; next; next };
-%%end
-''')
+    write_project(project)
 
     def run(*args):
         out = subprocess.run([example, project, store, "--persistent-source", "app", *args],
