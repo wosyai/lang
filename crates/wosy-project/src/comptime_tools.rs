@@ -1,10 +1,10 @@
-use super::{BuilderConfig, ProjectConfiguration, RunnerConfig};
+use super::{string_array, BuilderConfig, ProjectConfiguration, RunnerConfig};
 use std::path::Path;
-use toml_edit::Item;
+use toml_edit::{Item, TableLike};
 
-/// The consuming profile's two declared evaluator tools, observed from
-/// one ordinary project manifest read. Not an executable identity, a
-/// capability grant, or a full build configuration.
+/// The consuming profile's evaluator tools and build declarations from one
+/// ordinary manifest read. Not an executable identity, a capability grant,
+/// or a full build configuration.
 #[derive(Debug)]
 pub struct SelectedComptimeTools {
     target: String,
@@ -13,6 +13,28 @@ pub struct SelectedComptimeTools {
     builder: BuilderConfig,
     runner_name: String,
     runner: RunnerConfig,
+    build_permissions: Option<Vec<String>>,
+    build_mounts: Option<Vec<ComptimeBuildMountDeclaration>>,
+}
+
+/// An authored mount declaration, not a resolved or authorized host path.
+#[derive(Debug)]
+pub struct ComptimeBuildMountDeclaration {
+    host_path: String,
+    guest_path: String,
+    access: ComptimeMountAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComptimeMountAccess {
+    Read,
+    ReadWrite,
+}
+
+impl ComptimeBuildMountDeclaration {
+    pub fn host_path(&self) -> &str { &self.host_path }
+    pub fn guest_path(&self) -> &str { &self.guest_path }
+    pub fn access(&self) -> ComptimeMountAccess { self.access }
 }
 
 impl SelectedComptimeTools {
@@ -52,6 +74,9 @@ impl SelectedComptimeTools {
                 return Err(format!("{kind} {name} has no executable command"));
             }
         }
+        let build_permissions = authored.get("build_permissions")
+            .map(|_| string_array(authored, "build_permissions")).transpose()?;
+        let build_mounts = authored.get("build_mounts").map(build_mount_declarations).transpose()?;
         Ok(Some(Self {
             target: target.into(),
             profile: profile.into(),
@@ -59,6 +84,8 @@ impl SelectedComptimeTools {
             builder,
             runner_name: runner_name.into(),
             runner,
+            build_permissions,
+            build_mounts,
         }))
     }
 
@@ -66,6 +93,34 @@ impl SelectedComptimeTools {
     pub fn profile(&self) -> &str { &self.profile }
     pub fn builder(&self) -> (&str, &BuilderConfig) { (&self.builder_name, &self.builder) }
     pub fn runner(&self) -> (&str, &RunnerConfig) { (&self.runner_name, &self.runner) }
+    pub fn build_permissions(&self) -> Option<&[String]> { self.build_permissions.as_deref() }
+    pub fn build_mounts(&self) -> Option<&[ComptimeBuildMountDeclaration]> { self.build_mounts.as_deref() }
+}
+
+fn build_mount_declarations(item: &Item) -> Result<Vec<ComptimeBuildMountDeclaration>, String> {
+    if let Some(array) = item.as_array() {
+        return array.iter().map(|value| {
+            let row = value.as_inline_table().ok_or("build_mounts entries must be tables")?;
+            build_mount(row)
+        }).collect();
+    }
+    if let Some(tables) = item.as_array_of_tables() {
+        return tables.iter().map(|row| build_mount(row)).collect();
+    }
+    Err("build_mounts must be an array".into())
+}
+
+fn build_mount(row: &dyn TableLike) -> Result<ComptimeBuildMountDeclaration, String> {
+    let field = |key: &str| row.get(key).and_then(Item::as_str)
+        .ok_or_else(|| format!("build_mounts.{key} must be a string"));
+    let host_path = field("host_path")?;
+    let guest_path = field("guest_path")?;
+    let access = match field("access")? {
+        "read" => ComptimeMountAccess::Read,
+        "read_write" => ComptimeMountAccess::ReadWrite,
+        _ => return Err("build_mounts.access must be read or read_write".into()),
+    };
+    Ok(ComptimeBuildMountDeclaration { host_path: host_path.into(), guest_path: guest_path.into(), access })
 }
 
 #[cfg(test)]
@@ -116,6 +171,8 @@ mod tests {
         output = "native"
         builder = "artifact"
         run_runner = "runtime"
+        run_permissions = ["network"]
+        run_mounts = [{ host_path = "runtime", guest_path = "/var", access = "read_write" }]
 
         [targets.app.artifacts.main.profiles.wasm]
         backend = "llvm"
@@ -127,11 +184,18 @@ mod tests {
         main_artifact = "main"
         comptime_builder = "eval"
         comptime_runner = "evaluate"
+        build_permissions = ["filesystem:schemas_read", "filesystem:scratch"]
+        build_mounts = [
+            { host_path = "schemas", guest_path = "/schemas", access = "read" },
+            { host_path = "./scratch", guest_path = "/tmp", access = "read_write" },
+        ]
 
         [targets.app.profiles.wasm]
         main_artifact = "main"
         comptime_builder = "special"
         comptime_runner = "alt"
+        build_permissions = []
+        build_mounts = []
 
         [targets.helper]
         root = "src/helper.w"
@@ -170,6 +234,8 @@ mod tests {
                 [targets.app.profiles.dev]
                 comptime_builder = "provider_only"
                 comptime_runner = "evaluate"
+                build_permissions = ["network"]
+                build_mounts = [{ host_path = ".", guest_path = "/provider", access = "read" }]
             "#).unwrap();
             fixture.write(MANIFEST);
             fixture
@@ -250,6 +316,71 @@ mod tests {
             fixture.write(&MANIFEST.replace(original, replacement));
             let ordinary = ProjectConfiguration::load(&fixture.project()).unwrap();
             assert_eq!(ordinary.artifact_profile("app", "dev").unwrap().2.run_runner, "runtime");
+            assert!(fixture.load("app", "wasm").unwrap().is_some());
+            assert_eq!(fixture.load("app", "dev").unwrap_err(), error);
+        }
+    }
+
+    fn mount_values(tools: &SelectedComptimeTools) -> Vec<(&str, &str, ComptimeMountAccess)> {
+        tools.build_mounts().unwrap().iter()
+            .map(|row| (row.host_path(), row.guest_path(), row.access())).collect()
+    }
+
+    #[test]
+    fn build_declarations_are_selected_and_preserve_order_empty_and_absent() {
+        use ComptimeMountAccess::{Read, ReadWrite};
+        let fixture = Fixture::new();
+        let dev = fixture.load("app", "dev").unwrap().unwrap();
+        assert_eq!(dev.build_permissions().unwrap(), ["filesystem:schemas_read", "filesystem:scratch"]);
+        assert_eq!(mount_values(&dev), [("schemas", "/schemas", Read), ("./scratch", "/tmp", ReadWrite)]);
+        let wasm = fixture.load("app", "wasm").unwrap().unwrap();
+        assert!(wasm.build_permissions().unwrap().is_empty());
+        assert!(wasm.build_mounts().unwrap().is_empty());
+
+        let ordinary = serde_json::to_vec(&ProjectConfiguration::load(&fixture.project()).unwrap()).unwrap();
+        let mut without: toml_edit::DocumentMut = MANIFEST.parse().unwrap();
+        let profile = without["targets"]["app"]["profiles"]["dev"].as_table_mut().unwrap();
+        profile.remove("build_permissions").unwrap();
+        profile.remove("build_mounts").unwrap();
+        fixture.write(&without.to_string());
+        assert_eq!(serde_json::to_vec(&ProjectConfiguration::load(&fixture.project()).unwrap()).unwrap(), ordinary);
+        let absent = fixture.load("app", "dev").unwrap().unwrap();
+        assert!(absent.build_permissions().is_none() && absent.build_mounts().is_none());
+        assert_eq!(mount_values(&dev), [("schemas", "/schemas", Read), ("./scratch", "/tmp", ReadWrite)]);
+
+        fixture.write(&format!("{without}\n{}", r#"
+            [[targets.app.profiles.dev.build_mounts]]
+            host_path = "schemas"
+            guest_path = "/schemas"
+            access = "read"
+            [[targets.app.profiles.dev.build_mounts]]
+            host_path = "./scratch"
+            guest_path = "/tmp"
+            access = "read_write"
+        "#));
+        assert_eq!(mount_values(&fixture.load("app", "dev").unwrap().unwrap()), mount_values(&dev));
+    }
+
+    #[test]
+    fn malformed_build_declarations_fail_only_for_the_opted_in_profile() {
+        let fixture = Fixture::new();
+        for (field, value, error) in [
+            ("build_permissions", "true", "build_permissions must be an array"),
+            ("build_permissions", "[1]", "build_permissions values must be strings"),
+            ("build_mounts", "\"not a list\"", "build_mounts must be an array"),
+            ("build_mounts", "[123]", "build_mounts entries must be tables"),
+            ("build_mounts", "[{ guest_path = \"/data\", access = \"read\" }]", "build_mounts.host_path must be a string"),
+            ("build_mounts", "[{ host_path = \"data\", guest_path = 5, access = \"read\" }]", "build_mounts.guest_path must be a string"),
+            ("build_mounts", "[{ host_path = \"data\", guest_path = \"/data\" }]", "build_mounts.access must be a string"),
+            ("build_mounts", "[{ host_path = \"data\", guest_path = \"/data\", access = \"write\" }]",
+                "build_mounts.access must be read or read_write"),
+        ] {
+            let mut manifest: toml_edit::DocumentMut = MANIFEST.parse().unwrap();
+            let candidate = format!("value = {value}").parse::<toml_edit::DocumentMut>().unwrap();
+            let selected = manifest["targets"]["app"]["profiles"]["dev"].as_table_mut().unwrap();
+            selected[field] = candidate["value"].clone();
+            fixture.write(&manifest.to_string());
+            assert!(ProjectConfiguration::load(&fixture.project()).unwrap().artifact_profile("app", "dev").is_ok());
             assert!(fixture.load("app", "wasm").unwrap().is_some());
             assert_eq!(fixture.load("app", "dev").unwrap_err(), error);
         }

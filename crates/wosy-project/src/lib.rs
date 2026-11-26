@@ -10,7 +10,7 @@ use toml_edit::DocumentMut;
 
 mod comptime_tools;
 pub mod packages;
-pub use comptime_tools::SelectedComptimeTools;
+pub use comptime_tools::{ComptimeBuildMountDeclaration, ComptimeMountAccess, SelectedComptimeTools};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceIdentity {
