@@ -10072,12 +10072,17 @@ fn private_shared_index_forward(
     Some((view.span, call, call_site.id))
 }
 
+fn exclusive_relay_scalar(ty: &ScalarType) -> bool {
+    ordinary_value(ty) || matches!(ty, ScalarType::Enum(_))
+}
+
 pub(crate) fn exclusive_runtime_relay_signature(parameters: &[ScalarType], outputs: &[ScalarOutput]) -> bool {
     matches!(parameters, [ScalarType::CheckedReference {
         mutability: ScalarReferenceMutability::Mutable, inner,
     }, rest @ ..] if matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. } if ordinary_value(element))
-        && rest.iter().all(ordinary_value))
-        && (outputs.is_empty() || matches!(outputs, [output] if output.ty == ScalarType::Unit))
+        && rest.iter().all(exclusive_relay_scalar))
+        && (matches!(outputs, [output] if output.ty == ScalarType::Unit)
+            || outputs.iter().all(|output| exclusive_relay_scalar(&output.ty)))
 }
 
 fn exact_exclusive_runtime_relay(
@@ -10128,10 +10133,25 @@ fn exact_exclusive_runtime_relay(
         if !exclusive_runtime_relay_signature(&signature.parameters, &signature.outputs.outputs)
             || scalar_type_identity(signature.parameters.first()?) != scalar_type_identity(parameters.first()?)
         { return None; }
+        let call_point = cfg.points.get(call.0)?;
         let CfgPointKind::Call {
-            target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. },
-            expression: ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
-        } = &cfg.points.get(call.0)?.kind else { return None; };
+            target: target_kind @ ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. },
+            expression: expression @ ScalarExpression::Call { arguments, .. }, argument_points, output: 0,
+        } = &call_point.kind else { return None; };
+        // A grouped call is one runtime invocation. Its additional CFG
+        // projections must follow the same exact producer, not add call edges.
+        let mut producer = call_point;
+        for lane in 1..signature.outputs.outputs.len() {
+            let [next] = producer.successors.as_slice() else { return None; };
+            let projection = cfg.points.get(next.0)?;
+            if projection.scope != call_point.scope || projection.source_span != call_point.source_span
+                || !matches!(&projection.kind, CfgPointKind::Call {
+                    target, expression: source, argument_points: inputs, output,
+                } if target == target_kind && source == expression && inputs == argument_points && *output == lane)
+            { return None; }
+            exact.insert(*next);
+            producer = projection;
+        }
         let first = *argument_points.first()?;
         let actual = cfg.points.get(first.0)?;
         let OccurrenceNode::Expression(argument) = *sites.structure.edges.get(&(
@@ -10190,11 +10210,64 @@ fn exact_exclusive_runtime_relay(
         exact.extend([call, first, read]);
         calls.push((ordinal.0, PrivateRuntimePairCall { owner: formal, target, inherited: true, portable_birth: None }));
     }
+    let scalar_locals: HashSet<_> = sites.structure.blocks.iter().flat_map(|block| &block.items)
+        .filter_map(|item| match &item.kind {
+            BlockItemKind::Binding(binding) => Some(binding.receivers()),
+            _ => None,
+        }).flatten().filter(|receiver| exclusive_relay_scalar(&receiver.ty))
+        .map(|receiver| receiver.span).collect();
+    let mut scalar_groups = HashMap::new();
+    let mut scalar_destinations = HashMap::new();
+    for group in sites.assignments.values() {
+        let mut lanes = Vec::new();
+        for slot in group.destinations() {
+            let AssignmentReplacement::Resolved(ty) = &slot.replacement else { break; };
+            let Some(DirectDestinationIdentity::Existing(binding)) = sites.prepared_direct_destination(slot.destination)
+                else { break; };
+            if !exclusive_relay_scalar(ty) || binding == formal_binding
+                || sites.structure.checked_types.places.get(&slot.destination) != Some(ty)
+            { break; }
+            lanes.push((slot.target_span, binding));
+        }
+        if lanes.len() != group.destinations().len() { continue; }
+        for &(span, binding) in &lanes {
+            if scalar_destinations.insert(span, binding).is_some() { return None; }
+        }
+        if lanes.len() > 1 && scalar_groups.insert(group.span, lanes).is_some() { return None; }
+    }
+    let scalar_install = |point: &ReferenceFlowPoint, expected: &ReferenceBindingId| {
+        matches!(&point.kind, CfgPointKind::Assign { target, previous_origins, previous_loans, .. }
+            if &target.binding == expected && target.projections.is_empty()
+                && matches!(target.place, ScalarPlace::Name { .. })
+                && previous_origins.is_empty() && previous_loans.is_empty())
+            && point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty)
+    };
     if calls.is_empty() || !cfg.points.iter().all(|point| exact.contains(&point.id) || match &point.kind {
         CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Branch { .. }
         | CfgPointKind::Join | CfgPointKind::Return | CfgPointKind::ReturnOutput { checked: false, .. } => true,
         CfgPointKind::Evaluate(value) => neutral_scalar_evaluation(value),
         CfgPointKind::Read { binding } => binding.declaration_span != formal,
+        CfgPointKind::Bind { binding } => binding != formal_binding
+            && binding.source == formal_binding.source && binding.function_span == original
+            && matches!(binding.kind, ReferenceBindingKind::Declared)
+            && point.source_span.range == binding.declaration_span
+            && scalar_locals.contains(&binding.declaration_span)
+            && point.possible_origins.as_ref().is_none_or(BTreeSet::is_empty),
+        CfgPointKind::Assign { .. } => scalar_destinations.get(&point.source_span.range)
+            .is_some_and(|expected| scalar_install(point, expected)),
+        CfgPointKind::CaptureAssignmentPrevious { writes } => scalar_groups.get(&point.source_span.range)
+            .is_some_and(|lanes| writes.len() == lanes.len()
+                && writes.iter().zip(lanes).all(|(write, (span, binding))|
+                    *write > point.id && cfg.points.get(write.0).is_some_and(|install|
+                        install.scope == point.scope && install.source_span.range == *span
+                            && scalar_install(install, binding)))),
+        CfgPointKind::Move { owner, place, ty: ScalarType::Enum(_) }
+            if owner != formal_binding && &place.binding == owner && place.projections.is_empty()
+                && matches!(place.place, ScalarPlace::Name { .. }) =>
+            predecessors.get(&point.id).copied().flatten().and_then(|read| cfg.points.get(read.0))
+                .is_some_and(|read| read.scope == point.scope && read.source_span == point.source_span
+                    && read.successors.as_slice() == [point.id]
+                    && matches!(&read.kind, CfgPointKind::Read { binding } if binding == owner)),
         _ => false,
     }) { return None; }
     Some((formal, calls))

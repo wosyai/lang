@@ -347,6 +347,24 @@ pub(super) fn extract_borrowed_extent_formal<'ctx>(
     Ok(address)
 }
 
+fn private_runtime_relay_type<'ctx>(
+    context: &'ctx Context, layout: ScalarTargetLayout, signature: &ScalarType,
+) -> Result<FunctionType<'ctx>, String> {
+    let ScalarType::Callable { parameters, outputs } = signature else {
+        return Err("exclusive runtime relay is not callable".into());
+    };
+    if !crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs) {
+        return Err("invalid exclusive runtime relay signature".into());
+    }
+    let ordinary = function_type(context, signature, layout)?;
+    let mut args: Vec<BasicMetadataTypeEnum<'ctx>> = ordinary.get_param_types().into_iter().map(Into::into).collect();
+    args[0] = borrowed_extent_type(context, layout).into();
+    Ok(match ordinary.get_return_type() {
+        Some(result) => result.fn_type(&args, false),
+        None => context.void_type().fn_type(&args, false),
+    })
+}
+
 pub(super) fn emit_private_runtime_access_call<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>, expression: &ScalarExpression,
     symbol: &str, arguments: &[ScalarExpression], parameters: &[ScalarType],
@@ -387,15 +405,13 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         let pair = state.builder.build_insert_value(pair, count, 1, "exclusive_forward_pair")
             .map_err(builder_error)?.into_struct_value();
         let function = *state.functions.get(symbol).ok_or("missing exclusive runtime relay target")?;
-        let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
+        let Some(signature @ ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
             return Err("exclusive runtime relay lost its exact output".into());
         };
-        if !crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs)
-            || function.get_linkage() != Linkage::Internal || function.get_type().get_return_type().is_some()
-            || function.count_params() as usize != parameters.len()
-            || function.get_type().get_param_types().first() != Some(&descriptor.into())
+        if function.get_linkage() != Linkage::Internal
+            || function.get_type() != private_runtime_relay_type(context, state.target_layout, signature)?
         {
-            return Err("exclusive runtime relay changed its sealed unit ABI".into());
+            return Err("exclusive runtime relay changed its sealed ABI".into());
         }
         let values = super::expression::emit_contextual_arguments(context, state, tail, &parameters[1..], project)?;
         let mut args = vec![BasicMetadataValueEnum::from(pair)];
@@ -403,8 +419,9 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
             let EmitValue::Basic(value) = value else { return Err("missing exclusive relay scalar".into()); };
             args.push(value.into());
         }
-        state.builder.build_call(function, &args, "").map_err(builder_error)?;
-        return Ok(Some(EmitValue::Unit));
+        let name = if function.get_type().get_return_type().is_some() { "exclusive_forward_result" } else { "" };
+        let result = state.builder.build_call(function, &args, name).map_err(builder_error)?;
+        return super::expression::ordinary_call_result(result.try_as_basic_value(), outputs).map(Some);
     }
     let declaration = site.owner;
     let portable = plan.private_runtime_portable_calls.contains(&occurrence);
@@ -453,7 +470,7 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
     let pair = state.builder.build_insert_value(pair, length, 1, "private_runtime_argument")
         .map_err(builder_error)?.into_struct_value();
     let function = *state.functions.get(symbol).ok_or("missing private runtime array accessor")?;
-    let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
+    let Some(signature @ ScalarType::Callable { outputs, .. }) = state.signatures.get(symbol) else {
         return Err("private runtime array accessor lost its exact output".into());
     };
     let mutable = *mutability == crate::scalar::ScalarReferenceMutability::Mutable;
@@ -465,11 +482,7 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
                 == [descriptor.into(), context.i64_type().into(), basic_type(context, &parameters[2], state.target_layout)?.into()]
                 && function_type.get_return_type() == Some(basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
         } else if mutable && crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs) {
-            let mut types = vec![descriptor.into()];
-            for parameter in scalar_parameters {
-                types.push(basic_type(context, parameter, state.target_layout)?.into());
-            }
-            function_type.get_param_types() == types && function_type.get_return_type().is_none()
+            function_type == private_runtime_relay_type(context, state.target_layout, signature)?
         } else if mutable && (crate::scalar::private_runtime_write_signature(parameters, &outputs.outputs)
             || crate::scalar::private_runtime_copy_write_signature(parameters, &outputs.outputs)) {
             function_type.get_param_types().as_slice()
@@ -490,14 +503,9 @@ pub(super) fn emit_private_runtime_access_call<'ctx>(
         let EmitValue::Basic(value) = value else { return Err("private runtime array accessor lacks a scalar argument".into()); };
         args.push(value.into());
     }
-    let value = state.builder.build_call(function, &args, if mutable && !child_store { "" } else { "private_runtime_read" })
-        .map_err(builder_error)?;
-    if mutable && !child_store {
-        Ok(Some(EmitValue::Unit))
-    } else {
-        let value = value.try_as_basic_value().basic().ok_or("private runtime reader returned no scalar")?;
-        Ok(Some(EmitValue::Basic(value)))
-    }
+    let name = if function_type.get_return_type().is_some() { "private_runtime_result" } else { "" };
+    let value = state.builder.build_call(function, &args, name).map_err(builder_error)?;
+    super::expression::ordinary_call_result(value.try_as_basic_value(), outputs).map(Some)
 }
 
 pub(super) fn emit_borrowed_extent_call<'ctx>(
@@ -866,14 +874,7 @@ pub(super) fn definition_type<'ctx>(
             return Err("private runtime array reader is not callable".into());
         };
         if plan.is_some_and(|body| body.private_runtime_exclusive_relay) {
-            if !crate::scalar::exclusive_runtime_relay_signature(parameters, &outputs.outputs) {
-                return Err("invalid exclusive runtime relay signature".into());
-            }
-            let mut args = vec![borrowed_extent_type(context, layout).into()];
-            for parameter in &parameters[1..] {
-                args.push(basic_type(context, parameter, layout)?.into());
-            }
-            return Ok(context.void_type().fn_type(&args, false));
+            return private_runtime_relay_type(context, layout, &function.signature);
         }
         if crate::scalar::private_runtime_copy_child_store_signature(parameters, &outputs.outputs)
             && plan.is_some_and(|body| body.private_runtime_copy_child_store && body.private_runtime_copy_borrows.len() == 1
