@@ -260,7 +260,7 @@ impl SourceStore {
             // those flights. Holding one never blocks a Tokio worker thread.
             let mut permits = Vec::with_capacity(keys.len());
             for key in keys {
-                permits.push(self.base_flights.acquire(key).lock_owned().await);
+                permits.push(phases.lock_owned(self.base_flights.acquire(key)).await?);
             }
             let permits = Arc::new(permits);
             let active = Arc::clone(&permits);

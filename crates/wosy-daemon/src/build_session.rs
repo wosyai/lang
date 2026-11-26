@@ -1,7 +1,7 @@
 //! Product dispatcher for the leased, diagnostic-only Build projection.
 use super::{
     retention_plan::SourceLease, source_reconciliation::reconcile_on_worker, BaseCstAdmissionLimits,
-    storage_worker::{CancelQueryOnDrop, QueryCancellation},
+    storage_worker::QueryCancellation,
     PreparedBaseDeclarations, Result, SourceReconciliation, SourceStorageWorker,
 };
 use std::sync::Arc;
@@ -122,8 +122,8 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub(super) async fn dispatch_framed(&self, request: BuildDiagnosticRequest) -> Result<BuildDiagnosticResponse<Diagnostic>> {
-        let stop = CancelQueryOnDrop::default();
-        self.dispatch_analysis(request, Some(stop.signal())).await
+        let (_observer, cancellation) = QueryCancellation::observe();
+        self.dispatch_analysis(request, Some(cancellation)).await
     }
 
     async fn dispatch_analysis(

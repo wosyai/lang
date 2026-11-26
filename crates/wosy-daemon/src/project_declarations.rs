@@ -320,7 +320,7 @@ impl SourceStore {
     ) -> Result<(Vec<Option<Projection>>, usize)> {
         // Do not hold this gate during CST extraction. Concurrent roots can
         // share AST flights; the short commit phase linearizes shared links.
-        let _publication = self.project_commit.lock().await;
+        let _publication = phases.lock(&self.project_commit).await?;
         loop {
             let step = Arc::clone(plan);
             let (tx, projections, derived) = phases.run(move |store|

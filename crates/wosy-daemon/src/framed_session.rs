@@ -591,4 +591,106 @@ mod tests {
             Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
         });
     }
+
+    #[test]
+    #[ignore = "requires a fresh source-only store with two annotation revisions of the same project"]
+    fn disconnected_framed_waiter_releases_slot_without_stopping_shared_producer() {
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Mutex};
+
+        let (path, selected, alternate) = fixture();
+        let root = selected.root;
+        let cancelled = BuildSourceSelection { root: alternate, ..selected.clone() };
+        let runtime = Builder::new_current_thread().max_blocking_threads(4).enable_time().build().unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(SourceStore::open(&path, 8 << 20).unwrap());
+            assert_eq!(store.snapshot(root).unwrap().unwrap().executable,
+                store.snapshot(alternate).unwrap().unwrap().executable);
+            assert_ne!(root, alternate);
+            let bound = |n| NonZeroUsize::new(n).unwrap();
+            let mut worker = SourceStorageWorker::new(
+                Arc::clone(&store), Handle::current(), bound(3), bound(1), bound(20_000),
+            ).unwrap();
+            let (entered, wait_for_producer) = tokio::sync::oneshot::channel();
+            let (resume, held) = mpsc::channel::<()>();
+            let producer_gate = Mutex::new(Some((entered, held)));
+            let phases = AtomicUsize::new(0);
+            worker.after_cancellable_phase(move || {
+                // Fresh producer: lease read, project index scan, then
+                // actual base planning inside its sorted AST flights.
+                if phases.fetch_add(1, Ordering::Relaxed) == 2 {
+                    let (entered, held) = producer_gate.lock().unwrap().take().unwrap();
+                    entered.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            });
+            let (blocked, mut waits) = tokio::sync::mpsc::channel(8);
+            worker.on_cancellable_gate_wait(move || blocked.try_send(()).unwrap());
+
+            let (mut producer, producer_stream) = io::duplex(256);
+            let (mut waiter, waiter_stream) = io::duplex(256);
+            let (mut follower, follower_stream) = io::duplex(256);
+            let lifetime = Duration::from_secs(30);
+            let (owner, abandoned, next, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(
+                    worker.serve_build_session(producer_stream, selected.clone(), lifetime),
+                    worker.serve_build_session(waiter_stream, cancelled, lifetime),
+                    worker.serve_build_session(follower_stream, selected, lifetime),
+                    async {
+                        let mut producer_frames = SessionFrameReader::default();
+                        let mut waiter_frames = SessionFrameReader::default();
+                        let mut follower_frames = SessionFrameReader::default();
+                        start(&mut producer, &mut producer_frames, root).await;
+                        send_request(&mut producer, 61, analyze_request()).await;
+                        wait_for_producer.await.unwrap();
+                        start(&mut waiter, &mut waiter_frames, alternate).await;
+                        send_request(&mut waiter, 71, analyze_request()).await;
+                        waits.recv().await.unwrap();
+                        start(&mut follower, &mut follower_frames, root).await;
+                        send_request(&mut follower, 81, analyze_request()).await;
+                        waits.recv().await.unwrap();
+                        assert!(matches!(worker.try_inspect(root, &[alternate], &[]), Err(StorageAdmissionError::Busy)));
+                        let before = store.plan_source_retention(root, &[alternate], &[], 20_000).unwrap();
+                        assert_eq!((before.active_read_roots, before.candidate_roots), (2, 0));
+
+                        send_request(&mut waiter, 72, Request::Disconnect).await;
+                        assert!(matches!(receive(&mut waiter, &mut waiter_frames, 72).await, Reply::Closed));
+                        assert!(waiter_frames.read::<_, BuildSessionResponse<Diagnostic>>(&mut waiter).await.unwrap().is_none());
+                        let after = loop {
+                            match worker.try_inspect(root, &[alternate], &[]) {
+                                Ok(job) => break job.finish().await.unwrap().inventory.plan,
+                                Err(StorageAdmissionError::Busy) => tokio::task::yield_now().await,
+                                Err(other) => panic!("fixture worker error: {other}"),
+                            }
+                        };
+                        // No owner progress: cancelled revision's admitted
+                        // read and the sole freed slot have drained already.
+                        assert_eq!((after.active_read_roots, after.candidate_roots), (1, 1));
+                        resume.send(()).unwrap();
+                        let (a, b) = tokio::join!(
+                            receive(&mut producer, &mut producer_frames, 61),
+                            receive(&mut follower, &mut follower_frames, 81),
+                        );
+                        let shape = |reply| match reply {
+                            Reply::Analysis { response: BuildDiagnosticResponse::BuildDiagnostics {
+                                source_root, profile, preparation, receipt, phase, origin, diagnostics, ..
+                            }} => ((source_root, profile, preparation, receipt, phase, diagnostics), origin),
+                            _ => panic!("expected the ordinary owner and follower results"),
+                        };
+                        let (a, owner_origin) = shape(a);
+                        let (b, follower_origin) = shape(b);
+                        assert_eq!(a, b);
+                        assert_eq!([owner_origin, follower_origin].into_iter()
+                            .filter(|origin| *origin == BuildAnalysisOrigin::Derived).count(), 1);
+                        drop(producer);
+                        drop(follower);
+                    },
+                )
+            }).await.unwrap();
+            assert_eq!((owner.unwrap(), abandoned.unwrap(), next.unwrap()), (
+                BuildSessionEnd::PeerClosed, BuildSessionEnd::Disconnected, BuildSessionEnd::PeerClosed,
+            ));
+            drop(worker);
+            Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+        });
+    }
 }

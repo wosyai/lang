@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex as AsyncMutex;
 use wosy_compiler::{
     analyze_scalar_build, prepare_scalar_project, Diagnostic, PreparedScalarProject,
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
@@ -52,7 +52,7 @@ struct CanonicalPreparation {
     // Only a Build-analysis request initializes this projection. The weak
     // preparation registry never extends the lifetime of its diagnostics.
     build_lookup: Lookup,
-    build_analysis: OnceCell<CanonicalBuildAnalysis>,
+    build_analysis: AsyncMutex<Option<CanonicalBuildAnalysis>>,
 }
 
 #[derive(Default)]
@@ -75,6 +75,7 @@ impl BuildAnalysisKey {
     }
 }
 
+#[derive(Clone)]
 struct CanonicalBuildAnalysis {
     phase: BuildAnalysisPhase,
     diagnostics: Arc<[Diagnostic]>,
@@ -149,50 +150,60 @@ impl RootedPreparedProject<'_> {
     pub(super) async fn build_analysis_with(&self, worker: Option<&QueryWorker>) -> Result<RootedBuildAnalysis> {
         let phases = QueryPhases::new(self.store, worker, Some(&self.declarations.read));
         let start = Instant::now();
-        let mut origin = BuildAnalysisOrigin::Live;
-        let mut receipt_written = false;
-        let canonical = self.canonical.build_analysis.get_or_try_init(|| async {
-            let phase = match self.canonical.outcome {
-                PreparationOutcome::Ready(_) => BuildAnalysisPhase::Analyzed,
-                PreparationOutcome::Rejected(_) => BuildAnalysisPhase::PreparationRejected,
-            };
-            let lookup = self.canonical.build_lookup;
-            // Only this optional derivation record can fail open to ordinary
-            // analysis. Source admission, preparation and projection still
-            // follow their original error paths.
-            if let Ok(Some(diagnostics)) = phases.run(move |store| store.read_build_receipt(&lookup, phase)).await {
-                if diagnostics.iter().flat_map(|diagnostic| &diagnostic.labels)
-                    .all(|label| self.canonical.owners.contains_key(&label.span.source))
-                {
-                    origin = BuildAnalysisOrigin::Stored;
-                    return Ok(CanonicalBuildAnalysis { phase, diagnostics: diagnostics.into() });
-                }
+        let (canonical, origin, receipt_written) = {
+            let mut stored = phases.lock(&self.canonical.build_analysis).await?;
+            if let Some(canonical) = stored.as_ref() {
+                (canonical.clone(), BuildAnalysisOrigin::Live, false)
+            } else {
+                let (canonical, origin, written) = self.analyze_canonical(phases).await?;
+                *stored = Some(canonical.clone());
+                (canonical, origin, written)
             }
-            origin = BuildAnalysisOrigin::Derived;
-            let preparation = Arc::clone(&self.canonical);
-            let diagnostics: Arc<[_]> = phases.run(move |_| Ok(match &preparation.outcome {
-                PreparationOutcome::Ready(prepared) => analyze_scalar_build(prepared).diagnostics().to_vec(),
-                PreparationOutcome::Rejected(rejection) => rejection.ordered_build_diagnostics(),
-            }.into())).await?;
-            receipt_written = self.store.persist_build_receipt(phases, lookup, phase, Arc::clone(&diagnostics))
-                .await.unwrap_or(false);
-            Ok::<_, super::Error>(CanonicalBuildAnalysis { phase, diagnostics })
-        }).await?;
+        };
         let analysis_elapsed = start.elapsed();
         let start = Instant::now();
         let diagnostics = if canonical.diagnostics.is_empty() {
             Vec::new()
         } else {
-            let diagnostics = Arc::clone(&canonical.diagnostics);
             let preparation = Arc::clone(&self.canonical);
             let modules = Arc::clone(&self.declarations.modules);
-            phases.run(move |store| project_diagnostics(store, &preparation, &modules, diagnostics.to_vec())).await?
+            let canonical_diagnostics = canonical.diagnostics;
+            phases.run(move |store| project_diagnostics(store, &preparation, &modules, canonical_diagnostics.to_vec())).await?
         };
         Ok(RootedBuildAnalysis {
             source_root: self.declarations.snapshot, preparation: self.identity(),
             key: BuildAnalysisKey(self.canonical.build_lookup.digest), phase: canonical.phase,
             origin, receipt_written, diagnostics, analysis_elapsed, authored_projection_elapsed: start.elapsed(),
         })
+    }
+
+    async fn analyze_canonical(
+        &self, phases: QueryPhases<'_>,
+    ) -> Result<(CanonicalBuildAnalysis, BuildAnalysisOrigin, bool)> {
+        let phase = match self.canonical.outcome {
+            PreparationOutcome::Ready(_) => BuildAnalysisPhase::Analyzed,
+            PreparationOutcome::Rejected(_) => BuildAnalysisPhase::PreparationRejected,
+        };
+        let lookup = self.canonical.build_lookup;
+        // Only this optional derivation record can fail open to ordinary
+        // analysis. Source admission, preparation and projection still
+        // follow their original error paths.
+        if let Ok(Some(diagnostics)) = phases.run(move |store| store.read_build_receipt(&lookup, phase)).await {
+            if diagnostics.iter().flat_map(|diagnostic| &diagnostic.labels)
+                .all(|label| self.canonical.owners.contains_key(&label.span.source))
+            {
+                let analysis = CanonicalBuildAnalysis { phase, diagnostics: diagnostics.into() };
+                return Ok((analysis, BuildAnalysisOrigin::Stored, false));
+            }
+        }
+        let preparation = Arc::clone(&self.canonical);
+        let diagnostics: Arc<[_]> = phases.run(move |_| Ok(match &preparation.outcome {
+            PreparationOutcome::Ready(prepared) => analyze_scalar_build(prepared).diagnostics().to_vec(),
+            PreparationOutcome::Rejected(rejection) => rejection.ordered_build_diagnostics(),
+        }.into())).await?;
+        let written = self.store.persist_build_receipt(phases, lookup, phase, Arc::clone(&diagnostics))
+            .await.unwrap_or(false);
+        Ok((CanonicalBuildAnalysis { phase, diagnostics }, BuildAnalysisOrigin::Derived, written))
     }
 }
 
@@ -270,7 +281,7 @@ impl SourceStore {
         let identity = preparation_identity(declarations.entry_projection, build_inputs, profile, target_layout);
 
         let flight = self.prepared_projects.flights.acquire(identity);
-        let _permit = flight.lock().await;
+        let _permit = phases.lock(&flight).await?;
         let canonical = if let Some(canonical) = self.prepared_projects.get(identity) {
             report.reused_live_preparation = true;
             canonical
@@ -310,7 +321,7 @@ impl SourceStore {
             let canonical = Arc::new(CanonicalPreparation {
                 identity, target_layout, owners, outcome,
                 build_lookup: Lookup::new(declarations.image, build_inputs, declarations.entry_projection, identity),
-                build_analysis: OnceCell::new(),
+                build_analysis: AsyncMutex::new(None),
             });
             self.prepared_projects.remember(identity, &canonical);
             canonical

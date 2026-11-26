@@ -3,9 +3,8 @@ use super::{retention_plan::SourceRead, Result, SourceRetentionInventory, Source
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::{runtime::Handle, sync::{OwnedSemaphorePermit, Semaphore}, task::JoinHandle};
+use tokio::{runtime::Handle, sync::{watch, Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore}, task::JoinHandle};
 use wosy_protocol::NodeId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +50,8 @@ pub struct SourceStorageWorker {
     census_limit: usize,
     #[cfg(test)]
     after_cancellable_phase: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    on_gate_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SourceStorageWorker {
@@ -66,6 +67,8 @@ impl SourceStorageWorker {
             selection_limit: selection_limit.get(), census_limit: census_limit.get(),
             #[cfg(test)]
             after_cancellable_phase: None,
+            #[cfg(test)]
+            on_gate_wait: None,
         })
     }
 
@@ -115,6 +118,8 @@ impl SourceStorageWorker {
             store: Arc::clone(&self.store), runtime: self.runtime.clone(), slot: Arc::new(slot),
             #[cfg(test)]
             after_phase: cancellation.as_ref().and(self.after_cancellable_phase.as_ref()).cloned(),
+            #[cfg(test)]
+            on_gate_wait: cancellation.as_ref().and(self.on_gate_wait.as_ref()).cloned(),
             cancellation,
         };
         self.runtime.spawn(query(worker))
@@ -124,34 +129,33 @@ impl SourceStorageWorker {
     pub(super) fn after_cancellable_phase(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.after_cancellable_phase = Some(Arc::new(hook));
     }
+
+    #[cfg(test)]
+    pub(super) fn on_cancellable_gate_wait(&mut self, hook: impl Fn() + Send + Sync + 'static) {
+        self.on_gate_wait = Some(Arc::new(hook));
+    }
 }
 
-/// An observer-owned stop signal for one reserved query, not its lease or
-/// a shared compiler cell. Running phases and handed-off commits still drain.
-#[derive(Clone, Default)]
-pub(super) struct QueryCancellation(Arc<AtomicBool>);
+/// Only the framed request owns the sender; it sends no values. Dropping
+/// it both signals blocking phase boundaries and wakes async gate waiters.
+#[derive(Clone)]
+pub(super) struct QueryCancellation(watch::Receiver<()>);
 
 impl QueryCancellation {
+    pub fn observe() -> (watch::Sender<()>, Self) {
+        let (observer, stopped) = watch::channel(());
+        (observer, Self(stopped))
+    }
+
+    fn stopped() -> super::Error { "framed Build analysis no longer has an observer".into() }
+
     fn check(cancellation: Option<&Self>) -> Result<()> {
-        if cancellation.is_some_and(|stop| stop.0.load(Ordering::Acquire)) {
-            Err("framed Build analysis no longer has an observer".into())
+        if cancellation.is_some_and(|stop| stop.0.has_changed().is_err()) {
+            Err(Self::stopped())
         } else {
             Ok(())
         }
     }
-}
-
-#[derive(Default)]
-pub(super) struct CancelQueryOnDrop {
-    signal: QueryCancellation,
-}
-
-impl CancelQueryOnDrop {
-    pub fn signal(&self) -> QueryCancellation { self.signal.clone() }
-}
-
-impl Drop for CancelQueryOnDrop {
-    fn drop(&mut self) { self.signal.0.store(true, Ordering::Release); }
 }
 
 /// One admitted query. Blocking phases never await a commit, and keep the
@@ -163,6 +167,8 @@ pub(super) struct QueryWorker {
     cancellation: Option<QueryCancellation>,
     #[cfg(test)]
     after_phase: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    on_gate_wait: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl QueryWorker {
@@ -205,6 +211,39 @@ impl<'a> QueryPhases<'a> {
 
     pub fn direct(store: &'a SourceStore) -> Self {
         Self::new(store, None, None)
+    }
+
+    pub async fn lock<T>(self, gate: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+        self.wait_for_gate(gate.lock()).await
+    }
+
+    pub async fn lock_owned<T>(self, gate: Arc<Mutex<T>>) -> Result<OwnedMutexGuard<T>> {
+        self.wait_for_gate(gate.lock_owned()).await
+    }
+
+    async fn wait_for_gate<T>(self, acquire: impl Future<Output = T>) -> Result<T> {
+        let Some(worker) = self.worker else { return Ok(acquire.await); };
+        let Some(signal) = &worker.cancellation else { return Ok(acquire.await); };
+        #[cfg(test)]
+        let acquire = async {
+            let mut acquire = std::pin::pin!(acquire);
+            let mut hook = worker.on_gate_wait.as_ref();
+            std::future::poll_fn(|cx| {
+                let result = acquire.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(hook) = hook.take() { hook(); }
+                }
+                result
+            }).await
+        };
+        // Select only over acquiring the existing FIFO gate, never work
+        // performed under its guard or a handed-off storage transaction.
+        let mut stopped = signal.0.clone();
+        tokio::select! {
+            biased;
+            _ = stopped.changed() => Err(QueryCancellation::stopped()),
+            guard = acquire => Ok(guard),
+        }
     }
 
     pub async fn run<T: Send + 'static>(
