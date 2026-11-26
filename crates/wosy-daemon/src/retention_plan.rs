@@ -1,35 +1,80 @@
 //! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, build_receipt, edge, key, pins, project_declarations, published_source, read_node,
+    authority_key, base_declarations, build_receipt, edge, key, pins, project_declarations, published_source, read_node, read_source_config,
     source_top, Edge, Result, SourceStore, EDGES_OUT, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use surrealkv::{LSMIterator, Mode, Transaction};
-use wosy_protocol::{FileKey, Kind, NodeId};
+use wosy_protocol::{BuildSourceSelection, FileKey, Kind, NodeId};
 
 const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
 const SHARED: u8 = PROTECTED | CANDIDATE;
+const MAX_BUILD_SESSIONS: usize = 64;
 
-/// Live handles within this store process. These are not renewable client
-/// leases, durable pins, or a registry for transport/scheduler work.
+/// Direct reads and expiring client sessions share the existing read gate.
+/// A started query holds a direct read independently of the session owner.
 #[derive(Default)]
-pub(super) struct SourceReads(Arc<Mutex<BTreeMap<NodeId, usize>>>);
+pub(super) struct SourceReads(Arc<Mutex<ReadRegistry>>);
+
+#[derive(Default)]
+struct ReadRegistry {
+    active: BTreeMap<NodeId, usize>,
+    sessions: BTreeMap<u64, (NodeId, Instant)>,
+    next_session: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LeaseGrant {
+    id: u64,
+    pub root: NodeId,
+}
+
+pub(super) struct SourceLease {
+    reads: Arc<Mutex<ReadRegistry>>,
+    grant: LeaseGrant,
+    lifetime: Duration,
+}
+
+impl SourceLease {
+    pub fn grant(&self) -> LeaseGrant { self.grant }
+
+    pub fn renew(&self) -> bool {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        let now = Instant::now();
+        let Some((_, expires)) = reads.sessions.get_mut(&self.grant.id) else { return false; };
+        if now >= *expires {
+            reads.sessions.remove(&self.grant.id);
+            return false;
+        }
+        let Some(next) = now.checked_add(self.lifetime) else { return false; };
+        *expires = next;
+        true
+    }
+}
+
+impl Drop for SourceLease {
+    fn drop(&mut self) {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        reads.sessions.remove(&self.grant.id);
+    }
+}
 
 pub(super) struct SourceRead {
-    reads: Arc<Mutex<BTreeMap<NodeId, usize>>>,
+    reads: Arc<Mutex<ReadRegistry>>,
     root: NodeId,
 }
 
 impl Drop for SourceRead {
     fn drop(&mut self) {
         let mut reads = self.reads.lock().expect("source reader registry");
-        let count = reads.get_mut(&self.root).expect("admitted source reader");
+        let count = reads.active.get_mut(&self.root).expect("admitted source reader");
         *count -= 1;
-        if *count == 0 { reads.remove(&self.root); }
+        if *count == 0 { reads.active.remove(&self.root); }
     }
 }
 
@@ -40,6 +85,7 @@ pub struct SourceRetentionPlan {
     pub protection_epoch: NodeId,
     pub nominated_roots: usize,
     pub protected_roots: usize,
+    /// Distinct roots held by live sessions or in-flight reads.
     pub active_read_roots: usize,
     pub candidate_roots: usize,
     pub nodes_visited: usize,
@@ -231,6 +277,54 @@ fn framed_hash(hash: &mut blake3::Hasher, bytes: &[u8]) {
 }
 
 impl SourceStore {
+    pub(super) fn lease_build_source(
+        &self, selection: BuildSourceSelection, lifetime: Duration,
+    ) -> Result<Option<SourceLease>> {
+        if lifetime.is_zero() { return Err("a Build diagnostic lease must have a positive lifetime".into()); }
+        let root = selection.root;
+        let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
+        let source = source_top(&tx, root)?.ok_or("unsupported Build diagnostic source root")?;
+        let config = read_source_config(&tx, source.children[0])?;
+        let owner = config.namespaces.get(&config.entry.package)
+            .ok_or("Build diagnostic scope is missing its entry namespace")?;
+        if owner.project != selection.project { return Err("Build diagnostic selection has a different workspace".into()); }
+        if config.target != selection.target { return Err("Build diagnostic selection has a different target".into()); }
+        drop(tx);
+        let lease = {
+            let mut reads = self.source_reads.0.lock().expect("source reader registry");
+            let now = Instant::now();
+            let expires = now.checked_add(lifetime).ok_or("Build diagnostic lease expiry is out of range")?;
+            reads.sessions.retain(|_, (_, expires)| *expires > now);
+            if reads.sessions.len() == MAX_BUILD_SESSIONS { return Err("Build diagnostic session quota exceeded".into()); }
+            let id = reads.next_session.checked_add(1).ok_or("Build diagnostic lease IDs exhausted")?;
+            reads.next_session = id;
+            let grant = LeaseGrant { id, root };
+            reads.sessions.insert(id, (root, expires));
+            SourceLease { reads: Arc::clone(&self.source_reads.0), grant, lifetime }
+        };
+        // The ordinary read prevents a gap between validating the identity
+        // and registering the expiring session under the same retention gate.
+        drop(read);
+        Ok(Some(lease))
+    }
+
+    pub(super) fn leased_source_snapshot(&self, grant: LeaseGrant) -> Result<Option<super::SourceView>> {
+        let (tx, read) = {
+            let mut reads = self.source_reads.0.lock().expect("source reader registry");
+            let Some(&(root, expires)) = reads.sessions.get(&grant.id) else { return Ok(None); };
+            if Instant::now() >= expires {
+                reads.sessions.remove(&grant.id);
+                return Ok(None);
+            }
+            if root != grant.root { return Ok(None); }
+            let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+            if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+            *reads.active.entry(root).or_default() += 1;
+            (tx, SourceRead { reads: Arc::clone(&self.source_reads.0), root })
+        };
+        self.snapshot_with_read(grant.root, tx, read)
+    }
+
     pub(super) fn begin_source_read(&self, root: NodeId) -> Result<Option<(Transaction, SourceRead)>> {
         Ok(self.begin_source_reads([root])?.map(|(tx, [read])| (tx, read)))
     }
@@ -244,7 +338,7 @@ impl SourceStore {
             if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
         }
         let admitted = roots.map(|root| {
-            *reads.entry(root).or_default() += 1;
+            *reads.active.entry(root).or_default() += 1;
             SourceRead { reads: Arc::clone(&self.source_reads.0), root }
         });
         Ok(Some((tx, admitted)))
@@ -252,8 +346,8 @@ impl SourceStore {
 
     /// Conservative, direct fixture inspection. All other published roots are
     /// protected by default. The supplied keep list adds fixture read roots;
-    /// real in-process readers are protected automatically. This is not a
-    /// substitute for production leases or a retention policy.
+    /// direct readers and current process-local session leases are protected
+    /// automatically. This confers no sweep or cross-process retention right.
     pub fn plan_source_retention(
         &self, scope: NodeId, nominated: &[NodeId], keep: &[NodeId], limit: usize,
     ) -> Result<SourceRetentionPlan> {
@@ -288,10 +382,17 @@ impl SourceStore {
         // Lease admission and the census cut share one short gate. Reads and
         // filesystem inspection never hold it during graph traversal.
         let (tx, active) = {
-            let reads = self.source_reads.0.lock().expect("source reader registry");
-            if reads.len() > limit { return Err("source retention plan exceeded reader root budget".into()); }
+            let mut reads = self.source_reads.0.lock().expect("source reader registry");
+            if reads.active.len() > limit { return Err("source retention plan exceeded reader root budget".into()); }
             let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-            (tx, reads.keys().copied().collect::<BTreeSet<_>>())
+            let now = Instant::now();
+            reads.sessions.retain(|_, (_, expires)| *expires > now);
+            let mut active: BTreeSet<_> = reads.active.keys().copied().collect();
+            for &(root, _) in reads.sessions.values() {
+                active.insert(root);
+                if active.len() > limit { return Err("source retention plan exceeded reader root budget".into()); }
+            }
+            (tx, active)
         };
         let scope_top = published_source(&tx, scope)?.ok_or("unknown source retention scope")?;
         let owner = pins::workspace_of_config(&tx, scope_top.children[0])?;
@@ -377,5 +478,79 @@ impl SourceStore {
             }
         }
         Ok((report, marks.cas))
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires a disposable store with two acknowledged source roots"]
+    fn expired_session_does_not_release_inflight_owner() {
+        let path = PathBuf::from(std::env::var_os("WOSY_TEST_IMAGE_STORE").unwrap());
+        let old = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_ROOT").unwrap()).unwrap();
+        let current = NodeId::parse_hex(&std::env::var("WOSY_TEST_IMAGE_OTHER_ROOT").unwrap()).unwrap();
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
+            let store = SourceStore::open(&path, 8 << 20).unwrap();
+            let census = || store.plan_source_retention(current, &[old], &[], 20_000).unwrap();
+            assert_eq!(census().candidate_roots, 1);
+
+            let workspace = path.parent().unwrap().join("project").canonicalize().unwrap();
+            let selected = BuildSourceSelection { root: old, project: workspace.to_str().unwrap().into(), target: "app".into() };
+            let open = || store.lease_build_source(selected.clone(), Duration::from_secs(60));
+
+            for (var, reason) in [
+                ("WOSY_TEST_LEASE_OTHER_TARGET", "Build diagnostic selection has a different target"),
+                ("WOSY_TEST_LEASE_OTHER_WORKSPACE", "Build diagnostic selection has a different workspace"),
+            ] {
+                let wrong = NodeId::parse_hex(&std::env::var(var).unwrap()).unwrap();
+                let refusal = store.lease_build_source(BuildSourceSelection { root: wrong, ..selected.clone() },
+                    Duration::from_secs(60)).err().unwrap();
+                assert_eq!(refusal.to_string(), reason);
+            }
+
+            let lease = open().unwrap().unwrap();
+            assert!(lease.renew());
+            assert_eq!((census().candidate_roots, census().active_read_roots), (0, 1));
+            let in_flight = store.leased_source_snapshot(lease.grant()).unwrap().unwrap();
+            // Set only our fixture lease's clock state; this tests expiry at
+            // the real admission boundary without a wall-clock sleep.
+            let grant = lease.grant();
+            {
+                let mut reads = store.source_reads.0.lock().unwrap();
+                reads.sessions.get_mut(&grant.id).unwrap().1 = Instant::now();
+            }
+            assert!(store.leased_source_snapshot(grant).unwrap().is_none());
+            assert!(!lease.renew());
+            drop(lease);
+            assert_eq!((census().candidate_roots, census().active_read_roots), (0, 1));
+            let prepared = store.prepare_configured(in_flight.configured().unwrap(), "dev", None).await.unwrap();
+            let response = prepared.build_analysis().await.unwrap();
+            assert_eq!(response.source_root, old);
+            assert_eq!(census().candidate_roots, 0);
+            drop(prepared);
+            assert_eq!((census().candidate_roots, census().active_read_roots), (1, 0));
+
+            let mut slots = (0..MAX_BUILD_SESSIONS).map(|_| open().unwrap().unwrap()).collect::<Vec<_>>();
+            let quota = || assert_eq!(open().err().unwrap().to_string(), "Build diagnostic session quota exceeded");
+            assert_eq!(census().active_read_roots, 1);
+            quota();
+            drop(slots.pop().unwrap());
+            slots.push(open().unwrap().unwrap());
+            quota();
+            {
+                let mut reads = store.source_reads.0.lock().unwrap();
+                reads.sessions.get_mut(&slots[0].grant().id).unwrap().1 = Instant::now();
+            }
+            let replacement = open().unwrap().unwrap();
+            assert!(!slots[0].renew());
+            quota();
+            drop(replacement);
+            drop(slots);
+            assert_eq!(census().active_read_roots, 0);
+            store.close().await.unwrap();
+        });
     }
 }

@@ -127,20 +127,27 @@ fn report(view: &RootedPreparedProject<'_>, elapsed_ms: f64) -> Result<serde_jso
     }))
 }
 
+pub(super) fn check_ordinary_build(
+    project: &Path, profile: &str, phase: BuildAnalysisPhase, diagnostics: &[wosy_compiler::Diagnostic],
+) -> Result<()> {
+    let (ordinary_phase, ordinary) = match fresh_preparation(project, profile, None)? {
+        Ok(prepared) => (
+            BuildAnalysisPhase::Analyzed, analyze_scalar_build(&prepared).diagnostics().to_vec(),
+        ),
+        Err(rejected) => (
+            BuildAnalysisPhase::PreparationRejected, rejected.into_ordered_diagnostics(),
+        ),
+    };
+    assert_eq!((phase, diagnostics), (ordinary_phase, ordinary.as_slice()));
+    Ok(())
+}
+
 async fn report_build(
     view: &RootedPreparedProject<'_>, preparation_ms: f64, oracle: Option<(&Path, &str)>,
 ) -> Result<serde_json::Value> {
     let analysis = view.build_analysis().await?;
     if let Some((project, profile)) = oracle {
-        let (phase, diagnostics) = match fresh_preparation(project, profile, None)? {
-            Ok(prepared) => (
-                BuildAnalysisPhase::Analyzed, analyze_scalar_build(&prepared).diagnostics().to_vec(),
-            ),
-            Err(rejected) => (
-                BuildAnalysisPhase::PreparationRejected, rejected.into_ordered_diagnostics(),
-            ),
-        };
-        assert_eq!((analysis.phase, &analysis.diagnostics), (phase, &diagnostics));
+        check_ordinary_build(project, profile, analysis.phase, &analysis.diagnostics)?;
     }
     Ok(serde_json::json!({
         "snapshot": analysis.source_root.hex(), "prepared_identity": analysis.preparation.hex(),

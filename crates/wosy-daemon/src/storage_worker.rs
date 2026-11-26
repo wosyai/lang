@@ -1,9 +1,10 @@
 //! Opt-in blocking I/O admission for the rooted source inventory.
 use super::{Result, SourceRetentionInventory, SourceStore};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{runtime::Handle, sync::Semaphore, task::JoinHandle};
+use tokio::{runtime::Handle, sync::{OwnedSemaphorePermit, Semaphore}, task::JoinHandle};
 use wosy_protocol::NodeId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,7 +16,7 @@ pub enum StorageAdmissionError {
 impl std::fmt::Display for StorageAdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Busy => "source inventory worker is at capacity",
+            Self::Busy => "source storage worker is at capacity",
             Self::SelectionOverBudget => "source inventory selection exceeds the worker budget",
         })
     }
@@ -38,9 +39,9 @@ impl RetentionReadJob {
     }
 }
 
-/// Bounds one inventory service's admitted jobs and copied root IDs. Each
-/// job uses the store's root/pin count and distinct-node census limit. Does
-/// not bound bytes read, other work, the global blocking pool, or total RSS.
+/// Admission shared by rooted storage jobs. Inventory reads also bound
+/// copied root IDs and use the store's census limit. Does not bound bytes
+/// read, other work, the global blocking pool, or total RSS.
 pub struct SourceStorageWorker {
     store: Arc<SourceStore>,
     runtime: Handle,
@@ -55,7 +56,7 @@ impl SourceStorageWorker {
         selection_limit: NonZeroUsize, census_limit: NonZeroUsize,
     ) -> Result<Self> {
         if slots.get() > Semaphore::MAX_PERMITS {
-            return Err("source inventory slot count exceeds the worker limit".into());
+            return Err("source storage slot count exceeds the worker limit".into());
         }
         Ok(Self {
             store, runtime, slots: Arc::new(Semaphore::new(slots.get())),
@@ -69,20 +70,46 @@ impl SourceStorageWorker {
         if nominated.len().saturating_add(keep.len()) > self.selection_limit {
             return Err(StorageAdmissionError::SelectionOverBudget);
         }
-        let slot = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| StorageAdmissionError::Busy)?;
-        let store = Arc::clone(&self.store);
+        let slot = self.try_slot()?;
         let nominated = nominated.to_vec();
         let keep = keep.to_vec();
         let limit = self.census_limit;
         let submitted = Instant::now();
-        let job = self.runtime.spawn_blocking(move || {
+        let job = self.spawn_reserved(slot, move |store| {
             let start = Instant::now();
-            let inventory = store.inspect_source_retention(scope, &nominated, &keep, limit);
-            let work = start.elapsed();
-            drop((store, nominated, keep));
-            drop(slot);
-            Ok(RetentionRead { inventory: inventory?, queued: start.duration_since(submitted), work })
+            let inventory = store.inspect_source_retention(scope, &nominated, &keep, limit)?;
+            Ok(RetentionRead { inventory, queued: start.duration_since(submitted), work: start.elapsed() })
         });
         Ok(RetentionReadJob(job))
     }
+
+    pub(super) fn try_slot(&self) -> std::result::Result<OwnedSemaphorePermit, StorageAdmissionError> {
+        Arc::clone(&self.slots).try_acquire_owned().map_err(|_| StorageAdmissionError::Busy)
+    }
+
+    pub(super) fn spawn_reserved<T: Send + 'static>(
+        &self, slot: OwnedSemaphorePermit, job: impl FnOnce(&SourceStore) -> T + Send + 'static,
+    ) -> JoinHandle<T> {
+        let store = Arc::clone(&self.store);
+        self.runtime.spawn_blocking(move || {
+            let result = job(&store);
+            drop(store);
+            drop(slot);
+            result
+        })
+    }
+
+    pub(super) fn spawn_reserved_query<T, F>(
+        &self, slot: OwnedSemaphorePermit, query: impl FnOnce(Arc<SourceStore>, Handle) -> F + Send + 'static,
+    ) -> JoinHandle<T>
+    where T: Send + 'static, F: Future<Output = T> + Send + 'static {
+        let store = Arc::clone(&self.store);
+        let runtime = self.runtime.clone();
+        self.runtime.spawn(async move {
+            let result = query(store, runtime).await;
+            drop(slot);
+            result
+        })
+    }
+
 }

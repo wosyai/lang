@@ -41,6 +41,12 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "leased-build" => {
+            let profile = args.next().ok_or("expected fixture Build profile")?;
+            let oracle = args.next().as_deref() == Some("--oracle");
+            let selected = client.acknowledged_build_source(&target)?.ok_or("fixture must have an acknowledged source")?;
+            super::leased_build::run(project, dir, selected, &profile, oracle).await?
+        }
         "pin-local" => {
             let name = args.next().ok_or("expected local fixture pin name")?;
             local_pin(&client.pin_selected_source(&target, &name)?)

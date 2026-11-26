@@ -198,6 +198,14 @@ impl SqliteSourceState {
         Ok(SourceStage { root, parsed, reused, new_nodes, new_bytes, storage_reads, pending })
     }
 
+    /// Bind only SQLite's acknowledged target selection to this canonical
+    /// workspace. Pending source attempts cannot feed compiler requests.
+    pub fn acknowledged_build_source(&self, target: &str) -> Result<Option<wosy_protocol::BuildSourceSelection>> {
+        let Some(root) = self.selection(target)?.selected else { return Ok(None); };
+        let project = self.project.to_str().ok_or("workspace path is not UTF-8")?;
+        Ok(Some(wosy_protocol::BuildSourceSelection { root, project: project.into(), target: target.into() }))
+    }
+
     /// A complete resubmission for a reopened client and an empty or reopened
     /// daemon cache. This does not read the live workspace or invoke a parser.
     pub fn replay(&self, target: &str, which: ReplaySource) -> Result<Option<SourceReplay>> {

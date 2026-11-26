@@ -1,14 +1,14 @@
 //! Real compiler preparation and separately requested Build analysis.
 use super::{
     base_declarations::Flights, build_receipt::{BuildInputs, Lookup}, read_comments,
-    ProjectDeclarationModule, ProjectDeclarationsView,
-    Result, SourceStore,
+    BuildAnalysisOrigin, BuildAnalysisPhase, ConfiguredSourceView, ProjectDeclarationModule,
+    ProjectDeclarationsView, Result, SourceStore,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use surrealkv::Mode;
-use tokio::sync::OnceCell;
+use tokio::{runtime::Handle, sync::OnceCell};
 use wosy_compiler::{
     analyze_scalar_build, prepare_scalar_project, Diagnostic, PreparedScalarProject,
     ScalarNamespaceBinding, ScalarPreparationInputs, ScalarProjectPreparationRejection,
@@ -43,6 +43,15 @@ enum PreparationOutcome {
     Rejected(ScalarProjectPreparationRejection),
 }
 
+async fn compiler_cpu<T: Send + 'static>(
+    runtime: Option<&Handle>, derive: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    match runtime {
+        Some(runtime) => Ok(runtime.spawn_blocking(derive).await?),
+        None => Ok(derive()),
+    }
+}
+
 struct CanonicalPreparation {
     identity: NodeId,
     target_layout: ScalarTargetLayout,
@@ -63,12 +72,6 @@ pub struct ProjectPreparationReport {
     pub reused_live_preparation: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub enum BuildAnalysisPhase {
-    PreparationRejected,
-    Analyzed,
-}
-
 /// Identity of the diagnostic-only Build query for a canonical preparation.
 /// Not a Check key, a Build result, or authority to use any compiled artifact.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -78,13 +81,6 @@ impl BuildAnalysisKey {
     pub fn digest(self) -> NodeId {
         self.0
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BuildAnalysisOrigin {
-    Derived,
-    Live,
-    Stored,
 }
 
 struct CanonicalBuildAnalysis {
@@ -155,10 +151,14 @@ impl RootedPreparedProject<'_> {
     /// may be reused; neither a Build verdict nor any executable output is
     /// selected. Each caller projects its own authored revision.
     pub async fn build_analysis(&self) -> Result<RootedBuildAnalysis> {
+        self.build_analysis_with(None).await
+    }
+
+    pub(super) async fn build_analysis_with(&self, runtime: Option<&Handle>) -> Result<RootedBuildAnalysis> {
         let start = Instant::now();
         let mut origin = BuildAnalysisOrigin::Live;
         let mut receipt_written = false;
-        let canonical = self.canonical.build_analysis.get_or_init(|| async {
+        let canonical = self.canonical.build_analysis.get_or_try_init(|| async {
             let phase = match self.canonical.outcome {
                 PreparationOutcome::Ready(_) => BuildAnalysisPhase::Analyzed,
                 PreparationOutcome::Rejected(_) => BuildAnalysisPhase::PreparationRejected,
@@ -172,17 +172,18 @@ impl RootedPreparedProject<'_> {
                     .all(|label| self.canonical.owners.contains_key(&label.span.source))
                 {
                     origin = BuildAnalysisOrigin::Stored;
-                    return CanonicalBuildAnalysis { phase, diagnostics };
+                    return Ok(CanonicalBuildAnalysis { phase, diagnostics });
                 }
             }
             origin = BuildAnalysisOrigin::Derived;
-            let diagnostics = match &self.canonical.outcome {
+            let preparation = Arc::clone(&self.canonical);
+            let diagnostics = compiler_cpu(runtime, move || match &preparation.outcome {
                 PreparationOutcome::Ready(prepared) => analyze_scalar_build(prepared).diagnostics().to_vec(),
                 PreparationOutcome::Rejected(rejection) => rejection.ordered_build_diagnostics(),
-            };
+            }).await?;
             receipt_written = self.store.persist_build_receipt(lookup, phase, &diagnostics).await.unwrap_or(false);
-            CanonicalBuildAnalysis { phase, diagnostics }
-        }).await;
+            Ok::<_, super::Error>(CanonicalBuildAnalysis { phase, diagnostics })
+        }).await?;
         let analysis_elapsed = start.elapsed();
         let start = Instant::now();
         let diagnostics = self.project_diagnostics(canonical.diagnostics.clone())?;
@@ -236,9 +237,14 @@ impl SourceStore {
     pub async fn rooted_prepared_project(
         &self, root: NodeId, profile: &str,
     ) -> Result<Option<RootedPreparedProject<'_>>> {
-        let start = Instant::now();
         let Some(snapshot) = self.snapshot(root)? else { return Ok(None); };
-        let snapshot = snapshot.configured()?;
+        self.prepare_configured(snapshot.configured()?, profile, None).await.map(Some)
+    }
+
+    pub(super) async fn prepare_configured(
+        &self, snapshot: ConfiguredSourceView, profile: &str, runtime: Option<&Handle>,
+    ) -> Result<RootedPreparedProject<'_>> {
+        let start = Instant::now();
         let layout = snapshot.config.profiles.get(profile)
             .ok_or("artifact profile is not present in the rooted source configuration")?
             .target_layout()?;
@@ -286,9 +292,10 @@ impl SourceStore {
             }
             report.materialized_bodies = start.elapsed();
             let start = Instant::now();
-            let outcome = match prepare_scalar_project(
-                inputs, owners.clone(), ScalarPreparationInputs { target_layout },
-            ) {
+            let order = owners.clone();
+            let outcome = match compiler_cpu(runtime, move ||
+                prepare_scalar_project(inputs, order, ScalarPreparationInputs { target_layout })
+            ).await? {
                 Ok(prepared) => PreparationOutcome::Ready(prepared),
                 Err(rejected) => PreparationOutcome::Rejected(rejected),
             };
@@ -303,6 +310,6 @@ impl SourceStore {
             self.prepared_projects.remember(identity, &canonical);
             canonical
         };
-        Ok(Some(RootedPreparedProject { store: self, declarations, canonical, report }))
+        Ok(RootedPreparedProject { store: self, declarations, canonical, report })
     }
 }

@@ -206,9 +206,10 @@ impl SourceStore {
                 return Ok(BaseOutput { id, declarations: Some(declarations), disposition });
             }
         }
-        let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(&read, executable)?);
-        let declarations = derive_scalar_declarations_from_cst(&cst);
-        drop(cst);
+        let declarations = {
+            let cst = CanonicalCstRoot::new(detached_identity(executable), read_cst(&read, executable)?);
+            derive_scalar_declarations_from_cst(&cst)
+        };
         drop(read);
         let bytes = serde_json::to_vec(&declarations)?;
         let payload = self.pack_payload(bytes, query.is_some())?;

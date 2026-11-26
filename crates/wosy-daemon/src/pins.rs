@@ -1,7 +1,7 @@
 //! Explicit durable pins for admitted source roots, scoped to their workspace.
-use super::{key, published_source, read_node, source_top, Result, SourceStore, SNAPSHOT_ROOTS};
+use super::{key, published_source, read_source_config, source_top, Result, SourceStore, SNAPSHOT_ROOTS};
 use surrealkv::{Durability, LSMIterator, Mode, Transaction};
-use wosy_protocol::{NodeId, SourceConfig};
+use wosy_protocol::NodeId;
 
 pub(super) const PINS: u8 = 10;
 const OWNER_PREFIX_BYTES: usize = 34;
@@ -12,7 +12,7 @@ pub struct SourcePin {
 }
 
 pub(super) fn workspace_of_config(tx: &Transaction, id: NodeId) -> Result<String> {
-    let mut config: SourceConfig = serde_json::from_slice(&read_node(tx, id)?.data)?;
+    let mut config = read_source_config(tx, id)?;
     // Publication matched the entry's authored project to this namespace.
     Ok(config.namespaces.remove(&config.entry.package)
         .ok_or("pin scope is missing its entry namespace")?.project)

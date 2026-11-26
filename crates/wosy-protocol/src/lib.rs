@@ -4,6 +4,11 @@ use std::collections::BTreeMap;
 use wosy_project::packages::{LockedInputId, PatchStackId};
 use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
+mod build_diagnostics;
+pub use build_diagnostics::{
+    BuildAnalysisOrigin, BuildAnalysisPhase, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSourceSelection, BUILD_DIAGNOSTIC_VERSION,
+};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NodeId(pub [u8; 32]);
 

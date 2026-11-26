@@ -12,10 +12,14 @@ project, store = fixture / "project", fixture / "store"
 record = fixture / "phase-a.json"
 
 
-def invoke(*args):
-    proc = subprocess.run([example, project, store, *args], capture_output=True, text=True, check=True)
+def invoke_at(workspace, *args):
+    proc = subprocess.run([example, workspace, store, *args], capture_output=True, text=True, check=True)
     assert not proc.stderr, proc.stderr
     return json.loads(proc.stdout)
+
+
+def invoke(*args):
+    return invoke_at(project, *args)
 
 
 def image():
@@ -49,7 +53,7 @@ def reused(view, new_modules, new_bodies):
 entry = 'leaf = namespace std "leaf.w";\nsibling = namespace std "sibling.w";\nu32 answer = leaf.value;\n'
 
 
-def initialize():
+def initialize(project=project):
     template = (Path(__file__).parent /
                 "fixtures/build/shared_stdlib_local_dependency/project/wosy.toml").read_text()
     (project / "src").mkdir(parents=True)
@@ -148,5 +152,23 @@ elif phase == "receipt-unit":
     (project / "stdlib/src/leaf.w").write_text(source("u32 value = 31;\n"))
     other = invoke(root)["snapshot"]["source_root"]
     (fixture / "unit-roots.json").write_text(json.dumps({"root": root, "other": other, "entry_body": body}))
+elif phase == "lease-scope":
+    initialize()
+    root = invoke()["snapshot"]["source_root"]
+    body = project_view(root)["modules"][0]["body"]
+    (project / "stdlib/src/leaf.w").write_text(source("u32 value = 31;\n"))
+    other = invoke(root)["snapshot"]["source_root"]
+    manifest = project / "wosy.toml"
+    manifest.write_text(manifest.read_text().replace("targets.app", "targets.alternate")
+                        .replace('default_target = "app"', 'default_target = "alternate"'))
+    other_target = invoke(other)["snapshot"]["source_root"]
+    foreign = fixture / "foreign-project"
+    initialize(foreign)
+    other_workspace = invoke_at(foreign)["snapshot"]["source_root"]
+    assert len({root, other, other_target, other_workspace}) == 4
+    (fixture / "unit-roots.json").write_text(json.dumps({
+        "root": root, "other": other, "entry_body": body,
+        "other_target": other_target, "other_workspace": other_workspace,
+    }))
 else:
     raise AssertionError(phase)

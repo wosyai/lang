@@ -42,6 +42,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 mod base_declarations;
 mod build_receipt;
+mod build_session;
 mod derivation_image;
 mod pins;
 mod project_declarations;
@@ -50,16 +51,18 @@ mod retention_plan;
 mod source_impact;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
+pub use build_session::BuildDiagnosticSession;
 pub use pins::SourcePin;
 pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
 pub use prepared_project::{
-    BuildAnalysisKey, BuildAnalysisOrigin, BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
+    BuildAnalysisKey, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
+pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};
 
 pub struct SourceStore {
     tree: Tree,
@@ -174,6 +177,12 @@ impl SourceStore {
 
     pub fn snapshot(&self, root: NodeId) -> Result<Option<SourceView>> {
         let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
+        self.snapshot_with_read(root, tx, read)
+    }
+
+    fn snapshot_with_read(
+        &self, root: NodeId, tx: Transaction, read: retention_plan::SourceRead,
+    ) -> Result<Option<SourceView>> {
         let Some(top) = source_top(&tx, root)? else { return Ok(None); };
         let index = read_index(&tx, top)?;
         Ok(Some(SourceView {
@@ -708,9 +717,13 @@ fn read_cst(tx: &Transaction, root: NodeId) -> Result<CstNode> {
     Ok(CstNode::new_root(green.finish()))
 }
 
+fn read_source_config(tx: &Transaction, id: NodeId) -> Result<SourceConfig> {
+    Ok(serde_json::from_slice(&read_node(tx, id)?.data)?)
+}
+
 impl SourceView {
     fn source_config(&self) -> Result<SourceConfig> {
-        Ok(serde_json::from_slice(&read_node(&self.tx, self.config)?.data)?)
+        read_source_config(&self.tx, self.config)
     }
 
     fn configured(self) -> Result<ConfiguredSourceView> {
