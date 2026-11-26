@@ -226,7 +226,7 @@ pub(super) async fn run_generation(
     }))
 }
 
-async fn confirm(store: &SourceStore, writer: &SqliteSourceState, target: &str,
+pub(super) async fn confirm(store: &SourceStore, writer: &SqliteSourceState, target: &str,
     attempt: wosy_cli::source_state::SourceAttempt,
 ) -> Result<()> {
     let pending = writer.replay(target, ReplaySource::Pending)?.ok_or("fixture pending source is missing")?;

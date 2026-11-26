@@ -13,6 +13,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 mod diagnostics;
 mod diagnostic_report;
 mod delta;
+mod current_view;
 mod pins;
 mod pin_reconciliation;
 pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
@@ -33,6 +34,29 @@ pub struct SourceSelection {
     pub pending: Option<SourceAttempt>,
     generation: i64,
     selected_generation: Option<i64>,
+}
+
+/// A captured acknowledged generation for one project and target. The root
+/// digest alone cannot distinguish A → B → another acknowledgement of A.
+#[derive(Clone)]
+pub struct AcknowledgedSourceGeneration {
+    selection: wosy_protocol::BuildSourceSelection,
+    generation: i64,
+}
+
+impl AcknowledgedSourceGeneration {
+    pub fn selection(&self) -> &wosy_protocol::BuildSourceSelection { &self.selection }
+
+    pub fn generation(&self) -> i64 { self.generation }
+
+    fn matches(&self, state: SourceSelection) -> bool {
+        state.selected == Some(self.selection.root) && state.selected_generation == Some(self.generation)
+    }
+
+    fn is_current(&self, local: &SqliteSourceState) -> Result<bool> {
+        if local.project.to_str() != Some(self.selection.project.as_str()) { return Ok(false); }
+        Ok(self.matches(local.selection(&self.selection.target)?))
+    }
 }
 
 /// A local upload attempt is distinct from its immutable source root. A
@@ -81,6 +105,15 @@ struct Observation {
 }
 
 impl SqliteSourceState {
+    pub fn capture_acknowledged_source(&self, target: &str) -> Result<Option<AcknowledgedSourceGeneration>> {
+        let state = self.selection(target)?;
+        let Some(root) = state.selected else { return Ok(None) };
+        let generation = state.selected_generation.ok_or("acknowledged source has no generation")?;
+        let project = self.project.to_str().ok_or("workspace path is not UTF-8")?;
+        let selection = wosy_protocol::BuildSourceSelection { root, project: project.into(), target: target.into() };
+        Ok(Some(AcknowledgedSourceGeneration { selection, generation }))
+    }
+
     /// Explicit opt-in, separate from ordinary Parse, Build, Check and Run.
     /// Uses ordinary project-owned files on a local Unix filesystem supporting
     /// SQLite rollback journals. It does not promise power-loss recovery on

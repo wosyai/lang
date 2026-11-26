@@ -41,6 +41,37 @@ pub(super) async fn run(
             })
         }
         "state" => serde_json::json!({}),
+        "current-entry-cst" | "current-entry-cst-restage" => {
+            let encoding: usize = args.next().ok_or("expected fixture JSON byte limit")?.parse()?;
+            let expanded: usize = args.next().ok_or("expected fixture record byte limit")?.parse()?;
+            let authored: usize = args.next().ok_or("expected fixture authored byte limit")?.parse()?;
+            let budget = || wosy_protocol::CstExpansionBudget::new(expanded, 20_000, 128, authored);
+            let captured = client.capture_acknowledged_source(&target)?.ok_or("fixture needs an acknowledged entry")?;
+            let current = if mode.ends_with("-restage") {
+                let alternate = args.next().ok_or("expected a disposable fixture's alternate source")?;
+                let store = SourceStore::open(dir, 8 << 20)?;
+                let entry = wosy_project::ProjectContext::load_parse_target(project, Some(&target))?.source_path();
+                let original = std::fs::read(&entry)?;
+                let mut writer = SqliteSourceState::open(project, limits)?;
+                std::fs::write(&entry, alternate)?;
+                let next = writer.stage(&target)?.pending.ok_or("fixture did not issue the alternate root")?;
+                assert_ne!(next.root(), captured.selection().root);
+                super::framed_reconciliation::confirm(&store, &writer, &target, next).await?;
+                std::fs::write(&entry, original)?;
+                let restaged = writer.stage(&target)?.pending.ok_or("fixture did not reissue the original root")?;
+                assert_eq!(restaged.root(), captured.selection().root);
+                assert!(restaged.generation() > captured.generation());
+                super::framed_reconciliation::confirm(&store, &writer, &target, restaged).await?;
+                assert!(captured.entry_cst_current_json(&mut client, budget(), encoding)?.is_none());
+                store.close().await?;
+                client.capture_acknowledged_source(&target)?.ok_or("fixture lost the new acknowledgement")?
+            } else { captured.clone() };
+            let started = Instant::now();
+            let json = current.entry_cst_current_json(&mut client, budget(), encoding)?
+                .ok_or("fixture's current entry became stale")?;
+            serde_json::json!({ "root": current.selection().root.hex(), "generation": current.generation(),
+                "prior_generation": captured.generation(), "json": String::from_utf8(json)?, "view_ms": milliseconds(started) })
+        }
         "reconcile-acknowledged" | "reconcile-acknowledged-limited" => {
             super::source_reconciliation::run(&mut client, dir, &target, mode.ends_with("-limited")).await?
         }

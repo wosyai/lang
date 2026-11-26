@@ -143,14 +143,14 @@ impl CapturedBuildDiagnostics {
         &self, local: &mut SqliteSourceState, response: BuildDiagnosticResponse<Diagnostic>, mut budget: CstExpansionBudget,
     ) -> Result<Option<RootedDiagnosticReport>> {
         let tx = local.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let state = read_selection(&tx, &self.selected.target)?;
-        if state.selected != Some(self.selected.root) || state.selected_generation != Some(self.generation) {
+        let selected = self.selection();
+        if !self.source.matches(read_selection(&tx, &selected.target)?) {
             return Ok(None);
         }
         let BuildDiagnosticResponse::BuildDiagnostics { diagnostics, profile, .. } = &response;
-        if let Some(usage) = load_usage(&tx, self.selected.root)? { usage.admit(local.limits)?; }
+        if let Some(usage) = load_usage(&tx, selected.root)? { usage.admit(local.limits)?; }
         let mut read = StoredNodes::new(&tx)?;
-        let (config, files) = SqliteSourceState::header_using(&local.project, &self.selected.target, self.selected.root,
+        let (config, files) = SqliteSourceState::header_using(&local.project, &selected.target, selected.root,
             |id| read.charged_record(id, false, |bytes| budget.read(bytes)))?;
         if !config.profiles.contains_key(profile) { return Err("diagnostic profile is not in the selected source".into()); }
         let mut requested = BTreeMap::new();
@@ -241,7 +241,7 @@ mod tests {
         let capture = local.capture_build_diagnostics("app", "dev").unwrap().unwrap();
         {
             let mut records = StoredNodes::new(&local.db).unwrap();
-            let root = capture.selected.root;
+            let root = capture.selection().root;
             let mut limited = CstExpansionBudget::new(0, 1, 1, 0);
             assert!(records.charged_record(root, true, |bytes| limited.read(bytes)).is_err());
             assert!(records.checked.nodes.is_empty());
@@ -255,10 +255,10 @@ mod tests {
         }
         let text = std::fs::read_to_string(project.join("src/main.w")).unwrap();
         let unicode = text.find('☕').unwrap() as u32;
-        let source = SourceIdentity::new(capture.selected.project.clone(), "app".into(), "src/main.w".into(),
+        let source = SourceIdentity::new(capture.selection().project.clone(), "app".into(), "src/main.w".into(),
             NodeId(*blake3::hash(text.as_bytes()).as_bytes()).hex());
         let report = |source: SourceIdentity, range: ByteSpan| BuildDiagnosticResponse::BuildDiagnostics {
-            version: BUILD_DIAGNOSTIC_VERSION, source_root: capture.selected.root,
+            version: BUILD_DIAGNOSTIC_VERSION, source_root: capture.selection().root,
             profile: "dev".into(), preparation: NodeId([12; 32]), receipt: NodeId([13; 32]),
             phase: BuildAnalysisPhase::Analyzed, origin: BuildAnalysisOrigin::Derived,
             diagnostics: vec![Diagnostic {

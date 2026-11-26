@@ -422,16 +422,24 @@ fn parse_diagnostics(result: &ParseResult) -> Vec<Diagnostic> {
 }
 
 pub fn publication(output: &ParseOutput) -> CstPublication {
-    let mut comments_by_span = HashMap::with_capacity(output.result.comments.len());
-    for comment in &output.result.comments {
+    publication_from_cst(&output.result.source, &output.result.root, &output.result.comments, &output.diagnostics)
+}
+
+/// The ordinary tool-facing projection, independent of how the authored
+/// CST and its comment metadata were obtained.
+pub fn publication_from_cst(
+    source: &SourceIdentity, root: &CstNode, comments: &[TypedComment], diagnostics: &[Diagnostic],
+) -> CstPublication {
+    let mut comments_by_span = HashMap::with_capacity(comments.len());
+    for comment in comments {
         comments_by_span.entry(comment.span).or_insert(comment);
     }
     CstPublication {
-        source: output.result.source.clone(),
-        source_revision: output.result.source.revision.clone(),
-        root: project_node(&output.result.root, &comments_by_span, "0"),
-        comments: output.result.comments.clone(),
-        diagnostics: output.diagnostics.clone(),
+        source: source.clone(),
+        source_revision: source.revision.clone(),
+        root: project_node(root, &comments_by_span, "0"),
+        comments: comments.to_vec(),
+        diagnostics: diagnostics.to_vec(),
     }
 }
 
