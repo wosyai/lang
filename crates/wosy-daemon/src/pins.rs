@@ -1,11 +1,12 @@
 //! Explicit durable pins for admitted source roots, scoped to their workspace.
 use super::{
-    key, published_source, read_source_config, source_top, retention_plan::SourceRead,
+    build_session::BuildRequestRejection, key, published_source, read_source_config, source_top,
+    retention_plan::{SourceLease, SourceRead},
     source_proposal::{matches_source_scope, stage_reconciled_closure},
-    source_reconciliation::checked_published_source_header,
+    source_reconciliation::{bounded_source_records, checked_published_source_header, checked_source_header_using},
     BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, SNAPSHOT_ROOTS,
 };
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::{Arc, Weak}};
 use surrealkv::{Durability, LSMIterator, Mode, Transaction};
 use wosy_protocol::{Delta, NodeId, SourceConfig, SourcePinIntent, SourcePinReflection, SourcePinRetention};
 
@@ -15,6 +16,34 @@ const OWNER_PREFIX_BYTES: usize = 34;
 pub struct SourcePin {
     pub name: String,
     pub root: NodeId,
+}
+
+const MAX_LIST_ROWS: usize = 64;
+
+/// An in-process continuation of a workspace's pin names. It holds no
+/// lease or transaction and cannot be used by another opened session.
+#[derive(Clone)]
+pub struct SourcePinPageCursor {
+    lease: Weak<SourceLease>,
+    owner: Arc<Owner>,
+    lower: Vec<u8>,
+}
+
+impl SourcePinPageCursor {
+    pub(super) fn is_for(&self, lease: &Arc<SourceLease>) -> bool {
+        Weak::ptr_eq(&self.lease, &Arc::downgrade(lease))
+    }
+}
+
+/// One read-only MVCC page, not a global/semantic snapshot catalog.
+/// Each page observes its own cut; the scan does not freeze pin updates.
+pub struct SourcePinPage {
+    pub pins: Vec<SourcePin>,
+    /// Includes reflected release tombstones and one key-only lookahead,
+    /// if present. Not a count of internal LSM versions, bytes, or I/O.
+    pub visible_rows_visited: usize,
+    /// Can be Some even when the page returned no live pins.
+    pub continuation: Option<SourcePinPageCursor>,
 }
 
 pub(super) fn workspace_of_config(tx: &Transaction, id: NodeId) -> Result<String> {
@@ -234,14 +263,64 @@ impl SourceStore {
         let mut pins = Vec::new();
         scan.seek_first()?;
         while scan.valid() {
-            let name = std::str::from_utf8(&scan.key().user_key()[OWNER_PREFIX_BYTES..])?.to_owned();
-            if let Some(root) = owner.stored(scan.value()?.as_ref())?.retained_root() {
-                pins.push(SourcePin { name, root });
+            if let Some(pin) = retained_pin(&owner, scan.key().user_key(), scan.value_ref()?.as_ref())? {
+                pins.push(pin);
             }
             scan.next()?;
         }
         Ok(pins)
     }
+
+    pub(super) fn leased_source_pin_page(
+        &self, lease: &Arc<SourceLease>, cursor: Option<SourcePinPageCursor>,
+        page_rows: NonZeroUsize, limits: BaseCstAdmissionLimits,
+    ) -> Result<SourcePinPage> {
+        let grant = lease.grant();
+        let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
+            .ok_or(BuildRequestRejection::Expired)?;
+        let (owner, lower) = match cursor {
+            Some(cursor) => (cursor.owner, Some(cursor.lower)),
+            None => {
+                let (_, config) = checked_source_header_using(grant.root, bounded_source_records(&tx, limits))?;
+                (Arc::new(Owner::new(workspace_of_source_config(&config)?.to_owned())), None)
+            }
+        };
+        let limit = page_rows.get().min(MAX_LIST_ROWS);
+        let upper = owner.upper_bound();
+        let mut scan = tx.range(lower.as_deref().unwrap_or(&owner.prefix), upper.as_slice())?;
+        let mut pins = Vec::new();
+        let mut consumed = 0;
+        let mut continuation = None;
+        scan.seek_first()?;
+        while scan.valid() && consumed < limit {
+            let key = scan.key();
+            if let Some(pin) = retained_pin(&owner, key.user_key(), scan.value_ref()?.as_ref())? {
+                pins.push(pin);
+            }
+            consumed += 1;
+            let next = (consumed == limit).then(|| {
+                let mut lower = key.user_key().to_vec();
+                // Least bytewise key strictly above this name, including
+                // legitimate longer names with this key as their prefix.
+                lower.push(0);
+                lower
+            });
+            scan.next()?;
+            if let Some(lower) = next.filter(|_| scan.valid()) {
+                continuation = Some(SourcePinPageCursor {
+                    lease: Arc::downgrade(lease), owner: Arc::clone(&owner), lower,
+                });
+            }
+        }
+        let visible_rows_visited = consumed + usize::from(continuation.is_some());
+        lease.finish_current(|| SourcePinPage { pins, visible_rows_visited, continuation })
+            .ok_or_else(|| BuildRequestRejection::Expired.into())
+    }
+}
+
+fn retained_pin(owner: &Owner, key: &[u8], value: &[u8]) -> Result<Option<SourcePin>> {
+    let name = std::str::from_utf8(&key[OWNER_PREFIX_BYTES..])?;
+    Ok(owner.stored(value)?.retained_root().map(|root| SourcePin { name: name.to_owned(), root }))
 }
 
 enum Plan {

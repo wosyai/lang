@@ -75,7 +75,7 @@ pub use build_session::{BuildDiagnosticSession, BuildSourceOpening};
 pub use framed_session::BuildSessionEnd;
 pub use installed_git_scope::InstalledGitScopeRejection;
 pub use wosy_protocol::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};
-pub use pins::SourcePin;
+pub use pins::{SourcePin, SourcePinPage, SourcePinPageCursor};
 pub use project_declarations::{
     PreparedBaseModule, ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport,
     ProjectDeclarationsView,

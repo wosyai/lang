@@ -8,9 +8,10 @@ use super::{
     RootedForwardedPairStartupComptimeProjection, SourceStore,
     RootedLlvmIdentity,
     RootedLlvmProjection, RootedPreparedProject,
-    SavedBuildDiagnostic, SavedBuildDiagnosticView, SourceReconciliation, SourceStorageWorker,
+    SavedBuildDiagnostic, SavedBuildDiagnosticView, SourcePinPage, SourcePinPageCursor, SourceReconciliation,
+    SourceStorageWorker,
 };
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 use std::time::{Duration, Instant};
 use wosy_compiler::{derive_direct_pair_startup_comptime_plan, derive_direct_startup_comptime_plan, Diagnostic};
 use wosy_project::packages::InstalledGitBase;
@@ -136,6 +137,22 @@ impl BuildDiagnosticSession<'_> {
 
     /// Drop the client session; already started reads retain their own roots.
     pub fn release(self) {}
+
+    /// Page through committed base-source pins of this leased workspace.
+    /// No socket request, CLI routing or new retention authority.
+    pub async fn source_pin_page(
+        &self, cursor: Option<SourcePinPageCursor>, page_rows: NonZeroUsize,
+        limits: BaseCstAdmissionLimits,
+    ) -> Result<SourcePinPage> {
+        if cursor.as_ref().is_some_and(|cursor| !cursor.is_for(&self.lease)) {
+            return Err("source pin cursor belongs to another opened session".into());
+        }
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        self.worker.spawn_reserved(slot, move |store| {
+            store.leased_source_pin_page(&lease, cursor, page_rows, limits)
+        }).await?
+    }
 
     pub(super) async fn project_base_declarations(
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
