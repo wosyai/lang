@@ -16,7 +16,7 @@ Installs the locked Git revisions with the project's patches. Keeps the lock and
 
 ## `wosy dep snapshot`
 
-Saves edits to a Git dependency as project patches. Keeps the checkout and lock unchanged. Sync a changed patch stack before taking another snapshot.
+From the consuming project, run `wosy dep sync` to install the locked Git dependencies. Edit the source in `deps/<package>/`, then run `wosy dep snapshot`. Commit the generated files under `patches/`; do not write or name them by hand. The snapshot keeps the checkout and lock unchanged. If the patch stack changes separately, run `wosy dep sync` before taking another snapshot.
 
 ## `wosy dep update`
 

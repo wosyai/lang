@@ -83,7 +83,7 @@ A path-only dependency inside a Git package selects a sibling in the same reposi
 
 ## Dependency patches
 
-Store patches in `patches/<package>/<uuid-v7>.patch`. Wosy applies them in UUID order. Patches are Git binary diffs and do not change the original source hash.
+Create patches with [`wosy dep snapshot`](cli.md#wosy-dep-snapshot).
 
 ## `wosy.meta.json`
 
