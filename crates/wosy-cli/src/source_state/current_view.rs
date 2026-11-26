@@ -2,12 +2,12 @@
 use super::{
     checked_file_key, load_usage, pins::read_retained_pin, read_selection,
     AcknowledgedSourceGeneration, ClientSourceLimits, LocalSourcePin, Result,
-    SqliteSourceState, StoredNodes,
+    SourceHeaderRead, SqliteSourceState, StoredNodes,
 };
 use rowan::GreenNodeBuilder;
 use rusqlite::{Connection, TransactionBehavior};
 use std::{io::{self, Write}, path::Path};
-use wosy_protocol::{walk_cst, CstEvent, CstExpansionBudget, FileEntry, Kind, NodeId};
+use wosy_protocol::{walk_cst, CstEvent, CstExpansionBudget, CstKindEncoding, FileEntry, Kind, NodeId};
 use wosy_syntax::{typed_comment_from_token, CstNode, SourceIdentity, SyntaxKind, TypedComment};
 
 /// A local named pin and its authored entry view. Neither the bytes nor the
@@ -32,7 +32,8 @@ impl SqliteSourceState {
     ) -> Result<Option<PinnedEntryCst>> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let Some(pin) = read_retained_pin(&tx, name)? else { return Ok(None); };
-        let entry = load_entry(&tx, &self.project, &pin.target, pin.root, self.limits, budget, json_bytes)?;
+        let entry = load_entry(&tx, &self.project, &pin.target, pin.root,
+            SourceHeaderRead::PinnedEntry, self.limits, budget, json_bytes)?;
         tx.commit()?;
         let json = entry.encode(json_bytes)?;
         Ok((read_retained_pin(&self.db, name)?.as_ref() == Some(&pin)).then_some(PinnedEntryCst { pin, json }))
@@ -52,7 +53,8 @@ impl AcknowledgedSourceGeneration {
         if local.project.to_str() != Some(selected.project.as_str()) { return Ok(None); }
         let tx = local.db.transaction_with_behavior(TransactionBehavior::Deferred)?;
         if !self.matches(read_selection(&tx, &selected.target)?) { return Ok(None); }
-        let entry = load_entry(&tx, &local.project, &selected.target, selected.root, local.limits, budget, json_bytes)?;
+        let entry = load_entry(&tx, &local.project, &selected.target, selected.root,
+            SourceHeaderRead::Active, local.limits, budget, json_bytes)?;
         tx.commit()?;
         let bytes = entry.encode(json_bytes)?;
         Ok(self.is_current(local)?.then_some(bytes))
@@ -76,12 +78,12 @@ impl AuthoredEntry {
 }
 
 fn load_entry(
-    sql: &Connection, project: &Path, target: &str, root: NodeId, limits: ClientSourceLimits,
+    sql: &Connection, project: &Path, target: &str, root: NodeId, purpose: SourceHeaderRead, limits: ClientSourceLimits,
     mut budget: CstExpansionBudget, json_bytes: usize,
 ) -> Result<AuthoredEntry> {
     if let Some(usage) = load_usage(sql, root)? { usage.admit(limits)?; }
     let mut read = StoredNodes::new(sql)?;
-    let (config, files) = SqliteSourceState::header_using(project, target, root,
+    let (config, files, kind_encoding) = SqliteSourceState::read_source_header(project, target, root, purpose,
         |id| read.charged_record(id, false, |bytes| budget.read(bytes)))?;
     if files.len() > limits.nodes { return Err("CST view file index exceeds the node budget".into()); }
     let policy = config.parser.id();
@@ -100,13 +102,14 @@ fn load_entry(
     let display_source = SourceIdentity::new(
         entry.metadata.source.project.clone(), config.entry.package, path.replace('\\', "/"), entry.metadata.revision.hex(),
     );
-    let (tree, comments) = read_authored_entry(&mut read, &mut budget, &entry, &config.parser.categories, json_bytes)?;
+    let (tree, comments) = read_authored_entry(&mut read, &mut budget, &entry,
+        &config.parser.categories, kind_encoding, json_bytes)?;
     Ok(AuthoredEntry { display_source, tree, comments })
 }
 
 fn read_authored_entry(
     read: &mut StoredNodes<'_>, budget: &mut CstExpansionBudget, entry: &FileEntry,
-    configured: &[String], mut text_budget: usize,
+    configured: &[String], kind_encoding: CstKindEncoding, mut text_budget: usize,
 ) -> Result<(CstNode, Vec<TypedComment>)> {
     let declared_bytes = entry.metadata.bytes as usize;
     budget.file(declared_bytes)?;
@@ -125,7 +128,7 @@ fn read_authored_entry(
     }, |(_, budget), event| {
         match event {
             CstEvent::Start { kind, depth, children } => {
-                if (depth == 1 && kind != SyntaxKind::Root) || kind == SyntaxKind::Error {
+                if !kind_encoding.allows(kind) || (depth == 1 && kind != SyntaxKind::Root) || kind == SyntaxKind::Error {
                     return Err("selected CST entry is not an admitted authored tree".into());
                 }
                 budget.children(depth, children)?;
@@ -133,6 +136,9 @@ fn read_authored_entry(
                 green.start_node(rowan::SyntaxKind(kind as u16));
             }
             CstEvent::Token { kind, text } => {
+                if !kind_encoding.allows(kind) {
+                    return Err("selected CST token kind is outside its authored schema".into());
+                }
                 if text.len() > declared_bytes - offset {
                     return Err("selected CST entry exceeds its authored extent".into());
                 }

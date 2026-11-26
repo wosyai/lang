@@ -6,7 +6,10 @@ use crate::source_recovery::{
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior};
 use std::path::{Path, PathBuf};
-use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig};
+use wosy_protocol::{
+    pinned_source_preparation_parts, source_preparation_parts, CstKindEncoding,
+    Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -30,6 +33,11 @@ pub struct SqliteSourceState {
     project: PathBuf,
     db: Connection,
     limits: ClientSourceLimits,
+}
+
+enum SourceHeaderRead {
+    Active,
+    PinnedEntry,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -351,21 +359,31 @@ impl SqliteSourceState {
     }
 
     fn header_using(
-        project: &Path, target: &str, root: NodeId, mut record: impl FnMut(NodeId) -> Result<Node>,
+        project: &Path, target: &str, root: NodeId, record: impl FnMut(NodeId) -> Result<Node>,
     ) -> Result<(SourceConfig, Vec<NodeId>)> {
+        let (config, files, _) = Self::read_source_header(project, target, root, SourceHeaderRead::Active, record)?;
+        Ok((config, files))
+    }
+
+    fn read_source_header(
+        project: &Path, target: &str, root: NodeId, purpose: SourceHeaderRead, mut record: impl FnMut(NodeId) -> Result<Node>,
+    ) -> Result<(SourceConfig, Vec<NodeId>, CstKindEncoding)> {
         let top = record(root)?;
-        let parts = source_preparation_parts(&top).ok_or("unsupported persisted source schema")?;
+        let parts = match purpose {
+            SourceHeaderRead::Active => source_preparation_parts(&top),
+            SourceHeaderRead::PinnedEntry => pinned_source_preparation_parts(&top),
+        }.ok_or("unsupported persisted source schema")?;
         let config = record(parts.config)?;
         if config.kind != Kind::Config { return Err("expected persisted source configuration".into()); }
         let config: SourceConfig = serde_json::from_slice(&config.data)?;
-        if config.target != target || !parts.envelope.matches_config(&config)
+        if config.target != target || !parts.matches_config(&config)
             || config.namespaces.get(&config.entry.package).is_none_or(|ns| {
                 ns.git.is_some() || Path::new(&ns.project) != project
             })
         {
             return Err("persisted source does not match this project, target, or parser".into());
         }
-        Ok((config, parts.files.to_vec()))
+        Ok((config, parts.files.to_vec(), parts.kind_encoding()))
     }
 
     fn observe_again(&self, target: &str, root: NodeId) -> Result<Observation> {
