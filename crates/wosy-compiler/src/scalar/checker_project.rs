@@ -4421,13 +4421,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let passive_caller = collection.map(|(source, _)| source);
         #[cfg(feature = "internal-checker")]
-        let capped_named_initializer = startup_named;
+        // Both enrolled scalar proof roles have already checked the
+        // exact caller site and completed provider above. The ordinary
+        // namespace predicate below deliberately excludes recursive bodies.
+        let capped_scalar_proof_initializer = startup_named || startup_ranked;
         #[cfg(not(feature = "internal-checker"))]
-        let capped_named_initializer = false;
+        let capped_scalar_proof_initializer = false;
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
                 && (matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
-                    || (!enrolled_direct_proof && !capped_named_initializer
+                    || (!enrolled_direct_proof && !capped_scalar_proof_initializer
                         && !self.completed_namespace_call(caller_source, owner, target_module, body, signature, expected, collection.visits)))
             {
                 return Err(ProjectCheck::Unsupported);
