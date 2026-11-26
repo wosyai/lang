@@ -256,6 +256,11 @@ impl StartUpSearch {
     pub(super) fn current_path(&self) -> &[PathStep] { &self.prefix }
 
     #[cfg(test)]
+    pub(super) fn selected_steps(&self) -> impl ExactSizeIterator<Item = &[PathStep]> {
+        self.selected.iter().map(|path| path.steps.as_slice())
+    }
+
+    #[cfg(test)]
     pub(super) fn call_paths(&self) -> Vec<Vec<SourceSpan>> {
         self.selected.iter().map(|path| path.steps.iter().filter_map(|step| match step {
             PathStep::Call(site) => Some(site.clone()),

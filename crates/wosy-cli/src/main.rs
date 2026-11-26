@@ -3257,7 +3257,70 @@ main_artifact = "main"
                         if candidate_refused {
                             assert!(observed.1.is_empty() && observed.3.is_empty(), "unsupported result must be atomic");
                         }
-                        let label = if incumbent_refused && candidate_refused {
+                        // Two known terminal differences have stronger oracles than byte parity.
+                        // The compiler tests independently authenticate the original branch/return
+                        // histories; here bind the same source, ordered witnesses and publication
+                        // outcomes through the actual configured owner.
+                        let structural_contract = match (*name, scope) {
+                            ("nested-binary-unit" | "affine-snapshot-symbolic", ScalarCheckerScope::MainFlowOnly) => {
+                                assert_eq!(baseline, (Ok(0), Vec::new(), Vec::new(), BTreeMap::new()));
+                                assert_eq!(observed, baseline, "a dormant callable cannot leak into main flow");
+                                None
+                            }
+                            ("nested-binary-unit", ScalarCheckerScope::CurrentPackage) => {
+                                let [old] = incumbent[0].outcome.as_ref().unwrap().directives.as_slice()
+                                    else { panic!("incumbent merges the two histories"); };
+                                let records = &candidate[0].outcome.as_ref().unwrap().directives;
+                                assert_eq!(records.len(), if cap == 1 { 1 } else { 2 });
+                                assert_eq!(baseline, (Ok(7), b"after".to_vec(), Vec::new(), BTreeMap::new()));
+                                assert_eq!(observed, (Ok(7), b"after".repeat(records.len()), Vec::new(), BTreeMap::new()));
+                                for (row, (lo, hi)) in records.iter().zip([(0, 127), (128, 255)]) {
+                                    assert_eq!((&row.source, row.directive, row.condition), (&old.source, old.directive, old.condition));
+                                    assert_eq!(&program[row.condition.start as usize..row.condition.end as usize], "b != 3");
+                                    assert_eq!(row.witness.row_count(), 1);
+                                    assert!(row.witness.intervals_at(0, 0).unwrap().eq([(&lo.into(), &hi.into())]));
+                                    assert!(row.witness.intervals_at(0, 1).unwrap().eq([(&3.into(), &3.into())]));
+                                }
+                                (cap != 1).then_some("verified-distinct-second-history")
+                            }
+                            ("affine-snapshot-symbolic", ScalarCheckerScope::CurrentPackage) => {
+                                let path = Path::new(".wosy/outputs/check/state.json");
+                                let [old] = incumbent[0].outcome.as_ref().unwrap().directives.as_slice()
+                                    else { panic!("incumbent merges the two affine selections"); };
+                                let records = &candidate[0].outcome.as_ref().unwrap().directives;
+                                assert_eq!(records.len(), if cap == 1 { 1 } else { 2 });
+                                assert_eq!((&baseline.0, baseline.1.as_slice(), baseline.2.as_slice()),
+                                    (&Ok(59), b"".as_slice(), b"construction".as_slice()));
+                                assert_eq!(baseline.3.len(), 1);
+                                let first_file = records[0].files()[0].text.to_vec();
+                                assert_ne!(baseline.3[path], first_file);
+                                for (row, value) in records.iter().zip([1, 3]) {
+                                    assert_eq!((&row.source, row.directive, row.condition), (&old.source, old.directive, old.condition));
+                                    assert_eq!(&program[row.condition.start as usize..row.condition.end as usize], "value != 7");
+                                    assert_eq!(row.witness.axes().len(), 1);
+                                    let [file] = row.files() else { panic!("one file in this history"); };
+                                    assert_eq!(file.path.as_ref(), "state.json");
+                                    let snapshot: serde_json::Value = serde_json::from_slice(&file.text).unwrap();
+                                    assert_eq!(snapshot["value"]["plain"]["value"], value);
+                                    assert_eq!(snapshot["value"]["raised"]["value"], value + 2);
+                                    assert_eq!(snapshot["value"]["reflected"]["value"], 7 - value);
+                                }
+                                if cap == 1 {
+                                    assert_eq!(observed, (Ok(59), Vec::new(), b"construction".to_vec(),
+                                        BTreeMap::from([(path.to_owned(), first_file)])));
+                                    Some("verified-first-affine-history")
+                                } else {
+                                    assert_eq!(observed, (Err("check: result requires unsupported output; no result published".to_owned()),
+                                        Vec::new(), Vec::new(), BTreeMap::new()));
+                                    assert!(!root.join(".wosy/outputs/check").exists());
+                                    Some("verified-distinct-affine-duplicate-refusal")
+                                }
+                            }
+                            _ => None,
+                        };
+                        let label = if let Some(contract) = structural_contract {
+                            contract
+                        } else if incumbent_refused && candidate_refused {
                             "both-refused"
                         } else if incumbent_refused {
                             "incumbent-refused-candidate-open"

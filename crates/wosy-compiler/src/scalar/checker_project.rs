@@ -19000,9 +19000,16 @@ mod tests {
             let (records, end, trace, _) = prepare().search_startup_authored_path(NonZeroUsize::new(64).unwrap()).unwrap();
             assert_eq!(end, StartupAuthoredCompletion::Exhausted);
             assert_eq!(records.len(), 2);
-            assert!(trace.contains_branch(branch.clone(), true) && trace.contains_branch(branch.clone(), false));
-            assert!(trace.contains_return(&call));
-            assert_eq!(trace.call_paths(), [vec![call.clone()], vec![call.clone()]]);
+            for (path, accepted) in trace.selected_steps().zip([true, false]) {
+                use failure_search::PathStep;
+                let ordered = path.iter().filter(|step| matches!(step,
+                    PathStep::Call(_) | PathStep::Branch { .. } | PathStep::Return(_))).cloned().collect::<Vec<_>>();
+                assert_eq!(ordered, [
+                    PathStep::Call(call.clone()),
+                    PathStep::Branch { condition: branch.clone(), accepted },
+                    PathStep::Return(call.clone()),
+                ]);
+            }
             let legacy_contains = |axis, value: &BigInt| (0..legacy.witness.row_count()).any(|row|
                 legacy.witness.intervals_at(row, axis).is_some_and(|mut domain| domain.any(|(lo, hi)| lo <= value && value <= hi)));
             for (record, (lo, hi)) in records.iter().zip([(0,127),(128,255)]) {
@@ -20162,9 +20169,19 @@ mod tests {
                     assert_eq!(record.files()[0].text.as_ref(), file.as_bytes());
                     assert_eq!(record.witness.axes().len(), 1, "do not expose synthetic capture axes");
                 }
-                assert!(trace.contains_branch(at(lhs), true));
-                assert_eq!(trace.contains_branch(at(lhs), false), cap >= 2);
-                assert_eq!(trace.contains_branch(at(rhs), true), cap >= 2);
+                assert_eq!(trace.selected_steps().len(), records.len());
+                let after = at(text.find("value == 1) {").unwrap());
+                for (path, first) in trace.selected_steps().zip([true, false]) {
+                    use failure_search::PathStep;
+                    let conditions = path.iter().filter_map(|step| match step {
+                        PathStep::Branch { condition, accepted } if [at(lhs), at(rhs), after.clone()].contains(condition)
+                            => Some((condition.clone(), *accepted)),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    let expected = if first { vec![(at(lhs), true), (after.clone(), true)] }
+                        else { vec![(at(lhs), false), (at(rhs), true), (after.clone(), false)] };
+                    assert_eq!(conditions, expected);
+                }
             }
         }
     }
