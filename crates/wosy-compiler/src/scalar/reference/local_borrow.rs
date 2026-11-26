@@ -212,7 +212,9 @@ impl Author {
                         || (aggregate_parent_type(inner) && self.pending_loan.is_some_and(|pending|
                             matches!(points.get(pending.issued.0).map(|point| &point.kind),
                                 Some(CfgPointKind::Borrow { place, loan }) if loan.parent.is_none()
-                                    && place.projections.is_empty() && types.get(&place.binding) == Some(inner.as_ref()))))),
+                                    && place.projections.is_empty()
+                                    && types.get(&place.binding).is_some_and(|root| aggregate_parent_type(root)
+                                        && scalar_type_equal(root, inner.as_ref())))))),
                 Some(ty) => {
                     let aggregate = matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
                         && self.last_literal_aggregate.is_some_and(|value| value.0.checked_add(1) == Some(id.0));
