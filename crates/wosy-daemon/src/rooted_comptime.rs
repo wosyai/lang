@@ -348,7 +348,7 @@ impl SourceStore {
             CstKindEncoding::Current, Some(&mut work), |id, work| {
                 read_verified_node_with(tx, id, |bytes| work.expect("bounded authored expansion").read(bytes))
             })?;
-        let Some(fresh) = verified_authored_parse(file, &config.parser.categories, &checked)? else {
+        let Some((fresh, _)) = verified_authored_parse(file, &config.parser.categories, &checked)? else {
             return Ok(Err(Refusal::AuthoredGrammarNotVerified));
         };
         Ok(Ok(VerifiedComptimeSource {

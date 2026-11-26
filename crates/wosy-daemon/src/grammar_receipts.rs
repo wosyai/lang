@@ -1,5 +1,5 @@
 //! Process-local evidence for the canonical authored grammar check only.
-use std::{collections::{HashSet, VecDeque}, sync::{Mutex, MutexGuard}};
+use std::{collections::{HashMap, VecDeque}, sync::{Mutex, MutexGuard}};
 use wosy_protocol::{FileEntry, NodeId};
 
 const RECEIPTS: usize = 2048;
@@ -19,14 +19,15 @@ impl GrammarKey {
 }
 
 #[derive(Default)]
-pub(super) struct VerifiedGrammarBatch(Vec<GrammarKey>);
+pub(super) struct VerifiedGrammarBatch(Vec<(GrammarKey, bool)>);
 
 impl VerifiedGrammarBatch {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
-    /// Only after the real canonical grammar check accepted this file.
-    pub fn verified(&mut self, file: &FileEntry) {
-        if self.0.len() < RECEIPTS { self.0.push(GrammarKey::for_file(file)); }
+    /// Only after the real canonical grammar check accepted this file
+    /// and observed its authored syntax in the same equality walk.
+    pub fn verified(&mut self, file: &FileEntry, authored_comptime: bool) {
+        if self.0.len() < RECEIPTS { self.0.push((GrammarKey::for_file(file), authored_comptime)); }
     }
 }
 
@@ -37,25 +38,30 @@ pub(super) struct GrammarReceiptAdmission<'a>(MutexGuard<'a, Receipts>);
 
 #[derive(Default)]
 struct Receipts {
-    keys: HashSet<GrammarKey>,
+    keys: HashMap<GrammarKey, bool>,
     fifo: VecDeque<GrammarKey>,
 }
 
 impl Receipts {
-    fn remember(&mut self, key: GrammarKey) {
-        if self.keys.contains(&key) { return; }
+    fn remember(&mut self, key: GrammarKey, authored_comptime: bool) {
+        if self.keys.contains_key(&key) { return; }
         if self.keys.len() == RECEIPTS {
             let oldest = self.fifo.pop_front().expect("full receipt queue");
             self.keys.remove(&oldest);
         }
-        self.keys.insert(key);
+        self.keys.insert(key, authored_comptime);
         self.fifo.push_back(key);
     }
 }
 
 impl GrammarReceipts {
     pub fn contains(&self, file: &FileEntry) -> bool {
-        self.0.lock().expect("grammar receipt memo").keys.contains(&GrammarKey::for_file(file))
+        self.authored_comptime(file).is_some()
+    }
+
+    // None is missing authority, never evidence of an empty source.
+    pub fn authored_comptime(&self, file: &FileEntry) -> Option<bool> {
+        self.0.lock().expect("grammar receipt memo").keys.get(&GrammarKey::for_file(file)).copied()
     }
 
     /// One open SourceStore and running parser implementation. Nothing is
@@ -72,7 +78,7 @@ impl GrammarReceipts {
 
 impl GrammarReceiptAdmission<'_> {
     pub fn accept(&mut self, batch: VerifiedGrammarBatch) {
-        for key in batch.0 { self.0.remember(key); }
+        for (key, authored_comptime) in batch.0 { self.0.remember(key, authored_comptime); }
     }
 }
 
@@ -90,17 +96,18 @@ mod tests {
     fn bounded_fifo_keeps_grammar_policy_exact() {
         let mut receipts = Receipts::default();
         for file in 0..RECEIPTS {
-            receipts.remember(key(file, 1));
+            receipts.remember(key(file, 1), file % 2 == 0);
         }
         assert_eq!(receipts.keys.len(), RECEIPTS);
         assert_eq!(receipts.fifo.len(), RECEIPTS);
-        assert!(!receipts.keys.contains(&key(0, 2)));
-        receipts.remember(key(0, 1));
-        receipts.remember(key(0, 2));
+        assert!(!receipts.keys.contains_key(&key(0, 2)));
+        receipts.remember(key(0, 1), true);
+        receipts.remember(key(0, 2), false);
         assert_eq!(receipts.keys.len(), RECEIPTS);
         assert_eq!(receipts.fifo.len(), RECEIPTS);
-        assert!(!receipts.keys.contains(&key(0, 1)));
-        assert!(receipts.keys.contains(&key(0, 2)));
-        assert!(receipts.keys.contains(&key(1, 1)));
+        assert!(!receipts.keys.contains_key(&key(0, 1)));
+        assert_eq!(receipts.keys.get(&key(0, 2)), Some(&false));
+        assert_eq!(receipts.keys.get(&key(1, 1)), Some(&false));
+        assert_eq!(receipts.keys.get(&key(2, 1)), Some(&true));
     }
 }

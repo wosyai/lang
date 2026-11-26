@@ -92,7 +92,7 @@ pub use rooted_comptime::{
 pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
-pub use source_proposal::{BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
+pub use source_proposal::{AuthoredComptimeCoverage, BaseCstAdmission, BaseCstAdmissionLimits, PreparedBaseIdentity, PreparedBaseDeclarations};
 pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};

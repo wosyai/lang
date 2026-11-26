@@ -7,7 +7,7 @@ use super::{
     CheckedFile, Expected, FileTree, Index, PreparedBaseModule, PublishReport, Result,
     SourceStorageWorker, SourceStore, INTERN, NODES, SNAPSHOT_ROOTS,
 };
-use super::grammar_receipts::VerifiedGrammarBatch;
+use super::grammar_receipts::{GrammarReceipts, VerifiedGrammarBatch};
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use wosy_protocol::{
     CstExpansionBudget, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, SourceDeltaCommit,
     SourceDeltaPublication, BASE_CST_DELTA_VERSION,
 };
-use wosy_syntax::CstNode;
+use wosy_syntax::{CstNode, SyntaxKind};
 
 /// Logical bounds for the selected closure plus the proposal, and for actual
 /// unfolded occurrences and text inspected in changed files. Not an RSS or
@@ -52,6 +52,26 @@ impl PreparedBaseIdentity {
     pub fn digest(self) -> NodeId { self.0 }
 }
 
+/// Authored syntax in the exact selected BASE closure. Present proves
+/// one occurrence, not full verification or specialized reachability.
+/// Unverified is never an empty fragment set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthoredComptimeCoverage {
+    Absent,
+    Present,
+    Unverified,
+}
+
+impl AuthoredComptimeCoverage {
+    fn observe(&mut self, authored_comptime: Option<bool>) {
+        match authored_comptime {
+            Some(true) => *self = Self::Present,
+            None if *self != Self::Present => *self = Self::Unverified,
+            _ => {}
+        }
+    }
+}
+
 /// An immutable, ordinary base declaration projection of a proposal. Holding
 /// it retains its actual predecessor, but does not occupy a worker permit.
 /// It is not a protocol Prepared response, fragment IR, or a typed program.
@@ -59,6 +79,7 @@ pub struct PreparedBaseDeclarations {
     identity: PreparedBaseIdentity,
     admission: BaseCstAdmission,
     declarations: UnpublishedDeclarations,
+    authored_comptime: AuthoredComptimeCoverage,
     lease: Arc<SourceLease>,
     _read: SourceRead,
     _allocation: PreparedAllocation,
@@ -76,6 +97,12 @@ impl PreparedBaseDeclarations {
     /// Canonical serialized bodies once per executable, not total RSS.
     pub fn declaration_bytes(&self) -> usize { self.declarations.declaration_bytes }
 
+    /// Coverage is bound to this exact prepared proposal and live source
+    /// lease. No semantic result, publication, or runner is implied.
+    pub fn authored_comptime_coverage(&self) -> Option<AuthoredComptimeCoverage> {
+        self.lease.finish_current(|| self.authored_comptime)
+    }
+
     pub fn lease_is_live(&self) -> bool {
         self.lease.deadline().is_some_and(|deadline| Instant::now() < deadline)
     }
@@ -87,6 +114,7 @@ struct ValidatedProposal {
     index: Index,
     work: CstWork,
     grammar: VerifiedGrammarBatch,
+    authored_comptime: AuthoredComptimeCoverage,
 }
 
 fn prepared_identity(
@@ -141,7 +169,7 @@ impl SourceStorageWorker {
                         false
                     };
                     let mut report = PublishReport::default();
-                    let validated = validate(&mut tx, &binding, &proposal, limits, Some(&mut report))?;
+                    let validated = validate(&mut tx, &binding, &proposal, limits, Some(&mut report), None)?;
                     if !already_present { tx.set(&marker, &proposal.root.0)?; }
                     Ok((tx, read, SourceDeltaCommit {
                         binding: binding.as_ref().clone(), validated_files: validated.admission.validated_files,
@@ -171,7 +199,7 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<BaseCstAdmission> {
-        let (admission, _, _) = self.with_cst_admission(binding, proposal, limits, AdmissionLease::Open(lifetime), |_, _, valid| {
+        let (admission, _, _) = self.with_cst_admission(binding, proposal, limits, AdmissionLease::Open(lifetime), false, |_, _, valid| {
             Ok(valid.admission)
         }).await?;
         Ok(admission)
@@ -190,27 +218,27 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
     ) -> Result<PreparedBaseDeclarations> {
-        let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease,
+        let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease, true,
             move |store, tx, valid| {
-                let ValidatedProposal { admission, entry, index, mut work, .. } = valid;
+                let ValidatedProposal { admission, entry, index, mut work, authored_comptime, .. } = valid;
                 let mut allocation = store.source_reads.reserve_preparation()?;
                 let declarations = store.prepare_unpublished_declarations(tx, &entry, index, &mut work,
                     declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
                 allocation.charge(declarations.declaration_bytes)?;
                 let identity = prepared_identity(&admission, declarations.entry_projection, store.derivation_image());
-                Ok((identity, admission, declarations, allocation))
+                Ok((identity, admission, declarations, authored_comptime, allocation))
             },
         ).await?;
-        let (identity, admission, declarations, allocation) = owned;
+        let (identity, admission, declarations, authored_comptime, allocation) = owned;
         Ok(PreparedBaseDeclarations {
-            identity, admission, declarations, lease, _read: read, _allocation: allocation,
+            identity, admission, declarations, authored_comptime, lease, _read: read, _allocation: allocation,
             _store: self.retained_store(),
         })
     }
 
     async fn with_cst_admission<T: Send + 'static>(
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
-        limits: BaseCstAdmissionLimits, admission_lease: AdmissionLease,
+        limits: BaseCstAdmissionLimits, admission_lease: AdmissionLease, observe_comptime: bool,
         use_validated: impl FnOnce(&SourceStore, &Transaction, ValidatedProposal) -> Result<T> + Send + 'static,
     ) -> Result<(T, Arc<SourceLease>, SourceRead)> {
         check_binding(&binding, &proposal)?;
@@ -224,7 +252,8 @@ impl SourceStorageWorker {
             };
             let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
-            let validated = validate(&mut tx, &binding, &proposal, limits, None)?;
+            let validated = validate(&mut tx, &binding, &proposal, limits, None,
+                observe_comptime.then_some(&store.grammar_receipts))?;
             let accepted = use_validated(store, &tx, validated)?;
             // No transaction is committed and no snapshot entry is written.
             drop(tx);
@@ -249,6 +278,7 @@ fn check_binding(binding: &BaseCstProposalBinding, proposal: &BaseCstProposal) -
 fn validate(
     tx: &mut Transaction, binding: &BaseCstProposalBinding, proposal: &BaseCstProposal,
     limits: BaseCstAdmissionLimits, mut publish: Option<&mut PublishReport>,
+    predecessor_grammar: Option<&GrammarReceipts>,
 ) -> Result<ValidatedProposal> {
     if proposal.files.len() > limits.records {
         return Err("base CST proposal exceeds the record budget".into());
@@ -283,6 +313,8 @@ fn validate(
     let mut work = limits.cst_work();
     let mut validated_files = 0;
     let mut grammar = VerifiedGrammarBatch::default();
+    let mut authored_comptime = if predecessor_grammar.is_some() { AuthoredComptimeCoverage::Absent }
+        else { AuthoredComptimeCoverage::Unverified };
     let (current, config) = validate_snapshot_with(tx, proposal.root, |config| {
         if !matches_source_scope(config, &binding.selected) {
             return Err("proposed source does not match the bound workspace and target".into());
@@ -291,13 +323,19 @@ fn validate(
     }, |tx, file, categories| {
         let key = wosy_protocol::FileKey::from(&file.metadata.source);
         if previous.files.get(&key).is_some_and(|prior| prior.file == file.file) {
+            if authored_comptime != AuthoredComptimeCoverage::Present {
+                if let Some(memo) = predecessor_grammar {
+                    authored_comptime.observe(memo.authored_comptime(file));
+                }
+            }
             return Ok(());
         }
         let tree = if publish.is_some() { FileTree::Both } else { FileTree::Authored };
-        let checked = grammar_checked_file(tx, file, categories, tree, &mut work)?;
+        let (checked, present) = grammar_checked_file(tx, file, categories, tree, &mut work)?;
+        if predecessor_grammar.is_some() { authored_comptime.observe(Some(present)); }
         if let Some(report) = publish.as_deref_mut() {
             admit_checked_namespace_authority(tx, file, checked, report)?;
-            grammar.verified(file);
+            grammar.verified(file, present);
         } else if imports_from_cst(&checked.authored.ok_or("missing checked authored CST")?)? != file.metadata.imports {
             return Err("changed CST does not match canonical namespace provenance".into());
         }
@@ -320,7 +358,7 @@ fn validate(
         base: proposal.base, proposed: proposal.root, attempt: proposal.attempt,
         base_records: prior.len(), novel_records: supplied.len(), validated_files,
     };
-    Ok(ValidatedProposal { admission, entry: config.entry, index: current, work, grammar })
+    Ok(ValidatedProposal { admission, entry: config.entry, index: current, work, grammar, authored_comptime })
 }
 
 pub(super) fn matches_source_scope(config: &SourceConfig, selected: &BuildSourceSelection) -> bool {
@@ -330,29 +368,30 @@ pub(super) fn matches_source_scope(config: &SourceConfig, selected: &BuildSource
 
 fn grammar_checked_file(
     tx: &Transaction, file: &FileEntry, categories: &[String], tree: FileTree, work: &mut CstWork,
-) -> Result<CheckedFile> {
+) -> Result<(CheckedFile, bool)> {
     let checked = validate_file(tx, file, categories, tree, Some(work))?;
-    if !authored_grammar_matches(file, categories, &checked)? {
-        return Err("changed CST does not match canonical source grammar or provenance".into());
-    }
-    Ok(checked)
+    let present = verified_authored_comptime(file, categories, &checked)?
+        .ok_or("changed CST does not match canonical source grammar or provenance")?;
+    Ok((checked, present))
 }
 
-pub(super) fn authored_grammar_matches(file: &FileEntry, categories: &[String], checked: &CheckedFile) -> Result<bool> {
-    Ok(verified_authored_parse(file, categories, checked)?.is_some())
+pub(super) fn verified_authored_comptime(
+    file: &FileEntry, categories: &[String], checked: &CheckedFile,
+) -> Result<Option<bool>> {
+    Ok(verified_authored_parse(file, categories, checked)?.map(|(_, present)| present))
 }
 
 pub(super) fn verified_authored_parse(
     file: &FileEntry, categories: &[String], checked: &CheckedFile,
-) -> Result<Option<wosy_syntax::FreshParseResult>> {
+) -> Result<Option<(wosy_syntax::FreshParseResult, bool)>> {
     let authored = checked.authored.as_ref().ok_or("source file has no authored CST")?;
     // Use the ordinary parser and the checked Rowan text. A lease alone is
     // not grammar authority; compiler consumers get only the matching parse.
     let fresh = wosy_syntax::parse_with_snapshot(file_source(file)?, authored.text().to_string(), categories);
     let parsed = fresh.result();
-    let matches = parsed.is_valid() && same_cst(authored, &parsed.canonical_cst().root)
-        && parsed.comments == checked.comments;
-    Ok(matches.then_some(fresh))
+    if !parsed.is_valid() { return Ok(None); }
+    let Some(present) = same_cst(authored, &parsed.canonical_cst().root) else { return Ok(None); };
+    Ok((parsed.comments == checked.comments).then_some((fresh, present)))
 }
 
 /// Validate and provisionally install only the full canonical graph supplied
@@ -379,7 +418,7 @@ pub(super) fn stage_reconciled_closure(
         }
         Ok(())
     }, |tx, file, categories| {
-        let checked = grammar_checked_file(tx, file, categories, FileTree::Both, &mut work)?;
+        let (checked, _) = grammar_checked_file(tx, file, categories, FileTree::Both, &mut work)?;
         admit_checked_namespace_authority(tx, file, checked, report)?;
         validated_files += 1;
         Ok(())
@@ -484,19 +523,20 @@ fn trace(
     Ok(done)
 }
 
-fn same_cst(expected: &CstNode, actual: &CstNode) -> bool {
+fn same_cst(expected: &CstNode, actual: &CstNode) -> Option<bool> {
+    let mut authored_comptime = false;
     let mut wanted = expected.preorder_with_tokens();
     let mut observed = actual.preorder_with_tokens();
     loop {
         match (wanted.next(), observed.next()) {
-            (None, None) => return true,
+            (None, None) => return Some(authored_comptime),
             (Some(WalkEvent::Enter(NodeOrToken::Node(a))), Some(WalkEvent::Enter(NodeOrToken::Node(b))))
-                if a.kind() == b.kind() => {}
+                if a.kind() == b.kind() => { authored_comptime |= a.kind() == SyntaxKind::ComptimeExpr; }
             (Some(WalkEvent::Enter(NodeOrToken::Token(a))), Some(WalkEvent::Enter(NodeOrToken::Token(b))))
                 if a.kind() == b.kind() && a.text() == b.text() => {}
             (Some(WalkEvent::Leave(NodeOrToken::Node(_))), Some(WalkEvent::Leave(NodeOrToken::Node(_))))
             | (Some(WalkEvent::Leave(NodeOrToken::Token(_))), Some(WalkEvent::Leave(NodeOrToken::Token(_)))) => {}
-            _ => return false,
+            _ => return None,
         }
     }
 }

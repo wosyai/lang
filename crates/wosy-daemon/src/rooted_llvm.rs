@@ -4,7 +4,7 @@ use super::{
     grammar_receipts::VerifiedGrammarBatch,
     read_index_using, read_verified_node_with, retention_plan::SourceLease,
     rooted_llvm_receipts::{ExecutableLlvmFlight, ExecutableLlvmKey, ExecutableLlvmReceipt, FlightState, StagedExecutableLlvmReceipt},
-    source_proposal::{authored_grammar_matches, take},
+    source_proposal::{take, verified_authored_comptime},
     source_reconciliation::{bounded_source_records, checked_source_header_using},
     storage_worker::{QueryPhases, QueryWorker},
     validate_file_using, BaseCstAdmissionLimits, FileTree, Result, SourceStore,
@@ -444,12 +444,12 @@ impl SourceStore {
             // hits. A generic published marker carries no grammar witness.
             if !grammar_known {
                 let verification = Instant::now();
-                if !authored_grammar_matches(&module.file, &parser.categories, &checked)? {
+                let Some(present) = verified_authored_comptime(&module.file, &parser.categories, &checked)? else {
                     return complete(ScalarOutcome::Unsupported(Unsupported::AuthoredGrammarNotVerified), grammar_reparsed_files, grammar_verification);
-                }
+                };
                 grammar_verification += verification.elapsed();
                 grammar_reparsed_files += 1;
-                if let Some((_, grammar)) = llvm_memo.as_mut() { grammar.verified(&module.file); }
+                if let Some((_, grammar)) = llvm_memo.as_mut() { grammar.verified(&module.file, present); }
             }
             if cache_hit { continue; }
             let owner = &owners[ordinal];
