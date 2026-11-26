@@ -744,13 +744,18 @@ std.utf8[2] result = comptime prepare {
         };
         assert_eq!(actual_text, "olá\n\t\r\"ok\\\0".as_bytes());
     }
-    // Each of these checked-in/imported sources is individually below
-    // the caller's cap; an additional reachable regular file is too large
-    // for what remains after the genuine std sources and the entry.
-    fs::write(standard.join("src/extra.w"), format!("%%start\n{}\n%%end\n", " ".repeat(1 << 16))).unwrap();
-    fs::write(&source, direct.replacen("%%start\n", "%%start\nextra = namespace std \"extra.w\";\n", 1)).unwrap();
-    assert!(matches!(assemble(256), Err(ClosedComptimePlanError::Project(message))
-        if message == "preview source exceeds the authored byte budget"));
+    // The real std bootstrap and this valid regular module each fit the
+    // caller's cap alone. Their combined bytes exceed it before parsing the
+    // auxiliary module, which follows bootstrap in ordinary discovery order.
+    fs::write(standard.join("src/extra.w"),
+        format!("%%start\nstruct Extra {{ bool ok; }}\n{}\n%%end\n", " ".repeat(1 << 16))).unwrap();
+    let namespace = "std = namespace std \"bootstrap.w\";\n";
+    fs::write(&source, direct.replacen(namespace,
+        &format!("{namespace}extra = namespace std \"extra.w\";\n"), 1)).unwrap();
+    let oversized = assemble(256);
+    assert!(matches!(&oversized, Err(ClosedComptimePlanError::Project(message))
+        if message == "preview source exceeds the authored byte budget"),
+        "aggregate source budget control returned {:?}", oversized.err());
     // The old authored-site cap still applies to the exact entry file,
     // not to the individually larger std bootstrap proved above.
     fs::write(&source, format!("{}{}", " ".repeat(1 << 16), direct)).unwrap();
