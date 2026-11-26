@@ -2859,6 +2859,53 @@ main_artifact = "main"
                     ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(root, None, "dev"),
                     ScalarCheckerScope::MainFlowOnly => configured_check::check_target(root, None, "dev", scope, Vec::new()),
                 }.ok().unwrap();
+                let named_ordinary = format!(r#"%%start
+                    u8(u8) named = fn(value) {{ value }};
+                    proof reached for named(entry) -> (out) where (entry == 3) ensures (out == 4) {{}}
+                    unit(u8) packet = fn(entry) {{
+                        if (entry == 7) {{
+                            core.require(false, {{ .stdout = "packet"; .stderr = ""; .code = 23;
+                                .files = [{{ .path = "packet.json"; .state = entry; }}]; }});
+                        }};
+                    }};
+                    u8 actual = named(3);
+                    core.require(actual == 4, {first});
+                %%end"#);
+                fs::write(&source, &named_ordinary).unwrap();
+                let old = legacy();
+                let old_printed = terminal(&[old], scope, false);
+                let old_files = files();
+                assert_eq!(old_files.get("first.txt"), first_file.get("first.txt"));
+                let during = scope == ScalarCheckerScope::CurrentPackage;
+                assert_eq!(old_files.contains_key("packet.json"), during);
+                if during {
+                    assert_eq!(old_files["packet.json"], b"{\"type\":{\"kind\":\"u8\"},\"value\":7}\n");
+                }
+                clean();
+                let exact = selected(1);
+                let report = exact[0].outcome.as_ref().unwrap();
+                assert_eq!(report.directives.len(), 1);
+                assert_eq!(report.diagnostics.len(), 1);
+                let hit = report.diagnostics[0].invocation.call.range;
+                assert_eq!(&named_ordinary[hit.start as usize..hit.end as usize], "named(3)");
+                let first_only = terminal(&exact, scope, false);
+                assert_eq!(first_only.1, b"first");
+                assert_eq!(files(), first_file);
+                clean();
+                assert_eq!(terminal(&selected(4), scope, false), old_printed);
+                assert_eq!(files(), old_files);
+                clean();
+                let duplicate = named_ordinary.replace("packet.json", "first.txt");
+                fs::write(&source, duplicate).unwrap();
+                if during {
+                    let rejected = terminal(&selected(4), scope, false);
+                    assert!(rejected.0.is_err() && rejected.1.is_empty());
+                    assert!(!state.exists());
+                    assert_eq!(terminal(&selected(1), scope, false), first_only);
+                    assert_eq!(files(), first_file);
+                    clean();
+                }
+
                 let graph_root = format!(r#"%%start
                     shared = namespace app "shared.w";
                     relay = namespace app "relay.w";
