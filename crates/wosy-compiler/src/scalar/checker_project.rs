@@ -3960,7 +3960,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let trace = effects.startup_search.as_ref()?.borrow();
             let recipe = trace.wide_rank_recipe.as_ref()?;
             (recipe.target == target && recipe.site == call && std::ptr::eq(caller, body)
-                && parent.source == &owner.source && trace.owns_initialization(parent.source))
+                && parent.source == &owner.source
+                && ordered.startup_site_source.is_some_and(|startup| trace.owns_initialization(startup)
+                    && (startup == parent.source || (trace.named_cross_source
+                        && completed_namespace_owner(startup, parent.source, target.0, ordered.visits)))))
                 .then(|| Rc::clone(recipe))
         });
         #[cfg(not(feature = "internal-checker"))]
@@ -4304,7 +4307,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && ((is_integer_type(expected) || (module_bool_initializer && *expected == ScalarType::Bool))
                     && closed_startup_scalar_history(body)
                     || (signature.parameters.len() == 1 && is_integer_type(expected) && plain_scalar_wrapper));
-            let matches_wide_rank = pending == Some(&(target, Ranked)) && caller == &owner.source
+            let matches_wide_rank = pending == Some(&(target, Ranked))
+                && (caller == &owner.source || search.allows_qualified_scalar_proof(caller, call, target))
                 && ordered.scalar_initializer.is_some() && search.wide_rank_recipe.as_ref().is_some_and(|recipe| recipe.target == target)
                 && (3..=MAX_RANKED_INTEGER_AXES).contains(&signature.parameters.len());
             let matches_ranked = pending == Some(&(target, Ranked))
@@ -11030,7 +11034,7 @@ fn run_startup_authored_path(
     let (project, calls) = owner.parts();
     let count = if proof_free_scalars.is_some() || qualified { project.initialization_order.len() }
         else { 1 };
-    if wide_rank.as_ref().is_some_and(|recipe| qualified || !named.is_empty()
+    if wide_rank.as_ref().is_some_and(|recipe| !named.is_empty() || (qualified && count != 2)
         || ranked.is_none_or(|(target, _)| target != recipe.target))
         || (!named.is_empty() && project.modules.len() != count)
         || named.iter().any(|(_, sites)| sites.is_empty())
@@ -11827,7 +11831,7 @@ fn run_private_named_after_startup(
     let (mut verified_rank, wide_rank) = if reached_rank {
         let plan = ranked.as_ref().ok_or(ProjectCheck::Unsupported)?;
         if plan.typed.body.boundary.parameters.len() > 2 {
-            if qualified || !plans.is_empty() || expected.is_some() { return Err(ProjectCheck::Unsupported); }
+            if !plans.is_empty() || expected.is_some() { return Err(ProjectCheck::Unsupported); }
             let (verified, recipe) = prepare_capped_wide_ranked_receipts(plan)?;
             (Some(verified), Some(Rc::new(recipe)))
         } else { (Some(prepare_capped_ranked_receipts(plan)?), None) }
@@ -25523,6 +25527,90 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     text.replace("core.use(rank(left - 3, page, flag, quota))", "core.use(rank(left - 2, page, flag, quota))")]
                 {
                     assert!(matches!(prepare(&bad).run_private_authored_root(NonZeroUsize::MIN),
+                        Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_qualified_wide_rank_keeps_caller_and_provider_frames_separate() {
+        use std::num::NonZeroUsize;
+        let root = source("src/main.w", "private-qualified-wide-root");
+        let provider = source("src/lib.w", "private-qualified-wide-provider");
+        let main = format!(r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8 actual = lib.descend(8, 12, 1, 4);
+            core.require(actual == 7, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let lib = format!(r#"%%start
+            u8(u8,u16,u8,u16) descend = fn(left, page, flag, quota) {{
+                if (left < 3) {{ 7 }} else {{ descend(left - 3, page, flag, quota) }}
+            }};
+            proof rank for descend(left, page, flag, quota) -> (out)
+                where (left <= 8 && page == 12 && flag == 1 && quota == 4)
+                ensures (out == 7) decreases (left) {{
+                if (left < 3) {{ core.show(out == 7); }} else {{ core.use(rank(left - 3, page, flag, quota)); }}
+            }}
+            core.require(false, {OUTPUT});
+        %%end"#);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let prepare = |program: &str, provider: &SourceIdentity| {
+                    let (_, catalog) = crate::parse_proof_source(provider.clone(), lib.clone(), &[])
+                        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+                    let import = ScalarNamespaceBinding { binding: "lib".into(), target: provider.clone(), span: ByteSpan::new(0, 0) };
+                    prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&root, program), vec![import])], [(catalog, Vec::new())],
+                        vec![root.clone(), provider.clone()], ScalarPreparationInputs { target_layout: layout }, scope, Vec::new())
+                };
+                let old = prepare(&main, &provider).unwrap().run().unwrap();
+                assert_eq!(old.directives.iter().map(|directive| &directive.source).collect::<Vec<_>>(), [&provider, &root]);
+                for n in [1, 2, 3] {
+                    let (report, end) = prepare(&main, &provider).unwrap().run_private_authored_root(NonZeroUsize::new(n).unwrap()).unwrap();
+                    assert_eq!(report.directives, old.directives[..n.min(2)]);
+                    assert_eq!(end, Some(if n <= 2 { StartupAuthoredCompletion::LimitReached }
+                        else { StartupAuthoredCompletion::Exhausted }));
+                }
+                let prepared = prepare(&main, &provider).unwrap();
+                let PreparedConfiguredCheck::Named { owner, .. } = &prepared.owner else { panic!("original qualified catalog"); };
+                let plan = owner.plan_module_proof_in_scope::<true, false, false>(&provider, "rank").unwrap();
+                let (token, recipe) = prepare_capped_wide_ranked_receipts(&plan).unwrap();
+                let (_, calls) = owner.prepared.parts();
+                let sites = calls.owned_direct_startup_callable_uses(&root, Some(&provider), [(&provider, plan.function.name_span)],
+                    Some((&provider, plan.target.1, plan.function.name_span))).unwrap();
+                let (_, _, trace, _) = run_startup_authored_path(&owner.prepared, Some(NonZeroUsize::new(3).unwrap()),
+                    &[], true, &[], None, Some((token.target, &sites[&(&provider, plan.function.name_span)])), false, Some(Rc::new(recipe))).unwrap();
+                let [observed] = trace.wide_rank_observations.as_slice() else { panic!("one original qualified return"); };
+                assert_eq!(observed.site.source, root);
+                assert_eq!(observed.arguments, [8, 12, 1, 4].map(BigInt::from));
+                assert_eq!(trace.ranked_entries, [8, 5, 2].map(BigInt::from));
+                assert_eq!(observed.returned, 7.into());
+                use failure_search::PathStep;
+                let boundaries = trace.current_path().iter().filter_map(|step| match step {
+                    PathStep::Call(span) => Some((false, span)),
+                    PathStep::Return(span) => Some((true, span)),
+                    _ => None,
+                }).map(|(returning, span)| {
+                    let source = if span.source == root { &main } else { assert_eq!(span.source, provider); &lib };
+                    (returning, &span.source, &source[span.range.start as usize..span.range.end as usize])
+                }).collect::<Vec<_>>();
+                assert_eq!(boundaries, [
+                    (false, &root, "lib.descend(8, 12, 1, 4)"),
+                    (false, &provider, "descend(left - 3, page, flag, quota)"),
+                    (false, &provider, "descend(left - 3, page, flag, quota)"),
+                    (true, &provider, "descend(left - 3, page, flag, quota)"),
+                    (true, &provider, "descend(left - 3, page, flag, quota)"),
+                    (true, &root, "lib.descend(8, 12, 1, 4)"),
+                ]);
+                let formal = prepare(&main, &provider).unwrap().run_private_proofs_after_command_cap().unwrap();
+                assert!(formal.active && formal.directives.is_empty());
+                let outside = main.replace("descend(8, 12, 1, 4)", "descend(8, 12, 1, 5)");
+                let foreign = SourceIdentity { project: "other-project".into(), ..provider.clone() };
+                for (program, owner) in [(&outside, &provider), (&main, &foreign)] {
+                    assert!(matches!(prepare(program, owner).and_then(|check| check.run_private_authored_root(NonZeroUsize::MIN)),
                         Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 }
             }
