@@ -3716,26 +3716,23 @@ pub(super) fn search_closed_callable_histories(
     });
     let mut unsupported = false;
     let mut sink = |mut failure: IntegerCheckFailure<'_>| {
-        let mut seen = std::collections::HashSet::new();
-        for mut row in failure.state.0.drain(..) {
-            let mut trace = histories.borrow_mut();
-            if trace.charge(1).is_none() { unsupported = true; break; }
-            if !seen.insert(row.callable_history) { continue; }
-            let Some(steps) = trace.steps(row.callable_history) else { unsupported = true; break; };
-            row.callable_history = 0; // History is a selection key, not witness data.
-            let state = IntegerInputs(vec![row]);
-            let equal_axes = state.common_equal_axes();
-            if trace.charge(failure.axes.len()).is_none() { unsupported = true; break; }
-            let selected = select(IntegerCheckFailure {
-                directive: failure.directive, state, axes: failure.axes.clone(), equal_axes,
-            }, steps);
-            match selected {
-                Some(true) => { trace.stopped = true; break; }
-                Some(false) => {}
-                None => { unsupported = true; break; }
+        let mut trace = histories.borrow_mut();
+        let selected = (|| {
+            let history = failure.state.0.first()?.callable_history;
+            trace.charge(failure.state.0.len().checked_add(failure.axes.len())?)?;
+            let steps = trace.steps(history)?;
+            // The driver submits one complete structural packet.
+            for row in &mut failure.state.0 {
+                if row.callable_history != history { return None; }
+                row.callable_history = 0;
             }
+            select(failure, steps)
+        })();
+        match selected {
+            Some(true) => trace.stopped = true,
+            Some(false) => {}
+            None => { unsupported = true; trace.stopped = true; }
         }
-        if unsupported { histories.borrow_mut().stopped = true; }
     };
     let allow_calls = nested.is_some();
     let mut call = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
@@ -3749,6 +3746,43 @@ pub(super) fn search_closed_callable_histories(
     if unsupported { return None; }
     if histories.borrow().stopped { return Some(CallableHistoryCompletion::LimitReached); }
     result.map(|(active, continuation)| CallableHistoryCompletion::Exhausted(active, continuation))
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn test_first_complete_history_packet(
+    calls: &FunctionCallSites, mut inspect: impl FnMut(IntegerCheckFailure<'_>),
+) -> Option<()> {
+    // Two separately represented incoming exact rows, both at the genuine
+    // start of the same prepared body. No branch labels or histories invented.
+    let [parameter] = calls.boundary.parameters.as_slice() else { return None; };
+    let [binding] = calls.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    if parameter.ty != ScalarType::U8 { return None; }
+    let mut roots = IntegerRoots { parameters: 1, ..IntegerRoots::default() };
+    roots.add(binding, &parameter.ty);
+    let work = std::cell::Cell::new(0);
+    let tracker = std::cell::RefCell::new(CallableHistories {
+        work: &work, outgoing_call: None, scalar_return_steps: None, step_owner: None,
+        stopped: false, nodes: Vec::new(), interned: HashMap::new(),
+    });
+    roots.callable_history = Some(&tracker);
+    let mut selected = false;
+    let mut sink = |failure| {
+        assert!(!selected, "cap 1");
+        selected = true;
+        inspect(failure);
+        tracker.borrow_mut().stopped = true;
+    };
+    let mut collection = Some(IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty, projected: None,
+        allow_projected_calls: false, allow_contextual_local_transfers: false, sink: &mut sink,
+    });
+    let inputs = IntegerInputs([BigInt::from(0u8), BigInt::from(7u8)].iter()
+        .map(|value| exact_integer_entry_row(&[value])).collect());
+    let mut failures = collection.as_mut();
+    let mut imports: &mut [Option<ImportedLocal<'_>>] = &mut [];
+    let _ = walk_integer_block::<false, true, _>(calls, &mut roots, calls.structure.root, inputs, None,
+        None, &mut None, &mut failures, &mut imports, TrackCallableHistory(&tracker));
+    selected.then_some(())
 }
 
 /// Preserve the actual child's selected branch history alongside each
@@ -7646,9 +7680,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             _ => return None,
                         };
                         let mut emit = |rejecting: IntegerInputs| {
-                            histories.borrow().charge(roots.axes.len().checked_add(1)?)?;
+                            let tracker = histories.borrow();
+                            tracker.charge(roots.axes.len().checked_add(1)?)?;
+                            let mut work = tracker.work.get();
+                            let equal_axes = rejecting.common_equal_axes_bounded(&mut work)?;
+                            tracker.work.set(work);
+                            drop(tracker);
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
-                                directive: expression, equal_axes: rejecting.common_equal_axes(),
+                                directive: expression, equal_axes,
                                 state: rejecting, axes: roots.axes.clone(),
                             });
                             roots.after_startup_candidate()
@@ -7659,10 +7698,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 row.len().checked_add(cuts.checked_mul(2)?)?.checked_add(1)?)
                         };
                         if directive.operation == CheckerOperation::Require {
+                            // Index already materialized rows in encounter
+                            // order; never project a later path after cutoff.
+                            histories.borrow().charge(path.0.len().checked_mul(2)?)?;
+                            let mut order = HashMap::new();
+                            let mut groups = Vec::<Vec<&IntegerRow>>::new();
                             for row in &path.0 {
-                                charge_row(row)?;
-                                let candidate = IntegerInputs(vec![row.clone()]);
-                                let rejecting = candidate.failing_witness(roots, predicate)?;
+                                let group = *order.entry(row.callable_history).or_insert_with(|| {
+                                    let index = groups.len();
+                                    groups.push(Vec::new());
+                                    index
+                                });
+                                groups[group].push(row);
+                            }
+                            for group in groups {
+                                let mut rejecting = IntegerInputs::default();
+                                for row in group {
+                                    charge_row(row)?;
+                                    let candidate = IntegerInputs(vec![row.clone()]);
+                                    rejecting.0.extend(candidate.failing_witness(roots, predicate)?.0);
+                                }
                                 if !rejecting.is_unreachable() { emit(rejecting)?; }
                             }
                         } else {

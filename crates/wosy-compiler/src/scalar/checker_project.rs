@@ -589,20 +589,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
     };
     // Resolve authored outputs only for a completed check, before planning
     // any client-visible code, stream, or file effect.
-    if effects.has_selected_code && !E::AUTHORED_SINGLETON_CODE { return Err(ProjectCheck::Unsupported); }
-    if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty() {
-        let mut work = effects.startup_output_work;
-        let mut hidden = effects.snapshot_records.into_iter().peekable();
-        for (index, record) in effects.records.iter_mut().enumerate() {
-            if !record.output.state_files.is_empty() || !matches!(record.output.code_value, CheckerCode::Literal(_)) {
-                record.output = Rc::new(render_authored_output(&record.output, &record.witness, None, &mut work).ok_or(ProjectCheck::Unsupported)?);
-            }
-            if hidden.peek() == Some(&index) {
-                hidden.next();
-                record.witness.remove_snapshot_axes(&mut work).ok_or(ProjectCheck::Unsupported)?;
-            }
-        }
-    }
+    effects.finalize_selected_outputs(E::AUTHORED_SINGLETON_CODE)?;
     Ok(PreparedOrderedRun {
         finished_all_initialization, active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
         contextual_proofs: effects.contextual_proofs,
@@ -5093,6 +5080,24 @@ impl OrderedFailurePayloads {
 }
 
 impl OrderedFailures {
+    #[cfg(feature = "internal-checker")]
+    fn finalize_selected_outputs(&mut self, allow_singleton_code: bool) -> Result<(), ProjectCheck> {
+        if self.has_selected_code && !allow_singleton_code { return Err(ProjectCheck::Unsupported); }
+        if self.has_authored_state || self.has_selected_code || !self.snapshot_records.is_empty() {
+            let mut hidden = std::mem::take(&mut self.snapshot_records).into_iter().peekable();
+            for (index, record) in self.records.iter_mut().enumerate() {
+                if !record.output.state_files.is_empty() || !matches!(record.output.code_value, CheckerCode::Literal(_)) {
+                    record.output = Rc::new(render_authored_output(&record.output, &record.witness, None, &mut self.startup_output_work).ok_or(ProjectCheck::Unsupported)?);
+                }
+                if hidden.peek() == Some(&index) {
+                    hidden.next();
+                    record.witness.remove_snapshot_axes(&mut self.startup_output_work).ok_or(ProjectCheck::Unsupported)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn push(
         &mut self,
         source: &SourceIdentity,
@@ -10525,7 +10530,7 @@ fn closed_startup_scalar_history(body: &FunctionCallSites) -> bool {
         && matches!(body.boundary.results.as_slice(), [result] if is_integer_type(&result.ty))
         && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
-        && literal_history_directives(body)
+        && witness_history_directives(body)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10554,6 +10559,18 @@ fn literal_history_directives(body: &FunctionCallSites) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
+fn witness_history_directives(body: &FunctionCallSites) -> bool {
+    use super::checker_directive::{CheckerStateSelection, CheckerStateType};
+    body.structure.checker_directives.values().all(|directive| matches!(directive.operation,
+        CheckerOperation::Require | CheckerOperation::Narrow)
+        && matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+        && !directive.output.has_module_values
+        && matches!(directive.output.code_value, CheckerCode::Literal(_) | CheckerCode::Binding(..))
+        && directive.output.state_files.iter().all(|file|
+            matches!((&file.selection, &file.ty), (CheckerStateSelection::Binding(_), CheckerStateType::Scalar(_)))))
+}
+
+#[cfg(feature = "internal-checker")]
 fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
     body.checker_returns_unit() && body.checker_named_route_frame()
         && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
@@ -10569,7 +10586,7 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
             matches!(body.structure.checker_branches.get(condition),
                 Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
         })
-        && literal_history_directives(body)
+        && witness_history_directives(body)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -10866,11 +10883,16 @@ fn run_startup_authored_path(
         Err(error) => return Err(error),
         _ => return Err(ProjectCheck::Unsupported),
     };
-    // Only concrete already-rendered startup records cross this private
-    // boundary until the full selected output finalizer is shared.
-    if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-        || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len())
-    { return Err(ProjectCheck::Unsupported); }
+    if cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(search.remaining()) != Some(effects.records.len()) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    if proof_free_scalars.is_some() {
+        // Only admitted records reach the incumbent renderer. A projection
+        // refusal invalidates the complete transaction.
+        effects.finalize_selected_outputs(true)?;
+    } else if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty() {
+        return Err(ProjectCheck::Unsupported);
+    }
     Ok((effects.records, completion, search, active))
 }
 
@@ -31626,6 +31648,38 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             vec![source.clone()],
             inputs(),
         )
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn private_prepared_require_finishes_the_whole_same_history_before_cap() {
+        let app = source("src/main.w", "private-complete-history");
+        let program = r#"%%start
+            unit(u8) report = fn(value) {
+                core.require(false, { .stdout = ""; .stderr = ""; .code = value; .files = []; });
+                core.require(false, { .stdout = "later"; .stderr = ""; .code = 9; .files = []; });
+            };
+        %%end"#;
+        let prepare = |layout| {
+            let parsed = crate::parse_source(app.clone(), program.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty());
+            let declarations = crate::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_checker_project(vec![(declarations, Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout: layout }).unwrap()
+        };
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare(layout);
+            let (_, calls) = prepared.parts();
+            let body = calls.function_body(0, 0, None).unwrap();
+            let mut effects = OrderedFailures::default();
+            super::super::checker_flow::test_first_complete_history_packet(body, |failure|
+                effects.push_callable(body, &app, failure)).unwrap();
+            let [record] = effects.records.as_slice() else { panic!("one structural packet"); };
+            assert_eq!(record.witness.row_count(), 2);
+            assert!(record.witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &0.into())]));
+            assert!(record.witness.intervals_at(1, 0).unwrap().eq([(&7.into(), &7.into())]));
+            assert!(matches!(effects.finalize_selected_outputs(true), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[test]

@@ -3817,6 +3817,79 @@ main_artifact = "main"
                     assert_eq!((refused.0, refused.1), (Ok(1), Vec::new()));
                     assert!(!refused.2.is_empty() && files().is_empty() && !state.exists());
                 }
+
+                let witness_output = r#"%%start
+                    unit(u8) report = fn(value) {
+                        core.require(value == 7, { .stdout = "witness"; .stderr = ""; .code = 0;
+                            .files = [{ .path = "witness.json"; .state = value; }]; });
+                        core.require(value != 7, { .stdout = "selected"; .stderr = ""; .code = value;
+                            .files = [{ .path = "selected.json"; .state = value; }]; });
+                    };
+                %%end"#;
+                fs::write(&source, witness_output).unwrap();
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    let old = terminal(&[legacy()], scope, false);
+                    assert_eq!(old, (Ok(7), b"witnessselected".to_vec(), Vec::new()));
+                    let old_files = files();
+                    clean();
+                    let one = selected(1);
+                    let [first] = one[0].outcome.as_ref().unwrap().directives.as_slice()
+                        else { panic!("two disjoint alternatives count as one path"); };
+                    assert!(first.witness.intervals_at(0, 0).unwrap().eq([(&0.into(), &6.into()), (&8.into(), &255.into())]));
+                    assert_eq!(terminal(&one, scope, false), (Ok(0), b"witness".to_vec(), Vec::new()));
+                    assert_eq!(files().len(), 1);
+                    assert_eq!(files()["witness.json"], old_files["witness.json"]);
+                    clean();
+                    for cap in [2, 8] {
+                        assert_eq!(terminal(&selected(cap), scope, false), old);
+                        assert_eq!(files(), old_files);
+                        clean();
+                    }
+
+                    fs::write(&source, witness_output.replace("value != 7,", "value == 7,")).unwrap();
+                    assert_eq!(terminal(&selected(1), scope, false), (Ok(0), b"witness".to_vec(), Vec::new()));
+                    assert_eq!(files().len(), 1);
+                    clean();
+                    let refused = terminal(&selected(2), scope, false);
+                    assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty() && !state.exists());
+                } else {
+                    assert_eq!(terminal(&selected(2), scope, false), terminal(&[legacy()], scope, false));
+                    assert!(!state.exists());
+                }
+
+                if scope == ScalarCheckerScope::CurrentPackage {
+                    // Short-circuit compound predicates remain outside this
+                    // history profile; do not coalesce their operand paths.
+                    let compound = r#"%%start
+                        unit(u8, u8) report = fn(left, right) {
+                            if (left == 0 || right == 0) {
+                                core.require(false, { .stdout = "arm"; .stderr = ""; .code = 9; .files = []; });
+                            };
+                        };
+                    %%end"#;
+                    fs::write(&source, compound).unwrap();
+                    assert_eq!(terminal(&[legacy()], scope, false), (Ok(9), b"arm".to_vec(), Vec::new()));
+                    let refused = terminal(&selected(1), scope, false);
+                    assert!(refused.0.is_err() && refused.1.is_empty() && refused.2.is_empty() && !state.exists());
+                }
+
+                let startup_witness = r#"%%start
+                    i8 status = -37;
+                    bool ready = true;
+                    core.require(false, { .stdout = "startup"; .stderr = ""; .code = -status;
+                        .files = [{ .path = "status.json"; .state = -status; },
+                                  { .path = "ready.json"; .state = !ready; }]; });
+                %%end"#;
+                fs::write(&source, startup_witness).unwrap();
+                let old = terminal(&[legacy()], scope, false);
+                let old_files = files();
+                assert_eq!(old.0, Ok(37));
+                assert_eq!(old_files["ready.json"], b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+                assert_eq!(old_files["status.json"], b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
+                clean();
+                assert_eq!(terminal(&selected(1), scope, false), old);
+                assert_eq!(files(), old_files);
+                clean();
             }
         }
 
