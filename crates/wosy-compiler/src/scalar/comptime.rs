@@ -338,6 +338,15 @@ fn rewrite_parameter(
     Ok(Some(observed))
 }
 
+fn audited_closed_unary(operator: &UnaryOperator) -> bool {
+    matches!(operator, UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot)
+}
+
+fn audited_closed_eager_binary(operator: &BinaryOperator) -> bool {
+    matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual
+        | BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor)
+}
+
 fn admit_pure_expression(
     expression: &ScalarExpression, scope: &impl Fn(ByteSpan) -> SourceSpan,
 ) -> Result<(), ClosedComptimeRejection> {
@@ -345,13 +354,10 @@ fn admit_pure_expression(
     while let Some(expression) = pending.pop() {
         match expression {
             ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } | ScalarExpression::Name { .. } => (),
-            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot, operand, .. } =>
+            ScalarExpression::Unary { operator, operand, .. } if audited_closed_unary(operator) =>
                 pending.push(operand),
-            ScalarExpression::Binary {
-                operator: BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::And | BinaryOperator::Or
-                    | BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor,
-                left, right, ..
-            } => {
+            ScalarExpression::Binary { operator, left, right, .. }
+                if audited_closed_eager_binary(operator) || matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
                 pending.extend([&**left, &**right]);
             }
             _ => return Err(ClosedComptimeRejection::Unsupported {

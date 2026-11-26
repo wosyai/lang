@@ -1,6 +1,7 @@
 //! Inspect one direct authored comptime call and emit only its detached evaluator.
 use super::{
-    analyze_scalar_build, derive_block, emit_closed_evaluator, prepare_scalar_project, span_of,
+    analyze_scalar_build, audited_closed_eager_binary, audited_closed_unary, derive_block,
+    emit_closed_evaluator, prepare_scalar_project, span_of,
     ClosedComptimeFragment, ClosedComptimeRejection, ScalarBlock,
     ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs, ScalarTargetLayout,
     ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
@@ -9,7 +10,6 @@ use super::super::{
     control::{ModuleInitializationStepKind, PlainNameIdentity},
     derive_scalar_declarations_with_embedding, ConcreteCallSelection, EmbeddedComptimeExpression,
 };
-use rowan::NodeOrToken;
 use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
 
 const MAX_DIRECT_STARTUP_CALLS: usize = 16;
@@ -31,6 +31,7 @@ pub struct InspectedDirectComptimeCall {
     argument: SourceSpan,
     formal: SourceSpan,
     read: SourceSpan,
+    operand: FormalOperand,
     value: DirectComptimeArgument,
     result: ScalarType,
 }
@@ -48,7 +49,8 @@ impl InspectedDirectComptimeCall {
 
 /// Inspect only one module containing a single ordinary function and one
 /// binding that immediately calls it with a scalar literal. Its only
-/// comptime tail reads the exact formal. The caller must establish the
+/// comptime tail reads the exact formal, alone or in one eager scalar operation.
+/// The caller must establish the
 /// module's real target-entry authority separately. No general proof,
 /// profile lookup, execution, result substitution or cache identity.
 pub fn inspect_direct_function_comptime(
@@ -114,7 +116,7 @@ impl DirectStartupComptimePlan {
     }
 }
 
-/// One formal-only tail and at most sixteen direct literal startup calls to
+/// One eager scalar tail and at most sixteen direct literal startup calls to
 /// that same declaration. Authenticate the entire ordinary startup list
 /// before emitting anything. Equal tuples share one evaluator only within
 /// this exact analysis; this does not define a reusable ComptimeKey.
@@ -160,9 +162,15 @@ fn emit_bound_evaluator(
         DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
         DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
     };
-    *item = value.clone();
-    *expression = value.clone();
-    output.value = value;
+    let Some(read) = facts.operand.get_mut(item) else {
+        return Err(ClosedComptimeRejection::Emitter("verified formal operand disappeared".into()));
+    };
+    if !matches!(read, ScalarExpression::Name { span: current, .. } if *current == span) {
+        return Err(ClosedComptimeRejection::Emitter("verified formal operand changed identity".into()));
+    }
+    *read = value;
+    *expression = item.clone();
+    output.value = item.clone();
     output.ty = facts.result.clone();
     emit_closed_evaluator(id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body)
 }
@@ -216,19 +224,25 @@ fn with_verified_direct_calls<T>(
         }
     }
     if count == 0 { return Err(unsupported("no direct startup call was authored")); }
-    let name = sole_final_value(&site.block)
-        .and_then(|expression| only(expression.children()))
-        .filter(|value| value.kind() == SyntaxKind::Primary && value.children().next().is_none())
-        .and_then(|value| only(value.children_with_tokens().filter_map(NodeOrToken::into_token)
-            .filter(|token| !matches!(token.kind(), SyntaxKind::Whitespace | SyntaxKind::LineEnding
-                | SyntaxKind::Indentation | SyntaxKind::TypedComment))))
-        .filter(|token| token.kind() == SyntaxKind::Identifier)
+    sole_final_value(&site.block)
+        .filter(primitive_operand_source)
         .ok_or_else(|| unsupported("comptime body must only read its formal"))?;
+    let authored_body = derive_block(&site.block);
+    let [ScalarBlockItem::Expression(authored)] = authored_body.items.as_slice() else {
+        return Err(unsupported("comptime body must only read its formal"));
+    };
+    let (operand, read_span) = FormalOperand::select(authored)
+        .map(|(operand, read)| (operand, span_of(read)))
+        .ok_or_else(|| unsupported(match authored {
+            ScalarExpression::Unary { .. } | ScalarExpression::Binary { .. } =>
+                "comptime accepts one audited eager scalar operator with one formal read",
+            _ => "comptime body must only read its formal",
+        }))?;
 
     // The ordinary contextual typer visits the actual authored scalar
     // block. This is not a substitute literal or an executable lowering:
     // the analytical project stays inside this function, and is never emitted.
-    let block = ScalarExpression::Block(derive_block(&site.block));
+    let block = ScalarExpression::Block(authored_body);
     let declarations = derive_scalar_declarations_with_embedding(parsed.canonical_cst(), Some(
         EmbeddedComptimeExpression { site: &node, expression: &tail, value: &block },
     ));
@@ -255,9 +269,12 @@ fn with_verified_direct_calls<T>(
     let [ScalarBlockItem::Expression(ScalarExpression::Block(body))] = function.body.items.as_slice() else {
         return Err(unsupported("ordinary callable tail does not match the authored block"));
     };
-    let [ScalarBlockItem::Expression(read @ ScalarExpression::Name { .. })] = body.items.as_slice() else {
-        return Err(unsupported("ordinary block does not contain one formal read"));
+    let [ScalarBlockItem::Expression(typed)] = body.items.as_slice() else {
+        return Err(unsupported("ordinary block does not contain one scalar result"));
     };
+    let read = operand.get(typed)
+        .filter(|value| matches!(value, ScalarExpression::Name { span, .. } if *span == read_span))
+        .ok_or_else(|| unsupported("ordinary block does not contain the authored formal read"))?;
     let points = build.callable_point_facts(0, 0, None)
         .ok_or_else(|| unsupported("ordinary parameter binding facts are unavailable"))?;
     let nodes = prepared.bind_callable_body_call_nodes(0, 0, None, &function.body)
@@ -265,8 +282,8 @@ fn with_verified_direct_calls<T>(
     let (formal, formal_type) = nodes.formal(points, 0)
         .ok_or_else(|| unsupported("no ordinary formal binding was prepared"))?;
     if nodes.checked_expression_type(read) != Some(formal_type)
+        || nodes.checked_expression_type(typed) != Some(formal_type)
         || !matches!(nodes.plain_name(read), Some(PlainNameIdentity::Lexical(binding)) if binding == formal)
-        || span_of(read) != super::super::token_span(&name)
     {
         return Err(unsupported("authored read does not select the exact ordinary formal"));
     }
@@ -317,10 +334,73 @@ fn with_verified_direct_calls<T>(
         selected.push(InspectedDirectComptimeCall {
             site: scope(site.span), function: declaration.clone(), call: scope(span_of(call)),
             argument: scope(span_of(argument)), formal: scope(formal.declaration_span),
-            read: scope(span_of(read)), value, result: result.ty.clone(),
+            read: scope(span_of(read)), operand, value, result: result.ty.clone(),
         });
     }
     observe(selected, body, super::super::token_span(&site.id))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormalOperand {
+    Result,
+    Unary,
+    Left,
+    Right,
+}
+
+impl FormalOperand {
+    fn select(expression: &ScalarExpression) -> Option<(Self, &ScalarExpression)> {
+        let name = |value: &ScalarExpression| matches!(value, ScalarExpression::Name { .. });
+        let literal = |value: &ScalarExpression| matches!(value,
+            ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. });
+        match expression {
+            value if name(value) => Some((Self::Result, value)),
+            ScalarExpression::Unary { operator, operand, .. }
+                if audited_closed_unary(operator) && name(operand) => Some((Self::Unary, operand)),
+            ScalarExpression::Binary { operator, left, right, .. } if audited_closed_eager_binary(operator) => {
+                if name(left) && literal(right) { Some((Self::Left, left)) }
+                else if literal(left) && name(right) { Some((Self::Right, right)) }
+                else { None }
+            }
+            _ => None,
+        }
+    }
+
+    fn get<'a>(self, expression: &'a ScalarExpression) -> Option<&'a ScalarExpression> {
+        match (self, expression) {
+            (Self::Result, value) => Some(value),
+            (Self::Unary, ScalarExpression::Unary { operand, .. }) => Some(operand),
+            (Self::Left, ScalarExpression::Binary { left, .. }) => Some(left),
+            (Self::Right, ScalarExpression::Binary { right, .. }) => Some(right),
+            _ => None,
+        }
+    }
+
+    fn get_mut<'a>(self, expression: &'a mut ScalarExpression) -> Option<&'a mut ScalarExpression> {
+        match (self, expression) {
+            (Self::Result, value) => Some(value),
+            (Self::Unary, ScalarExpression::Unary { operand, .. }) => Some(operand),
+            (Self::Left, ScalarExpression::Binary { left, .. }) => Some(left),
+            (Self::Right, ScalarExpression::Binary { right, .. }) => Some(right),
+            _ => None,
+        }
+    }
+}
+
+// Bound the syntactic projection before detached AST extraction. The AST,
+// not syntax spelling, selects the operator and its authenticated read.
+fn primitive_operand_source(expression: &CstNode) -> bool {
+    let mut operator_nodes = 0;
+    expression.descendants().enumerate().all(|(index, node)| {
+        index < 16 && match node.kind() {
+            SyntaxKind::Expression | SyntaxKind::Primary | SyntaxKind::Parenthesized | SyntaxKind::Operator => true,
+            SyntaxKind::Unary | SyntaxKind::Binary => {
+                operator_nodes += 1;
+                operator_nodes == 1
+            }
+            _ => false,
+        }
+    })
 }
 
 fn only<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -507,6 +587,65 @@ mod tests {
         assert!(over.result().is_valid());
         assert!(matches!(derive_direct_startup_comptime_plan(&over, "value", layout),
             Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. })));
+    }
+
+    #[test]
+    fn direct_comptime_eager_scalar_operation_is_not_an_identity_projection() {
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (ty, body, literal, bound_expression, argument) in [
+                ("u32", "input ^ 255", "7", "7 ^ 255", DirectComptimeArgument::U32(7)),
+                ("u32", "255 ^ input", "9", "255 ^ 9", DirectComptimeArgument::U32(9)),
+                ("i32", "~input", "7", "~7", DirectComptimeArgument::I32(7)),
+                ("bool", "!input", "true", "!true", DirectComptimeArgument::Bool(true)),
+                ("bool", "input != true", "true", "true != true", DirectComptimeArgument::Bool(true)),
+            ] {
+                let direct = fresh(&format!(
+                    "{ty}({ty}) solve = fn(input) {{ comptime value {{ {body} }} }};\n{ty} answer = solve({literal});"
+                ));
+                assert!(direct.result().is_valid());
+                let actual = derive_direct_function_comptime_fragment(&direct, "value", layout)
+                    .unwrap_or_else(|error| panic!("direct body {body} on {layout:?}: {error:?}"));
+                assert_eq!(spelling(&direct, actual.facts().read()), "input");
+                assert_eq!(spelling(&direct, actual.facts().argument()), literal);
+                assert_eq!(actual.facts().value(), argument);
+                let emit_closed = |expression: &str| {
+                    let authored = fresh(&format!("{ty} answer = comptime value {{ {expression} }};"));
+                    super::super::derive_closed_comptime_fragment(&authored, "value", layout, |_| None)
+                        .unwrap_or_else(|error| panic!("ordinary oracle {expression}: {error:?}"))
+                        .llvm().to_text()
+                };
+                let text = actual.evaluator().llvm().to_text();
+                assert_eq!(text, emit_closed(bound_expression));
+                assert_ne!(text, emit_closed(literal), "{body} was reduced to an identity projection");
+            }
+
+            let batch = fresh("u32(u32) solve = fn(input) { comptime value { input ^ 255 } };\nu32 first = solve(7);\nu32 second = solve(9);\nu32 third = solve(7);");
+            let plan = derive_direct_startup_comptime_plan(&batch, "value", layout).unwrap();
+            assert_eq!(plan.calls().iter().map(DirectStartupComptimeUse::evaluator_index).collect::<Vec<_>>(), [0, 1, 0]);
+            let [first, next] = plan.evaluators() else { panic!("two evaluator tuples"); };
+            assert_ne!(first.llvm().to_text(), next.llvm().to_text());
+        }
+    }
+
+    #[test]
+    fn direct_comptime_eager_scope_rejects_unaudited_operations_and_multiple_reads() {
+        for (out, input, body, argument) in [
+            ("i32", "i32", "input + 1", "7"),
+            ("i32", "i32", "-input", "7"),
+            ("i32", "i32", "input << 1", "7"),
+            ("bool", "i32", "input < 8", "7"),
+            ("bool", "bool", "false && input", "true"),
+            ("u32", "u32", "input ^ input", "7"),
+        ] {
+            let authored = fresh(&format!(
+                "{out}({input}) solve = fn(input) {{ comptime value {{ {body} }} }};\n{out} answer = solve({argument});"
+            ));
+            assert!(authored.result().is_valid(), "fixture {body}");
+            assert!(matches!(derive_direct_function_comptime_fragment(&authored, "value", ScalarTargetLayout::WASM32),
+                Err(ClosedComptimeRejection::Unsupported {
+                    feature: "comptime accepts one audited eager scalar operator with one formal read", ..
+                })), "unexpectedly admitted {body}");
+        }
     }
 
     #[test]
