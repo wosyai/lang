@@ -2496,12 +2496,74 @@ proof leaf_contract for echo(entry) -> (out) where (entry == 3) ensures (out == 
                 }
             }
         }
+        let mixed_leaf = r#"%%start
+u8(u8) echo = fn(value) { value };
+proof live for echo(entry) -> (out) where (entry == 3) ensures (out == 4) {}
+u8[2]() make = fn { [7, 1] };
+proof cells for make() -> (items)
+    forall (u64 i where i == 0) ensures (items[i] == 8)
+{ core.show(items[i] == 8); }
+core.require(false, { .stdout = "leaf"; .stderr = ""; .code = 6; .files = []; });
+u8 observed = echo(3);
+core.require(observed == 3, { .stdout = "not selected"; .stderr = ""; .code = 9; .files = []; });
+u8[2] actual = make();
+u8 cell = actual[0];
+core.require(cell == 7, { .stdout = "not selected"; .stderr = ""; .code = 9; .files = []; });
+%%end"#;
+        for layout in ["native", "wasm-wasip1"] {
+            fs::write(&leaf_manifest, saved_leaf_manifest.replace("wasm-wasip1", layout)).unwrap();
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let run = |cap| configured_check::check_targets_with_private_authored_limit(
+                    root, None, "dev", scope, NonZeroUsize::new(cap).unwrap(),
+                ).ok().unwrap();
+                for deferred in [false, true] {
+                    let leaf = if deferred { mixed_leaf.replace("u8[2] actual = make();\nu8 cell = actual[0];", "u8 cell = 7;") }
+                        else { mixed_leaf.to_owned() };
+                    assert_eq!(leaf != mixed_leaf, deferred);
+                    fs::write(&leaf_source, &leaf).unwrap();
+                    let old = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+                    let old_last = old.last().unwrap();
+                    let old_diagnostics = ordered_check_diagnostics(old_last.outcome.as_ref().unwrap(), &old_last.texts).unwrap();
+                    for (cap, output, authored_leaf) in [(1, "app", false), (4, "appableaf", true), (8, "appableaf", true)] {
+                        let receipts = run(cap);
+                        let reports = checked_publication_reports(&receipts).unwrap_or_else(|receipt| panic!("mixed dependency check rejected: {:?}", receipt.outcome.as_ref().err()));
+                        let last = receipts.last().unwrap();
+                        assert_eq!(last.root, root.join("leaf"));
+                        let formal = reports.last().unwrap();
+                        assert_eq!(formal.directives.len(), usize::from(authored_leaf));
+                        let [scalar] = formal.diagnostics.as_slice() else { panic!("actual transitive dependency scalar proof survives cap"); };
+                        assert_eq!(scalar.proof.source.package, "leaf");
+                        assert_eq!(scalar.invocation.returned, 3.into());
+                        // Selected dependency targets use their own declared package scope,
+                        // including when the app uses --main-flow-only.
+                        let [array] = formal.aggregate_diagnostics.as_slice() else { panic!("transitive dependency array proof survives cap"); };
+                        assert_eq!(array.proof.source.package, "leaf");
+                        assert_eq!(array.call.is_none(), deferred);
+                        assert_eq!(array.cell.as_ref().unwrap().value, 7.into());
+                        assert_eq!(ordered_check_diagnostics(formal, &last.texts).unwrap(), old_diagnostics);
+                        let plan = plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()).unwrap();
+                        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+                        assert_eq!(plan.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), 3);
+                        assert_eq!(stdout, output.as_bytes());
+                        assert!(stderr.is_empty() && !root.join(".wosy").exists());
+                    }
+                }
+                fs::write(&leaf_source, mixed_leaf.replace("core.require(false,", "core.require(false || true,")).unwrap();
+                let refused = run(1);
+                let [rejected] = refused.as_slice() else { panic!("unsupported mixed owner must not disappear behind cap"); };
+                assert_eq!(rejected.root, root.join("leaf"));
+                assert!(matches!(rejected.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(checked_publication_reports(&refused).is_err());
+                assert!(!root.join(".wosy").exists());
+                fs::write(&leaf_source, mixed_leaf.replace("u8 cell = actual[0]", "bool cell = actual[0]")).unwrap();
+                let invalid = run(1);
+                assert!(matches!(invalid.as_slice(), [failure]
+                    if failure.root == root.join("leaf") && matches!(failure.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Invalid(_)))));
+                assert!(checked_publication_reports(&invalid).is_err());
+                assert!(!root.join(".wosy").exists());
+            }
+        }
         fs::write(&leaf_manifest, saved_leaf_manifest).unwrap();
-        fs::write(&leaf_source, proof_only_leaf.replace("%%end", r#"core.require(false, { .stdout = "leaf"; .stderr = ""; .code = 6; .files = []; }); %%end"#)).unwrap();
-        let refused = private(1);
-        let [rejected] = refused.as_slice() else { panic!("mixed owner cannot disappear behind cap"); };
-        assert_eq!(rejected.root, root.join("leaf"));
-        assert!(matches!(rejected.outcome, Err(wosy_compiler::ScalarOrderedCheckerOutcome::Unsupported)));
         fs::write(&leaf_source, body("leaf", 6)).unwrap();
         fs::write(&leaf_dormant, old_dormant).unwrap();
 

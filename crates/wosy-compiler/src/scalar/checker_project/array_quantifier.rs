@@ -350,7 +350,7 @@ impl<'a> Cohort<'a> {
     /// Actual proof receipts and closed no-incoming-edge deferred claims use
     /// one prepared owner and share a single metered startup walk.
     pub(super) fn run_capped(
-        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: std::num::NonZeroUsize,
+        &self, owner: &PreparedProofModule, scope: ScalarCheckerScope, cap: Option<std::num::NonZeroUsize>,
         bare: Option<&PlannedModuleProof<'_>>, rank: Option<&PlannedModuleProof<'_>>, provider: Option<&SourceIdentity>,
     ) -> Result<(MainFlowProofReceipt, StartupAuthoredCompletion), ProjectCheck> {
         use failure_search::StartupProofRole::{Aggregate, Bare, Ranked};
@@ -390,7 +390,10 @@ impl<'a> Cohort<'a> {
         if let Some(observer) = scalar.as_mut() { observer.finish_plans(prepared, scope)?; }
         let incoming = calls.owned_direct_startup_callable_uses(root, provider,
             targets.iter().map(|(_, source, span, _)| (*source, *span)), rank.map(|plan| (plan.target.1, plan.function.name_span))).ok_or(ProjectCheck::Unsupported)?;
-        let mut trace = failure_search::StartUpSearch::new(root, cap);
+        let mut trace = match cap {
+            Some(cap) => failure_search::StartUpSearch::new(root, cap),
+            None => failure_search::StartUpSearch::formal_only(root),
+        };
         trace.retain_after_cutoff = true;
         trace.named_cross_source = provider.is_some();
         let mut reached_arrays = HashSet::new();
@@ -432,9 +435,13 @@ impl<'a> Cohort<'a> {
             .map_err(|_| ProjectCheck::Unsupported)?.into_inner();
         if trace.invalid() || !trace.required_sites.is_empty() || evidence.seen != reached_arrays
             || effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty()
-            || cap.get().checked_sub(trace.remaining()) != Some(effects.records.len())
+            || cap.map_or(0, std::num::NonZeroUsize::get).checked_sub(trace.remaining()) != Some(effects.records.len())
         { return Err(ProjectCheck::Unsupported); }
         let (completion, mut active) = match init {
+            Ok(init) if cap.is_none() => {
+                let applicable = evidence.complete_startup(&init.reached)?;
+                (StartupAuthoredCompletion::LimitReached, init.had_obligations || applicable)
+            },
             Ok(init) if trace.remaining() > 0 => {
                 let applicable = evidence.complete_startup(&init.reached)?;
                 (StartupAuthoredCompletion::Exhausted, init.had_obligations || applicable)

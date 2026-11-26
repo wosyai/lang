@@ -55,6 +55,7 @@ pub(in super::super) struct StartUpSearch {
     pub(super) named_observations: Vec<StartupProofObservation>,
     pub(super) required_sites: HashMap<OccurrenceOrdinal, (PreparedCallable, StartupProofRole)>,
     pub(super) retain_after_cutoff: bool,
+    finish_dormant_startup: bool,
     pub(super) metered_frames: bool,
     pub(super) pointee_route: Option<PointeeRoute>,
     pub(super) contextual_route: Option<(PreparedCallable, PreparedCallable)>,
@@ -67,11 +68,21 @@ pub(in super::super) struct StartUpSearch {
 
 impl StartUpSearch {
     pub(super) fn new(root: &SourceIdentity, cap: NonZeroUsize) -> Self {
-        Self { remaining: cap.get(), prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, metered_frames: false,
+        Self::with_budget(root, cap.get(), false)
+    }
+
+    fn with_budget(root: &SourceIdentity, remaining: usize, finish_dormant_startup: bool) -> Self {
+        Self { remaining, prefix: vec![PathStep::Startup(root.clone())], selected: HashSet::new(), work: 0, invalid: false, proof_free_scalar_initializers: false, named_target: None, named_cross_source: false, named_observations: Vec::new(), required_sites: HashMap::new(), retain_after_cutoff: false, finish_dormant_startup, metered_frames: false,
             pointee_route: None, contextual_route: None, contextual_observed: false, ranked_target: None, ranked_observations: Vec::new(),
             #[cfg(test)]
             ranked_entries: Vec::new(),
         }
+    }
+
+    /// A separately prepared proof-bearing package whose command budget
+    /// was already spent. It has no authored admission from its first item.
+    pub(super) fn formal_only(root: &SourceIdentity) -> Self {
+        Self::with_budget(root, 0, true)
     }
 
     pub(in super::super) fn branch(&mut self, condition: SourceSpan, accepted: bool) -> Option<()> {
@@ -118,6 +129,9 @@ impl StartUpSearch {
     pub(super) fn invalidate(&mut self) { self.invalid = true; }
     pub(super) fn enroll_proof_sites(&mut self, target: PreparedCallable, role: StartupProofRole, sites: &[OccurrenceOrdinal]) -> Option<()> {
         super::super::checker_flow::charge_call_work(&mut self.work, sites.len())?;
+        // At least one actual observation means the existing required-site
+        // continuation, not the dormant-only lane, owns the stopping point.
+        if !sites.is_empty() { self.finish_dormant_startup = false; }
         for &site in sites {
             if self.required_sites.insert(site, (target, role)).is_some() { return None; }
         }
@@ -154,7 +168,7 @@ impl StartUpSearch {
 
     pub(in super::super) fn proof_only_continuation(&self) -> bool {
         !self.invalid && self.remaining == 0
-            && ((self.contextual_route.is_some() && !self.contextual_observed)
+            && (self.finish_dormant_startup || (self.contextual_route.is_some() && !self.contextual_observed)
                 || self.pending_named_startup_observation()
                 || self.pointee_route.as_ref().is_some_and(|route| !route.pending_calls.is_empty()))
     }

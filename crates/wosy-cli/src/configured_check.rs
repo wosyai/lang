@@ -302,9 +302,8 @@ fn map_dependency_owners<T>(
     Ok(receipts)
 }
 
-/// Private configured routes classify the exact prepared primary. Non-primary
-/// owners remain explicitly limited to the previously supported dependency
-/// lanes. No fallback to the unbounded evaluator for authored owners.
+/// Private configured routes classify each exact prepared owner before
+/// publishing. No unbounded fallback for mixed proof/authored dependencies.
 #[cfg(test)]
 pub(crate) fn check_targets_with_private_authored_limit(
     root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
@@ -338,6 +337,7 @@ fn run_private_prepared_owners(
         ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
         Primary(PreparedScalarOrderedCheck),
         DependencyProofOnly(PreparedScalarOrderedCheck),
+        DependencyNamed(PreparedScalarOrderedCheck),
     }
     let mut owners = Vec::with_capacity(prepared.len());
     for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
@@ -347,6 +347,8 @@ fn run_private_prepared_owners(
             }
             if check.is_private_named_without_authored_paths()? {
                 Ok(Owner::DependencyProofOnly(check))
+            } else if check.supports_private_named_authored_dependency() {
+                Ok(Owner::DependencyNamed(check))
             } else {
                 check.into_startup_authored_owner().map(Owner::ProofFree)
             }
@@ -370,12 +372,18 @@ fn run_private_prepared_owners(
                 selected.push(ConfiguredCheckReceipt { root, outcome, texts });
                 continue;
             }
+            Owner::DependencyNamed(check) if remaining == 0 => {
+                let outcome = check.run_private_named_after_command_cap();
+                if outcome.is_err() { return vec![ConfiguredCheckReceipt { root, outcome, texts }]; }
+                selected.push(ConfiguredCheckReceipt { root, outcome, texts });
+                continue;
+            }
             authored => authored,
         };
         let Some(cap) = std::num::NonZeroUsize::new(remaining) else { continue; };
         let (report, completion) = match match owner {
             Owner::ProofFree(owner) => owner.run_report(cap),
-            Owner::Primary(owner) => owner.run_private_authored_root(cap),
+            Owner::Primary(owner) | Owner::DependencyNamed(owner) => owner.run_private_authored_root(cap),
             Owner::DependencyProofOnly(_) => unreachable!("formal owners do not use the authored quota"),
         } {
             Ok(report) => report,
