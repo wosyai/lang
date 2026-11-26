@@ -435,3 +435,50 @@ unit((*u8(*u8)), *u8) inspect = fn(callback, input) {
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
     }
 }
+
+#[test]
+fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch() {
+    let text = "%%start\n*u8(*u8) forward = fn(input) { input };\nunit(bool) examine = fn(use_value) { u8 value = 7; *u8 held = forward(&value); if (use_value) { value = 8; } else { held; }; value; };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let call_sites = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (provisional, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &call_sites, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let callee = &provisional[0].1.cfg;
+        let ret = callee.points.iter().find(|point| matches!(point.kind,
+            CfgPointKind::ReturnOutput { output: 0, checked: true, .. })).unwrap();
+        let origin = &callee.facts[ret.possible_origins.as_ref().unwrap().first().unwrap().0];
+        let caller = &provisional[1].1;
+        let proof = &caller.proof_points;
+        let [(bind, call)] = proof.checked_binding_initializers.as_slice() else { panic!("exact authored initializer"); };
+        let points = &caller.cfg.initial_points;
+        let CfgPointKind::Bind { binding } = &points[bind.0].kind else { panic!("typed alias holder"); };
+        let contracts = HashMap::from([(*call, CallOriginTransfer::Explicit(std::slice::from_ref(origin)))]);
+        let mut liveness = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        liveness.call_aliases = Some(CallAliasStage {
+            contracts: &contracts, initializers: &proof.checked_binding_initializers,
+            checked_outputs: &proof.resolved_checked_call_outputs, holders: Default::default(),
+        });
+        let stage = liveness.call_aliases.as_ref().unwrap();
+        assert!(stage.holds(points, binding));
+        let write = points.iter().find(|point| matches!(point.kind, CfgPointKind::Assign { .. })).unwrap();
+        let read = points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding: actual } if actual == binding)).unwrap();
+        assert!(read.id > write.id, "coarse typed alias candidate survives a sibling read");
+        assert!(!liveness.lexical_after(write.id, binding));
+        assert!(liveness.lexical.as_ref().unwrap().borrow().rows.contains_key(binding));
+        assert!(!liveness.lexical_after(read.id, binding));
+        let unknown = HashMap::from([(*call, CallOriginTransfer::WholeFormal(0))]);
+        let unchecked_stage = CallAliasStage { contracts: &unknown, initializers: &proof.checked_binding_initializers,
+            checked_outputs: &proof.resolved_checked_call_outputs, holders: Default::default() };
+        assert!(!unchecked_stage.holds(points, binding));
+        let checked = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+    }
+}

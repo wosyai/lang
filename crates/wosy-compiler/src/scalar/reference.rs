@@ -8272,11 +8272,53 @@ impl ProjectedCarrierReads {
     }
 }
 
+struct CallAliasStage<'a> {
+    contracts: &'a HashMap<CfgPointId, CallOriginTransfer<'a>>,
+    initializers: &'a [(CfgPointId, CfgPointId)],
+    checked_outputs: &'a [CfgPointId],
+    holders: std::cell::OnceCell<HashSet<&'a ReferenceBindingId>>,
+}
+
+impl<'a> CallAliasStage<'a> {
+    fn holds(&self, points: &'a [ReferenceFlowPoint], binding: &ReferenceBindingId) -> bool {
+        self.holders.get_or_init(|| self.initializers.iter().filter_map(|&(install, producer)| {
+            // Read the same typed call transfer and Bind→RHS edge used by
+            // definitive transfer. A fresh, generic, projected or opaque
+            // result cannot enter this ordinary forwarding cohort.
+            let CallOriginTransfer::Explicit([ReferenceOrigin::BorrowedFrom { parameter, loan }]) =
+                *self.contracts.get(&producer)? else { return None; };
+            let call = points.get(producer.0)?;
+            let bind = points.get(install.0)?;
+            let CfgPointKind::Call {
+                target: ResolvedCallTarget::ModuleCallable {
+                    source, concrete: ConcreteCallSelection::Declaration, ..
+                },
+                expression: ScalarExpression::Call { type_arguments, .. },
+                argument_points, output: 0,
+            } = &call.kind else { return None; };
+            let CfgPointKind::Bind { binding } = &bind.kind else { return None; };
+            let actual = points.get(argument_points.get(*parameter)?.0)?;
+            if producer >= install || call.successors.as_slice() != [install]
+                || call.scope != bind.scope || actual.scope != call.scope || actual.id >= producer
+                || self.checked_outputs.binary_search(&producer).is_err()
+                || !type_arguments.is_empty() || !matches!(binding.kind, ReferenceBindingKind::Declared)
+                || loan.mode != ScalarReferenceMutability::Shared || loan.parent.is_some()
+                || !loan.origin_place.projections.is_empty() || &loan.origin_place.source != source
+                || !matches!(&actual.kind, CfgPointKind::Borrow { loan, place }
+                    if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+                        && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. }))
+            { return None; }
+            Some(binding)
+        }).collect()).contains(binding)
+    }
+}
+
 struct ConflictLiveness<'a> {
     points: &'a [ReferenceFlowPoint],
     scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     strictly_forward: bool,
     lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
+    call_aliases: Option<CallAliasStage<'a>>,
     projected: std::cell::OnceCell<ProjectedCarrierReads>,
 }
 
@@ -8287,19 +8329,23 @@ impl<'a> ConflictLiveness<'a> {
         strictly_forward: bool,
         branched: bool,
     ) -> Self {
-        Self { points, scope_exits, strictly_forward, projected: Default::default(),
+        Self { points, scope_exits, strictly_forward, call_aliases: None, projected: Default::default(),
             lexical: (strictly_forward && branched).then(Default::default) }
+    }
+
+    fn carrier_summary(&self) -> &ProjectedCarrierReads {
+        self.projected.get_or_init(|| {
+            let mut reads = ProjectedCarrierReads::default();
+            for point in self.points { reads.record(point); }
+            reads
+        })
     }
 
     fn projected_after(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
         if self.strictly_forward && (1..=MAX_STAGED_CARRIER_DEPTH).contains(&place.projections.len())
             && place.projections.iter().all(|step| CarrierSelector::from_projection(step).is_some())
         {
-            let projected = self.projected.get_or_init(|| {
-                let mut reads = ProjectedCarrierReads::default();
-                for point in self.points { reads.record(point); }
-                reads
-            });
+            let projected = self.carrier_summary();
             if !projected.candidate(from, place) { return false; }
         }
         reference_holder_read_reachable(self.points, self.scope_exits, self.strictly_forward,
@@ -8307,6 +8353,12 @@ impl<'a> ConflictLiveness<'a> {
     }
 
     fn lexical_after(&self, from: CfgPointId, binding: &ReferenceBindingId) -> bool {
+        if self.strictly_forward && self.call_aliases.as_ref().is_some_and(|stage| stage.holds(self.points, binding))
+            && !self.carrier_summary().bindings.get(binding).and_then(|row| row.whole)
+                .is_some_and(|point| point > from)
+        {
+            return false;
+        }
         let Some(lexical) = &self.lexical else {
             return reference_read_reachable(self.points, self.scope_exits, self.strictly_forward, from, binding);
         };
@@ -11569,7 +11621,13 @@ fn transfer_reference_facts(
             std::collections::VecDeque::from([CfgPointId(0)]),
         )
     });
-    let liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
+    let mut liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
+    if strictly_forward && !contracts.is_empty() && !cfg.checked_binding_initializers.is_empty() {
+        liveness.call_aliases = Some(CallAliasStage {
+            contracts, initializers: cfg.checked_binding_initializers, checked_outputs: cfg.resolved_checked_call_outputs,
+            holders: Default::default(),
+        });
+    }
     let mut forward_cursor = 0;
     let mut joined_family = None;
     let mut forward_single_observation = None;
