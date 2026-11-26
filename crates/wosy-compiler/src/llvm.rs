@@ -484,6 +484,8 @@ fn runtime_allocation_access<'ctx>(
         }
     }
     if let Some(plan) = plan {
+        indexed.extend(plan.grouped_owning_extent_roots.iter().copied());
+        not_portable.extend(plan.grouped_owning_extent_roots.iter().copied());
         for &owner in &plan.private_runtime_access_owners {
             let id = key(owner);
             indexed.insert(id);
@@ -2603,8 +2605,11 @@ fn store_runtime_allocation<'ctx, 'module>(
         aggregate.plan().guarded_array_descriptor_leaf || aggregate.plan().fallible_allocation_leaf
             || !aggregate.plan().fallible_relay_allocations.is_empty()))
     { return Err("generated array requires its ordinary direct owning backing".into()); }
+    let grouped_extent = state.aggregate.as_ref().is_some_and(|aggregate|
+        aggregate.plan().grouped_owning_extent_roots.contains(&declaration));
     let checked_extent = widened || generated || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
-        || (prepared && state.require_release_checked_access && state.indexed_runtime_allocations.contains(&declaration));
+        || (prepared && (state.require_release_checked_access || grouped_extent)
+            && state.indexed_runtime_allocations.contains(&declaration));
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
         .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
     aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
@@ -3280,11 +3285,13 @@ fn emit_function<'ctx, 'module>(
             align_storage_alloca(slot, alignment)?;
             let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
                 aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
-            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+            } else if let Some(declaration) = array_descriptor_observer
+                .or_else(|| aggregate_plan.and_then(|plan| plan.grouped_owning_extent)).filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
-                let indexed = aggregate_plan.is_some_and(|plan| plan.array_descriptor_index_observer);
+                let indexed = aggregate_plan.is_some_and(|plan|
+                    plan.array_descriptor_index_observer || plan.grouped_owning_extent.is_some());
                 state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), indexed));
                 backing
             } else {
@@ -3657,11 +3664,13 @@ fn emit_project_function<'ctx, 'module>(
             align_storage_alloca(slot, alignment)?;
             let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some() || plan.private_runtime_access_formal.is_some()) {
                 aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
-            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+            } else if let Some(declaration) = array_descriptor_observer
+                .or_else(|| aggregate_plan.and_then(|plan| plan.grouped_owning_extent)).filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
-                let indexed = aggregate_plan.is_some_and(|plan| plan.array_descriptor_index_observer);
+                let indexed = aggregate_plan.is_some_and(|plan|
+                    plan.array_descriptor_index_observer || plan.grouped_owning_extent.is_some());
                 state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), indexed));
                 backing
             } else {

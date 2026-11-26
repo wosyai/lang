@@ -853,6 +853,47 @@ fn emit_prepared_call<'ctx, 'module>(
     if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
         return Ok(value);
     }
+    let grouped = state.aggregate.as_ref().and_then(|aggregate| {
+        let ordinal = state.body_call_nodes?.expression_ordinal(expression)?;
+        aggregate.plan().grouped_owning_extent_calls.get(&ordinal).copied()
+    });
+    if let Some(declaration) = grouped {
+        let [argument @ ScalarExpression::Name { name, .. }, ..] = arguments else {
+            return Err("grouped owning extent requires a whole lexical owner".into());
+        };
+        if state.body_call_nodes.and_then(|nodes| nodes.lexical_expression_declaration(argument)) != Some(declaration) {
+            return Err("grouped owning extent changed its lexical owner".into());
+        }
+        let [EmitValue::Basic(BasicValueEnum::PointerValue(backing)), tail @ ..] = values.as_slice() else {
+            return Err("grouped owning extent lost its backing argument".into());
+        };
+        let extent = memory::capture_grouped_owning_extent(context, state, name, declaration, *backing)?
+            .ok_or("grouped owning call lacks an authenticated array extent")?;
+        let pair = context.struct_type(&[context.ptr_type(AddressSpace::default()).into(),
+            context.i64_type().into()], false);
+        let value = state.builder.build_insert_value(pair.get_undef(), *backing, 0, "grouped_array_backing")
+            .map_err(builder_error)?.into_struct_value();
+        let value = state.builder.build_insert_value(value, extent, 1, "grouped_array_argument")
+            .map_err(builder_error)?;
+        let mut args = vec![BasicMetadataValueEnum::from(value.into_struct_value())];
+        for value in tail {
+            let EmitValue::Basic(value) = value else {
+                return Err("grouped owning transfer lost a scalar input lane".into());
+            };
+            args.push((*value).into());
+        }
+        let function = state.functions[target];
+        let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(target) else {
+            return Err("missing grouped owning transfer output signature".into());
+        };
+        if function.get_linkage() != Linkage::Internal || function.count_params() as usize != args.len()
+            || function.get_type().get_param_types().first() != Some(&pair.into())
+        {
+            return Err("grouped owning transfer changed its private formal ABI".into());
+        }
+        let call = state.builder.build_call(function, &args, "grouped_array_result").map_err(builder_error)?;
+        return ordinary_call_result(call.try_as_basic_value(), outputs);
+    }
     reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
     aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;
     emit_call_values(context, state, target, values)

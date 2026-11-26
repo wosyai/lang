@@ -286,7 +286,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
     plan.filter(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
-        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some() || body.private_runtime_access_formal.is_some())
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.grouped_owning_extent.is_some() || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some() || body.private_runtime_access_formal.is_some())
         .map(|_| Linkage::Internal)
 }
 
@@ -862,6 +862,28 @@ pub(super) fn definition_type<'ctx>(
         }
         let descriptor = array_descriptor_type(context);
         return Ok(descriptor.fn_type(&[descriptor.into()], false));
+    }
+    if let Some(plan) = plan.filter(|body| body.grouped_owning_extent.is_some()) {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("invalid grouped owning extent declaration".into());
+        };
+        if outputs.outputs.len() < 2
+            || !matches!(parameters.first(), Some(ScalarType::RuntimeArray { element, .. }) if **element == ScalarType::U8)
+            || !matches!(&outputs.outputs[0].ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8)
+            || !plan.inputs.is_empty() || plan.returning.is_some()
+            || !dynamic_return_outputs(function.span, cfg).is_empty()
+        {
+            return Err("invalid grouped owning extent ABI".into());
+        }
+        let original = definition_function_type(context, function, cfg, layout, inline_results, layouts)?;
+        let mut args: Vec<BasicMetadataTypeEnum<'ctx>> =
+            original.get_param_types().into_iter().map(Into::into).collect();
+        if args.len() != parameters.len() {
+            return Err("unexpected grouped owning extent sidecar".into());
+        }
+        args[0] = array_descriptor_type(context).into();
+        let returned = original.get_return_type().ok_or("missing grouped owning result lanes")?;
+        return Ok(returned.fn_type(&args, false));
     }
     if let Some(plan) = plan.filter(|body| body.array_descriptor_return) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
@@ -1666,7 +1688,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
-        || plan.array_descriptor_observer.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
+        || plan.array_descriptor_observer.is_some() || plan.grouped_owning_extent.is_some() || plan.guarded_array_descriptor_producer_choice.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 

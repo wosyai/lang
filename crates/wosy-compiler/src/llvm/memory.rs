@@ -552,7 +552,10 @@ pub(super) fn place_pointer<'ctx, 'module>(
             });
             let portable_local = matches!(local_extent, Some((_, LocalRuntimeExtent::PortableConstruction { .. }, true)));
             let portable_wasm_offset = state.target_layout == ScalarTargetLayout::WASM32
-                && (portable_local || portable_formal || portable_reborrow || runtime_offset.is_some_and(|receipt|
+                && (portable_local || portable_formal || portable_reborrow
+                    || (indexed_owning_formal && state.aggregate.as_ref().is_some_and(|aggregate|
+                        aggregate.plan().grouped_owning_extent.is_some()))
+                    || runtime_offset.is_some_and(|receipt|
                     receipt.address == crate::scalar::ReturnedArrayAddress::PortableDefault));
             let index = emit_place_index(context, state, index, project)?;
             if signed_selector_maximum.zip(index.get_zero_extended_constant())
@@ -869,14 +872,50 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
     if let Some(extent) = ownership::guarded_array_extent(context, state, base, address, ty)? {
         return Ok(Some(extent));
     }
+    capture_paired_runtime_extent(context, state, name, storage, element, address, for_index,
+        || state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base)))
+}
+
+fn loaded_from_slot<'ctx>(value: PointerValue<'ctx>, slot: PointerValue<'ctx>) -> bool {
+    value.as_instruction_value().is_some_and(|instruction|
+        instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
+            && instruction.get_operand(0).and_then(|operand| operand.value()) == Some(slot.into()))
+}
+
+pub(super) fn capture_grouped_owning_extent<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    name: &str,
+    declaration: wosy_syntax::ByteSpan,
+    backing: PointerValue<'ctx>,
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
+    let Some((storage, ScalarType::RuntimeArray { element, .. })) = state.storage.get(name) else {
+        return Ok(None);
+    };
+    if (*storage != backing || state.runtime_array_allocations.get(name) != Some(&true))
+        && !loaded_from_slot(backing, *storage) {
+        return Err("grouped owning extent lost its paired backing".into());
+    }
+    capture_paired_runtime_extent(context, state, name, storage, element, backing, true, || Some(declaration))
+}
+
+fn capture_paired_runtime_extent<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    name: &str,
+    storage: &PointerValue<'ctx>,
+    element: &ScalarType,
+    address: PointerValue<'ctx>,
+    for_index: bool,
+    exact_declaration: impl FnOnce() -> Option<wosy_syntax::ByteSpan>,
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
     let Some((declaration, extent, checked_extent)) = state.local_runtime_extents.get(storage) else {
-        // Incoming, forwarded and other unresolved extents use their existing path.
         return Ok(None);
     };
     if for_index && !checked_extent {
         return Ok(None);
     }
-    if state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base)) != Some(*declaration) {
+    if exact_declaration() != Some(*declaration) {
         return Err("runtime-array index differs from its qualified local declaration".to_owned());
     }
     match extent {
@@ -912,10 +951,7 @@ pub(super) fn capture_local_runtime_extent<'ctx>(
         LocalRuntimeExtent::OwningFormal(length) if state.runtime_array_allocations.get(name) == Some(&false) => {
             // Extent observation uses the slot; address formation uses its exact
             // loaded backing. Only the sealed route enables the latter use.
-            let exact_backing = address.as_instruction_value().is_some_and(|instruction|
-                instruction.get_opcode() == inkwell::values::InstructionOpcode::Load
-                    && instruction.get_operand(0).and_then(|operand| operand.value()) == Some((*storage).into()));
-            if (!for_index && *storage == address) || (for_index && exact_backing) {
+            if (!for_index && *storage == address) || (for_index && loaded_from_slot(address, *storage)) {
                 Ok(Some(*length))
             } else {
                 Err("owning formal index lost its descriptor backing".into())

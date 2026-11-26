@@ -3132,6 +3132,9 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_index_observer: bool,
+    pub(crate) grouped_owning_extent: Option<ByteSpan>,
+    pub(crate) grouped_owning_extent_calls: BTreeMap<usize, ByteSpan>,
+    pub(crate) grouped_owning_extent_roots: BTreeSet<(u32, u32)>,
     pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
     pub(crate) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
@@ -6115,6 +6118,159 @@ fn seal_array_descriptor_identities(
     }
 }
 
+// Owning grouped results keep the existing result lanes. The private
+// incoming extent is valid only when every normal path returns that same
+// owner in lane zero, and every direct user can supply a proven pair.
+fn grouped_owning_formal(body: &Body<'_>) -> Option<ByteSpan> {
+    let facts = body.facts?;
+    let [first, ..] = body.sites.boundary.parameters.as_slice() else { return None };
+    let [returned, _, ..] = body.sites.boundary.results.as_slice() else { return None };
+    if !body.is_monomorphic || !facts.array_neutral || facts.array_invalid || facts.array_returns.is_empty()
+        || !same_runtime_array_type(&first.ty, &returned.ty)
+        || !matches!(&first.ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8)
+        || !body.sites.boundary.parameters[1..].iter().all(|slot| array_neutral_scalar(&slot.ty))
+        || !body.sites.boundary.results[1..].iter().all(|slot| array_neutral_scalar(&slot.ty))
+    {
+        return None;
+    }
+    Some(first.span)
+}
+
+fn exclude_grouped_roots_on_resolved_effect(
+    roots: &mut BTreeSet<ReferenceBindingId>,
+    effect: &CfgPointKind,
+) {
+    match effect {
+        CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
+        | CfgPointKind::Invalidate { candidates, .. } => {
+            if candidates.is_empty() {
+                roots.clear();
+            } else {
+                for candidate in candidates {
+                    roots.remove(&candidate.place.binding);
+                }
+            }
+        }
+        CfgPointKind::Release { target: ReleaseTarget::Raw { .. } } => roots.clear(),
+        _ => {}
+    }
+}
+
+fn grouped_owning_extent_calls(
+    ordinary: &OrdinaryCohorts,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    leaves: &BTreeSet<BodyKey>,
+    neighbors: &BTreeMap<BodyKey, BTreeSet<BodyKey>>,
+    result: &mut ClosedAggregates,
+) {
+    // Reuse the same grounded return proof used to publish exact grouped
+    // same-owner rebinds. Anything else keeps its ordinary existing ABI.
+    let mut cohort: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)| {
+        if key.2.is_some() || !(leaves.contains(&key)
+            || neighbors.get(&key).is_some_and(|deps| deps.is_subset(leaves))) {
+            return None;
+        }
+        Some((key, grouped_owning_formal(body)?))
+    }).collect();
+    if cohort.is_empty() { return }
+    let mut calls = BTreeMap::<BodyKey, Vec<(BodyKey, usize, ByteSpan, bool)>>::new();
+    let mut roots = HashMap::<BodyKey, BTreeSet<ReferenceBindingId>>::new();
+    cohort.retain(|key, _| {
+        let Some(Some(users)) = ordinary.transport_uses.get(key) else { return false };
+        if users.is_empty() { return false }
+        let mut sites = Vec::with_capacity(users.len());
+        for &(caller, ordinal) in users {
+            let Some(body) = bodies.get(&caller) else { return false };
+            let Some(facts) = body.facts else { return false };
+            let Some(point) = body.cfg.primary_call_point(OccurrenceOrdinal(ordinal)) else { return false };
+            let Some((_, _, owner)) = facts.array_calls.get(&point) else { return false };
+            if target_body(declarations, body.cfg, point) != Some(*key)
+                || !result.bodies.get(&caller).is_some_and(|plan| plan.same_array_rebinds.contains_key(&ordinal)) {
+                return false;
+            }
+            let incoming = body.sites.boundary.parameters.first().is_some_and(|formal|
+                formal.span == owner.declaration_span && matches!(formal.ty, ScalarType::RuntimeArray { .. }));
+            if !incoming && !roots.entry(caller).or_insert_with(|| {
+                let mut constructed: BTreeSet<_> = facts.allocation_slots.keys().filter_map(|bind|
+                    match &body.cfg.initial_points.get(bind.0)?.kind {
+                        CfgPointKind::Bind { binding } if body.cfg.allocations.contains(binding) => Some(binding.clone()),
+                        _ => None,
+                    }).collect();
+                let caller_plan = &result.bodies[&caller];
+                // Use precisely the resolved candidate union used by allocation
+                // planning; the original graph does not name destructive aliases.
+                for point in &body.cfg.points {
+                    match &point.kind {
+                        CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
+                            let same_owner = facts.array_rebinds.get(&point.id)
+                                .and_then(|(call, _, destination)| facts.array_calls.get(call)
+                                    .map(|(ordinal, _, source)| (ordinal, source, destination)))
+                                .is_some_and(|(ordinal, source, destination)| source == &target.binding
+                                    && caller_plan.same_array_rebinds.get(&ordinal.0) == Some(&destination.0));
+                            if !same_owner { constructed.remove(&target.binding); }
+                        }
+                        effect => exclude_grouped_roots_on_resolved_effect(&mut constructed, effect),
+                    }
+                }
+                constructed
+            }).contains(owner) { return false }
+            sites.push((caller, ordinal, owner.declaration_span, incoming));
+        }
+        calls.insert(*key, sites);
+        true
+    });
+    let mut dependents = HashMap::<BodyKey, Vec<BodyKey>>::new();
+    let mut refused = Vec::new();
+    for &key in cohort.keys() {
+        let dependencies = calls[&key].iter().filter_map(|(caller, _, _, incoming)|
+            incoming.then_some(*caller)).chain(neighbors.get(&key).into_iter().flatten().copied());
+        for dependency in dependencies {
+            if cohort.contains_key(&dependency) {
+                dependents.entry(dependency).or_default().push(key);
+            } else {
+                refused.push(key);
+            }
+        }
+    }
+    while let Some(key) = refused.pop() {
+        if cohort.remove(&key).is_some() {
+            refused.extend(dependents.remove(&key).into_iter().flatten());
+        }
+    }
+    let mut connected = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
+    for key in cohort.keys() {
+        for &(caller, _, _, incoming) in &calls[key] {
+            if incoming {
+                connected.entry(caller).or_default().insert(*key);
+                connected.entry(*key).or_default().insert(caller);
+            }
+        }
+    }
+    let mut required = BTreeSet::new();
+    let mut pending: Vec<_> = cohort.iter().filter_map(|(&key, &formal)| {
+        bodies[&key].cfg.initial_points.iter().any(|point| match &point.kind {
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } =>
+                matches!(candidates.as_slice(), [place] if place.binding.declaration_span == formal
+                    && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
+            _ => false,
+        }).then_some(key)
+    }).collect();
+    while let Some(key) = pending.pop() {
+        if required.insert(key) {
+            pending.extend(connected.get(&key).into_iter().flatten().copied());
+        }
+    }
+    for (key, formal) in cohort.into_iter().filter(|(key, _)| required.contains(key)) {
+        result.bodies.entry(key).or_default().grouped_owning_extent = Some(formal);
+        for &(caller, call, owner, incoming) in &calls[&key] {
+            let plan = result.bodies.entry(caller).or_default();
+            plan.grouped_owning_extent_calls.insert(call, owner);
+            if !incoming { plan.grouped_owning_extent_roots.insert((owner.start, owner.end)); }
+        }
+    }
+}
+
 fn closed_descriptor_routes<Route>(
     ordinary: &OrdinaryCohorts,
     routes: &BTreeMap<BodyKey, Route>,
@@ -6864,6 +7020,9 @@ fn closed_aggregates<'a>(
                     .filter(|(point, call)| exact_borrowed_extent_forward(&body, *point, *call))
                 {
                     borrowed_extent_observers.insert(key, BorrowedExtentRoute::Forward(call, point));
+                    ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                }
+                if grouped_owning_formal(&body).is_some() {
                     ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 }
                 if let Some(route) = array_descriptor_route(&body) {
@@ -8122,6 +8281,7 @@ fn closed_aggregates<'a>(
             }
         }
 
+        grouped_owning_extent_calls(&ordinary, &bodies, &declarations, &array_leaves, &array_neighbors, &mut result);
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &widened_owning_receives, &declarations, &array_descriptor_identities, &bodies, &mut result);
         for &(key, body, _, call, source, receiver, replace) in &widened_owning_receives {
@@ -10164,6 +10324,43 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_extent_excludes_resolved_and_opaque_destructive_effects() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+        let span = ByteSpan::new(0, 0);
+        let root = ReferenceBindingId {
+            source: source.clone(), function_span: span, declaration_span: span,
+            block_span: span, kind: ReferenceBindingKind::Declared,
+        };
+        let sibling = ReferenceBindingId { declaration_span: ByteSpan::new(1, 2), ..root.clone() };
+        let address_span = SourceSpan { source: source.clone(), range: span };
+        let place = ReferencePlaceId {
+            source, function_span: span, declaration_span: span, block_span: span,
+            binding: root.clone(), projections: Vec::new(),
+            place: ScalarPlace::Name { name: "bytes".into(), span },
+        };
+        let candidate = InvalidationCandidate {
+            origin: ReferenceOriginId(0), place: place.clone(),
+            loan: ReferenceLoanId {
+                mode: ScalarReferenceMutability::Mutable, origin_place: place,
+                creation_span: span, parent: None,
+            },
+        };
+        let mut roots = BTreeSet::from([root.clone(), sibling.clone()]);
+        let release = |candidates| CfgPointKind::Release { target: ReleaseTarget::Checked {
+            address_point: CfgPointId(0), candidates, address_span: address_span.clone(),
+        }};
+        exclude_grouped_roots_on_resolved_effect(&mut roots, &release(vec![candidate]));
+        assert_eq!(roots, BTreeSet::from([sibling]));
+        exclude_grouped_roots_on_resolved_effect(&mut roots, &release(Vec::new()));
+        assert!(roots.is_empty());
+        roots.insert(root.clone());
+        exclude_grouped_roots_on_resolved_effect(&mut roots, &CfgPointKind::Release {
+            target: ReleaseTarget::Raw { binding: root },
+        });
+        assert!(roots.is_empty());
+    }
 
     #[test]
     fn selected_return_components_require_external_primary_and_exact_internal_edges() {

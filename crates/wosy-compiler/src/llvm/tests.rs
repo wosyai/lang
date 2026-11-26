@@ -12310,6 +12310,67 @@ if (scoped(false) != 33) { core.system_panic(); };
 }
 
 #[test]
+fn closed_grouped_recursive_owner_keeps_dynamic_byte_extent() {
+    let text = "%%start
+enum ReadMode { skip; sample; }
+(u8[], u8, ReadMode)(u8[], u64, u64, u8, ReadMode) visit = fn(bytes, index, remaining, value, mode) {
+    if (remaining == 0) {
+        if (mode == ReadMode::sample) { value = bytes[index]; };
+    } else {
+        bytes, value, mode = visit(bytes, index, remaining - 1, value, mode);
+    };
+    bytes, value, mode
+};
+u8(u64, u64) read_benign = fn(count, depth) {
+    u8[count] bytes;
+    u64 index = 1;
+    bytes[index] = 17;
+    u8 value = 0;
+    ReadMode mode = ReadMode::sample;
+    bytes, value, mode = visit(bytes, index, depth, value, mode);
+    if (mode != ReadMode::sample) { core.system_panic(); };
+    if (bytes[index] != value) { core.system_panic(); };
+    value
+};
+u8(u64, u64) no_local_index = fn(count, depth) {
+    u8[count] bytes;
+    u8 value = 23;
+    ReadMode mode = ReadMode::skip;
+    bytes, value, mode = visit(bytes, 0, depth, value, mode);
+    if (mode != ReadMode::skip) { core.system_panic(); };
+    value
+};
+if (no_local_index(3, 2) != 23) { core.system_panic(); };
+if (read_benign(3, 2) != 17) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let symbol = self_tail_test_symbol(&prepared.project().modules[0].source, true, "visit");
+        let function = llvm.split_once(&format!("define internal {{ ptr, i8, i32 }} @{symbol}("))
+            .unwrap_or_else(|| panic!("missing private grouped owning callee: {llvm}")).1.split_once("\n}").unwrap().0;
+        assert!(function.contains("{ ptr, i64 } %bytes") && function.contains("array_formal_extent")
+            && function.contains("load i8") && function.contains("grouped_array_argument"), "{function}");
+        let helper = project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent");
+        let guard = function.find(&format!("call void @{helper}(")).expect("ordinary bounds helper");
+        let address = function.find("getelementptr").expect("byte addressing");
+        assert!(guard < address, "{function}");
+        assert!(!function.contains("@__wosy_core_free("), "{function}");
+    }
+}
+
+#[test]
 fn closed_owning_array_descriptor_guards_first_byte_read() {
     let text = "%%start
 u8[](u8[]) inspect = fn(values) {
