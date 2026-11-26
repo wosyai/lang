@@ -8155,18 +8155,21 @@ struct LexicalConflictMemo {
     retained: usize,
 }
 
-// A conservative use relation for directly named, one-field carriers. Forget
+// A conservative use relation for directly named one-projection carriers. Forget
 // branches, writes and kills here; only the existing CFG walk can prove a
 // candidate unreachable on a particular path. A read into a lexical alias is
-// a use of the field, not a transfer of the alias's subsequent uses back to it.
+// a use of the projection, not a transfer of the alias's subsequent uses back to it.
 #[derive(Default)]
-struct FieldCarrierReads {
+struct ProjectedCarrierReads {
     whole: HashMap<ReferenceBindingId, CfgPointId>,
     fields: HashMap<ReferenceBindingId, BTreeMap<ScalarStructFieldId, CfgPointId>>,
+    indices: HashMap<ReferenceBindingId, BTreeMap<BigInt, CfgPointId>>,
+    last_field: HashMap<ReferenceBindingId, CfgPointId>,
+    last_index: HashMap<ReferenceBindingId, CfgPointId>,
     opaque: Option<CfgPointId>,
 }
 
-impl FieldCarrierReads {
+impl ProjectedCarrierReads {
     fn record(&mut self, point: &ReferenceFlowPoint) {
         match &point.kind {
             CfgPointKind::Read { binding } => {
@@ -8188,15 +8191,30 @@ impl FieldCarrierReads {
         match place.projections.first() {
             Some(ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))) => {
                 self.fields.entry(place.binding.clone()).or_default().insert(field.clone(), at);
+                self.last_field.insert(place.binding.clone(), at);
+            }
+            Some(ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })) => {
+                self.indices.entry(place.binding.clone()).or_default().insert(value.clone(), at);
+                self.last_index.insert(place.binding.clone(), at);
             }
             _ => { self.whole.insert(place.binding.clone(), at); }
         }
     }
 
-    fn candidate(&self, from: CfgPointId, binding: &ReferenceBindingId, field: &ScalarStructFieldId) -> bool {
+    fn candidate(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
+        let binding = &place.binding;
+        let later = |latest: Option<&CfgPointId>| latest.is_some_and(|point| *point > from);
         self.opaque.is_some_and(|p| p > from)
-            || self.whole.get(binding).is_some_and(|p| *p > from)
-            || self.fields.get(binding).and_then(|fields| fields.get(field)).is_some_and(|p| *p > from)
+            || later(self.whole.get(binding))
+            || match place.projections.as_slice() {
+                [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =>
+                    later(self.last_index.get(binding))
+                        || later(self.fields.get(binding).and_then(|fields| fields.get(field))),
+                [ReferencePlaceProjection::Index(ScalarExpression::Integer { value, .. })] =>
+                    later(self.last_field.get(binding))
+                        || later(self.indices.get(binding).and_then(|indices| indices.get(value))),
+                _ => true,
+            }
     }
 }
 
@@ -8205,7 +8223,7 @@ struct ConflictLiveness<'a> {
     scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     strictly_forward: bool,
     lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
-    fields: std::cell::OnceCell<FieldCarrierReads>,
+    projected: std::cell::OnceCell<ProjectedCarrierReads>,
 }
 
 impl<'a> ConflictLiveness<'a> {
@@ -8215,22 +8233,21 @@ impl<'a> ConflictLiveness<'a> {
         strictly_forward: bool,
         branched: bool,
     ) -> Self {
-        Self { points, scope_exits, strictly_forward, fields: Default::default(),
+        Self { points, scope_exits, strictly_forward, projected: Default::default(),
             lexical: (strictly_forward && branched).then(Default::default) }
     }
 
     fn projected_after(&self, from: CfgPointId, place: &ReferencePlaceId) -> bool {
-        if self.strictly_forward {
-            if let [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =
-                place.projections.as_slice()
-            {
-                let fields = self.fields.get_or_init(|| {
-                    let mut reads = FieldCarrierReads::default();
-                    for point in self.points { reads.record(point); }
-                    reads
-                });
-                if !fields.candidate(from, &place.binding, field) { return false; }
-            }
+        if self.strictly_forward && matches!(place.projections.as_slice(),
+            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))]
+            | [ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })])
+        {
+            let projected = self.projected.get_or_init(|| {
+                let mut reads = ProjectedCarrierReads::default();
+                for point in self.points { reads.record(point); }
+                reads
+            });
+            if !projected.candidate(from, place) { return false; }
         }
         reference_holder_read_reachable(self.points, self.scope_exits, self.strictly_forward,
             from, &place.binding, Some(place))
@@ -8297,6 +8314,61 @@ impl<'a> ConflictLiveness<'a> {
                 .expect("refined successor fact")
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn projected_literal_carriers_run_precise_search_only_for_conservative_candidates() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "liveness.w".into(), "r1".into());
+    let span = ByteSpan::new(0, 40);
+    let holder = ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(1, 2), kind: ReferenceBindingKind::Declared,
+    };
+    let carrier = |index: ScalarExpression| ReferencePlaceId {
+        binding: holder.clone(), source: source.clone(), function_span: span, block_span: span,
+        declaration_span: holder.declaration_span,
+        place: ScalarPlace::Index {
+            base: Box::new(ScalarPlace::Name { name: "refs".into(), span }),
+            index: Box::new(index.clone()), span, index_span: span,
+        },
+        projections: vec![ReferencePlaceProjection::Index(index)],
+    };
+    let literal = |value: u8| carrier(ScalarExpression::Integer { value: value.into(), span });
+    let first = literal(0);
+    let second = literal(1);
+    let unknown = carrier(ScalarExpression::Name { name: "selector".into(), span });
+    let make = |id, kind, successors: Vec<_>| ReferenceFlowPoint {
+        id: CfgPointId(id), kind, scope: ReferenceScopeId(0),
+        source_span: SourceSpan::new(source.clone(), span), possible_origins: None,
+        successors: successors.into_iter().map(CfgPointId).collect(),
+    };
+    let read = |place: &ReferencePlaceId| CfgPointKind::ReadPlace {
+        place: place.place.clone(), pointer_point: None, candidates: vec![place.clone()], reads_origin: true,
+    };
+    let sibling_only = [
+        make(0, CfgPointKind::Entry, vec![1]),
+        make(1, read(&second), vec![]),
+    ];
+    let liveness = ConflictLiveness::new(&sibling_only, None, true, false);
+    assert!(!liveness.projected_after(CfgPointId(0), &first));
+    let summary = liveness.projected.get().unwrap();
+    assert!(!summary.candidate(CfgPointId(0), &first));
+    assert!(liveness.projected_after(CfgPointId(0), &second));
+    let killed = [
+        make(0, CfgPointKind::Entry, vec![1]),
+        make(1, CfgPointKind::Assign { target: first.clone(), rhs_point: CfgPointId(0),
+            previous_origins: BTreeSet::new(), previous_loans: vec![] }, vec![2]),
+        make(2, read(&first), vec![]),
+    ];
+    let liveness = ConflictLiveness::new(&killed, None, true, false);
+    assert!(!liveness.projected_after(CfgPointId(0), &first));
+    assert!(liveness.projected.get().unwrap().candidate(CfgPointId(0), &first));
+    assert!(liveness.projected_after(CfgPointId(1), &first));
+    let may_alias = [make(0, CfgPointKind::Entry, vec![1]), make(1, read(&unknown), vec![])];
+    let liveness = ConflictLiveness::new(&may_alias, None, true, false);
+    assert!(liveness.projected_after(CfgPointId(0), &first));
+    assert!(liveness.projected_after(CfgPointId(0), &second));
 }
 
 #[cfg(test)]
