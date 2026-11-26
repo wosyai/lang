@@ -2485,19 +2485,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     // An exact effect body and the later checked output edge
                     // are both needed. A return contract alone grants no call effects.
                     if source == &self.source && !calls.declared_unsafe_calls.contains(&ordinal.0) {
-                        if let (Some(effect), [argument]) = (
-                            shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects),
-                            argument_points.as_slice(),
+                        if let Some(effect) = shared_scalar_read_effect(
+                            &self.source, calls, ordinal, target, self.shared_scalar_read_effects,
                         ) {
                             let call_point = CfgPointId(self.cfg.points.len());
-                            if checked_call_output && effect.returns_formal && !effect.joined_only
-                                && effect.parameter == 0
+                            if let [argument] = argument_points.as_slice() {
+                                if checked_call_output && effect.returns_formal && !effect.joined_only
+                                    && effect.parameter == 0
+                                {
+                                    author.prepare_shared_identity(call_point, *argument);
+                                }
+                            }
+                            if !checked_call_output && effect.staged_local_forward
+                                && argument_points.len() == effect.parameter + 1
                             {
-                                author.prepare_shared_identity(call_point, *argument);
-                            } else if !checked_call_output && effect.staged_local_forward
-                                && read_effect_argument.is_some_and(|(read, local, _, returns)| read == *argument && local && !returns)
-                            {
-                                author.prepare_scalar_read(call_point, *argument, &self.cfg.points);
+                                if let Some((read, true, _, false)) = read_effect_argument {
+                                    if argument_points.last() == Some(&read) {
+                                        author.prepare_scalar_read(call_point, read, &self.cfg.points, argument_points.len());
+                                    }
+                                }
                             }
                         }
                     }
@@ -14364,6 +14370,74 @@ fn exact_joined_conditional_reader(
     Some(())
 }
 
+// The single self edge takes the same checked formal and a literal false:
+// after entering the recursive arm it must select the direct read arm.
+fn exact_bounded_recursive_scalar_reader(
+    source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+    expression: &ScalarExpression, output: OccurrenceOrdinal, guard: &ParameterSlot,
+    parameter: &ParameterSlot, inner: &ScalarType,
+    formal_name: &impl Fn(OccurrenceOrdinal, ByteSpan) -> bool,
+) -> Option<()> {
+    let ScalarExpression::If { condition, then_branch, else_branch, .. } = expression else { return None; };
+    let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, type_arguments, .. })] =
+        then_branch.items.as_slice() else { return None; };
+    let [ScalarExpression::Boolean { value: false, .. }, ScalarExpression::Name { .. }] =
+        arguments.as_slice() else { return None; };
+    let [ScalarBlockItem::Expression(base @ ScalarExpression::Dereference { .. })] =
+        else_branch.items.as_slice() else { return None; };
+    if !type_arguments.is_empty() || !matches!(condition.as_ref(), ScalarExpression::Name { .. }) {
+        return None;
+    }
+    let structure = &calls.structure;
+    let OccurrenceNode::Expression(condition) = *structure.edges.get(&(
+        OccurrenceParent::Expression(output), OccurrenceEdge::Condition,
+    ))? else { return None; };
+    if !formal_name(condition, guard.span)
+        || structure.checked_types.expressions.get(&condition) != Some(&ScalarType::Bool)
+        || structure.checked_types.expressions.get(&output) != Some(inner)
+    {
+        return None;
+    }
+    let branch_output = |edge| {
+        let OccurrenceNode::Block(block) = *structure.edges.get(&(OccurrenceParent::Expression(output), edge))?
+            else { return None; };
+        let OccurrenceNode::Expression(result) = *structure.edges.get(&(
+            OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+        ))? else { return None; };
+        (structure.checked_types.expressions.get(&result) == Some(inner)).then_some(result)
+    };
+    let recursive = branch_output(OccurrenceEdge::ThenBranch)?;
+    let [call] = calls.call_occurrences.as_slice() else { return None; };
+    if call.ordinal != recursive || calls.declared_unsafe_calls.contains(&recursive.0)
+        || !matches!(&calls.sites.get(call.site)?.target, ResolvedCallTarget::ModuleCallable {
+            source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        } if callee == source && *declaration_span == function.name_span)
+    {
+        return None;
+    }
+    let signature = calls.checked_call_signatures.get(&recursive)?;
+    let [guard_ty, parameter_ty] = signature.parameters.as_slice() else { return None; };
+    let [result] = signature.outputs.outputs.as_slice() else { return None; };
+    if guard_ty != &ScalarType::Bool || parameter_ty != &parameter.ty || &result.ty != inner {
+        return None;
+    }
+    let argument = |index| match structure.edges.get(&(
+        OccurrenceParent::Expression(recursive), OccurrenceEdge::CallArgument(index),
+    ))? {
+        OccurrenceNode::Expression(argument) => Some(*argument),
+        _ => None,
+    };
+    let (first, second) = (argument(0)?, argument(1)?);
+    if structure.checked_types.expressions.get(&first) != Some(guard_ty)
+        || structure.checked_types.expressions.get(&second) != Some(parameter_ty)
+        || !formal_name(second, parameter.span)
+    {
+        return None;
+    }
+    exact_joined_conditional_reader(base, branch_output(OccurrenceEdge::ElseBranch)?,
+        structure, parameter, None, inner, formal_name, 2)
+}
+
 impl SharedScalarReadEffect {
     fn prepare(
         source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
@@ -14406,6 +14480,14 @@ impl SharedScalarReadEffect {
         if if descriptor { !aggregate::ordinary_value(&result.ty) || !calls.call_occurrences.is_empty() }
             else { &result.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
             return None;
+        }
+        if let Some(guard) = scalar.filter(|guard| guard.ty == ScalarType::Bool) {
+            if exact_bounded_recursive_scalar_reader(source, function, calls, expression, output,
+                guard, parameter, inner, &formal_name).is_some()
+            {
+                return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: true,
+                    bool_prefix: true, returns_formal: false, staged_local_forward: true });
+            }
         }
         if scalar.is_none_or(|formal| formal.ty == ScalarType::Bool)
             && !descriptor && matches!(expression, ScalarExpression::If { .. })
@@ -14818,7 +14900,9 @@ impl FunctionCallSites {
             if source == caller || self.declared_unsafe_calls.contains(&call.ordinal.0) {
                 continue;
             }
-            if let Some(&effect) = readers.get(source).and_then(|readers| readers.get(declaration_span)) {
+            if let Some(&effect) = readers.get(source).and_then(|readers| readers.get(declaration_span))
+                .filter(|effect| !(effect.staged_local_forward && effect.bool_prefix))
+            {
                 self.imported_shared_readers.insert(
                     call.ordinal, (SourceSpan::new(source.clone(), *declaration_span), effect),
                 );
