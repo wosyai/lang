@@ -8132,6 +8132,44 @@ fn defer_read_search_siblings(successors: &[CfgPointId], pending: &mut Vec<CfgPo
     Some(*last)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LexicalInstallKind { Bind, Replace }
+
+#[derive(Clone, Copy)]
+struct CheckedLexicalInstall<'a> {
+    holder: &'a ReferenceBindingId,
+    producer: CfgPointId,
+    kind: LexicalInstallKind,
+}
+
+fn checked_lexical_install<'a>(
+    points: &'a [ReferenceFlowPoint],
+    install: CfgPointId,
+    producer: CfgPointId,
+    checked_outputs: &[CfgPointId],
+) -> Option<CheckedLexicalInstall<'a>> {
+    let write = points.get(install.0)?;
+    let input = points.get(producer.0)?;
+    let (holder, kind) = match &write.kind {
+        CfgPointKind::Bind { binding } => (binding, LexicalInstallKind::Bind),
+        CfgPointKind::Assign { target, rhs_point, .. } if *rhs_point == producer
+            && target.projections.is_empty() && matches!(target.place, ScalarPlace::Name { .. }) =>
+            (&target.binding, LexicalInstallKind::Replace),
+        _ => return None,
+    };
+    if !matches!(holder.kind, ReferenceBindingKind::Declared) || producer >= install
+        || write.id != install || input.id != producer || input.scope != write.scope
+        || input.source_span.source != write.source_span.source
+        || holder.source != write.source_span.source || input.successors.as_slice() != [install]
+        || !match &input.kind {
+            CfgPointKind::Borrow { place, loan } => place == &loan.origin_place,
+            CfgPointKind::Call { .. } => checked_outputs.binary_search(&producer).is_ok(),
+            _ => false,
+        }
+    { return None; }
+    Some(CheckedLexicalInstall { holder, producer, kind })
+}
+
 fn lexical_read_kills(
     point: &ReferenceFlowPoint,
     scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
@@ -8274,24 +8312,20 @@ impl ProjectedCarrierReads {
 
 struct CallAliasStage<'a> {
     return_edges: &'a HashMap<CfgPointId, CheckedReturnArgumentEdge>,
-    initializers: &'a [(CfgPointId, CfgPointId)],
+    installs: &'a HashMap<CfgPointId, CheckedLexicalInstall<'a>>,
     holders: std::cell::OnceCell<HashSet<&'a ReferenceBindingId>>,
 }
 
 impl<'a> CallAliasStage<'a> {
     fn holds(&self, points: &'a [ReferenceFlowPoint], binding: &ReferenceBindingId) -> bool {
-        self.holders.get_or_init(|| self.initializers.iter().filter_map(|&(install, producer)| {
-            let edge = self.return_edges.get(&producer)?;
-            let call = points.get(producer.0)?;
-            let bind = points.get(install.0)?;
-            let CfgPointKind::Bind { binding } = &bind.kind else { return None; };
+        self.holders.get_or_init(|| self.installs.values().filter_map(|install| {
+            let edge = self.return_edges.get(&install.producer)?;
+            let binding = install.holder;
             let actual = points.get(edge.argument.0)?;
             // The definite transfer and the conservative holder subset
             // consume the same typed call edge. This particular holder slice
             // remains limited to a fresh direct shared loan.
-            if producer >= install || call.successors.as_slice() != [install]
-                || call.scope != bind.scope || edge.mode != ScalarReferenceMutability::Shared
-                || !matches!(binding.kind, ReferenceBindingKind::Declared)
+            if edge.mode != ScalarReferenceMutability::Shared
                 || !matches!(&actual.kind, CfgPointKind::Borrow { loan, place }
                     if loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                         && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. }))
@@ -8307,6 +8341,7 @@ struct ConflictLiveness<'a> {
     strictly_forward: bool,
     lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
     call_aliases: Option<CallAliasStage<'a>>,
+    checked_installs: Option<&'a HashMap<CfgPointId, CheckedLexicalInstall<'a>>>,
     projected: std::cell::OnceCell<ProjectedCarrierReads>,
 }
 
@@ -8317,7 +8352,7 @@ impl<'a> ConflictLiveness<'a> {
         strictly_forward: bool,
         branched: bool,
     ) -> Self {
-        Self { points, scope_exits, strictly_forward, call_aliases: None, projected: Default::default(),
+        Self { points, scope_exits, strictly_forward, call_aliases: None, checked_installs: None, projected: Default::default(),
             lexical: (strictly_forward && branched).then(Default::default) }
     }
 
@@ -8377,7 +8412,10 @@ impl<'a> ConflictLiveness<'a> {
                 let point = &self.points[id.0];
                 let live = if matches!(&point.kind, CfgPointKind::Read { binding: read } if read == binding) {
                     true
-                } else if lexical_read_kills(point, self.scope_exits, binding) {
+                } else if self.checked_installs.and_then(|states| states.get(&id)).map_or_else(
+                    || lexical_read_kills(point, self.scope_exits, binding),
+                    |install| install.holder == binding,
+                ) {
                     false
                 } else if let Some(&successor) = point.successors.iter().rev().nth(child) {
                     debug_assert!(successor > id, "only strictly forward graphs use this refinement");
@@ -11361,6 +11399,7 @@ fn transfer_reference_facts(
         )? else { return None };
         child_holders.get(binding).copied()
     };
+    let mut checked_installs = HashMap::new();
     let mut dependency_pair = [CfgPointId(0); 2];
     let mut local_fork_index = 0;
     for (index, point) in original_points.iter().enumerate() {
@@ -11568,6 +11607,15 @@ fn transfer_reference_facts(
                 _ => false,
             };
         }
+        if let CfgPointKind::Assign { rhs_point, .. } = &point.kind {
+            if !grouped_installs.contains(&point.id) {
+                if let Some(install) = checked_lexical_install(
+                    original_points, point.id, *rhs_point, cfg.resolved_checked_call_outputs,
+                ) {
+                    checked_installs.insert(point.id, install);
+                }
+            }
+        }
         let dependencies = point_last_use_dependencies(&point.kind, &mut dependency_pair);
         for dependency in dependencies {
             last_use[dependency.0] = point.id.0;
@@ -11610,6 +11658,9 @@ fn transfer_reference_facts(
     });
     for &(bind, value) in cfg.checked_binding_initializers {
         last_use[value.0] = last_use[value.0].max(bind.0);
+        if let Some(install) = checked_lexical_install(original_points, bind, value, cfg.resolved_checked_call_outputs) {
+            checked_installs.insert(bind, install);
+        }
         if let Some((children, parents)) = &mut runtime_child_installs {
             if let Some(child) = children.get_mut(&value) { *child = Some(bind); }
             if let CfgPointKind::Bind { binding } = &original_points[bind.0].kind {
@@ -11646,9 +11697,10 @@ fn transfer_reference_facts(
     });
     let return_edges = checked_return_argument_edges(original_points, contracts, cfg.resolved_checked_call_outputs);
     let mut liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
-    if strictly_forward && !return_edges.is_empty() && !cfg.checked_binding_initializers.is_empty() {
+    if !checked_installs.is_empty() { liveness.checked_installs = Some(&checked_installs); }
+    if strictly_forward && !return_edges.is_empty() && !checked_installs.is_empty() {
         liveness.call_aliases = Some(CallAliasStage {
-            return_edges: &return_edges, initializers: cfg.checked_binding_initializers, holders: Default::default(),
+            return_edges: &return_edges, installs: &checked_installs, holders: Default::default(),
         });
     }
     let mut forward_cursor = 0;
@@ -11982,9 +12034,13 @@ fn transfer_reference_facts(
                 }
                 _ => None,
             };
+            let exact_install = checked_installs.get(&id);
             let assignment_rhs = match &cfg.points[id.0].kind {
-                CfgPointKind::Assign { rhs_point, .. }
-                | CfgPointKind::AssignThrough { rhs_point, .. } => {
+                CfgPointKind::Assign { rhs_point, .. } => {
+                    let producer = exact_install.map_or(*rhs_point, |install| install.producer);
+                    Some(state.point_values.get(producer).cloned())
+                }
+                CfgPointKind::AssignThrough { rhs_point, .. } => {
                     Some(state.point_values.get(*rhs_point).cloned())
                 }
                 _ => None,
@@ -13077,11 +13133,13 @@ fn transfer_reference_facts(
                             .as_ref()
                             .is_some_and(|set| !set.is_empty()) =>
                 {
-                    let rhs = match cfg.checked_binding_initializers
-                        .binary_search_by_key(&id, |&(bind, _)| bind)
-                    {
-                        Ok(index) => state.point_values.get(cfg.checked_binding_initializers[index].1),
-                        Err(_) => point.possible_origins.as_ref(),
+                    let rhs = if let Some(install) = exact_install.filter(|install| install.kind == LexicalInstallKind::Bind) {
+                        state.point_values.get(install.producer)
+                    } else {
+                        match cfg.checked_binding_initializers.binary_search_by_key(&id, |&(bind, _)| bind) {
+                            Ok(index) => state.point_values.get(cfg.checked_binding_initializers[index].1),
+                            Err(_) => point.possible_origins.as_ref(),
+                        }
                     };
                     match rhs.filter(|origins| !origins.is_empty()) {
                         Some(origins) => {

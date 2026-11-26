@@ -467,9 +467,13 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
             _ => panic!("typed call producer"),
         };
         assert_eq!(return_edges[call].argument, expected);
+        let install = checked_lexical_install(points, *bind, *call, &proof.resolved_checked_call_outputs).unwrap();
+        assert!(install.holder == binding && install.kind == LexicalInstallKind::Bind);
+        let installs = HashMap::from([(*bind, install)]);
         let mut liveness = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        liveness.checked_installs = Some(&installs);
         liveness.call_aliases = Some(CallAliasStage {
-            return_edges: &return_edges, initializers: &proof.checked_binding_initializers, holders: Default::default(),
+            return_edges: &return_edges, installs: &installs, holders: Default::default(),
         });
         let stage = liveness.call_aliases.as_ref().unwrap();
         assert!(stage.holds(points, binding));
@@ -483,8 +487,51 @@ fn staged_call_alias_uses_exact_return_and_install_then_refines_sibling_branch()
         let unknown_edges = checked_return_argument_edges(points, &unknown, &proof.resolved_checked_call_outputs);
         assert!(unknown_edges.is_empty());
         let unchecked_stage = CallAliasStage { return_edges: &unknown_edges,
-            initializers: &proof.checked_binding_initializers, holders: Default::default() };
+            installs: &installs, holders: Default::default() };
         assert!(!unchecked_stage.holds(points, binding));
+        let checked = derive_scalar_program_with_layout(&parsed.result, target);
+        assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+    }
+}
+
+#[test]
+fn checked_lexical_install_retires_only_the_version_on_its_branch() {
+    let text = "%%start\n*u8(*u8) forward = fn(input) { input };\nunit(bool) examine = fn(overwrite) { u8 value = 7; u8 replacement = 9; *u8 held = forward(&value); if (overwrite) { held = &replacement; value = 8; }; held; value; };\n%%end";
+    for target in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let parsed = parse_source(source(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(declarations, target);
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let (provisional, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let caller = &provisional[1].1;
+        let points = &caller.cfg.initial_points;
+        let proof = &caller.proof_points;
+        let [(bind, producer)] = proof.checked_binding_initializers.as_slice()
+            else { panic!("exact initial checked install"); };
+        let first = checked_lexical_install(points, *bind, *producer, &proof.resolved_checked_call_outputs).unwrap();
+        let (replace, rhs) = points.iter().find_map(|point| match &point.kind {
+            CfgPointKind::Assign { target, rhs_point, .. } if &target.binding == first.holder =>
+                Some((point.id, *rhs_point)),
+            _ => None,
+        }).unwrap();
+        let second = checked_lexical_install(points, replace, rhs, &proof.resolved_checked_call_outputs).unwrap();
+        assert!(second.kind == LexicalInstallKind::Replace && second.holder == first.holder);
+        assert!(checked_lexical_install(points, replace, *producer, &proof.resolved_checked_call_outputs).is_none());
+        let installs = HashMap::from([(*bind, first), (replace, second)]);
+        let mut staged = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        staged.checked_installs = Some(&installs);
+        let baseline = ConflictLiveness::new(points, proof.scope_exit_bindings.as_ref(), true, true);
+        for point in points {
+            assert_eq!(staged.lexical_after(point.id, first.holder), baseline.lexical_after(point.id, first.holder));
+        }
+        assert!(staged.lexical_after(*bind, first.holder), "the other branch keeps the original value");
+        assert!(staged.lexical_after(replace, first.holder), "access at the replacement sees its new value");
         let checked = derive_scalar_program_with_layout(&parsed.result, target);
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
     }
