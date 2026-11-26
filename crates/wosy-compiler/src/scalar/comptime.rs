@@ -28,6 +28,29 @@ pub enum ComptimeParameterRejection {
     UnsupportedProfileValue,
 }
 
+/// Only occurrences actually substituted in this compiler-derived fragment.
+/// A default records absence in the profile, not an explicit override.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComptimeParameterUse {
+    pub name: String,
+    pub call: ByteSpan,
+    pub context: ScalarType,
+    pub resolved: ComptimeParameterValue,
+    pub origin: ComptimeParameterOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComptimeParameterValue {
+    Integer(i64),
+    Boolean(bool),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComptimeParameterOrigin {
+    Profile,
+    Default { literal: ByteSpan },
+}
+
 #[derive(Debug)]
 pub enum ClosedComptimeRejection {
     InvalidParse,
@@ -47,6 +70,8 @@ pub struct ClosedComptimeFragment {
     id: String,
     site: SourceSpan,
     result_type: ScalarType,
+    layout: ScalarTargetLayout,
+    parameter_uses: Vec<ComptimeParameterUse>,
     llvm: LlvmPartition,
 }
 
@@ -54,6 +79,8 @@ impl ClosedComptimeFragment {
     pub fn id(&self) -> &str { &self.id }
     pub fn site(&self) -> &SourceSpan { &self.site }
     pub fn result_type(&self) -> &ScalarType { &self.result_type }
+    pub fn layout(&self) -> ScalarTargetLayout { self.layout }
+    pub fn parameter_uses(&self) -> &[ComptimeParameterUse] { &self.parameter_uses }
     pub fn llvm(&self) -> &LlvmPartition { &self.llvm }
 }
 
@@ -101,7 +128,7 @@ pub fn derive_closed_comptime_fragment(
     let (diagnostics, _) = collect_scalar_diagnostics(&block_cst, |_| {});
     if !diagnostics.is_empty() { return Err(ClosedComptimeRejection::OrdinaryDiagnostics(diagnostics)); }
     let mut body = derive_block(&site.block);
-    rewrite_body(&mut body, &result_type, &scope, &parameter)?;
+    let parameter_uses = rewrite_body(&mut body, &result_type, &scope, &parameter)?;
     let output_span = body.final_output_values[0].span;
     let name_span = super::token_span(&site.id);
     let function = ScalarFunction {
@@ -129,7 +156,7 @@ pub fn derive_closed_comptime_fragment(
         return Err(ClosedComptimeRejection::OrdinaryDiagnostics(build.diagnostics().to_vec()));
     }
     let llvm = emit_scalar_build_single_module_artifact_llvm(&build).map_err(ClosedComptimeRejection::Emitter)?;
-    Ok(ClosedComptimeFragment { id: id.into(), site: scope(site.span), result_type, llvm })
+    Ok(ClosedComptimeFragment { id: id.into(), site: scope(site.span), result_type, layout, parameter_uses, llvm })
 }
 
 fn root_receiver_type(node: &CstNode) -> Option<CstNode> {
@@ -159,7 +186,7 @@ fn supported_type(ty: &ScalarType) -> bool {
 fn rewrite_body(
     body: &mut ScalarBlock, result_type: &ScalarType, scope: &impl Fn(ByteSpan) -> SourceSpan,
     parameter: &impl Fn(&str) -> Option<ComptimeParameter>,
-) -> Result<(), ClosedComptimeRejection> {
+) -> Result<Vec<ComptimeParameterUse>, ClosedComptimeRejection> {
     let unsupported = |span, feature| ClosedComptimeRejection::Unsupported { site: scope(span), feature };
     let [output] = body.final_output_values.as_mut_slice() else {
         return Err(unsupported(body.span, "expected one final value"));
@@ -167,32 +194,35 @@ fn rewrite_body(
     let Some((ScalarBlockItem::Expression(final_value), locals)) = body.items.split_last_mut() else {
         return Err(unsupported(body.span, "expected one final expression"));
     };
+    let mut uses = Vec::new();
     for item in locals {
         let ScalarBlockItem::LocalBinding(binding) = item else {
             return Err(unsupported(body.span, "only immutable local bindings may precede the final value"));
         };
         if !supported_type(&binding.declared_type) { return Err(unsupported(binding.span, "binding type")); }
-        if rewrite_parameter(&mut binding.value, &binding.declared_type, scope, parameter)? {
+        if let Some(observed) = rewrite_parameter(&mut binding.value, &binding.declared_type, scope, parameter)? {
             binding.output_values[0].value = binding.value.clone();
+            uses.push(observed);
         }
     }
-    if rewrite_parameter(final_value, result_type, scope, parameter)? {
+    if let Some(observed) = rewrite_parameter(final_value, result_type, scope, parameter)? {
         output.value = final_value.clone();
         body.expressions[0] = final_value.clone();
+        uses.push(observed);
     }
     output.ty = result_type.clone();
-    Ok(())
+    Ok(uses)
 }
 
 fn rewrite_parameter(
     expression: &mut ScalarExpression, expected: &ScalarType, scope: &impl Fn(ByteSpan) -> SourceSpan,
     parameter: &impl Fn(&str) -> Option<ComptimeParameter>,
-) -> Result<bool, ClosedComptimeRejection> {
+) -> Result<Option<ComptimeParameterUse>, ClosedComptimeRejection> {
     let ScalarExpression::Call { receiver: Some(receiver), name, arguments, type_arguments, span, .. } = expression
-        else { admit_pure_expression(expression, scope)?; return Ok(false); };
+        else { admit_pure_expression(expression, scope)?; return Ok(None); };
     if receiver != "core" || name != "comp_param" {
         admit_pure_expression(expression, scope)?;
-        return Ok(false);
+        return Ok(None);
     }
     let span = *span;
     let unsupported = |feature| ClosedComptimeRejection::Unsupported { site: scope(span), feature };
@@ -206,21 +236,29 @@ fn rewrite_parameter(
     // It denotes an expression of the same contextual type, never a cast.
     let default = match arguments.get(1) {
         None => None,
-        Some(ScalarExpression::Integer { value, .. }) if integer_literal_fits_type(value, expected) =>
-            Some(ScalarExpression::Integer { value: value.clone(), span }),
-        Some(ScalarExpression::Boolean { value, .. }) if *expected == ScalarType::Bool =>
-            Some(ScalarExpression::Boolean { value: *value, span }),
+        Some(ScalarExpression::Integer { value, span }) if integer_literal_fits_type(value, expected) =>
+            Some((ComptimeParameterValue::Integer(i64::try_from(value).expect("a supported scalar default fits i64")), *span)),
+        Some(ScalarExpression::Boolean { value, span }) if *expected == ScalarType::Bool =>
+            Some((ComptimeParameterValue::Boolean(*value), *span)),
         Some(ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. }) =>
             return Err(reject(ComptimeParameterRejection::DefaultType)),
         Some(_) => return Err(reject(ComptimeParameterRejection::UnsupportedDefault)),
     };
-    *expression = match parameter(name) {
-        Some(ComptimeParameter::Integer(value)) => ScalarExpression::Integer { value: value.into(), span },
-        Some(ComptimeParameter::Boolean(value)) => ScalarExpression::Boolean { value, span },
+    let (resolved, origin) = match parameter(name) {
+        Some(ComptimeParameter::Integer(value)) => (ComptimeParameterValue::Integer(value), ComptimeParameterOrigin::Profile),
+        Some(ComptimeParameter::Boolean(value)) => (ComptimeParameterValue::Boolean(value), ComptimeParameterOrigin::Profile),
         Some(ComptimeParameter::UnsupportedValue) => return Err(reject(ComptimeParameterRejection::UnsupportedProfileValue)),
-        None => default.ok_or_else(|| reject(ComptimeParameterRejection::Missing))?,
+        None => {
+            let (resolved, literal) = default.ok_or_else(|| reject(ComptimeParameterRejection::Missing))?;
+            (resolved, ComptimeParameterOrigin::Default { literal })
+        }
     };
-    Ok(true)
+    let observed = ComptimeParameterUse { name: name.into(), call: span, context: expected.clone(), resolved, origin };
+    *expression = match resolved {
+        ComptimeParameterValue::Integer(value) => ScalarExpression::Integer { value: value.into(), span },
+        ComptimeParameterValue::Boolean(value) => ScalarExpression::Boolean { value, span },
+    };
+    Ok(Some(observed))
 }
 
 fn admit_pure_expression(

@@ -15,7 +15,11 @@ pub fn declared_comptime_parameters(
     configuration: &ProjectConfiguration, document: &ImDocument<String>, target: &str, profile: &str,
 ) -> Result<BTreeMap<String, DeclaredComptimeParameter>, String> {
     configuration.target_profile(target, profile)?;
-    let Some(parameters) = authored_profile(document, target, profile)?.get("params") else {
+    parameters_in(authored_profile(document, target, profile)?)
+}
+
+fn parameters_in(authored: &toml_edit::Table) -> Result<BTreeMap<String, DeclaredComptimeParameter>, String> {
+    let Some(parameters) = authored.get("params") else {
         return Ok(BTreeMap::new());
     };
     let parameters = parameters.as_table_like().ok_or("compile-time params must be a table")?;
@@ -29,6 +33,55 @@ pub fn declared_comptime_parameters(
         };
         (name.to_owned(), value)
     }).collect())
+}
+
+/// A real profile/pair observed in a single loaded project configuration
+/// with no applicable watches, mounts or permissions. No command authority.
+pub struct ObservedClosedComptimeProfile {
+    tools: SelectedComptimeTools,
+    parameters: BTreeMap<String, DeclaredComptimeParameter>,
+}
+
+impl ObservedClosedComptimeProfile {
+    pub fn select(
+        configuration: &ProjectConfiguration, document: &ImDocument<String>,
+        target: &str, profile: &str, package: &str, id: &str,
+    ) -> Result<Self, String> {
+        configuration.target_profile(target, profile)?;
+        let authored = authored_profile(document, target, profile)?;
+        let tools = SelectedComptimeTools::from_authored(configuration, authored, target, profile)?
+            .ok_or("closed comptime staging needs an explicit comptime builder and runner")?;
+        if tools.build_permissions().is_some_and(|permissions| !permissions.is_empty())
+            || tools.build_mounts().is_some_and(|mounts| !mounts.is_empty())
+        {
+            return Err("closed comptime staging does not resolve build permissions or mounts".into());
+        }
+        reject_applicable_watches(document, package, id)?;
+        let parameters = parameters_in(authored)?;
+        Ok(Self { tools, parameters })
+    }
+
+    pub fn parameters(&self) -> &BTreeMap<String, DeclaredComptimeParameter> { &self.parameters }
+
+    pub fn into_tools(self) -> SelectedComptimeTools { self.tools }
+}
+
+fn reject_applicable_watches(document: &ImDocument<String>, package: &str, id: &str) -> Result<(), String> {
+    let Some(comptime) = document.get("comptime") else { return Ok(()); };
+    let declarations = comptime.as_table_like().ok_or("comptime watches must be a table")?;
+    // This fragment has no imports. Inspect the exact local site and refuse
+    // any qualified declaration that could otherwise be mistaken for its input.
+    for key in [id, &format!("{package}:{id}")] {
+        let Some(item) = declarations.get(key) else { continue; };
+        let site = item.as_table_like().ok_or("comptime site watches must be a table")?;
+        for field in ["watch", "watch_add"] {
+            if let Some(paths) = site.get(field) {
+                let paths = paths.as_array().ok_or("comptime watch paths must be an array")?;
+                if !paths.is_empty() { return Err("closed comptime staging does not resolve watches".into()); }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn authored_profile<'a>(
@@ -81,9 +134,16 @@ impl SelectedComptimeTools {
     /// neither declaration have no evaluator tools. An artifact's runner
     /// and any dependency's tools are not candidates.
     pub fn load(root: &Path, target: &str, profile: &str) -> Result<Option<Self>, String> {
-        let (mut configuration, document) = ProjectConfiguration::load_with_manifest(root)?;
+        let (configuration, document) = ProjectConfiguration::load_with_manifest(root)?;
         configuration.target_profile(target, profile)?;
         let authored = authored_profile(&document, target, profile)?;
+        Self::from_authored(&configuration, authored, target, profile)
+    }
+
+    fn from_authored(
+        configuration: &ProjectConfiguration, authored: &toml_edit::Table,
+        target: &str, profile: &str,
+    ) -> Result<Option<Self>, String> {
         let (builder, runner) = match (authored.get("comptime_builder"), authored.get("comptime_runner")) {
             (None, None) => return Ok(None),
             (Some(builder), Some(runner)) => (builder, runner),
@@ -97,9 +157,9 @@ impl SelectedComptimeTools {
         let runner_name = runner.as_str().ok_or_else(|| format!(
             "target {target} profile {profile} comptime_runner must be a string"
         ))?;
-        let builder = configuration.builders.remove(builder_name)
+        let builder = configuration.builders.get(builder_name)
             .ok_or_else(|| format!("comptime builder {builder_name} is missing"))?;
-        let runner = configuration.runners.remove(runner_name)
+        let runner = configuration.runners.get(runner_name)
             .ok_or_else(|| format!("comptime runner {runner_name} is missing"))?;
         for (kind, name, command) in [
             ("comptime builder", builder_name, &builder.command),
@@ -116,9 +176,9 @@ impl SelectedComptimeTools {
             target: target.into(),
             profile: profile.into(),
             builder_name: builder_name.into(),
-            builder,
+            builder: builder.clone(),
             runner_name: runner_name.into(),
-            runner,
+            runner: runner.clone(),
             build_permissions,
             build_mounts,
         }))

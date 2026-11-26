@@ -12,7 +12,7 @@ mod comptime_tools;
 pub mod packages;
 pub use comptime_tools::{
     declared_comptime_parameters, ComptimeBuildMountDeclaration, ComptimeMountAccess,
-    DeclaredComptimeParameter, SelectedComptimeTools,
+    DeclaredComptimeParameter, ObservedClosedComptimeProfile, SelectedComptimeTools,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
