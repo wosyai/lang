@@ -2257,12 +2257,35 @@ fn try_observed_projected_storage_call(
     let mut complete = HashSet::new();
     let mut admitted = HashMap::new();
     let mut getters = HashMap::new();
+    let mut frontiers = HashMap::new();
+    let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
+        if child.0 != node.0 && visits.get(child.0) != Some(&InitializationVisit::Completed) { return None; }
+        if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,site,signature) != Some(child) { return None; }
+        let getter = PreparedScalarGetter::from_body(body_of(child)?)?;
+        (getter.declaration.source == actual.project.modules.get(child.0)?.source).then_some(getter)
+    };
     let mut writes_or_reads_storage = false;
     while let Some(event) = todo.pop() {
         match event {
             Event::Enter(node) if !complete.contains(&node) => {
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
+                if node != target {
+                    let recursive_sites = body.structure.checker_direct_targets.iter()
+                        .filter_map(|(&site,&child)| (child == node).then_some(site));
+                    if let Some((condition, guard_calls)) = super::checker_flow::observed_recursive_guard_frontier(body,recursive_sites) {
+                        for site in guard_calls {
+                            let Some(signature) = super::checker_flow::observed_getter_signature(body,site) else { return Ok(false); };
+                            let Some(&child) = body.structure.checker_direct_targets.get(&site) else { return Ok(false); };
+                            let Some(getter) = admit_getter(node,body,site,child,signature) else { return Ok(false); };
+                            getters.insert((body as *const FunctionCallSites,site),getter);
+                        }
+                        frontiers.insert(node,condition);
+                        visiting.remove(&node);
+                        complete.insert(node);
+                        continue;
+                    }
+                }
                 let frame = if node == target {
                     super::checker_flow::projected_integer_storage_frame_after_prefix(body,
                         plan.as_ref().map_or(0, |plan| plan.bindings.len()), &prefix_reads, &prefix_calls)
@@ -2275,18 +2298,7 @@ fn try_observed_projected_storage_call(
                     if scalar_calls.contains(site) {
                         if node == target && prefix_calls.contains(site) { continue; }
                         if let Some(signature) = super::checker_flow::observed_getter_signature(body,*site) {
-                            if child.0 != node.0 && visits.get(child.0) != Some(&InitializationVisit::Completed) {
-                                return Ok(false);
-                            }
-                            if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,*site,signature) != Some(child) {
-                                return Ok(false);
-                            }
-                            let Some(getter) = body_of(child).and_then(PreparedScalarGetter::from_body)
-                                else { return Ok(false); };
-                            if getter.declaration.source != actual.project.modules.get(child.0)
-                                .ok_or(ProjectCheck::MissingRootOccurrences)?.source {
-                                return Ok(false);
-                            }
+                            let Some(getter) = admit_getter(node,body,*site,child,signature) else { return Ok(false); };
                             getters.insert((body as *const FunctionCallSites,*site),getter);
                         }
                         continue;
@@ -2426,7 +2438,7 @@ fn try_observed_projected_storage_call(
         getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call), Some(&scalar_getter),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call), Some(&scalar_getter), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -12514,7 +12526,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -24646,6 +24658,82 @@ unit(u8) parent = fn(a) {
                 assert_eq!(evaluations(),2);
             }
             eprintln!("Orbital checked User Unit operands {target_layout:?}: two original arithmetic values, no replay, overflow remains unsupported");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_index_range_returns_only_from_known_false_entry() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        let provider_text = std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let engine = std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let (_, functions) = engine.split_once("unit(i32,i32) index_range=").unwrap();
+        let (index_range, _) = functions.split_once("unit(i32,u64,u64,u64,u64) index_vertex=").unwrap();
+        let app = source("src/main.w","pinned-index-range-consumer");
+        let provider = source("src/indexed-pack.w","pinned-index-range-provider");
+        let exact = format!(r#"%%start
+            packing = namespace demo "indexed-pack.w";
+            i32 touched=0;
+            i32 retained=0;
+            unit(i32,u64,u64,u64,u64) index_vertex=fn(i,p,a,j,k) {{ touched=i; }};
+            unit(i32,i32) index_range={index_range}
+            unit() launch=fn {{
+                packing.start();
+                packing.partition(37,90);
+                index_range(3,3);
+                packing.partition(18,12);
+                index_range(3,4);
+                retained=packing.end()-touched;
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=retained;.files=[];}});
+        %%end"#);
+        let true_arm=exact.replace("index_range(3,3)", "index_range(3,4)");
+        let with_suffix=exact.replace(index_range, &index_range.replacen("    };\n};", "    }; touched=1;\n};",1));
+        assert_ne!(with_suffix,exact);
+        let span=|site:&str| {
+            let start=exact.find(site).unwrap() as u32;
+            SourceSpan::new(app.clone(),ByteSpan::new(start,start+site.len() as u32))
+        };
+        let declaration=span(r#"packing = namespace demo "indexed-pack.w";"#);
+        let empty=span("index_range(3,3)");
+        let failed=span("index_range(3,4)");
+        let ok=span("packing.ok()");
+        let left=span("begin<finish");
+        let guard=span("begin<finish&&packing.ok()");
+        let skipped=span("index_vertex(begin,p,a,j,k)");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:declaration.range,
+                }]),(declarations(&provider,&provider_text),Vec::new())],
+                [],vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let all=prepare(&exact).run().unwrap();
+            let [result]=all.directives.as_slice() else { panic!("one result"); };
+            assert_eq!(result.code(),&BigInt::from(37));
+            let (capped,_,trace,_)=prepare(&exact).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(capped,all.directives);
+            assert!(trace.contains_return(&empty));
+            assert!(trace.contains_return(&failed));
+            assert!(trace.contains_return(&ok));
+            assert!(!trace.contains_return(&skipped));
+            assert!(trace.contains_branch(left.clone(),false));
+            assert!(trace.contains_branch(left.clone(),true));
+            assert!(trace.contains_branch(ok.clone(),false));
+            assert!(trace.contains_branch(guard.clone(),false));
+            assert!(!trace.contains_branch(guard.clone(),true));
+            let paths=trace.call_paths();
+            let [calls]=paths.as_slice() else { panic!("one root history"); };
+            assert_eq!(calls.iter().filter(|site| [&empty,&failed,&ok,&skipped].contains(site)).collect::<Vec<_>>(),
+                [&empty,&failed,&ok]);
+            for program in [&true_arm,&with_suffix] {
+                assert!(matches!(prepare(program).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+            eprintln!("Orbital original index_range {target_layout:?}: empty and failed-provider return, live recursion remains unadmitted");
         }
     }
 

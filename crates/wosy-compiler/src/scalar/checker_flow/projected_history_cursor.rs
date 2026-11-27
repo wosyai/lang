@@ -76,6 +76,7 @@ pub(in super::super) fn drive_finite_history<'p>(
     field_read: Option<&dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
     math_call: Option<&ObservedFloatCall<'_>>,
     scalar_getter: Option<&ObservedScalarGetter<'_>>,
+    guard_frontiers: Option<&HashMap<Target, OccurrenceOrdinal>>,
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
     mut record: impl FnMut(Target, IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
@@ -212,8 +213,20 @@ pub(in super::super) fn drive_finite_history<'p>(
             Machine::Unit { roots, block } => {
                 let mut failed = IntegerFailureCollection { continuation: IntegerRequirementContinuation::Empty,
                     projected: None, allow_projected_calls: true, allow_contextual_local_transfers: false, sink: &mut sink };
-                let progress = drive_integer_block::<false, true, _, false>(body, roots, block, None, None,
-                    &mut Some(&mut apply), &mut Some(&mut failed), &mut &mut [][..], (), false, None, None, None);
+                let progress = if let Some(&condition) = guard_frontiers.and_then(|frontiers| frontiers.get(&target)) {
+                    // A true or unknown row would reach an unadmitted body.
+                    // Never return a receipt for it or turn it into an empty lane.
+                    if ready_site.is_some() || actual_storage.is_none() || block.next != 0 { return None; }
+                    if block.path.0.len() != 1 { return None; }
+                    let mut row = block.path.0.pop()?;
+                    if !row.has_projected_storage() || evaluate_observed_boolean(body,condition,roots,&mut row)? { return None; }
+                    let mut path = IntegerInputs(vec![row]);
+                    histories.borrow_mut().append_rows(&mut path,body.occurrences.get(condition.0)?.span,false)?;
+                    Some(IntegerControl::Continue(path))
+                } else {
+                    drive_integer_block::<false, true, _, false>(body, roots, block, None, None,
+                        &mut Some(&mut apply), &mut Some(&mut failed), &mut &mut [][..], (), false, None, None, None)
+                };
                 if unpublishable { return None; }
                 if histories.borrow().stopped { return Some(CallableHistoryCompletion::LimitReached); }
                 match progress? {

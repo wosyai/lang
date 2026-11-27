@@ -12379,6 +12379,29 @@ pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Opti
     projected_integer_storage_frame_after_prefix(calls, 0, &HashSet::new(), &HashSet::new()).map(|(state, _)| state)
 }
 
+/// Select the exact no-op exit of a Unit function whose only root item
+/// is a typed if without else. This does not admit anything in its arm.
+#[cfg(feature = "internal-checker")]
+pub(super) fn observed_recursive_guard_frontier(calls: &FunctionCallSites, mut recursive_sites: impl Iterator<Item = OccurrenceOrdinal>)
+    -> Option<(OccurrenceOrdinal, Vec<OccurrenceOrdinal>)> {
+    let root = calls.structure.blocks.get(calls.structure.root.0)?;
+    if root.unsafe_context || !calls.checker_returns_unit() || calls.contextual_formal().is_some()
+        || !calls.arms.is_empty() || !calls.structure.checker_directives.is_empty()
+        || !calls.structure.checker_ordinary_directive_calls.is_empty()
+        || !calls.structure.checker_selected_snapshots.is_empty()
+        || !calls.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+    { return None; }
+    let [item] = root.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
+    let ConditionalRegion::Unit { condition, then_block, .. } = calls.conditionals.get(&expression)? else { return None; };
+    let arm = calls.structure.blocks.get(then_block.0)?.span;
+    let first = recursive_sites.next()?;
+    if !std::iter::once(first).chain(recursive_sites).all(|site| calls.occurrences.get(site.0)
+        .is_some_and(|occurrence| arm.start <= occurrence.span.start && occurrence.span.end <= arm.end)) { return None; }
+    let guard = observed_boolean_inputs(calls, *condition)?;
+    Some((*condition,guard.calls))
+}
+
 #[cfg(feature = "internal-checker")]
 pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallSites, prefix: usize,
     prefix_reads: &HashSet<(wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole)>, prefix_calls: &HashSet<OccurrenceOrdinal>,
