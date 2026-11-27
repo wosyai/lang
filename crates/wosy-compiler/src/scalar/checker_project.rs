@@ -1366,6 +1366,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
     #[cfg(not(feature = "internal-checker"))]
     let _ = ordinary_local_callers;
     let mut active = false;
+    #[cfg(feature = "internal-checker")]
+    let mut closed_unit_heights = HashMap::new();
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
             continue;
@@ -1413,6 +1415,23 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             };
             active |= observed;
             continue;
+        }
+        #[cfg(feature = "internal-checker")]
+        if COLLECT && !Proof::ENABLED && body.checker_returns_unit()
+            && has_projected_unit_history_edge(calls, (ordinal, item))
+            && completed_visits.is_some()
+            && failures.as_ref().is_some_and(|effects| effects.contextual_proofs.entries.is_empty())
+        {
+            let target = (ordinal, item);
+            let mut spent = 0;
+            if closed_callable_history_height(project, calls, target, &mut closed_unit_heights, &mut HashSet::new(), &mut spent, 0).is_some() {
+                let observed = collect_complete_unit_history::<ENTRY_EVIDENCE>(
+                    project, calls, completed_visits.ok_or(ProjectCheck::Unsupported)?, target, spent,
+                    failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?,
+                )?;
+                active |= observed;
+                continue;
+            }
         }
         if !matches!(body.boundary.results.as_slice(), [result]
             if result.ty == ScalarType::Unit || is_integer_type(&result.ty)
@@ -3255,6 +3274,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 ActualProjectedArguments::Single(Some(exact)),
             NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
             NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
+            #[cfg(feature = "internal-checker")]
+            NestedIntegerArgument::UnitHistory(_) => return Err(ProjectCheck::Unsupported),
         };
         self.run(
             &caller.structure, call, signature, projected, source, *declaration_span, expected, None, false, collection,
@@ -11711,7 +11732,7 @@ fn symbolic_history_call_target(
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
     if (owner == module && caller == item)
         || !(output.ty == ScalarType::Unit || is_integer_type(&output.ty))
-        || signature.parameters.len() > 2 || (signature.parameters.is_empty() && output.ty != ScalarType::Unit)
+        || (output.ty != ScalarType::Unit && !(1..=2).contains(&signature.parameters.len()))
         || !signature.parameters.iter().all(is_integer_type)
     { return None; }
     let source = project.modules.get(owner)?;
@@ -11898,6 +11919,66 @@ impl ClosedAuthoredHistories<'_> {
         search_callable_history_frame(body, entry, self.work, (target.0 != origin).then_some(target.0), depth != 0,
             effects, nested, |failure, steps| (self.record)(target, failure, prefix, steps))
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn has_projected_unit_history_edge(calls: &ProjectCallSiteResults, target: PreparedCallable) -> bool {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let mut pending = vec![target];
+    let mut visited = HashSet::new();
+    while let Some(target) = pending.pop() {
+        if !visited.insert(target) { continue; }
+        let Some(body) = calls.function_body(target.0, target.1, None) else { continue; };
+        for (&site, &child) in &body.structure.checker_direct_targets {
+            let Some(signature) = body.checked_call_signatures.get(&site) else { continue; };
+            if !matches!(signature.outputs.outputs.as_slice(), [result] if result.ty == ScalarType::Unit) {
+                continue;
+            }
+            // Routing only: the legacy carrier represents at most a pair
+            // independently. The new engine authenticates the entire graph.
+            if signature.parameters.len() > 2 { return true; }
+            let mut slots = HashSet::new();
+            let parent = OccurrenceParent::Expression(site);
+            for slot in 0..signature.parameters.len() {
+                let Some(OccurrenceNode::Expression(argument)) =
+                    body.structure.edges.get(&(parent, OccurrenceEdge::CallArgument(slot)))
+                else { continue; };
+                if let Some(PlainNameIdentity::Lexical(binding)) = body.prepared_plain_name(*argument) {
+                    if !slots.insert(binding) { return true; }
+                }
+            }
+            pending.push(child);
+        }
+    }
+    false
+}
+
+#[cfg(feature = "internal-checker")]
+fn collect_complete_unit_history<const ENTRY_EVIDENCE: bool>(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, visits: &[InitializationVisit],
+    target: PreparedCallable, spent: usize, effects: &mut OrderedFailures,
+) -> Result<bool, ProjectCheck> {
+    use super::checker_flow::CallableHistoryCompletion;
+    let work = std::cell::Cell::new(spent);
+    let nested_active = std::cell::Cell::new(false);
+    let collecting = RefCell::new(effects);
+    let record = |target: PreparedCallable, failure: IntegerCheckFailure<'_>,
+        _: &[super::checker_flow::CallableHistoryStep], _: Vec<super::checker_flow::CallableHistoryStep>| {
+        let module = project.modules.get(target.0)?;
+        let body = calls.function_body(target.0, target.1, None)?;
+        let mut effects = collecting.borrow_mut();
+        if ENTRY_EVIDENCE {
+            let ScalarItem::Function(function) = module.items.get(target.1)? else { return None; };
+            effects.capture_entry_evidence(body, function, &module.source, &failure);
+        }
+        effects.push_callable(body, &module.source, failure);
+        Some(false)
+    };
+    let graph = ClosedAuthoredHistories { project, calls, visits, work: &work, observed: &nested_active, record: &record };
+    let (CallableHistoryCompletion::Exhausted(active), _) =
+        graph.visit_unit(target, IntegerRequirementEntry::Arbitrary, target.0, 0, &[]).ok_or(ProjectCheck::Unsupported)?
+    else { return Err(ProjectCheck::Unsupported); };
+    Ok(active || nested_active.get())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -21269,6 +21350,91 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn variadic_unit_history_preserves_repeated_arguments_and_real_return_paths() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "variadic-unit-history");
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = |caller_bound| format!(r#"%%start
+            unit(u8,u8,u8) leaf = fn(first,middle,last) {{
+                if (first < 128) {{ core.narrow(last < 64, {}); }};
+                core.require(middle <= 255, {});
+            }};
+            unit(u8,u8) parent = fn(a,b) {{
+                leaf(a,b,a);
+                if (a < 128) {{ core.require(a < 64, {}); }};
+                core.require(a < {caller_bound}, {});
+            }};
+        %%end"#, report(5), report(7), report(11), report(13));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).unwrap_or_else(|failure| panic!("variadic fixture preparation: {failure:?}"));
+            for (bound, expected_failures) in [(255, 1), (250, 1)] {
+                let text = program(bound);
+                let scope = ScalarCheckerScope::CurrentPackage;
+                let full = prepare(&text, scope).run().unwrap();
+                let (capped, _, trace, active) = prepare(&text, scope)
+                    .search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+                assert!(active);
+                let (full, expected_failures) = (full.directives, expected_failures);
+                assert_eq!(full.len(), expected_failures);
+                assert_eq!(capped, full);
+                let [failure] = full.as_slice() else { unreachable!() };
+                assert_eq!(failure.code(), &BigInt::from(13));
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(bound), &BigInt::from(255))]));
+                let start = text.find("leaf(a,b,a)").unwrap() as u32;
+                assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(app.clone(),
+                    ByteSpan::new(start, start+11))));
+                let main = prepare(&text, ScalarCheckerScope::MainFlowOnly).run().unwrap();
+                assert!(main.directives.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn unit_history_preserves_transitive_alias_between_distinct_lexical_arguments() {
+        use std::num::NonZeroUsize;
+        let source = source("src/main.w", "transitive-unit-history-alias");
+        let text = r#"%%start
+u8(u8) same_value = fn(value) { value };
+unit(u8,u8) leaf = fn(first,last) {
+    if (first < 128) { core.narrow(last < 64, {.stdout="";.stderr="callee narrow";.code=5;.files=[];}); };
+};
+unit(u8) parent = fn(a) {
+    u8 copied = same_value(a);
+    leaf(a,copied);
+    if (a < 128) { core.require(a < 64, {.stdout="";.stderr="identity alias not preserved";.code=11;.files=[];}); };
+    core.require(a < 250, {.stdout="";.stderr="expected real caller witness";.code=13;.files=[];});
+};
+%%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&source, text), Vec::new())], [], vec![source.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).unwrap_or_else(|failure| panic!("transitive alias preparation: {failure:?}"));
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let all = prepare(scope).run().unwrap().directives;
+            let (selected, end, _, active) = prepare(scope)
+                .search_startup_authored_path(NonZeroUsize::new(2).unwrap()).unwrap();
+            assert!(active);
+            assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+            assert_eq!(selected, all);
+            let [failure] = all.as_slice() else { panic!("expected only real post-return diagnostic, got {all:?}"); };
+            assert_eq!(failure.code(), &BigInt::from(13));
+            assert_eq!(failure.witness.row_count(), 1);
+            assert_eq!(failure.witness.equal_axes(), &[(1, 0)]);
+            let [low, high] = [250,255].map(BigInt::from);
+            for axis in 0..2 {
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&low, &high)]));
+            }
+            assert!(prepare(ScalarCheckerScope::MainFlowOnly).run().unwrap().directives.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_binary_unit_history_keeps_each_real_swapped_return_rectangle() {
         use std::num::NonZeroUsize;
         let app = source("src/main.w", "private-binary-unit-history");
@@ -21360,8 +21526,17 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 }
             }
             let aliased = program.replace("wrapper(tag, n);", "wrapper(n, n);");
-            assert!(matches!(prepare(&aliased, ScalarCheckerScope::CurrentPackage)
-                .search_startup_authored_path(NonZeroUsize::new(2).unwrap()), Err(ProjectCheck::Unsupported)));
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let all = prepare(&aliased, scope).run().unwrap().directives;
+            let (selected, end, _, active) = prepare(&aliased, scope)
+                .search_startup_authored_path(NonZeroUsize::new(2).unwrap()).unwrap();
+            assert_eq!(end, StartupAuthoredCompletion::Exhausted);
+            assert!(active);
+            assert_eq!(selected, all);
+            let [failure] = all.as_slice() else { panic!("one real aliased caller failure: {all:?}"); };
+            assert_eq!(failure.code(), &BigInt::from(11));
+            let n = BigInt::from(-1);
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&n, &n)]));
         }
     }
 
