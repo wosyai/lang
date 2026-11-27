@@ -2051,26 +2051,30 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             completed_passive.clear();
             if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
                 visits, projected_storage, failures)? {
-                for (span, value) in &mut storage {
-                    let declaration = wosy_syntax::SourceSpan::new(source.clone(), *span);
-                    match value {
-                        InitializerValue::Integer { ty, value } => {
-                            *value.to_mut() = projected_storage.exact_scalar(&declaration, ty)
-                                .ok_or(ProjectCheck::Unsupported)?.clone();
+                projected_storage.settle(|declaration, index, observed| {
+                    if &declaration.source != source { return None; }
+                    let value = storage.get_mut(&declaration.range)?;
+                    match (index, value) {
+                        (None, InitializerValue::Integer { value, .. }) => *value.to_mut() = observed.clone(),
+                        (Some(index), InitializerValue::FixedArray { cells, .. }) => *cells.get_mut(index)? = observed.clone(),
+                        (Some(index), InitializerValue::PatchedIntegerArray { updates, .. }) => {
+                            updates.insert(index, observed.clone());
                         }
-                        InitializerValue::FixedArray { ty, cells } => {
-                            *cells = projected_storage.exact_array(&declaration, ty).ok_or(ProjectCheck::Unsupported)?;
+                        (Some(index), value @ InitializerValue::PassiveAggregate { .. }) => {
+                            let InitializerValue::PassiveAggregate { ty, value: original, .. } = value else { return None; };
+                            *value = InitializerValue::PatchedIntegerArray {
+                                ty, original: Rc::clone(original), updates: HashMap::from([(index, observed.clone())]),
+                            };
                         }
-                        InitializerValue::PassiveAggregate { ty, .. } if matches!(ty, ScalarType::Array { element, .. } if is_integer_type(element)) => {
-                            let selected = projected_storage.exact_array(&declaration, ty).ok_or(ProjectCheck::Unsupported)?;
-                            *value = InitializerValue::FixedArray { ty, cells: selected };
-                        }
-                        _ => {}
+                        _ => return None,
                     }
-                }
+                    Some(())
+                }).ok_or(ProjectCheck::Unsupported)?;
                 continue;
             }
-            projected_storage.forget();
+            if !topology.structure.checker_directives.contains_key(expression) {
+                projected_storage.forget();
+            }
         }
         if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(topology, actual, source, &storage, *expression, 0, failures, visits)? == StartupLane::Empty {
             return Ok(StartupLane::Empty);
@@ -2659,6 +2663,12 @@ enum InitializerValue<'a> {
     #[cfg(feature = "internal-checker")]
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
     #[cfg(feature = "internal-checker")]
+    PatchedIntegerArray {
+        ty: &'a ScalarType,
+        original: Rc<PassiveLiteral<'a>>,
+        updates: HashMap<usize, BigInt>,
+    },
+    #[cfg(feature = "internal-checker")]
     PassiveFloat { _atom: ranked_float::Atom },
     #[cfg(feature = "internal-checker")]
     PassiveEnum { _enumeration: &'a super::ScalarEnumId, _tag: u32 },
@@ -2897,10 +2907,14 @@ fn initialized_fixed_array_cell<'a>(
         OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
     ))? else { return None; };
     let InitializationStorage::Module(binding) = topology.identities.roots.get(&base)? else { return None; };
-    let InitializerValue::FixedArray { ty, cells } = storage.get(binding)? else { return None; };
+    let array = storage.get(binding)?;
+    let ty = match array {
+        InitializerValue::FixedArray { ty, .. } | InitializerValue::PatchedIntegerArray { ty, .. } => *ty,
+        _ => return None,
+    };
     let ScalarType::Array { element, length, .. } = ty else { return None; };
     if element.as_ref() != expected || !super::scalar_type_equal(structure.checked_types.places.get(&base)?, ty)
-        || structure.checked_types.places.get(&place)? != expected || u64::try_from(cells.len()).ok()? != *length
+        || structure.checked_types.places.get(&place)? != expected
     {
         return None;
     }
@@ -2918,7 +2932,23 @@ fn initialized_fixed_array_cell<'a>(
         ScalarExpression::Name { .. } => initialized_integer_argument(topology, storage, index, &ScalarType::U64)?,
         _ => return None,
     };
-    cells.get(usize::try_from(value).ok()?)
+    let index = usize::try_from(value).ok()?;
+    if u64::try_from(index).ok()? >= *length { return None; }
+    match array {
+        InitializerValue::FixedArray { cells, .. } if u64::try_from(cells.len()).ok()? == *length => cells.get(index),
+        InitializerValue::PatchedIntegerArray { original, updates, .. } => {
+            if let Some(value) = updates.get(&index) { return Some(value); }
+            let mut original = original.as_ref();
+            while let PassiveLiteral::Copy(next) = original { original = next; }
+            let PassiveLiteral::Array(cells) = original else { return None; };
+            if u64::try_from(cells.len()).ok()? != *length { return None; }
+            let mut cell = cells.get(index)?;
+            while let PassiveLiteral::Copy(next) = cell { cell = next; }
+            let PassiveLiteral::Integer(actual, number) = cell else { return None; };
+            (element.as_ref() == *actual).then_some(number)
+        }
+        _ => None,
+    }
 }
 
 fn initialized_scalar_initializer_argument<'a>(

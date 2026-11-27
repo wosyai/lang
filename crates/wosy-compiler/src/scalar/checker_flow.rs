@@ -1776,42 +1776,45 @@ struct ClosedRadixAxes {
 pub(super) struct ProjectedStorage {
     // Whole cells are immutable until a write on this symbolic path.
     // A canonical prepared declaration, not a spelling, identifies the allocation.
-    scalars: HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<IntegerSet>)>,
-    fixed_arrays: HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>,
+    scalars: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<IntegerSet>)>>,
+    fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
+    changes: HashMap<(wosy_syntax::SourceSpan, Option<usize>), Rc<IntegerSet>>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl ProjectedStorage {
-    pub(super) fn forget(&mut self) { self.scalars.clear(); self.fixed_arrays.clear(); }
+    pub(super) fn forget(&mut self) { *self = Self::default(); }
 
     fn overwrite_scalar(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) -> Option<()> {
-        let (observed_type, cell) = self.scalars.get_mut(declaration)?;
+        let (observed_type, _) = self.scalars.get(declaration)?;
         if observed_type != ty { return None; }
-        *cell = Rc::new(IntegerSet::singleton(value));
+        self.changes.insert((declaration.clone(), None), Rc::new(IntegerSet::singleton(value)));
         Some(())
     }
 
     fn overwrite_array_element(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, index: usize, value: &BigInt) -> Option<()> {
-        let (ScalarType::Array { element, .. }, cells) = self.fixed_arrays.get_mut(declaration)? else { return None; };
-        if element.as_ref() != ty { return None; }
-        *Rc::make_mut(cells).get_mut(index)? = Rc::new(IntegerSet::singleton(value));
+        let (ScalarType::Array { element, .. }, cells) = self.fixed_arrays.get(declaration)? else { return None; };
+        if element.as_ref() != ty || index >= cells.len() { return None; }
+        self.changes.insert((declaration.clone(), Some(index)), Rc::new(IntegerSet::singleton(value)));
         Some(())
     }
 
-    pub(super) fn exact_scalar(&self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType) -> Option<&BigInt> {
-        let (observed, value) = self.scalars.get(declaration)?;
-        (ty == observed).then_some(())?;
-        value.singleton_value()
-    }
-
-    pub(super) fn exact_array(&self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType) -> Option<Vec<BigInt>> {
-        let (observed, cells) = self.fixed_arrays.get(declaration)?;
-        super::scalar_type_equal(ty, observed).then_some(())?;
-        cells.iter().map(|value| value.singleton_value().cloned()).collect()
+    pub(super) fn settle(&mut self, mut touched: impl FnMut(&wosy_syntax::SourceSpan, Option<usize>, &BigInt) -> Option<()>) -> Option<()> {
+        for ((declaration, index), value) in std::mem::take(&mut self.changes) {
+            touched(&declaration, index, value.singleton_value()?)?;
+            if let Some(index) = index {
+                let (_, array) = Rc::get_mut(&mut self.fixed_arrays)?.get_mut(&declaration)?;
+                *Rc::get_mut(array)?.get_mut(index)? = value;
+            } else {
+                let (_, scalar) = Rc::get_mut(&mut self.scalars)?.get_mut(&declaration)?;
+                *scalar = value;
+            }
+        }
+        Some(())
     }
 
     pub(super) fn observe_scalar(&mut self, declaration: wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) {
-        self.scalars.insert(declaration, (ty.clone(), Rc::new(IntegerSet::singleton(value))));
+        Rc::make_mut(&mut self.scalars).insert(declaration, (ty.clone(), Rc::new(IntegerSet::singleton(value))));
     }
 
     pub(super) fn observe_array<'v>(&mut self, declaration: wosy_syntax::SourceSpan, ty: &ScalarType, cells: impl ExactSizeIterator<Item = &'v BigInt>) {
@@ -1819,7 +1822,7 @@ impl ProjectedStorage {
         if !is_integer_type(element) || u64::try_from(cells.len()).ok() != Some(*length) { return; }
         let cells = cells.map(|value| super::typecheck::integer_literal_fits_type(value, element)
             .then(|| Rc::new(IntegerSet::singleton(value)))).collect::<Option<Vec<_>>>();
-        if let Some(cells) = cells { self.fixed_arrays.insert(declaration, (ty.clone(), Rc::new(cells))); }
+        if let Some(cells) = cells { Rc::make_mut(&mut self.fixed_arrays).insert(declaration, (ty.clone(), Rc::new(cells))); }
     }
 }
 
@@ -2968,6 +2971,36 @@ impl IntegerInputs {
                         .is_some_and(|(matching, _)| !matching.is_empty())
                 })
         })
+    }
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn projected_storage_return_bills_touched_cells_not_array_extent() {
+    use wosy_syntax::{SourceIdentity, SourceSpan};
+    let source = SourceIdentity { project: "local".into(), package: "app".into(), path: "src/main.w".into(), revision: "sparse-cells".into() };
+    let scalar = SourceSpan::new(source.clone(), super::ByteSpan { start: 1, end: 2 });
+    let array = SourceSpan::new(source, super::ByteSpan { start: 3, end: 4 });
+    for width in [32usize, 4096, 65536] {
+        let initial = BigInt::from(12);
+        let mut storage = ProjectedStorage::default();
+        let ty = ScalarType::Array { element: Box::new(ScalarType::U8), length: width as u64, length_span: array.range, span: array.range };
+        storage.observe_scalar(scalar.clone(), &ScalarType::U8, &initial);
+        storage.observe_array(array.clone(), &ty, vec![&initial; width].into_iter());
+        let buffer = Rc::as_ptr(&storage.fixed_arrays[&array].1);
+        let mut touches = 0;
+        for iteration in 0..128usize {
+            let parent = storage.clone();
+            storage.overwrite_scalar(&scalar, &ScalarType::U8, &BigInt::from(31)).unwrap();
+            storage.overwrite_array_element(&array, &ScalarType::U8, iteration % width, &BigInt::from(37)).unwrap();
+            assert_eq!(Rc::as_ptr(&parent.fixed_arrays[&array].1), buffer);
+            assert_eq!(Rc::as_ptr(&storage.fixed_arrays[&array].1), buffer);
+            drop(parent);
+            storage.settle(|_, _, _| { touches += 1; Some(()) }).unwrap();
+            assert_eq!(Rc::as_ptr(&storage.fixed_arrays[&array].1), buffer);
+        }
+        assert_eq!(touches, 256);
+        eprintln!("projected-state extent={width} observed writes={touches}");
     }
 }
 
@@ -12108,7 +12141,7 @@ struct ProjectedIntegerStoragePlace<'a> {
 #[cfg(feature = "internal-checker")]
 impl ProjectedIntegerStoragePlace<'_> {
     fn read<'s>(&self, storage: &'s ProjectedStorage) -> Option<&'s Rc<IntegerSet>> {
-        match self.index {
+        let initialized = match self.index {
             Some(index) => {
                 let (ScalarType::Array { element, .. }, cells) = storage.fixed_arrays.get(self.declaration)? else { return None; };
                 if element.as_ref() != self.ty { return None; }
@@ -12118,7 +12151,8 @@ impl ProjectedIntegerStoragePlace<'_> {
                 let (observed, cell) = storage.scalars.get(self.declaration)?;
                 (observed == self.ty).then_some(cell)
             }
-        }
+        }?;
+        Some(storage.changes.get(&(self.declaration.clone(), self.index)).unwrap_or(initialized))
     }
 }
 
