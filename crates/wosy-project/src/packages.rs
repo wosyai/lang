@@ -314,17 +314,26 @@ fn is_lower_hex(value: &str) -> bool {
 
 pub(super) fn normalize_package_path(path: &str) -> Result<String, String> {
     let relative = crate::PackageRelativePath::new(PathBuf::from(path))?;
-    let normalized: PathBuf = relative.as_path().components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(name),
-            _ => None,
-        }).collect();
-    if normalized.as_os_str().is_empty() {
-        Ok(".".to_owned())
-    } else {
-        normalized.into_os_string().into_string()
-            .map_err(|_| "Git package path is not UTF-8".to_owned())
+    let path = git_path_text(relative.as_path())?;
+    Ok(if path.is_empty() { ".".to_owned() } else { path })
+}
+
+// A repository path appears in Git pathspecs, lockfiles and source identities.
+// Use the Git separator, regardless of the host filesystem separator.
+fn git_path_text(path: &Path) -> Result<String, String> {
+    let mut text = String::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| "Git package path is not UTF-8".to_owned())?;
+                if !text.is_empty() { text.push('/'); }
+                text.push_str(part);
+            }
+            _ => return Err("Git package path is not relative to its repository".to_owned()),
+        }
     }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -368,6 +377,16 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.diagnostics[0].message.contains("rev belongs in wosy.lock"));
+    }
+
+    #[test]
+    fn git_package_paths_use_repository_separators_in_the_lock() {
+        let path = PathBuf::from("packages").join("leaf_lib");
+        assert_eq!(git_path_text(&path).unwrap(), "packages/leaf_lib");
+        assert_eq!(normalize_package_path("./packages//leaf_lib/.").unwrap(), "packages/leaf_lib");
+        assert_eq!(normalize_package_path(".").unwrap(), ".");
+        let lock = format!("version = 1\n\n[packages.leaf_lib]\ngit = \"../repo with spaces\"\nrev = \"{REV}\"\npath = \"packages/leaf_lib\"\nsource_hash = \"{HASH}\"\n");
+        assert_eq!(PackageLock::parse(lock.clone()).unwrap().render(), lock);
     }
 
     #[test]

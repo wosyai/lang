@@ -922,7 +922,7 @@ impl Stage {
             let selected = checked_output(
                 git_command(&git.directory, &self.handle, Some(&repository))?
                     .args(["--literal-pathspecs", "ls-tree", "-z", "--full-tree", revision.as_str(), "--"])
-                    .arg(path),
+                    .arg(&source.package_path),
                 "ls-tree",
             )?;
             git_wire::selected_tree(&selected.stdout, path)?
@@ -1105,8 +1105,8 @@ pub(super) fn materialize_tree(
             .map_err(|error| format!("cannot extract {}: {error}", path.display()))?;
         restore_mode(&destination, entry.executable)
             .map_err(|error| format!("cannot set permissions for {}: {error}", path.display()))?;
-        let path = path.to_str().expect("Git adapter requires UTF-8 paths");
-        digests.insert(path.to_owned(), (contents, entry.executable));
+        let path = super::git_path_text(path)?;
+        digests.insert(path, (contents, entry.executable));
     }
     Ok(identity_from_files(&digests))
 }
@@ -1190,8 +1190,8 @@ fn collect_tree_files(
                 };
                 #[cfg(not(unix))]
                 let executable = false;
-                let path = path.to_str().ok_or_else(|| "non-UTF-8 Git dependency path".to_owned())?;
-                visit(path, file, executable)?;
+                let path = super::git_path_text(&path)?;
+                visit(&path, file, executable)?;
             } else {
                 return Err(format!("{} is not a regular dependency file", path.display()));
             }

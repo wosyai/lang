@@ -1,5 +1,5 @@
 use super::git_wire::GitOid;
-use super::valid_package_name;
+use super::{git_path_text, valid_package_name};
 use crate::{DependencyDeclaration, DependencySource, GitSource, ResolvedPackage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -105,7 +105,7 @@ fn sibling_path(parent: &str, declaration: &Path) -> Result<String, String> {
     if path.as_os_str().is_empty() {
         Ok(".".to_owned())
     } else {
-        path.into_os_string().into_string().map_err(|_| "Git package path is not UTF-8".to_owned())
+        git_path_text(&path)
     }
 }
 

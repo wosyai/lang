@@ -17,6 +17,10 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_label("wosy-dep-sync")
+    }
+
+    fn with_label(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
         let time = std::time::SystemTime::now()
@@ -24,7 +28,7 @@ impl Fixture {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "wosy-dep-sync-{}-{time}-{serial}",
+            "{label}-{}-{time}-{serial}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
@@ -183,9 +187,9 @@ fn stub_artifact(project: &Path) -> PathBuf {
 
 #[test]
 fn dep_sync_materializes_the_exact_subpackage_and_keeps_the_local_path() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_label("wosy project with spaces");
     let local = fixture.local();
-    let package_path = "packages/remote_lib";
+    let package_path = "packages/leaf_lib";
     let (origin, revision) = fixture.origin(package_path, "remote_lib");
     let project = fixture.project("clean", "remote_lib", package_path);
     expect_error(&wosy(&project, &["dep", "sync"]), "require wosy.lock");
@@ -1125,7 +1129,10 @@ unit(u8) unused = fn(value) {{
     let plain = check(&["check", "--profile", "checked"]);
     assert!(plain.status.success(), "{plain:?}");
     assert!(plain.stdout.is_empty() && plain.stderr.is_empty());
-    let checked = check(&["check", "--profile", "checked", "--dependencies"]);
+    let default = check(&["check", "--profile", "checked", "--dependencies"]);
+    assert_eq!(default.status.code(), Some(3), "{default:?}");
+    assert_eq!(default.stdout, b"leaf");
+    let checked = check(&["check", "--profile", "checked", "--dependencies", "--all-errors"]);
     assert_eq!(checked.status.code(), Some(3), "{checked:?}");
     assert_eq!(checked.stdout, b"leafpatchednamespaceremote");
     assert!(checked.stderr.is_empty());
