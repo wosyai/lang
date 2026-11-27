@@ -1367,7 +1367,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
     let _ = ordinary_local_callers;
     let mut active = false;
     #[cfg(feature = "internal-checker")]
-    let mut closed_unit_heights = HashMap::new();
+    let mut closed_units = HashSet::new();
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
             continue;
@@ -1424,7 +1424,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         {
             let target = (ordinal, item);
             let mut spent = 0;
-            if closed_callable_history_height(project, calls, target, &mut closed_unit_heights, &mut HashSet::new(), &mut spent, 0).is_some() {
+            if plan_finite_projected_history(project, calls, target, &mut closed_units, &mut spent).is_some() {
                 let observed = collect_complete_unit_history::<ENTRY_EVIDENCE>(
                     project, calls, completed_visits.ok_or(ProjectCheck::Unsupported)?, target, spent,
                     failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?,
@@ -11214,7 +11214,7 @@ fn plan_closed_authored_roots(
         order[ordinals[source]] = position;
     }
     ordered.sort_unstable_by_key(|&(module, item)| (order[module], item));
-    let mut history_heights = HashMap::new();
+    let mut planned_histories = HashSet::new();
     let mut history_work = 0;
     for (module, item) in ordered {
         let source = project.modules.get(module).ok_or(ProjectCheck::Unsupported)?;
@@ -11231,8 +11231,7 @@ fn plan_closed_authored_roots(
         if allow_startup_scalars && (mixed_guard_plan(project, calls, (module, item), body, module < startup_count).is_some()
             || closed_dormant_float_plan(project, calls, (module, item), body, module < startup_count).is_some()) {
             super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
-        } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
-            &mut HashSet::new(), &mut history_work, 0).is_none() {
+        } else if !body.checker_returns_unit() || plan_finite_projected_history(project, calls, (module, item), &mut planned_histories, &mut history_work).is_none() {
             return Err(ProjectCheck::Unsupported);
         }
         callable_roots.push((module, item));
@@ -11680,6 +11679,31 @@ fn search_closed_dormant_float(
 }
 
 #[cfg(feature = "internal-checker")]
+fn forwarded_float_history_frame(body: &FunctionCallSites) -> bool {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let float = |ty: &ScalarType| matches!(ty, ScalarType::F32 | ScalarType::F64);
+    if !body.boundary.parameters.iter().any(|formal| float(&formal.ty)) { return true; }
+    if !body.assignments.is_empty() || body.structure.blocks.iter().any(|block| block.unsafe_context) { return false; }
+    let Some(ids) = body.boundary.checker_parameter_bindings.as_deref() else { return false; };
+    let formals = ids.iter().zip(&body.boundary.parameters).filter(|(_, formal)| float(&formal.ty))
+        .map(|(id, formal)| (id, &formal.ty)).collect::<HashMap<_, _>>();
+    let mut forwarded = HashSet::new();
+    for site in body.structure.checker_direct_targets.keys() {
+        let Some(signature) = body.checked_call_signatures.get(site) else { return false; };
+        for (slot, ty) in signature.parameters.iter().enumerate().filter(|(_, ty)| float(ty)) {
+            let Some(OccurrenceNode::Expression(arg)) = body.structure.edges.get(&(
+                OccurrenceParent::Expression(*site), OccurrenceEdge::CallArgument(slot),
+            )) else { return false; };
+            let Some(PlainNameIdentity::Lexical(id)) = body.prepared_plain_name(*arg) else { return false; };
+            if formals.get(id).copied() != Some(ty) { return false; }
+            forwarded.insert(*arg);
+        }
+    }
+    // No float can influence a witness or a branch until its IEEE domain is represented.
+    body.structure.checked_types.expressions.iter().all(|(arg, ty)| !float(ty) || forwarded.contains(arg))
+}
+
+#[cfg(feature = "internal-checker")]
 fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
     let scoped_context = body.structure.has_ordinary_contextual_places()
         && body.arms.is_empty() && body.allocation_length_calls.is_empty()
@@ -11695,9 +11719,10 @@ fn closed_callable_history_body(body: &FunctionCallSites) -> bool {
                     && body.structure.checker_integer_literals.contains_key(&rhs)
                     && body.structure.checker_contextual_occurrences.contains(&destination))
         });
-    body.checker_returns_unit() && (body.checker_named_route_frame() || scoped_context)
+    body.checker_returns_unit() && forwarded_float_history_frame(body) && (body.checker_named_route_frame() || scoped_context)
         && body.contextual_formal().is_none() && body.boundary.parameters.iter().all(|parameter|
-            is_integer_type(&parameter.ty) || (parameter.ty == ScalarType::Bool && body.checker_has_authored_match_history()))
+            is_integer_type(&parameter.ty) || matches!(parameter.ty, ScalarType::F32 | ScalarType::F64)
+            || (parameter.ty == ScalarType::Bool && body.checker_has_authored_match_history()))
         && body.call_occurrences.iter().all(|call| body.structure.checker_direct_targets.contains_key(&call.ordinal))
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
         && body.conditionals.iter().all(|(expression, region)| {
@@ -11733,7 +11758,7 @@ fn symbolic_history_call_target(
     if (owner == module && caller == item)
         || !(output.ty == ScalarType::Unit || is_integer_type(&output.ty))
         || (output.ty != ScalarType::Unit && !(1..=2).contains(&signature.parameters.len()))
-        || !signature.parameters.iter().all(is_integer_type)
+        || !signature.parameters.iter().all(|ty| is_integer_type(ty) || (output.ty == ScalarType::Unit && matches!(ty, ScalarType::F32 | ScalarType::F64)))
     { return None; }
     let source = project.modules.get(owner)?;
     let caller_source = &project.modules.get(module)?.source;
@@ -11753,19 +11778,9 @@ fn symbolic_history_call_target(
 }
 
 #[cfg(feature = "internal-checker")]
-const MAX_PROJECTED_HISTORY_DEPTH: usize = 12;
-
-#[cfg(feature = "internal-checker")]
-fn projected_history_scalar_height(
-    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
-    cache: &mut HashMap<PreparedCallable, usize>, active: &mut HashSet<PreparedCallable>, work: &mut usize,
-    depth: usize,
-) -> Option<usize> {
-    if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
-    if let Some(&height) = cache.get(&target) {
-        return (depth.checked_add(height)? <= MAX_PROJECTED_HISTORY_DEPTH).then_some(height);
-    }
-    if !active.insert(target) { return None; }
+fn projected_scalar_history_children(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable, work: &mut usize,
+) -> Option<Vec<PreparedCallable>> {
     let body = calls.function_body(target.0, target.1, None)?;
     super::checker_flow::charge_call_work(work, body.occurrences.len())?;
     let [output] = body.boundary.results.as_slice() else { return None; };
@@ -11780,16 +11795,11 @@ fn projected_history_scalar_height(
         .saturating_add(body.call_occurrences.len()))?;
     let bindings = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
     if bindings.len() != body.call_occurrences.len() { return None; }
-    let mut height = 1;
-    for site in &body.call_occurrences {
+    body.call_occurrences.iter().map(|site| {
         if !bindings.contains(&site.ordinal) { return None; }
         let signature = body.checked_call_signatures.get(&site.ordinal)?;
-        let next = symbolic_history_call_target(project, calls, target.0, target.1, body, site.ordinal, signature)?;
-        height = height.max(projected_history_scalar_height(project, calls, next, cache, active, work, depth + 1)?.checked_add(1)?);
-    }
-    active.remove(&target);
-    cache.insert(target, height);
-    Some(height)
+        symbolic_history_call_target(project, calls, target.0, target.1, body, site.ordinal, signature)
+    }).collect()
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11801,60 +11811,50 @@ fn completed_history_namespace(project: &ScalarProject, caller: usize, provider:
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_projected_history_scalar_return(
-    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
-    argument: NestedIntegerArgument<'_>, signature: &CheckedCallSignature, origin_module: usize,
-    visits: &[InitializationVisit], work: &std::cell::Cell<usize>, depth: usize,
-) -> Option<super::checker_flow::CallableHistoryCall> {
-    if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
-    let body = calls.function_body(target.0, target.1, None)?;
-    let [output] = signature.outputs.outputs.as_slice() else { return None; };
-    if !is_integer_type(&output.ty) { return None; }
-    let entry = argument.callable_history_entry(&signature.parameters, work)?;
-    let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
-        actual: NestedIntegerArgument<'_>, _steps| {
-        if !std::ptr::eq(body, caller) { return None; }
-        let next = symbolic_history_call_target(project, calls, target.0, target.1, body, site, signature)?;
-        if next.0 != target.0 && !completed_history_namespace(project, target.0, next.0, visits) { return None; }
-        check_projected_history_scalar_return(project, calls, next, actual, signature, origin_module, visits, work, depth + 1)
-    };
-    let nested = (!body.call_occurrences.is_empty())
-        .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
-    let step_owner = (target.0 != origin_module).then_some(target.0);
-    super::checker_flow::trace_closed_projected_scalar_return(body, entry, &output.ty, step_owner, work, nested)
-}
-
-#[cfg(feature = "internal-checker")]
-fn closed_callable_history_height(
-    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
-    cache: &mut HashMap<PreparedCallable, usize>, active: &mut HashSet<PreparedCallable>, work: &mut usize, depth: usize,
-) -> Option<usize> {
-    if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
-    if let Some(&height) = cache.get(&target) {
-        return (depth.checked_add(height)? <= MAX_PROJECTED_HISTORY_DEPTH).then_some(height);
-    }
+fn projected_history_children(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable, work: &mut usize,
+) -> Option<Vec<PreparedCallable>> {
     let body = calls.function_body(target.0, target.1, None)?;
     if !body.checker_returns_unit() {
-        return projected_history_scalar_height(project, calls, target, cache, active, work, depth);
+        return projected_scalar_history_children(project, calls, target, work);
     }
-    if !active.insert(target) { return None; }
     super::checker_flow::charge_call_work(work, body.occurrences.len()
         .saturating_add(body.structure.checker_integer_call_locals.len())
         .saturating_add(body.structure.checker_direct_targets.len()))?;
     if !closed_callable_history_body(body) && !closed_affine_snapshot_history(body) { return None; }
     let scalar_sites = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
-    let mut height = 1;
-    for &site in body.structure.checker_direct_targets.keys() {
+    body.structure.checker_direct_targets.keys().map(|&site| {
         let signature = body.checked_call_signatures.get(&site)?;
-        let child = symbolic_history_call_target(project, calls, target.0, target.1, body, site, signature)?;
         let [out] = signature.outputs.outputs.as_slice() else { return None; };
         if out.ty != ScalarType::Unit && !scalar_sites.contains(&site) { return None; }
-        height = height.max(closed_callable_history_height(project, calls, child, cache, active,
-            work, depth + 1)?.checked_add(1)?);
+        symbolic_history_call_target(project, calls, target.0, target.1, body, site, signature)
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
+fn plan_finite_projected_history(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    completed: &mut HashSet<PreparedCallable>, work: &mut usize,
+) -> Option<()> {
+    enum Event { Enter(PreparedCallable), Finish(PreparedCallable) }
+    let mut pending = vec![Event::Enter(target)];
+    let mut active = HashSet::new();
+    while let Some(event) = pending.pop() {
+        match event {
+            Event::Enter(node) if !completed.contains(&node) => {
+                if !active.insert(node) { return None; } // Requires a recursion summary.
+                let children = projected_history_children(project, calls, node, work)?;
+                pending.push(Event::Finish(node));
+                pending.extend(children.into_iter().map(Event::Enter));
+            }
+            Event::Finish(node) => {
+                active.remove(&node);
+                completed.insert(node);
+            }
+            Event::Enter(_) => {}
+        }
     }
-    active.remove(&target);
-    cache.insert(target, height);
-    Some(height)
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11875,49 +11875,104 @@ struct ClosedAuthoredHistories<'run> {
 
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
-    fn visit_unit(
-        &self, target: PreparedCallable, entry: IntegerRequirementEntry<'_>, origin: usize, depth: usize,
-        prefix: &[super::checker_flow::CallableHistoryStep],
-    ) -> Option<(super::checker_flow::CallableHistoryCompletion, Vec<super::checker_flow::UnitHistoryPiece>)> {
-        use super::checker_flow::{search_callable_history_frame, CallableHistoryCall, CallableHistoryCompletion, HistoryFrameEffects};
-        if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
-        let body = self.calls.function_body(target.0, target.1, None)?;
-        let mut meter = self.work.get();
-        super::checker_flow::charge_call_work(&mut meter, body.occurrences.len().saturating_add(prefix.len()))?;
-        self.work.set(meter);
-        let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
-            argument: NestedIntegerArgument<'_>, steps: Vec<super::checker_flow::CallableHistoryStep>| {
-            if !std::ptr::eq(body, caller) { return None; }
-            let child = symbolic_history_call_target(self.project, self.calls, target.0, target.1, body, site, signature)?;
-            if child.0 != target.0 && !completed_history_namespace(self.project, target.0, child.0, self.visits) {
-                return None;
-            }
-            let [output] = signature.outputs.outputs.as_slice() else { return None; };
-            if is_integer_type(&output.ty) {
-                return check_projected_history_scalar_return(self.project, self.calls, child, argument, signature,
-                    origin, self.visits, self.work, depth + 1);
-            }
-            let entry = IntegerRequirementEntry::UnitHistory(argument.callable_history_entry(&signature.parameters, self.work)?);
-            let mut meter = self.work.get();
-            super::checker_flow::charge_call_work(&mut meter, prefix.len().saturating_add(steps.len()))?;
-            self.work.set(meter);
-            let child_prefix = prefix.iter().copied().chain(steps).collect::<Vec<_>>();
-            let (completion, pieces) = self.visit_unit(child, entry, origin, depth + 1, &child_prefix)?;
-            Some(match completion {
-                CallableHistoryCompletion::LimitReached => CallableHistoryCall::LimitReached,
-                CallableHistoryCompletion::Exhausted(active) => {
-                    self.observed.set(self.observed.get() || active);
-                    CallableHistoryCall::UnitPartitions(pieces)
-                }
-            })
-        };
-        let nested = (!body.call_occurrences.is_empty())
-            .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
+    fn execute_frame(
+        &self, body: &FunctionCallSites, entry: Option<&super::checker_flow::CallableHistoryEntry>,
+        step_owner: Option<usize>, nested: Option<&mut super::checker_flow::CallableHistoryCallHandler<'_>>,
+        select: impl FnMut(IntegerCheckFailure<'_>, Vec<super::checker_flow::CallableHistoryStep>) -> Option<bool>,
+    ) -> Option<super::checker_flow::CallableHistoryCall> {
+        use super::checker_flow::{CallableHistoryCall as Receipt, CallableHistoryCompletion as Completion, HistoryFrameEffects};
+        if !body.checker_returns_unit() {
+            let [result] = body.boundary.results.as_slice() else { return None; };
+            return super::checker_flow::trace_closed_projected_scalar_return(body, entry?.clone(), &result.ty, step_owner, self.work, nested);
+        }
+        let capture = entry.is_some();
+        let inputs = entry.map_or(IntegerRequirementEntry::Arbitrary, |row| IntegerRequirementEntry::UnitHistory(row.clone()));
         let effects = if !body.structure.checker_selected_snapshots.is_empty() { HistoryFrameEffects::Snapshot }
-            else if body.structure.has_ordinary_contextual_places() { HistoryFrameEffects::LexicalContext }
-            else { HistoryFrameEffects::None };
-        search_callable_history_frame(body, entry, self.work, (target.0 != origin).then_some(target.0), depth != 0,
-            effects, nested, |failure, steps| (self.record)(target, failure, prefix, steps))
+            else if body.structure.has_ordinary_contextual_places() { HistoryFrameEffects::LexicalContext } else { HistoryFrameEffects::None };
+        let (result, pieces) = super::checker_flow::search_callable_history_frame(body, inputs, self.work, step_owner,
+            capture, effects, nested, select)?;
+        Some(match result {
+            Completion::LimitReached => Receipt::LimitReached,
+            Completion::Exhausted(active) => {
+                self.observed.set(self.observed.get() || active);
+                Receipt::UnitPartitions(pieces)
+            }
+        })
+    }
+
+    /// The interpreter calls synchronously into a nested frame. Keep suspended
+    /// frames and their completed call receipts on the heap, not the host stack.
+    fn visit_unit(&self, root: PreparedCallable) -> Option<(super::checker_flow::CallableHistoryCompletion, Vec<super::checker_flow::UnitHistoryPiece>)> {
+        use super::checker_flow::{CallableHistoryCall as Receipt, CallableHistoryCompletion as Completion,
+            CallableHistoryEntry as Entry, CallableHistoryStep as Step};
+        struct Call { site: OccurrenceOrdinal, target: PreparedCallable, entry: Entry, prefix: Vec<Step> }
+        struct Frame {
+            target: PreparedCallable, incoming: Option<Call>,
+            returned: Vec<(Call, Receipt)>, reported: usize,
+        }
+        let mut stack = vec![Frame { target: root, incoming: None, returned: Vec::new(), reported: 0 }];
+        let mut prefix = Vec::new();
+        loop {
+            let frame = stack.last_mut()?;
+            let target = frame.target;
+            let body = self.calls.function_body(target.0, target.1, None)?;
+            let step_owner = (target.0 != root.0).then_some(target.0);
+            let mut position = 0;
+            let mut pending = None;
+            let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
+                argument: NestedIntegerArgument<'_>, steps: Vec<Step>| {
+                if !std::ptr::eq(body, caller) { return None; }
+                let child = symbolic_history_call_target(self.project, self.calls, target.0, target.1, body, site, signature)?;
+                if child.0 != target.0 && !completed_history_namespace(self.project, target.0, child.0, self.visits) { return None; }
+                let entry = argument.callable_history_entry(&signature.parameters, self.work)?;
+                let index = position;
+                position += 1;
+                if let Some((call, receipt)) = frame.returned.get(index) {
+                    if call.site != site || call.target != child || call.entry != entry || call.prefix != steps { return None; }
+                    return Some(receipt.clone());
+                }
+                let child_body = self.calls.function_body(child.0, child.1, None)?;
+                if child_body.structure.checker_direct_targets.is_empty() {
+                    // No suspension or parent rewalk for ordinary leaves. Keep the receipt
+                    // only because a later nested call may require resuming this parent.
+                    let child_prefix = || prefix.iter().chain(&steps).copied().collect::<Vec<_>>();
+                    let receipt = self.execute_frame(child_body, Some(&entry), (child.0 != root.0).then_some(child.0),
+                        None, |failure, suffix| (self.record)(child, failure, &child_prefix(), suffix))?;
+                    frame.returned.push((Call { site, target: child, entry, prefix: steps }, receipt.clone()));
+                    return Some(receipt);
+                }
+                pending = Some(Call { site, target: child, entry, prefix: steps });
+                None
+            };
+            let handler = (!body.call_occurrences.is_empty())
+                .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
+            let mut count = 0;
+            let seen = frame.reported;
+            let result = self.execute_frame(body, frame.incoming.as_ref().map(|call| &call.entry), step_owner,
+                handler, |failure, steps| {
+                    count += 1;
+                    if count <= seen { return Some(false); }
+                    (self.record)(target, failure, &prefix, steps)
+                });
+            if matches!(result, Some(Receipt::LimitReached)) { return Some((Completion::LimitReached, Vec::new())); }
+            if let Some(call) = pending {
+                if result.is_some() || count < seen || position != frame.returned.len() + 1 { return None; }
+                frame.reported = count;
+                let child = call.target;
+                prefix.extend_from_slice(&call.prefix);
+                stack.push(Frame { target: child, incoming: Some(call), returned: Vec::new(), reported: 0 });
+            } else {
+                let receipt = result?;
+                if count < seen || position != frame.returned.len() { return None; }
+                if frame.incoming.is_none() {
+                    let Receipt::UnitPartitions(pieces) = receipt else { return None; };
+                    return Some((Completion::Exhausted(self.observed.get()), pieces));
+                }
+                let call = stack.pop()?.incoming?;
+                prefix.truncate(prefix.len().checked_sub(call.prefix.len())?);
+                stack.last_mut()?.returned.push((call, receipt));
+            }
+        }
     }
 }
 
@@ -11929,6 +11984,7 @@ fn has_projected_unit_history_edge(calls: &ProjectCallSiteResults, target: Prepa
     while let Some(target) = pending.pop() {
         if !visited.insert(target) { continue; }
         let Some(body) = calls.function_body(target.0, target.1, None) else { continue; };
+        if body.boundary.parameters.iter().any(|p| matches!(p.ty, ScalarType::F32 | ScalarType::F64)) { return true; }
         for (&site, &child) in &body.structure.checker_direct_targets {
             let Some(signature) = body.checked_call_signatures.get(&site) else { continue; };
             if !matches!(signature.outputs.outputs.as_slice(), [result] if result.ty == ScalarType::Unit) {
@@ -11936,7 +11992,7 @@ fn has_projected_unit_history_edge(calls: &ProjectCallSiteResults, target: Prepa
             }
             // Routing only: the legacy carrier represents at most a pair
             // independently. The new engine authenticates the entire graph.
-            if signature.parameters.len() > 2 { return true; }
+            if signature.parameters.len() > 2 || signature.parameters.iter().any(|ty| matches!(ty, ScalarType::F32 | ScalarType::F64)) { return true; }
             let mut slots = HashSet::new();
             let parent = OccurrenceParent::Expression(site);
             for slot in 0..signature.parameters.len() {
@@ -11976,7 +12032,7 @@ fn collect_complete_unit_history<const ENTRY_EVIDENCE: bool>(
     };
     let graph = ClosedAuthoredHistories { project, calls, visits, work: &work, observed: &nested_active, record: &record };
     let (CallableHistoryCompletion::Exhausted(active), _) =
-        graph.visit_unit(target, IntegerRequirementEntry::Arbitrary, target.0, 0, &[]).ok_or(ProjectCheck::Unsupported)?
+        graph.visit_unit(target).ok_or(ProjectCheck::Unsupported)?
     else { return Err(ProjectCheck::Unsupported); };
     Ok(active || nested_active.get())
 }
@@ -12145,7 +12201,7 @@ fn collect_unreached_authored_paths(
             expected == InitializationVisit::Completed) {
             search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
         } else {
-            graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[]).map(|(completion, _)| completion)
+            graph.visit_unit((ordinal, item)).map(|(completion, _)| completion)
         }.ok_or(ProjectCheck::Unsupported)?;
         match result {
             CallableHistoryCompletion::Exhausted(observed) => active |= observed || nested_active.get(),
@@ -21389,6 +21445,65 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let main = prepare(&text, ScalarCheckerScope::MainFlowOnly).run().unwrap();
                 assert!(main.directives.is_empty());
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn forwarded_mixed_history_exhausts_deep_finite_graph_without_duplicate_diagnostics() {
+        let src = source("src/main.w", "deep-mixed-unit-history");
+        let mut text = String::from("%%start\nunit(f32,u8) layer0 = fn(dt,x) { };\n");
+        for level in 1..=32 {
+            let prior = level - 1;
+            text.push_str(&format!("unit(f32,u8) layer{level} = fn(dt,x) {{ layer{prior}(dt,x); }};\n"));
+        }
+        text.push_str(&format!("unit(f32,u8) root = fn(dt,x) {{ core.require(x < 250, {}); layer32(dt,x); core.require(x < 240, {}); }};\n%%end",
+            OUTPUT.replace(".code = 1", ".code = 11"), OUTPUT.replace(".code = 1", ".code = 13")));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&src, &text), Vec::new())], [], vec![src.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let full = prepare().run().unwrap().directives;
+            assert_eq!(full.iter().map(|f| f.code().clone()).collect::<Vec<_>>(), [11,13].map(BigInt::from));
+            let (capped, completion, _, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::new(3).unwrap()).unwrap();
+            assert_eq!(completion, StartupAuthoredCompletion::Exhausted);
+            assert_eq!(capped, full);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_unit_forwarding_preserves_real_order_and_original_integer_slots() {
+        let src = source("src/main.w", "mixed-unit-forwarding");
+        let text = r#"%%start
+unit(f32,u8,f64,u8) leaf = fn(dt,first,aspect,last) {
+    if (first < 128) { core.narrow(last < 64, {.stdout="";.stderr="callee narrow";.code=5;.files=[];}); };
+};
+unit(f64,u8,f32) frame = fn(aspect,x,dt) {
+    leaf(dt,x,aspect,x);
+    if (x < 128) { core.require(x < 64, {.stdout="";.stderr="lost call effect";.code=11;.files=[];}); };
+    core.require(x < 250, {.stdout="";.stderr="actual failure";.code=13;.files=[];});
+};
+%%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&src, program), Vec::new())], [], vec![src.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let full = prepare(text).run().unwrap().directives;
+            let (capped, _, steps, _) = prepare(text).search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+            assert_eq!(full, capped);
+            let [failure] = full.as_slice() else { panic!("unexpected reports: {full:?}"); };
+            assert_eq!(failure.code(), &BigInt::from(13));
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(250), &BigInt::from(255))]));
+            let call = "leaf(dt,x,aspect,x)";
+            let start = text.find(call).unwrap() as u32;
+            assert!(steps.contains_return(&wosy_syntax::SourceSpan::new(src.clone(),
+                ByteSpan::new(start, start + call.len() as u32))));
+            let computed = text.replace(call, "leaf(dt+1.0,x,aspect,x)");
+            assert!(prepare(&computed).run().is_err());
+            assert!(prepare(&computed).search_startup_authored_path(std::num::NonZeroUsize::MIN).is_err());
         }
     }
 

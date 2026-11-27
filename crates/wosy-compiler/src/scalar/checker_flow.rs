@@ -3768,6 +3768,7 @@ pub(super) enum IntegerRequirementEntry<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct CallableHistoryEntry(IntegerRow);
 
 pub(super) enum IntegerRequirementContinuation {
@@ -3822,12 +3823,14 @@ pub(super) enum CallableHistoryCompletion {
 }
 
 #[cfg(feature = "internal-checker")]
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 pub(super) struct UnitHistoryPiece {
     domains: Vec<Rc<IntegerSet>>,
     steps: Vec<CallableHistoryStep>,
 }
 
 #[cfg(feature = "internal-checker")]
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 pub(super) enum CallableHistoryCall {
     UnitPartitions(Vec<UnitHistoryPiece>),
     ScalarPartitions(Vec<IntegerReturnPartition>, Vec<Vec<CallableHistoryStep>>),
@@ -3890,7 +3893,7 @@ pub(super) fn search_callable_history_frame(
     if capture_unit && !calls.checker_returns_unit() { return None; }
     let histories = std::cell::RefCell::new(CallableHistories {
         work, outgoing_call: None, scalar_return_steps: None, step_owner, stopped: false, nodes: Vec::new(), interned: HashMap::new(),
-        unit_return_arity: capture_unit.then_some(calls.boundary.parameters.len()), unit_return_paths: None, received_unit_paths: None,
+        unit_return_arity: capture_unit.then(|| calls.boundary.parameters.iter().filter(|p| !matches!(p.ty, ScalarType::F32 | ScalarType::F64)).count()), unit_return_paths: None, received_unit_paths: None,
     });
     let mut unsupported = false;
     let mut sink = |mut failure: IntegerCheckFailure<'_>| {
@@ -4532,11 +4535,13 @@ pub(super) struct ProjectedUnitPair {
     survivors: IntegerInputs,
 }
 
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 pub(super) struct ProjectedIntegerPair {
     caller_axes: [usize; 2],
     pieces: Vec<IntegerPairReturnPartition>,
 }
 
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 struct IntegerPairReturnPartition {
     #[cfg(feature = "internal-checker")]
     span: super::ByteSpan,
@@ -4550,6 +4555,7 @@ enum ComputedIntegerReturn {
     Pair(IntegerPairReturnPartition),
 }
 
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 enum IntegerPairPartitionOutput {
     Singleton(Rc<IntegerSet>),
     InputAlias(usize),
@@ -4560,12 +4566,14 @@ pub(super) use super::analysis_budget::{charge_call_work, MAX_ACTUAL_CALL_DEPTH}
 #[cfg(test)]
 pub(super) use super::analysis_budget::FORMER_TRANSFER_CEILING;
 
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 pub(super) struct IntegerReturnPartition {
     span: super::ByteSpan,
     input: Rc<IntegerSet>,
     output: IntegerPartitionOutput,
 }
 
+#[cfg_attr(feature = "internal-checker", derive(Clone))]
 enum IntegerPartitionOutput {
     Singleton(Rc<IntegerSet>),
     InputAlias,
@@ -5211,13 +5219,14 @@ impl<'a> NestedIntegerArgument<'a> {
 impl ProjectedUnitHistory<'_> {
     fn entry(&self, parameters: &[ScalarType], work: &std::cell::Cell<usize>) -> Option<CallableHistoryEntry> {
         use CallableHistoryOperand::{Axis, Exact};
-        if self.operands.len() != parameters.len() { return None; }
+        let integer_parameters = parameters.iter().filter(|ty| !matches!(ty, ScalarType::F32 | ScalarType::F64));
+        if self.operands.len() != integer_parameters.clone().count() { return None; }
         let mut charged = work.get();
         charge_call_work(&mut charged, parameters.len())?;
         let mut row = IntegerRow::new(Vec::with_capacity(parameters.len()));
         let mut aliases = HashMap::new();
         let mut projected_affine = None;
-        for (slot, (operand, parameter)) in self.operands.iter().zip(parameters).enumerate() {
+        for (slot, (operand, parameter)) in self.operands.iter().zip(integer_parameters).enumerate() {
             match *operand {
                 Exact((ty, value)) if ty == parameter && super::typecheck::integer_literal_fits_type(value, ty) => {
                     row.cells.push(Rc::new(IntegerSet::singleton(value)));
@@ -5257,6 +5266,19 @@ fn projected_unit_operands<'a>(
     charge_call_work(work, signature.parameters.len())?;
     let mut operands = Vec::with_capacity(signature.parameters.len());
     for (slot, parameter) in signature.parameters.iter().enumerate() {
+        if matches!(parameter, ScalarType::F32 | ScalarType::F64) {
+            // A read of a by-value formal returns normally, regardless of its IEEE bits.
+            // Keep the *authored* slot until the operand's type and identity are checked.
+            // Computed expressions need ordered effects of their own and aren't erased.
+            let OccurrenceNode::Expression(arg) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
+            ))? else { return None; };
+            if calls.structure.checked_types.expressions.get(arg)? != parameter { return None; }
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*arg)? else { return None; };
+            if !calls.boundary.checker_parameter_bindings.as_ref()?.iter().zip(&calls.boundary.parameters)
+                .any(|(id, formal)| id == binding && &formal.ty == parameter) { return None; }
+            continue;
+        }
         let operand = match nested_integer_operand(calls, expression, slot, roots, path, false, Some(work))? {
             NestedIntegerOperand::Exact((ty, value)) if ty == parameter => CallableHistoryOperand::Exact((ty, value)),
             NestedIntegerOperand::Axis(ty, axis) if ty == parameter => CallableHistoryOperand::Axis(ty, axis),
@@ -7176,7 +7198,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         #[cfg(feature = "internal-checker")]
-        if roots.mixed_guard_plan.is_some() && matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
+        if (roots.mixed_guard_plan.is_some() || roots.callable_history.is_some()) && matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
             continue;
         }
         roots.add(binding, &parameter.ty);
@@ -7196,7 +7218,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         entries
     } else {
         let mut row: IntegerRow = if let Some((slot, row)) = projected {
-            if row.len() != boundary.parameters.len() || row.get(slot)?.is_empty() {
+            if row.len() != roots.parameters || (!row.cells.is_empty() && row.get(slot)?.is_empty()) {
                 return None;
             }
             row
