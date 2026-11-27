@@ -2282,6 +2282,7 @@ fn try_observed_projected_storage_call(
     let mut admitted = HashMap::new();
     let mut observed_owners = HashMap::new();
     let mut provider_units = HashSet::new();
+    let mut productive_ranges = HashMap::new();
     let mut getters = HashMap::new();
     let mut frontiers = HashMap::new();
     let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
@@ -2315,7 +2316,14 @@ fn try_observed_projected_storage_call(
                             let Some(getter) = admit_getter(node,body,site,child,signature) else { return Ok(false); };
                             getters.insert((body as *const FunctionCallSites,site),getter);
                         }
-                        frontiers.insert(node,condition);
+                        if let Some(rank)=stateful_provider::advancing_range_plan(body,node,condition).filter(|_|
+                            stateful_provider::qualified_store_reachable(actual.project,actual.calls,node,visits)) {
+                            productive_ranges.insert(node,rank);
+                            provider_units.insert(node);
+                            writes_or_reads_storage=true;
+                        } else {
+                            frontiers.insert(node,condition);
+                        }
                         visiting.remove(&node);
                         complete.insert(node);
                         continue;
@@ -2441,9 +2449,12 @@ fn try_observed_projected_storage_call(
         let child=authenticate_prepared_direct_edge(actual.project,actual.calls,caller,body,site,signature)?;
         // Do not observe an ambient owner. The real namespace provider has
         // finished initialization and shares this exact storage row.
-        if child.0==caller || !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
+        if child.0==caller {
+            if !productive_ranges.contains_key(&child) || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
+        } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
-        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),&mut provider_dispatch.borrow_mut(),&read_array_atom)?;
+        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
+            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,&read_array_atom)?;
         Some((value,result.map(&intern_trace),cost))
     };
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
@@ -25139,6 +25150,102 @@ unit(u8) parent = fn(a) {
             assert!(trace.contains_branch(short.clone(),true));
             assert!(trace.contains_branch(short.clone(),false));
             eprintln!("Orbital original pt/index_vertex/put {target_layout:?}: indices [37,37,38], end 39, invalid data sets flag and later put skips");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_moving_partition_runs_productive_current_range() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        use super::super::checker_flow::take_observed_u16_writes as writes;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let range=fragment("unit(i32,i32) index_range=", "unit(i32,i32) static_partition=");
+        let moving=fragment("unit(i32) moving_partition=", "i32(i32,i32) pack_moving=");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let text=format!(r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            {mesh}
+            i32 count=4097;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32[5] motion_first=[4097,0,0,0,0];
+            i32[5] motion_size=[3,0,0,0,0];
+            i32[5] motion_base=[37,0,0,0,0];
+            i32[5] motion_unique=[0,0,0,0,0];
+            i32 result=0; i32 last=0;
+            {pt}
+            {range}
+            {moving}
+            unit() launch=fn {{
+                packing.start();
+                pt(1.125,-2.25,3.5,-4.5);
+                pt(1.125,-2.25,3.5,-4.5);
+                pt(9.125,-2.25,3.5,-4.5);
+                moving_partition(0);
+                result=motion_unique[0];
+                last=packing.end();
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=result;.files=[{{.path="last.json";.state=last;}}];}});
+        %%end"#);
+        let outside=text.replace("motion_first=[4097,0", "motion_first=[20479,0");
+        let app=source("src/main.w","pinned-orbital-actual-moving-partition");
+        let provider=source("src/indexed-pack.w","pinned-orbital-actual-moving-provider");
+        let span=|snippet:&str| {
+            let start=text.find(snippet).unwrap() as u32;
+            SourceSpan::new(app.clone(),ByteSpan::new(start,start+snippet.len() as u32))
+        };
+        let ns=span(r#"packing=namespace demo "indexed-pack.w";"#);
+        let recurse=span("index_range(begin+1,finish)");
+        let range_site=span("index_range(src,src+reserve)");
+        let guard=span("begin<finish&&packing.ok()");
+        let body_guard=span("begin<finish");
+        let check_writes=|| {
+            let items=writes();
+            assert_eq!(items.len(),3);
+            for ((cell,value),(index,expected)) in items.iter().zip([(1,37),(2,37),(3,38)]) {
+                assert_eq!(cell.declaration.source,provider);
+                assert_eq!(cell.indices.as_ref(),[1,0,0,index]);
+                assert_eq!(*value,expected);
+            }
+        };
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ns.range,
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            writes();
+            let all=prepare(&text).run().unwrap();
+            check_writes();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(2));
+            assert_eq!(report.files()[0].text.as_ref(),b"{\"type\":{\"kind\":\"i32\"},\"value\":39}\n");
+            let (capped,_,trace,_)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            check_writes();
+            assert_eq!(all.directives,capped);
+            assert!(trace.contains_return(&range_site));
+            assert!(trace.contains_branch(guard.clone(),true));
+            assert!(trace.contains_branch(guard.clone(),false));
+            assert!(trace.contains_branch(body_guard.clone(),false));
+            let recursions=trace.selected_steps().flatten().filter_map(|step| match step {
+                failure_search::PathStep::ObservedPrefix(history)=>Some(history.root.iter().chain(history.segments.iter().flatten())
+                    .filter(|event| matches!(event,ordered_float_prefix::ObservedStep::Call {site,..} if site==&recurse)).count()),
+                _=>None,
+            }).sum::<usize>();
+            assert_eq!(recursions,3);
+            assert!(matches!(prepare(&outside).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            eprintln!("Orbital original moving_partition {target_layout:?}: 3 strictly decreasing live steps, indices [37,37,38], unique 2, no out-of-bounds outcome");
         }
     }
 

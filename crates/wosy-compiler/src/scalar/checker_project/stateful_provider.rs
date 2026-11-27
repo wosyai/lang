@@ -112,6 +112,56 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
+#[derive(Clone,Copy)]
+pub(super) struct RangeRank { begin:usize, finish:usize }
+
+/// Tie a structurally terminal source recurrence to its checked two-formal
+/// comparison and replacement edges. Runtime still checks the live rank.
+pub(super) fn advancing_range_plan(body:&FunctionCallSites, target:PreparedCallable, condition:OccurrenceOrdinal) -> Option<RangeRank> {
+    let st=&body.structure;
+    let ids=body.boundary.checker_parameter_bindings.as_deref()?;
+    if ids.len()!=2 || !body.boundary.parameters.iter().all(|p| p.ty==ScalarType::I32) { return None; }
+    let cut=body.short_circuits.get(&condition)?;
+    if !cut.evaluate_right_when || cut.bypass { return None; }
+    let (left,BinaryOperator::Less,right)=st.prepared_range_binary.get(&cut.left)? else { return None; };
+    let formal=|at| match body.prepared_plain_name(at)? {
+        PlainNameIdentity::Lexical(id)=>ids.iter().position(|p| p==id),
+        _=>None,
+    };
+    let (begin,finish)=(formal(*left)?,formal(*right)?);
+    if begin==finish { return None; }
+    let [item]=st.blocks.get(st.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression }=item.kind else { return None; };
+    let ConditionalRegion::Unit { condition:actual,then_block,.. }=body.conditionals.get(&expression)? else { return None; };
+    if *actual!=condition { return None; }
+    let BlockItemKind::Evaluation { expression:backedge }=st.blocks.get(then_block.0)?.items.last()?.kind else { return None; };
+    if st.checker_direct_targets.get(&backedge)!=Some(&target)
+        || st.checker_direct_targets.iter().any(|(&site,&child)| child==target && site!=backedge) { return None; }
+    let argument=|slot| match st.edges.get(&(OccurrenceParent::Expression(backedge),OccurrenceEdge::CallArgument(slot)))? {
+        OccurrenceNode::Expression(at)=>Some(*at), _=>None,
+    };
+    let (old,BinaryOperator::Add,one)=st.prepared_range_binary.get(&argument(begin)?)? else { return None; };
+    if formal(*old)!=Some(begin) || formal(argument(finish)?)!=Some(finish)
+        || st.prepared_range_literals.get(one)?!=&BigInt::from(1)
+        || st.checked_types.expressions.get(&argument(begin)?)?!=&ScalarType::I32
+    { return None; }
+    Some(RangeRank { begin,finish })
+}
+
+impl RangeRank {
+    fn decreases(self, slots:&HashMap<ReferenceBindingId,ExactValue>,ids:&[ReferenceBindingId],args:&[ExactValue]) -> Option<()> {
+        let begin=rank_value(slots.get(ids.get(self.begin)?)?)?;
+        let finish=rank_value(slots.get(ids.get(self.finish)?)?)?;
+        let next=rank_value(args.get(self.begin)?)?;
+        let next_finish=rank_value(args.get(self.finish)?)?;
+        // Compute the true mathematical distance in i64, not a potentially
+        // overflowing difference in the source i32 coordinate type.
+        let distance=i64::from(finish)-i64::from(begin);
+        let successor=i64::from(next_finish)-i64::from(next);
+        (distance>0 && successor==distance-1 && finish==next_finish && begin.checked_add(1)?==next).then_some(())
+    }
+}
+
 /// The common Unit cursor keeps its established lane for ordinary scopes.
 /// A mixed, directly prepared Unit with a nested U16 store needs this
 /// state-returning runner. The store itself is checked again on execution.
@@ -126,6 +176,36 @@ pub(super) fn needs_unit_runner(body:&FunctionCallSites) -> bool {
                 && observed_f32_array::typed_place(body,destination.destination,&ScalarType::U16).is_some()))
 }
 
+/// Restrict productive recursion to a prepared chain that actually carries
+/// a completed owner's U16 storage effect. A syntactic edge is not an
+/// execution fact; every selected call is checked again by the cursor.
+pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCallSiteResults,start:PreparedCallable,
+    visits:&[InitializationVisit]) -> bool {
+    let mut seen=HashSet::new();
+    let mut pending=vec![start];
+    while let Some(target)=pending.pop() {
+        if !seen.insert(target) { continue; }
+        let Some(body)=calls.function_body(target.0,target.1,None) else { continue; };
+        for (&site,&child) in &body.structure.checker_direct_targets {
+            if child==target { continue; }
+            let Some(signature)=body.checked_call_signatures.get(&site) else { continue; };
+            if !matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::Unit)
+                || authenticate_prepared_direct_edge(project,calls,target.0,body,site,signature)!=Some(child) {
+                continue;
+            }
+            if child.0==start.0 {
+                pending.push(child);
+                continue;
+            }
+            let Some(from)=project.modules.get(target.0) else { continue; };
+            let Some(to)=project.modules.get(child.0) else { continue; };
+            if completed_namespace_owner(&from.source,&to.source,child.0,Some(visits))
+                && calls.function_body(child.0,child.1,None).is_some_and(needs_unit_runner) { return true; }
+        }
+    }
+    false
+}
+
 #[derive(Default)]
 pub(super) struct Dispatch<'a> {
     declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
@@ -136,9 +216,9 @@ pub(super) struct Dispatch<'a> {
 pub(super) fn run<'a>(
     project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
     storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
+    ranges:&HashMap<PreparedCallable,RangeRank>, visits:&[InitializationVisit],
     read_array:impl Fn(&ProjectedStorage,&observed_f32_array::Cell,&ScalarType)->Option<(ExactValue,usize)>,
 ) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize)> {
-    let owner=&project.modules.get(target.0)?.source;
     let mut active=HashSet::new();
     let mut latest_segment=HashMap::<PreparedCallable,(Rc<ObservedTrace>,usize)>::new();
     let mut values=Vec::new();
@@ -170,6 +250,7 @@ pub(super) fn run<'a>(
         charge_call_work(&mut work,1)?;
         let frame=stack.last_mut()?;
         let (function,body,_) = get_symbol(&mut dispatch.declarations,frame.target)?;
+        let owner=&project.modules.get(frame.target.0)?.source;
         let st=&body.structure;
         let edge=|at,edge| match st.edges.get(&(OccurrenceParent::Expression(at),edge))? {
             OccurrenceNode::Expression(found)=>Some(*found),
@@ -359,8 +440,10 @@ pub(super) fn run<'a>(
                     values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::U16,value.into())));
                     continue;
                 }
-                let child=authenticate_prepared_direct_edge(project,calls,target.0,body,site,signature)?;
-                if child.0!=target.0 { return None; }
+                let child=authenticate_prepared_direct_edge(project,calls,frame.target.0,body,site,signature)?;
+                if child.0!=frame.target.0 && !completed_namespace_owner(owner,&project.modules.get(child.0)?.source,child.0,Some(visits)) {
+                    return None;
+                }
                 // Reuse the independently sealed pure engine for precisely
                 // scoped F32-input functions. Its certificate forbids all
                 // state reads/writes and opaque calls; never try it for find.
@@ -377,9 +460,10 @@ pub(super) fn run<'a>(
                         let locals=function.formals.iter().zip(args).map(|((id,_),value)| (id.clone(),value)).collect();
                         let (mut returned,inner)=ordered_float_prefix::evaluate_observed_prefix(plan,Some(function),locals,
                             |_,_,_| None,trace,&mut work,|func,at| {
-                                if func.0!=target.0 { return None; }
+                                if func.0!=child.0 { return None; }
                                 let owner_body=calls.function_body(func.0,func.1,None)?;
-                                Some(SourceSpan::new(owner.clone(),owner_body.occurrences.get(at.0)?.span))
+                                let source=&project.modules.get(func.0)?.source;
+                                Some(SourceSpan::new(source.clone(),owner_body.occurrences.get(at.0)?.span))
                             })?;
                         if returned.len()!=1 { return None; }
                         let value=returned.pop()?;
@@ -413,8 +497,12 @@ pub(super) fn run<'a>(
                     continue;
                 }
                 let rank=if child==frame.target {
-                    if !matches!(tasks.last(),Some(Task::Finish(..))) { return None; }
                     let bindings=body.boundary.checker_parameter_bindings.as_deref()?;
+                    if let Some(rank)=ranges.get(&child) {
+                        rank.decreases(&frame.slots,bindings,&args)?;
+                        None
+                    } else {
+                    if !matches!(tasks.last(),Some(Task::Finish(..))) { return None; }
                     let use_rank=|slot| -> Option<usize> {
                         let id=bindings.get(slot)?;
                         rank_argument(body,site,slot,id)?;
@@ -423,6 +511,7 @@ pub(super) fn run<'a>(
                         (next>=0 && next.checked_add(1)?==prior).then_some(slot)
                     };
                     Some(match frame.rank { Some(slot)=>use_rank(slot)?, None=>(0..n).find_map(use_rank)? })
+                    }
                 } else {
                     if !active.insert(child) { return None; }
                     None
