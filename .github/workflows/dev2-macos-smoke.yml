@@ -1,0 +1,31 @@
+name: Wosy Dev2 macOS release smoke (one-off)
+on:
+  push:
+    branches: [test/dev2-macos-d524f9c3-01]
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout one-off test harness
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Checkout exact Dev2 source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: d524f9c3ffdfa8c0f56414a0385cb60beed79e82
+          path: dev2-source
+          persist-credentials: false
+      - name: Prepare LLVM 18 on the disposable runner
+        shell: bash
+        run: |
+          if ! brew list --versions llvm@18; then
+            brew install llvm@18
+          fi
+      - name: Validate real macOS native build and run
+        working-directory: dev2-source
+        shell: bash
+        run: sh ../.github/wosy-one-off/mac-smoke.sh
