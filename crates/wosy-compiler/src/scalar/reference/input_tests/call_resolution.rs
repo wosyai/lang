@@ -26,7 +26,7 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
         let ScalarItem::Function(parent) = &mut program.items[3] else {
             panic!("overload")
         };
-        let shared = expression_span(&parent.overload_arms[0].body.expressions[0]);
+        let shared = expression_span(parent.overload_arms[0].body.expressions().next().unwrap());
         let original_metadata = parent
             .overload_arms
             .iter()

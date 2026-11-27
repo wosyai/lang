@@ -1026,7 +1026,6 @@ enum ScalarTypeIdentity {
 #[derive(Clone, Debug, PartialEq)]
 struct ScalarBlockIdentity {
     items: Vec<ScalarBlockItemIdentity>,
-    expressions: Vec<ScalarExpressionIdentity>,
     final_output_values: Vec<(usize, ScalarTypeIdentity, ScalarExpressionIdentity)>,
     unsafe_context: bool,
 }
@@ -1251,11 +1250,6 @@ fn scalar_block_identity(block: &ScalarBlock) -> ScalarBlockIdentity {
                         .collect(),
                 ),
             })
-            .collect(),
-        expressions: block
-            .expressions
-            .iter()
-            .map(scalar_expression_identity)
             .collect(),
         final_output_values: block
             .final_output_values
@@ -1970,14 +1964,41 @@ pub enum ScalarExternModule {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ScalarBlock {
     pub items: Vec<ScalarBlockItem>,
     pub terminated_items: Vec<bool>,
-    pub expressions: Vec<ScalarExpression>,
     pub final_output_values: Vec<ScalarOutputValue>,
     pub span: ByteSpan,
     pub unsafe_context: bool,
+}
+
+impl Serialize for ScalarBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        struct ExpressionProjection<'a>(&'a ScalarBlock);
+        impl Serialize for ExpressionProjection<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.collect_seq(self.0.expressions())
+            }
+        }
+
+        let mut block = serializer.serialize_struct("ScalarBlock", 6)?;
+        block.serialize_field("items", &self.items)?;
+        block.serialize_field("terminated_items", &self.terminated_items)?;
+        block.serialize_field("expressions", &ExpressionProjection(self))?;
+        block.serialize_field("final_output_values", &self.final_output_values)?;
+        block.serialize_field("span", &self.span)?;
+        block.serialize_field("unsafe_context", &self.unsafe_context)?;
+        block.end()
+    }
 }
 
 struct ScalarTailConditional<'a> {
@@ -1997,6 +2018,14 @@ enum ScalarBlockItemRole<'a> {
 }
 
 impl ScalarBlock {
+    /// The expressions in source order, borrowed from the canonical block items.
+    pub fn expressions(&self) -> impl Iterator<Item = &ScalarExpression> {
+        self.items.iter().filter_map(|item| match item {
+            ScalarBlockItem::Expression(expression) => Some(expression),
+            _ => None,
+        })
+    }
+
     pub(crate) fn final_expressions(
         &self,
     ) -> impl Iterator<Item = (&ScalarExpression, &ScalarOutputValue)> {
@@ -4039,7 +4068,7 @@ fn derive_function_with_runtime_match(node: &CstNode, places: &contextual::Conte
         .find(|child| child.kind() == SyntaxKind::Block)
         .map(|node| derive_block_with_context(node, false, places))
         .or_else(|| runtime_enum_match.as_ref().map(|plan| ScalarBlock {
-            span: plan.span, items: Vec::new(), terminated_items: Vec::new(), expressions: Vec::new(),
+            span: plan.span, items: Vec::new(), terminated_items: Vec::new(),
             final_output_values: Vec::new(), unsafe_context: false,
         }))
         .expect("function block");
@@ -4184,7 +4213,6 @@ fn derive_overload(node: &CstNode, places: &contextual::ContextualPlaces) -> Sca
         body: ScalarBlock {
             items: Vec::new(),
             terminated_items: Vec::new(),
-            expressions: Vec::new(),
             final_output_values: Vec::new(),
             span: wosy_syntax::byte_span(node),
             unsafe_context: false,
@@ -4663,17 +4691,9 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool, places: &cont
             .map(|output| ScalarBlockItem::Expression(output.value.clone())),
     );
     terminated_items.extend(final_output_values.iter().map(|_| false));
-    let expressions = items
-        .iter()
-        .filter_map(|item| match item {
-            ScalarBlockItem::Expression(expression) => Some(expression.clone()),
-            _ => None,
-        })
-        .collect();
     ScalarBlock {
         items,
         terminated_items,
-        expressions,
         final_output_values,
         span: wosy_syntax::byte_span(node),
         unsafe_context,

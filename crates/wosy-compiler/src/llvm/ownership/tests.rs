@@ -39,7 +39,6 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
                 value,
             })
             .collect(),
-        expressions: values,
         span: ByteSpan { start, end },
         unsafe_context: false,
     };

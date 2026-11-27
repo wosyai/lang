@@ -943,7 +943,7 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         panic!("function")
     };
     let mut function = function.clone();
-    let read_span = expression_span(&function.body.expressions[0]);
+    let read_span = expression_span(function.body.expressions().next().unwrap());
     let calls =
         reference::test_function_call_sites(&validated.program.source, &function, &HashMap::new());
     let errors = record_function_reference_origins(
@@ -1875,7 +1875,7 @@ fn terminal_unsafe_block_derives_one_final_output() {
             assert_eq!(body.final_output_values.len(), 1);
             assert_eq!(body.items.len(), item_count);
             assert_eq!(body.terminated_items, vec![false; item_count]);
-            assert_eq!(body.expressions.len(), item_count);
+            assert_eq!(body.expressions().count(), item_count);
             let output = &body.final_output_values[0];
             assert_eq!(output.position, 0);
             let start = source_text.rfind(final_expression).expect("final unsafe") as u32;
@@ -4815,7 +4815,17 @@ fn unsafe_statement_and_unit_output_remain_statements_in_both_pipelines() {
             };
             let body = &function.body;
             assert_eq!(body.items.len(), body.terminated_items.len());
-            assert_eq!(body.items.len(), body.expressions.len());
+            assert_eq!(body.items.len(), body.expressions().count());
+            for (expression, item) in body.expressions().zip(&body.items) {
+                let ScalarBlockItem::Expression(original) = item else { panic!("expected expression") };
+                assert!(std::ptr::eq(expression, original));
+            }
+            let wire = serde_json::to_value(body).unwrap();
+            assert_eq!(
+                wire["expressions"],
+                serde_json::to_value(body.expressions().collect::<Vec<_>>()).unwrap(),
+            );
+            assert_eq!(serde_json::from_value::<ScalarBlock>(wire).unwrap(), *body);
             assert_eq!(body.final_output_values.len(), final_output_count);
             assert_eq!(body.terminated_items, terminated_items);
         }
