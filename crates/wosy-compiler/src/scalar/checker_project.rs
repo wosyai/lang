@@ -2452,7 +2452,7 @@ fn passive_startup_initializer(ty: &ScalarType, expression: &ScalarExpression) -
     match (ty, expression) {
         (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. }) => true,
         (ScalarType::Array { element, .. }, ScalarExpression::ArrayLiteral { .. }) =>
-            matches!(element.as_ref(), ScalarType::Array { .. } | ScalarType::Struct(_)
+            is_integer_type(element) || matches!(element.as_ref(), ScalarType::Array { .. } | ScalarType::Struct(_)
                 | ScalarType::F32 | ScalarType::F64),
         _ => false,
     }
@@ -18589,6 +18589,37 @@ mod tests {
                 }
                 if cap == 3 { assert!(histories[1][0].range.start < histories[1][1].range.start); }
                 assert_eq!(prepare().run().unwrap().directives.len(), 2);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn passive_integer_startup_arrays_keep_typed_leaves_and_share_owned_copies() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "passive-integer-startup-arrays");
+        let cells = (0..96).map(|index| if index == 95 { "255" } else { "0" })
+            .collect::<Vec<_>>().join(",");
+        let program = |claim: &str| format!(r#"%%start
+            u8[96] line=[{cells}];
+            u8[96][2] layer=[line,line];
+            u8[96][2][2] grid=[layer,layer];
+            core.require({claim},{OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).unwrap_or_else(|error| panic!("typed integer array preparation: {error:?}"));
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let good = program("true");
+                let bad = program("false");
+                let (valid, _) = prepare(&good, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert!(valid.active && valid.directives.is_empty());
+                assert!(prepare(&good, scope).run().unwrap().directives.is_empty());
+                let (invalid, _) = prepare(&bad, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(invalid.directives.len(), 1);
+                assert_eq!(invalid.directives, prepare(&bad, scope).run().unwrap().directives);
             }
         }
     }
