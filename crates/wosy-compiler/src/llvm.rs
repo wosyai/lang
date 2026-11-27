@@ -436,65 +436,18 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
     root: &wosy_syntax::SourceIdentity,
     requested: &BTreeMap<String, String>,
 ) -> Result<LlvmPartition, String> {
-    let modules = &validation.prepared().project().modules;
-    let singleton = modules.len() == 1;
-    let root_module = modules.iter().find(|module| &module.source == root)
-        .ok_or_else(|| format!("missing selected Wasm export root {}", root.path))?;
-    if root_module.target_layout != ScalarTargetLayout::WASM32 {
-        return Err("Wasm root exports require a Wasm artifact".into());
-    }
-    let direct = |ty: &ScalarType| matches!(
-        ty, ScalarType::I32 | ScalarType::U32 | ScalarType::I64 | ScalarType::U64
-            | ScalarType::F32 | ScalarType::F64
-    );
-    let mut root_functions = requested
-        .values()
-        .map(|name| (name.as_str(), None))
-        .collect::<BTreeMap<_, _>>();
-    for item in &root_module.items {
-        if let ScalarItem::Function(function) = item {
-            if let Some(entry) = root_functions.get_mut(function.name.as_str()) {
-                match entry {
-                    Some((_, ambiguous)) => *ambiguous = true,
-                    None => *entry = Some((function, false)),
-                }
-            }
-        }
-    }
-    let mut exports = Vec::with_capacity(requested.len());
-    for (label, authored) in requested {
-        let mut bytes = label.bytes();
-        if !bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
-            || matches!(label.as_str(), "main" | "_start" | "memory")
-            || label.starts_with("__") || label.starts_with("wosy_")
-        {
-            return Err(format!("invalid or reserved Wasm root export label {label:?}"));
-        }
-        let (function, ambiguous) = root_functions[authored.as_str()].ok_or_else(|| {
-            format!("Wasm root export {label:?} names no root function {authored:?}")
-        })?;
-        if ambiguous || !function.generic_parameters.is_empty()
-            || !function.overload_arms.is_empty()
-        {
-            return Err(format!("Wasm root export {label:?} needs an unambiguous concrete declaration"));
-        }
-        let ScalarType::Callable { outputs, parameters } = &function.signature else {
-            return Err(format!("Wasm root export {label:?} is not callable"));
-        };
-        if !parameters.iter().all(direct) || !match outputs.outputs.as_slice() {
-            [] => true,
-            [output] => output.ty == ScalarType::Unit || direct(&output.ty),
-            _ => false,
-        } {
-            return Err(format!("Wasm root export {label:?} needs only direct scalar ABI values"));
-        }
-        exports.push(WasmRootExport {
-            label,
-            symbol: if singleton { authored.clone() } else { project_function_name(root, authored) },
+    let prepared = validation.prepared();
+    let singleton = prepared.project().modules.len() == 1;
+    let selected = crate::scalar::wasm_root_exports::resolve_prepared_wasm_root_exports(prepared, root, requested)?;
+    let exports = selected.iter().map(|entry| {
+        let function = entry.function();
+        let authored = &function.name;
+        WasmRootExport {
+            label: entry.label(),
+            symbol: if singleton { authored.clone() } else { project_function_name(entry.source(), authored) },
             signature: &function.signature,
-        });
-    }
+        }
+    }).collect::<Vec<_>>();
     if singleton {
         emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)
     } else {

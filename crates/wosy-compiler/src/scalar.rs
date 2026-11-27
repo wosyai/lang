@@ -2737,6 +2737,7 @@ use overload::{
     ScalarOverloadHeader, ScalarTypingView,
 };
 pub(crate) mod layout;
+pub(crate) mod wasm_root_exports;
 pub use layout::{ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout, ScalarEnumVariantLayout, ScalarTargetLayouts};
 use layout::{resolve_program_struct_layouts, resolve_project_struct_layouts};
 mod resolution;
