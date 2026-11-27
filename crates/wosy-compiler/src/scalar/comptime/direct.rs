@@ -14,7 +14,8 @@ use super::super::{
     derive_scalar_declarations_with_embedding, ConcreteCallSelection, EmbeddedComptimeExpression,
     PreparedScalarProject, ResolvedCallTarget, ScalarBuildValidation, ScalarFunction,
 };
-use wosy_syntax::{ByteSpan, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind};
+use rowan::{ast::SyntaxNodePtr, GreenNode};
+use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind, WosyLanguage};
 
 const MAX_DIRECT_STARTUP_CALLS: usize = 16;
 const MAX_PAIR_STARTUP_HOPS: usize = 8;
@@ -402,7 +403,7 @@ impl PairStartupCallGraphEvidence {
 pub struct PairStartupCallGraphComptimePlan {
     evidence: PairStartupCallGraphEvidence,
     evaluators: Vec<ClosedComptimeFragment>,
-    max_wasip1_stdout: Option<usize>,
+    wasip1_stdout: Option<(usize, RetainedPairOrdinaryCst)>,
 }
 
 /// Same bound graph, exact compiler-produced P1 IR and resolved result type
@@ -412,8 +413,43 @@ pub struct PairStartupCallGraphComptimePlan {
 pub struct BoundedPairStartupWasip1Output {
     evidence: PairStartupCallGraphEvidence,
     evaluators: Vec<BoundedStartupWasip1Evaluator>,
+    ordinary: RetainedPairOrdinaryCst,
     ir_bytes: usize,
     max_stdout: usize,
+}
+
+type AuthoredNode = SyntaxNodePtr<WosyLanguage>;
+
+#[derive(Debug)]
+struct RetainedPairOrdinaryCst {
+    green: GreenNode,
+    site: AuthoredNode,
+    callable_tail: AuthoredNode,
+    initializers: Vec<AuthoredNode>,
+    source_bytes: usize,
+}
+
+/// A normal canonical CST view of this exact compiler-owned continuation.
+/// Opening the view reconstructs only Rowan's red root; it does not parse,
+/// type, replace occurrences, compile, apply results or publish anything.
+pub struct PairOrdinaryContinuation<'plan> {
+    canonical: CanonicalCstRoot,
+    retained: &'plan RetainedPairOrdinaryCst,
+    evidence: &'plan PairStartupCallGraphEvidence,
+}
+
+impl PairOrdinaryContinuation<'_> {
+    pub fn canonical_cst(&self) -> &CanonicalCstRoot { &self.canonical }
+    pub fn comptime_site(&self) -> CstNode { self.retained.site.to_node(&self.canonical.root) }
+    pub fn callable_tail(&self) -> CstNode { self.retained.callable_tail.to_node(&self.canonical.root) }
+
+    /// Exact initializer addresses with the existing authenticated cases,
+    /// in the same ordinary initialization order. Bypasses have no evaluator index.
+    pub fn initializers(&self) -> impl ExactSizeIterator<Item = (CstNode, PairStartupOccurrence<'_>)> {
+        self.retained.initializers.iter().zip(self.evidence.occurrences()).map(|(node, case)| {
+            (node.to_node(&self.canonical.root), case)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -428,6 +464,14 @@ impl BoundedPairStartupWasip1Output {
     pub fn evaluators(&self) -> &[BoundedStartupWasip1Evaluator] { &self.evaluators }
     pub fn ir_bytes(&self) -> usize { self.ir_bytes }
     pub fn max_stdout(&self) -> usize { self.max_stdout }
+    /// Logical authored bytes, not a Rowan heap/RSS measurement.
+    pub fn authored_source_bytes(&self) -> usize { self.ordinary.source_bytes }
+
+    pub fn ordinary_continuation(&self) -> PairOrdinaryContinuation<'_> {
+        let canonical = CanonicalCstRoot::new(self.evidence.site().source.clone(),
+            CstNode::new_root(self.ordinary.green.clone()));
+        PairOrdinaryContinuation { canonical, retained: &self.ordinary, evidence: &self.evidence }
+    }
 }
 
 impl BoundedStartupWasip1Evaluator {
@@ -460,7 +504,7 @@ impl PairStartupCallGraphComptimePlan {
     /// Bound aggregate retained IR while serializing the ordinary emitted text.
     /// This is still a non-executable compiler projection, not readback.
     pub fn into_bounded_wasip1_output(self, max_ir_bytes: usize) -> std::io::Result<BoundedPairStartupWasip1Output> {
-        let max_stdout = self.max_wasip1_stdout.ok_or_else(|| std::io::Error::new(
+        let (max_stdout, ordinary) = self.wasip1_stdout.ok_or_else(|| std::io::Error::new(
             std::io::ErrorKind::Unsupported, "the startup graph did not emit WASIp1 stdout"))?;
         let mut remaining = max_ir_bytes;
         let mut evaluators = Vec::with_capacity(self.evaluators.len());
@@ -470,7 +514,7 @@ impl PairStartupCallGraphComptimePlan {
             evaluators.push(BoundedStartupWasip1Evaluator { ir: std::sync::Arc::new(bytes), result_type, output_span: site.range });
         }
         Ok(BoundedPairStartupWasip1Output {
-            evidence: self.evidence, evaluators, ir_bytes: max_ir_bytes - remaining, max_stdout,
+            evidence: self.evidence, evaluators, ordinary, ir_bytes: max_ir_bytes - remaining, max_stdout,
         })
     }
 }
@@ -507,13 +551,14 @@ fn derive_pair_startup_graph_with_delivery(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, max_wasip1_stdout: Option<usize>,
 ) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
     with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
-        StartupEntry::PairCallGraph, |calls, body, name_span, proof| {
-            let VerifiedStartupPaths::Graph { site, hops, selectors, paths, order } = proof else {
+        StartupEntry::PairCallGraph { retain_cst: max_wasip1_stdout.is_some() }, |calls, body, name_span, proof| {
+            let VerifiedStartupPaths::Graph { site, hops, selectors, paths, order, ordinary } = proof else {
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
             };
             let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls, max_wasip1_stdout)?.into_parts();
             let evidence = PairStartupCallGraphEvidence { site_id: id.to_owned(), site, layout, calls, hops, selectors, paths, order };
-            Ok(PairStartupCallGraphComptimePlan { evidence, evaluators, max_wasip1_stdout })
+            let wasip1_stdout = max_wasip1_stdout.zip(ordinary);
+            Ok(PairStartupCallGraphComptimePlan { evidence, evaluators, wasip1_stdout })
         })
 }
 
@@ -596,7 +641,7 @@ fn with_verified_direct_call<T>(
 enum StartupEntry {
     Direct,
     OneForwarder,
-    PairCallGraph,
+    PairCallGraph { retain_cst: bool },
 }
 
 enum VerifiedStartupPaths {
@@ -608,6 +653,7 @@ enum VerifiedStartupPaths {
         selectors: Vec<PairStartupSelector>,
         paths: Vec<PairStartupCallPath>,
         order: Vec<PairStartupOrder>,
+        ordinary: Option<RetainedPairOrdinaryCst>,
     },
 }
 
@@ -653,7 +699,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
                 .ok_or_else(|| unsupported("expected one safe authored forwarder before startup bindings"))?;
             forwarders.push(wosy_syntax::byte_span(&declaration));
         }
-        StartupEntry::PairCallGraph => {
+        StartupEntry::PairCallGraph { .. } => {
             while let Some(declaration) = authored_items.peek().and_then(|item| only(item.children()))
                 .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
             {
@@ -669,13 +715,20 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         }
     }
     let mut count = 0;
+    let mut cst_initializers = matches!(entry, StartupEntry::PairCallGraph { retain_cst: true }).then(Vec::new);
     for item in authored_items {
-        if only(item.children()).is_none_or(|child| child.kind() != SyntaxKind::BindingDecl) {
+        let Some(binding) = only(item.children()).filter(|child| child.kind() == SyntaxKind::BindingDecl) else {
             return Err(unsupported("each authored startup item must be one ordinary binding"));
-        }
+        };
         count += 1;
         if count > limit {
             return Err(unsupported("direct comptime startup call limit exceeded"));
+        }
+        if let Some(cst_initializers) = &mut cst_initializers {
+            let initializer = binding.children().find(|node| node.kind() == SyntaxKind::OutputList)
+                .and_then(|outputs| only(outputs.children().filter(|node| node.kind() == SyntaxKind::Expression)))
+                .ok_or_else(|| unsupported("ordinary continuation requires one authored initializer expression"))?;
+            cst_initializers.push(SyntaxNodePtr::new(&initializer));
         }
     }
     if count == 0 { return Err(unsupported("no direct startup call was authored")); }
@@ -822,7 +875,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             }
         }
     }
-    let routes = if matches!(entry, StartupEntry::PairCallGraph) {
+    let routes = if matches!(entry, StartupEntry::PairCallGraph { .. }) {
         verified_pair_paths(&graph, &hops, &selectors, &unsupported)?
     } else { Vec::new() };
     let mut selected = Vec::with_capacity(count);
@@ -839,7 +892,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         let ScalarExpression::Call { receiver: None, type_arguments, arguments, .. } = call else {
             return Err(unsupported("expected a direct ordinary initializer call"));
         };
-        if !matches!(entry, StartupEntry::PairCallGraph) && arguments.len() != ARITY {
+        if !matches!(entry, StartupEntry::PairCallGraph { .. }) && arguments.len() != ARITY {
             return Err(unsupported("the exact literal tuple arity is required"));
         }
         if !type_arguments.is_empty() { return Err(unsupported("generic arguments are not admitted")); }
@@ -851,7 +904,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         let chosen = match (entry, selected_declaration) {
             (StartupEntry::Direct, Some(0)) => 0,
             (StartupEntry::OneForwarder, Some(1)) => 1,
-            (StartupEntry::PairCallGraph, Some(index)) => index,
+            (StartupEntry::PairCallGraph { .. }, Some(index)) => index,
             _ => return Err(unsupported("initializer did not select the authored function")),
         };
         if target.concrete != &ConcreteCallSelection::Declaration {
@@ -867,7 +920,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         }
         let startup = StartupArgumentFacts {
             initializers: &facts,
-            prior: matches!(entry, StartupEntry::PairCallGraph).then_some(order.as_slice()),
+            prior: matches!(entry, StartupEntry::PairCallGraph { .. }).then_some(order.as_slice()),
             scope: &scope,
             unsupported: &unsupported,
         };
@@ -965,8 +1018,13 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
                 declaration: edge.caller, tail_call: edge.tail_call, startup_argument_positions,
             })
         }
-        StartupEntry::PairCallGraph => VerifiedStartupPaths::Graph {
+        StartupEntry::PairCallGraph { .. } => VerifiedStartupPaths::Graph {
             site: scope(site.span), hops: hops.into_iter().map(|hop| hop.edge).collect(), selectors, paths, order,
+            ordinary: cst_initializers.map(|initializers| RetainedPairOrdinaryCst {
+                green: parsed.canonical_cst().root.green().into_owned(),
+                site: SyntaxNodePtr::new(&node), callable_tail: SyntaxNodePtr::new(&tail),
+                initializers, source_bytes: parsed.text.len(),
+            }),
         },
     };
     observe(selected, body, super::super::token_span(&site.id), proof)
@@ -1154,7 +1212,7 @@ fn check_pair_forwarding(
     let [ScalarBlockItem::Expression(tail)] = wrapper.body.items.as_slice() else {
         return Err(unsupported("forwarder must contain only one unconditional direct call"));
     };
-    let conditional = matches!(entry, StartupEntry::PairCallGraph) && matches!(tail, ScalarExpression::If { .. });
+    let conditional = matches!(entry, StartupEntry::PairCallGraph { .. }) && matches!(tail, ScalarExpression::If { .. });
     if !conditional && !matches!(tail, ScalarExpression::Call { receiver: None, .. }) {
         return Err(unsupported("forwarder must contain only one unconditional direct call"));
     }
@@ -1238,8 +1296,8 @@ impl PairEdgeFacts<'_> {
         };
         let target = match (self.entry, target) {
             (StartupEntry::OneForwarder, Some(0)) => 0,
-            (StartupEntry::PairCallGraph, Some(target)) => target,
-            (StartupEntry::PairCallGraph, _) =>
+            (StartupEntry::PairCallGraph { .. }, Some(target)) => target,
+            (StartupEntry::PairCallGraph { .. }, _) =>
                 return Err(unsupported("forwarding call did not select a verified local declaration")),
             _ => return Err(unsupported("forwarding call did not select the authored comptime function")),
         };

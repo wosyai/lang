@@ -477,7 +477,10 @@ impl SourceStorageWorker {
                 let projection = valid.pending_pair_call_graph(store, &request, max_wasip1_stdout)?;
                 let bytes = match &projection {
                     PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan)) =>
-                        plan.evaluators().iter().map(|evaluator| evaluator.bytes().len()).sum(),
+                        match plan.wasip1_output() {
+                            Some(output) => output.ir_bytes() + output.authored_source_bytes(),
+                            None => plan.evaluators().iter().map(|evaluator| evaluator.bytes().len()).sum(),
+                        },
                     _ => 0,
                 };
                 Ok((projection, bytes))
@@ -494,11 +497,11 @@ impl SourceStorageWorker {
         let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease, true, selected_file,
             move |store, tx, mut valid| {
                 let mut allocation = store.source_reads.reserve_preparation()?;
-                let (projection, evaluator_bytes) = observe(store, &mut valid)?;
+                let (projection, projection_bytes) = observe(store, &mut valid)?;
                 let ValidatedProposal { admission, config, index, mut work, authored_comptime, .. } = valid;
                 let declarations = store.prepare_unpublished_declarations(tx, &config.entry, index, &mut work,
                     declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
-                allocation.charge(declarations.declaration_bytes + evaluator_bytes)?;
+                allocation.charge(declarations.declaration_bytes + projection_bytes)?;
                 let identity = prepared_identity(&admission, declarations.entry_projection, store.derivation_image());
                 Ok((identity, admission, declarations, authored_comptime, projection, allocation))
             },

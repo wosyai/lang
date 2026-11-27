@@ -915,7 +915,9 @@ fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
     use std::{os::unix::{fs::DirBuilderExt, process::ExitStatusExt}, path::Path, process::ExitStatus};
     use wosy_cli::{comptime_fragment::{ComptimeReadbackError, PendingPairWasip1Occurrence, PendingPairWasip1ReadbackError},
         source_state::TrustedPreparedPairWasip1};
-    use wosy_compiler::{ComptimeStdoutError, DirectComptimeArgument, ScalarExpression, ScalarTargetLayout, ScalarType};
+    use wosy_compiler::{ComptimeStdoutError, DirectComptimeArgument, PairStartupOccurrence, ScalarExpression,
+        ScalarTargetLayout, ScalarType};
+    use wosy_syntax::{byte_span, SyntaxKind};
     use wosy_daemon::{PendingPairCallGraphComptimeProjection, PreparedPendingPairCallGraphComptime,
         RootedClosedComptimeRequest, RootedPairCallGraphComptimeProjection};
     use wosy_project::{packages::ComptimeWatchLimits, PackageRelativePath};
@@ -930,6 +932,7 @@ fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
     }
 
     const SOURCE: &str = r#"%%start
+# WHY: órbita com café ☕
 u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
 u32(bool, u32, u32) choose = fn(select_path, left, right) {
     if (select_path) { solve(left, right) } else { right }
@@ -986,6 +989,40 @@ u32 different = solve(7, 13);
         assert_eq!(staging.plan().max_stdout(), 11);
         assert_eq!(staging.observation().binding(), &binding);
         assert_eq!(staging.observation().watches().files[0].revision.0, blake3::hash(b"watched input").to_hex().as_str());
+
+        // The green tree came through the daemon's blocking worker from
+        // the once-validated proposal. Open only a new view, after the
+        // live file lost this graph entirely. UTF-8 ranges remain authored.
+        let ordinary = staging.plan().ordinary_continuation();
+        let exact_site = staging.plan().evidence().site();
+        assert_eq!(ordinary.canonical_cst().source, exact_site.source);
+        assert_eq!(ordinary.canonical_cst().root.text().to_string(), SOURCE);
+        assert_eq!(staging.plan().authored_source_bytes(), SOURCE.len());
+        let site_node = ordinary.comptime_site();
+        let tail = ordinary.callable_tail();
+        assert_eq!(byte_span(&site_node), exact_site.range);
+        assert_eq!(site_node.text().to_string(), "comptime prepare { right ^ left }");
+        assert_eq!(tail.kind(), SyntaxKind::Expression);
+        assert!(site_node.ancestors().any(|node| node == tail));
+        let mut selections = Vec::new();
+        let initializers = [
+            "choose(false, 7, 37)", "choose(true, 7, bypass)", "solve(7, bypass)", "solve(7, 13)",
+        ];
+        assert_eq!(ordinary.initializers().len(), initializers.len());
+        for ((expression, case), spelling) in ordinary.initializers().zip(initializers) {
+            assert_eq!(expression.kind(), SyntaxKind::Expression);
+            assert_eq!(expression.text().to_string(), spelling);
+            let (call, evaluator_index) = match case {
+                PairStartupOccurrence::Bypass(bypass) => (bypass.call(), None),
+                PairStartupOccurrence::Specialization(call, _) => (call.facts().call(), Some(call.evaluator_index())),
+            };
+            let span = byte_span(&expression);
+            assert!(span.start <= call.range.start && call.range.end <= span.end);
+            assert_eq!(&SOURCE[span.start as usize..span.end as usize], spelling);
+            selections.push(evaluator_index);
+        }
+        assert_eq!(selections, [None, Some(0), Some(0), Some(1)]);
+        drop(ordinary);
         assert_eq!(fs::read_dir(&private).unwrap().count(), 2);
         for (stage, exact) in staging.evaluators().zip([first, distinct]) {
             assert_eq!(stage.result_type(), &ScalarType::U32);
