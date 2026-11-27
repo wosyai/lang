@@ -18632,6 +18632,53 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_float_ferry_count_prefix_preserves_unrestricted_key_and_nested_local_guards() {
+        use std::num::NonZeroUsize;
+        // Ferry's unrestricted integer prefix and authored test. The closed
+        // fixture deliberately does not cover the original return calls or
+        // the coordinate table reads.
+        let owner = source("src/main.w", "dormant-float-ferry-count-prefix");
+        let text = |claim: &str| format!(r#"%%start
+            f32(i32,i32,i32) route_value = fn(key,row,column) {{
+                i32 route=key/16;
+                i32 leg=key%16;
+                i32 start=if (leg>0) {{ leg-1 }} else {{ 0 }};
+                i32 route_count=if (route==1) {{ 4 }}
+                    else {{ if (route==2) {{ 10 }}
+                    else {{ if (route==3) {{ 5 }}
+                    else {{ if (route==4) {{ 4 }}
+                    else {{ if (route==5) {{ 7 }}
+                    else {{ if (route==6 || route==7) {{ 4 }} else {{ 0 }} }} }} }} }} }};
+                if (key<=0 || leg>=route_count) {{ 0.0 }}
+                else {{
+                    if (row==-1 && column==0) {{
+                        i32 count=route_count-start;
+                        core.require({claim}, {OUTPUT}); 2.0
+                    }} else {{ 0.0 }}
+                }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).ok().unwrap();
+            let good = text("count>=2 && count<=10");
+            let wrong = text("(count>=3 || key!=19) && count<=10");
+            let (positive, _) = prepare(&good).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(positive.active && positive.directives.is_empty());
+            let (negative, _) = prepare(&wrong).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(negative.directives, prepare(&wrong).run().unwrap().directives);
+            let [failure] = negative.directives.as_slice() else { panic!("one false route-count claim"); };
+            for (axis, value) in [19, -1, 0].into_iter().enumerate() {
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_wide_actual_unit_history_checks_each_admitted_frame_once() {
         use failure_search::PathStep;
         use std::num::NonZeroUsize;

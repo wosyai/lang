@@ -1659,6 +1659,7 @@ struct ClosedRadixAxes {
     remainder: Option<usize>,
     radix: BigInt,
     domain: Rc<IntegerSet>,
+    normalized: Option<[Option<Rc<IntegerSet>>; 3]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -7854,7 +7855,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     loop {
         #[cfg(feature = "internal-checker")]
         if authored_return.discards_closed_float_output() && path.0.iter().any(IntegerRow::has_closed_radix) {
-            path = path.close_radix_rows(roots.ordinary_local_work.get_or_insert(0))?;
+            path = path.close_radix_rows(false, roots.ordinary_local_work.get_or_insert(0))?;
         }
         #[cfg(feature = "internal-checker")]
         if let Some(work) = &mut roots.symbolic_context_work {
@@ -8028,11 +8029,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
-                    // No directive may see an enclosure as an exact row or
-                    // publish a witness assembled from independent marginals.
+                    // Expand only after enclosing guards have narrowed the
+                    // source. No witness may use independent marginals.
                     #[cfg(feature = "internal-checker")]
                     if authored_return.discards_closed_float_output() && path.0.iter().any(IntegerRow::has_closed_radix) {
-                        return None;
+                        path = path.close_radix_rows(true, roots.ordinary_local_work.get_or_insert(0))?;
+                        if path.0.iter().any(IntegerRow::has_closed_radix) { return None; }
+                        if path.is_unreachable() { continue; }
                     }
                     #[cfg(feature = "internal-checker")]
                     if COLLECT && roots.allow_snapshot_history && directive.operation == CheckerOperation::Narrow
@@ -8462,6 +8465,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             evaluated_guard.0
                         } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
+                        } else if authored_return.discards_closed_float_output() {
+                            match path.callable_compound_branch(calls, *condition, roots)? {
+                                Some(rows) => Some(rows),
+                                None => path.ordinary_predicate_at(structure, *condition, roots, [true, true])?,
+                            }
                         } else {
                             path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
                         };
@@ -9367,7 +9375,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
                                 if !roots.allow_extended_scalar_locals { return None; }
-                                path = bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?;
+                                path = if authored_return.discards_closed_float_output() && is_integer_type(&receiver.ty) {
+                                    bind_closed_integer_conditional_local(calls, roots, path, origin.source, &receiver.ty)?
+                                } else {
+                                    bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?
+                                };
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
                                 if receiver.ty != ScalarType::Bool || !SUSPEND_CALL || !suspend_integer { return None; }
@@ -10663,9 +10675,10 @@ impl IntegerInputs {
             }
             let output = row.len();
             let relation = row.closed_radix.get_or_insert_with(|| Rc::new(ClosedRadixAxes {
-                input, quotient: None, remainder: None, radix: radix.clone(), domain: Rc::clone(&domain),
+                input, quotient: None, remainder: None, radix: radix.clone(), domain: Rc::clone(&domain), normalized: None,
             }));
             let relation = Rc::make_mut(relation);
+            relation.normalized = None;
             if relation.input != input || &relation.radix != radix || relation.domain != domain { return None; }
             let previous = match operation {
                 AuthoredIntegerOperation::Divide => relation.quotient.replace(output),
@@ -10678,7 +10691,7 @@ impl IntegerInputs {
         Some(self)
     }
 
-    fn close_radix_rows(self, work: &mut usize) -> Option<Self> {
+    fn close_radix_rows(self, materialize: bool, work: &mut usize) -> Option<Self> {
         use super::symbolic_integer::signed_radix_projection;
         const MAX_MATERIALIZED_RADIX_POINTS: usize = 64;
         let mut remaining = MAX_MATERIALIZED_RADIX_POINTS;
@@ -10686,11 +10699,30 @@ impl IntegerInputs {
         for mut row in self.0 {
             charge_call_work(work, 1)?;
             let Some(relation) = row.closed_radix.as_ref().cloned() else { output.push(row); continue; };
-            if row.entry.is_some() || row.affine.is_some() { return None; }
+            if row.entry.is_some() { return None; }
+            let endpoints = [Some(relation.input), relation.quotient, relation.remainder];
+            if let Some(class) = &row.affine {
+                // An affine local may depend on one radix coordinate, but
+                // intersecting two coordinates would add a new equation to
+                // the reduced product that this projection cannot represent.
+                if endpoints.iter().flatten().filter(|&&axis| class.contains(row.canonical_axis(axis))).count() > 1 {
+                    return None;
+                }
+            }
             let read = |axis: Option<usize>| match axis {
                 Some(axis) => row.get(axis).map(|set| set.as_ref()),
                 None => Some(relation.domain.as_ref()),
             };
+            if !materialize && relation.normalized.as_ref().is_some_and(|saved|
+                endpoints.into_iter().zip(saved).all(|(axis, previous)| match (axis, previous) {
+                    (Some(axis), Some(previous)) => row.get(axis).is_some_and(|now| Rc::ptr_eq(now, previous)),
+                    (None, None) => true,
+                    _ => false,
+                }))
+            {
+                output.push(row);
+                continue;
+            }
             let Some(projected) = signed_radix_projection(row.get(relation.input)?, read(relation.quotient)?,
                 read(relation.remainder)?, &relation.radix, work)? else { continue; };
             let input = IntegerSet::closed_interval(projected.first[0].clone(), projected.last[0].clone())?;
@@ -10699,7 +10731,6 @@ impl IntegerInputs {
                 IntegerIntersection::Changed(input) => Rc::new(input),
                 IntegerIntersection::Empty => return None,
             };
-            let endpoints = [Some(relation.input), relation.quotient, relation.remainder];
             // All live endpoints denote different original bindings. Ordinary
             // aliases may constrain a single endpoint, but never equate two.
             for (i, axis) in endpoints.into_iter().enumerate() {
@@ -10710,15 +10741,31 @@ impl IntegerInputs {
                 }
             }
             let alias_pass = row.equal_axes().len().checked_add(1)?;
-            charge_call_work(work, alias_pass.checked_mul(3)?)?;
+            let mut narrowed_cost = alias_pass.checked_mul(3)?;
+            for (axis, set) in endpoints.into_iter().zip([input.as_ref(), &projected.quotient, &projected.remainder]) {
+                if let Some(axis) = axis {
+                    row.charge_affine_replacement(axis, set.interval_count(), &mut narrowed_cost)?;
+                }
+            }
+            charge_call_work(work, narrowed_cost)?;
             row.replace_domain(relation.input, input);
             if let Some(axis) = relation.quotient { row.replace_domain(axis, Rc::new(projected.quotient)); }
             if let Some(axis) = relation.remainder { row.replace_domain(axis, Rc::new(projected.remainder)); }
+            if !materialize {
+                charge_call_work(work, 4)?;
+                let domains = endpoints.map(|axis| axis.and_then(|axis| row.get(axis).cloned()));
+                Rc::make_mut(row.closed_radix.as_mut()?).normalized = Some(domains);
+                output.push(row);
+                continue;
+            }
             let width = (&projected.last[0] - &projected.first[0]) + 1u8;
             let Ok(width) = usize::try_from(width) else { output.push(row); continue; };
             if width > remaining { output.push(row); continue; }
             remaining -= width;
-            let copy_cost = row.len().checked_add(alias_pass.checked_mul(4)?)?.checked_add(5)?;
+            let mut copy_cost = row.len().checked_add(alias_pass.checked_mul(4)?)?.checked_add(5)?;
+            for axis in endpoints.into_iter().flatten() {
+                row.charge_affine_replacement(axis, 1, &mut copy_cost)?;
+            }
             charge_call_work(work, width.checked_mul(copy_cost)?)?;
             let mut point = projected.first[0].clone();
             for _ in 0..width {
@@ -11230,6 +11277,94 @@ fn append_ordinary_scalar_lane(
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), lane.0.len().checked_add(relocated)?)?;
     joined.0.append(&mut lane.0);
     Some(())
+}
+
+// Applies only to the result-oblivious, closed checker corridor. Each
+// evaluated branch is authenticated from the original occurrence table.
+#[cfg(feature = "internal-checker")]
+fn bind_closed_integer_conditional_local(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, path: IntegerInputs,
+    source: OccurrenceOrdinal, ty: &ScalarType,
+) -> Option<IntegerInputs> {
+    if !is_integer_type(ty) { return None; }
+    let structure = &calls.structure;
+    let tracker = roots.callable_history?;
+    let mut joined = IntegerInputs::default();
+    let mut pending = vec![(source, path)];
+    while let Some((source, mut path)) = pending.pop() {
+        if path.is_unreachable() { continue; }
+        charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1)?;
+        if path.0.iter().any(IntegerRow::has_closed_radix) {
+            path = path.close_radix_rows(false, roots.ordinary_local_work.get_or_insert(0))?;
+        }
+        if path.is_unreachable() { continue; }
+        if structure.checked_types.expressions.get(&source)? != ty
+            || structure.checker_contextual_occurrences.contains(&source)
+        { return None; }
+        if let Some(ConditionalRegion::Value { condition, then_block, else_block, resume, .. }) =
+            calls.conditionals.get(&source)
+        {
+            let parent = OccurrenceParent::Expression(source);
+            if *resume != source || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
+                || structure.checker_contextual_occurrences.contains(condition)
+                || structure.edges.get(&(parent, OccurrenceEdge::Condition)) != Some(&OccurrenceNode::Expression(*condition))
+                || structure.edges.get(&(parent, OccurrenceEdge::ThenBranch)) != Some(&OccurrenceNode::Block(*then_block))
+                || structure.edges.get(&(parent, OccurrenceEdge::ElseBranch)) != Some(&OccurrenceNode::Block(*else_block))
+            { return None; }
+            let [mut no, mut yes] = if let Some(rows) = path.callable_compound_branch(calls, *condition, roots)? {
+                rows
+            } else if let Some(rows) = path.ordinary_predicate_at(structure, *condition, roots, [true, true])? {
+                rows
+            } else {
+                let predicate = structure.checker_branches.get(condition)?;
+                path.charge_projected_integer_directive(roots, predicate)?;
+                let (yes, no, _) = path.split(roots, predicate)?;
+                [no, yes]
+            };
+            let span = calls.occurrences.get(condition.0)?.span;
+            let mut tracker = tracker.borrow_mut();
+            tracker.append_rows(&mut yes, span, true)?;
+            tracker.append_rows(&mut no, span, false)?;
+            for (block, branch) in [(*else_block, no), (*then_block, yes)] {
+                if branch.is_unreachable() { continue; }
+                let region = structure.blocks.get(block.0)?;
+                let [item] = region.items.as_slice() else { return None; };
+                let BlockItemKind::FinalOutput(slot) = item.kind else { return None; };
+                if region.unsafe_context || slot.output != 0
+                    || structure.edges.get(&(OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput { item: slot.item, output: 0 }))
+                        != Some(&OccurrenceNode::Expression(slot.expression))
+                { return None; }
+                pending.push((slot.expression, branch));
+            }
+            continue;
+        }
+        charge_ordinary_scalar_append(roots, &path)?;
+        if let Some(literal) = scalar_call_literal(structure, source, ty, false) {
+            path.append_local(IntegerSet::singleton(literal));
+        } else if let Some((operator, operands)) = structure.checker_integer_final_operations.get(&source) {
+            let operation = AuthoredIntegerOperation::checked(operator)?;
+            let operand = |occurrence: OccurrenceOrdinal| {
+                if structure.checked_types.expressions.get(&occurrence)? != ty { return None; }
+                if let Some(literal) = scalar_call_literal(structure, occurrence, ty, false) {
+                    return Some((Some(literal), None));
+                }
+                let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(occurrence)? else { return None; };
+                let (axis, actual) = roots.lookup(binding)?;
+                (actual == ty).then_some((None, Some(axis)))
+            };
+            let left = operand(operands[0])?;
+            let right = operand(operands[1])?;
+            path.append_ordinary_calculation(operation, left, right, ty,
+                &mut roots.ordinary_local_work, &mut roots.affine_work)?;
+        } else {
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(source)? else { return None; };
+            let (axis, actual) = roots.lookup(binding)?;
+            if actual != ty { return None; }
+            path.append_ordinary_copy(axis, roots)?;
+        }
+        append_ordinary_scalar_lane(roots, &mut joined, &mut path)?;
+    }
+    Some(joined)
 }
 
 #[cfg(feature = "internal-checker")]
