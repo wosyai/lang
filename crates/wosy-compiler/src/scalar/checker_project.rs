@@ -1707,10 +1707,13 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
     #[cfg(feature = "internal-checker")]
     let mut completed_passive = HashMap::new();
     #[cfg(feature = "internal-checker")]
+    let mut completed_arrays = HashMap::new();
+    #[cfg(feature = "internal-checker")]
     let mut projected_storage = super::checker_flow::ProjectedStorage::default();
     let outcome = walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
         project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures,
         #[cfg(feature = "internal-checker")] &mut completed_passive,
+        #[cfg(feature = "internal-checker")] &mut completed_arrays,
         #[cfg(feature = "internal-checker")] &mut projected_storage);
     #[cfg(feature = "internal-checker")]
     if outcome.is_ok() {
@@ -1737,6 +1740,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     source: &SourceIdentity,
     failures: &mut Option<&mut OrderedFailures>,
     #[cfg(feature = "internal-checker")] completed_passive: &mut CompletedPassiveStorage<'a>,
+    #[cfg(feature = "internal-checker")] completed_arrays: &mut CompletedPassiveStorage<'a>,
     #[cfg(feature = "internal-checker")] projected_storage: &mut super::checker_flow::ProjectedStorage,
 ) -> Result<StartupLane, ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
@@ -1780,6 +1784,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             if walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
                 project, calls, ordinals, visits, actual, target, failures,
                 #[cfg(feature = "internal-checker")] completed_passive,
+                #[cfg(feature = "internal-checker")] completed_arrays,
                 #[cfg(feature = "internal-checker")] projected_storage,
             )? == StartupLane::Empty {
                 return Ok(StartupLane::Empty);
@@ -1860,6 +1865,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 // Namespace completion alone does not guarantee a value is
                 // unchanged across a later executable initializer.
                 completed_passive.clear();
+                completed_arrays.clear();
                 projected_storage.forget();
             }
             #[cfg(feature = "internal-checker")]
@@ -2107,7 +2113,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             passive_generation = generation + 1;
             completed_passive.clear();
             if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
-                visits, projected_storage, &storage, completed_passive, ordinals, failures)? {
+                visits, projected_storage, &storage, completed_arrays, ordinals, failures)? {
                 projected_storage.settle(|declaration, index, observed| {
                     if &declaration.source != source {
                         // A completed provider will not resume its local
@@ -2139,6 +2145,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 continue;
             }
             if !topology.structure.checker_directives.contains_key(expression) {
+                completed_arrays.clear();
                 projected_storage.forget();
             }
         }
@@ -2149,14 +2156,20 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     visits[ordinal] = InitializationVisit::Completed;
     #[cfg(feature = "internal-checker")]
     if COLLECT {
-        // Nominal copy still uses only the last passive generation. Array
-        // backing remains lazy and is usable only with the live observed
-        // provenance marker; an unknown initializer effect erases that marker.
+        // Nominal copy still observes only the last passive generation.
+        // Completed array backing outlives known observed calls, but its
+        // exact capability and overlay live only in ProjectedStorage.
         storage.retain(|range,value| match value {
             InitializerValue::PassiveAggregate { ty: ScalarType::Struct(_),generation,.. } =>
                 *generation == passive_generation,
-            InitializerValue::PassiveAggregate { ty,.. } if observed_nested_array_leaf(ty).is_some() =>
-                projected_storage.has_observed_aggregate(&wosy_syntax::SourceSpan::new(source.clone(),*range)),
+            InitializerValue::PassiveAggregate { ty,generation,depth,value }
+                if observed_nested_array_leaf(ty).is_some() && projected_storage.has_observed_aggregate(
+                    &wosy_syntax::SourceSpan::new(source.clone(),*range)) => {
+                completed_arrays.entry(ordinal).or_default().insert(*range,InitializerValue::PassiveAggregate {
+                    ty,generation:*generation,depth:*depth,value:Rc::clone(value),
+                });
+                false
+            }
             _ => false,
         });
         if !storage.is_empty() { completed_passive.insert(ordinal, storage); }
