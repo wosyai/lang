@@ -2,7 +2,8 @@
 use super::{
     analyze_scalar_build, audited_closed_eager_binary, audited_closed_unary, collect_scalar_diagnostics,
     derive_block, prepare_scalar_project, root_receiver_and_initializer, single_binding_type, span_of,
-    ClosedComptimeFragment, ClosedComptimeRejection, RootInitializer, ScalarBlockItem, ScalarExpression,
+    BoundedStartupWasip1Evaluator, ClosedComptimeFragment, ClosedComptimeRejection, RootInitializer,
+    ScalarBlockItem, ScalarExpression,
     ScalarItem, ScalarPreparationInputs, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
     FUNCTION,
 };
@@ -475,9 +476,21 @@ impl PreparedComptimeStdout {
 impl ClosedComptimeFragment {
     /// Same grammar for the existing compiler-issued scalar fragment.
     pub fn parse_stdout(&self, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
-        let shape = Shape::scalar(self.result_type()).ok_or(ComptimeStdoutError::UnsupportedResultType)?;
-        parse(&shape, self.site().range, stdout, max_bytes)
+        parse_scalar(self.result_type(), self.site().range, stdout, max_bytes)
     }
+}
+
+impl BoundedStartupWasip1Evaluator {
+    /// Inspect bytes using the expected type and source span retained from
+    /// this compiler-produced evaluator. Not an execution or result receipt.
+    pub fn parse_stdout(&self, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
+        parse_scalar(self.result_type(), self.output_span(), stdout, max_bytes)
+    }
+}
+
+fn parse_scalar(ty: &ScalarType, span: ByteSpan, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
+    let shape = Shape::scalar(ty).ok_or(ComptimeStdoutError::UnsupportedResultType)?;
+    parse(&shape, span, stdout, max_bytes)
 }
 
 fn parse(shape: &Shape, span: ByteSpan, stdout: &[u8], budget: usize) -> Result<ScalarExpression, ComptimeStdoutError> {

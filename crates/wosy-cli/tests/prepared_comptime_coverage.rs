@@ -912,9 +912,10 @@ main_artifact = "main"
 #[cfg(target_os = "linux")]
 #[test]
 fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
-    use std::{os::unix::fs::DirBuilderExt, path::Path};
-    use wosy_cli::source_state::TrustedPreparedPairWasip1;
-    use wosy_compiler::{ScalarTargetLayout, ScalarType};
+    use std::{os::unix::{fs::DirBuilderExt, process::ExitStatusExt}, path::Path, process::ExitStatus};
+    use wosy_cli::{comptime_fragment::{ComptimeReadbackError, PendingPairWasip1Occurrence, PendingPairWasip1ReadbackError},
+        source_state::TrustedPreparedPairWasip1};
+    use wosy_compiler::{ComptimeStdoutError, DirectComptimeArgument, ScalarExpression, ScalarTargetLayout, ScalarType};
     use wosy_daemon::{PendingPairCallGraphComptimeProjection, PreparedPendingPairCallGraphComptime,
         RootedClosedComptimeRequest, RootedPairCallGraphComptimeProjection};
     use wosy_project::{packages::ComptimeWatchLimits, PackageRelativePath};
@@ -930,8 +931,12 @@ fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
 
     const SOURCE: &str = r#"%%start
 u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
-u32 first = solve(7, 37);
-u32 repeated = solve(7, 37);
+u32(bool, u32, u32) choose = fn(select_path, left, right) {
+    if (select_path) { solve(left, right) } else { right }
+};
+u32 bypass = choose(false, 7, 37);
+u32 first = choose(true, 7, bypass);
+u32 repeated = solve(7, bypass);
 u32 different = solve(7, 13);
 %%end
 "#;
@@ -1001,6 +1006,39 @@ u32 different = solve(7, 13);
                 "executable": stage.expected_module_path(), "parameters": {}, "permissions": [], "mounts": []
             }));
             assert!(!stage.expected_module_path().exists());
+        }
+        // Known scalar bytes and statuses are host fixtures, not a claim
+        // these evaluators ran. One parsed value per distinct tuple.
+        let ok = ExitStatus::from_raw(0);
+        let read = staging.read_stdout(&[(ok, b"34\n"), (ok, b"10\n")]).unwrap();
+        let ordered = read.occurrences().collect::<Vec<_>>();
+        let [
+            PendingPairWasip1Occurrence::Bypass(bypass),
+            PendingPairWasip1Occurrence::Specialization { call: first_call, value: first_value, .. },
+            PendingPairWasip1Occurrence::Specialization { call: repeated_call, value: repeated_value, .. },
+            PendingPairWasip1Occurrence::Specialization { call: other_call, value: other_value, .. },
+        ] = ordered.as_slice() else { panic!("ordinary bypass and all three authored reached slots"); };
+        assert_eq!(bypass.returned_value(), DirectComptimeArgument::U32(37));
+        assert_eq!([first_call.evaluator_index(), repeated_call.evaluator_index(), other_call.evaluator_index()], [0, 0, 1]);
+        assert!(std::ptr::eq(*first_value, *repeated_value), "a repeat borrows the same parsed value");
+        assert!(!std::ptr::eq(*first_value, *other_value));
+        let site = held.output.evidence().site();
+        assert!(matches!(first_value, ScalarExpression::Integer { value, span }
+            if u32::try_from(value) == Ok(34) && *span == site.range));
+        assert!(matches!(other_value, ScalarExpression::Integer { value, span }
+            if u32::try_from(value) == Ok(10) && *span == site.range));
+
+        type ReadError = PendingPairWasip1ReadbackError;
+        assert!(matches!(staging.read_stdout(&[(ok, b"34\n")]), Err(ReadError::TerminalCount { expected: 2, supplied: 1 })));
+        assert!(matches!(staging.read_stdout(&[(ok, b"34\n"), (ExitStatus::from_raw(7 << 8), b"not parsed")]),
+            Err(ReadError::Evaluator { index: 1, error: ComptimeReadbackError::Exit(Some(7)) })));
+        for (bytes, expected) in [
+            (b"true\n".as_slice(), ComptimeStdoutError::NonCanonical),
+            (b"4294967296\n".as_slice(), ComptimeStdoutError::OutOfRange),
+            (b"00000000000\n".as_slice(), ComptimeStdoutError::ByteLimit),
+        ] {
+            assert!(matches!(staging.read_stdout(&[(ok, b"34\n"), (ok, bytes)]),
+                Err(ReadError::Evaluator { index: 1, error: ComptimeReadbackError::Output(actual) }) if actual == expected));
         }
         drop(staging);
         assert_eq!(fs::read_dir(&private).unwrap().count(), 0);

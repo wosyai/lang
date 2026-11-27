@@ -420,6 +420,7 @@ pub struct BoundedPairStartupWasip1Output {
 pub struct BoundedStartupWasip1Evaluator {
     ir: std::sync::Arc<Vec<u8>>,
     result_type: ScalarType,
+    output_span: ByteSpan,
 }
 
 impl BoundedPairStartupWasip1Output {
@@ -432,6 +433,8 @@ impl BoundedPairStartupWasip1Output {
 impl BoundedStartupWasip1Evaluator {
     pub fn bytes(&self) -> &[u8] { self.ir.as_slice() }
     pub fn result_type(&self) -> &ScalarType { &self.result_type }
+
+    pub(super) fn output_span(&self) -> ByteSpan { self.output_span }
 
     /// An additional read-only view of the already emitted text. The owning
     /// typed plan retains its allocation; modifying a new view cannot alter it.
@@ -461,10 +464,10 @@ impl PairStartupCallGraphComptimePlan {
             std::io::ErrorKind::Unsupported, "the startup graph did not emit WASIp1 stdout"))?;
         let mut remaining = max_ir_bytes;
         let mut evaluators = Vec::with_capacity(self.evaluators.len());
-        for ClosedComptimeFragment { llvm, result_type, .. } in self.evaluators {
+        for ClosedComptimeFragment { llvm, result_type, site, .. } in self.evaluators {
             let bytes = llvm.to_bounded_text_bytes(remaining)?;
             remaining -= bytes.len();
-            evaluators.push(BoundedStartupWasip1Evaluator { ir: std::sync::Arc::new(bytes), result_type });
+            evaluators.push(BoundedStartupWasip1Evaluator { ir: std::sync::Arc::new(bytes), result_type, output_span: site.range });
         }
         Ok(BoundedPairStartupWasip1Output {
             evidence: self.evidence, evaluators, ir_bytes: max_ir_bytes - remaining, max_stdout,

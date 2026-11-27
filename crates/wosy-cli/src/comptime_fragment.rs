@@ -24,7 +24,8 @@ pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime,
 #[cfg(target_os = "linux")]
 mod wasip1_pair;
 #[cfg(target_os = "linux")]
-pub use wasip1_pair::{StagedPendingPairWasip1, StagedPendingPairWasip1Evaluator, StagedWasip1ToolPair};
+pub use wasip1_pair::{PendingPairWasip1Occurrence, PendingPairWasip1Readback, PendingPairWasip1ReadbackError,
+    StagedPendingPairWasip1, StagedPendingPairWasip1Evaluator, StagedWasip1ToolPair};
 #[cfg(target_os = "linux")]
 mod stdout;
 #[cfg(target_os = "linux")]

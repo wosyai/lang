@@ -185,7 +185,7 @@ impl ClosedComptimeModuleObservation<'_> {
     }
 }
 
-fn after_success(
+pub(super) fn after_success(
     status: ExitStatus, parse: impl FnOnce() -> Result<ScalarExpression, ComptimeStdoutError>,
 ) -> Result<ScalarExpression, ComptimeReadbackError> {
     if !status.success() { return Err(ComptimeReadbackError::Exit(status.code())); }

@@ -1,11 +1,12 @@
 //! Private local manifest for the selected WASIp1 tool pair.
 //! Staging never authenticates tools, invokes them, or accepts a result.
-use super::{provision::EvaluatorFiles, selected_builder_invocation, selected_runner_invocation,
-    ClosedComptimeInvocation, ProvisionedWasip1Comptime, StagedEvaluatorIr};
+use super::{provision::EvaluatorFiles, selected_builder_invocation, selected_runner_invocation, stdout::after_success,
+    ClosedComptimeInvocation, ComptimeReadbackError, ProvisionedWasip1Comptime, StagedEvaluatorIr};
 use crate::source_state::PendingPairComptimeInputObservation;
 use serde::Serialize;
-use std::{collections::BTreeMap, io::{self, Write}, path::Path};
-use wosy_compiler::{BoundedPairStartupWasip1Output, BoundedStartupWasip1Evaluator, ScalarType};
+use std::{collections::BTreeMap, fmt, io::{self, Write}, path::Path, process::ExitStatus};
+use wosy_compiler::{BoundedPairStartupWasip1Output, BoundedStartupWasip1Evaluator, DirectStartupComptimeUse,
+    PairStartupBypass, PairStartupCallGraphEvidence, PairStartupCallPath, PairStartupOccurrence, ScalarExpression, ScalarType};
 use wosy_project::SelectedComptimeTools;
 
 #[derive(Serialize)]
@@ -94,6 +95,26 @@ impl<'plan> StagedPendingPairWasip1<'plan> {
 
     pub fn observation(&self) -> &PendingPairComptimeInputObservation { &self.observation }
     pub fn plan(&self) -> &BoundedPairStartupWasip1Output { self.plan }
+
+    /// Inspect one already captured terminal per distinct staged evaluator,
+    /// in evaluator-index order. Bytes/status are not launch provenance or
+    /// permission to apply a result. A failed terminal yields no readback.
+    pub fn read_stdout(&self, terminals: &[(ExitStatus, &[u8])])
+        -> Result<PendingPairWasip1Readback<'_>, PendingPairWasip1ReadbackError>
+    {
+        let evaluators = self.plan.evaluators();
+        let expected = evaluators.len();
+        if terminals.len() != expected {
+            return Err(PendingPairWasip1ReadbackError::TerminalCount { expected, supplied: terminals.len() });
+        }
+        let max_bytes = self.plan.max_stdout();
+        let values = evaluators.iter().zip(terminals).enumerate().map(|(index, (evaluator, (status, bytes)))| {
+            after_success(*status, || evaluator.parse_stdout(bytes, max_bytes))
+                .map_err(|error| PendingPairWasip1ReadbackError::Evaluator { index, error })
+        }).collect::<Result<_, _>>()?;
+        Ok(PendingPairWasip1Readback { evidence: self.plan.evidence(), values })
+    }
+
     pub fn evaluators(&self) -> impl ExactSizeIterator<Item = StagedPendingPairWasip1Evaluator<'_>> {
         let project = Path::new(&self.observation.binding().selected.project);
         let tools = self.observation.declarations().tools();
@@ -117,3 +138,49 @@ impl StagedPendingPairWasip1Evaluator<'_> {
         selected_runner_invocation(self.project, self.tools, self.manifest_path())
     }
 }
+
+
+/// Parsed inspection values on the same authored graph. Repeated call
+/// slots borrow one parsed value; ordinary bypasses stay ordinary evidence.
+pub struct PendingPairWasip1Readback<'stage> {
+    evidence: &'stage PairStartupCallGraphEvidence,
+    values: Vec<ScalarExpression>,
+}
+
+pub enum PendingPairWasip1Occurrence<'a> {
+    Specialization {
+        call: &'a DirectStartupComptimeUse<2>,
+        path: &'a PairStartupCallPath,
+        value: &'a ScalarExpression,
+    },
+    Bypass(&'a PairStartupBypass),
+}
+
+impl PendingPairWasip1Readback<'_> {
+    pub fn occurrences(&self) -> impl ExactSizeIterator<Item = PendingPairWasip1Occurrence<'_>> {
+        self.evidence.occurrences().map(|slot| match slot {
+            PairStartupOccurrence::Specialization(call, path) => PendingPairWasip1Occurrence::Specialization {
+                call, path, value: &self.values[call.evaluator_index()],
+            },
+            PairStartupOccurrence::Bypass(bypass) => PendingPairWasip1Occurrence::Bypass(bypass),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum PendingPairWasip1ReadbackError {
+    TerminalCount { expected: usize, supplied: usize },
+    Evaluator { index: usize, error: ComptimeReadbackError },
+}
+
+impl fmt::Display for PendingPairWasip1ReadbackError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TerminalCount { expected, supplied } =>
+                write!(out, "comptime readback needs {expected} evaluator terminals, got {supplied}"),
+            Self::Evaluator { index, error } => write!(out, "comptime evaluator {index}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PendingPairWasip1ReadbackError {}
