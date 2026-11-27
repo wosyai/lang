@@ -2105,7 +2105,13 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
                 visits, projected_storage, &storage, failures)? {
                 projected_storage.settle(|declaration, index, observed| {
-                    if &declaration.source != source { return None; }
+                    if &declaration.source != source {
+                        // A completed provider will not resume its local
+                        // initializer lane. The shared projected storage
+                        // settles its cells; never alter a still-active owner.
+                        let provider = *ordinals.get(&declaration.source)?;
+                        return (visits.get(provider) == Some(&InitializationVisit::Completed)).then_some(());
+                    }
                     let value = storage.get_mut(&declaration.range)?;
                     match (index, value) {
                         (None, InitializerValue::Integer { value, .. }) => *value.to_mut() = observed.clone(),
@@ -2205,6 +2211,7 @@ fn try_observed_projected_storage_call(
     let mut todo = vec![Event::Enter(target)];
     let mut visiting = HashSet::new();
     let mut complete = HashSet::new();
+    let mut admitted = HashMap::new();
     let mut writes_or_reads_storage = false;
     while let Some(event) = todo.pop() {
         match event {
@@ -2221,7 +2228,14 @@ fn try_observed_projected_storage_call(
                 todo.push(Event::Exit(node));
                 for (site, &child) in &body.structure.checker_direct_targets {
                     if scalar_calls.contains(site) { continue; }
-                    if child.0 != target.0 { return Ok(false); }
+                    if child.0 != node.0 && visits.get(child.0) != Some(&InitializationVisit::Completed) {
+                        return Ok(false);
+                    }
+                    let Some(signature) = body.checked_call_signatures.get(site) else { return Ok(false); };
+                    if symbolic_history_call_target(actual.project, actual.calls, node.0, node.1, body, *site, signature) != Some(child) {
+                        return Ok(false);
+                    }
+                    admitted.insert((node, *site), child);
                     todo.push(Event::Enter(child));
                 }
             }
@@ -2331,7 +2345,15 @@ fn try_observed_projected_storage_call(
                 CallableHistoryStep::Return(range) => PathStep::Return(convert(range)),
                 CallableHistoryStep::MatchArm(range) => PathStep::MatchArm(convert(range)),
                 CallableHistoryStep::ObservedFloatTrace(id) => PathStep::ObservedPrefix(Rc::clone(math_traces.borrow().get(id)?)),
-                _ => return None, // This cohort never crosses source owners.
+                CallableHistoryStep::ProviderBranch(owner, range, accepted) => PathStep::Branch {
+                    condition: wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range), accepted,
+                },
+                CallableHistoryStep::ProviderCall(owner, range) => PathStep::Call(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
+                CallableHistoryStep::ProviderReturn(owner, range) => PathStep::Return(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
+                CallableHistoryStep::ProviderMatchArm(owner, range) => PathStep::MatchArm(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
             };
             search.append(step)?;
         }
@@ -2339,9 +2361,7 @@ fn try_observed_projected_storage_call(
     };
     let mut current = Rc::new(std::mem::take(storage));
     let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call),
-        body_of, |parent, body, site, signature| {
-            symbolic_history_call_target(actual.project, actual.calls, parent.0, parent.1, body, site, signature)
-        }, |_, _, _| None);
+        body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
     }
@@ -24352,6 +24372,75 @@ unit(u8) parent = fn(a) {
                 assert_eq!(files[4].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":90}\n");
                 assert_eq!(files[5].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
                 assert!(matches!(run(&out_of_bounds, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Orbital indexed-pack provider"]
+    fn pinned_orbital_partition_transfers_prepared_provider_state_and_history() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap());
+        let packing_text = std::fs::read_to_string(path).unwrap();
+        let app = source("src/main.w","pinned-partition-consumer");
+        let packing = source("src/indexed-pack.w","pinned-partition-provider");
+        let template = r#"%%start
+            packing = namespace demo "indexed-pack.w";
+            unit() success_then_failure = fn {
+                packing.start();
+                packing.partition(37,90);
+                packing.partition(18,12);
+            };
+            unit() restart = fn {
+                packing.start();
+            };
+            success_then_failure();
+            RESTART
+            core.narrow(false,{.stdout="";.stderr="";.code=91;.files=[];});
+        %%end"#;
+        let span_for = |source: &SourceIdentity, text: &str, needle: &str| {
+            let start = text.find(needle).unwrap();
+            SourceSpan::new(source.clone(), ByteSpan::new(start as u32, (start+needle.len()) as u32))
+        };
+        let guard = span_for(&packing,&packing_text,"base<0||limit<base||limit>20480||generation>=2147483646");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (suffix, failed) in [("",true),("restart();",false)] {
+                let text = template.replace("RESTART",suffix);
+                let namespace = span_for(&app,&text,r#"packing = namespace demo "indexed-pack.w";"#);
+                let modules = || vec![(declarations(&app,&text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:packing.clone(),span:namespace.range,
+                }]),(declarations(&packing,&packing_text),Vec::new())];
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    modules(), [], vec![app.clone(),packing.clone()], ScalarPreparationInputs { target_layout },
+                    ScalarCheckerScope::MainFlowOnly, Vec::new(),
+                ).unwrap();
+                let prepared = prepare();
+                let PreparedConfiguredCheck::Plain { owner, .. } = &prepared.owner
+                    else { panic!("expected authenticated current main flow"); };
+                let (root, ordinals) = package_initialization_order(owner.parts().0).unwrap();
+                let mut failures = OrderedFailures::default();
+                let (checked, ()) = check_package_initialization_observing_with_policy::<(),true,false>(
+                    owner,root,ordinals,(),Some(&mut failures),
+                ).unwrap();
+                for (name, value) in [("generation",1),("next_vertex",37),("ceiling",90)] {
+                    let key = span_for(&packing,&packing_text,name);
+                    assert_eq!(checked.projected_storage.observed_atom(&key),
+                        Some(ObservedExactValue::Integer(ScalarType::I32,BigInt::from(value))));
+                }
+                let key = span_for(&packing,&packing_text,"failed");
+                assert_eq!(checked.projected_storage.observed_atom(&key),Some(ObservedExactValue::Boolean(failed)));
+                let ordinary = prepared.run().unwrap();
+                let (capped,_,path,_) = prepare().search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped,ordinary.directives);
+                assert_eq!(capped.len(),1);
+                assert_eq!(capped[0].code(),&BigInt::from(91));
+                assert!(path.contains_return(&span_for(&app,&text,"packing.partition(37,90)")));
+                assert!(path.contains_return(&span_for(&app,&text,"packing.partition(18,12)")));
+                assert!(path.contains_branch(guard.clone(),false));
+                assert!(path.contains_branch(guard.clone(),true));
+                eprintln!("Orbital prepared packing generation=1 next=37 ceiling=90 failed={failed} {target_layout:?}");
             }
         }
     }
