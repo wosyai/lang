@@ -6335,6 +6335,7 @@ pub(super) enum CheckerOrdinaryBoolean {
     Integer(super::checker_flow::IntegerPredicate),
     Lexical(CheckerOrdinaryIntegerComparison),
     Difference(Box<CheckerPreparedDifferenceComparison>),
+    PureFloatThreshold { input: ReferenceBindingId, ty: ScalarType },
     And(Box<[Self; 2]>),
     Or(Box<[Self; 2]>),
     Not(Box<Self>),
@@ -8020,6 +8021,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         if let Some(call) = occurrence.and_then(|call| self.ordinary_bool_call(expression, call)) {
             return Some(CheckerOrdinaryBoolean::Call(call));
         }
+        if let Some((input, ty)) = occurrence.and_then(|site| self.prepared_float_threshold(expression, site)) {
+            return Some(CheckerOrdinaryBoolean::PureFloatThreshold { input, ty });
+        }
         if !matches!(self.mode, WalkMode::Callable(_)) || !matches!(expression,
             ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. }
                 | ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, .. })
@@ -8118,6 +8122,35 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 }
             }
         })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn prepared_float_threshold(&self, expression: &ScalarExpression, site: OccurrenceOrdinal) -> Option<(ReferenceBindingId, ScalarType)> {
+        let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
+        if !matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
+            | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
+        { return None; }
+        let types = &self.structure.checked_types.expressions;
+        if types.get(&site)? != &ScalarType::Bool { return None; }
+        let child = |edge| {
+            let OccurrenceNode::Expression(child) = self.structure.edges.get(&(OccurrenceParent::Expression(site), edge))?
+                else { return None; };
+            Some(*child)
+        };
+        let [a, b] = [child(OccurrenceEdge::BinaryLeft)?, child(OccurrenceEdge::BinaryRight)?];
+        let ty = types.get(&a)?;
+        if !matches!(ty, ScalarType::F32 | ScalarType::F64) || types.get(&b)? != ty { return None; }
+        let PlainNameFacts::Prepared(identities) = &self.plain_names else { return None; };
+        for (name, ordinal, constant) in [(left.as_ref(), a, right.as_ref()), (right.as_ref(), b, left.as_ref())] {
+            let literal = matches!(constant, ScalarExpression::Float { .. })
+                || matches!(constant, ScalarExpression::Unary { operator: super::UnaryOperator::Negate, operand, .. }
+                    if matches!(operand.as_ref(), ScalarExpression::Float { .. }));
+            if matches!(name, ScalarExpression::Name { .. }) && literal {
+                let PlainNameIdentity::Lexical(input) = identities.get(&ordinal)? else { return None; };
+                return Some((input.clone(), ty.clone()));
+            }
+        }
+        None
     }
 
     #[cfg(feature = "internal-checker")]

@@ -1375,6 +1375,16 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
+        if !Proof::ENABLED && super::checker_flow::supports_mixed_float_guard_root(body) {
+            let work = std::cell::Cell::new(0);
+            let Some(super::checker_flow::CallableHistoryCompletion::Exhausted(observed)) =
+                super::checker_flow::search_mixed_float_guard_root(body, &work) else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+            active |= observed;
+            continue;
+        }
+        #[cfg(feature = "internal-checker")]
         if let Some(plan) = (!Proof::ENABLED).then(|| closed_dormant_float_plan(project, calls, (ordinal, item), body,
             completed_visits.and_then(|visits| visits.get(ordinal)) == Some(&InitializationVisit::Completed))).flatten() {
             let work = std::cell::Cell::new(0);
@@ -11192,7 +11202,8 @@ fn plan_closed_authored_roots(
             mandatory_startup_scalars.push((item, function.name_span));
             continue;
         }
-        if allow_startup_scalars && closed_dormant_float_plan(project, calls, (module, item), body, module < startup_count).is_some() {
+        if allow_startup_scalars && (super::checker_flow::supports_mixed_float_guard_root(body)
+            || closed_dormant_float_plan(project, calls, (module, item), body, module < startup_count).is_some()) {
             super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
         } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
             &mut HashSet::new(), &mut history_work, 0).is_none() {
@@ -11988,7 +11999,9 @@ fn collect_unreached_authored_paths(
         let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
             observed: &nested_active, record: &record };
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
-        let result = if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body,
+        let result = if super::checker_flow::supports_mixed_float_guard_root(body) {
+            super::checker_flow::search_mixed_float_guard_root(body, &work)
+        } else if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body,
             expected == InitializationVisit::Completed) {
             search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
         } else {
@@ -19057,6 +19070,41 @@ mod tests {
         assert!(matches!(&**parts, PassiveLiteral::Array(cells)
             if matches!(cells.as_ref(), [PassiveLiteral::Copy(link)] if std::rc::Rc::ptr_eq(link, row))));
         assert_eq!(work, 7);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_float_guard_accepts_only_a_closed_requirement_without_fabricating_a_witness() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "mixed-prepared-float-guard-root");
+        let program = |claim: &str, then_arm: &str| format!(r#"%%start
+            unit(i32,f32) frame=fn(step,weight) {{
+                i32 flag=if (weight>0.0) {{ {then_arm} }} else {{ 0 }};
+                if (step>=0) {{ core.require({claim},{OUTPUT}); }};
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, capped: bool| {
+                let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap_or_else(|error| panic!("mixed guard preparation: {error:?}"));
+                if capped { prepared.run_private_authored_root(NonZeroUsize::MIN).map(|(report, _)| report) }
+                else { prepared.run() }
+            };
+            for capped in [true, false] {
+                let good = program("flag>=0 && flag<=1", "1");
+                let report = run(&good, capped)
+                    .unwrap_or_else(|error| panic!("mixed guard {target_layout:?} capped={capped}: {error:?}"));
+                assert!(report.active && report.directives.is_empty());
+                for program in [
+                    program("flag==0", "1"),
+                    program("flag>=0 && flag<=1", &format!("core.require(false,{OUTPUT}); 1")),
+                ] {
+                    assert!(matches!(run(&program, capped), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]
