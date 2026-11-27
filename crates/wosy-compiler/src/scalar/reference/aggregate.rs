@@ -3335,15 +3335,15 @@ fn seal_fixed_view_backing<'a>(
                         ScalarBlockItem::Assignment(assignment) => {
                             let [target] = assignment.targets.as_slice() else { return None; };
                             let ScalarPlace::Index { index, .. } = &target.place else { return None; };
+                            let [value] = assignment.values.as_slice() else { return None; };
                             if !matches!(index.as_ref(), ScalarExpression::Integer { value, .. }
                                 if value >= &0.into() && value < &(*length).into())
-                                || !matches!(assignment.values.as_slice(), [value] if value == &assignment.value)
                             { return None; }
                             let place = place_edge(sites, root_parent, OccurrenceEdge::AssignmentDestination { item, destination: 0 })?;
                             if !same_backing(place_edge(sites, OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase)?)
                                 || sites.structure.checked_types.places.get(&place) != Some(&ScalarType::U8)
                                 { return None; }
-                            scalar(&assignment.value, expression(sites, root_parent,
+                            scalar(value, expression(sites, root_parent,
                                 OccurrenceEdge::AssignmentRhs { item, output: 0 })?, &available)?;
                         }
                         _ => return None,

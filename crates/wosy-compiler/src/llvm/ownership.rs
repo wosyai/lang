@@ -939,14 +939,17 @@ pub(super) fn return_bindings(block: &ScalarBlock) -> BTreeMap<String, ScalarExp
                     bindings.insert(receivers[0].0.clone(), binding.value.clone());
                 } else if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions
                 {
-                    for ((name, _), output) in receivers.iter().zip(&binding.output_values) {
-                        bindings.insert(name.clone(), output.value.clone());
+                    for (position, (name, _)) in receivers.iter().enumerate() {
+                        let ScalarBindingOutput::Evaluate(value) = binding.output_source(position) else {
+                            unreachable!("independent output evaluates its initializer")
+                        };
+                        bindings.insert(name.clone(), value.clone());
                     }
                 }
             }
             ScalarBlockItem::Assignment(assignment) => {
-                if assignment.targets.len() == 1 {
-                    bindings.insert(assignment.target.clone(), assignment.value.clone());
+                if let ([target], Some(value)) = (&assignment.targets[..], assignment.values.first()) {
+                    bindings.insert(target.target.clone(), value.clone());
                 }
                 for (target, value) in assignment.targets.iter().zip(&assignment.values) {
                     if let crate::ScalarPlace::Name { name, .. } = &target.place {

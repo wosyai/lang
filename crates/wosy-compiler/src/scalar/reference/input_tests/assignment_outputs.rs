@@ -32,7 +32,6 @@ fn assignment_rhs_view_borrows_independent_roots_and_reuses_ordered_call_project
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].0, 0);
         assert!(std::ptr::eq(roots[0].1, &projected.values[0]));
-        assert!(!std::ptr::eq(roots[0].1, &projected.value));
         assert_eq!(rhs.projected_outputs().collect::<Vec<_>>(), vec![1, 2]);
         let independent = assignments[1];
         let rhs = independent.rhs();

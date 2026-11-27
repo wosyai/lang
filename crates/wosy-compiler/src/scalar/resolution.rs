@@ -3,18 +3,6 @@ use super::typecheck::{
 };
 use super::*;
 
-fn secondary_binding_initializers_mut(
-    binding: &mut ScalarBinding,
-) -> impl Iterator<Item = &mut ScalarExpression> {
-    let outputs = match (binding.is_allocation, &binding.output_origin) {
-        (false, ScalarBindingOutputOrigin::IndependentExpressions) => {
-            binding.output_values.as_mut_slice()
-        }
-        _ => &mut [],
-    };
-    outputs.iter_mut().skip(1).map(|output| &mut output.value)
-}
-
 pub(super) fn resolve_program_types(
     program: &mut ScalarProgram,
     diagnostics: &mut Vec<super::Diagnostic>,
@@ -58,7 +46,7 @@ pub(super) fn resolve_program_types(
                         span: output.span,
                     })
                     .collect();
-                for initializer in secondary_binding_initializers_mut(binding) {
+                for initializer in binding.secondary_initializers_mut() {
                     resolve_expression_types(initializer, &names, &[]);
                 }
             }
@@ -103,7 +91,7 @@ fn resolve_item_types(item: &mut ScalarBlockItem, names: &BTreeMap<String, Scala
             for receiver in &mut binding.receivers {
                 receiver.ty = resolve_type(&receiver.ty, names);
             }
-            for initializer in secondary_binding_initializers_mut(binding) {
+            for initializer in binding.secondary_initializers_mut() {
                 resolve_expression_types(initializer, names, &[]);
             }
         }
@@ -128,7 +116,7 @@ fn resolve_block_types(
                     receiver.ty = resolve_scoped_type(&receiver.ty, names, generics);
                 }
                 resolve_expression_types(&mut binding.value, names, generics);
-                for initializer in secondary_binding_initializers_mut(binding) {
+                for initializer in binding.secondary_initializers_mut() {
                     resolve_expression_types(initializer, names, generics);
                 }
             }
@@ -136,7 +124,6 @@ fn resolve_block_types(
                 resolve_expression_types(expression, names, generics)
             }
             ScalarBlockItem::Assignment(assignment) => {
-                resolve_expression_types(&mut assignment.value, names, generics);
                 for value in &mut assignment.values {
                     resolve_expression_types(value, names, generics);
                 }
@@ -335,7 +322,7 @@ pub(super) fn resolve_program_places(
                     overloads,
                     owners,
                 );
-                for initializer in secondary_binding_initializers_mut(binding) {
+                for initializer in binding.secondary_initializers_mut() {
                     resolve_expression_places(
                         initializer,
                         &declarations,
@@ -400,7 +387,7 @@ fn resolve_item_places(
                 overloads,
                 owners,
             );
-            for initializer in secondary_binding_initializers_mut(binding) {
+            for initializer in binding.secondary_initializers_mut() {
                 resolve_expression_places(
                     initializer,
                     scope,
@@ -434,15 +421,6 @@ fn resolve_item_places(
                     owners,
                 );
             }
-            resolve_expression_places(
-                &mut assignment.value,
-                scope,
-                program,
-                names,
-                unsafe_context,
-                overloads,
-                owners,
-            );
             for value in &mut assignment.values {
                 resolve_expression_places(
                     value,
@@ -900,15 +878,8 @@ fn resolve_binding_types_project(
             resolve_scoped_type_in_project(&receiver.ty, declarations, current_module, generics);
     }
     resolve_expression_types_project(&mut binding.value, declarations, current_module, generics);
-    if binding.output_origin == ScalarBindingOutputOrigin::IndependentExpressions {
-        for output in &mut binding.output_values {
-            resolve_expression_types_project(
-                &mut output.value,
-                declarations,
-                current_module,
-                generics,
-            );
-        }
+    for initializer in binding.secondary_initializers_mut() {
+        resolve_expression_types_project(initializer, declarations, current_module, generics);
     }
 }
 
@@ -929,12 +900,6 @@ fn resolve_item_types_project(
             for value in &mut assignment.values {
                 resolve_expression_types_project(value, declarations, current_module, generics);
             }
-            resolve_expression_types_project(
-                &mut assignment.value,
-                declarations,
-                current_module,
-                generics,
-            );
         }
     }
 }
@@ -1171,7 +1136,7 @@ pub(super) fn resolve_module_places(
                     overloads,
                     owners,
                 );
-                for initializer in secondary_binding_initializers_mut(binding) {
+                for initializer in binding.secondary_initializers_mut() {
                     resolve_expression_module_places(
                         initializer,
                         &bindings,
@@ -1252,7 +1217,7 @@ fn resolve_item_module_places(
                 overloads,
                 owners,
             );
-            for initializer in secondary_binding_initializers_mut(binding) {
+            for initializer in binding.secondary_initializers_mut() {
                 resolve_expression_module_places(
                     initializer,
                     scope,
@@ -1295,18 +1260,6 @@ fn resolve_item_module_places(
                     owners,
                 );
             }
-            resolve_expression_module_places(
-                &mut assignment.value,
-                scope,
-                module,
-                modules,
-                names,
-                unsafe_context,
-                declarations,
-                current_module,
-                overloads,
-                owners,
-            );
             for value in &mut assignment.values {
                 resolve_expression_module_places(
                     value,

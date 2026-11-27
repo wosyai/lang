@@ -53,7 +53,9 @@ fn initializer_facts_binding_output_routes_preserve_actual_secondary_occurrences
         };
         let independent = binding("left");
         let projected = binding("first");
-        let call = &independent.output_values[1].value;
+        let ScalarBindingOutput::Evaluate(call) = independent.output_source(1) else {
+            panic!("independent initializer");
+        };
         let facts = prepared.initializer_facts(module).unwrap();
         let evaluated = facts.binding_output(independent, 1, call).unwrap();
         assert_eq!(evaluated.route, InitializerOutputRoute::EvaluateSecondary);

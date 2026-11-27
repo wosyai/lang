@@ -1611,14 +1611,6 @@ pub struct ScalarOutputReceiver {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ScalarOutputValue {
-    pub position: usize,
-    pub ty: ScalarType,
-    pub span: ByteSpan,
-    pub value: ScalarExpression,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScalarBindingOutputOrigin {
     SingleExpression,
     IndependentExpressions,
@@ -2210,16 +2202,24 @@ pub enum ScalarExternModule {
 pub struct ScalarBlock {
     pub items: Vec<ScalarBlockItem>,
     pub terminated_items: Vec<bool>,
-    pub final_output_values: Vec<ScalarBlockOutput>,
+    pub final_output_values: Vec<ScalarOutputMetadata>,
     pub span: ByteSpan,
     pub unsafe_context: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct ScalarBlockOutput {
+pub struct ScalarOutputMetadata {
     pub position: usize,
     pub ty: ScalarType,
     pub span: ByteSpan,
+}
+
+#[derive(Serialize)]
+struct ScalarOutputWireRef<'a> {
+    position: usize,
+    ty: &'a ScalarType,
+    span: ByteSpan,
+    value: &'a ScalarExpression,
 }
 
 impl Serialize for ScalarBlock {
@@ -2245,13 +2245,6 @@ impl Serialize for ScalarBlock {
             where
                 S: serde::Serializer,
             {
-                #[derive(Serialize)]
-                struct Output<'a> {
-                    position: usize,
-                    ty: &'a ScalarType,
-                    span: ByteSpan,
-                    value: &'a ScalarExpression,
-                }
                 use serde::ser::{Error, SerializeSeq};
                 let metadata = &self.0.final_output_values;
                 let start = self.0.items.len().checked_sub(metadata.len()).ok_or_else(|| {
@@ -2262,7 +2255,7 @@ impl Serialize for ScalarBlock {
                     let ScalarBlockItem::Expression(value) = item else {
                         return Err(S::Error::custom("ScalarBlock final output is not an expression item"));
                     };
-                    outputs.serialize_element(&Output {
+                    outputs.serialize_element(&ScalarOutputWireRef {
                         position: metadata.position,
                         ty: &metadata.ty,
                         span: metadata.span,
@@ -2296,7 +2289,7 @@ enum ScalarBlockItemRole<'a> {
     Ordinary,
     FinalOutput {
         output: usize,
-        metadata: &'a ScalarBlockOutput,
+        metadata: &'a ScalarOutputMetadata,
     },
 }
 
@@ -2311,7 +2304,7 @@ impl ScalarBlock {
 
     pub(crate) fn final_expressions(
         &self,
-    ) -> impl Iterator<Item = (&ScalarExpression, &ScalarBlockOutput)> {
+    ) -> impl Iterator<Item = (&ScalarExpression, &ScalarOutputMetadata)> {
         let first_output = self.items.len() - self.final_output_values.len();
         self.items[first_output..]
             .iter()
@@ -2324,7 +2317,7 @@ impl ScalarBlock {
             })
     }
 
-    pub(crate) fn final_expression(&self, index: usize) -> Option<(&ScalarExpression, &ScalarBlockOutput)> {
+    pub(crate) fn final_expression(&self, index: usize) -> Option<(&ScalarExpression, &ScalarOutputMetadata)> {
         let metadata = self.final_output_values.get(index)?;
         let first_output = self.items.len() - self.final_output_values.len();
         let ScalarBlockItem::Expression(expression) = &self.items[first_output + index] else {
@@ -2382,16 +2375,35 @@ pub enum ScalarBlockItem {
     Assignment(ScalarAssignment),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub struct ScalarAssignment {
     pub receiver: Option<String>,
     pub target: String,
     pub receiver_span: Option<ByteSpan>,
     pub target_span: ByteSpan,
     pub targets: Vec<ScalarAssignmentTarget>,
-    pub value: ScalarExpression,
     pub values: Vec<ScalarExpression>,
     pub span: ByteSpan,
+}
+
+impl Serialize for ScalarAssignment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeStruct};
+
+        let value = self.values.first().ok_or_else(|| {
+            S::Error::custom("ScalarAssignment has no right-hand expression")
+        })?;
+        let mut wire = serializer.serialize_struct("ScalarAssignment", 8)?;
+        wire.serialize_field("receiver", &self.receiver)?;
+        wire.serialize_field("target", &self.target)?;
+        wire.serialize_field("receiver_span", &self.receiver_span)?;
+        wire.serialize_field("target_span", &self.target_span)?;
+        wire.serialize_field("targets", &self.targets)?;
+        wire.serialize_field("value", value)?;
+        wire.serialize_field("values", &self.values)?;
+        wire.serialize_field("span", &self.span)?;
+        wire.end()
+    }
 }
 
 struct ScalarAssignmentRhs<'a> {
@@ -2432,7 +2444,8 @@ pub struct ScalarAssignmentTarget {
     pub place: ScalarPlace,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(try_from = "ScalarBindingWire")]
 pub struct ScalarBinding {
     pub name: String,
     pub name_span: ByteSpan,
@@ -2440,12 +2453,123 @@ pub struct ScalarBinding {
     pub value: ScalarExpression,
     pub receivers: Vec<ScalarOutputReceiver>,
     pub output_sequence: ScalarOutputSequence,
-    pub output_values: Vec<ScalarOutputValue>,
+    pub output_values: Vec<ScalarOutputMetadata>,
+    secondary_initializers: Vec<ScalarExpression>,
     pub output_origin: ScalarBindingOutputOrigin,
     pub is_allocation: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallible_assignment: Option<ByteSpan>,
     pub span: ByteSpan,
+}
+
+#[derive(Deserialize)]
+struct ScalarBindingWire {
+    name: String,
+    name_span: ByteSpan,
+    declared_type: ScalarType,
+    value: ScalarExpression,
+    receivers: Vec<ScalarOutputReceiver>,
+    output_sequence: ScalarOutputSequence,
+    output_values: Vec<ScalarBindingOutputWire>,
+    output_origin: ScalarBindingOutputOrigin,
+    is_allocation: bool,
+    #[serde(default)]
+    fallible_assignment: Option<ByteSpan>,
+    span: ByteSpan,
+}
+
+#[derive(Deserialize)]
+struct ScalarBindingOutputWire {
+    position: usize,
+    ty: ScalarType,
+    span: ByteSpan,
+    value: ScalarExpression,
+}
+
+impl TryFrom<ScalarBindingWire> for ScalarBinding {
+    type Error = &'static str;
+
+    fn try_from(wire: ScalarBindingWire) -> Result<Self, Self::Error> {
+        if wire.output_values.len() != wire.receivers.len() {
+            return Err("ScalarBinding output metadata doesn't match its receivers");
+        }
+        let independent = !wire.is_allocation
+            && wire.output_origin == ScalarBindingOutputOrigin::IndependentExpressions;
+        let mut secondary_initializers = Vec::new();
+        let output_values = wire.output_values.into_iter().enumerate().map(|(index, output)| {
+            if independent && index != 0 {
+                secondary_initializers.push(output.value);
+            }
+            ScalarOutputMetadata {
+                position: output.position,
+                ty: output.ty,
+                span: output.span,
+            }
+        }).collect();
+        Ok(Self {
+            name: wire.name,
+            name_span: wire.name_span,
+            declared_type: wire.declared_type,
+            value: wire.value,
+            receivers: wire.receivers,
+            output_sequence: wire.output_sequence,
+            output_values,
+            secondary_initializers,
+            output_origin: wire.output_origin,
+            is_allocation: wire.is_allocation,
+            fallible_assignment: wire.fallible_assignment,
+            span: wire.span,
+        })
+    }
+}
+
+impl Serialize for ScalarBinding {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq, SerializeStruct};
+
+        struct Outputs<'a>(&'a ScalarBinding);
+        impl Serialize for Outputs<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let binding = self.0;
+                let mut values = serializer.serialize_seq(Some(binding.output_values.len()))?;
+                let projects_primary = binding.is_allocation
+                    || binding.output_origin == ScalarBindingOutputOrigin::SingleExpression;
+                for (index, metadata) in binding.output_values.iter().enumerate() {
+                    let value = if index == 0 || projects_primary {
+                        &binding.value
+                    } else {
+                        binding.secondary_initializers.get(index - 1).ok_or_else(|| {
+                            S::Error::custom("ScalarBinding has no independent expression for its output")
+                        })?
+                    };
+                    values.serialize_element(&ScalarOutputWireRef {
+                        position: metadata.position, ty: &metadata.ty, span: metadata.span, value,
+                    })?;
+                }
+                values.end()
+            }
+        }
+
+        if self.output_values.len() != self.receivers.len() {
+            return Err(S::Error::custom("ScalarBinding output metadata doesn't match its receivers"));
+        }
+        let mut wire = serializer.serialize_struct(
+            "ScalarBinding", 10 + usize::from(self.fallible_assignment.is_some()),
+        )?;
+        wire.serialize_field("name", &self.name)?;
+        wire.serialize_field("name_span", &self.name_span)?;
+        wire.serialize_field("declared_type", &self.declared_type)?;
+        wire.serialize_field("value", &self.value)?;
+        wire.serialize_field("receivers", &self.receivers)?;
+        wire.serialize_field("output_sequence", &self.output_sequence)?;
+        wire.serialize_field("output_values", &Outputs(self))?;
+        wire.serialize_field("output_origin", &self.output_origin)?;
+        wire.serialize_field("is_allocation", &self.is_allocation)?;
+        if let Some(fallible_assignment) = self.fallible_assignment {
+            wire.serialize_field("fallible_assignment", &fallible_assignment)?;
+        }
+        wire.serialize_field("span", &self.span)?;
+        wire.end()
+    }
 }
 
 pub(crate) fn generated_runtime_scalar_binding(binding: &ScalarBinding) -> bool {
@@ -2462,13 +2586,17 @@ pub(crate) enum ScalarBindingOutput<'a> {
 }
 
 impl ScalarBinding {
+    pub(crate) fn secondary_initializers_mut(&mut self) -> impl Iterator<Item = &mut ScalarExpression> {
+        self.secondary_initializers.iter_mut()
+    }
+
     pub(crate) fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
-        if position == 0 {
+        if position == 0 || self.is_allocation {
             return ScalarBindingOutput::Evaluate(&self.value);
         }
         match self.output_origin {
             ScalarBindingOutputOrigin::IndependentExpressions => {
-                ScalarBindingOutput::Evaluate(&self.output_values[position].value)
+                ScalarBindingOutput::Evaluate(&self.secondary_initializers[position - 1])
             }
             ScalarBindingOutputOrigin::SingleExpression => {
                 ScalarBindingOutput::ProjectPrimary { output: position }
@@ -3698,40 +3826,33 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
             .map(|child| derive_expression(&child))
             .collect::<Vec<_>>()
     });
-    let value = outputs
-        .first()
-        .cloned()
-        .unwrap_or(ScalarExpression::Integer {
-            value: BigInt::from(0),
-            span: wosy_syntax::byte_span(node),
-        });
-    let name = receivers[0].name.clone();
-    let output_values = receivers
-        .iter()
-        .enumerate()
-        .map(|(position, receiver)| ScalarOutputValue {
-            position,
-            ty: receiver.ty.clone(),
-            span: if outputs.is_empty() {
-                receiver.span
-            } else {
-                span_of(if outputs.len() == 1 {
-                    &value
-                } else {
-                    &outputs[position]
-                })
-            },
-            value: if outputs.is_empty() || outputs.len() == 1 {
-                value.clone()
-            } else {
-                outputs[position].clone()
-            },
-        })
-        .collect::<Vec<_>>();
+    let is_allocation = outputs.is_empty();
     let output_origin = match outputs.len() {
         1 => ScalarBindingOutputOrigin::SingleExpression,
         _ => ScalarBindingOutputOrigin::IndependentExpressions,
     };
+    let mut outputs = outputs.into_iter();
+    let value = outputs.next().unwrap_or_else(|| ScalarExpression::Integer {
+        value: BigInt::from(0),
+        span: wosy_syntax::byte_span(node),
+    });
+    let secondary_initializers = outputs.collect::<Vec<_>>();
+    let name = receivers[0].name.clone();
+    let output_values = receivers
+        .iter()
+        .enumerate()
+        .map(|(position, receiver)| ScalarOutputMetadata {
+            position,
+            ty: receiver.ty.clone(),
+            span: if is_allocation {
+                receiver.span
+            } else if position == 0 || output_origin == ScalarBindingOutputOrigin::SingleExpression {
+                span_of(&value)
+            } else {
+                span_of(&secondary_initializers[position - 1])
+            },
+        })
+        .collect::<Vec<_>>();
     let output_sequence = ScalarOutputSequence {
         outputs: receivers
             .iter()
@@ -3753,8 +3874,9 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         receivers,
         output_sequence,
         output_values,
+        secondary_initializers,
         output_origin,
-        is_allocation: outputs.is_empty(),
+        is_allocation,
         fallible_assignment: direct_token(node, SyntaxKind::FallibleAssignmentOperator)
             .as_ref().map(token_span),
         span: wosy_syntax::byte_span(node),
@@ -4630,7 +4752,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .enumerate()
                 .map(|(position, child)| {
                     let value = derive_expression(&child);
-                    let metadata = ScalarBlockOutput {
+                    let metadata = ScalarOutputMetadata {
                         position,
                         ty: ScalarType::Error,
                         span: span_of(&value),
@@ -4666,7 +4788,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                         .into_iter()
                         .any(|actual| actual.kind() == SyntaxKind::Unsafe)
             }) {
-                final_output_values.push(ScalarBlockOutput {
+                final_output_values.push(ScalarOutputMetadata {
                     position: 0,
                     ty: ScalarType::Error,
                     span: wosy_syntax::byte_span(&expression),
@@ -4776,14 +4898,12 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
         .filter(|child| child.kind() == SyntaxKind::Expression)
         .map(|child| derive_expression(&child))
         .collect::<Vec<_>>();
-    let value = values[0].clone();
     ScalarAssignment {
         receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
         target: target.text().to_owned(),
         receiver_span: (identifiers.len() == 2).then(|| token_span(&identifiers[0])),
         target_span: token_span(&target),
         targets,
-        value,
         values,
         span: wosy_syntax::byte_span(node),
     }

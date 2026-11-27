@@ -5097,7 +5097,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     position: source,
                     expression,
                 } => {
-                    self.expression(&binding.output_values[*source].value, scope, *expression)?;
+                    let ScalarBindingOutput::Evaluate(initializer) = binding.output_source(*source) else {
+                        unreachable!("independent output evaluates its initializer")
+                    };
+                    self.expression(initializer, scope, *expression)?;
                 }
                 BindingOutput::ProjectPrimary { output } => {
                     if let Some(producer) = call_producer {
@@ -17010,7 +17013,7 @@ impl StructuralWalker<'_, '_> {
                         };
                         assert!(rows.insert(slot.destination, identity).is_none());
                     }
-                    if let ScalarExpression::Name { name, .. } = &assignment.value {
+                    if let Some(ScalarExpression::Name { name, .. }) = assignment.values.first() {
                         if let Some(ty) = types.get(name).cloned() {
                             types.extend(introduced.keys().map(|name| (name.clone(), ty.clone())));
                         }
@@ -17077,8 +17080,8 @@ impl StructuralWalker<'_, '_> {
                     for target in &assignment.targets {
                         if let ScalarPlace::Name { name, .. } = &target.place {
                             if !names.contains_key(name) {
-                                if let ScalarExpression::Name { name: source, .. } =
-                                    &assignment.value
+                                if let Some(ScalarExpression::Name { name: source, .. }) =
+                                    assignment.values.first()
                                 {
                                     if let Some(ty) = types.get(source).cloned() {
                                         types.insert(name.clone(), ty);

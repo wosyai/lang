@@ -623,12 +623,6 @@ fn record_block_item_overload_selections(
             record_expression_overload_selection(expression, None, &scope, overloads)
         }
         ScalarBlockItem::Assignment(assignment) => {
-            record_expression_overload_selection(
-                &mut assignment.value,
-                scope.get(&assignment.target),
-                &scope,
-                overloads,
-            );
             for (value, target) in assignment.values.iter_mut().zip(&assignment.targets) {
                 record_expression_overload_selection(
                     value,

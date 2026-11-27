@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::ScalarBlockOutput;
+use crate::scalar::ScalarOutputMetadata;
 use crate::scalar::{
     ReferenceBindingId, ReferenceLoanId, ReferenceOriginId, ReferencePlaceId, ReferenceScopeId,
     ReturnedAllocationId, ScalarOutput, ScalarOutputSequence, ScalarPlace,
@@ -31,7 +31,7 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
         final_output_values: values
             .iter()
             .enumerate()
-            .map(|(position, _)| ScalarBlockOutput {
+            .map(|(position, _)| ScalarOutputMetadata {
                 position,
                 ty: checked.clone(),
                 span: value_span,

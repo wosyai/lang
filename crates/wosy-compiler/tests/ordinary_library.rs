@@ -292,6 +292,45 @@ u64 result = drive(2);
 }
 
 #[test]
+fn nested_binding_and_assignment_rhs_keep_one_canonical_tree() {
+    const DEPTH: usize = 48;
+    let app = source("workbench", "src/deep_rhs.w");
+    for assignment in [false, true] {
+        let rhs = (0..DEPTH).fold("41".to_owned(), |rhs, index| {
+            let initializer = if assignment {
+                format!("u64 level{index} = 0; level{index} = {rhs};")
+            } else {
+                format!("u64 level{index} = {rhs};")
+            };
+            format!("if (flag) {{ {initializer} level{index} }} else {{ 41 }}")
+        });
+        let text = format!(
+            "%%start\nu64(bool) probe = fn(flag) {{ {rhs} }};\nu64 answer = probe(true);\n%%end"
+        );
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, &text), Vec::new())],
+                vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "deep-rhs");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let function = module.get_function(&function_with_suffix(&module, "probe")).unwrap();
+            let merges = function.get_basic_blocks().into_iter()
+                .flat_map(|block| block.get_instructions())
+                .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Phi)
+                .count();
+            assert_eq!(merges, DEPTH, "{target_layout:?}, assignment={assignment}");
+        }
+    }
+}
+
+#[test]
 fn deeply_nested_aggregate_input_transfer_uses_each_authored_merge() {
     const DEPTH: usize = 80;
     let app = source("workbench", "src/deep_conditional_transfer.w");

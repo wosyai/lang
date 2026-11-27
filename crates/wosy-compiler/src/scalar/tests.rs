@@ -5437,6 +5437,30 @@ fn unsafe_statement_and_unit_output_remain_statements_in_both_pipelines() {
 }
 
 #[test]
+fn assignment_json_prefers_the_canonical_values_and_projects_legacy_primary() {
+    let result = validate_text(
+        "%%start\nu64() change = fn { u64 item = 0; item = 41; item };\n%%end",
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let ScalarItem::Function(function) = &result.program.items[0] else {
+        panic!("expected function");
+    };
+    let ScalarBlockItem::Assignment(assignment) = &function.body.items[1] else {
+        panic!("expected assignment");
+    };
+    let mut wire = serde_json::to_value(assignment).unwrap();
+    assert_eq!(wire["value"], wire["values"][0]);
+    wire["value"] = serde_json::json!(null);
+    assert_eq!(
+        serde_json::from_value::<ScalarAssignment>(wire).unwrap(),
+        *assignment,
+    );
+    let mut malformed = assignment.clone();
+    malformed.values.clear();
+    assert!(serde_json::to_value(malformed).is_err());
+}
+
+#[test]
 fn malformed_final_block_json_projection_returns_an_error() {
     let result = validate_text("%%start\nu8(u8) f = fn(v) { u8 copy = v; copy };\n%%end");
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -9256,8 +9280,8 @@ fn validates_two_output_namespace_call_and_receiver_order() {
     assert_eq!(binding.output_values[1].position, 1);
     assert_eq!(binding.output_values[0].ty, ScalarType::U64);
     assert_eq!(binding.output_values[1].ty, ScalarType::Bool);
-    assert_eq!(expression_span(&binding.output_values[0].value), call_span);
-    assert_eq!(expression_span(&binding.output_values[1].value), call_span);
+    assert_eq!(expression_span(&binding.value), call_span);
+    assert_eq!(binding.output_values[1].span, call_span);
     assert_eq!(binding.receivers[0].ty, ScalarType::U64);
     assert_eq!(binding.receivers[1].ty, ScalarType::Bool);
 }
@@ -9862,8 +9886,8 @@ fn preserves_independent_output_expression_spans() {
     assert_eq!(binding.output_values[0].position, 0);
     assert_eq!(binding.output_values[1].position, 1);
     assert_ne!(
-        expression_span(&binding.output_values[0].value),
-        expression_span(&binding.output_values[1].value)
+        expression_span(&binding.value),
+        expression_span(&binding.secondary_initializers[0])
     );
     assert_eq!(
         binding.output_sequence.outputs[0].span,
@@ -9888,8 +9912,8 @@ fn marks_equal_independent_output_expressions_independently() {
     );
     assert!(matches!(
         (
-            &binding.output_values[0].value,
-            &binding.output_values[1].value
+            &binding.value,
+            &binding.secondary_initializers[0]
         ),
         (
             ScalarExpression::Integer { value: first, .. },
@@ -9897,8 +9921,8 @@ fn marks_equal_independent_output_expressions_independently() {
         ) if first == second
     ));
     assert_ne!(
-        expression_span(&binding.output_values[0].value),
-        expression_span(&binding.output_values[1].value)
+        expression_span(&binding.value),
+        expression_span(&binding.secondary_initializers[0])
     );
 }
 

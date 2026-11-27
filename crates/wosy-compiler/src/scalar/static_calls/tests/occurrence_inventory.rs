@@ -411,7 +411,7 @@ fn preparation_keeps_equal_span_independent_occurrences_and_earlier_legacy_call_
         };
         let root_span = *root_span;
         let call_span = expression_span(left);
-        let ScalarExpression::Binary { left, span, .. } = &mut binding.output_values[1].value
+        let ScalarExpression::Binary { left, span, .. } = binding.secondary_initializers_mut().next().unwrap()
         else {
             panic!("second root")
         };

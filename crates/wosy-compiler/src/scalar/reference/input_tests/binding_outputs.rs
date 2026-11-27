@@ -38,7 +38,7 @@ fn binding_output_sources_borrow_canonical_roots_and_project_precise_primary_ord
         assert_eq!(independent.output_values.len(), 2);
         assert_eq!(independent.receivers.len(), 2);
         let shared = expression_span(&independent.value);
-        let ScalarExpression::Binary { span, .. } = &mut independent.output_values[1].value else {
+        let ScalarExpression::Binary { span, .. } = &mut independent.secondary_initializers[0] else {
             panic!("second independent root")
         };
         *span = shared;
@@ -49,7 +49,7 @@ fn binding_output_sources_borrow_canonical_roots_and_project_precise_primary_ord
             let canonical = if position == 0 {
                 &independent.value
             } else {
-                &independent.output_values[position].value
+                &independent.secondary_initializers[position - 1]
             };
             assert!(std::ptr::eq(value, canonical));
             assert_eq!(expression_span(value), shared);
@@ -61,7 +61,7 @@ fn binding_output_sources_borrow_canonical_roots_and_project_precise_primary_ord
             unreachable!()
         };
         assert!(!std::ptr::eq(primary, secondary));
-        assert!(!std::ptr::eq(primary, &independent.output_values[0].value));
+        assert_eq!(independent.secondary_initializers.len(), 1);
         let single = bindings.next().unwrap();
         assert_eq!(
             single.output_origin,
@@ -274,13 +274,24 @@ fn raw_binding_outputs_use_canonical_primary_and_real_secondary() {
             let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
                 panic!("independent binding");
             };
-            let (expression, expected, replacement) = match (position, canonical) {
-                (0, true) => (&mut binding.value, "first", "second"),
-                (0, false) => (&mut binding.output_values[0].value, "first", "second"),
-                (1, false) => (&mut binding.output_values[1].value, "second", "first"),
+            let mutation = match (position, canonical) {
+                (0, true) => Some((&mut binding.value, "first", "second")),
+                (0, false) => None,
+                (1, false) => Some((&mut binding.secondary_initializers[0], "second", "first")),
                 _ => unreachable!(),
             };
-            rename(expression, expected, replacement);
+            if let Some((expression, expected, replacement)) = mutation {
+                rename(expression, expected, replacement);
+            } else {
+                // Legacy slot-zero payload is ignored; primary is the owned node.
+                let mut wire = serde_json::to_value(&*binding).unwrap();
+                let mut legacy: ScalarExpression = serde_json::from_value(
+                    wire["output_values"][0]["value"].clone(),
+                ).unwrap();
+                rename(&mut legacy, "first", "second");
+                wire["output_values"][0]["value"] = serde_json::to_value(legacy).unwrap();
+                *binding = serde_json::from_value(wire).unwrap();
+            }
 
             let changed_project = project(&changed.program);
             let encoded_raw = serde_json::to_vec(&changed).unwrap();

@@ -845,8 +845,8 @@ fn prepared_body_dispatch_uses_rows_when_call_spelling_differs() {
                         }
                         crate::ScalarBlockItem::LocalBinding(binding) => {
                             corrupt_call(&mut binding.value);
-                            for output in binding.output_values.iter_mut().skip(1) {
-                                corrupt_call(&mut output.value);
+                            for initializer in binding.secondary_initializers_mut() {
+                                corrupt_call(initializer);
                             }
                         }
                         crate::ScalarBlockItem::Assignment(assignment) => {
@@ -1244,11 +1244,12 @@ i32 nested = unsafe { echo(33) };
             panic!("expected function and two bindings");
         };
         assert!(matches!(&nested.value, ScalarExpression::Block(_)));
-        let mirror = &mut binding.output_values[0];
-        mirror.value = ScalarExpression::Integer {
+        let mut wire = serde_json::to_value(&*binding).unwrap();
+        wire["output_values"][0]["value"] = serde_json::to_value(ScalarExpression::Integer {
             value: 99.into(),
-            span: mirror.span,
-        };
+            span: binding.output_values[0].span,
+        }).unwrap();
+        *binding = serde_json::from_value(wire).unwrap();
 
         let region = prepared.initialization_region(0).unwrap();
         let input = super::GenericInitializerInput::PreparedRows(build.prepared());
@@ -6697,7 +6698,8 @@ fn emits_equal_independent_output_values_with_typed_receivers() {
     let crate::ScalarItem::Binding(binding) = &mut validation.program.items[0] else {
         panic!("output binding");
     };
-    binding.output_values[1].value = binding.output_values[0].value.clone();
+    let primary = binding.value.clone();
+    *binding.secondary_initializers_mut().next().unwrap() = primary;
     let text = emit_scalar_llvm(&validation)
         .expect("equal independent output LLVM")
         .to_text();
