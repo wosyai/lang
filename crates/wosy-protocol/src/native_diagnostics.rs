@@ -54,6 +54,41 @@ pub async fn connect(directory: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Bind the verified endpoint to the activator's own unreaped child and
+/// the same opened executable it nominated for launch. This must be paired
+/// with the compiler image digest and source checks by the caller before any
+/// Build use. The activator owns the child exclusively (no external reaper)
+/// and trusts that executable not to exec again or hand off its listener.
+/// This does not isolate hostile processes running at the same effective UID.
+pub async fn connect_owned_child(
+    directory: &Path,
+    child: &mut std::process::Child,
+    executable: &fs::File,
+) -> io::Result<UnixStream> {
+    if child.try_wait()?.is_some() {
+        return Err(invalid("owned local diagnostic child already exited"));
+    }
+    let expected = executable.metadata()?;
+    if !expected.is_file() {
+        return Err(invalid("owned local diagnostic child requires an opened regular executable"));
+    }
+    let stream = connect(directory).await?;
+    let pid = child.id();
+    if stream.peer_cred()?.pid().and_then(|pid| u32::try_from(pid).ok()) != Some(pid) {
+        return Err(invalid("local diagnostic peer is not the owned child"));
+    }
+    // Keep the Child borrowed until after matching the live executable.
+    // The exclusive waiter prevents PID reuse while this check is in flight.
+    let actual = fs::File::open(format!("/proc/{pid}/exe"))?.metadata()?;
+    if !actual.is_file() || identity(&actual) != identity(&expected) {
+        return Err(invalid("local diagnostic child executable does not match the opened image"));
+    }
+    if child.try_wait()?.is_some() {
+        return Err(invalid("owned local diagnostic child exited during connection"));
+    }
+    Ok(stream)
+}
+
 fn check_parent(directory: &Path, uid: u32) -> io::Result<()> {
     if !directory.is_absolute() || directory.components().any(|part| part == Component::ParentDir) {
         return Err(invalid("local diagnostics require an absolute endpoint directory without .."));
