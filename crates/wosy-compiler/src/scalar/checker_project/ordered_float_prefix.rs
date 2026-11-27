@@ -650,9 +650,10 @@ pub(super) fn evaluate_observed_prefix(
     mut formals: HashMap<ReferenceBindingId, ExactValue>,
     mut read: impl FnMut(&SourceSpan, Option<u64>) -> Option<ExactValue>,
     trace: bool,
+    work: &mut usize,
     resolve_span: impl Fn(PreparedCallable, OccurrenceOrdinal) -> Option<SourceSpan>,
 ) -> Option<ObservedResult> {
-    use super::super::checker_flow::projected_f32::ExactF32;
+    use super::super::checker_flow::{charge_call_work, projected_f32::ExactF32};
     use std::cell::RefCell;
     type Locals = Rc<RefCell<HashMap<ReferenceBindingId, ExactValue>>>;
     type Key = (PreparedCallable, Vec<MemoValue>);
@@ -683,6 +684,7 @@ pub(super) fn evaluate_observed_prefix(
             _ => return None,
         })
     }
+    charge_call_work(work, formals.len().saturating_add(certificate.bindings.len().saturating_mul(3)))?;
     let locals = Rc::new(RefCell::new(std::mem::take(&mut formals)));
     let mut pending = Vec::new();
     let mut values = Vec::new();
@@ -690,7 +692,10 @@ pub(super) fn evaluate_observed_prefix(
     // Scoped to this activation: the reader authenticates one immutable module
     // snapshot for the whole readonly prefix and all its callees. The checked
     // target signature fixes integer width/signedness for each memo position.
-    let mut memo = HashMap::<Key, (ExactValue, Option<usize>)>::new();
+    // One last specialization per checked declaration bounds the memo by the
+    // static call graph, even when the exact dynamic arguments all differ.
+    // Replacement changes only reuse: every miss still executes exactly.
+    let mut memo = HashMap::<PreparedCallable, (Vec<MemoValue>, ExactValue, Option<usize>)>::new();
     let mut trace_stack = trace.then(|| vec![Vec::new()]);
     let mut interned = HashMap::new();
     let mut segments = Vec::new();
@@ -699,8 +704,9 @@ pub(super) fn evaluate_observed_prefix(
         pending.push(Work::Bind(fact, Rc::clone(&locals)));
         pending.push(Work::Eval(fact.returning_effect, Rc::clone(&locals)));
     }
-    while let Some(work) = pending.pop() {
-        match work {
+    while let Some(task) = pending.pop() {
+        charge_call_work(work, 1)?;
+        match task {
             Work::Eval(at, scope) => {
                 let record = certificate.effects.get(at)?;
                 match &record.operation {
@@ -715,10 +721,12 @@ pub(super) fn evaluate_observed_prefix(
                         pending.push(Work::Eval(*left, scope));
                     }
                     Effect::Sequence { kind, operands, .. } => {
+                        charge_call_work(work, operands.len())?;
                         pending.push(Work::Sequence(kind, operands.len()));
                         pending.extend(operands.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
                     }
                     Effect::Call { at, function, arguments, ty } => {
+                        charge_call_work(work, arguments.len())?;
                         pending.push(Work::Call(record.owner, *at, *function, ty, arguments.len()));
                         pending.extend(arguments.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
                     }
@@ -728,6 +736,7 @@ pub(super) fn evaluate_observed_prefix(
             Work::Select(owner, at, yes, no, scope) => {
                 let ExactValue::Boolean(accepted) = values.pop()? else { return None; };
                 if let Some(stack) = &mut trace_stack {
+                    charge_call_work(work, 1)?;
                     stack.last_mut()?.push(ObservedStep::Branch { site: resolve_span(owner, at)?, accepted });
                 }
                 pending.push(Work::Eval(if accepted { yes } else { no }, scope));
@@ -735,6 +744,7 @@ pub(super) fn evaluate_observed_prefix(
             Work::Short(owner, at, conjunction, right, scope) => {
                 let ExactValue::Boolean(left) = values.pop()? else { return None; };
                 if let Some(stack) = &mut trace_stack {
+                    charge_call_work(work, 1)?;
                     stack.last_mut()?.push(ObservedStep::Branch { site: resolve_span(owner, at)?, accepted: left });
                 }
                 if left == conjunction {
@@ -749,24 +759,32 @@ pub(super) fn evaluate_observed_prefix(
             Work::Publish => published.push(values.pop()?),
             Work::DropLocalResult => { values.pop()?; }
             Work::Sequence(kind, arity) => {
+                charge_call_work(work, arity)?;
                 let args = take(&mut values, arity)?;
                 values.push(compute(kind, args)?);
             }
             Work::Call(owner, at, target, result, arity) => {
+                charge_call_work(work, arity)?;
                 let args = take(&mut values, arity)?;
                 if let Some(target) = target {
                     let function = certificate.callees.get(&target)?;
                     if args.len() != function.formals.len() { return None; }
                     if !function.formals.iter().zip(&args).all(|((_, ty), value)| value.ty() == *ty) { return None; }
-                    let key = (target, args.iter().map(MemoValue::from).collect());
-                    if let Some((value, nested)) = memo.get(&key) {
+                    charge_call_work(work, args.iter().fold(1usize, |cost, value| {
+                        let words = match value { ExactValue::Integer(_, value) => (value.bits().saturating_add(63))/64, _ => 1 };
+                        cost.saturating_add(usize::try_from(words).unwrap_or(usize::MAX))
+                    }))?;
+                    let key: Key = (target, args.iter().map(MemoValue::from).collect());
+                    if let Some((_, value, nested)) = memo.get(&target).filter(|(known, _, _)| known == &key.1) {
                         if value.ty() != *result { return None; }
                         if let Some(stack) = &mut trace_stack {
+                            charge_call_work(work, 1)?;
                             stack.last_mut()?.push(ObservedStep::Call { site: resolve_span(owner, at)?, nested: (*nested)? });
                         }
                         values.push(value.clone());
                         continue;
                     }
+                    charge_call_work(work, function.formals.len().saturating_add(function.bindings.len().saturating_mul(3)))?;
                     let nested = function.formals.iter().zip(args).map(|((slot, _), value)| (slot.clone(), value)).collect();
                     let scope = Rc::new(RefCell::new(nested));
                     if let Some(stack) = &mut trace_stack { stack.push(Vec::new()); }
@@ -788,6 +806,7 @@ pub(super) fn evaluate_observed_prefix(
                 if value.ty() != *ty { return None; }
                 let nested = if let Some(stack) = &mut trace_stack {
                     let steps = stack.pop()?;
+                    charge_call_work(work, steps.len().saturating_add(1))?;
                     let id = *interned.entry(steps).or_insert_with_key(|steps| {
                         let id = segments.len();
                         segments.push(steps.clone());
@@ -796,7 +815,7 @@ pub(super) fn evaluate_observed_prefix(
                     stack.last_mut()?.push(ObservedStep::Call { site: resolve_span(owner, at)?, nested: id });
                     Some(id)
                 } else { None };
-                if memo.insert(key, (value.clone(), nested)).is_some() { return None; }
+                memo.insert(key.0, (key.1, value.clone(), nested));
             }
         }
     }

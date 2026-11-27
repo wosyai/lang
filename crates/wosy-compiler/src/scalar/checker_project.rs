@@ -2184,13 +2184,15 @@ fn try_observed_projected_storage_call(
     let mut prefix = Vec::new();
     let mut prefix_history = None;
     if let Some(plan) = &plan {
+        let mut prefix_work = work.get();
         let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index| {
             if index.is_some() { return None; }
             storage.observed_atom(declaration)
-        }, trace.is_some(), |owner, at| {
+        }, trace.is_some(), &mut prefix_work, |owner, at| {
             if owner.0 != target.0 { return None; }
             Some(wosy_syntax::SourceSpan::new(source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
         }).ok_or(ProjectCheck::Unsupported)?;
+        work.set(prefix_work);
         if values.len() != plan.bindings.len() { return Err(ProjectCheck::Unsupported); }
         prefix.extend(plan.bindings.iter().zip(values).map(|(fact, value)| (&fact.slot, &fact.ty, value)));
         prefix_history = evaluated;
@@ -19805,7 +19807,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 if index.is_some() || declaration.source != source { return None; }
                 reads += 1;
                 (reads <= 2).then_some(ExactValue::F32(expected))
-            }, true, |(module, item), at| {
+            }, true, &mut 0, |(module, item), at| {
                 Some(wosy_syntax::SourceSpan::new(source.clone(), calls.function_body(module,item,None)?.occurrences.get(at.0)?.span))
             }).unwrap();
             let trace = trace.unwrap();
@@ -19820,6 +19822,44 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 assert_eq!((*left,*right), (level-1,level-1));
             }
             eprintln!("readonly float DAG depth={depth} reads={reads} trace_segments={} physical_steps={}", trace.segments.len(), trace.root.len()+trace.segments.iter().map(Vec::len).sum::<usize>());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn readonly_float_distinct_arguments_keep_exact_values_without_unbounded_value_memo() {
+        use ordered_float_prefix::ExactValue;
+        use super::super::checker_flow::projected_f32::ExactF32;
+        let source = source("src/main.w", "float-distinct-call-trace");
+        for depth in [4usize, 8, 11] {
+            let mut code = String::from("%%start\nf32 offset = 0.25; f32(f32) f0 = fn(x) { x+offset };\n");
+            for level in 1..=depth {
+                let prior = level - 1;
+                code.push_str(&format!("f32(f32) f{level} = fn(x) {{ f32 a = f{prior}(x+x); f32 b = f{prior}(x+x+1.0); if (a<b) {{ b }} else {{ a }} }};\n"));
+            }
+            code.push_str(&format!(r#"unit() root = fn {{ f32 total = f{depth}(0.0); core.require(total >= 0.0, {{.stdout="";.stderr="";.code=7;.files=[];}}); }}; %%end"#));
+            let prepared = prepare_checker_project(vec![(declarations(&source, &code), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 }).unwrap();
+            let (project, calls) = prepared.parts();
+            let item = project.modules[0].items.iter().position(|item| matches!(item, ScalarItem::Function(f) if f.name == "root")).unwrap();
+            let plan = ordered_float_prefix::plan_prefix::<false>(project, calls, (0,item)).unwrap();
+            let mut reads = 0usize;
+            let mut work = 0usize;
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index| {
+                if index.is_some() || declaration.source != source { return None; }
+                reads += 1;
+                Some(ExactValue::F32(ExactF32::checked_bits(0.25f32.to_bits())?))
+            }, true, &mut work, |(module, item), at| {
+                Some(wosy_syntax::SourceSpan::new(source.clone(), calls.function_body(module,item,None)?.occurrences.get(at.0)?.span))
+            }).unwrap();
+            let leaf_count = 1usize << depth;
+            let expected = (leaf_count - 1) as f32 + 0.25;
+            let trace = trace.unwrap();
+            assert_eq!(values, [ExactValue::F32(ExactF32::checked_bits(expected.to_bits()).unwrap())]);
+            assert_eq!(reads, leaf_count);
+            assert!(work >= leaf_count.saturating_mul(4));
+            assert_eq!(trace.segments.len(), depth+1);
+            eprintln!("distinct float arguments depth={depth} exact_leaf_reads={reads} evaluator_work={work} trace_segments={}", trace.segments.len());
         }
     }
 
@@ -19903,7 +19943,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                         "wreck_entered" => entered.map(ExactValue::Boolean),
                         _ => None,
                     }
-                }, false, |_, _| None).map(|(values, _)| values);
+                }, false, &mut 0, |_, _| None).map(|(values, _)| values);
                 (result, reads)
             };
             let f32_value = |bits| ExactValue::F32(ExactF32::checked_bits(bits).unwrap());
