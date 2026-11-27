@@ -6,7 +6,7 @@ use crate::source_state::PendingPairComptimeInputObservation;
 use serde::Serialize;
 use std::{collections::BTreeMap, fmt, io::{self, Write}, path::Path, process::ExitStatus};
 use wosy_compiler::{BoundedPairStartupWasip1Output, BoundedStartupWasip1Evaluator, DirectStartupComptimeUse,
-    PairStartupBypass, PairStartupCallGraphEvidence, PairStartupCallPath, PairStartupOccurrence, ScalarExpression, ScalarType};
+    ObservedPairStartupWasip1, PairStartupBypass, PairStartupCallPath, PairStartupOccurrence, ScalarExpression, ScalarType};
 use wosy_project::SelectedComptimeTools;
 
 #[derive(Serialize)]
@@ -102,17 +102,16 @@ impl<'plan> StagedPendingPairWasip1<'plan> {
     pub fn read_stdout(&self, terminals: &[(ExitStatus, &[u8])])
         -> Result<PendingPairWasip1Readback<'_>, PendingPairWasip1ReadbackError>
     {
-        let evaluators = self.plan.evaluators();
-        let expected = evaluators.len();
-        if terminals.len() != expected {
-            return Err(PendingPairWasip1ReadbackError::TerminalCount { expected, supplied: terminals.len() });
-        }
-        let max_bytes = self.plan.max_stdout();
-        let values = evaluators.iter().zip(terminals).enumerate().map(|(index, (evaluator, (status, bytes)))| {
-            after_success(*status, || evaluator.parse_stdout(bytes, max_bytes))
-                .map_err(|error| PendingPairWasip1ReadbackError::Evaluator { index, error })
-        }).collect::<Result<_, _>>()?;
-        Ok(PendingPairWasip1Readback { evidence: self.plan.evidence(), values })
+        let observed = self.plan.observe_stdout(
+            terminals,
+            |index, (status, bytes)| {
+                after_success(*status, || Ok(*bytes))
+                    .map_err(|error| PendingPairWasip1ReadbackError::Evaluator { index, error })
+            },
+            |expected, supplied| PendingPairWasip1ReadbackError::TerminalCount { expected, supplied },
+            |index, error| PendingPairWasip1ReadbackError::Evaluator { index, error: ComptimeReadbackError::Output(error) },
+        )?;
+        Ok(PendingPairWasip1Readback { observed })
     }
 
     pub fn evaluators(&self) -> impl ExactSizeIterator<Item = StagedPendingPairWasip1Evaluator<'_>> {
@@ -143,8 +142,7 @@ impl StagedPendingPairWasip1Evaluator<'_> {
 /// Parsed inspection values on the same authored graph. Repeated call
 /// slots borrow one parsed value; ordinary bypasses stay ordinary evidence.
 pub struct PendingPairWasip1Readback<'stage> {
-    evidence: &'stage PairStartupCallGraphEvidence,
-    values: Vec<ScalarExpression>,
+    observed: ObservedPairStartupWasip1<'stage>,
 }
 
 pub enum PendingPairWasip1Occurrence<'a> {
@@ -158,12 +156,21 @@ pub enum PendingPairWasip1Occurrence<'a> {
 
 impl PendingPairWasip1Readback<'_> {
     pub fn occurrences(&self) -> impl ExactSizeIterator<Item = PendingPairWasip1Occurrence<'_>> {
-        self.evidence.occurrences().map(|slot| match slot {
-            PairStartupOccurrence::Specialization(call, path) => PendingPairWasip1Occurrence::Specialization {
-                call, path, value: &self.values[call.evaluator_index()],
-            },
-            PairStartupOccurrence::Bypass(bypass) => PendingPairWasip1Occurrence::Bypass(bypass),
-        })
+        self.observed.occurrences().map(|(case, value)| occurrence(case, value))
+    }
+
+    /// The original initializer, not a replacement CST or applied value.
+    pub fn initializers(&self) -> impl ExactSizeIterator<Item = (wosy_syntax::CstNode, PendingPairWasip1Occurrence<'_>)> {
+        self.observed.initializers().map(|(node, case, value)| (node, occurrence(case, value)))
+    }
+}
+
+fn occurrence<'a>(case: PairStartupOccurrence<'a>, value: Option<&'a ScalarExpression>) -> PendingPairWasip1Occurrence<'a> {
+    match case {
+        PairStartupOccurrence::Specialization(call, path) => PendingPairWasip1Occurrence::Specialization {
+            call, path, value: value.expect("compiler associates a value with each reached evaluator"),
+        },
+        PairStartupOccurrence::Bypass(bypass) => PendingPairWasip1Occurrence::Bypass(bypass),
     }
 }
 

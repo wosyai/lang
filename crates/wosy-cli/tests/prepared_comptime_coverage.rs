@@ -1065,8 +1065,55 @@ u32 different = solve(7, 13);
         assert!(matches!(other_value, ScalarExpression::Integer { value, span }
             if u32::try_from(value) == Ok(10) && *span == site.range));
 
+        let terminals: [(ExitStatus, &[u8]); 2] = [(ok, b"34\n"), (ok, b"10\n")];
+        let accepted = client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals).unwrap().unwrap();
+        let exact = held.output.ordinary_continuation();
+        let projected = accepted.initializers().collect::<Vec<_>>();
+        assert_eq!(projected.len(), initializers.len());
+        for (((node, observed), (original, case)), spelling) in projected.iter().zip(exact.initializers()).zip(initializers) {
+            assert_eq!(byte_span(node), byte_span(&original));
+            assert_eq!(node.text().to_string(), spelling);
+            assert_eq!(node.ancestors().last().unwrap().text().to_string(), SOURCE);
+            match (observed, case) {
+                (PendingPairWasip1Occurrence::Bypass(seen), PairStartupOccurrence::Bypass(authored)) => {
+                    assert!(std::ptr::eq(*seen, authored));
+                }
+                (PendingPairWasip1Occurrence::Specialization { call, path, .. }, PairStartupOccurrence::Specialization(authored, route)) => {
+                    assert!(std::ptr::eq(*call, authored));
+                    assert!(std::ptr::eq(*path, route));
+                }
+                _ => panic!("initializer and result must keep the original case"),
+            }
+        }
+        let [(_, PendingPairWasip1Occurrence::Bypass(_)),
+            (_, PendingPairWasip1Occurrence::Specialization { value: one, .. }),
+            (_, PendingPairWasip1Occurrence::Specialization { value: again, .. }),
+            (_, PendingPairWasip1Occurrence::Specialization { value: other, .. })] = projected.as_slice()
+            else { panic!("same exact three reached slots") };
+        assert!(std::ptr::eq(*one, *again));
+        assert!(!std::ptr::eq(*one, *other));
+
+        let watch = project.join("watch.txt");
+        fs::write(&watch, b"changed input").unwrap();
+        assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals)
+            .err().unwrap().to_string().contains("inputs changed"));
+        fs::write(&watch, b"watched input").unwrap();
+        let manifest_file = project.join("wosy.toml");
+        let original_manifest = fs::read(&manifest_file).unwrap();
+        let changed_manifest = String::from_utf8(original_manifest.clone()).unwrap()
+            .replace("fixture-must-not-run", "other-configured-runner");
+        fs::write(&manifest_file, changed_manifest).unwrap();
+        assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals)
+            .err().unwrap().to_string().contains("configuration changed"));
+        fs::write(&manifest_file, original_manifest).unwrap();
+        assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals[..1]).is_err());
+        assert!(client.observe_staged_pending_pair_wasip1(&staging, limits,
+            &[(ok, b"34\n"), (ExitStatus::from_raw(7 << 8), b"not parsed")]).is_err());
+
         type ReadError = PendingPairWasip1ReadbackError;
         assert!(matches!(staging.read_stdout(&[(ok, b"34\n")]), Err(ReadError::TerminalCount { expected: 2, supplied: 1 })));
+        assert!(matches!(staging.read_stdout(&[(ok, b"34\n"), (ok, b"10\n"), (ok, b"99\n")]),
+            Err(ReadError::TerminalCount { expected: 2, supplied: 3 })));
         assert!(matches!(staging.read_stdout(&[(ok, b"34\n"), (ExitStatus::from_raw(7 << 8), b"not parsed")]),
             Err(ReadError::Evaluator { index: 1, error: ComptimeReadbackError::Exit(Some(7)) })));
         for (bytes, expected) in [
@@ -1077,14 +1124,13 @@ u32 different = solve(7, 13);
             assert!(matches!(staging.read_stdout(&[(ok, b"34\n"), (ok, bytes)]),
                 Err(ReadError::Evaluator { index: 1, error: ComptimeReadbackError::Output(actual) }) if actual == expected));
         }
-        drop(staging);
-        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 2);
 
         // A budget that admits the first slot but not both writes neither.
         let denied = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, first.bytes().len(),
             || trusted(&owner)).err().unwrap();
         assert!(denied.to_string().contains("exceeds byte budget"));
-        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 2);
 
         fs::write(&entry, SOURCE).unwrap();
         let stale = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total, || {
@@ -1096,6 +1142,8 @@ u32 different = solve(7, 13);
             trusted(&owner)
         }).unwrap();
         assert!(stale.is_none());
+        assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals).unwrap().is_none());
+        drop(staging);
         assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
         assert!(client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total,
             || panic!("do not call the owner for an already superseded attempt")).unwrap().is_none());

@@ -2,7 +2,7 @@
 use super::{
     analyze_scalar_build, audited_closed_eager_binary, audited_closed_unary, derive_block,
     emit_closed_evaluator, prepare_scalar_project, span_of,
-    ClosedComptimeFragment, ClosedComptimeRejection, ScalarBlock,
+    ClosedComptimeFragment, ClosedComptimeRejection, ComptimeStdoutError, ScalarBlock,
     ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs, ScalarTargetLayout,
     ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
@@ -459,6 +459,34 @@ pub struct BoundedStartupWasip1Evaluator {
     output_span: ByteSpan,
 }
 
+/// All-or-nothing typed interpretation of observed terminal stdout. This
+/// borrows the exact compiler plan; it carries no execution provenance.
+pub struct ObservedPairStartupWasip1<'plan> {
+    plan: &'plan BoundedPairStartupWasip1Output,
+    values: Vec<ScalarExpression>,
+}
+
+impl ObservedPairStartupWasip1<'_> {
+    pub fn plan(&self) -> &BoundedPairStartupWasip1Output { self.plan }
+
+    pub fn occurrences(&self) -> impl ExactSizeIterator<Item = (PairStartupOccurrence<'_>, Option<&ScalarExpression>)> {
+        self.plan.evidence.occurrences().map(|case| { let value = self.value(&case); (case, value) })
+    }
+
+    pub fn initializers(&self) -> impl ExactSizeIterator<Item = (CstNode, PairStartupOccurrence<'_>, Option<&ScalarExpression>)> {
+        let canonical = self.plan.ordinary_continuation().canonical;
+        self.plan.ordinary.initializers.iter().zip(self.occurrences())
+            .map(move |(node, (case, value))| (node.to_node(&canonical.root), case, value))
+    }
+
+    fn value(&self, case: &PairStartupOccurrence<'_>) -> Option<&ScalarExpression> {
+        match case {
+            PairStartupOccurrence::Specialization(call, _) => Some(&self.values[call.evaluator_index()]),
+            PairStartupOccurrence::Bypass(_) => None,
+        }
+    }
+}
+
 impl BoundedPairStartupWasip1Output {
     pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
     pub fn evaluators(&self) -> &[BoundedStartupWasip1Evaluator] { &self.evaluators }
@@ -466,6 +494,24 @@ impl BoundedPairStartupWasip1Output {
     pub fn max_stdout(&self) -> usize { self.max_stdout }
     /// Logical authored bytes, not a Rowan heap/RSS measurement.
     pub fn authored_source_bytes(&self) -> usize { self.ordinary.source_bytes }
+
+    /// Read exactly one bounded value per evaluator in compiler index order.
+    /// The caller only supplies terminal bytes; it cannot select their type,
+    /// target slot, CST occurrence, or claim that any executable ran.
+    pub fn observe_stdout<'plan, 'bytes, T, E>(
+        &'plan self, terminals: &'bytes [T],
+        terminal_bytes: impl Fn(usize, &'bytes T) -> Result<&'bytes [u8], E>,
+        count_error: impl FnOnce(usize, usize) -> E,
+        output_error: impl Fn(usize, ComptimeStdoutError) -> E,
+    ) -> Result<ObservedPairStartupWasip1<'plan>, E> {
+        let expected = self.evaluators.len();
+        let supplied = terminals.len();
+        if supplied != expected { return Err(count_error(expected, supplied)); }
+        let values = self.evaluators.iter().zip(terminals).enumerate().map(|(index, (evaluator, terminal))| {
+            evaluator.parse_stdout(terminal_bytes(index, terminal)?, self.max_stdout).map_err(|error| output_error(index, error))
+        }).collect::<Result<_, _>>()?;
+        Ok(ObservedPairStartupWasip1 { plan: self, values })
+    }
 
     pub fn ordinary_continuation(&self) -> PairOrdinaryContinuation<'_> {
         let canonical = CanonicalCstRoot::new(self.evidence.site().source.clone(),

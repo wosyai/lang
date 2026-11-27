@@ -6,7 +6,8 @@ use rusqlite::TransactionBehavior;
 use std::{collections::BTreeMap, path::Path};
 use wosy_compiler::PairStartupCallGraphEvidence;
 #[cfg(target_os = "linux")]
-use {crate::comptime_fragment::StagedPendingPairWasip1, wosy_compiler::BoundedPairStartupWasip1Output};
+use {crate::comptime_fragment::{PendingPairWasip1Readback, StagedPendingPairWasip1}, std::process::ExitStatus,
+    wosy_compiler::BoundedPairStartupWasip1Output};
 use wosy_project::{packages::{observe_local_comptime_inputs, ComptimeWatchLimits, LocalComptimeInputScope},
     ObservedClosedComptimeProfile};
 use wosy_protocol::{BaseCstProposalBinding, FileEntry, NodeId, SourceConfig};
@@ -77,6 +78,28 @@ impl SqliteSourceState {
                 binding: plan.binding, authored_cst: plan.authored_cst, profile: plan.profile, graph: plan.output.evidence(),
             }, plan.output)
         }), |observation, output| Ok(StagedPendingPairWasip1::create(observation, output, private_parent, max_ir_bytes)?))
+    }
+
+    /// Observe the supplied terminals only while the same attempt and inputs
+    /// remain current. A successful result is neither execution provenance
+    /// nor an immutable result root; no state is published.
+    #[cfg(target_os = "linux")]
+    pub fn observe_staged_pending_pair_wasip1<'stage>(
+        &mut self, staging: &'stage StagedPendingPairWasip1<'_>,
+        watch_limits: ComptimeWatchLimits, terminals: &[(ExitStatus, &[u8])],
+    ) -> Result<Option<PendingPairWasip1Readback<'stage>>> {
+        let original = staging.observation();
+        let binding = original.binding();
+        let profile = original.declarations().tools().profile();
+        self.use_pending_pair_comptime_inputs(binding, profile, watch_limits, || Some((
+            TrustedPreparedPairComptime { binding, authored_cst: original.authored_cst(), profile, graph: staging.plan().evidence() },
+            (),
+        )), |current, ()| {
+            if current.watches() != original.watches() {
+                return Err("local comptime inputs changed after evaluator staging".into());
+            }
+            Ok(staging.read_stdout(terminals)?)
+        })
     }
 
     /// Check the attempt before borrowing trusted facts, and again after
