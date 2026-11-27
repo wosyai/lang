@@ -6486,6 +6486,10 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) projected_place_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     #[cfg(feature = "internal-checker")]
+    pub(super) prepared_range_binary: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) prepared_range_literals: HashMap<OccurrenceOrdinal, BigInt>,
+    #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_literals: HashMap<OccurrenceOrdinal, bool>,
     #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_negations: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
@@ -6697,6 +6701,10 @@ impl OccurrenceStructure {
             value_fields: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_place_fields: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            prepared_range_binary: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            prepared_range_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             observed_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -8558,6 +8566,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool) => {
                         self.structure.observed_bool_literals.insert(ordinal, *value);
                     }
+                _ if self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type) => {
+                    if let Some(value) = super::checker_flow::concrete_integer_literal(expression) {
+                        self.structure.prepared_range_literals.insert(ordinal,value.into_owned());
+                    }
+                }
                 _ => {}
             }
         }
@@ -9416,6 +9429,16 @@ impl StructuralWalker<'_, '_> {
                     self.expression_at(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
                 #[cfg(feature = "internal-checker")]
                 if self.occurrence_typing.checker_directives_enabled() && matches!(self.mode, WalkMode::Callable(_)) {
+                    let checked = &self.structure.checked_types.expressions;
+                    if let (Some(lhs),Some(rhs),Some(output)) = (checked.get(&left),checked.get(&right),checked.get(&ordinal)) {
+                        if lhs == rhs && is_integer_type(lhs)
+                            && ((*output == ScalarType::Bool && super::symbolic_integer::IntegerRelation::from_operator(operator).is_some())
+                                || (output == lhs && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
+                                    | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)))
+                        {
+                            self.structure.prepared_range_binary.insert(ordinal, (left,operator.clone(),right));
+                        }
+                    }
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
                         && [left,right].iter().all(|value| self.structure.checked_types.expressions.get(value) == Some(&ScalarType::F32))
                         && super::symbolic_integer::IntegerRelation::from_operator(operator).is_some() {

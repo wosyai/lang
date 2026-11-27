@@ -21,6 +21,8 @@ mod ranked;
 #[cfg(feature = "internal-checker")]
 mod ranked_float;
 #[cfg(feature = "internal-checker")]
+mod range_envelopes;
+#[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod ordered_float_prefix;
 #[cfg(feature = "internal-checker")]
@@ -456,7 +458,7 @@ trait OrderedRunEvidence: ActualIntegerObserver {
     type Symbolic<'a>: SymbolicRootProof where Self: 'a;
     type SymbolicReport: Default;
     const HAS_NAMED_ROOT: bool = false;
-    const IMMUTABLE_JOIN_REQUIREMENTS: bool = false;
+    const TYPED_LOCAL_REQUIREMENTS: bool = false;
 
     fn consume_mixed_startup(&mut self, _: MixedStartupTap) -> Result<MixedProofOrder, ProjectCheck> {
         Err(ProjectCheck::Unsupported)
@@ -503,7 +505,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
 
 #[cfg(feature = "internal-checker")]
 impl OrderedRunEvidence for ProofFreeOrderedEvidence {
-    const IMMUTABLE_JOIN_REQUIREMENTS: bool = true;
+    const TYPED_LOCAL_REQUIREMENTS: bool = true;
 
     type Symbolic<'a> = ProofFreeSymbolic;
     type SymbolicReport = ();
@@ -561,9 +563,9 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
     // The unbounded command keeps its ordinary initialization and ordered
     // failure walk. Only already-proved exact requirements leave the roster.
     let verified_joins = if scope == ScalarCheckerScope::CurrentPackage && matches!(policy, OrderedReachPolicy::Closed)
-        && E::IMMUTABLE_JOIN_REQUIREMENTS && !PASSIVE_MIXED_STARTUP && effects.contextual_proofs.entries.is_empty()
+        && E::TYPED_LOCAL_REQUIREMENTS && !PASSIVE_MIXED_STARTUP && effects.contextual_proofs.entries.is_empty()
     {
-        prove_immutable_join_roots(prepared, &mut authored_roots)?
+        prove_typed_local_roots(prepared, &mut authored_roots)?
     } else { Vec::new() };
     let (initialization, mut evidence) = if PASSIVE_MIXED_STARTUP {
         if !matches!(policy, OrderedReachPolicy::Closed) { return Err(ProjectCheck::Unsupported); }
@@ -11638,18 +11640,20 @@ fn integer_literal_join_bounds<'a>(body: &'a FunctionCallSites, root: Occurrence
 }
 
 #[cfg(feature = "internal-checker")]
-fn prove_immutable_join_roots(
+fn prove_typed_local_roots(
     owner: &PreparedCheckerProject,
     pending: &mut HashMap<usize, Vec<usize>>,
 ) -> Result<Vec<wosy_syntax::SourceSpan>, ProjectCheck> {
     let (project, calls) = owner.parts();
     let mut proven = Vec::new();
+    let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
     for (&module, items) in pending.iter_mut() {
         let source = &project.modules.get(module).ok_or(ProjectCheck::MissingRootOccurrences)?.source;
         let mut kept = Vec::with_capacity(items.len());
         for item in std::mem::take(items) {
             let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            if let Some(sites) = immutable_integer_join_requirements(body) {
+            if let Some(sites) = immutable_integer_join_requirements(body)
+                .or_else(|| envelopes.close_guarded_formals((module,item))) {
                 proven.extend(sites.into_iter().map(|span| wosy_syntax::SourceSpan::new(source.clone(), span)));
             } else {
                 kept.push(item);
@@ -11670,7 +11674,7 @@ fn plan_closed_authored_roots(
     let (project, calls) = owner.parts();
     let mut callable_roots = Vec::new();
     let mut mandatory_startup_scalars = Vec::new();
-    let proven_joins = if allow_startup_scalars { prove_immutable_join_roots(owner, &mut deferred)? } else { Vec::new() };
+    let proven_joins = if allow_startup_scalars { prove_typed_local_roots(owner, &mut deferred)? } else { Vec::new() };
     let mut needed = deferred.into_iter().flat_map(|(module,items)| items.into_iter().map(move |item| (module,item))).collect::<HashSet<_>>();
     if !needed.is_empty() {
         let callers = ordered_symbolic_callers(project, calls, root, None)?;
@@ -12246,6 +12250,16 @@ fn symbolic_history_call_target(
         || (output.ty != ScalarType::Unit && !(1..=2).contains(&signature.parameters.len()))
         || !signature.parameters.iter().all(|ty| is_integer_type(ty) || (output.ty == ScalarType::Unit && matches!(ty, ScalarType::F32 | ScalarType::F64)))
     { return None; }
+    authenticate_prepared_direct_edge(project,calls,module,body,site,signature)
+}
+
+#[cfg(feature = "internal-checker")]
+fn authenticate_prepared_direct_edge(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, module: usize,
+    body: &FunctionCallSites, site: OccurrenceOrdinal, signature: &CheckedCallSignature,
+) -> Option<PreparedCallable> {
+    let (owner,item) = *body.structure.checker_direct_targets.get(&site)?;
+    let [output] = signature.outputs.outputs.as_slice() else { return None; };
     let source = project.modules.get(owner)?;
     let caller_source = &project.modules.get(module)?.source;
     if source.source.project != caller_source.project || source.source.package != caller_source.package {
@@ -20155,6 +20169,70 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let offset = text.find(nested).unwrap() as u32;
                 let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
                 assert_eq!(trace.contains_return(&site), age == "0");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn typed_true_guard_imports_only_its_all_returning_branches_for_checked_formals() {
+        let app = source("src/main.w", "terrain-independent-true-guard-envelope");
+        let program = r#"%%start
+            i32() west = fn { -384 };
+            i32() east = fn { 480 };
+            i32() width = fn { 4 };
+            i32(i32,i32) less = fn(x,y) { if (x < y) { x } else { y } };
+            i32(i32,i32) greater = fn(x,y) { if (x > y) { x } else { y } };
+            i32(i32) low = fn(center) { greater(west()/12,center-2) };
+            i32(i32) high = fn(center) { less(east()/12-1,center+2) };
+            bool(i32,i32) creative = fn(x,z) { x>=0 && z>=0 && x<width() && z<width() };
+            bool(i32,i32,i32,i32,bool) resident = fn(x,z,cx,cz,adventure) {
+                if (adventure) { x>=low(cx) && x<=high(cx) && z>=low(cz) && z<=high(cz) } else { creative(x,z) }
+            };
+            unit(i32,i32,i32,i32,bool) refresh = fn(x,z,cx,cz,adventure) {
+                if (resident(x,z,cx,cz,adventure)) {
+                    core.require(x>=-32 && x<40 && z>=-32 && z<40, {.stdout="";.stderr="range";.code=1;.files=[];});
+                };
+            };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),Vec::new())],[],vec![app.clone()],
+                ScalarPreparationInputs { target_layout },ScalarCheckerScope::CurrentPackage,Vec::new(),
+            ).unwrap();
+            let owner = prepare(program).into_startup_authored_owner().unwrap();
+            let (project,calls) = owner.owner.parts();
+            let index = project.modules[0].items.iter().position(|item|
+                matches!(item, ScalarItem::Function(function) if function.name == "resident")).unwrap();
+            let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
+            let input = envelopes.true_formal_envelopes((0,index)).unwrap();
+            for slot in 0..2 {
+                let range = input[slot].as_ref().unwrap();
+                assert_eq!((range.low.clone(),range.high.clone()),(BigInt::from(-32),BigInt::from(39)));
+            }
+            assert_eq!(owner.proven_joins.len(),1);
+            assert_eq!(owner.proven_joins[0].range.start as usize,program.find("core.require").unwrap());
+            let (bounded, end, active) = owner.run(std::num::NonZeroUsize::MIN).unwrap();
+            assert!(active && end == StartupAuthoredCompletion::Exhausted && bounded.is_empty());
+            let all = prepare(program).run().unwrap();
+            assert!(all.active && all.directives == bounded);
+            for text in [
+                program.replace("else { creative(x,z) }","else { true }"),
+                program.replace("if (resident(x,z,cx,cz,adventure))","if (!resident(x,z,cx,cz,adventure))"),
+                program.replace("i32() west = fn { -384 }","i32() west = fn { -396 }"),
+            ] {
+                match prepare(&text).into_startup_authored_owner() {
+                    Ok(owner) => {
+                        assert!(owner.proven_joins.is_empty());
+                        match owner.run(std::num::NonZeroUsize::MIN) {
+                            Ok((failures,_,_)) => assert!(!failures.is_empty()),
+                            Err(ScalarOrderedCheckerOutcome::Unsupported) => {}
+                            Err(other) => panic!("unexpected witness outcome: {other:?}"),
+                        }
+                    }
+                    Err(ScalarOrderedCheckerOutcome::Unsupported) => {}
+                    Err(other) => panic!("unexpected admission outcome: {other:?}"),
+                }
             }
         }
     }
