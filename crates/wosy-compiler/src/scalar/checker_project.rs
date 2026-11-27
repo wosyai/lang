@@ -11524,26 +11524,133 @@ impl PreparedScalarOrderedCheck {
         let (potential_obligations, deferred) =
             package_obligation_roots(&owner, self.scope, startup_count, root).map_err(configured_ordered_error)?;
         let empty_root = (!potential_obligations).then(|| root.clone());
-        let (callable_roots, mandatory_startup_scalars) = if self.scope == ScalarCheckerScope::CurrentPackage {
+        let (callable_roots, mandatory_startup_scalars, proven_joins) = if self.scope == ScalarCheckerScope::CurrentPackage {
             plan_closed_authored_roots(&owner, root, startup_count, &ordinals, deferred, true).map_err(configured_ordered_error)?
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
-        Ok(PreparedStartupAuthoredCheck { owner, empty_root, callable_roots,
+        Ok(PreparedStartupAuthoredCheck { owner, empty_root, callable_roots, proven_joins,
             mandatory_startup_scalars: mandatory_startup_scalars.into_iter().map(|(item, _)| (0, item)).collect() })
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn immutable_integer_join_requirements(body: &FunctionCallSites) -> Option<Vec<ByteSpan>> {
+    // A literal join can prove an obligation for every reaching execution
+    // without deciding which conditions return or what they do elsewhere.
+    // This certificate is all-or-nothing per owner; unmatched requirements
+    // and narrowings continue through the ordinary path search.
+    use super::reference::{CheckerOrdinaryBoolean, CheckerOrdinaryScalarLocalKind, DirectDestinationIdentity, NamedPlaceRootIdentity};
+    use super::symbolic_integer::IntegerRelation;
+    let structure = &body.structure;
+    if !body.arms.is_empty() || structure.checker_directives.is_empty()
+        || structure.checker_directives.values().any(|directive| directive.operation != CheckerOperation::Require)
+    { return None; }
+    let root = structure.blocks.get(structure.root.0)?;
+    let mut altered_or_addressed = HashSet::new();
+    for occurrence in 0..body.occurrences.len() {
+        let at = OccurrenceOrdinal(occurrence);
+        if let Some(DirectDestinationIdentity::Existing(binding)) = body.prepared_direct_destination(at) {
+            altered_or_addressed.insert(binding);
+        }
+        if let Some(NamedPlaceRootIdentity::Lexical(binding)) = body.prepared_named_place_root(at) {
+            altered_or_addressed.insert(binding);
+        }
+    }
+    let unsafe_start = structure.blocks.iter().filter(|block| block.unsafe_context).map(|block| block.span.start).min();
+    let mut joins = HashMap::new();
+    let mut covered = Vec::new();
+    for item in &root.items {
+        match &item.kind {
+            BlockItemKind::Binding(region) => {
+                let Some(local) = structure.checker_ordinary_scalar_locals.get(&(structure.root,item.position)) else { continue; };
+                if !matches!(local.kind, CheckerOrdinaryScalarLocalKind::Conditional)
+                    || local.binding.kind != super::ReferenceBindingKind::Declared
+                    || altered_or_addressed.contains(&local.binding)
+                { continue; }
+                let ([receiver], BindingInitialization::Outputs(outputs)) =
+                    (region.receivers(), &region.initialization) else { continue; };
+                if receiver.span != local.binding.declaration_span || receiver.contextual_storage.is_some()
+                    || !is_integer_type(&receiver.ty) || !outputs.secondary.is_empty() || outputs.primary != local.source
+                { continue; }
+                if let Some((first,last)) = integer_literal_join_bounds(body, local.source, &receiver.ty) {
+                    joins.insert(&local.binding, (&receiver.ty,first,last));
+                }
+            }
+            BlockItemKind::Evaluation { expression } if structure.checker_directives.contains_key(expression) => {
+                let span = body.occurrences.get(expression.0)?.span;
+                if unsafe_start.is_some_and(|unsafe_start| unsafe_start < span.start) { return None; }
+                let predicate = structure.checker_ordinary_booleans.get(expression)?;
+                let mut pending = vec![predicate];
+                while let Some(predicate) = pending.pop() {
+                    match predicate {
+                        CheckerOrdinaryBoolean::And(operands) => pending.extend(operands.iter().rev()),
+                        CheckerOrdinaryBoolean::Integer(comparison) => {
+                            let (ty, first, last) = joins.get(&comparison.binding)?;
+                            if *ty != &comparison.ty
+                                || !IntegerRelation::from_operator(&comparison.operator)?.accepts_closed(first,last,&comparison.bound)
+                            { return None; }
+                        }
+                        _ => return None,
+                    }
+                }
+                covered.push(span);
+            }
+            _ => {}
+        }
+    }
+    (covered.len() == structure.checker_directives.len()).then_some(covered)
+}
+
+#[cfg(feature = "internal-checker")]
+fn integer_literal_join_bounds<'a>(body: &'a FunctionCallSites, root: OccurrenceOrdinal, ty: &ScalarType)
+    -> Option<(&'a BigInt, &'a BigInt)> {
+    let structure = &body.structure;
+    let mut pending = vec![root];
+    let mut bounds: Option<(&BigInt, &BigInt)> = None;
+    while let Some(at) = pending.pop() {
+        if structure.checked_types.expressions.get(&at)? != ty { return None; }
+        if let Some(value) = structure.checker_integer_literals.get(&at) {
+            if !super::typecheck::integer_literal_fits_type(value, ty) { return None; }
+            bounds = Some(bounds.map_or((value,value), |(lo,hi)| (std::cmp::min(lo,value),std::cmp::max(hi,value))));
+            continue;
+        }
+        let ConditionalRegion::Value { condition, then_block, else_block, resume, .. } = body.conditionals.get(&at)? else { return None; };
+        if *resume != at || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool { return None; }
+        for block in [else_block, then_block] {
+            let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None; };
+            let BlockItemKind::FinalOutput(slot) = item.kind else { return None; };
+            if slot.output != 0 { return None; }
+            pending.push(slot.expression);
+        }
+    }
+    bounds
 }
 
 #[cfg(feature = "internal-checker")]
 fn plan_closed_authored_roots(
     owner: &PreparedCheckerProject, root: &SourceIdentity, startup_count: usize,
     ordinals: &HashMap<&SourceIdentity, usize>, deferred: HashMap<usize, Vec<usize>>, allow_startup_scalars: bool,
-) -> Result<(Vec<PreparedCallable>, Vec<(usize, ByteSpan)>), ProjectCheck> {
+) -> Result<(Vec<PreparedCallable>, Vec<(usize, ByteSpan)>, Vec<wosy_syntax::SourceSpan>), ProjectCheck> {
     let (project, calls) = owner.parts();
     let mut callable_roots = Vec::new();
     let mut mandatory_startup_scalars = Vec::new();
-    let mut needed = deferred.into_iter().flat_map(|(module, items)|
-        items.into_iter().map(move |item| (module, item))).collect::<HashSet<_>>();
+    let mut proven_joins = Vec::new();
+    let mut needed = HashSet::new();
+    for (module, items) in deferred {
+        let source = &project.modules.get(module).ok_or(ProjectCheck::MissingRootOccurrences)?.source;
+        for item in items {
+            let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            if allow_startup_scalars {
+                if let Some(sites) = immutable_integer_join_requirements(body) {
+                    proven_joins.extend(sites.into_iter().map(|span| wosy_syntax::SourceSpan::new(source.clone(), span)));
+                    continue;
+                }
+            }
+            needed.insert((module,item));
+        }
+    }
+    proven_joins.sort_unstable_by(|a,b| a.source.path.cmp(&b.source.path).then_with(|| a.range.start.cmp(&b.range.start)));
     if !needed.is_empty() {
         let callers = ordered_symbolic_callers(project, calls, root, None)?;
         let mut pending = needed.iter().copied().collect::<Vec<_>>();
@@ -11593,7 +11700,7 @@ fn plan_closed_authored_roots(
             return Err(ProjectCheck::Unsupported);
         }
     }
-    Ok((callable_roots, mandatory_startup_scalars))
+    Ok((callable_roots, mandatory_startup_scalars, proven_joins))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11603,6 +11710,8 @@ pub struct PreparedStartupAuthoredCheck {
     empty_root: Option<SourceIdentity>,
     callable_roots: Vec<PreparedCallable>,
     mandatory_startup_scalars: Vec<PreparedCallable>,
+    // Sealed authored occurrences, not executed startup roots.
+    proven_joins: Vec<wosy_syntax::SourceSpan>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12330,7 +12439,10 @@ impl PreparedStartupAuthoredCheck {
         if let Some(root) = &self.empty_root {
             return Ok((Vec::new(), StartupAuthoredCompletion::Exhausted, failure_search::StartUpSearch::new(root, cap), false));
         }
-        run_startup_authored_path(&self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None, false, None)
+        let (failures, completion, search, active) = run_startup_authored_path(
+            &self.owner, Some(cap), &[], false, &self.callable_roots, Some(&self.mandatory_startup_scalars), None, false, None,
+        )?;
+        Ok((failures, completion, search, active || !self.proven_joins.is_empty()))
     }
 }
 
@@ -12591,7 +12703,7 @@ fn run_private_contextual_startup(
     }
     // Admission is limited to independent ordinary dormant owners; the
     // authenticated startup entry and contextual proof cohort stay separate.
-    let (callable_roots, _) = plan_closed_authored_roots(prepared, root, startup_count, &ordinals, roots, false)?;
+    let (callable_roots, _, _) = plan_closed_authored_roots(prepared, root, startup_count, &ordinals, roots, false)?;
     if callable_roots.contains(&entry)
         || callable_roots.iter().any(|candidate| effects.contextual_proofs.entries.contains_key(candidate))
     {
@@ -13345,7 +13457,7 @@ fn run_private_named_after_startup(
     // The exact incoming-edge census above already refused lexical uses
     // of named targets. This ordinary graph cannot depend on theorem
     // results, so an independent proof diagnostic never becomes a path.
-    let (callable_roots, _) =
+    let (callable_roots, _, _) =
         plan_closed_authored_roots(&owner.prepared, root, startup_count, &ordinals, authored_roots, false)?;
     let authored = if cap.is_some() { callable_roots.as_slice() } else { &[] };
     // Legacy dormant observers walk declaration order, not proof clause
@@ -20022,6 +20134,56 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let offset = text.find(nested).unwrap() as u32;
                 let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
                 assert_eq!(trace.contains_return(&site), age == "0");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn immutable_literal_joins_close_only_dominated_authored_requirements() {
+        let app = source("src/main.w", "authored-returning-join-envelope");
+        let program = r#"%%start
+            bool(i32) choose = fn(n) { n == 0 };
+            unit(i32) frame = fn(n) {
+                i32 ring_code = if (choose(n)) { 1 } else { 0 };
+                i32 view_code = if (choose(n)) { 1 } else { if (n > 10) { 2 } else { 0 } };
+                core.require(ring_code >= 0 && ring_code <= 1, {.stdout="";.stderr="ring";.code=11;.files=[];});
+                core.require(view_code >= 0 && view_code <= 2, {.stdout="";.stderr="view";.code=22;.files=[];});
+            };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            for cap in [std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MAX] {
+                let owner = prepare(program).into_startup_authored_owner().unwrap();
+                let spans = owner.proven_joins.iter().map(|span| span.range.start as usize).collect::<Vec<_>>();
+                let expected = program.match_indices("core.require").map(|(at,_)| at).collect::<Vec<_>>();
+                assert_eq!(spans, expected);
+                assert!(owner.callable_roots.is_empty());
+                let (failures, outcome, active) = owner.run(cap).unwrap();
+                assert!(failures.is_empty() && active && outcome == StartupAuthoredCompletion::Exhausted);
+            }
+            let negatives = [
+                program.replace("n > 10) { 2 }", "n > 10) { 3 }"),
+                program.replace("core.require(view_code", "view_code = 3; core.require(view_code"),
+                program.replace("core.require(view_code", r#"core.require(false, {.stdout="";.stderr="extra";.code=33;.files=[];}); core.require(view_code"#),
+            ];
+            for text in negatives {
+                let check = prepare(&text).into_startup_authored_owner();
+                match check {
+                    Ok(owner) => {
+                        assert!(owner.proven_joins.is_empty());
+                        match owner.run(std::num::NonZeroUsize::MIN) {
+                            Ok((failures,_,_)) => assert!(!failures.is_empty()),
+                            Err(ScalarOrderedCheckerOutcome::Unsupported) => {}
+                            Err(other) => panic!("unexpected check outcome: {other:?}"),
+                        }
+                    }
+                    Err(ScalarOrderedCheckerOutcome::Unsupported) => {}
+                    Err(other) => panic!("unexpected admission outcome: {other:?}"),
+                }
             }
         }
     }
