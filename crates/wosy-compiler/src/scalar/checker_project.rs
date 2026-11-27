@@ -1651,8 +1651,11 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
     if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
         actual.mixed_reached = Some(tap.captured.clone());
     }
+    #[cfg(feature = "internal-checker")]
+    let mut completed_passive = HashMap::new();
     let outcome = walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
-        project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures);
+        project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures,
+        #[cfg(feature = "internal-checker")] &mut completed_passive);
     #[cfg(feature = "internal-checker")]
     if outcome.is_ok() {
         if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
@@ -1665,14 +1668,18 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
         actual.observer)
 }
 
-fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
-    project: &ScalarProject,
-    calls: &ProjectCallSiteResults,
-    ordinals: &HashMap<&SourceIdentity, usize>,
+#[cfg(feature = "internal-checker")]
+type CompletedPassiveStorage<'a> = HashMap<usize, HashMap<ByteSpan, InitializerValue<'a>>>;
+
+fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
+    project: &'a ScalarProject,
+    calls: &'a ProjectCallSiteResults,
+    ordinals: &HashMap<&'a SourceIdentity, usize>,
     visits: &mut [InitializationVisit],
-    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    actual: &mut CheckedCalls<'a, impl ActualIntegerObserver>,
     source: &SourceIdentity,
     failures: &mut Option<&mut OrderedFailures>,
+    #[cfg(feature = "internal-checker")] completed_passive: &mut CompletedPassiveStorage<'a>,
 ) -> Result<StartupLane, ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
     match visits[ordinal] {
@@ -1710,7 +1717,10 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             #[cfg(not(feature = "internal-checker"))]
             let _ = binding_span;
-            if walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(project, calls, ordinals, visits, actual, target, failures)? == StartupLane::Empty {
+            if walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
+                project, calls, ordinals, visits, actual, target, failures,
+                #[cfg(feature = "internal-checker")] completed_passive,
+            )? == StartupLane::Empty {
                 return Ok(StartupLane::Empty);
             }
             continue;
@@ -1757,9 +1767,28 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     (ScalarType::Bool, ScalarExpression::Boolean { .. })
                     | (ScalarType::Char, ScalarExpression::Char { .. })));
             #[cfg(feature = "internal-checker")]
-            if !passive_literal && !passive_scalar { passive_generation = generation + 1; }
+            let passive_return = passive_receiver.and_then(|receiver| {
+                if !actual.permits_authored_startup_scalars() || !matches!(receiver.ty, ScalarType::Struct(_))
+                    || !matches!(&binding.value, ScalarExpression::Call { receiver: Some(_), arguments, .. } if arguments.is_empty())
+                { return None; }
+                let effects = failures.as_deref_mut()?;
+                if !effects.contextual_proofs.entries.is_empty() || effects.mixed_startup.is_some()
+                    || effects.startup_search.as_ref().is_some_and(|trace| !trace.borrow().proof_free_scalar_initializers)
+                { return None; }
+                actual.passive_qualified_nominal_return(
+                    topology, source, outputs.primary, &receiver.ty, visits, ordinals, completed_passive,
+                    &mut effects.passive_literal_work,
+                )
+            });
             #[cfg(feature = "internal-checker")]
-            if startup_trace_requested(failures) && !passive_literal
+            if !passive_literal && !passive_scalar && passive_return.is_none() {
+                passive_generation = generation + 1;
+                // Namespace completion alone does not guarantee a value is
+                // unchanged across a later executable initializer.
+                completed_passive.clear();
+            }
+            #[cfg(feature = "internal-checker")]
+            if startup_trace_requested(failures) && !passive_literal && passive_return.is_none()
                 && passive_float.is_none() && passive_integer.is_none() && passive_enum.is_none()
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
@@ -1824,11 +1853,25 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     InitializerValue::PassiveFloat { _atom: passive_float.ok_or(ProjectCheck::Unsupported)? }
                 },
                 #[cfg(feature = "internal-checker")]
+                (ty, _) if passive_return.is_some() => {
+                    let (target, value, depth) = passive_return.ok_or(ProjectCheck::Unsupported)?;
+                    if let Some(trace) = failures.as_deref().and_then(|effects| effects.startup_search.as_ref()) {
+                        let span = topology.occurrences.get(outputs.primary.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+                        let site = wosy_syntax::SourceSpan::new(source.clone(), span);
+                        let mut trace = trace.borrow_mut();
+                        trace.append(failure_search::PathStep::Call(site.clone())).ok_or(ProjectCheck::Unsupported)?;
+                        trace.append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
+                    }
+                    actual.note_reached(target);
+                    InitializerValue::PassiveAggregate { ty, generation: passive_generation, depth, value }
+                },
+                #[cfg(feature = "internal-checker")]
                 (ty, expression) if passive_literal => {
                     let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
                     let mut preparation = PassiveLiteralPreparation {
-                        topology, project, ordinals, work: &mut effects.passive_literal_work,
-                        copies: Some((&storage, passive_generation)), maximum_depth: 0,
+                        occurrences: &topology.occurrences, structure: &topology.structure,
+                        project, ordinals, work: &mut effects.passive_literal_work, maximum_depth: 0,
+                        copies: Some(PassiveCopySource::Current { topology, storage: &storage, generation: passive_generation }),
                     };
                     let value = preparation.node(outputs.primary, ty, expression, 0).ok_or(ProjectCheck::Unsupported)?;
                     let value = match value {
@@ -1950,12 +1993,24 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 return Err(ProjectCheck::Unsupported);
             };
         #[cfg(feature = "internal-checker")]
-        { passive_generation = generation + 1; }
+        {
+            passive_generation = generation + 1;
+            completed_passive.clear();
+        }
         if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(topology, actual, source, &storage, *expression, 0, failures, visits)? == StartupLane::Empty {
             return Ok(StartupLane::Empty);
         }
     }
     visits[ordinal] = InitializationVisit::Completed;
+    #[cfg(feature = "internal-checker")]
+    if COLLECT {
+        // Only nominal values of the most recent independently proven
+        // passive segment are useful to a qualified nominal initializer.
+        storage.retain(|_, value| matches!(value, InitializerValue::PassiveAggregate {
+            ty: ScalarType::Struct(_), generation, ..
+        } if *generation == passive_generation));
+        if !storage.is_empty() { completed_passive.insert(ordinal, storage); }
+    }
     Ok(StartupLane::Feasible)
 }
 
@@ -2481,47 +2536,85 @@ enum PassiveLiteral<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+enum PassiveCopySource<'a, 'w> {
+    Current {
+        topology: &'w ModuleInitializationTopology,
+        storage: &'w HashMap<ByteSpan, InitializerValue<'a>>,
+        generation: usize,
+    },
+    Completed {
+        body: &'w FunctionCallSites,
+        owner: &'w SourceIdentity,
+        storage: &'w HashMap<ByteSpan, InitializerValue<'a>>,
+    },
+}
+
+#[cfg(feature = "internal-checker")]
 struct PassiveLiteralPreparation<'a, 'w> {
-    topology: &'w ModuleInitializationTopology,
+    occurrences: &'w [super::reference::OccurrenceMetadata],
+    structure: &'w OccurrenceStructure,
     project: &'a ScalarProject,
     ordinals: &'w HashMap<&'a SourceIdentity, usize>,
     work: &'w mut usize,
-    copies: Option<(&'w HashMap<ByteSpan, InitializerValue<'a>>, usize)>,
+    copies: Option<PassiveCopySource<'a, 'w>>,
     maximum_depth: usize,
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> PassiveLiteralPreparation<'a, '_> {
+    fn copy_type(&self, ty: &ScalarType) -> bool {
+        super::copy_policy_with(ty, &std::collections::BTreeSet::new(),
+            &mut |id| {
+                let owner = self.project.modules.get(*self.ordinals.get(&id.source)?)?;
+                owner.structs.get(id.index).filter(|declared| declared.id == *id)
+                    .map(|declared| declared.copy_policy)
+            }, &mut |id| {
+                let owner = self.project.modules.get(*self.ordinals.get(&id.source)?)?;
+                owner.enums.get(id.index).filter(|declared| declared.id == *id)
+                    .map(|declared| declared.copy_policy)
+            }) == Ok(super::CopyPolicy::Copy)
+    }
+
     fn node(
         &mut self, at: OccurrenceOrdinal, ty: &'a ScalarType, expression: &ScalarExpression, depth: usize,
     ) -> Option<PassiveLiteral<'a>> {
         use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
         use super::analysis_budget::charge_call_work;
         const MAX_DEPTH: usize = 16;
-        if depth > MAX_DEPTH || self.topology.occurrences.get(at.0)?.span != super::typecheck::expression_span(expression) {
+        if depth > MAX_DEPTH || self.occurrences.get(at.0)?.span != super::typecheck::expression_span(expression) {
             return None;
         }
         charge_call_work(self.work, 1)?;
-        let typed = self.topology.structure.checked_types.expressions.get(&at)?;
+        let typed = self.structure.checked_types.expressions.get(&at)?;
         self.maximum_depth = self.maximum_depth.max(depth);
         if matches!(expression, ScalarExpression::Name { .. })
             && matches!(ty, ScalarType::Array { .. } | ScalarType::Struct(_))
         {
-            let (storage, current_generation) = self.copies?;
-            let InitializationName::Storage(InitializationStorage::Module(span)) =
-                self.topology.identities.names.get(&at)? else { return None; };
+            let (value, current_generation) = match self.copies.as_ref()? {
+                PassiveCopySource::Current { topology, storage, generation } => {
+                    let InitializationName::Storage(InitializationStorage::Module(span)) =
+                        topology.identities.names.get(&at)? else { return None; };
+                    (storage.get(span)?, Some(*generation))
+                }
+                PassiveCopySource::Completed { body, owner, storage } => {
+                    let super::reference::PlainNameIdentity::ModuleValue(span) =
+                        body.prepared_plain_name(at)? else { return None; };
+                    if &span.source != *owner { return None; }
+                    (storage.get(&span.range)?, None)
+                }
+            };
             let InitializerValue::PassiveAggregate { ty: original, generation, value, depth: source_depth } =
-                storage.get(span)? else { return None; };
+                value else { return None; };
             let expanded_depth = depth.checked_add(*source_depth)?;
-            if *generation != current_generation || expanded_depth > MAX_DEPTH
+            if current_generation.is_some_and(|live| *generation != live) || expanded_depth > MAX_DEPTH
                 || !passive_type_equal(ty, original, MAX_DEPTH - depth)
-                || !passive_type_equal(ty, typed, MAX_DEPTH - depth)
+                || !passive_type_equal(ty, typed, MAX_DEPTH - depth) || !self.copy_type(ty)
             { return None; }
             self.maximum_depth = self.maximum_depth.max(expanded_depth);
             return Some(PassiveLiteral::Copy(std::rc::Rc::clone(value)));
         }
         let child = |edge| {
-            let OccurrenceNode::Expression(at) = *self.topology.structure.edges.get(&(
+            let OccurrenceNode::Expression(at) = *self.structure.edges.get(&(
                 OccurrenceParent::Expression(at), edge,
             ))? else { return None; };
             Some(at)
@@ -2547,13 +2640,12 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
             {
                 let owner = self.project.modules.get(*self.ordinals.get(&id.source)?)?;
                 let declared = owner.structs.get(id.index).filter(|item| item.id == *id)?;
-                if declared.copy_policy != super::CopyPolicy::Copy || fields.is_empty()
-                    || fields.len() != declared.fields.len()
+                if fields.is_empty() || fields.len() != declared.fields.len()
                 { return None; }
                 let mut values: Vec<_> = std::iter::repeat_with(|| None).take(fields.len()).collect();
                 for (position, field) in fields.iter().enumerate() {
                     let node = child(OccurrenceEdge::AggregateField(position))?;
-                    let field_id = self.topology.structure.literal_fields.get(&node)?;
+                    let field_id = self.structure.literal_fields.get(&node)?;
                     let declaration = declared.fields.get(field_id.index)?;
                     if declaration.id != *field_id || field_id.structure != *id || field.name != declaration.name {
                         return None;
@@ -3445,6 +3537,59 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let &target = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
         self.validated_prepared_body(target, target_source, target_span)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn passive_qualified_nominal_return(
+        &self, topology: &ModuleInitializationTopology, caller: &SourceIdentity, call: OccurrenceOrdinal,
+        expected: &'project ScalarType, visits: &[InitializationVisit],
+        ordinals: &HashMap<&'project SourceIdentity, usize>, captured: &CompletedPassiveStorage<'project>,
+        work: &mut usize,
+    ) -> Option<(PreparedCallable, Rc<PassiveLiteral<'project>>, usize)> {
+        use super::reference::PlainNameIdentity;
+        let signature = topology.checked_call_signatures.get(&call)?;
+        if !ACTUAL_STARTUP || !signature.parameters.is_empty()
+            || !matches!(signature.outputs.outputs.as_slice(), [result] if &result.ty == expected)
+        { return None; }
+        let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration } =
+            topology.call_targets.get(&call)? else { return None; };
+        let (target, owner, function, body) =
+            self.validated_direct_body(&topology.structure, call, &declaration.source, declaration.range).ok()?;
+        if caller == &owner.source || !completed_namespace_owner(caller, &owner.source, target.0, Some(visits))
+            || body.contextual_formal().is_some() || function.body.unsafe_context || !body.boundary.parameters.is_empty()
+            || !matches!(body.boundary.results.as_slice(), [result] if &result.ty == expected)
+        { return None; }
+        let [ScalarBlockItem::LocalBinding(local), ScalarBlockItem::Expression(tail)] =
+            function.body.items.as_slice() else { return None; };
+        let [output] = function.body.final_output_values.as_slice() else { return None; };
+        if local.is_allocation || !matches!(&local.value, ScalarExpression::StructLiteral { .. })
+            || !matches!(tail, ScalarExpression::Name { .. })
+            || super::typecheck::expression_span(tail) != super::typecheck::expression_span(&output.value)
+        { return None; }
+        let root = body.structure.blocks.get(body.structure.root.0)?;
+        let [binding, result] = root.items.as_slice() else { return None; };
+        let BlockItemKind::Binding(checked) = &binding.kind else { return None; };
+        let BlockItemKind::FinalOutput(result) = &result.kind else { return None; };
+        let BindingInitialization::Outputs(outputs) = &checked.initialization else { return None; };
+        let [receiver] = checked.receivers() else { return None; };
+        let PlainNameIdentity::Lexical(returned) = body.prepared_plain_name(result.expression)? else { return None; };
+        if &receiver.ty != expected || receiver.contextual_storage.is_some() || !outputs.secondary.is_empty()
+            || returned.source != owner.source || returned.function_span != function.span
+            || returned.declaration_span != receiver.span || returned.block_span != function.body.span
+            || returned.kind != super::ReferenceBindingKind::Declared
+            || body.structure.checked_types.expressions.get(&result.expression)? != expected
+            || !matches!(output.value, ScalarExpression::Name { .. })
+            || body.occurrences.get(result.expression.0)?.span != super::typecheck::expression_span(&output.value)
+        { return None; }
+        let storage = captured.get(&target.0)?;
+        let mut preparation = PassiveLiteralPreparation {
+            occurrences: &body.occurrences, structure: &body.structure, project: self.project,
+            ordinals, work, maximum_depth: 0,
+            copies: Some(PassiveCopySource::Completed { body, owner: &owner.source, storage }),
+        };
+        if !preparation.copy_type(expected) { return None; }
+        let value = preparation.node(outputs.primary, expected, &local.value, 0)?;
+        Some((target, Rc::new(value), preparation.maximum_depth))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -18647,6 +18792,63 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn passive_nominal_startup_distinguishes_fresh_construction_copy_and_qualified_return() {
+        use std::num::NonZeroUsize;
+        let app = source("src/main.w", "passive-nominal-startup-root");
+        let lib = source("src/lib.w", "passive-nominal-startup-lib");
+        let provider = r#"%%start
+            struct copy Part { f32 x; }
+            struct copy Frame { Part home; Part backup; }
+            Part home={.x=1.0;};
+            Part backup={.x=2.0;};
+            Frame() make=fn {
+                Frame selected={.home=home;.backup=backup;};
+                selected
+            };
+        %%end"#;
+        let root = |middle: &str, body: &str| format!(r#"%%start
+            map = namespace demo "src/lib.w";
+            {middle}
+            {body}
+            core.require(true,{OUTPUT});
+        %%end"#);
+        let fresh = "struct Pose { f32 x; } Pose pov={.x=1.0;};";
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, capped: bool| {
+                let start = text.find("map =").unwrap();
+                let end = start + text[start..].find(';').unwrap() + 1;
+                let binding = ScalarNamespaceBinding {
+                    binding: "map".into(), target: lib.clone(), span: ByteSpan::new(start as u32, end as u32),
+                };
+                let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, text), vec![binding]), (declarations(&lib, provider), Vec::new())],
+                    [], vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout },
+                    ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap_or_else(|error| panic!("nominal startup fixture preparation: {error:?}"));
+                if capped { prepared.run_private_authored_root(NonZeroUsize::MIN).map(|(report, _)| report) }
+                else { prepared.run() }
+            };
+            for capped in [true, false] {
+                for program in [
+                    root(fresh, ""),
+                    root("bool inert=true;", "map.Frame frame=map.make();"),
+                ] {
+                    let valid = run(&program, capped)
+                        .unwrap_or_else(|error| panic!("nominal value {target_layout:?} capped={capped}: {error:?}\n{program}"));
+                    assert!(valid.active && valid.directives.is_empty());
+                }
+                for program in [
+                    root(fresh, "Pose moved=pov;"),
+                    root(&format!("core.require(true,{OUTPUT});"), "map.Frame frame=map.make();"),
+                ] {
+                    assert!(matches!(run(&program, capped), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn prepared_passive_float_literals_keep_ieee_bits_and_checked_extent() {
         use ranked_float::Atom;
         let file = source("src/main.w", "typed-float-startup-bits");
@@ -18667,17 +18869,16 @@ mod tests {
             let BlockItemKind::Binding(checked) = &item.kind else { panic!("binding") };
             let BindingInitialization::Outputs(outputs) = &checked.initialization else { panic!("bound output") };
             let [slot] = checked.receivers() else { panic!("one slot") };
-            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
+            assert!(PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
                 .node(outputs.primary, &slot.ty, &binding.value, 17).is_none());
             let ScalarType::Array { element, length_span, span, .. } = &slot.ty else { panic!("array receiver") };
             let wrong_extent = ScalarType::Array {
                 element: element.clone(), length: 1, length_span: *length_span, span: *span,
             };
             let mut refused_work = 0;
-            assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut refused_work, copies: None, maximum_depth: 0 }
+            assert!(PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals, work: &mut refused_work, copies: None, maximum_depth: 0 }
                 .node(outputs.primary, &wrong_extent, &binding.value, 0).is_none());
-            let PassiveLiteral::Array(cells) = (PassiveLiteralPreparation {
-                topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0,
+            let PassiveLiteral::Array(cells) = (PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0,
             }).node(outputs.primary, &slot.ty, &binding.value, 0).unwrap() else { panic!("array") };
             values.push(cells);
         }
@@ -18711,7 +18912,7 @@ mod tests {
         let [slot] = checked.receivers() else { panic!("one slot") };
         let ordinals = HashMap::from([(&owner.source, 0)]);
         let mut work = 0;
-        let prepared = PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
+        let prepared = PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals, work: &mut work, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0).unwrap();
         let id = &owner.structs[0].id;
         assert_eq!(prepared, Array(Box::new([Array(Box::new([
@@ -18720,7 +18921,7 @@ mod tests {
         ]))])));
         assert_eq!(work, 8);
         let mut exhausted = super::super::analysis_budget::FORMER_TRANSFER_CEILING - 1;
-        assert_eq!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
+        assert_eq!(PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0), Some(prepared));
         assert_eq!(exhausted, super::super::analysis_budget::FORMER_TRANSFER_CEILING + 7);
     }
@@ -18824,12 +19025,12 @@ mod tests {
             let [slot] = checked.receivers() else { panic!("one slot") };
             if !values.is_empty() {
                 let mut refused_work = 0;
-                let mut wrong_generation = PassiveLiteralPreparation { topology, project, ordinals: &ordinals,
-                    work: &mut refused_work, copies: Some((&storage, 1)), maximum_depth: 0 };
+                let mut wrong_generation = PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals,
+                    work: &mut refused_work, copies: Some(PassiveCopySource::Current { topology, storage: &storage, generation: 1 }), maximum_depth: 0 };
                 assert!(wrong_generation.node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
             }
-            let mut preparation = PassiveLiteralPreparation { topology, project, ordinals: &ordinals,
-                work: &mut work, copies: Some((&storage, 0)), maximum_depth: 0 };
+            let mut preparation = PassiveLiteralPreparation { occurrences: &topology.occurrences, structure: &topology.structure, project, ordinals: &ordinals,
+                work: &mut work, copies: Some(PassiveCopySource::Current { topology, storage: &storage, generation: 0 }), maximum_depth: 0 };
             let value = std::rc::Rc::new(preparation.node(outputs.primary, &slot.ty, &binding.value, 0).unwrap());
             let depth = preparation.maximum_depth;
             storage.insert(slot.span, InitializerValue::PassiveAggregate { ty: &slot.ty, generation: 0, value: value.clone(), depth });
