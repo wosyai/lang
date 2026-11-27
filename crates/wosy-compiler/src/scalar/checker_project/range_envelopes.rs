@@ -63,7 +63,7 @@ impl Envelope {
 }
 
 pub(super) type Inputs = Vec<Option<Envelope>>;
-type Key = (PreparedCallable, Rc<Inputs>);
+type Key = (PreparedCallable, Rc<Inputs>, bool);
 type Lanes = Option<Rc<Inputs>>;
 
 // Constructed only from a prepared call occurrence and its dominating guards.
@@ -90,6 +90,7 @@ struct Frame<'a> {
     body: &'a FunctionCallSites,
     target: PreparedCallable,
     ids: &'a [ReferenceBindingId],
+    arrival: bool,
 }
 
 impl<'a> Frame<'a> {
@@ -143,7 +144,7 @@ impl<'a> PreparedEnvelopes<'a> {
                 || matches!(body.prepared_named_place_root(at),Some(NamedPlaceRootIdentity::Lexical(id)) if formals.contains(id))
             { return None; }
         }
-        Some(Frame { body,target,ids })
+        Some(Frame { body,target,ids,arrival:false })
     }
 
     fn frame(&self, target: PreparedCallable) -> Option<Frame<'a>> {
@@ -156,7 +157,7 @@ impl<'a> PreparedEnvelopes<'a> {
         { return None; }
         let ids = function.boundary.checker_parameter_bindings.as_deref()?;
         if ids.len() != function.boundary.parameters.len() { return None; }
-        Some(Frame { body: function, target, ids })
+        Some(Frame { body: function, target, ids, arrival:false })
     }
 
     fn min_max(&self, frame: Frame<'a>, condition: OccurrenceOrdinal, yes: OccurrenceOrdinal, no: OccurrenceOrdinal,
@@ -190,7 +191,7 @@ impl<'a> PreparedEnvelopes<'a> {
             Join(Need,&'a ScalarType),
             Arithmetic(&'a BinaryOperator,&'a ScalarType),
             Compare(Frame<'a>,OccurrenceOrdinal,OccurrenceOrdinal,&'a BinaryOperator,bool,Rc<Inputs>),
-            Args(PreparedCallable,Vec<Option<OccurrenceOrdinal>>,Frame<'a>,Need,Rc<Inputs>),
+            Args(PreparedCallable,Vec<Option<OccurrenceOrdinal>>,Frame<'a>,Need,Rc<Inputs>,&'a ScalarType),
             Record(Key,Need),
             Forward(Vec<Option<OccurrenceOrdinal>>,Frame<'a>,Rc<Inputs>),
         }
@@ -264,8 +265,20 @@ impl<'a> PreparedEnvelopes<'a> {
                             Restrict(frame,yes,needed),Visit(frame,condition,Need::Bool(true),input)]);
                         continue;
                     }
-                    let signature = frame.body.checked_call_signatures.get(&e)?;
-                    let child = super::authenticate_prepared_direct_edge(self.project,self.calls,frame.target.0,frame.body,e,signature)?;
+                    let child = frame.body.checked_call_signatures.get(&e).and_then(|signature| {
+                        let target = super::authenticate_prepared_direct_edge(self.project,self.calls,frame.target.0,frame.body,e,signature)?;
+                        Some((target,signature))
+                    });
+                    let Some((child,signature)) = child else {
+                        // Unknown typed values are an unconstrained range *on
+                        // arrival*. This is not a claim that a producing
+                        // expression executes, is pure, or returns normally.
+                        if frame.arrival && matches!(needed, Need::Int) {
+                            values.push(Int(Some(Envelope::whole(ty)?)));
+                            continue;
+                        }
+                        return None;
+                    };
                     let mut slots = Vec::with_capacity(signature.parameters.len());
                     for (slot,ty) in signature.parameters.iter().enumerate() {
                         let OccurrenceNode::Expression(argument) = st.edges.get(&(
@@ -273,12 +286,12 @@ impl<'a> PreparedEnvelopes<'a> {
                         ))? else { return None; };
                         if st.checked_types.expressions.get(argument)? != ty { return None; }
                         if is_integer_type(ty) { slots.push(Some(*argument)); }
-                        else if *ty == ScalarType::Bool && (frame.formal(*argument).is_some()
+                        else if *ty == ScalarType::Bool && (frame.arrival || frame.formal(*argument).is_some()
                             || st.observed_bool_literals.contains_key(argument)) {
                             slots.push(None);
                         } else { return None; }
                     }
-                    steps.push(Args(child,slots.clone(),frame,needed,Rc::clone(&input)));
+                    steps.push(Args(child,slots.clone(),frame,needed,Rc::clone(&input),ty));
                     steps.extend(slots.into_iter().rev().flatten().map(|arg| Visit(frame,arg,Need::Int,Rc::clone(&input))));
                 }
                 Restrict(frame,next,need) => {
@@ -312,10 +325,10 @@ impl<'a> PreparedEnvelopes<'a> {
                     }
                     values.push(Bool(viable.then_some(input)));
                 }
-                Args(target,slots,frame,needed,outer) => {
+                Args(target,slots,frame,needed,outer,ty) => {
                     let args = slots.iter().rev().map(|slot| if slot.is_some() { Some(Some(values.pop()?.bound()?)) } else { Some(None) })
                         .collect::<Option<Vec<_>>>()?.into_iter().rev().collect::<Vec<_>>();
-                    let key = (target,Rc::new(args));
+                    let key = (target,Rc::new(args),frame.arrival);
                     if matches!(needed,Need::Bool(_)) { steps.push(Forward(slots,frame,outer)); }
                     let cached = match needed {
                         Need::Int => self.integer.get(&key).cloned(),
@@ -326,11 +339,19 @@ impl<'a> PreparedEnvelopes<'a> {
                         values.push(known);
                         continue;
                     }
-                    if !active.insert(target) { return None; }
-                    let target = self.frame(target)?;
-                    let output = target.output(target.body.structure.root)?;
+                    let definition = (!active.contains(&target)).then(|| self.frame(target)).flatten()
+                        .and_then(|body| Some((body,body.output(body.body.structure.root)?)));
+                    let Some((mut definition,output)) = definition else {
+                        if frame.arrival && matches!(needed, Need::Int) {
+                            values.push(Int(Some(Envelope::whole(ty)?)));
+                            continue;
+                        }
+                        return None;
+                    };
+                    active.insert(target);
+                    definition.arrival = frame.arrival;
                     let local = Rc::clone(&key.1);
-                    steps.extend([Record(key,needed),Visit(target,output,needed,local)]);
+                    steps.extend([Record(key,needed),Visit(definition,output,needed,local)]);
                 }
                 Record(key,needed) => {
                     active.remove(&key.0);
@@ -446,7 +467,20 @@ impl<'a> PreparedEnvelopes<'a> {
     pub(super) fn direct_edge_envelopes(
         &mut self, owner: PreparedCallable, callee: PreparedCallable, input: &Inputs,
     ) -> Option<Vec<IncomingRangeEdge>> {
-        let frame = self.frame_without_formal_mutation(owner)?;
+        self.direct_edge_envelopes_with_unknown_places(owner,callee,input,false)
+    }
+
+    pub(super) fn direct_arrival_edge_envelopes(
+        &mut self, owner: PreparedCallable, callee: PreparedCallable, input: &Inputs,
+    ) -> Option<Vec<IncomingRangeEdge>> {
+        self.direct_edge_envelopes_with_unknown_places(owner,callee,input,true)
+    }
+
+    fn direct_edge_envelopes_with_unknown_places(
+        &mut self, owner: PreparedCallable, callee: PreparedCallable, input: &Inputs, arrival: bool,
+    ) -> Option<Vec<IncomingRangeEdge>> {
+        let mut frame = self.frame_without_formal_mutation(owner)?;
+        frame.arrival = arrival;
         if !contained(&initial_inputs(frame.body)?,input) { return None; }
         let parents = Self::parents(frame)?;
         let mut known = HashMap::from([(OccurrenceParent::Block(frame.body.structure.root),Some(Rc::new(input.clone())))]);
@@ -558,6 +592,39 @@ impl<'a> PreparedEnvelopes<'a> {
         (!edges.is_empty()).then_some(edges)
     }
 
+    /// Conditional on reaching a prepared occurrence, bound its typed
+    /// arguments with no claims about the caller's effects or any branch.
+    /// In particular, a local/current module value starts as its full type;
+    /// a pure max/min in that argument can still establish an outer bound.
+    pub(super) fn unconstrained_arrival_edges(&mut self, caller: PreparedCallable, callee: PreparedCallable)
+        -> Option<Vec<IncomingRangeEdge>> {
+        let body = self.calls.function_body(caller.0,caller.1,None)?;
+        let st = &body.structure;
+        let ids = body.boundary.checker_parameter_bindings.as_deref()?;
+        if ids.len() != body.boundary.parameters.len() || !body.arms.is_empty() || body.contextual_formal().is_some() {
+            return None;
+        }
+        let input = Rc::new(initial_inputs(body)?);
+        let frame = Frame { body,target:caller,ids,arrival:true };
+        let mut edges = Vec::new();
+        for call in &body.call_occurrences {
+            let site = call.ordinal;
+            if st.checker_direct_targets.get(&site) != Some(&callee) { continue; }
+            let signature = body.checked_call_signatures.get(&site)?;
+            if super::authenticate_prepared_direct_edge(self.project,self.calls,caller.0,body,site,signature)? != callee { return None; }
+            let values = signature.parameters.iter().enumerate().map(|(slot,ty)| {
+                let OccurrenceNode::Expression(argument) = st.edges.get(&(
+                    OccurrenceParent::Expression(site),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+                if st.checked_types.expressions.get(argument)? != ty { return None; }
+                if *ty == ScalarType::Bool { return Some(None); }
+                let value = self.evaluate(frame,*argument,Need::Int,Rc::clone(&input)).and_then(Answer::bound);
+                Some(Some(value.unwrap_or(Envelope::whole(ty)?)))
+            }).collect::<Option<Inputs>>()?;
+            edges.push(IncomingRangeEdge { caller,callee,site,inputs:Some(values) });
+        }
+        (!edges.is_empty()).then_some(edges)
+    }
+
     /// Ranges on a direct child edge of this activation only. Opaque effects
     /// elsewhere cannot be used to claim no indirect reentry or termination.
     pub(super) fn forward_incoming_edge(&mut self, incoming: &IncomingRangeEdge, callee: PreparedCallable)
@@ -586,7 +653,7 @@ impl<'a> PreparedEnvelopes<'a> {
         let block = body.structure.blocks.get(body.structure.root.0)?;
         if block.unsafe_context { return None; }
         let BlockItemKind::Evaluation { expression } = block.items.first()?.kind else { return None; };
-        self.requirement_accepts(Frame { body,target:edge.callee,ids },expression,input)?;
+        self.requirement_accepts(Frame { body,target:edge.callee,ids,arrival:false },expression,input)?;
         Some(body.occurrences.get(expression.0)?.span)
     }
 

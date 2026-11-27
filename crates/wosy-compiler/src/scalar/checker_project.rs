@@ -20349,6 +20349,125 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_streaming_routes_bound_original_retire_enter_and_refresh() {
+        use range_envelopes::{Envelope, PreparedEnvelopes};
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap());
+        let text = std::fs::read_to_string(path).unwrap();
+        let identity = source("src/engine.w","pinned-pocket-streaming");
+        let range = |low,high| Some(Envelope { low: BigInt::from(low), high: BigInt::from(high) });
+        let min = i32::MIN;
+        let max = i32::MAX;
+        let any = range(min,max);
+        let east = range(min,39);
+        let west = range(-32,max);
+        let world = range(-32,39);
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner = prepare_checker_project(vec![(declarations(&identity,&text),Vec::new())],
+                vec![identity.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = owner.parts();
+            let function = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let mut solver = PreparedEnvelopes::new(project,calls);
+            let publish = function("publish_chunk");
+            let chunk = function("rebuild_chunk");
+            let prove = |solver: &mut PreparedEnvelopes<'_>, edge: &range_envelopes::IncomingRangeEdge| {
+                assert_eq!(edge.inputs.as_ref().unwrap()[1..], [world.clone(),world.clone()]);
+                assert_eq!(solver.incoming_entry_requirement(edge).unwrap(), ByteSpan::new(41777,41933));
+            };
+            let sync = function("sync_terrain");
+            let rebuild = function("rebuild");
+            let retire = function("retire_terrain");
+            let retire_row = function("retire_terrain_row");
+            let enter = function("enter_terrain");
+            let enter_row = function("enter_terrain_row");
+            let mut retire_seeds = solver.unconstrained_arrival_edges(sync,retire).unwrap();
+            retire_seeds.extend(solver.unconstrained_arrival_edges(rebuild,retire).unwrap());
+            assert_eq!(retire_seeds.len(),3);
+            let mut dispatch = Vec::new();
+            for seed in &retire_seeds {
+                let inv = vec![west.clone(),west.clone(),east.clone(),east.clone(),any.clone(),any.clone(),None];
+                let (steps, row_edges) = solver.forward_inductive_edges(seed,&inv,retire_row).unwrap();
+                assert_eq!(steps.len(),1);
+                let [row] = row_edges.as_slice() else { panic!("one authored retire row"); };
+                let inv = vec![west.clone(),world.clone(),east.clone(),any.clone(),any.clone(),None];
+                let (steps, exits) = solver.forward_inductive_edges(row,&inv,publish).unwrap();
+                assert_eq!(steps.len(),1);
+                for exit in &exits { prove(&mut solver,exit); dispatch.push(exit.site); }
+            }
+            let entry_seeds = solver.unconstrained_arrival_edges(sync, enter).unwrap();
+            let [seed] = entry_seeds.as_slice() else { panic!("one real adventure entry"); };
+            let inv = vec![west.clone(),west.clone(),east.clone(),east.clone(),None,any.clone(),any.clone()];
+            let (steps, row_edges) = solver.forward_inductive_edges(seed,&inv,enter_row).unwrap();
+            assert_eq!(steps.len(),1);
+            let [row] = row_edges.as_slice() else { panic!("one authored enter row"); };
+            let inv = vec![west.clone(),world.clone(),east.clone(),None,any.clone(),any.clone()];
+            let (steps, chunk_edges) = solver.forward_inductive_edges(row,&inv,chunk).unwrap();
+            assert_eq!(steps.len(),1);
+            let [edge] = chunk_edges.as_slice() else { panic!("one authored terrain rebuild"); };
+            assert_eq!(edge.inputs.as_ref().unwrap(),&vec![world.clone(),world.clone()]);
+            let exits = solver.forward_incoming_edge(edge,publish).unwrap();
+            for exit in &exits { prove(&mut solver,exit); dispatch.push(exit.site); }
+            let refresh = function("refresh_visible_terrain");
+            let edges = solver.direct_arrival_edge_envelopes(refresh,chunk,&vec![any.clone(),any.clone()]).unwrap();
+            let [edge] = edges.as_slice() else { panic!("one authored refresh"); };
+            assert_eq!(edge.inputs.as_ref().unwrap(),&vec![world.clone(),world.clone()]);
+            let exits = solver.forward_incoming_edge(edge,publish).unwrap();
+            for exit in &exits { prove(&mut solver,exit); dispatch.push(exit.site); }
+            assert_eq!(dispatch.len(),5);
+            assert!(solver.close_guarded_formals(publish).is_none());
+            eprintln!("Pocket site bounds for retirement seeds, entry and refresh dispatch: {dispatch:?}");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn arrival_bounds_use_the_type_of_unknown_cells_without_adopting_initial_values() {
+        use range_envelopes::{Envelope, PreparedEnvelopes};
+        let identity = source("src/main.w","unknown-current-arrivals");
+        let program = r#"%%start
+            i32 current = 0;
+            bool enabled = true;
+            i32(i32,i32) lower = fn(a,b) { if(a>b){a}else{b} };
+            i32(i32,i32) upper = fn(a,b) { if(a<b){a}else{b} };
+            bool(i32,i32,bool) inside = fn(x, center, narrow) {
+                if(narrow){x>=lower(-32,center-2)&&x<=upper(39,center+2)}
+                else{x>=0&&x<4}
+            };
+            unit(i32) sink = fn(x) {
+                core.require(x>= -32&&x<40,{.stdout="";.stderr="range";.code=19;.files=[];});
+            };
+            unit() producer = fn { sink(upper(39,lower(-32,current))); sink(current); };
+            unit(i32) conditional_route = fn(x) { if(inside(x,current,enabled)){sink(x);}; };
+        %%end"#;
+        let wider = program.replace("else{x>=0&&x<4}", "else{true}");
+        let domain = vec![Some(Envelope { low:i32::MIN.into(), high:i32::MAX.into() })];
+        let bounded = vec![Some(Envelope { low:(-32).into(), high:39.into() })];
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (text, both_arms_bound) in [(program,true),(wider.as_str(),false)] {
+                let owner = prepare_checker_project(vec![(declarations(&identity,text), Vec::new())],
+                    vec![identity.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let (project,calls) = owner.parts();
+                let function = |name| (0,project.modules[0].items.iter().position(|item|
+                    matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+                let (sink,producer,conditional) = (function("sink"),function("producer"),function("conditional_route"));
+                let mut solver = PreparedEnvelopes::new(project,calls);
+                let entries = solver.unconstrained_arrival_edges(producer,sink).unwrap();
+                let [clamped, bare] = entries.as_slice() else { panic!("both call sites"); };
+                assert_eq!(clamped.inputs.as_ref().unwrap(),&bounded);
+                assert_eq!(bare.inputs.as_ref().unwrap(),&domain);
+                assert!(solver.incoming_entry_requirement(clamped).is_some());
+                assert!(solver.incoming_entry_requirement(bare).is_none());
+                let claimed = solver.direct_arrival_edge_envelopes(conditional,sink,&domain).unwrap();
+                let [guarded] = claimed.as_slice() else { panic!("one conditional call site"); };
+                assert_eq!(guarded.inputs.as_ref().unwrap(), if both_arms_bound { &bounded } else { &domain });
+                assert_eq!(solver.incoming_entry_requirement(guarded).is_some(),both_arms_bound);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn entry_requirement_covers_only_the_pinned_arrival_before_opaque_effects() {
         use range_envelopes::{Envelope, PreparedEnvelopes};
         let identity = source("src/main.w","incoming-prefix-authored");
