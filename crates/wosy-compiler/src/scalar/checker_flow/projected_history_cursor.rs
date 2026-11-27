@@ -191,7 +191,9 @@ pub(in super::super) fn drive_finite_history<'p>(
                     }).collect::<Option<Vec<_>>>()?;
                     if integer.next().is_some() || ids.len()!=signature.parameters.len() { return None; }
                     let row=&mut entry.0;
-                    let (None,trace,cost)=provider_call?(body,site,args,Rc::make_mut(row.storage.as_mut()?))?
+                    let node=row.callable_history;
+                    let ordered_prefix=|| histories.borrow().steps(node);
+                    let (None,trace,cost)=provider_call?(body,site,args,Rc::make_mut(row.storage.as_mut()?),Some(&ordered_prefix))?
                         else { return None; };
                     let mut tracker=histories.borrow_mut();
                     tracker.charge(cost.saturating_add(1))?;

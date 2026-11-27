@@ -636,6 +636,7 @@ pub(in super::super) enum ObservedStep {
     // Call and return bracket this exact nested trace. IDs are local to this
     // activation's canonical postorder trace table.
     Call { site: SourceSpan, nested: usize },
+    Entered { site: SourceSpan, nested: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

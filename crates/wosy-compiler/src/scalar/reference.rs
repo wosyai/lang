@@ -8468,6 +8468,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             #[cfg(feature = "internal-checker")]
             if self.structure.checker_ordinary_booleans.get(&ordinal)
                 .is_some_and(super::checker_flow::call_free_history_boolean)
+                || (matches!(self.mode,WalkMode::Callable(_)) && marker.operation==super::checker_directive::CheckerOperation::Require
+                    && output.state_files.is_empty() && !output.has_module_values
+                    && matches!(output.code_value,super::checker_directive::CheckerCode::Literal(_))
+                    && is_current_integer_projection_predicate(condition))
             {
                 // The ordinary checker has already type-checked this
                 // condition. Retain its real operand occurrences only in
@@ -12528,4 +12532,34 @@ fn build_function_reference_cfg(
     aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
     aggregate.read_formal_fields = builder.aggregate_facts.read_fields;
     (builder.cfg, errors, builder.proof_points, aggregate)
+}
+
+
+#[cfg(feature = "internal-checker")]
+fn is_current_integer_projection_predicate(root:&ScalarExpression)->bool {
+    let mut projected=false;
+    let mut pending=vec![root];
+    while let Some(node)=pending.pop() {
+        match node {
+            ScalarExpression::Boolean {..}|ScalarExpression::Integer {..}|ScalarExpression::Name {..}=>{}
+            ScalarExpression::Binary {operator,left,right,..} if matches!(operator,
+                BinaryOperator::And|BinaryOperator::Or|BinaryOperator::Equal|BinaryOperator::NotEqual
+                |BinaryOperator::Less|BinaryOperator::LessEqual|BinaryOperator::Greater|BinaryOperator::GreaterEqual
+                |BinaryOperator::Add|BinaryOperator::Subtract|BinaryOperator::Multiply|BinaryOperator::Divide|BinaryOperator::Remainder)=>
+                pending.extend([right.as_ref(),left.as_ref()]),
+            ScalarExpression::Unary {operator,operand,..} if matches!(operator,super::UnaryOperator::LogicalNot|super::UnaryOperator::Negate)=>
+                pending.push(operand),
+            ScalarExpression::IndexedRead {place,..}=>{
+                let mut cursor=place;
+                while let super::ScalarPlace::Index {base,index,..}=cursor {
+                    if !matches!(index.as_ref(),ScalarExpression::Integer {..}|ScalarExpression::Name {..}) { return false; }
+                    projected=true;
+                    cursor=base.as_ref();
+                }
+                if !matches!(cursor,super::ScalarPlace::Name {..}) { return false; }
+            }
+            _=>return false,
+        }
+    }
+    projected
 }

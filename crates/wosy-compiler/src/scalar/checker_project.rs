@@ -2273,6 +2273,11 @@ fn try_observed_projected_storage_call(
             }
         }
     }
+    let trace = failures.as_ref().and_then(|effects| effects.startup_search.clone());
+    let permits_capped_requirement = || trace.as_ref().is_some_and(|search| {
+        let search=search.borrow();
+        search.proof_free_scalar_initializers && search.remaining()==1 && !search.proof_only_continuation()
+    });
     // Keep existing authoring/reporting routes for this first storage cohort:
     // only an ordinary state update, not a second source of diagnostics.
     enum Event { Enter(PreparedCallable), Exit(PreparedCallable) }
@@ -2283,6 +2288,7 @@ fn try_observed_projected_storage_call(
     let mut observed_owners = HashMap::new();
     let mut provider_units = HashSet::new();
     let mut productive_ranges = HashMap::new();
+    let mut authored_units=HashSet::new();
     let mut getters = HashMap::new();
     let mut frontiers = HashMap::new();
     let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
@@ -2298,6 +2304,16 @@ fn try_observed_projected_storage_call(
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
                 observed_owners.insert(body as *const FunctionCallSites,node.0);
+                if node!=target && node.0==target.0 && permits_capped_requirement() && stateful_provider::supports_requirements(body) {
+                    let Some(rank)=stateful_provider::advancing_range_plan(body,node) else { return Ok(false); };
+                    productive_ranges.insert(node,rank);
+                    authored_units.insert(node);
+                    provider_units.insert(node);
+                    writes_or_reads_storage=true;
+                    visiting.remove(&node);
+                    complete.insert(node);
+                    continue;
+                }
                 if node.0!=target.0 && visits.get(node.0)==Some(&InitializationVisit::Completed) {
                     let padding=stateful_provider::advancing_range_plan(body,node).filter(|_|
                         stateful_provider::qualified_store_reachable(actual.project,actual.calls,node,visits,true));
@@ -2369,7 +2385,6 @@ fn try_observed_projected_storage_call(
     if visits.get(target.0) != Some(&InitializationVisit::Started) { return Err(ProjectCheck::Unsupported); }
     let work = std::cell::Cell::new(0);
     let observed = std::cell::Cell::new(false);
-    let trace = failures.as_ref().and_then(|effects| effects.startup_search.clone());
     if let Some(trace) = &trace {
         let search = trace.borrow();
         if !search.proof_free_scalar_initializers || search.proof_only_continuation() {
@@ -2431,7 +2446,7 @@ fn try_observed_projected_storage_call(
         work.set(prefix_work);
         if values.len() != plan.bindings.len() { return Err(ProjectCheck::Unsupported); }
         prefix.extend(plan.bindings.iter().zip(values).map(|(fact, value)| (&fact.slot, &fact.ty, value)));
-        prefix_history = evaluated;
+        prefix_history = evaluated.map(Rc::new);
     }
     // Scoped to this observed activation. Plan leaves never contain runtime
     // storage and are indexed by authenticated target identity and bits.
@@ -2449,8 +2464,39 @@ fn try_observed_projected_storage_call(
             id
         })
     };
+    let append_observed_history = |search:&mut failure_search::StartUpSearch,history:Vec<super::checker_flow::CallableHistoryStep>| {
+        use super::checker_flow::CallableHistoryStep;
+        use failure_search::PathStep;
+        search.append(PathStep::Call(span.clone()))?;
+        if let Some(steps) = &prefix_history { search.append(PathStep::ObservedPrefix(Rc::clone(steps)))?; }
+        for step in history {
+            let convert = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
+            let step = match step {
+                CallableHistoryStep::Branch(range, accepted) => PathStep::Branch { condition: convert(range), accepted },
+                CallableHistoryStep::Call(range) => PathStep::Call(convert(range)),
+                CallableHistoryStep::Return(range) => PathStep::Return(convert(range)),
+                CallableHistoryStep::MatchArm(range) => PathStep::MatchArm(convert(range)),
+                CallableHistoryStep::ObservedFloatTrace(id) => PathStep::ObservedPrefix(Rc::clone(math_traces.borrow().get(id)?)),
+                CallableHistoryStep::ProviderBranch(owner, range, accepted) => PathStep::Branch {
+                    condition: wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range), accepted,
+                },
+                CallableHistoryStep::ProviderCall(owner, range) => PathStep::Call(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
+                CallableHistoryStep::ProviderReturn(owner, range) => PathStep::Return(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
+                CallableHistoryStep::ProviderMatchArm(owner, range) => PathStep::MatchArm(
+                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
+            };
+            search.append(step)?;
+        }
+        Some(())
+    };
     let provider_dispatch = RefCell::new(stateful_provider::Dispatch::default());
-    let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage| {
+    let selected_requirement=std::cell::Cell::new(false);
+    let reached_requirement=std::cell::Cell::new(false);
+    let collect=RefCell::new(failures);
+    let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage,
+        history:Option<&dyn Fn()-> Option<Vec<super::checker_flow::CallableHistoryStep>>>| {
         let signature=body.checked_call_signatures.get(&site)?;
         let caller=*observed_owners.get(&(body as *const FunctionCallSites))?;
         let child=authenticate_prepared_direct_edge(actual.project,actual.calls,caller,body,site,signature)?;
@@ -2460,8 +2506,24 @@ fn try_observed_projected_storage_call(
             if !productive_ranges.contains_key(&child) || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
-        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
-            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,&read_array_atom)?;
+        let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
+        let (value,result,cost,failure)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
+            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom)?;
+        if let Some(failure)=failure {
+            use failure_search::{Admission,PathStep};
+            if !allow_failure || failure.target.0!=target.0 { return None; }
+            let body=body_of(failure.target)?;
+            let directive=body.structure.checker_directives.get(&failure.site)?;
+            let at=body.occurrences.get(failure.site.0)?.span;
+            let mut search=trace.as_ref()?.borrow_mut();
+            append_observed_history(&mut search,history?()?)?;
+            search.append(PathStep::ObservedPrefix(Rc::new(failure.history)))?;
+            if !matches!(search.admit(wosy_syntax::SourceSpan::new(source.clone(),at))?,Admission::SelectedAndStop)
+                || !search.cannot_continue() { return None; }
+            collect.borrow_mut().as_deref_mut()?.push(source,directive,at,IntegerInputs::closed(),Vec::new(),Vec::new());
+            selected_requirement.set(true);
+            return None;
+        }
         Some((value,result.map(&intern_trace),cost))
     };
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
@@ -2501,33 +2563,11 @@ fn try_observed_projected_storage_call(
         latest_math.borrow_mut().insert(child, (bits, value.clone(), trace));
         Some((value.clone(),trace,work))
     };
-    let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
-        use super::checker_flow::CallableHistoryStep;
+    let mut record_return = |history:Vec<super::checker_flow::CallableHistoryStep>| {
         use failure_search::PathStep;
-        let Some(trace) = &trace else { return Some(()); };
-        let mut search = trace.borrow_mut();
-        search.append(PathStep::Call(span.clone()))?;
-        if let Some(steps) = prefix_history.take() { search.append(PathStep::ObservedPrefix(Rc::new(steps)))?; }
-        for step in history {
-            let convert = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
-            let step = match step {
-                CallableHistoryStep::Branch(range, accepted) => PathStep::Branch { condition: convert(range), accepted },
-                CallableHistoryStep::Call(range) => PathStep::Call(convert(range)),
-                CallableHistoryStep::Return(range) => PathStep::Return(convert(range)),
-                CallableHistoryStep::MatchArm(range) => PathStep::MatchArm(convert(range)),
-                CallableHistoryStep::ObservedFloatTrace(id) => PathStep::ObservedPrefix(Rc::clone(math_traces.borrow().get(id)?)),
-                CallableHistoryStep::ProviderBranch(owner, range, accepted) => PathStep::Branch {
-                    condition: wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range), accepted,
-                },
-                CallableHistoryStep::ProviderCall(owner, range) => PathStep::Call(
-                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
-                CallableHistoryStep::ProviderReturn(owner, range) => PathStep::Return(
-                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
-                CallableHistoryStep::ProviderMatchArm(owner, range) => PathStep::MatchArm(
-                    wosy_syntax::SourceSpan::new(actual.project.modules.get(owner)?.source.clone(), range)),
-            };
-            search.append(step)?;
-        }
+        let Some(trace)=&trace else { return Some(()); };
+        let mut search=trace.borrow_mut();
+        append_observed_history(&mut search,history)?;
         search.append(PathStep::Return(span.clone()))
     };
     let scalar_getter = |body: &FunctionCallSites, site, storage: &super::checker_flow::ProjectedStorage| {
@@ -2536,10 +2576,12 @@ fn try_observed_projected_storage_call(
     let mut current = Rc::new(std::mem::take(storage));
     let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&provider_units), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
+    if selected_requirement.get() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
     }
     *storage = Rc::unwrap_or_clone(current);
+    actual.had_obligations |= reached_requirement.get();
     Ok(true)
 }
 
@@ -25353,6 +25395,90 @@ unit(u8) parent = fn(a) {
             assert_eq!(all.directives,capped);
             for site in [&next_mask,&pad_call,&next_pad,&zero_vertex] { assert!(trace.contains_return(site),"{site:?}"); }
             eprintln!("Orbital original pack_prepared/pad {target_layout:?}: mask5 selects 0 and 2 only, 7 sparse index writes; pad retains end and subsequent duplicate allocates 47");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_upload_reports_original_false_requirement_only_at_valid_cap() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        use super::stateful_provider::take_requirement_results as outcomes;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let range=fragment("unit(i32,i32) index_range=", "unit(i32,i32) static_partition=");
+        let moving=fragment("unit(i32) moving_partition=", "i32(i32,i32) pack_moving=");
+        let prepared=fragment("unit(i32,i32) pack_prepared=", "f32 r =");
+        let upload=fragment("unit(i32,i32) upload_actuators=", "unit(i32) publish_actuators=");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let text=format!(r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            {mesh}
+            i32 count=4097;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32 room_partial=0;
+            i32[5] motion_first=[4097,0,0,0,0];
+            i32[5] motion_size=[3,0,0,0,0];
+            i32[5] motion_base=[37,0,0,0,0];
+            i32[5] motion_unique=[0,0,0,0,0];
+            {pt}
+            {range}
+            {moving}
+            {prepared}
+            {upload}
+            unit() launch=fn {{
+                packing.start();
+                pt(1.125,-2.25,3.5,-4.5); pt(1.125,-2.25,3.5,-4.5); pt(9.125,-2.25,3.5,-4.5);
+                pack_prepared(1,0);
+                upload_actuators(1,0);
+            }};
+            launch();
+        %%end"#);
+        let passing=text.replace("4097","4098");
+        let app=source("src/main.w","pinned-orbital-original-upload-actual-parent");
+        let provider=source("src/indexed-pack.w","pinned-orbital-original-upload-provider");
+        let ns=r#"packing=namespace demo "indexed-pack.w";"#;
+        let start=text.find(ns).unwrap() as u32;
+        let at=text.find("core.require(").unwrap() as u32;
+        let end=text[at as usize..].find(");").unwrap() as u32+at+1;
+        let authored=SourceSpan::new(app.clone(),ByteSpan::new(at,end));
+        let upload_call="upload_actuators(1,0)";
+        let called=text.find(upload_call).unwrap() as u32;
+        let upload_call=SourceSpan::new(app.clone(),ByteSpan::new(called,called+upload_call.len() as u32));
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|input| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,input),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ByteSpan::new(start,start+ns.len() as u32),
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            outcomes();
+            let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(outcomes(),[(authored.clone(),false)]);
+            assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
+            assert!(active);
+            let [failure]=failures.as_slice() else { panic!("one original selected author requirement"); };
+            assert_eq!(failure.source,app);
+            assert_eq!(failure.directive,authored.range);
+            assert_eq!(failure.code(),&BigInt::from(73));
+            assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
+            assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
+            assert!(!trace.contains_return(&upload_call));
+
+            assert!(matches!(prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN),Err(ProjectCheck::Unsupported)));
+            assert_eq!(outcomes(),[(authored.clone(),true)]);
+            assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));
+            assert!(matches!(prepare(&text).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(prepare(&passing).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            eprintln!("Orbital original upload_actuators {target_layout:?}: false author emits literal 73 only when capped; true and all continue to unresolved host");
         }
     }
 

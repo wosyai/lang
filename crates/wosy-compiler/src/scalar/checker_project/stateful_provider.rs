@@ -40,6 +40,7 @@ struct Activation {
     slots: HashMap<ReferenceBindingId,ExactValue>,
     rank: Option<usize>,
     value_base: usize,
+    entered_at: Option<SourceSpan>,
 }
 
 enum Task {
@@ -52,6 +53,7 @@ enum Task {
     Write(Place,ExactValue),
     Binary(BinaryOperator),
     Not,
+    Requirement(OccurrenceOrdinal),
     Branch(OccurrenceOrdinal,BlockOrdinal,Option<BlockOrdinal>,Output),
     Short(OccurrenceOrdinal,bool,OccurrenceOrdinal),
     Call(OccurrenceOrdinal,usize),
@@ -89,7 +91,8 @@ fn direct_symbol<'a>(project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,
     let ScalarItem::Function(function)=project.modules.get(target.0)?.items.get(target.1)? else { return None; };
     let body=calls.function_body(target.0,target.1,None)?;
     if !function.generic_parameters.is_empty() || !body.arms.is_empty() || !body.callable_escapes.is_empty()
-        || body.contextual_formal().is_some() || !body.allocation_length_calls.is_empty() || has_callable_obligations(body)
+        || body.contextual_formal().is_some() || !body.allocation_length_calls.is_empty()
+        || (has_callable_obligations(body) && !supports_requirements(body))
         || body.structure.blocks.iter().any(|block| block.unsafe_context)
     { return None; }
     let [return_slot]=body.boundary.results.as_slice() else { return None; };
@@ -112,6 +115,61 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
+fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<OccurrenceOrdinal> {
+    let st=&body.structure;
+    let directive=st.checker_directives.get(&at)?;
+    if directive.operation!=CheckerOperation::Require || !directive.output.state_files.is_empty()
+        || directive.output.has_module_values || !matches!(directive.output.code_value,CheckerCode::Literal(_)) { return None; }
+    let OccurrenceNode::Expression(condition)=st.edges.get(&(OccurrenceParent::Expression(at),OccurrenceEdge::CallArgument(0)))?
+        else { return None; };
+    if st.checked_types.expressions.get(condition)?!=&ScalarType::Bool
+        || body.occurrences.get(condition.0)?.span!=directive.condition { return None; }
+    let mut indexed=false;
+    let mut pending=vec![*condition];
+    while let Some(at)=pending.pop() {
+        let ty=st.checked_types.expressions.get(&at)?;
+        if let Some(cut)=body.short_circuits.get(&at) {
+            if *ty!=ScalarType::Bool { return None; }
+            pending.extend([cut.right,cut.left]);
+        } else if let Some((left,_,right))=st.prepared_range_binary.get(&at) {
+            if !matches!(ty,ScalarType::Bool|ScalarType::I32) { return None; }
+            pending.extend([*right,*left]);
+        } else if let Some(leaf)=st.observed_bool_negations.get(&at) {
+            if *ty!=ScalarType::Bool { return None; }
+            pending.push(*leaf);
+        } else if st.prepared_range_literals.contains_key(&at) || st.observed_bool_literals.contains_key(&at)
+            || matches!(body.prepared_plain_name(at),Some(PlainNameIdentity::Lexical(_) | PlainNameIdentity::ModuleValue(_))) {
+            if !matches!(ty,ScalarType::Bool|ScalarType::I32) { return None; }
+        } else if let Some(OccurrenceNode::Place(place))=st.edges.get(&(OccurrenceParent::Expression(at),OccurrenceEdge::ExpressionPlace)) {
+            if *ty!=ScalarType::I32 { return None; }
+            observed_f32_array::typed_place(body,*place,&ScalarType::I32)?;
+            indexed=true;
+        } else { return None; }
+    }
+    indexed.then_some(*condition)
+}
+
+pub(super) fn supports_requirements(body:&FunctionCallSites) -> bool {
+    body.checker_returns_unit() && body.arms.is_empty() && !body.structure.checker_directives.is_empty()
+        && body.structure.checker_directives.keys().all(|&site| requirement_condition(body,site).is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    static REQUIREMENT_RESULTS: RefCell<Vec<(SourceSpan,bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn take_requirement_results() -> Vec<(SourceSpan,bool)> {
+    REQUIREMENT_RESULTS.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+pub(super) struct SelectedRequirement {
+    pub(super) target:PreparedCallable,
+    pub(super) site:OccurrenceOrdinal,
+    pub(super) history:ObservedTrace,
+}
+
 #[derive(Clone,Copy)]
 enum RangeBound { Formal(usize), Literal(i32) }
 
@@ -123,7 +181,7 @@ pub(super) struct RangeRank { begin:usize, finish:RangeBound }
 pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallable) -> Option<RangeRank> {
     let st=&body.structure;
     let ids=body.boundary.checker_parameter_bindings.as_deref()?;
-    if !body.checker_returns_unit() || ids.len()!=2 || has_callable_obligations(body)
+    if !body.checker_returns_unit() || ids.len()!=2 || (has_callable_obligations(body) && !supports_requirements(body))
         || !body.boundary.parameters.iter().all(|p| p.ty==ScalarType::I32) { return None; }
     let mut sites=st.checker_direct_targets.iter().filter_map(|(&site,&child)| (child==target).then_some(site));
     let backedge=sites.next()?;
@@ -247,14 +305,15 @@ pub(super) struct Dispatch<'a> {
     pure_plans:HashMap<PreparedCallable,Option<(ordered_float_prefix::PrefixCertificate,ordered_float_prefix::FunctionEffects)>>,
     latest_pure:HashMap<PreparedCallable,(Vec<u32>,ExactValue,Option<Rc<ObservedTrace>>)>,
     range_ranks:HashMap<PreparedCallable,Option<RangeRank>>,
+    requirement_conditions:HashMap<(PreparedCallable,OccurrenceOrdinal),Option<OccurrenceOrdinal>>,
 }
 
 pub(super) fn run<'a>(
     project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
     storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
-    ranges:&HashMap<PreparedCallable,RangeRank>, visits:&[InitializationVisit],
+    ranges:&HashMap<PreparedCallable,RangeRank>, visits:&[InitializationVisit], allow_single_failure:bool, reached_requirement:&std::cell::Cell<bool>,
     read_array:impl Fn(&ProjectedStorage,&observed_f32_array::Cell,&ScalarType)->Option<(ExactValue,usize)>,
-) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize)> {
+) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize,Option<SelectedRequirement>)> {
     let mut active=HashSet::new();
     let mut latest_segment=HashMap::<PreparedCallable,(Rc<ObservedTrace>,usize)>::new();
     let mut values=Vec::new();
@@ -270,15 +329,15 @@ pub(super) fn run<'a>(
             Entry::Occupied(slot)=>Some(slot.get().clone()),
         }
     };
-    fn enter(body:&FunctionCallSites,target:PreparedCallable,args:Vec<ExactValue>,rank:Option<usize>,value_base:usize) -> Option<Activation> {
+    fn enter(body:&FunctionCallSites,target:PreparedCallable,args:Vec<ExactValue>,rank:Option<usize>,value_base:usize,entered_at:Option<SourceSpan>) -> Option<Activation> {
         let ids=body.boundary.checker_parameter_bindings.as_ref()?;
         if ids.len()!=args.len() || args.len()!=body.boundary.parameters.len()
             || !body.boundary.parameters.iter().map(|p| p.ty.clone()).eq(args.iter().map(ExactValue::ty))
         { return None; }
-        Some(Activation { target, slots:ids.iter().cloned().zip(args).collect(),rank,value_base })
+        Some(Activation { target, slots:ids.iter().cloned().zip(args).collect(),rank,value_base,entered_at })
     }
     let (_,body,ret)=get_symbol(&mut dispatch.declarations,target)?;
-    stack.push(enter(body,target,args,None,0)?);
+    stack.push(enter(body,target,args,None,0,None)?);
     active.insert(target);
     let output=if ret==ScalarType::Unit { Output::Unit } else { Output::Scalar };
     tasks.extend([Task::Finish(None,ret),Task::Block(body.structure.root,0,output)]);
@@ -320,8 +379,15 @@ pub(super) fn run<'a>(
                         tasks.extend([Task::Bind(id,slot.ty.clone()),Task::Eval(outputs.primary)]);
                     }
                     BlockItemKind::Evaluation { expression } => {
-                        if st.checked_types.expressions.get(expression)?!=&ScalarType::Unit { return None; }
-                        tasks.extend([Task::DropUnit,Task::Eval(*expression)]);
+                        if st.checker_directives.contains_key(expression) {
+                            if !allow_single_failure { return None; }
+                            let condition=(*dispatch.requirement_conditions.entry((frame.target,*expression))
+                                .or_insert_with(|| requirement_condition(body,*expression)))?;
+                            tasks.extend([Task::DropUnit,Task::Requirement(*expression),Task::Eval(condition)]);
+                        } else {
+                            if st.checked_types.expressions.get(expression)?!=&ScalarType::Unit { return None; }
+                            tasks.extend([Task::DropUnit,Task::Eval(*expression)]);
+                        }
                     }
                     BlockItemKind::Assignment { group } => {
                         let assignment=body.assignments.get(&(group.block,group.item))?;
@@ -437,6 +503,35 @@ pub(super) fn run<'a>(
             Task::Not => {
                 let ExactValue::Boolean(value)=scalar(values.pop()?)? else { return None; };
                 values.push(ResultValue::Scalar(ExactValue::Boolean(!value)));
+            }
+            Task::Requirement(site) => {
+                reached_requirement.set(true);
+                let ExactValue::Boolean(accepted)=scalar(values.pop()?)? else { return None; };
+                #[cfg(test)]
+                {
+                    let authored=span(site)?;
+                    REQUIREMENT_RESULTS.with(|log| log.borrow_mut().push((authored,accepted)));
+                }
+                if accepted {
+                    // Require is not a scope-narrowing operation. Its valid
+                    // actual state simply follows the next prepared item.
+                    values.push(ResultValue::Unit);
+                    continue;
+                }
+                let owner=frame.target;
+                let mut paths=traces.take()?;
+                if paths.len()!=stack.len() { return None; }
+                // Preserve active entries as open; never forge a return on
+                // the failure prefix. Completed nested segments stay shared.
+                for activation in stack.iter().skip(1).rev() {
+                    let events=paths.pop()?;
+                    let nested=segments.len();
+                    segments.push(events);
+                    paths.last_mut()?.push(ObservedStep::Entered {site:activation.entered_at.clone()?,nested});
+                }
+                let root=paths.pop()?;
+                let history=ObservedTrace::new(root,segments,&mut work)?;
+                return Some((None,None,work,Some(SelectedRequirement {target:owner,site,history})));
             }
             Task::Branch(at,yes,no,output) => {
                 let ExactValue::Boolean(accepted)=scalar(values.pop()?)? else { return None; };
@@ -557,9 +652,10 @@ pub(super) fn run<'a>(
                 let (_,callee,result)=get_symbol(&mut dispatch.declarations,child)?;
                 let output=if result==ScalarType::Unit { Output::Unit } else { Output::Scalar };
                 if let Some(traces)=&mut traces { traces.push(Vec::new()); }
-                tasks.extend([Task::Finish(Some(span(site)?),result),Task::Block(callee.structure.root,0,output)]);
+                let entered=span(site)?;
+                tasks.extend([Task::Finish(Some(entered.clone()),result),Task::Block(callee.structure.root,0,output)]);
                 charge_call_work(&mut work,n)?;
-                stack.push(enter(callee,child,args,rank,values.len())?);
+                stack.push(enter(callee,child,args,rank,values.len(),Some(entered))?);
             }
             Task::Finish(site,ty) => {
                 if values.len()!=frame.value_base.checked_add(1)? { return None; }
@@ -587,5 +683,5 @@ pub(super) fn run<'a>(
         Some(ObservedTrace::new(root,segments,&mut work)?)
     } else { None };
     let value=match values.pop()? { ResultValue::Scalar(v)=>Some(v),ResultValue::Unit=>None };
-    Some((value,trace,work))
+    Some((value,trace,work,None))
 }

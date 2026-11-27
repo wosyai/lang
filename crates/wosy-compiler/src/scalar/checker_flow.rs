@@ -12906,7 +12906,8 @@ fn evaluate_observed_getter(calls: &FunctionCallSites, site: OccurrenceOrdinal, 
 
 #[cfg(feature = "internal-checker")]
 pub(super) type ObservedProviderCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal,
-    Vec<super::checker_project::ObservedExactValue>, &mut ProjectedStorage)
+    Vec<super::checker_project::ObservedExactValue>, &mut ProjectedStorage,
+    Option<&dyn Fn() -> Option<Vec<CallableHistoryStep>>>)
     -> Option<(Option<super::checker_project::ObservedExactValue>, Option<usize>, usize)> + 'a;
 
 #[cfg(feature = "internal-checker")]
@@ -12941,7 +12942,7 @@ fn evaluate_observed_provider(calls:&FunctionCallSites,at:OccurrenceOrdinal,
         });
     }
     let (Some(ObservedExactValue::Integer(ScalarType::I32,value)),trace,work)=
-        roots.observed_provider_call?(calls,at,values,Rc::make_mut(row.storage.as_mut()?))? else { return None; };
+        roots.observed_provider_call?(calls,at,values,Rc::make_mut(row.storage.as_mut()?),None)? else { return None; };
     append_observed_scalar_call(calls,at,roots,row,trace,work)?;
     Some(value)
 }
