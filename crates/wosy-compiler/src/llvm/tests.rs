@@ -9685,3 +9685,95 @@ Packet() packet = fn { { .data = null; } };
         assert!(result.unwrap_err().contains("supported fixed inline data layout"));
     }
 }
+
+#[test]
+fn native64_wide_fixed_aggregates_keep_exact_storage_count_and_field_offset() {
+    let text = "%%start
+struct Wide { u8[4294967297] data; u8 tail; }
+u8(Wide) read_tail = fn(value) { value.tail };
+u8(u8[4294967297]) indexed = fn(data) { data[4294967296] };
+u8(u8[3]) small = fn(data) { data[2] };
+%%end";
+    let layout = ScalarTargetLayout::NATIVE64;
+    let prepared = prepare_initializer_test(text, layout);
+    let parsed = parse_source(prepared.project().modules[0].source.clone(), text.into(), &[]);
+    let standalone = derive_scalar_program_with_layout(&parsed.result, layout);
+    assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+    let build = analyze_scalar_build(&prepared);
+    assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+
+    // Inspect verified IR only. None of these large objects is linked or executed.
+    for llvm in [
+        emit_scalar_llvm(&standalone),
+        emit_scalar_build_single_module_llvm(&build),
+        emit_scalar_build_project_llvm(&build),
+    ] {
+        let ir = llvm.unwrap().to_text();
+        for expected in [
+            "alloca [4294967297 x i8]",
+            "alloca [4294967298 x i8]",
+            "alloca [3 x i8]",
+            "i64 4294967296",
+            "i64 4294967297",
+        ] {
+            assert!(ir.contains(expected), "missing {expected}: {ir}");
+        }
+    }
+}
+
+#[test]
+fn wide_fixed_aggregates_preserve_real_target_and_data_layout_rejections() {
+    for (layout, count, expected) in [
+        (ScalarTargetLayout::WASM32, 4_294_967_297u64, "fixed array length exceeds LLVM array size"),
+        (ScalarTargetLayout::NATIVE64, u64::MAX / 8 + 1, "aggregate bit size exceeds LLVM DataLayout range"),
+    ] {
+        let text = format!("%%start\nu8(u8[{count}]) test = fn(data) {{ data[0] }};\n%%end");
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source, text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let standalone = derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        let error = emit_scalar_llvm(&standalone).err().unwrap_or_else(|| panic!("{layout:?} accepted illegal fixed storage count {count}"));
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn nested_fixed_array_storage_keeps_target_order_alignment_and_failures() {
+    use super::memory;
+    use crate::scalar::layout::ScalarLayoutIndex;
+    use inkwell::{context::Context, types::BasicTypeEnum};
+    use wosy_syntax::ByteSpan;
+
+    let array = |element, length| ScalarType::Array {
+        element: Box::new(element), length, length_span: ByteSpan::new(0, 0), span: ByteSpan::new(0, 0),
+    };
+    let layout_index = ScalarLayoutIndex::project(&[]);
+    let context = Context::create();
+    let mut extents = vec![1; 96];
+    extents[0] = 3;
+    extents[95] = 2;
+    let deep = extents.iter().rev().fold(ScalarType::U64, |ty, length| array(ty, *length));
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        assert_eq!(memory::allocation_layout(&deep, &layout_index, target).unwrap(), (48, 8));
+        let (mut storage, special_alignment) =
+            memory::storage_type_and_alignment(&context, &deep, &layout_index, target).unwrap();
+        assert_eq!(special_alignment, None);
+        for extent in &extents {
+            let BasicTypeEnum::ArrayType(current) = storage else { panic!("fixed array layer"); };
+            assert_eq!(u64::from(current.len()), *extent);
+            storage = current.get_element_type();
+        }
+        assert_eq!(storage, context.i64_type().into());
+
+        let invalid = array(array(ScalarType::U64, u64::MAX), 0);
+        assert_eq!(memory::allocation_layout(&invalid, &layout_index, target).unwrap_err(),
+            "runtime allocation size overflows u64");
+        assert_eq!(memory::storage_type(&context, &invalid, &layout_index, target).unwrap_err(),
+            if target == ScalarTargetLayout::NATIVE64 { "aggregate byte size overflows u64" }
+            else { "fixed array length exceeds LLVM array size" });
+    }
+    let bad_bits = array(array(ScalarType::U8, u64::MAX / 8 + 1), 0);
+    assert_eq!(memory::storage_type(&context, &bad_bits, &layout_index, ScalarTargetLayout::NATIVE64).unwrap_err(),
+        "aggregate bit size exceeds LLVM DataLayout range");
+}

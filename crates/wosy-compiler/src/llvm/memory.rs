@@ -1,4 +1,5 @@
 use inkwell::attributes::AttributeLoc;
+use inkwell::types::{ArrayType, AsTypeRef};
 use inkwell::values::BasicValue;
 
 use super::expression::{
@@ -84,13 +85,38 @@ pub(super) fn storage_type<'ctx>(
     storage_type_and_alignment(context, ty, layouts, target_layout).map(|(ty, _)| ty)
 }
 
+fn native_array_storage<'ctx>(
+    element: BasicTypeEnum<'ctx>, length: u64, byte_size: u64,
+) -> Result<ArrayType<'ctx>, String> {
+    // LLVM DataLayout represents type allocation size in bits as u64.
+    byte_size.checked_mul(8).ok_or("aggregate bit size exceeds LLVM DataLayout range")?;
+    // SAFETY: element is an existing sized storage type in this context.
+    // LLVMArrayType2 creates an array in that same context, and the result
+    // inherits the element type's lifetime.
+    Ok(unsafe {
+        ArrayType::new(inkwell::llvm_sys::core::LLVMArrayType2(element.as_type_ref(), length))
+    })
+}
+
 pub(super) fn storage_type_and_alignment<'ctx>(
     context: &'ctx Context,
     ty: &ScalarType,
     layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     target_layout: ScalarTargetLayout,
 ) -> Result<(BasicTypeEnum<'ctx>, Option<u64>), String> {
-    match ty {
+    storage_representation(context, ty, layouts, target_layout)
+        .map(|(ty, alignment, _)| (ty, alignment))
+}
+
+fn storage_representation<'ctx>(
+    context: &'ctx Context,
+    ty: &ScalarType,
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
+    target_layout: ScalarTargetLayout,
+) -> Result<(BasicTypeEnum<'ctx>, Option<u64>, Option<u64>), String> {
+    let native = target_layout == ScalarTargetLayout::NATIVE64;
+    let (leaf, extents) = fixed_array_layers(ty);
+    let (storage, alignment, bytes) = match leaf {
         ScalarType::Struct(id) => {
             let structure = layouts
                 .aggregate(id)
@@ -99,21 +125,50 @@ pub(super) fn storage_type_and_alignment<'ctx>(
                 .layout
                 .as_ref()
                 .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
-            let size =
-                u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?;
-            Ok((context.i8_type().array_type(size).into(), Some(layout.alignment)))
+            let byte = context.i8_type();
+            let storage = if native {
+                native_array_storage(byte.into(), layout.size, layout.size)?
+            } else {
+                let size = u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?;
+                byte.array_type(size)
+            };
+            (storage.into(), Some(layout.alignment), native.then_some(layout.size))
         }
-        ScalarType::Array {
-            element, length, ..
-        } => {
-            let (element, alignment) =
-                storage_type_and_alignment(context, element, layouts, target_layout)?;
-            let length =
-                u32::try_from(*length).map_err(|_| "fixed array length exceeds LLVM array size")?;
-            Ok((element.array_type(length).into(), alignment))
+        _ => {
+            let storage = basic_type(context, leaf, target_layout)?;
+            let bytes = if !native {
+                None
+            } else if matches!(leaf, ScalarType::RuntimeArray { .. }) {
+                // basic_type represents an erased runtime extent as a pointer.
+                Some(target_layout.pointer_size)
+            } else {
+                Some(allocation_leaf_layout(leaf, layouts, target_layout)?.0)
+            };
+            (storage, None, bytes)
         }
-        _ => Ok((basic_type(context, ty, target_layout)?, None)),
+    };
+    let (storage, bytes) = extents.into_iter().rev().try_fold(
+        (storage, bytes), |(element, element_bytes), length| -> Result<_, String> {
+            if let Some(element_bytes) = element_bytes {
+                let bytes = element_bytes.checked_mul(length).ok_or("aggregate byte size overflows u64")?;
+                let storage = native_array_storage(element, length, bytes)?;
+                Ok((storage.into(), Some(bytes)))
+            } else {
+                let length = u32::try_from(length).map_err(|_| "fixed array length exceeds LLVM array size")?;
+                Ok((element.array_type(length).into(), None))
+            }
+        },
+    )?;
+    Ok((storage, alignment, bytes))
+}
+
+fn fixed_array_layers(mut ty: &ScalarType) -> (&ScalarType, Vec<u64>) {
+    let mut extents = Vec::new();
+    while let ScalarType::Array { element, length, .. } = ty {
+        extents.push(*length);
+        ty = element;
     }
+    (ty, extents)
 }
 
 pub(super) fn storage_alignment(alignment: Option<u64>) -> Result<Option<u32>, String> {
@@ -130,6 +185,19 @@ pub(super) fn storage_alignment(alignment: Option<u64>) -> Result<Option<u32>, S
 }
 
 pub(super) fn allocation_layout(
+    ty: &ScalarType,
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
+    target_layout: ScalarTargetLayout,
+) -> Result<(u64, u64), String> {
+    let (leaf, extents) = fixed_array_layers(ty);
+    let (size, alignment) = allocation_leaf_layout(leaf, layouts, target_layout)?;
+    let size = extents.into_iter().rev().try_fold(size, |size, length| {
+        size.checked_mul(length).ok_or_else(|| "runtime allocation size overflows u64".to_owned())
+    })?;
+    Ok((size, alignment))
+}
+
+fn allocation_leaf_layout(
     ty: &ScalarType,
     layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     target_layout: ScalarTargetLayout,
@@ -151,15 +219,7 @@ pub(super) fn allocation_layout(
             .and_then(|structure| structure.layout.as_ref())
             .map(|layout| (layout.size, layout.alignment))
             .ok_or_else(|| format!("runtime allocation has no layout for struct {}", id.index)),
-        ScalarType::Array {
-            element, length, ..
-        } => {
-            let (size, alignment) = allocation_layout(element, layouts, target_layout)?;
-            let size = size
-                .checked_mul(*length)
-                .ok_or_else(|| "runtime allocation size overflows u64".to_owned())?;
-            Ok((size, alignment))
-        }
+        ScalarType::Array { .. } => unreachable!("fixed arrays are peeled before leaf allocation"),
         ScalarType::Named { .. }
         | ScalarType::Qualified { .. }
         | ScalarType::RuntimeArray { .. }
@@ -656,18 +716,10 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
         return Err("struct literal requires a resolved struct type".to_owned());
     };
     let structure = structure(state.structs, id.clone())?;
-    let layout = state
-        .layouts
-        .aggregate(id)
-        .ok_or_else(|| format!("unknown LLVM struct {}", id.index))?
-        .layout
-        .as_ref()
-        .ok_or_else(|| format!("LLVM struct {} has no valid layout", id.index))?;
-    let storage = context.i8_type().array_type(
-        u32::try_from(layout.size).map_err(|_| "struct layout exceeds LLVM array size")?,
-    );
-    let destination = entry_alloca(state, storage.into(), "struct_literal")?;
-    align_storage_alloca(destination, Some(layout.alignment))?;
+    let (storage, alignment) =
+        storage_type_and_alignment(context, expected, state.layouts, state.target_layout)?;
+    let destination = entry_alloca(state, storage, "struct_literal")?;
+    align_storage_alloca(destination, alignment)?;
     let mut values = BTreeMap::new();
     for field in &structure.fields {
         values.entry(field.name.as_str()).or_insert((&field.ty, None));
