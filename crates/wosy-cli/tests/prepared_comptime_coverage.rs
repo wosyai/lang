@@ -360,3 +360,92 @@ fn changed_pending_entry_reuses_verified_parse_for_first_comptime_fragment() {
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exact_pending_owner_can_commit_source_without_a_second_parser_run() {
+    use wosy_compiler::ScalarTargetLayout;
+    use wosy_daemon::{PendingFirstComptimeProjection, PreparedPendingFirstComptime,
+        RootedClosedComptimeProjection, RootedClosedComptimeRequest};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::FileKey;
+
+    async fn prepare(
+        client: &mut SqliteSourceState, worker: &SourceStorageWorker, attempt: SourceAttempt, lifetime: Duration,
+    ) -> PreparedPendingFirstComptime {
+        let request = RootedClosedComptimeRequest {
+            profile: "dev".into(),
+            file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+            id: "fixture".into(), evaluator_layout: ScalarTargetLayout::NATIVE64, source_limits: LIMITS, output_bytes: 1 << 20,
+        };
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let owner = worker.prepare_pending_first_comptime(binding, proposal, request, 1 << 20, lifetime).await.unwrap();
+        assert_eq!(owner.base().admission().validated_files, 1);
+        assert!(matches!(owner.projection(), Some(PendingFirstComptimeProjection::Candidate(
+            RootedClosedComptimeProjection::Emitted(_)))));
+        owner
+    }
+
+    let fixture = Scratch::new();
+    let root = fixture.0.join("project");
+    fs::create_dir(&root).unwrap();
+    let entry = root.join("main.w");
+    fs::write(root.join("wosy.toml"), MANIFEST).unwrap();
+    fs::write(&entry, "%%start\ni32 answer = 14;\n%%end\n").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&root, CLIENT).unwrap();
+        let base = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(base.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", base.pending.unwrap()).unwrap());
+        let prior = client.acknowledged_build_source("app").unwrap().unwrap();
+
+        fs::write(&entry, COMPTIME_LIB).unwrap();
+        let obsolete = client.stage("app").unwrap().pending.unwrap();
+        let stale = prepare(&mut client, &worker, obsolete, TTL).await;
+        assert!(client.abandon("app", obsolete).unwrap());
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        assert_eq!(attempt.root(), obsolete.root());
+        assert_ne!(attempt.generation(), obsolete.generation());
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let refused = worker.publish_prepared_first_comptime_source(binding, proposal, stale, LIMITS).await.err().unwrap();
+        assert!(refused.to_string().contains("does not match this pending attempt"));
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+
+        let lifetime = Duration::from_secs(2);
+        let expired = prepare(&mut client, &worker, attempt, lifetime).await;
+        tokio::time::sleep(lifetime).await;
+        assert!(expired.projection().is_none());
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let refused = worker.publish_prepared_first_comptime_source(binding, proposal, expired, LIMITS).await.err().unwrap();
+        assert!(refused.to_string().contains("predecessor lease expired"));
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+
+        let limited = prepare(&mut client, &worker, attempt, TTL).await;
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let strict = BaseCstAdmissionLimits { authored_bytes: 0, ..LIMITS };
+        let refused = worker.publish_prepared_first_comptime_source(binding, proposal, limited, strict).await.err().unwrap();
+        assert!(refused.to_string().contains("authored byte budget"));
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), prior);
+
+        let exact = prepare(&mut client, &worker, attempt, TTL).await;
+        let active_worker = &worker;
+        let applied = client.publish_pending_base("app", attempt, |binding, proposal| async move {
+            let committed = active_worker.publish_prepared_first_comptime_source(binding, proposal, exact, LIMITS).await?;
+            assert_eq!(committed.authored_reparsed_files, 0);
+            Ok(committed.source)
+        }).await.unwrap();
+        let PendingBasePublication::Applied(receipt) = applied else { panic!("expected exact source-only acknowledgement") };
+        assert_eq!((receipt.binding.proposed, receipt.binding.attempt, receipt.validated_files),
+            (attempt.root(), attempt.generation(), 1));
+        assert!(store.snapshot(attempt.root()).unwrap().is_some());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, attempt.root());
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

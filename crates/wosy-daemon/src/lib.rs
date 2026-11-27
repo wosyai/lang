@@ -94,7 +94,7 @@ pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRet
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{
     AuthoredComptimeCoverage, BaseCstAdmission, BaseCstAdmissionLimits, PendingFirstComptimeProjection,
-    PreparedBaseIdentity, PreparedBaseDeclarations, PreparedPendingFirstComptime,
+    PreparedBaseIdentity, PreparedBaseDeclarations, PreparedPendingFirstComptime, PreparedSourcePublication,
 };
 pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};

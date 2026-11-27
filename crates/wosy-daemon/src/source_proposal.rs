@@ -8,7 +8,7 @@ use super::{
     CheckedFile, Expected, FileTree, Index, PreparedBaseModule, PublishReport, Result,
     SourceStorageWorker, SourceStore, INTERN, NODES, SNAPSHOT_ROOTS,
 };
-use super::grammar_receipts::{GrammarReceipts, VerifiedGrammarBatch};
+use super::grammar_receipts::{GrammarReceipts, VerifiedFileGrammar, VerifiedGrammarBatch};
 use rowan::{NodeOrToken, WalkEvent};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -114,14 +114,24 @@ impl PreparedBaseDeclarations {
 /// evaluator text is a preview, not a published root or a Prepared response.
 pub struct PreparedPendingFirstComptime {
     base: PreparedBaseDeclarations,
+    binding: BaseCstProposalBinding,
+    observation: PendingFirstObservation,
+}
+
+struct PendingFirstObservation {
     projection: PendingFirstComptimeProjection,
+    grammar: Option<VerifiedFileGrammar>,
+}
+
+impl From<PendingFirstComptimeProjection> for PendingFirstObservation {
+    fn from(projection: PendingFirstComptimeProjection) -> Self { Self { projection, grammar: None } }
 }
 
 impl PreparedPendingFirstComptime {
     pub fn base(&self) -> &PreparedBaseDeclarations { &self.base }
 
     pub fn projection(&self) -> Option<&PendingFirstComptimeProjection> {
-        self.base.lease.finish_current(|| &self.projection)
+        self.base.lease.finish_current(|| &self.observation.projection)
     }
 }
 
@@ -149,36 +159,46 @@ struct ValidatedProposal {
     grammar: VerifiedGrammarBatch,
     authored_comptime: AuthoredComptimeCoverage,
     selected_changed_parse: Option<FreshParseResult>,
+    authored_reparsed_files: usize,
+}
+
+#[derive(Default)]
+struct AdmissionInspection<'a> {
+    predecessor_grammar: Option<&'a GrammarReceipts>,
+    selected_file: Option<&'a FileKey>,
+    prepared_changed: Option<VerifiedFileGrammar>,
 }
 
 impl ValidatedProposal {
     fn pending_first_comptime(
         &mut self, store: &SourceStore, request: &RootedClosedComptimeRequest,
-    ) -> Result<PendingFirstComptimeProjection> {
+    ) -> Result<PendingFirstObservation> {
         use PendingFirstComptimeProjection as Projection;
         use RootedClosedComptimeProjection::Refused;
         use RootedClosedComptimeRefusal as Refusal;
 
         if !self.config.profiles.contains_key(&request.profile) {
-            return Ok(Projection::Candidate(Refused(Refusal::ProfileNotSelected)));
+            return Ok(Projection::Candidate(Refused(Refusal::ProfileNotSelected)).into());
         }
         let Some(file) = self.index.files.get(&request.file) else {
-            return Ok(Projection::Candidate(Refused(Refusal::FileNotRooted)));
+            return Ok(Projection::Candidate(Refused(Refusal::FileNotRooted)).into());
         };
         if request.file != self.config.entry {
-            return Ok(Projection::Candidate(Refused(Refusal::NotTargetEntry)));
+            return Ok(Projection::Candidate(Refused(Refusal::NotTargetEntry)).into());
         }
         if self.index.files.len() != 1 {
-            return Ok(Projection::RequiresSingleModule);
+            return Ok(Projection::RequiresSingleModule.into());
         }
         if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-            return Ok(Projection::Candidate(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit))));
+            return Ok(Projection::Candidate(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit))).into());
         }
-        let Some(fresh) = self.selected_changed_parse.take() else { return Ok(Projection::EntryUnchanged) };
+        let Some(fresh) = self.selected_changed_parse.take() else { return Ok(Projection::EntryUnchanged.into()) };
         let projected = store.project_first_comptime_from_pending_parse(
             self.admission.proposed, file.authored, self.config.target.clone(), request, &fresh,
         )?;
-        Ok(Projection::Candidate(projected))
+        let grammar = matches!(&projected, RootedClosedComptimeProjection::Emitted(_))
+            .then(|| VerifiedFileGrammar::for_checked(file, true));
+        Ok(PendingFirstObservation { projection: Projection::Candidate(projected), grammar })
     }
 }
 
@@ -199,6 +219,18 @@ pub(super) enum AdmissionLease {
     Connection(Arc<SourceLease>),
 }
 
+enum PublicationLease {
+    Open(Duration),
+    Prepared { lease: Arc<SourceLease>, read: SourceRead, grammar: VerifiedFileGrammar },
+}
+
+/// Local source-only commit and the actual number of canonical authored
+/// parser calls on its successful attempt. Not a new wire message.
+pub struct PreparedSourcePublication {
+    pub source: SourceDeltaPublication,
+    pub authored_reparsed_files: usize,
+}
+
 impl SourceStorageWorker {
     /// Validate and publish just the canonical base-source delta. The trusted
     /// adapter binds one pending attempt and its acknowledged predecessor.
@@ -209,20 +241,50 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<SourceDeltaPublication> {
+        Ok(self.publish_base_source(binding, proposal, limits, PublicationLease::Open(lifetime)).await?.source)
+    }
+
+    /// Consume the exact live preview accepted by this local store. The
+    /// caller still uses the ordinary client acknowledgement compare-and-set;
+    /// this publishes only canonical base source, never the evaluator/result.
+    pub async fn publish_prepared_first_comptime_source(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        prepared: PreparedPendingFirstComptime, limits: BaseCstAdmissionLimits,
+    ) -> Result<PreparedSourcePublication> {
+        if binding != prepared.binding || !Arc::ptr_eq(&self.retained_store(), &prepared.base._store) {
+            return Err("prepared source owner does not match this pending attempt or store".into());
+        }
+        let grammar = prepared.observation.grammar.ok_or("prepared source owner has no accepted entry fragment")?;
+        let PreparedBaseDeclarations { lease, _read: read, .. } = prepared.base;
+        self.publish_base_source(binding, proposal, limits, PublicationLease::Prepared { lease, read, grammar }).await
+    }
+
+    async fn publish_base_source(
+        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        limits: BaseCstAdmissionLimits, admission: PublicationLease,
+    ) -> Result<PreparedSourcePublication> {
         check_binding(&binding, &proposal)?;
         let slot = self.try_slot()?;
         self.spawn_reserved_query(slot, None, move |worker| async move {
             let binding = Arc::new(binding);
             let proposal = Arc::new(proposal);
-            let selected = binding.selected.clone();
-            let Some(lease) = worker.phase(None, move |store| store.lease_build_source(selected, lifetime)).await? else {
-                return Ok(SourceDeltaPublication::PredecessorMissing);
+            let (lease, _prepared_read, prepared_changed) = match admission {
+                PublicationLease::Open(lifetime) => {
+                    let selected = binding.selected.clone();
+                    let Some(lease) = worker.phase(None, move |store| store.lease_build_source(selected, lifetime)).await? else {
+                        return Ok(PreparedSourcePublication {
+                            source: SourceDeltaPublication::PredecessorMissing, authored_reparsed_files: 0,
+                        });
+                    };
+                    (Arc::new(lease), None, None)
+                }
+                PublicationLease::Prepared { lease, read, grammar } => (lease, Some(read), Some(grammar)),
             };
             let grant = lease.grant();
             for conflicts in 0..=1 {
                 let binding = Arc::clone(&binding);
                 let proposal = Arc::clone(&proposal);
-                let (mut tx, _read, result, grammar) = worker.phase(None, move |store| {
+                let (mut tx, _read, result, grammar, authored_reparsed_files) = worker.phase(None, move |store| {
                     let (mut tx, read) = store.begin_leased_source(grant, Mode::ReadWrite)?
                         .ok_or("base CST predecessor lease expired")?;
                     tx.set_durability(Durability::Eventual);
@@ -234,12 +296,13 @@ impl SourceStorageWorker {
                         false
                     };
                     let mut report = PublishReport::default();
-                    let validated = validate(&mut tx, &binding, &proposal, limits, Some(&mut report), None, None)?;
+                    let validated = validate(&mut tx, &binding, &proposal, limits, Some(&mut report),
+                        AdmissionInspection { prepared_changed, ..Default::default() })?;
                     if !already_present { tx.set(&marker, &proposal.root.0)?; }
                     Ok((tx, read, SourceDeltaCommit {
                         binding: binding.as_ref().clone(), validated_files: validated.admission.validated_files,
                         written_records: report.written, already_present, conflicts,
-                    }, validated.grammar))
+                    }, validated.grammar, validated.authored_reparsed_files))
                 }).await?;
                 if lease.deadline().is_none_or(|deadline| Instant::now() >= deadline) {
                     return Err("base CST predecessor lease expired".into());
@@ -247,7 +310,9 @@ impl SourceStorageWorker {
                 match tx.commit().await {
                     Ok(()) => {
                         worker.store.grammar_receipts.accept(grammar);
-                        return Ok(SourceDeltaPublication::Committed(result));
+                        return Ok(PreparedSourcePublication {
+                            source: SourceDeltaPublication::Committed(result), authored_reparsed_files,
+                        });
                     }
                     Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
                     Err(error) => return Err(error.into()),
@@ -295,16 +360,17 @@ impl SourceStorageWorker {
         request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration,
     ) -> Result<PreparedPendingFirstComptime> {
         request.check_selector_bytes()?;
-        let (base, projection) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
+        let captured_binding = binding.clone();
+        let (base, observation) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
             declaration_bytes, AdmissionLease::Open(lifetime), Some(request)).await?;
-        Ok(PreparedPendingFirstComptime { base, projection: projection.expect("requested projection") })
+        Ok(PreparedPendingFirstComptime { base, binding: captured_binding, observation: observation.expect("requested projection") })
     }
 
     async fn prepare_base_cst_observing(
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
         first_comptime: Option<RootedClosedComptimeRequest>,
-    ) -> Result<(PreparedBaseDeclarations, Option<PendingFirstComptimeProjection>)> {
+    ) -> Result<(PreparedBaseDeclarations, Option<PendingFirstObservation>)> {
         let selected_file = first_comptime.as_ref().map(|request| request.file.clone());
         let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease, true, selected_file,
             move |store, tx, mut valid| {
@@ -313,7 +379,7 @@ impl SourceStorageWorker {
                 let ValidatedProposal { admission, config, index, mut work, authored_comptime, .. } = valid;
                 let declarations = store.prepare_unpublished_declarations(tx, &config.entry, index, &mut work,
                     declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
-                let evaluator_bytes = projection.as_ref().map_or(0, PendingFirstComptimeProjection::retained_bytes);
+                let evaluator_bytes = projection.as_ref().map_or(0, |observation| observation.projection.retained_bytes());
                 allocation.charge(declarations.declaration_bytes + evaluator_bytes)?;
                 let identity = prepared_identity(&admission, declarations.entry_projection, store.derivation_image());
                 Ok((identity, admission, declarations, authored_comptime, projection, allocation))
@@ -343,8 +409,10 @@ impl SourceStorageWorker {
             };
             let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
-            let validated = validate(&mut tx, &binding, &proposal, limits, None,
-                observe_comptime.then_some(&store.grammar_receipts), selected_file.as_ref())?;
+            let validated = validate(&mut tx, &binding, &proposal, limits, None, AdmissionInspection {
+                predecessor_grammar: observe_comptime.then_some(&store.grammar_receipts),
+                selected_file: selected_file.as_ref(), prepared_changed: None,
+            })?;
             let accepted = use_validated(store, &tx, validated)?;
             // No transaction is committed and no snapshot entry is written.
             drop(tx);
@@ -369,9 +437,9 @@ fn check_binding(binding: &BaseCstProposalBinding, proposal: &BaseCstProposal) -
 fn validate(
     tx: &mut Transaction, binding: &BaseCstProposalBinding, proposal: &BaseCstProposal,
     limits: BaseCstAdmissionLimits, mut publish: Option<&mut PublishReport>,
-    predecessor_grammar: Option<&GrammarReceipts>,
-    selected_file: Option<&FileKey>,
+    inspection: AdmissionInspection<'_>,
 ) -> Result<ValidatedProposal> {
+    let AdmissionInspection { predecessor_grammar, selected_file, prepared_changed } = inspection;
     if proposal.files.len() > limits.records {
         return Err("base CST proposal exceeds the record budget".into());
     }
@@ -406,6 +474,7 @@ fn validate(
     let mut validated_files = 0;
     let mut grammar = VerifiedGrammarBatch::default();
     let mut selected_changed_parse = None;
+    let mut authored_reparsed_files = 0;
     let mut authored_comptime = if predecessor_grammar.is_some() { AuthoredComptimeCoverage::Absent }
         else { AuthoredComptimeCoverage::Unverified };
     let (current, config) = validate_snapshot_with(tx, proposal.root, |config| {
@@ -423,11 +492,19 @@ fn validate(
             }
             return Ok(());
         }
-        let tree = if publish.is_some() { FileTree::Both } else { FileTree::Authored };
-        let (checked, fresh, present) = grammar_checked_file(tx, file, categories, tree, &mut work)?;
-        if selected_file == Some(&key) && file.metadata.bytes as usize <= CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-            selected_changed_parse = Some(fresh);
-        }
+        let (checked, present) = if let Some(proof) = prepared_changed {
+            let present = proof.observe(file).ok_or("prepared grammar does not match the exact changed file")?;
+            let checked = validate_file(tx, file, categories, FileTree::Executable, Some(&mut work))?;
+            (checked, present)
+        } else {
+            let tree = if publish.is_some() { FileTree::Both } else { FileTree::Authored };
+            let (checked, fresh, present) = grammar_checked_file(tx, file, categories, tree, &mut work)?;
+            authored_reparsed_files += 1;
+            if selected_file == Some(&key) && file.metadata.bytes as usize <= CLOSED_COMPTIME_MAX_SOURCE_BYTES {
+                selected_changed_parse = Some(fresh);
+            }
+            (checked, present)
+        };
         if predecessor_grammar.is_some() { authored_comptime.observe(Some(present)); }
         if let Some(report) = publish.as_deref_mut() {
             admit_checked_namespace_authority(tx, file, checked, report)?;
@@ -454,7 +531,9 @@ fn validate(
         base: proposal.base, proposed: proposal.root, attempt: proposal.attempt,
         base_records: prior.len(), novel_records: supplied.len(), validated_files,
     };
-    Ok(ValidatedProposal { admission, config, index: current, work, grammar, authored_comptime, selected_changed_parse })
+    Ok(ValidatedProposal {
+        admission, config, index: current, work, grammar, authored_comptime, selected_changed_parse, authored_reparsed_files,
+    })
 }
 
 pub(super) fn matches_source_scope(config: &SourceConfig, selected: &BuildSourceSelection) -> bool {

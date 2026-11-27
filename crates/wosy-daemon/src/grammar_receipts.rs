@@ -18,8 +18,26 @@ impl GrammarKey {
     }
 }
 
+/// One privately retained positive result of the canonical grammar oracle.
+/// A pending source owner can carry this without enrolling it in the memo.
+#[derive(Clone, Copy)]
+pub(super) struct VerifiedFileGrammar {
+    key: GrammarKey,
+    authored_comptime: bool,
+}
+
+impl VerifiedFileGrammar {
+    pub fn for_checked(file: &FileEntry, authored_comptime: bool) -> Self {
+        Self { key: GrammarKey::for_file(file), authored_comptime }
+    }
+
+    pub fn observe(self, file: &FileEntry) -> Option<bool> {
+        (self.key == GrammarKey::for_file(file)).then_some(self.authored_comptime)
+    }
+}
+
 #[derive(Default)]
-pub(super) struct VerifiedGrammarBatch(Vec<(GrammarKey, bool)>);
+pub(super) struct VerifiedGrammarBatch(Vec<VerifiedFileGrammar>);
 
 impl VerifiedGrammarBatch {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
@@ -27,7 +45,7 @@ impl VerifiedGrammarBatch {
     /// Only after the real canonical grammar check accepted this file
     /// and observed its authored syntax in the same equality walk.
     pub fn verified(&mut self, file: &FileEntry, authored_comptime: bool) {
-        if self.0.len() < RECEIPTS { self.0.push((GrammarKey::for_file(file), authored_comptime)); }
+        if self.0.len() < RECEIPTS { self.0.push(VerifiedFileGrammar::for_checked(file, authored_comptime)); }
     }
 }
 
@@ -78,7 +96,7 @@ impl GrammarReceipts {
 
 impl GrammarReceiptAdmission<'_> {
     pub fn accept(&mut self, batch: VerifiedGrammarBatch) {
-        for (key, authored_comptime) in batch.0 { self.0.remember(key, authored_comptime); }
+        for VerifiedFileGrammar { key, authored_comptime } in batch.0 { self.0.remember(key, authored_comptime); }
     }
 }
 
