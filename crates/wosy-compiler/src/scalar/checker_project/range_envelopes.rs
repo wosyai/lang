@@ -41,9 +41,17 @@ impl Envelope {
     }
 }
 
-type Inputs = Vec<Option<Envelope>>;
+pub(super) type Inputs = Vec<Option<Envelope>>;
 type Key = (PreparedCallable, Rc<Inputs>);
 type Lanes = Option<Rc<Inputs>>;
+
+// Constructed only from a prepared call occurrence and its dominating guards.
+pub(super) struct IncomingRangeEdge {
+    caller: PreparedCallable,
+    callee: PreparedCallable,
+    pub(super) site: OccurrenceOrdinal,
+    pub(super) inputs: Option<Inputs>,
+}
 
 #[derive(Clone, Copy)]
 enum Need { Int, Bool(bool) }
@@ -101,16 +109,28 @@ impl<'a> PreparedEnvelopes<'a> {
         }
     }
 
-    fn frame(&self, target: PreparedCallable) -> Option<Frame<'a>> {
-        self.frame_with_obligations(target,false)
+    fn frame_without_formal_mutation(&self,target: PreparedCallable) -> Option<Frame<'a>> {
+        use crate::scalar::reference::{DirectDestinationIdentity, NamedPlaceRootIdentity};
+        let body = self.calls.function_body(target.0,target.1,None)?;
+        let ids = body.boundary.checker_parameter_bindings.as_deref()?;
+        if ids.len() != body.boundary.parameters.len() || body.contextual_formal().is_some()
+            || !body.arms.is_empty() || body.structure.blocks.iter().any(|b| b.unsafe_context)
+        { return None; }
+        let formals = ids.iter().collect::<HashSet<_>>();
+        for at in (0..body.occurrences.len()).map(OccurrenceOrdinal) {
+            if matches!(body.prepared_direct_destination(at),Some(DirectDestinationIdentity::Existing(id)) if formals.contains(id))
+                || matches!(body.prepared_named_place_root(at),Some(NamedPlaceRootIdentity::Lexical(id)) if formals.contains(id))
+            { return None; }
+        }
+        Some(Frame { body,target,ids })
     }
 
-    fn frame_with_obligations(&self, target: PreparedCallable, authored: bool) -> Option<Frame<'a>> {
+    fn frame(&self, target: PreparedCallable) -> Option<Frame<'a>> {
         let function = self.calls.function_body(target.0, target.1, None)?;
         if function.contextual_formal().is_some() || !function.arms.is_empty() || !function.assignments.is_empty()
             || !function.callable_escapes.is_empty() || !function.allocation_length_calls.is_empty()
             || !function.structure.module_storage_uses.is_empty()
-            || (!authored && !function.structure.checker_directives.is_empty())
+            || !function.structure.checker_directives.is_empty()
             || function.structure.blocks.iter().any(|block| block.unsafe_context)
         { return None; }
         let ids = function.boundary.checker_parameter_bindings.as_deref()?;
@@ -325,69 +345,157 @@ impl<'a> PreparedEnvelopes<'a> {
     #[cfg(test)]
     pub(super) fn work(&self) -> [usize;3] { self.work }
 
+    fn refine_at_site(&mut self, frame: Frame<'a>, site: OccurrenceOrdinal,
+        parents: &HashMap<OccurrenceParent,(OccurrenceParent,OccurrenceEdge)>,
+        known: &mut HashMap<OccurrenceParent,Lanes>) -> Option<Lanes> {
+        let mut cursor = OccurrenceParent::Expression(site);
+        let mut suffix = Vec::new();
+        while !known.contains_key(&cursor) {
+            let &(parent,edge) = parents.get(&cursor)?;
+            suffix.push((cursor,parent,edge));
+            cursor = parent;
+        }
+        let mut current = known.get(&cursor)?.clone();
+        for (child,parent,edge) in suffix.into_iter().rev() {
+            let mut guard = None;
+            if let OccurrenceParent::Expression(at) = parent {
+                match edge {
+                    OccurrenceEdge::ThenBranch | OccurrenceEdge::ElseBranch => {
+                        let condition = match frame.body.conditionals.get(&at)? {
+                            ConditionalRegion::Unit { condition, .. } | ConditionalRegion::Value { condition, .. } => *condition,
+                        };
+                        guard = Some((condition,edge == OccurrenceEdge::ThenBranch));
+                    }
+                    OccurrenceEdge::BinaryRight => {
+                        if let Some(region) = frame.body.short_circuits.get(&at) {
+                            guard = Some((region.left,region.evaluate_right_when));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some((guard,want)),Some(row)) = (guard,&current) {
+                // An unknown guard does not rule out its arm. Cache the
+                // shared unchanged prefix as well as checked refinements.
+                if let Some(answer) = self.evaluate(frame,guard,Need::Bool(want),Rc::clone(row)) {
+                    current = answer.lanes()?;
+                }
+            }
+            known.insert(child,current.clone());
+        }
+        Some(current)
+    }
+
+    /// Bounds on the arguments of this exact incoming call in a given entry
+    /// envelope. This never narrows any other activation of the target.
+    fn edge_inputs(&mut self, frame: Frame<'a>, site: OccurrenceOrdinal,
+        parents: &HashMap<OccurrenceParent,(OccurrenceParent,OccurrenceEdge)>,
+        known: &mut HashMap<OccurrenceParent,Lanes>) -> Option<Option<Inputs>> {
+        let Some(row) = self.refine_at_site(frame,site,parents,known)? else { return Some(None); };
+        let st = &frame.body.structure;
+        let signature = frame.body.checked_call_signatures.get(&site)?;
+        let args = signature.parameters.iter().enumerate().map(|(slot,ty)| {
+            let OccurrenceNode::Expression(arg) = st.edges.get(&(
+                OccurrenceParent::Expression(site),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+            if st.checked_types.expressions.get(arg)? != ty { return None; }
+            if *ty == ScalarType::Bool { return Some(None); }
+            let entire = Envelope::whole(ty)?;
+            // A typed value outside this vocabulary is unknown, not a
+            // new externally supplied prerequisite.
+            Some(Some(self.evaluate(frame,*arg,Need::Int,Rc::clone(&row)).and_then(Answer::bound).unwrap_or(entire)))
+        }).collect::<Option<Inputs>>()?;
+        Some(Some(args))
+    }
+
+    fn parents(frame: Frame<'a>) -> Option<HashMap<OccurrenceParent,(OccurrenceParent,OccurrenceEdge)>> {
+        let mut parents = HashMap::new();
+        for (&(parent,edge), &child) in &frame.body.structure.edges {
+            let child = match child {
+                OccurrenceNode::Expression(at) => OccurrenceParent::Expression(at),
+                OccurrenceNode::Place(at) => OccurrenceParent::Place(at),
+                OccurrenceNode::Block(at) => OccurrenceParent::Block(at),
+            };
+            if parents.insert(child,(parent,edge)).is_some() { return None; }
+        }
+        Some(parents)
+    }
+
+    /// All call sites here are prepared identities of this one frame, not
+    /// an assertion that all ways to enter its callee have been enumerated.
+    pub(super) fn direct_edge_envelopes(
+        &mut self, owner: PreparedCallable, callee: PreparedCallable, input: &Inputs,
+    ) -> Option<Vec<IncomingRangeEdge>> {
+        let frame = self.frame_without_formal_mutation(owner)?;
+        if !contained(&initial_inputs(frame.body)?,input) { return None; }
+        let parents = Self::parents(frame)?;
+        let mut known = HashMap::from([(OccurrenceParent::Block(frame.body.structure.root),Some(Rc::new(input.clone())))]);
+        let mut edges = Vec::new();
+        for site in &frame.body.call_occurrences {
+            if frame.body.structure.checker_direct_targets.get(&site.ordinal) != Some(&callee) { continue; }
+            let sig = frame.body.checked_call_signatures.get(&site.ordinal)?;
+            if super::authenticate_prepared_direct_edge(self.project,self.calls,owner.0,frame.body,site.ordinal,sig)? != callee { return None; }
+            edges.push(IncomingRangeEdge { caller:owner, callee, site:site.ordinal,
+                inputs:self.edge_inputs(frame,site.ordinal,&parents,&mut known)? });
+        }
+        (!edges.is_empty()).then_some(edges)
+    }
+
+    /// Exact monotone self-edge checking after initial rows are proved by
+    /// their incoming caller; the default top external row does not
+    /// silently borrow that caller's bound.
+    pub(super) fn guarded_self_induction(
+        &mut self, target: PreparedCallable, invariant: &Inputs, initial: &IncomingRangeEdge,
+    ) -> Option<Vec<OccurrenceOrdinal>> {
+        if initial.callee != target || initial.caller == target || !contained(invariant,initial.inputs.as_ref()?) { return None; }
+        let mut returned = Vec::new();
+        for next in self.direct_edge_envelopes(target,target,invariant)? {
+            if next.inputs.as_ref().is_some_and(|row| !contained(invariant,row)) { return None; }
+            returned.push(next.site);
+        }
+        Some(returned)
+    }
+
     /// Close only obligations universal under exact same-call branch facts.
     /// Every remaining authored site and any unsupported history use the
     /// existing search; proving one call site never certifies other callers.
     pub(super) fn close_guarded_formals(&mut self, target: PreparedCallable) -> Option<Vec<ByteSpan>> {
-        use crate::scalar::reference::{CheckerOrdinaryBoolean, NamedPlaceRootIdentity};
-        let frame = self.frame_with_obligations(target,true)?;
-        let b = frame.body;
+        use crate::scalar::reference::CheckerOrdinaryBoolean;
+        let b = self.calls.function_body(target.0,target.1,None)?;
         let st = &b.structure;
         if st.checker_directives.is_empty() || !b.checker_returns_unit() || b.conditionals.is_empty() {
             return None;
         }
-        if (0..b.occurrences.len()).any(|at| matches!(b.prepared_named_place_root(OccurrenceOrdinal(at)),
-            Some(NamedPlaceRootIdentity::Lexical(binding)) if frame.ids.contains(binding))) {
-            return None;
-        }
-        let init = initial_inputs(b)?;
-        let mut blocks = vec![(st.root,init)];
+        let frame = self.frame_without_formal_mutation(target)?;
+        let parents = Self::parents(frame)?;
+        let mut known = HashMap::from([(OccurrenceParent::Block(st.root),Some(Rc::new(initial_inputs(b)?)))]);
         let mut covered = Vec::new();
-        while let Some((block,inputs)) = blocks.pop() {
-            for item in &st.blocks.get(block.0)?.items {
-                let BlockItemKind::Evaluation { expression } = item.kind else { continue; };
-                if let Some(directive) = st.checker_directives.get(&expression) {
-                    if directive.operation != CheckerOperation::Require { return None; }
-                    let accepts = |c: &super::super::checker_flow::IntegerPredicate| {
-                        let axis = frame.ids.iter().position(|id| id == &c.binding)?;
-                        let range = inputs.get(axis)?.as_ref()?;
-                        if b.boundary.parameters.get(axis)?.ty != c.ty { return None; }
-                        IntegerRelation::from_operator(&c.operator)?
-                            .accepts_closed(&range.low,&range.high,&c.bound).then_some(())
-                    };
-                    match directive.predicate.as_ref() {
-                        Some(CheckerPredicate::Integer(c)) => accepts(c)?,
-                        None => {
-                            let mut todo = vec![st.checker_ordinary_booleans.get(&expression)?];
-                            while let Some(p) = todo.pop() {
-                                match p {
-                                    CheckerOrdinaryBoolean::Integer(c) => accepts(c)?,
-                                    CheckerOrdinaryBoolean::And(pair) => todo.extend(pair.iter().rev()),
-                                    _ => return None,
-                                }
-                            }
+        for (&expression,directive) in &st.checker_directives {
+            if directive.operation != CheckerOperation::Require { return None; }
+            let inputs = self.refine_at_site(frame,expression,&parents,&mut known)??;
+            let accepts = |c: &super::super::checker_flow::IntegerPredicate| {
+                let axis = frame.ids.iter().position(|id| id == &c.binding)?;
+                let range = inputs.get(axis)?.as_ref()?;
+                if b.boundary.parameters.get(axis)?.ty != c.ty { return None; }
+                IntegerRelation::from_operator(&c.operator)?
+                    .accepts_closed(&range.low,&range.high,&c.bound).then_some(())
+            };
+            match directive.predicate.as_ref() {
+                Some(CheckerPredicate::Integer(c)) => accepts(c)?,
+                None => {
+                    let mut todo = vec![st.checker_ordinary_booleans.get(&expression)?];
+                    while let Some(p) = todo.pop() {
+                        match p {
+                            CheckerOrdinaryBoolean::Integer(c) => accepts(c)?,
+                            CheckerOrdinaryBoolean::And(pair) => todo.extend(pair.iter().rev()),
+                            _ => return None,
                         }
-                        _ => return None,
                     }
-                    covered.push(b.occurrences.get(expression.0)?.span);
-                    continue;
                 }
-                let (condition, yes, no) = match b.conditionals.get(&expression) {
-                    Some(ConditionalRegion::Unit { condition, then_block, .. }) => (*condition,*then_block,None),
-                    Some(ConditionalRegion::Value { condition, then_block, else_block, .. })
-                        if st.checked_types.expressions.get(&expression) == Some(&ScalarType::Unit) =>
-                        (*condition,*then_block,Some(*else_block)),
-                    _ => continue,
-                };
-                // A semantic unknown is not a narrow. Do not certify either
-                // arm on that test. No state is imported from another caller.
-                if let Some(row) = self.facts(&frame,condition,true,inputs.clone())? { blocks.push((yes,row)); }
-                if let Some(no) = no {
-                    if let Some(row) = self.facts(&frame,condition,false,inputs.clone())? { blocks.push((no,row)); }
-                }
+                _ => return None,
             }
+            covered.push(b.occurrences.get(expression.0)?.span);
         }
-        (covered.len() == st.checker_directives.len()).then_some(covered)
+        Some(covered)
     }
 
     #[cfg(test)]
@@ -402,6 +510,14 @@ impl<'a> PreparedEnvelopes<'a> {
         if !matches!(frame.body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool) { return None; }
         self.facts(&frame, frame.output(frame.body.structure.root)?, want, input)
     }
+}
+
+fn contained(outer: &Inputs, inner: &Inputs) -> bool {
+    outer.len() == inner.len() && outer.iter().zip(inner).all(|(limit,candidate)| match (limit,candidate) {
+        (Some(a),Some(b)) => b.low <= b.high && a.low <= b.low && a.high >= b.high,
+        (None,None) => true,
+        _ => false,
+    })
 }
 
 fn initial_inputs(body: &FunctionCallSites) -> Option<Inputs> {

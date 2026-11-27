@@ -20175,6 +20175,61 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn guarded_row_induction_authenticates_exact_seed_step_and_publish_site() {
+        let app = source("src/main.w", "terrain-row-monotone-incoming-envelope");
+        let program = r#"%%start
+            unit(i32,i32) publish = fn(x,z) {};
+            unit(i32,i32,i32) row = fn(x,z,east) {
+                if (x <= east) {
+                    if (z >= -32) { publish(x,z); };
+                    row(x+1,z,east);
+                };
+            };
+            unit() seed = fn { row(-32,12,39); };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),Vec::new())],[],vec![app.clone()],
+                ScalarPreparationInputs { target_layout },ScalarCheckerScope::CurrentPackage,Vec::new(),
+            ).unwrap().into_startup_authored_owner().unwrap();
+            let range = |low,high| Some(range_envelopes::Envelope { low:BigInt::from(low),high:BigInt::from(high) });
+            let invariant = vec![range(-32,40),range(-32,39),range(i32::MIN,39)];
+            for (text, expected) in [
+                (program.to_owned(),true),
+                (program.replace("x+1","x-1"),false),
+                (program.replace("row(-32,12,39)","row(-32,12,40)"),false),
+                (program.replace("row(-32,12,39)","row(-33,12,39)"),false),
+                (program.replace("unit() seed = fn { row(-32,12,39); };",
+                    "unit(i32) seed = fn(external) { row(external,12,39); };"),false),
+            ] {
+                let owner = prepare(&text);
+                let (project,calls) = owner.owner.parts();
+                let item = |name| project.modules[0].items.iter().position(|item|
+                    matches!(item,ScalarItem::Function(function) if function.name == name)).unwrap();
+                let (seed,row,publish) = ((0,item("seed")),(0,item("row")),(0,item("publish")));
+                let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
+                let parameters = calls.function_body(seed.0,seed.1,None).unwrap().boundary.parameters.len();
+                let entered = vec![range(i32::MIN,i32::MAX);parameters];
+                let incoming = envelopes.direct_edge_envelopes(seed,row,&entered).unwrap();
+                let [incoming] = incoming.as_slice() else { panic!("expected exact seed"); };
+                let checked = envelopes.guarded_self_induction(row,&invariant,incoming);
+                assert_eq!(checked.is_some(),expected);
+                if let Some(sites) = checked {
+                    let span = calls.function_body(row.0,row.1,None).unwrap().occurrences[sites[0].0].span;
+                    assert_eq!(span.start as usize,text.find("row(x+1,z,east)").unwrap());
+                    let projected = envelopes.direct_edge_envelopes(row,publish,&invariant).unwrap();
+                    let [edge] = projected.as_slice() else { panic!("expected exact original call"); };
+                    assert_eq!(edge.inputs.as_ref().unwrap(),&vec![range(-32,39),range(-32,39)]);
+                    let span = calls.function_body(row.0,row.1,None).unwrap().occurrences[edge.site.0].span;
+                    assert_eq!(span.start as usize,text.find("publish(x,z);").unwrap());
+                    assert!(envelopes.guarded_self_induction(row,&invariant,edge).is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn typed_guard_dag_uses_iterative_frames_and_distinct_outcome_keys() {
         let app = source("src/main.w", "typed-guard-dag-envelope");
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
