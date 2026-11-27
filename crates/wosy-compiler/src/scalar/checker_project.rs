@@ -2103,6 +2103,12 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     Ok(StartupLane::Feasible)
 }
 
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static OBSERVED_MATH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OBSERVED_MATH_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(feature = "internal-checker")]
 fn try_observed_projected_storage_call(
     actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
@@ -2222,12 +2228,22 @@ fn try_observed_projected_storage_call(
     // Scoped to this observed activation. Plan leaves never contain runtime
     // storage and are indexed by authenticated target identity and bits.
     let math_plans = RefCell::new(HashMap::new());
+    type MathMemo = (Vec<u32>, super::checker_flow::projected_f32::ExactF32, Option<usize>);
+    let latest_math = RefCell::new(HashMap::<PreparedCallable, MathMemo>::new());
     let math_traces = RefCell::new(Vec::<Rc<ordered_float_prefix::ObservedTrace>>::new());
     let math_interned = RefCell::new(HashMap::<Rc<ordered_float_prefix::ObservedTrace>,usize>::new());
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
         use std::collections::hash_map::Entry;
         let signature = body.checked_call_signatures.get(&site)?;
         let child = symbolic_math_effect_target(actual, target.0, body, site, signature)?;
+        let lookup_work = args.len().saturating_add(1);
+        if let Some((_, value, trace)) = latest_math.borrow().get(&child).filter(|(known, _, _)|
+            known.iter().copied().eq(args.iter().map(|value| value.0))) {
+            #[cfg(test)] OBSERVED_MATH_HITS.with(|count| count.set(count.get() + 1));
+            return Some((*value, *trace, lookup_work));
+        }
+        #[cfg(test)] OBSERVED_MATH_MISSES.with(|count| count.set(count.get() + 1));
+        let bits = args.iter().map(|arg| arg.0).collect();
         let mut plans = math_plans.borrow_mut();
         let (plan, root): &mut (ordered_float_prefix::PrefixCertificate, ordered_float_prefix::FunctionEffects) = match plans.entry(child) {
             Entry::Occupied(plan) => plan.into_mut(),
@@ -2235,7 +2251,7 @@ fn try_observed_projected_storage_call(
         };
         if args.len() != root.formals.len() || !root.formals.iter().all(|(_, ty)| *ty == ScalarType::F32) { return None; }
         let values = root.formals.iter().zip(args).map(|((id,_),value)| (id.clone(), ObservedExactValue::F32(value))).collect();
-        let mut work = 0;
+        let mut work = lookup_work;
         let (returned, nested) = ordered_float_prefix::evaluate_observed_prefix(plan, Some(root), values,
             |_,_,_| None, trace.is_some(), &mut work, |owner,at| {
                 if owner.0 != target.0 { return None; }
@@ -2251,6 +2267,7 @@ fn try_observed_projected_storage_call(
                 id
             })
         });
+        latest_math.borrow_mut().insert(child, (bits, *value, trace));
         Some((*value,trace,work))
     };
     let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
@@ -20035,24 +20052,33 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
         %%end"#;
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            for (route, expected) in [("present_pose(0,1.0); present_pose(0,0.5);", 37),
-                ("present_pose(0,0.5); present_pose(0,1.0);", 19), ("present_pose(0,1.0); present_pose(1,0.5);", 19)] {
+            for (route, expected, writes, hits, misses) in [
+                ("present_pose(0,1.0); present_pose(0,0.5);", 37, 5, 1, 2),
+                ("present_pose(0,0.5); present_pose(0,1.0);", 19, 5, 1, 2),
+                ("present_pose(0,1.0); present_pose(1,0.5);", 19, 5, 1, 2),
+                ("present_pose(0,0.5); present_pose(0,0.75); present_pose(0,0.5);", 37, 7, 3, 6),
+            ] {
                 let text = program.replace("present_pose(0,1.0); present_pose(0,0.5);", route);
                 let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
                     vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
                     ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
                 ).unwrap();
                 let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+                OBSERVED_MATH_HITS.with(|count| count.set(0));
+                OBSERVED_MATH_MISSES.with(|count| count.set(0));
                 let report = prepare().run().unwrap();
                 let touches = super::super::checker_flow::take_observed_storage_delta_visits();
-                assert_eq!(touches, 5*17);
+                assert_eq!(touches, writes*17);
+                assert_eq!(OBSERVED_MATH_HITS.with(|count| count.get()), hits);
+                assert_eq!(OBSERVED_MATH_MISSES.with(|count| count.get()), misses);
                 let (capped, _, trace, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
                 assert_eq!(capped, report.directives);
                 assert_eq!(capped[0].code(), &BigInt::from(expected));
-                let nested = "wrap(poses[lane].heading-prev_heading)";
-                let start = text.find(nested).unwrap() as u32;
-                assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start+nested.len() as u32))));
-                eprintln!("observed mixed pose route={route} out={expected} sparse visits={touches}");
+                for call in ["wrap(poses[lane].heading-prev_heading)", "wrap(prev_heading+wrap(poses[lane].heading-prev_heading)*alpha)"] {
+                    let start = text.find(call).unwrap() as u32;
+                    assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start+call.len() as u32))));
+                }
+                eprintln!("observed mixed pose route={route} out={expected} sparse visits={touches} math_hits={hits} math_misses={misses}");
             }
         }
     }

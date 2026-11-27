@@ -624,10 +624,33 @@ pub(in super::super) enum ObservedStep {
     Call { site: SourceSpan, nested: usize },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(in super::super) struct ObservedTrace {
     pub(super) root: Vec<ObservedStep>,
     pub(super) segments: Vec<Vec<ObservedStep>>,
+    pub(super) physical_cost: usize,
+    fingerprint: u64,
+}
+
+impl ObservedTrace {
+    fn new(root: Vec<ObservedStep>, segments: Vec<Vec<ObservedStep>>, work: &mut usize) -> Option<Self> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let physical_cost = segments.iter().fold(root.len().saturating_add(1), |cost, child|
+            cost.saturating_add(child.len()).saturating_add(1));
+        super::super::checker_flow::charge_call_work(work, physical_cost)?;
+        let mut digest = DefaultHasher::new();
+        root.hash(&mut digest);
+        segments.hash(&mut digest);
+        Some(Self { root, segments, physical_cost, fingerprint: digest.finish() })
+    }
+}
+
+impl std::hash::Hash for ObservedTrace {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Fingerprint accelerates lookup; derived Eq still compares the exact
+        // canonical root and segments when hashes collide.
+        state.write_u64(self.fingerprint);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -850,7 +873,7 @@ pub(super) fn evaluate_observed_prefix(
     let trace = if let Some(mut stack) = trace_stack {
         let root = stack.pop()?;
         if !stack.is_empty() { return None; }
-        Some(ObservedTrace { root, segments })
+        Some(ObservedTrace::new(root, segments, work)?)
     } else { None };
     Some((published, trace))
 }

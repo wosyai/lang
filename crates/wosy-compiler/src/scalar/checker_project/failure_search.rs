@@ -154,8 +154,7 @@ impl StartUpSearch {
 
     pub(in super::super) fn append(&mut self, step: PathStep) -> Option<()> {
         let cost = if let PathStep::ObservedPrefix(trace) = &step {
-            trace.root.len().checked_add(trace.segments.iter().try_fold(1usize, |count, segment|
-                count.checked_add(segment.len().checked_add(1)?))?)?
+            trace.physical_cost
         } else { 1 };
         super::super::checker_flow::charge_call_work(&mut self.work, cost)?;
         self.prefix.push(step);
