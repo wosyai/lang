@@ -103,11 +103,13 @@ fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'
 }
 
 pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
-    mut place: impl FnMut(&Place<'a>), mut core: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
+    mut place: impl FnMut(&Place<'a>), mut core: impl FnMut(OccurrenceOrdinal),
+    mut local: impl FnMut(&'a ReferenceBindingId, &'a ScalarType)) -> Option<()> {
     let mut todo = vec![at];
     while let Some(at) = todo.pop() {
         match expression(calls,at)? {
-            Expr::Literal(_) | Expr::Lexical(..) => {}
+            Expr::Literal(_) => {}
+            Expr::Lexical(binding,ty) => local(binding,ty),
             Expr::Module(value) => {
                 place(&value);
                 if let Some((_,i)) = value.index { todo.push(i); }
@@ -188,8 +190,8 @@ impl Write<'_> {
 
     pub(super) fn reads<'a>(&'a self,calls: &'a FunctionCallSites,
         mut place: impl FnMut(&Place<'a>),mut core: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
-        sites(calls,self.right,&mut place,&mut core)?;
-        if let Some((_,i)) = self.place.index { sites(calls,i,place,core)?; }
+        sites(calls,self.right,&mut place,&mut core,|_,_| {})?;
+        if let Some((_,i)) = self.place.index { sites(calls,i,place,core,|_,_| {})?; }
         Some(())
     }
 }

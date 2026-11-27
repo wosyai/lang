@@ -7974,8 +7974,13 @@ impl IntegerInputs {
         roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
         if roots.callable_history.is_none() { return Some(None); }
         let Some(guard) = observed_boolean_inputs(calls, condition) else { return Some(None); };
-        if (guard.integer && roots.observed_float_field_read.is_none())
-            || (!guard.integer && guard.reads.is_empty()) { return Some(None); }
+        if guard.integer && roots.observed_float_field_read.is_none() { return Some(None); }
+        // A source-backed predicate must either consume its current cells or
+        // decline. Pure predicates, however, already have a symbolic route;
+        // do not preempt it when a participating lexical lane is not exact.
+        if guard.reads.is_empty() && (!guard.integer || !observed_locals_are_singletons(roots, self, &guard.locals)) {
+            return Some(None);
+        }
         let mut rows = [Self::default(), Self::default()];
         for mut row in self.0.iter().cloned() {
             let selected = evaluate_observed_boolean(calls, condition, roots, &mut row)?;
@@ -9515,7 +9520,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             if roots.observed_float_field_read.is_some() {
                                 if let Some(identity) = structure.projected_integer_locals.get(&(block, item.position)) {
-                                    if observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}).is_some() {
+                                    let mut backed = false;
+                                    let mut locals = Vec::new();
+                                    if observed_integer::sites(calls, outputs.primary, |_| backed = true, |_| {},
+                                        |binding, ty| locals.push((binding, ty))).is_some()
+                                        && (backed || observed_locals_are_singletons(roots, &path, &locals)) {
                                         for row in &mut path.0 {
                                             let value = observed_integer::evaluate(calls, outputs.primary, roots, row)?;
                                             row.cells.push(Rc::new(IntegerSet::singleton(&value)));
@@ -12405,10 +12414,10 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                             || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
                     } else if calls.structure.projected_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position))
-                        && observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}).is_some() {
+                        && observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}, |_,_| {}).is_some() {
                         observed_integer::sites(calls, outputs.primary, |place| {
                             covered.insert((place.declaration.clone(), place.site, place.role()));
-                        }, |at| { scalar_calls.insert(at); })?;
+                        }, |at| { scalar_calls.insert(at); }, |_,_| {})?;
                     } else if receiver.ty == ScalarType::F32 && calls.structure.projected_f32_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) {
                         observed_float_expr_sites(calls, outputs.primary, |field| {
                             covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
@@ -12469,17 +12478,18 @@ fn observed_boolean_node(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> 
 }
 
 #[cfg(feature = "internal-checker")]
-struct ObservedBooleanInputs {
+struct ObservedBooleanInputs<'a> {
+    locals: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     reads: Vec<(wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole)>,
     calls: Vec<OccurrenceOrdinal>,
     integer: bool,
 }
 
 #[cfg(feature = "internal-checker")]
-fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdinal) -> Option<ObservedBooleanInputs> {
+fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdinal) -> Option<ObservedBooleanInputs<'_>> {
     use super::reference::ModuleStorageRole;
     let mut todo = vec![condition];
-    let mut inputs = ObservedBooleanInputs { reads: Vec::new(), calls: Vec::new(), integer: false };
+    let mut inputs = ObservedBooleanInputs { locals: Vec::new(), reads: Vec::new(), calls: Vec::new(), integer: false };
     while let Some(site) = todo.pop() {
         match observed_boolean_node(calls, site)? {
             ObservedBoolean::Module(declaration) => inputs.reads.push((declaration.clone(), site, ModuleStorageRole::Read)),
@@ -12489,14 +12499,71 @@ fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdin
                 for operand in [left, right] {
                     observed_integer::sites(calls, operand, |place| {
                         inputs.reads.push((place.declaration.clone(), place.site, place.role()));
-                    }, |at| inputs.calls.push(at))?;
+                    }, |at| inputs.calls.push(at), |binding,ty| inputs.locals.push((binding,ty)))?;
                 }
             }
             ObservedBoolean::ShortCircuit { left, right, .. } => { todo.push(right); todo.push(left); }
-            ObservedBoolean::Literal(_) | ObservedBoolean::Lexical(_) => {}
+            ObservedBoolean::Literal(_) => {}
+            ObservedBoolean::Lexical(binding) => inputs.locals.push((binding, &ScalarType::Bool))
         }
     }
     Some(inputs)
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_locals_are_singletons(roots: &IntegerRoots<'_>, path: &IntegerInputs,
+    locals: &[(&ReferenceBindingId, &ScalarType)]) -> bool {
+    locals.iter().all(|(binding, ty)| {
+        let Some((axis, actual)) = roots.lookup(binding) else { return false; };
+        actual == *ty && path.0.iter().all(|row| row.get(axis).and_then(|cell| cell.singleton_value()).is_some())
+    })
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn assert_observed_guard_partition(calls: &FunctionCallSites) {
+    let boundary = &calls.boundary;
+    let [parameter] = boundary.parameters.as_slice() else { panic!("one integer input"); };
+    let [binding] = boundary.checker_parameter_bindings.as_deref().unwrap()
+        else { panic!("one checked input identity"); };
+    let mut evaluations = calls.structure.blocks[calls.structure.root.0].items.iter().map(|item| {
+        let BlockItemKind::Evaluation { expression } = item.kind else { panic!("expected conditional"); };
+        match calls.conditionals.get(&expression).unwrap() {
+            ConditionalRegion::Unit { condition, .. } | ConditionalRegion::Value { condition, .. } => *condition,
+        }
+    });
+    let pure = evaluations.next().unwrap();
+    let with_storage = evaluations.next().unwrap();
+    assert!(evaluations.next().is_none());
+    let work = std::cell::Cell::new(0);
+    let history = std::cell::RefCell::new(CallableHistories {
+        shared: true, work: &work, nodes: Vec::new(), interned: HashMap::new(),
+        outgoing_call: None, scalar_return_steps: None, unit_return_arity: None,
+        unit_return_paths: None, received_unit_paths: None, step_owner: None, stopped: false,
+    });
+    let mut roots = IntegerRoots {
+        callable_history: Some(&history),
+        observed_float_field_read: Some(&|_,_| None),
+        ..IntegerRoots::default()
+    };
+    roots.add(binding, &parameter.ty);
+    let storage = Rc::new(ProjectedStorage::default());
+    let path = |input| {
+        let mut row = IntegerRow::new(vec![Rc::new(input)]);
+        row.storage = Some(Rc::clone(&storage));
+        IntegerInputs(vec![row])
+    };
+    let interval = path(IntegerSet::from_type(&parameter.ty).unwrap());
+    assert!(matches!(interval.observed_boolean_guard(calls, pure, &roots), Some(None)));
+    assert_eq!(work.get(), 0);
+    let [no, yes] = interval.callable_compound_branch(calls, pure, &roots, [true,true]).unwrap().unwrap();
+    for value in 0..=15i32 {
+        assert_eq!(yes.includes_signed(&[value]), (7..11).contains(&value));
+        assert_eq!(no.includes_signed(&[value]), !(7..11).contains(&value));
+    }
+    let exact = path(IntegerSet::singleton(&8.into()));
+    assert!(matches!(exact.observed_boolean_guard(calls, pure, &roots), Some(Some(_))));
+    // The same exact local does not authorize guessing the unavailable source slot.
+    assert!(exact.observed_boolean_guard(calls, with_storage, &roots).is_none());
 }
 
 #[cfg(feature = "internal-checker")]

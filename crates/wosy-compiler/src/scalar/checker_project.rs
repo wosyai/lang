@@ -23914,6 +23914,31 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_guards_preserve_symbolic_local_partitions_but_never_guess_storage() {
+        let app = source("src/main.w", "observed-pure-symbolic-guard");
+        let program = r#"%%start
+            i32 stored = 1;
+            unit(i32) update = fn(value) {
+                if (value >= 7 && value < 11) { stored = 8; };
+                if (value >= 7 && stored > 0) { stored = 9; };
+            };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let PreparedConfiguredCheck::Plain { owner, .. } = &prepared.owner
+                else { panic!("expected plain checked project"); };
+            let (project, calls) = owner.parts();
+            let (item, _) = project.modules[0].items.iter().enumerate()
+                .find(|(_, item)| matches!(item, ScalarItem::Function(f) if f.name == "update")).unwrap();
+            super::super::checker_flow::assert_observed_guard_partition(calls.function_body(0, item, None).unwrap());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn observed_partition_preserves_published_integer_cells_on_failed_path() {
         let app = source("src/main.w", "observed-partition-selected-cells");
         let program = r#"%%start
