@@ -8267,6 +8267,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         };
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
+                #[cfg(feature = "internal-checker")]
+                if roots.callable_history.is_some() && structure.checked_types.expressions.get(&expression)
+                    .is_some_and(|ty| is_integer_type(ty) || matches!(ty, ScalarType::F32 | ScalarType::F64))
+                    && matches!(calls.prepared_plain_name(expression), Some(PlainNameIdentity::Lexical(id))
+                        if calls.boundary.checker_parameter_bindings.as_deref().is_some_and(|bindings| bindings.contains(id))) {
+                    // A discarded by-value numeric formal is a read, not a branch or call.
+                    continue;
+                }
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     // Expand only after enclosing guards have narrowed the
                     // source. No witness may use independent marginals.
