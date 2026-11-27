@@ -98,6 +98,12 @@ pub struct RootedLlvmPartition {
     pub grammar_verification: Duration,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecutableReceiptPolicy {
+    Derivation,
+    ComparisonOnly,
+}
+
 #[derive(Default)]
 struct ProjectionEvidence {
     grammar: VerifiedGrammarBatch,
@@ -246,13 +252,12 @@ impl SourceStore {
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
         let identity = if executable { RootedLlvmIdentity::Executable } else { RootedLlvmIdentity::Authored };
-        let (answer, builder) = match self.plan_scalar(&tx, grant.root, profile, limits, identity)? {
+        let (answer, builder) = match self.plan_scalar_with_receipts(&tx, grant.root, profile, limits, identity, ExecutableReceiptPolicy::ComparisonOnly)? {
             ScalarPlanning::Unsupported(reason) => (RootedLlvmProjection::Unsupported(reason), None),
             ScalarPlanning::Ready(mut plan) => {
                 // Only framed experimental V3 uses new symbol identities.
                 // Do not look up or install internal executable receipts.
                 plan.stable_symbols = executable;
-                plan.receipt_key = None;
                 let witness = if builder_inputs {
                     let runtime = wosy_compiler::core_runtime(&plan.backend, &plan.output)?;
                     Some(OrdinaryLlvmBuilderWitness {
@@ -323,6 +328,13 @@ impl SourceStore {
         &self, tx: &surrealkv::Transaction, root: NodeId, profile: String,
         limits: BaseCstAdmissionLimits, identity: RootedLlvmIdentity,
     ) -> Result<ScalarPlanning> {
+        self.plan_scalar_with_receipts(tx, root, profile, limits, identity, ExecutableReceiptPolicy::Derivation)
+    }
+
+    fn plan_scalar_with_receipts(
+        &self, tx: &surrealkv::Transaction, root: NodeId, profile: String,
+        limits: BaseCstAdmissionLimits, identity: RootedLlvmIdentity, receipts: ExecutableReceiptPolicy,
+    ) -> Result<ScalarPlanning> {
         use RootedLlvmUnsupported as Unsupported;
 
         let mut imports = limits.graph_edges;
@@ -347,7 +359,7 @@ impl SourceStore {
         // The admitted index fixes the same first-discovery order and
         // ordered destinations as the ordinary project source loader.
         let order = RootedOrder::from_parts(&config.entry, index.modules, index.files, index.module_edges);
-        let receipt_key = (identity == RootedLlvmIdentity::Executable).then(|| {
+        let receipt_key = (identity == RootedLlvmIdentity::Executable && receipts == ExecutableReceiptPolicy::Derivation).then(|| {
             ExecutableLlvmKey::new(image, config_id, executable, dependencies, &profile, &order)
         });
         let layout = ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment };
