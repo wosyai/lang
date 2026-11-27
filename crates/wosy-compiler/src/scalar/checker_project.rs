@@ -22642,6 +22642,29 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_initializer_runs_nested_frames_that_grow_unique_storage_slots() {
+        let app = source("src/main.w", "startup-nested-growing-state");
+        for depth in [8usize, 32] {
+            let elements = std::iter::repeat_n("8", depth).collect::<Vec<_>>().join(",");
+            let mut program = format!("%%start\ni16 status = 5; i16[{depth}] checkpoints = [{elements}];\n");
+            for cell in (0..depth).rev() {
+                let nested = if cell + 1 < depth { format!("layer{}();", cell + 1) } else { String::from("status = 37;") };
+                program.push_str(&format!("unit() layer{cell} = fn {{ checkpoints[{cell}] = {}; {nested} }};\n", 64 + cell));
+            }
+            program.push_str(r#"layer0(); core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];}); %%end"#);
+            let owner = prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, &program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let ordinary = owner.run().unwrap();
+            assert_eq!(ordinary.directives.len(), 1);
+            assert_eq!(ordinary.directives[0].code(), &BigInt::from(37));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn startup_module_output_captures_only_successfully_initialized_values() {
         let app = source("src/main.w", "startup-module-selected-output");
         let program = r#"%%start

@@ -1772,13 +1772,19 @@ struct ClosedRadixAxes {
 }
 
 #[cfg(feature = "internal-checker")]
+mod storage_delta;
+
+#[cfg(feature = "internal-checker")]
+use storage_delta::StorageDelta;
+
+#[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProjectedStorage {
     // Whole cells are immutable until a write on this symbolic path.
     // A canonical prepared declaration, not a spelling, identifies the allocation.
     scalars: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<IntegerSet>)>>,
     fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
-    changes: HashMap<(wosy_syntax::SourceSpan, Option<usize>), Rc<IntegerSet>>,
+    changes: StorageDelta,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1800,7 +1806,7 @@ impl ProjectedStorage {
     }
 
     pub(super) fn settle(&mut self, mut touched: impl FnMut(&wosy_syntax::SourceSpan, Option<usize>, &BigInt) -> Option<()>) -> Option<()> {
-        for ((declaration, index), value) in std::mem::take(&mut self.changes) {
+        for ((declaration, index), value) in std::mem::take(&mut self.changes).into_entries() {
             touched(&declaration, index, value.singleton_value()?)?;
             if let Some(index) = index {
                 let (_, array) = Rc::get_mut(&mut self.fixed_arrays)?.get_mut(&declaration)?;
