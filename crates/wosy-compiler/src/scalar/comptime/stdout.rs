@@ -193,10 +193,9 @@ fn prepare(
         Delivery::Wasip1 { max_authored_source_bytes, .. } => max_authored_source_bytes,
         _ => CLOSED_COMPTIME_MAX_SOURCE_BYTES,
     };
-    for (ordinal, (fresh, _)) in sources.iter().enumerate() {
+    for (fresh, _) in &sources {
         if !fresh.result().is_valid() { return Err(Error::InvalidParse); }
         let size = fresh.result().text.len();
-        if ordinal == 0 && size > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
         remaining = remaining.checked_sub(size).ok_or(Error::SourceLimit)?;
     }
     let parsed = (*entry).result();

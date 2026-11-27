@@ -756,11 +756,6 @@ std.utf8[2] result = comptime prepare {
     assert!(matches!(&oversized, Err(ClosedComptimePlanError::Project(message))
         if message == "preview source exceeds the authored byte budget"),
         "aggregate source budget control returned {:?}", oversized.err());
-    // The old authored-site cap still applies to the exact entry file,
-    // not to the individually larger std bootstrap proved above.
-    fs::write(&source, format!("{}{}", " ".repeat(1 << 16), direct)).unwrap();
-    assert!(matches!(assemble(256), Err(ClosedComptimePlanError::Project(message))
-        if message == "preview source exceeds the authored byte budget"));
     assert!(!project.join(".wosy").exists());
 }
 
@@ -780,17 +775,20 @@ fn retained_wasip1_watch_inputs_distinguish_source_and_watch_changes() {
         MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\""));
     fixture.manifest(&manifest);
     let src = project.join("src/main.w");
-    let text = "%%start\nu32 value = comptime prepare { u32 seed = 7; seed ^ 9 };\n%%end\n";
-    fs::write(&src, text).unwrap();
+    let text = format!("%%start\nu32 value = comptime prepare {{ u32 seed = 7; seed ^ 9 }};\n{}\n%%end\n",
+        " ".repeat(1 << 16));
+    fs::write(&src, &text).unwrap();
     let assets = project.join("assets");
     fs::create_dir(&assets).unwrap();
     let watched = assets.join("input.txt");
     fs::write(&watched, "first").unwrap();
-    let selection = Wasip1ComptimeInputSelection {
-        target: "app", profile: "override", id: "prepare", max_authored_source_bytes: 1 << 17,
+    let selection = |max_authored_source_bytes| Wasip1ComptimeInputSelection {
+        target: "app", profile: "override", id: "prepare", max_authored_source_bytes,
         max_stdout_bytes: 256, watch_limits: ComptimeWatchLimits::default(),
     };
-    let (prepared, inputs) = prepare_wasip1_comptime_inputs(&project, selection).unwrap();
+    let denied = prepare_wasip1_comptime_inputs(&project, selection(text.len() - 1)).err().unwrap();
+    assert!(denied.to_string().contains("authored byte budget"));
+    let (prepared, inputs) = prepare_wasip1_comptime_inputs(&project, selection(text.len())).unwrap();
     let ordinary = prepare(&project, Some("app"), None).unwrap();
     assert_eq!((prepared.parsed, prepared.reused), (1, 0));
     assert_eq!(prepared.root, inputs.source_root());
@@ -802,8 +800,11 @@ fn retained_wasip1_watch_inputs_distinguish_source_and_watch_changes() {
     let mut captured = Vec::new();
     let observed = inputs.write_evaluator_ir(&mut captured, 1 << 16).unwrap();
     let mut direct = Vec::new();
-    let single = prepare_project_comptime_wasip1_stdout_evaluator(
-        &project, "app", "override", "prepare", 1 << 17, 256).unwrap();
+    let observe = |limit| prepare_project_comptime_wasip1_stdout_evaluator(
+        &project, "app", "override", "prepare", limit, 256);
+    assert!(matches!(observe(text.len() - 1), Err(ClosedComptimePlanError::Project(message))
+        if message.contains("authored byte budget")));
+    let single = observe(text.len()).unwrap();
     assert_eq!(single.write_evaluator_ir(&mut direct, 1 << 16).unwrap(), observed);
     assert_eq!(captured, direct);
 
@@ -828,7 +829,7 @@ fn retained_wasip1_watch_inputs_distinguish_source_and_watch_changes() {
     // Do not attempt to parse a changed live revision to decide freshness.
     fs::write(&src, "not a Wosy module").unwrap();
     assert_eq!(current(), SourceOrConfigurationChanged);
-    fs::write(&src, text).unwrap();
+    fs::write(&src, &text).unwrap();
     assert_eq!(current(), Unchanged);
     fixture.manifest(&manifest.replace("selected evaluator toolchain", "changed tool declaration"));
     assert_eq!(current(), SourceOrConfigurationChanged);

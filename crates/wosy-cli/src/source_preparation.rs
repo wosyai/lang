@@ -451,17 +451,15 @@ fn prepare_from_observation(
     let (mut parsed, mut reused) = (0, 0);
     let mut files = Files::new();
     let mut wasm_fresh = wasip1.map(|_| BTreeMap::new());
-    let mut wasm_remaining = wasip1.map(|selection| (selection.max_authored_source_bytes, true));
+    let mut wasm_remaining = wasip1.map(|selection| selection.max_authored_source_bytes);
     let singleton = watch.as_ref().is_some_and(|selection| selection.owner.is_none());
     let graph = project_sources::load_with_reader(&project, &ctx, &cfg, |path, opened| match live.as_mut() {
         Some(reader) => reader.observe(path, opened).map(|id| (id, None)).map_err(ObservationError::LiveRead),
         None if wasm_remaining.is_some() => {
             #[cfg(target_os = "linux")]
             {
-                let (remaining, entry) = wasm_remaining.as_mut().expect("WASI source observation");
-                let limit = if std::mem::take(entry) { (*remaining).min(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES) }
-                    else { *remaining };
-                let (revision, text) = project_sources::read_bounded_regular_source(path, opened, limit)?;
+                let remaining = wasm_remaining.as_mut().expect("WASI source observation");
+                let (revision, text) = project_sources::read_bounded_regular_source(path, opened, *remaining)?;
                 *remaining -= text.len();
                 Ok((revision, Some(text)))
             }

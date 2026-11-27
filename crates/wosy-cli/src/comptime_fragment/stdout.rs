@@ -100,15 +100,9 @@ fn observe_project<T>(
     let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
     let mut remaining = wasip1_source_limit.unwrap_or(CLOSED_COMPTIME_MAX_SOURCE_BYTES);
-    let mut is_entry = true;
     let mut authored = BTreeMap::new();
     let graph = project_sources::load_with_reader(&root, &context, &configuration, |path, opened| {
-        // The selected closed evaluator retains its per-entry ceiling.
-        // Every ordinary reachable source consumes the same graph budget.
-        let limit = if std::mem::take(&mut is_entry) {
-            remaining.min(CLOSED_COMPTIME_MAX_SOURCE_BYTES)
-        } else { remaining };
-        let (revision, text) = project_sources::read_bounded_regular_source(path, opened, limit)
+        let (revision, text) = project_sources::read_bounded_regular_source(path, opened, remaining)
             .map_err(ClosedComptimePlanError::Project)?;
         remaining -= text.len();
         Ok((revision, text))
