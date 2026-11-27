@@ -5562,6 +5562,14 @@ fn projected_unit_operands<'a>(
             operands.push(CallableHistoryOperand::Exact((parameter,value)));
             continue;
         }
+        if row.has_projected_storage() {
+            let (argument,ty) = checked_scalar_call_argument_at(&calls.structure,expression,slot,false,false)?;
+            if ty != parameter { return None; }
+            if let Some(value) = calls.structure.prepared_range_literals.get(&argument) {
+                operands.push(CallableHistoryOperand::Exact((ty,value)));
+                continue;
+            }
+        }
         let operand = match nested_integer_operand(calls, expression, slot, roots, path, false, Some(work))? {
             NestedIntegerOperand::Exact((ty, value)) if ty == parameter => CallableHistoryOperand::Exact((ty, value)),
             NestedIntegerOperand::Axis(ty, axis) if ty == parameter => CallableHistoryOperand::Axis(ty, axis),
