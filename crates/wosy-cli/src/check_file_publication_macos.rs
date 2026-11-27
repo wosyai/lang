@@ -57,6 +57,10 @@ fn output_directory(parent: impl AsFd, name: &str) -> io::Result<OwnedFd> {
 
 impl Stage {
     fn new(parent: OwnedFd) -> io::Result<Self> {
+        Self::prepare(parent, make_stage_acl_private)
+    }
+
+    fn prepare(parent: OwnedFd, make_acl_private: impl FnOnce(&OwnedFd) -> io::Result<()>) -> io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let name = loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -70,9 +74,13 @@ impl Stage {
         let directory = open_directory(&parent, name.as_str())?;
         let stage = Self { parent, directory, name, files: Vec::new() };
         let metadata = fs::fstat(&stage.directory)?;
-        if metadata.st_uid != geteuid().as_raw() || metadata.st_mode & 0o077 != 0
+        if metadata.st_uid != geteuid().as_raw()
             || metadata.st_dev != fs::fstat(&stage.parent)?.st_dev
         {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "check staging directory is not private"));
+        }
+        make_acl_private(&stage.directory)?;
+        if fs::fstat(&stage.directory)?.st_mode & 0o077 != 0 {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "check staging directory is not private"));
         }
         Ok(stage)
@@ -209,6 +217,89 @@ fn preflight_clone_volume(_: &OwnedFd) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+mod stage_acl {
+    use super::OwnedFd;
+    use std::{ffi::c_void, io, os::fd::AsRawFd, ptr};
+
+    // Values from Darwin <sys/fcntl.h> and <sys/acl.h>.
+    const FILESEC_ACL: libc::c_int = 5;
+    const FILESEC_REMOVE_ACL: *mut c_void = ptr::without_provenance_mut(1);
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_fd(fd: libc::c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: libc::c_int, entry: *mut *mut c_void) -> libc::c_int;
+        fn acl_free(acl: *mut c_void) -> libc::c_int;
+        fn filesec_init() -> *mut c_void;
+        fn filesec_set_property(filesec: *mut c_void, property: libc::c_int, value: *const c_void) -> libc::c_int;
+        fn fchmodx_np(fd: libc::c_int, filesec: *mut c_void) -> libc::c_int;
+        fn filesec_free(filesec: *mut c_void);
+    }
+
+    pub(super) fn has_entries(descriptor: &impl AsRawFd) -> io::Result<bool> {
+        // SAFETY: the descriptor is live, and the returned ACL is freed here.
+        unsafe {
+            let acl = acl_get_fd(descriptor.as_raw_fd());
+            if acl.is_null() {
+                let error = io::Error::last_os_error();
+                return if error.raw_os_error() == Some(libc::ENOENT) { Ok(false) } else { Err(error) };
+            }
+            if acl == FILESEC_REMOVE_ACL {
+                return Ok(false);
+            }
+            let mut entry = ptr::null_mut();
+            let status = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry);
+            let result = if status == 0 {
+                Ok(true)
+            } else {
+                let error = io::Error::last_os_error();
+                // Darwin reports EINVAL for the first entry of a valid empty ACL.
+                if error.raw_os_error() == Some(libc::EINVAL) { Ok(false) } else { Err(error) }
+            };
+            acl_free(acl);
+            result
+        }
+    }
+
+    pub(super) fn clear(directory: &OwnedFd) -> io::Result<()> {
+        // The descriptor form of Apple's chmod -N, restricted to our empty stage.
+        // SAFETY: the descriptor is live, FILESEC_REMOVE_ACL is the Darwin sentinel,
+        // and the initialized filesec lives until both calls finish.
+        unsafe {
+            let filesec = filesec_init();
+            if filesec.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let result = if filesec_set_property(filesec, FILESEC_ACL, FILESEC_REMOVE_ACL) != 0
+                || fchmodx_np(directory.as_raw_fd(), filesec) != 0
+            {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            };
+            filesec_free(filesec);
+            result
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn make_stage_acl_private(directory: &OwnedFd) -> io::Result<()> {
+    if stage_acl::has_entries(directory)? {
+        stage_acl::clear(directory)?;
+        if stage_acl::has_entries(directory)? {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "check staging directory still has ACL entries"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn make_stage_acl_private(_: &OwnedFd) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn publish_from_descriptor(payload: &File, destination: &OwnedFd, request: &Path) -> io::Result<()> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
@@ -270,6 +361,48 @@ mod tests {
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Unsupported);
         assert_eq!(fs::read_dir(output.join("check")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(output).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_privacy_failure_leaves_no_stage_or_payload() {
+        let root = temp();
+        let parent = open_directory(rustix::fs::CWD, &root).unwrap();
+        let result = Stage::prepare(parent, |fd| {
+            let dir = rustix::fs::Dir::read_from(fd).unwrap();
+            for entry in dir {
+                assert!(matches!(entry.unwrap().file_name().to_bytes(), b"." | b".."));
+            }
+            Err(io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inherited_acl_is_removed_only_from_stage() {
+        let root = temp();
+        let output = root.join(".wosy/outputs");
+        fs::create_dir_all(&output).unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read,execute,file_inherit,directory_inherit"])
+            .arg(&output)
+            .status().unwrap();
+        assert!(status.success());
+
+        let report = Path::new("report.json");
+        let files = PreparedFiles::new(&root, &[(report, b"complete")]).unwrap();
+        assert!(stage_acl::has_entries(&files.destination).unwrap());
+        assert!(stage_acl::has_entries(&files._stage.parent).unwrap());
+        assert!(!stage_acl::has_entries(&files._stage.directory).unwrap());
+        assert!(!stage_acl::has_entries(&files.payloads[0]).unwrap());
+
+        files.publish(&files.payloads[0], report).unwrap();
+        let published = OwnedFd::from(File::open(output.join("check").join(report)).unwrap());
+        assert!(stage_acl::has_entries(&published).unwrap());
+        drop(files);
         fs::remove_dir_all(root).unwrap();
     }
 
