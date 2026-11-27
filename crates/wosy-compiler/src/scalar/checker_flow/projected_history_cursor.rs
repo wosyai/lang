@@ -68,6 +68,7 @@ enum Outcome<'a> { Park(ExactCallEffect<'a>), Return(CallableHistoryCall) }
 pub(in super::super) fn drive_finite_history<'p>(
     root: Target, work: &Cell<usize>, observed: &Cell<bool>,
     mut actual_storage: Option<(&mut Rc<ProjectedStorage>, &mut dyn FnMut(Vec<CallableHistoryStep>) -> Option<()>)>,
+    observed_prefix: &[(&'p ReferenceBindingId, &'p ScalarType, super::super::checker_project::ObservedExactValue)],
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
     mut record: impl FnMut(Target, IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
@@ -83,7 +84,28 @@ pub(in super::super) fn drive_finite_history<'p>(
         row.storage = Some(Rc::clone(storage));
         Some(CallableHistoryEntry(row))
     } else { None };
-    let mut stack = vec![Frame { target: root, machine: Machine::enter(body, &histories, entry)?, pending: None }];
+    let mut machine = Machine::enter(body, &histories, entry)?;
+    if !observed_prefix.is_empty() {
+        if actual_storage.is_none() { return None; }
+        let Machine::Unit { roots, block } = &mut machine else { return None; };
+        let [row] = block.path.0.as_mut_slice() else { return None; };
+        for (id, ty, value) in observed_prefix {
+            if value.ty() != **ty { return None; }
+            use super::super::checker_project::ObservedExactValue;
+            let value = match value {
+                ObservedExactValue::Boolean(b) => BigInt::from(u8::from(*b)),
+                ObservedExactValue::Integer(_, value) => value.clone(),
+                // Readonly Float results are already consumed by the exact prefix.
+                // Later reads are not assumed: they remain unsupported in the suffix.
+                ObservedExactValue::F32(_) => continue,
+            };
+            roots.add(id, ty);
+            row.cells.push(Rc::new(IntegerSet::singleton(&value)));
+        }
+        roots.ordinary_comparison_work.get_or_insert(0);
+        block.next = observed_prefix.len();
+    }
+    let mut stack = vec![Frame { target: root, machine, pending: None }];
     loop {
         let frame = stack.last_mut()?;
         let target = frame.target;

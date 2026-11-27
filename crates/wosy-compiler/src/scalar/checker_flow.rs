@@ -1,4 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
+#[cfg(feature = "internal-checker")]
+use std::collections::HashSet;
 
 use num_bigint::BigInt;
 
@@ -1772,6 +1774,9 @@ struct ClosedRadixAxes {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) mod projected_f32;
+
+#[cfg(feature = "internal-checker")]
 mod storage_delta;
 
 #[cfg(feature = "internal-checker")]
@@ -1785,6 +1790,7 @@ pub(super) struct ProjectedStorage {
     scalars: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<IntegerSet>)>>,
     fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
     changes: StorageDelta,
+    f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1817,6 +1823,25 @@ impl ProjectedStorage {
             }
         }
         Some(())
+    }
+
+    pub(super) fn observe_f32(&mut self, declaration: wosy_syntax::SourceSpan, bits: u32) {
+        if let Some(value) = projected_f32::ExactF32::checked_bits(bits) {
+            Rc::make_mut(&mut self.f32_initial).insert(declaration, value);
+        }
+    }
+
+    pub(super) fn observed_atom(&self, declaration: &wosy_syntax::SourceSpan) -> Option<super::checker_project::ObservedExactValue> {
+        use super::checker_project::ObservedExactValue as Value;
+        if let Some(value) = self.f32_initial.get(declaration) { return Some(Value::F32(*value)); }
+        let (ty, base) = self.scalars.get(declaration)?;
+        let value = self.changes.get(&(declaration.clone(), None)).unwrap_or(base).singleton_value()?;
+        if *ty == ScalarType::Bool { return Some(Value::Boolean(bool_result_lane(value)? == 1)); }
+        Some(Value::Integer(ty.clone(), value.clone()))
+    }
+
+    pub(super) fn observe_boolean(&mut self, declaration: wosy_syntax::SourceSpan, value: bool) {
+        self.observe_scalar(declaration, &ScalarType::Bool, &BigInt::from(u8::from(value)));
     }
 
     pub(super) fn observe_scalar(&mut self, declaration: wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) {
@@ -12102,6 +12127,13 @@ fn checked_literal_assignment(
 // declaration alone does not authorize all its uses (e.g. taking its address).
 #[cfg(feature = "internal-checker")]
 pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Option<bool> {
+    projected_integer_storage_frame_after_prefix(calls, 0, &HashSet::new(), &HashSet::new())
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallSites, prefix: usize,
+    prefix_reads: &HashSet<(wosy_syntax::SourceSpan, OccurrenceOrdinal)>, prefix_calls: &HashSet<OccurrenceOrdinal>,
+) -> Option<bool> {
     use super::reference::ModuleStorageRole;
     if !calls.checker_returns_unit() || calls.contextual_formal().is_some()
         || !calls.arms.is_empty() || !calls.callable_escapes.is_empty()
@@ -12110,13 +12142,14 @@ pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Opti
         || !calls.structure.checker_selected_snapshots.is_empty()
         || !calls.structure.checker_ordinary_directive_calls.is_empty()
         || calls.boundary.parameters.iter().any(|parameter| !is_integer_type(&parameter.ty))
-        || calls.call_occurrences.iter().any(|site| !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) {
+        || calls.call_occurrences.iter().any(|site| !prefix_calls.contains(&site.ordinal) && !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) {
         return None;
     }
     let mut covered = std::collections::HashSet::new();
     let mut writes = false;
     for (ordinal, block) in calls.structure.blocks.iter().enumerate() {
-        for item in &block.items {
+        for (position, item) in block.items.iter().enumerate() {
+            if BlockOrdinal(ordinal) == calls.structure.root && position < prefix { continue; }
             match &item.kind {
                 BlockItemKind::Assignment { group } => {
                     let write = projected_integer_storage_write(calls, *group)?;
@@ -12151,10 +12184,11 @@ pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Opti
         }
     }
     if !calls.structure.module_storage_uses.iter().all(|(declaration, uses)|
-        uses.iter().all(|(site, role)| covered.contains(&(declaration.clone(), *site, *role)))) {
+        uses.iter().all(|(site, role)| covered.contains(&(declaration.clone(), *site, *role))
+            || (*role == ModuleStorageRole::Read && prefix_reads.contains(&(declaration.clone(), *site))))) {
         return None;
     }
-    Some(writes || !covered.is_empty())
+    Some(writes || !covered.is_empty() || !prefix_reads.is_empty())
 }
 
 #[cfg(feature = "internal-checker")]

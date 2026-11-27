@@ -24,6 +24,8 @@ mod ranked_float;
 #[cfg_attr(not(test), allow(dead_code))]
 mod ordered_float_prefix;
 #[cfg(feature = "internal-checker")]
+pub(super) use ordered_float_prefix::ExactValue as ObservedExactValue;
+#[cfg(feature = "internal-checker")]
 mod rewrite;
 
 use super::{
@@ -2029,6 +2031,8 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 let declaration = wosy_syntax::SourceSpan::new(source.clone(), receiver.span);
                 match &value {
                     InitializerValue::Integer { ty, value } => projected_storage.observe_scalar(declaration, ty, value),
+                    InitializerValue::Boolean(value) => projected_storage.observe_boolean(declaration, *value),
+                    InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
@@ -2056,6 +2060,9 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     let value = storage.get_mut(&declaration.range)?;
                     match (index, value) {
                         (None, InitializerValue::Integer { value, .. }) => *value.to_mut() = observed.clone(),
+                        (None, InitializerValue::Boolean(value)) => *value = match super::checker_flow::bool_result_lane(observed)? {
+                            0 => false, 1 => true, _ => return None,
+                        },
                         (Some(index), InitializerValue::FixedArray { cells, .. }) => *cells.get_mut(index)? = observed.clone(),
                         (Some(index), InitializerValue::PatchedIntegerArray { updates, .. }) => {
                             updates.insert(index, observed.clone());
@@ -2112,6 +2119,26 @@ fn try_observed_projected_storage_call(
     }
     let (target, _, _, _) = actual.validated_direct_body(&topology.structure, site, source, declaration.range)?;
     let body_of = |(module, item)| actual.calls.function_body(module, item, None);
+    let root_body = body_of(target).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let potential_float_prefix = root_body.structure.blocks.get(root_body.structure.root.0)
+        .is_some_and(|root| root.items.iter().map_while(|item| match &item.kind {
+            BlockItemKind::Binding(binding) => Some(binding),
+            _ => None,
+        }).any(|binding| binding.receivers().iter().any(|receiver| receiver.ty == ScalarType::F32)));
+    let plan = potential_float_prefix.then(|| ordered_float_prefix::plan_prefix::<false>(actual.project, actual.calls, target)).flatten()
+        .filter(|plan| plan.bindings.iter().any(|binding| binding.ty == ScalarType::F32));
+    let mut prefix_reads = HashSet::new();
+    let mut prefix_calls = HashSet::new();
+    if let Some(plan) = &plan {
+        for effect in &plan.effects {
+            if effect.owner != target { continue; }
+            match &effect.operation {
+                ordered_float_prefix::Effect::Read { at, declaration, index: None } => { prefix_reads.insert((declaration.clone(), *at)); }
+                ordered_float_prefix::Effect::Call { at, .. } => { prefix_calls.insert(*at); }
+                _ => {}
+            }
+        }
+    }
     // Keep existing authoring/reporting routes for this first storage cohort:
     // only an ordinary state update, not a second source of diagnostics.
     enum Event { Enter(PreparedCallable), Exit(PreparedCallable) }
@@ -2124,11 +2151,16 @@ fn try_observed_projected_storage_call(
             Event::Enter(node) if !complete.contains(&node) => {
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
-                let Some(has_storage) = super::checker_flow::projected_integer_storage_frame(body) else { return Ok(false); };
+                let frame = if node == target {
+                    super::checker_flow::projected_integer_storage_frame_after_prefix(body,
+                        plan.as_ref().map_or(0, |plan| plan.bindings.len()), &prefix_reads, &prefix_calls)
+                } else { super::checker_flow::projected_integer_storage_frame(body) };
+                let Some(has_storage) = frame else { return Ok(false); };
                 if has_callable_obligations(body) { return Ok(false); }
                 writes_or_reads_storage |= has_storage;
                 todo.push(Event::Exit(node));
-                for &child in body.structure.checker_direct_targets.values() {
+                for (site, &child) in &body.structure.checker_direct_targets {
+                    if node == target && prefix_calls.contains(site) { continue; }
                     if child.0 != target.0 { return Ok(false); }
                     todo.push(Event::Enter(child));
                 }
@@ -2149,12 +2181,36 @@ fn try_observed_projected_storage_call(
         }
     }
     let span = wosy_syntax::SourceSpan::new(source.clone(), topology.occurrences.get(site.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span);
+    let mut prefix = Vec::new();
+    let mut prefix_steps = Vec::new();
+    if let Some(plan) = &plan {
+        let values = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index| {
+            if index.is_some() { return None; }
+            storage.observed_atom(declaration)
+        }, |owner, at, step| {
+            if trace.is_some() {
+                use ordered_float_prefix::ObservedStep;
+                if owner.0 != target.0 { return None; }
+                let range = body_of(owner)?.occurrences.get(at.0)?.span;
+                let span = wosy_syntax::SourceSpan::new(source.clone(), range);
+                prefix_steps.push(match step {
+                    ObservedStep::Branch(accepted) => failure_search::PathStep::Branch { condition: span, accepted },
+                    ObservedStep::Call => failure_search::PathStep::Call(span),
+                    ObservedStep::Return => failure_search::PathStep::Return(span),
+                });
+            }
+            Some(())
+        }).ok_or(ProjectCheck::Unsupported)?;
+        if values.len() != plan.bindings.len() { return Err(ProjectCheck::Unsupported); }
+        prefix.extend(plan.bindings.iter().zip(values).map(|(fact, value)| (&fact.slot, &fact.ty, value)));
+    }
     let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
         use super::checker_flow::CallableHistoryStep;
         use failure_search::PathStep;
         let Some(trace) = &trace else { return Some(()); };
         let mut search = trace.borrow_mut();
         search.append(PathStep::Call(span.clone()))?;
+        for step in std::mem::take(&mut prefix_steps) { search.append(step)?; }
         for step in history {
             let convert = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
             let step = match step {
@@ -2169,7 +2225,7 @@ fn try_observed_projected_storage_call(
         search.append(PathStep::Return(span.clone()))
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix,
         body_of, |parent, body, site, signature| {
             symbolic_history_call_target(actual.project, actual.calls, parent.0, parent.1, body, site, signature)
         }, |_, _, _| None);
@@ -12059,7 +12115,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -19730,6 +19786,93 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             run(&excerpt.replace("f32 t = clamp",
                 r#"core.require(false,{.stdout="";.stderr="nested obligation";.code=7;.files=[];}); f32 t = clamp"#), 2);
             run(&excerpt.replace("presented_pose[0].heading", "presented_pose[core.int_extend<u64>(mail_status)].heading"), 4);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn projected_float_prefix_drives_real_initializer_storage_writeback() {
+        let app = source("src/main.w", "observed-flight-prefix-state");
+        let program = r#"%%start
+            i32 wreck_age = -1;
+            bool wreck_entered = false;
+            f32 wreck_alpha = 0.25;
+            i16 status = 5;
+            f32(i32) float_i = fn(a) { core.sint_to_float<f32>(a) };
+            unit() render = fn {
+                bool wrecking = wreck_age >= 0;
+                f32 wreck_time = if (wrecking && !wreck_entered) { float_i(wreck_age)+wreck_alpha } else { 0.0 };
+                bool active = wreck_time > 0.0;
+                if (active) { status = 37; } else { status = 19; };
+            };
+            render();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (age, expected) in [("-1", 19), ("0", 37)] {
+                let text = program.replace("wreck_age = -1", &format!("wreck_age = {age}"));
+                let owner = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let report = owner.run().unwrap();
+                let [failure] = report.directives.as_slice() else { panic!("one observed startup result"); };
+                assert_eq!(failure.code(), &BigInt::from(expected));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn original_frame_computes_current_short_circuited_finite_f32_time() {
+        use ordered_float_prefix::ExactValue;
+        use super::super::checker_flow::projected_f32::ExactF32;
+        let source = source("src/main.w", "original-flight-prefix-value");
+        let text = r#"%%start
+            i32 wreck_age = -1;
+            bool wreck_entered = false;
+            f32(i32) float_i = fn(a) { core.sint_to_float<f32>(a) };
+            unit(f32) frame = fn(wreck_alpha) {
+                bool wrecking = wreck_age >= 0;
+                f32 wreck_time = if (wrecking && !wreck_entered) { float_i(wreck_age)+wreck_alpha } else { 0.0 };
+                core.require(wreck_time >= 0.0, {.stdout="";.stderr="suffix";.code=7;.files=[];});
+            };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_checker_project(
+                vec![(declarations(&source, text), Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap();
+            let (project, calls) = prepared.parts();
+            let target = project.modules[0].items.iter().position(|item| matches!(item, ScalarItem::Function(f) if f.name == "frame")).unwrap();
+            let (root, ordinals) = package_startup_order(project, &project.modules).unwrap();
+            let mut records = OrderedFailures::default();
+            let (initialization, _) = check_package_initialization_observing_with_policy::<_, true, true>(
+                &prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut records),
+            ).unwrap();
+            let plan = ordered_float_prefix::prepare_readonly_prefix(&prepared, &initialization, (0,target)).unwrap();
+            assert_eq!(plan.bindings.len(), 2);
+            let formal = calls.function_body(0,target,None).unwrap().boundary.checker_parameter_bindings.as_ref().unwrap()[0].clone();
+            let run = |age: i32, entered: Option<bool>, alpha: Option<u32>| {
+                let formals = alpha.and_then(ExactF32::checked_bits).map(|value| (formal.clone(), ExactValue::F32(value))).into_iter().collect();
+                let mut reads = 0;
+                let result = ordered_float_prefix::evaluate_observed_prefix(&plan, formals, |decl, index| {
+                    if index.is_some() || decl.source != source { return None; }
+                    reads += 1;
+                    match &text[decl.range.start as usize..decl.range.end as usize] {
+                        "wreck_age" => Some(ExactValue::Integer(ScalarType::I32, BigInt::from(age))),
+                        "wreck_entered" => entered.map(ExactValue::Boolean),
+                        _ => None,
+                    }
+                }, |_, _, _| Some(()));
+                (result, reads)
+            };
+            let f32_value = |bits| ExactValue::F32(ExactF32::checked_bits(bits).unwrap());
+            assert_eq!(run(-1, None, None), (Some(vec![ExactValue::Boolean(false), f32_value(0)]), 1));
+            assert_eq!(run(0, Some(true), None), (Some(vec![ExactValue::Boolean(true), f32_value(0)]), 2));
+            assert_eq!(run(0, Some(false), Some(1)), (Some(vec![ExactValue::Boolean(true), f32_value(1)]), 3));
+            assert_eq!(run(0, Some(false), Some((-0.0f32).to_bits())), (Some(vec![ExactValue::Boolean(true), f32_value(0)]), 3));
+            assert_eq!(run(16_777_217, Some(false), Some(0)), (Some(vec![ExactValue::Boolean(true), f32_value(16_777_216f32.to_bits())]), 3));
+            assert_eq!(run(1, Some(false), None), (None, 3));
         }
     }
 

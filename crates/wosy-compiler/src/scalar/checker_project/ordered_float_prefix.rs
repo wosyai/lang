@@ -7,13 +7,22 @@ type EffectId = usize;
 
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
-    Sequence { at: OccurrenceOrdinal, operands: Vec<EffectId> },
+    Sequence { at: OccurrenceOrdinal, operands: Vec<EffectId>, kind: SequenceKind },
     LocalRead { at: OccurrenceOrdinal, binding: ReferenceBindingId, version: Option<EffectId> },
     Read { at: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64> },
     Field { at: OccurrenceOrdinal, field: super::super::ScalarStructFieldId, receiver: EffectId },
     Branch { at: OccurrenceOrdinal, condition: EffectId, yes: EffectId, no: EffectId },
     ShortCircuit { at: OccurrenceOrdinal, conjunction: bool, left: EffectId, right: EffectId },
-    Call { at: OccurrenceOrdinal, function: Option<PreparedCallable>, arguments: Vec<EffectId> },
+    Call { at: OccurrenceOrdinal, function: Option<PreparedCallable>, ty: ScalarType, arguments: Vec<EffectId> },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum SequenceKind {
+    Binary(BinaryOperator),
+    Unary(UnaryOperator),
+    Boolean(bool),
+    Integer(ScalarType, BigInt),
+    Float(ranked_float::Atom),
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +75,7 @@ pub(super) struct PrefixCertificate {
 pub(super) struct FunctionEffects {
     pub(super) bindings: Vec<BindingFact>,
     pub(super) returned: EffectId,
+    pub(super) formals: Vec<(ReferenceBindingId, ScalarType)>,
 }
 
 struct Frame<'a> {
@@ -104,6 +114,12 @@ fn prepare_prefix<const GUARDED: bool>(
         || !std::ptr::eq(*initialization.ordinals.get_key_value(&module.source)?.0, &module.source)
         || initialization.ordinals.get(&module.source) != Some(&target.0)
     { return None; }
+    plan_prefix::<GUARDED>(project, calls, target)
+}
+
+pub(super) fn plan_prefix<const GUARDED: bool>(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+) -> Option<PrefixCertificate> {
     let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
     let frame = planner.frame(target)?;
     let mut locals = frame.formals()?;
@@ -231,7 +247,9 @@ impl<'a> Planner<'a> {
         let (tail, at) = frame.returned(&frame.function.body, structure.root, last)?;
         if structure.checked_types.expressions.get(&at)? != &result.ty { return None; }
         let returned = self.expression(&frame, tail, at, &locals, &mut deps)?;
-        Some((FunctionEffects { bindings, returned }, deps))
+        let formals = frame.prepared.boundary.checker_parameter_bindings.as_deref()?.iter()
+            .zip(&frame.prepared.boundary.parameters).map(|(id, parameter)| (id.clone(), parameter.ty.clone())).collect();
+        Some((FunctionEffects { bindings, returned, formals }, deps))
     }
 
     fn binding(
@@ -312,11 +330,11 @@ impl<'a> Planner<'a> {
     ) -> Option<EffectId> {
         enum Work<'a> {
             Visit(OccurrenceOrdinal, &'a ScalarExpression),
-            Sequence(OccurrenceOrdinal, usize),
+            Sequence(OccurrenceOrdinal, usize, SequenceKind),
             Field(OccurrenceOrdinal, super::super::ScalarStructFieldId),
             Branch(OccurrenceOrdinal),
             Short(OccurrenceOrdinal, bool),
-            Call(OccurrenceOrdinal, Option<PreparedCallable>, usize),
+            Call(OccurrenceOrdinal, Option<PreparedCallable>, ScalarType, usize),
         }
 
         let mut pending = vec![Work::Visit(initial, expression)];
@@ -328,7 +346,7 @@ impl<'a> Planner<'a> {
         };
         while let Some(task) = pending.pop() {
             let effect = match task {
-                Work::Sequence(at, arity) => Effect::Sequence { at, operands: take(&mut operands, arity)? },
+                Work::Sequence(at, arity, kind) => Effect::Sequence { at, operands: take(&mut operands, arity)?, kind },
                 Work::Field(at, field) => Effect::Field { at, field, receiver: operands.pop()? },
                 Work::Branch(at) => {
                     let no = operands.pop()?;
@@ -341,7 +359,7 @@ impl<'a> Planner<'a> {
                     let left = operands.pop()?;
                     Effect::ShortCircuit { at, conjunction, left, right }
                 }
-                Work::Call(at, function, arity) => Effect::Call { at, function, arguments: take(&mut operands, arity)? },
+                Work::Call(at, function, ty, arity) => Effect::Call { at, function, ty, arguments: take(&mut operands, arity)? },
                 Work::Visit(at, expr) => {
                     let ty = structure.checked_types.expressions.get(&at)?;
                     if frame.prepared.occurrences.get(at.0)?.span != super::super::typecheck::expression_span(expr)
@@ -414,10 +432,10 @@ impl<'a> Planner<'a> {
                                     { return None; }
                                     Work::Short(at, conjunction)
                                 }
-                                Equal | NotEqual if *ty == ScalarType::Bool && value_type(kind) => Work::Sequence(at, 2),
+                                Equal | NotEqual if *ty == ScalarType::Bool && value_type(kind) => Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
                                 Less | LessEqual | Greater | GreaterEqual
-                                    if *ty == ScalarType::Bool && (is_integer_type(kind) || float_type(kind)) => Work::Sequence(at, 2),
-                                Add | Subtract | Multiply | Divide if float_type(ty) && kind == ty => Work::Sequence(at, 2),
+                                    if *ty == ScalarType::Bool && (is_integer_type(kind) || float_type(kind)) => Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
+                                Add | Subtract | Multiply | Divide if float_type(ty) && kind == ty => Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
                                 _ => return None,
                             };
                             pending.push(op);
@@ -431,7 +449,7 @@ impl<'a> Planner<'a> {
                         {
                             let operand_at = child(at, OccurrenceEdge::UnaryOperand)?;
                             if structure.checked_types.expressions.get(&operand_at)? != ty { return None; }
-                            pending.push(Work::Sequence(at, 1));
+                            pending.push(Work::Sequence(at, 1, SequenceKind::Unary(operator.clone())));
                             pending.push(Work::Visit(operand_at, operand));
                             continue;
                         }
@@ -478,7 +496,7 @@ impl<'a> Planner<'a> {
                                 }
                                 _ => return None,
                             };
-                            pending.push(Work::Call(at, target, arguments.len()));
+                            pending.push(Work::Call(at, target, ty.clone(), arguments.len()));
                             for (index, argument) in arguments.iter().enumerate().rev() {
                                 let argument_at = child(at, OccurrenceEdge::CallArgument(index))?;
                                 if structure.checked_types.expressions.get(&argument_at)? != signature.parameters.get(index)? {
@@ -488,10 +506,10 @@ impl<'a> Planner<'a> {
                             }
                             continue;
                         }
-                        ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => Effect::Sequence { at, operands: Vec::new() },
-                        ScalarExpression::Float { .. } if float_type(ty) => Effect::Sequence { at, operands: Vec::new() },
+                        ScalarExpression::Boolean { value, .. } if *ty == ScalarType::Bool => Effect::Sequence { at, operands: Vec::new(), kind: SequenceKind::Boolean(*value) },
+                        ScalarExpression::Float { .. } if float_type(ty) => Effect::Sequence { at, operands: Vec::new(), kind: SequenceKind::Float(ranked_float::Atom::literal(expr, ty)?) },
                         _ if is_integer_type(ty) && integer_literal_fits_type(concrete_integer_literal(expr)?.as_ref(), ty) =>
-                            Effect::Sequence { at, operands: Vec::new() },
+                            Effect::Sequence { at, operands: Vec::new(), kind: SequenceKind::Integer(ty.clone(), concrete_integer_literal(expr)?.into_owned()) },
                         _ => return None,
                     }
                 }
@@ -566,7 +584,7 @@ impl Frame<'_> {
     }
 }
 
-fn take(values: &mut Vec<EffectId>, count: usize) -> Option<Vec<EffectId>> {
+fn take<T>(values: &mut Vec<T>, count: usize) -> Option<Vec<T>> {
     Some(values.split_off(values.len().checked_sub(count)?))
 }
 
@@ -576,4 +594,152 @@ fn value_type(ty: &ScalarType) -> bool { is_integer_type(ty) || *ty == ScalarTyp
 
 fn is_signed_integer(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in super::super) enum ExactValue {
+    Boolean(bool),
+    Integer(ScalarType, BigInt),
+    F32(super::super::checker_flow::projected_f32::ExactF32),
+}
+
+impl ExactValue {
+    pub(in super::super) fn ty(&self) -> ScalarType {
+        match self {
+            Self::Boolean(_) => ScalarType::Bool,
+            Self::Integer(ty, _) => ty.clone(),
+            Self::F32(_) => ScalarType::F32,
+        }
+    }
+}
+
+/// Execute only the reached certified operations on one authenticated row.
+/// The caller owns storage and supplies current reads and real call-entry
+/// formals. This cannot fill in any unknown value or publish a Check result.
+#[derive(Clone, Copy)]
+pub(super) enum ObservedStep { Branch(bool), Call, Return }
+
+pub(super) fn evaluate_observed_prefix(
+    certificate: &PrefixCertificate,
+    mut formals: HashMap<ReferenceBindingId, ExactValue>,
+    mut read: impl FnMut(&SourceSpan, Option<u64>) -> Option<ExactValue>,
+    mut event: impl FnMut(PreparedCallable, OccurrenceOrdinal, ObservedStep) -> Option<()>,
+) -> Option<Vec<ExactValue>> {
+    use super::super::checker_flow::projected_f32::ExactF32;
+    use std::cell::RefCell;
+    type Locals = Rc<RefCell<HashMap<ReferenceBindingId, ExactValue>>>;
+    enum Work<'a> {
+        Eval(EffectId, Locals),
+        Bind(&'a BindingFact, Locals),
+        Select(PreparedCallable, OccurrenceOrdinal, EffectId, EffectId, Locals),
+        Short(PreparedCallable, OccurrenceOrdinal, bool, EffectId, Locals),
+        Sequence(&'a SequenceKind, usize),
+        Call(PreparedCallable, OccurrenceOrdinal, Option<PreparedCallable>, &'a ScalarType, usize),
+        CheckedReturn(PreparedCallable, OccurrenceOrdinal, &'a ScalarType),
+        Publish,
+        DropLocalResult,
+    }
+    fn compute(kind: &SequenceKind, args: Vec<ExactValue>) -> Option<ExactValue> {
+        use ExactValue::*;
+        Some(match (kind, args.as_slice()) {
+            (SequenceKind::Boolean(value), []) => Boolean(*value),
+            (SequenceKind::Integer(ty, value), []) => Integer(ty.clone(), value.clone()),
+            (SequenceKind::Float(ranked_float::Atom::Single(bits)), []) => F32(ExactF32::checked_bits(*bits)?),
+            (SequenceKind::Unary(UnaryOperator::LogicalNot), [Boolean(value)]) => Boolean(!value),
+            (SequenceKind::Binary(BinaryOperator::Add), [F32(left), F32(right)]) => F32(left.add(*right)?),
+            (SequenceKind::Binary(op), [F32(left), F32(right)]) => Boolean(
+                super::super::symbolic_integer::IntegerRelation::from_operator(op)?
+                    .accepts(f32::from_bits(left.0).partial_cmp(&f32::from_bits(right.0))?)),
+            (SequenceKind::Binary(op), [Integer(left_ty, left), Integer(right_ty, right)]) if left_ty == right_ty =>
+                Boolean(super::super::symbolic_integer::IntegerRelation::from_operator(op)?.accepts(left.cmp(right))),
+            _ => return None,
+        })
+    }
+    let locals = Rc::new(RefCell::new(std::mem::take(&mut formals)));
+    let mut pending = Vec::new();
+    let mut values = Vec::new();
+    let mut published = Vec::new();
+    for fact in certificate.bindings.iter().rev() {
+        pending.push(Work::Publish);
+        pending.push(Work::Bind(fact, Rc::clone(&locals)));
+        pending.push(Work::Eval(fact.returning_effect, Rc::clone(&locals)));
+    }
+    while let Some(work) = pending.pop() {
+        match work {
+            Work::Eval(at, scope) => {
+                let record = certificate.effects.get(at)?;
+                match &record.operation {
+                    Effect::LocalRead { binding, .. } => values.push(scope.borrow().get(binding)?.clone()),
+                    Effect::Read { declaration, index, .. } => values.push(read(declaration, *index)?),
+                    Effect::Branch { at, condition, yes, no } => {
+                        pending.push(Work::Select(record.owner, *at, *yes, *no, Rc::clone(&scope)));
+                        pending.push(Work::Eval(*condition, scope));
+                    }
+                    Effect::ShortCircuit { at, conjunction, left, right } => {
+                        pending.push(Work::Short(record.owner, *at, *conjunction, *right, Rc::clone(&scope)));
+                        pending.push(Work::Eval(*left, scope));
+                    }
+                    Effect::Sequence { kind, operands, .. } => {
+                        pending.push(Work::Sequence(kind, operands.len()));
+                        pending.extend(operands.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
+                    }
+                    Effect::Call { at, function, arguments, ty } => {
+                        pending.push(Work::Call(record.owner, *at, *function, ty, arguments.len()));
+                        pending.extend(arguments.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
+                    }
+                    Effect::Field { .. } => return None,
+                }
+            }
+            Work::Select(owner, at, yes, no, scope) => {
+                let ExactValue::Boolean(accepted) = values.pop()? else { return None; };
+                event(owner, at, ObservedStep::Branch(accepted))?;
+                pending.push(Work::Eval(if accepted { yes } else { no }, scope));
+            }
+            Work::Short(owner, at, conjunction, right, scope) => {
+                let ExactValue::Boolean(left) = values.pop()? else { return None; };
+                event(owner, at, ObservedStep::Branch(left))?;
+                if left == conjunction {
+                    pending.push(Work::Eval(right, scope));
+                } else { values.push(ExactValue::Boolean(left)); }
+            }
+            Work::Bind(fact, scope) => {
+                let value = values.pop()?;
+                if value.ty() != fact.ty || scope.borrow_mut().insert(fact.slot.clone(), value.clone()).is_some() { return None; }
+                values.push(value);
+            }
+            Work::Publish => published.push(values.pop()?),
+            Work::DropLocalResult => { values.pop()?; }
+            Work::Sequence(kind, arity) => {
+                let args = take(&mut values, arity)?;
+                values.push(compute(kind, args)?);
+            }
+            Work::Call(owner, at, target, result, arity) => {
+                let args = take(&mut values, arity)?;
+                if let Some(target) = target {
+                    let function = certificate.callees.get(&target)?;
+                    if args.len() != function.formals.len() { return None; }
+                    let nested = function.formals.iter().zip(args).map(|((slot, ty), value)|
+                        (value.ty() == *ty).then(|| (slot.clone(), value))).collect::<Option<HashMap<_, _>>>()?;
+                    let scope = Rc::new(RefCell::new(nested));
+                    event(owner, at, ObservedStep::Call)?;
+                    pending.push(Work::CheckedReturn(owner, at, result));
+                    pending.push(Work::Eval(function.returned, Rc::clone(&scope)));
+                    for fact in function.bindings.iter().rev() {
+                        pending.push(Work::DropLocalResult);
+                        pending.push(Work::Bind(fact, Rc::clone(&scope)));
+                        pending.push(Work::Eval(fact.returning_effect, Rc::clone(&scope)));
+                    }
+                } else {
+                    let [ExactValue::Integer(ScalarType::I32, value)] = args.as_slice() else { return None; };
+                    if *result != ScalarType::F32 { return None; }
+                    values.push(ExactValue::F32(ExactF32::signed_i32(i32::try_from(value).ok()?)));
+                }
+            }
+            Work::CheckedReturn(owner, at, ty) => {
+                if values.last()?.ty() != *ty { return None; }
+                event(owner, at, ObservedStep::Return)?;
+            }
+        }
+    }
+    values.is_empty().then_some(published)
 }
