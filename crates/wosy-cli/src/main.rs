@@ -20,7 +20,7 @@ use wosy_compiler::{
     LlvmPartition, ParseOutput, ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_cli::artifact_inputs::{compiler_identity, llvm_identity, pending_builder_inputs,
-    project_configuration_identity, BuilderInputPaths};
+    project_configuration_identity, BuilderInputPaths, PendingBuilderInputs};
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,
     ContentRevision, PackageRelativePath, ProjectConfiguration, ProjectContext,
@@ -221,10 +221,18 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     fs::write(&paths.runtime, runtime).map_err(|error| error.to_string())?;
     let inputs = pending_builder_inputs(&configuration, configuration_identity, &target_name, profile,
         artifact, artifact_profile, source_observations, llvm_input_identity, &paths.output)?;
+    finalize_ordinary_build(&root, paths, inputs)
+}
+
+fn finalize_ordinary_build(
+    root: &std::path::Path,
+    paths: BuilderInputPaths,
+    inputs: PendingBuilderInputs,
+) -> Result<(), String> {
     let pending_bytes = serde_json::to_vec_pretty(&inputs.manifest).map_err(|error| error.to_string())?;
     fs::write(&paths.pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
     let arguments = paths.arguments();
-    invoke_direct(&root, &inputs.builder.command, &inputs.builder.args, &arguments.each_ref().map(|arg| arg.as_ref()))?;
+    invoke_direct(root, &inputs.builder.command, &inputs.builder.args, &arguments.each_ref().map(|arg| arg.as_ref()))?;
     let wosy_project::ArtifactManifest {
         identity,
         executable,
