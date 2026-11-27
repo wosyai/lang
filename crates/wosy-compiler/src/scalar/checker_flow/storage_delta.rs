@@ -1,31 +1,32 @@
-use super::{IntegerSet, Rc};
+use super::Rc;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use wosy_syntax::SourceSpan;
-
-type Key = (SourceSpan, Option<usize>);
-type Entry = (Key, Rc<IntegerSet>);
+type Entry<K,V> = (K,V);
 
 /// Sixteen four-bit steps over the hash, followed by an exact key bucket.
 /// Call suspension clones only the root handle. Mutation copies only the
 /// nodes on the touched key's path, never the previous writes of the frame.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct StorageDelta(Option<Rc<Node>>);
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Node {
-    Branch(Vec<(u8, Rc<Node>)>),
-    Leaf(Vec<Entry>),
+pub(super) struct StorageDelta<K,V>(Option<Rc<Node<K,V>>>);
+
+impl<K,V> Default for StorageDelta<K,V> {
+    fn default() -> Self { Self(None) }
 }
 
-fn hash(key: &Key) -> u64 {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Node<K,V> {
+    Branch(Vec<(u8, Rc<Node<K,V>>)>),
+    Leaf(Vec<Entry<K,V>>),
+}
+
+fn hash(key: &impl Hash) -> u64 {
     let mut state = DefaultHasher::new();
     key.hash(&mut state);
     state.finish()
 }
 
-impl StorageDelta {
-    pub(super) fn insert(&mut self, key: Key, value: Rc<IntegerSet>) {
-        fn insert(slot: &mut Rc<Node>, level: u8, hash: u64, entry: Entry) {
+impl<K: Clone + Eq + Hash, V: Clone> StorageDelta<K,V> {
+    pub(super) fn insert(&mut self, key: K, value: V) {
+        fn insert<K: Clone + Eq, V: Clone>(slot: &mut Rc<Node<K,V>>, level: u8, hash: u64, entry: Entry<K,V>) {
             #[cfg(test)]
             DELTA_NODE_VISITS.with(|count| count.set(count.get() + 1));
             match Rc::make_mut(slot) {
@@ -54,7 +55,7 @@ impl StorageDelta {
         insert(self.0.get_or_insert_with(|| Rc::new(Node::Branch(Vec::new()))), 0, hash, (key, value));
     }
 
-    pub(super) fn get(&self, key: &Key) -> Option<&Rc<IntegerSet>> {
+    pub(super) fn get(&self, key: &K) -> Option<&V> {
         let mut hash = hash(key);
         let mut node = self.0.as_deref()?;
         loop {
@@ -70,7 +71,7 @@ impl StorageDelta {
         }
     }
 
-    pub(super) fn into_entries(self) -> impl Iterator<Item = Entry> {
+    pub(super) fn into_entries(self) -> impl Iterator<Item = Entry<K,V>> {
         let mut pending = Vec::from_iter(self.0);
         let mut bucket = Vec::new().into_iter();
         std::iter::from_fn(move || loop {
@@ -87,9 +88,15 @@ impl StorageDelta {
 thread_local! { static DELTA_NODE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
+pub(super) fn take_path_visits() -> usize { DELTA_NODE_VISITS.with(|count| count.replace(0)) }
+
+
+#[cfg(test)]
 #[test]
 fn nested_suspended_storage_versions_only_copy_a_fixed_length_key_path() {
     use num_bigint::BigInt;
+    use super::IntegerSet;
+    use wosy_syntax::SourceSpan;
     use wosy_syntax::{ByteSpan, SourceIdentity};
     let declaration = SourceSpan::new(
         SourceIdentity { project: "local".into(), package: "app".into(), path: "src/main.w".into(), revision: "nested-storage".into() },

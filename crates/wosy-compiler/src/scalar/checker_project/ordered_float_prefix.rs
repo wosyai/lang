@@ -9,7 +9,7 @@ type EffectId = usize;
 pub(super) enum Effect {
     Sequence { at: OccurrenceOrdinal, operands: Vec<EffectId>, kind: SequenceKind },
     LocalRead { at: OccurrenceOrdinal, binding: ReferenceBindingId, version: Option<EffectId> },
-    Read { at: OccurrenceOrdinal, storage_site: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64> },
+    Read { at: OccurrenceOrdinal, storage_site: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64>, projected: bool },
     Field { at: OccurrenceOrdinal, field: super::super::ScalarStructFieldId, receiver: EffectId },
     Branch { at: OccurrenceOrdinal, condition: EffectId, yes: EffectId, no: EffectId },
     ShortCircuit { at: OccurrenceOrdinal, conjunction: bool, left: EffectId, right: EffectId },
@@ -374,7 +374,7 @@ impl<'a> Planner<'a> {
                             },
                             PlainNameIdentity::ModuleValue(declaration) => {
                                 frame.module_value(declaration, ty)?;
-                                Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None }
+                                Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None, projected: false }
                             }
                             _ => return None,
                         },
@@ -384,7 +384,7 @@ impl<'a> Planner<'a> {
                             frame.module_value(declaration, &ScalarType::Struct(field.structure.clone()))?;
                             let receiver = self.certificate.effects.len();
                             self.certificate.effects.push(EffectRecord { owner: frame.target,
-                                operation: Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None },
+                                operation: Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None, projected: true },
                             });
                             Effect::Field { at, field: field.clone(), receiver }
                         }
@@ -580,7 +580,7 @@ impl Frame<'_> {
         } else if !value_type(ty) { return None; }
         let NamedPlaceRootIdentity::ModuleValue(declaration) = self.prepared.prepared_named_place_root(*base)? else { return None; };
         self.module_value(declaration, base_type)?;
-        Some(Effect::Read { at, storage_site: *base, declaration: declaration.clone(), index: Some(constant) })
+        Some(Effect::Read { at, storage_site: *base, declaration: declaration.clone(), index: Some(constant), projected: true })
     }
 }
 
@@ -735,8 +735,8 @@ pub(super) fn evaluate_observed_prefix(
                     Effect::Field { field, receiver, .. } => {
                         let receiver = certificate.effects.get(*receiver)?;
                         if receiver.owner != record.owner { return None; }
-                        let Effect::Read { declaration, index: Some(index), .. } = &receiver.operation else { return None; };
-                        values.push(read(declaration, Some(*index), Some(field))?);
+                        let Effect::Read { declaration, index, projected: true, .. } = &receiver.operation else { return None; };
+                        values.push(read(declaration, *index, Some(field))?);
                     }
                 }
             }

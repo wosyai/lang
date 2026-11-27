@@ -6483,6 +6483,10 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_integer_call_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCallOrigin>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_place_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_f32_literals: HashMap<OccurrenceOrdinal, u32>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -6679,6 +6683,10 @@ impl OccurrenceStructure {
             checker_integer_call_locals: HashMap::new(),
             literal_fields: HashMap::new(),
             value_fields: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_place_fields: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_f32_literals: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -8519,6 +8527,15 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         && matches!(signature.outputs.outputs.as_slice(), [output]
                             if output.ty == ScalarType::Unit || is_integer_type(&output.ty))
                 }));
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
+            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. })
+            && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::F32) {
+            if let ScalarExpression::Float { value, .. } = expression {
+                let exact = *value as f32;
+                if exact.is_finite() { self.structure.projected_f32_literals.insert(ordinal, exact.to_bits()); }
+            }
+        }
         #[cfg(any(test, feature = "internal-checker"))]
         if checker_enabled
             && (matches!(
@@ -9622,6 +9639,12 @@ impl StructuralWalker<'_, '_> {
                 }
             }
             ScalarPlace::Field { base, field, .. } => {
+                #[cfg(feature = "internal-checker")]
+                if self.structure.checked_types.places.get(&ordinal) == Some(&ScalarType::F32) {
+                    if let ScalarFieldReference::Resolved(field) = field {
+                        self.structure.projected_place_fields.insert(ordinal, field.clone());
+                    }
+                }
                 let base = self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase, storage_role)?;
                 if let (Some(source), ScalarFieldReference::Unresolved { name, .. }) =
                     (self.structure.resolved_namespace_places.get(&base).cloned(), field)

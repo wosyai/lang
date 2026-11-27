@@ -2035,7 +2035,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
-                        if matches!(ty, ScalarType::Array { element, .. } if matches!(element.as_ref(), ScalarType::Struct(_))) {
+                        if matches!(ty, ScalarType::Struct(_)) || matches!(ty, ScalarType::Array { element, .. } if matches!(element.as_ref(), ScalarType::Struct(_))) {
                             projected_storage.observe_aggregate(declaration.clone());
                         }
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
@@ -2137,9 +2137,9 @@ fn try_observed_projected_storage_call(
         for effect in &plan.effects {
             if effect.owner != target { continue; }
             match &effect.operation {
-                ordered_float_prefix::Effect::Read { storage_site, declaration, index, .. } => {
+                ordered_float_prefix::Effect::Read { storage_site, declaration, projected, .. } => {
                     use super::reference::ModuleStorageRole;
-                    let role = if index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read };
+                    let role = if *projected { ModuleStorageRole::Project } else { ModuleStorageRole::Read };
                     prefix_reads.insert((declaration.clone(), *storage_site, role));
                 }
                 ordered_float_prefix::Effect::Call { at, .. } => { prefix_calls.insert(*at); }
@@ -2189,6 +2189,13 @@ fn try_observed_projected_storage_call(
         }
     }
     let span = wosy_syntax::SourceSpan::new(source.clone(), topology.occurrences.get(site.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span);
+    let read_field = |storage: &super::checker_flow::ProjectedStorage, cell: &super::checker_flow::FloatFieldCell| {
+        if &cell.declaration.source != source || !storage.has_observed_aggregate(&cell.declaration) { return None; }
+        if let Some(value) = storage.observed_field(cell) { return Some(value); }
+        let field = super::ScalarStructFieldId { structure: cell.structure.clone(), index: cell.field };
+        let ObservedExactValue::F32(value) = observed_nominal_f32_field(initialized.get(&cell.declaration.range)?, cell.index, &field)? else { return None; };
+        Some(value)
+    };
     let mut prefix = Vec::new();
     let mut prefix_history = None;
     if let Some(plan) = &plan {
@@ -2196,8 +2203,11 @@ fn try_observed_projected_storage_call(
         let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index, field| {
             match (index, field) {
                 (None, None) => storage.observed_atom(declaration),
-                (Some(index), Some(field)) if &declaration.source == source && storage.has_observed_aggregate(declaration) =>
-                    observed_fixed_nominal_f32_field(initialized.get(&declaration.range)?, index, field),
+                (index, Some(field)) if &declaration.source == source && storage.has_observed_aggregate(declaration) => {
+                    let cell = super::checker_flow::FloatFieldCell { declaration: declaration.clone(), index,
+                        structure: field.structure.clone(), field: field.index };
+                    read_field(storage, &cell).map(ObservedExactValue::F32)
+                }
                 _ => None,
             }
         }, trace.is_some(), &mut prefix_work, |owner, at| {
@@ -2230,7 +2240,7 @@ fn try_observed_projected_storage_call(
         search.append(PathStep::Return(span.clone()))
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix,
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field),
         body_of, |parent, body, site, signature| {
             symbolic_history_call_target(actual.project, actual.calls, parent.0, parent.1, body, site, signature)
         }, |_, _, _| None);
@@ -2777,19 +2787,25 @@ enum PassiveLiteral<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-fn observed_fixed_nominal_f32_field(value: &InitializerValue<'_>, index: u64,
+fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
     field: &super::ScalarStructFieldId) -> Option<ObservedExactValue> {
-    let InitializerValue::PassiveAggregate { ty: ScalarType::Array { element, length, .. }, value, .. } = value else { return None; };
-    let ScalarType::Struct(expected) = element.as_ref() else { return None; };
-    if expected != &field.structure || index >= *length { return None; }
+    let InitializerValue::PassiveAggregate { ty, value, .. } = value else { return None; };
     fn original<'v,'a>(mut value: &'v PassiveLiteral<'a>) -> &'v PassiveLiteral<'a> {
         while let PassiveLiteral::Copy(next) = value { value = next; }
         value
     }
-    let PassiveLiteral::Array(values) = original(value) else { return None; };
-    if u64::try_from(values.len()).ok()? != *length { return None; }
-    let PassiveLiteral::Nominal(actual, fields) = original(values.get(usize::try_from(index).ok()?)?) else { return None; };
-    if *actual != expected { return None; }
+    let nominal = match (index, ty) {
+        (None, ScalarType::Struct(id)) if id == &field.structure => original(value),
+        (Some(index), ScalarType::Array { element, length, .. })
+            if element.as_ref() == &ScalarType::Struct(field.structure.clone()) && index < *length => {
+                let PassiveLiteral::Array(values) = original(value) else { return None; };
+                if u64::try_from(values.len()).ok()? != *length { return None; }
+                original(values.get(usize::try_from(index).ok()?)?)
+            }
+        _ => return None,
+    };
+    let PassiveLiteral::Nominal(actual, fields) = nominal else { return None; };
+    if *actual != &field.structure { return None; }
     let PassiveLiteral::Float(ranked_float::Atom::Single(bits)) = original(fields.get(field.index)?) else { return None; };
     Some(ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?))
 }
@@ -12138,7 +12154,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -19928,6 +19944,52 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let offset = text.find(nested).unwrap() as u32;
                 let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
                 assert_eq!(trace.contains_return(&site), age == "0");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn observed_present_pose_writes_current_indexed_heading_before_direct_camera_read() {
+        let app = source("src/main.w", "observed-flight-pose-writeback");
+        let program = r#"%%start
+            struct copy RenderPose { f32 x; f32 heading; }
+            struct copy ParcelCamera { f32 heading; }
+            RenderPose old = {.x=0.0;.heading=0.0;};
+            RenderPose shifted = {.x=0.0;.heading=0.75;};
+            RenderPose stationary = {.x=0.0;.heading=0.25;};
+            RenderPose[2] presented_pose = [old,old];
+            RenderPose[2] poses = [shifted,stationary];
+            ParcelCamera published_parcel_camera = {.heading=0.0;};
+            i16 status = 5;
+            unit(u64) present_pose = fn(lane) { presented_pose[lane].heading = poses[lane].heading; };
+            unit(u64) publish = fn(lane) { published_parcel_camera.heading = presented_pose[lane].heading; };
+            unit() update = fn { present_pose(0); publish(0); };
+            unit() frame = fn {
+                f32 p_heading = presented_pose[0].heading;
+                f32 home = published_parcel_camera.heading;
+                bool active = p_heading == 0.75 && home == p_heading;
+                if (active) { status = 37; } else { status = 19; };
+            };
+            update(); frame();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (route, expected) in [("present_pose(0); publish(0);", 37), ("present_pose(1); publish(0);", 19),
+                ("publish(0); present_pose(0);", 19)] {
+                let text = program.replace("present_pose(0); publish(0);", route);
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+                let report = prepare().run().unwrap();
+                let touches = super::super::checker_flow::take_observed_storage_delta_visits();
+                assert_eq!(touches, 3 * 17);
+                eprintln!("observed writing pose route={route} sparse path visits={touches}");
+                let (capped, _, _, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped, report.directives);
+                assert_eq!(capped[0].code(), &BigInt::from(expected));
             }
         }
     }
