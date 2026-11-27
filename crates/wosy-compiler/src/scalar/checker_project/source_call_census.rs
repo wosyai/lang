@@ -33,12 +33,19 @@ pub(super) struct SourceUse {
     pub(super) signature: Option<CheckedCallSignature>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ValueUse {
+    pub(super) owner: SourceOwner,
+    pub(super) site: OccurrenceOrdinal,
+    pub(super) span: ByteSpan,
+}
+
 #[derive(Default)]
 pub(super) struct SourceUses {
     pub(super) sites: Vec<SourceUse>,
     // A value use is not itself an execution, and must never be silently
     // reclassified as a call with the same span.
-    pub(super) escapes: Vec<SourceOwner>,
+    pub(super) escapes: Vec<ValueUse>,
 }
 
 pub(super) struct SourceCallCensus {
@@ -71,7 +78,8 @@ impl SourceCallCensus {
             if region.source != source.source { return None; }
             let ModuleInitializationDetail::Occurrences(initializers) = &region.detail else { return None; };
             let owner = SourceOwner::Initialization(module);
-            out.record_escapes(&index, &owner, &initializers.callable_escapes);
+            out.record_escapes(&index, &owner, &initializers.structure.prepared_callable_value_uses,
+                &initializers.occurrences)?;
             let mut canonical = HashSet::new();
             for &ordinal in &initializers.calls {
                 if !canonical.insert(ordinal) || !initializers.call_targets.contains_key(&ordinal) {
@@ -139,13 +147,18 @@ impl SourceCallCensus {
 
     fn record_escapes(
         &mut self, index: &HashMap<(&SourceIdentity, ByteSpan), PreparedCallable>, owner: &SourceOwner,
-        escapes: &HashSet<SourceSpan>,
-    ) {
-        for escape in escapes {
+        escapes: &HashMap<OccurrenceOrdinal, SourceSpan>,
+        occurrences: &[crate::scalar::reference::OccurrenceMetadata],
+    ) -> Option<()> {
+        let mut rows = escapes.iter().collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|(site, _)| site.0);
+        for (&site, escape) in rows {
             if let Some(target) = index.get(&(&escape.source, escape.range)) {
-                self.uses.get_mut(target).expect("registered declaration").escapes.push(owner.clone());
+                let span = occurrences.get(site.0)?.span;
+                self.uses.get_mut(target)?.escapes.push(ValueUse { owner: owner.clone(), site, span });
             }
         }
+        Some(())
     }
 
     fn record(&mut self, target: PreparedCallable, owner: &SourceOwner, kind: SourceUseKind,
@@ -186,7 +199,7 @@ impl SourceCallCensus {
                 todo.push((child, path));
             }
             let owner = SourceOwner::Function { declaration, arms };
-            self.record_escapes(index, &owner, &body.callable_escapes);
+            self.record_escapes(index, &owner, &body.structure.prepared_callable_value_uses, &body.occurrences)?;
             let mut associated = vec![false; body.sites.len()];
             for occurrence in &body.call_occurrences {
                 let ordinal = occurrence.ordinal;

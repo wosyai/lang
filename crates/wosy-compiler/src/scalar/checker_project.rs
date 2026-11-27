@@ -20345,9 +20345,51 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             for arm in 0..2 {
                 assert!(used.sites.iter().any(|use_| use_.owner == (SourceOwner::Function { declaration:route,arms:vec![arm] })));
             }
-            assert_eq!(used.escapes, vec![SourceOwner::Function { declaration:ordinary,arms:Vec::new() }]);
+            let [escape] = used.escapes.as_slice() else { panic!("one checked callable value"); };
+            assert_eq!(escape.owner, SourceOwner::Function { declaration:ordinary,arms:Vec::new() });
+            assert_eq!(&text[escape.span.start as usize..escape.span.end as usize], "reached");
+            assert!(used.sites.iter().all(|use_| use_.owner != escape.owner || use_.site != Some(escape.site)));
             assert!(unused.sites.is_empty() && unused.escapes.is_empty());
             assert!(result.foreign_or_indirect >= 3);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn source_call_census_keeps_namespace_callable_values_at_original_occurrences() {
+        use source_call_census::{SourceCallCensus, SourceOwner};
+        let root = source("src/main.w","qualified-census-main");
+        let provider = source("src/provider.w","qualified-census-provider");
+        let text = r#"%%start
+            dependency = namespace demo "provider.w";
+            unit((unit(i32)),i32) dispatch = fn(action, x) { action(x); };
+            unit(i32) forward = fn(x) { dispatch(dependency.observe,x); };
+            dispatch(dependency.observe,1);
+        %%end"#;
+        let foreign = "%%start\nunit(i32) observe = fn(x) { x; };\n%%end";
+        let token = text.find("dependency =").unwrap();
+        let end = token + text[token..].find(';').unwrap() + 1;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let modules = vec![(declarations(&root,text),vec![ScalarNamespaceBinding {
+                binding:"dependency".into(),target:provider.clone(),span:ByteSpan::new(token as u32,end as u32),
+            }]),(declarations(&provider,&foreign),Vec::new())];
+            let prepared = prepare_checker_project(modules,vec![provider.clone(),root.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let module = |id| project.modules.iter().position(|module| &module.source==id).unwrap();
+            let root_module = module(&root);
+            let provider_module = module(&provider);
+            let fn_item = |m:usize,name| project.modules[m].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap();
+            let target = (provider_module,fn_item(provider_module,"observe"));
+            let forward = (root_module,fn_item(root_module,"forward"));
+            let census = SourceCallCensus::build(project,calls,[target]).unwrap();
+            let uses = &census.uses[&target];
+            assert!(uses.sites.is_empty());
+            assert_eq!(uses.escapes.len(),2);
+            assert!(uses.escapes.iter().any(|site| site.owner == SourceOwner::Initialization(root_module)));
+            assert!(uses.escapes.iter().any(|site| site.owner == (SourceOwner::Function { declaration:forward,arms:Vec::new() })));
+            assert!(uses.escapes.iter().all(|site| &text[site.span.start as usize..site.span.end as usize] == "dependency.observe"));
         }
     }
 

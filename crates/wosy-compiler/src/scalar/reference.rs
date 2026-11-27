@@ -6505,6 +6505,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) projected_f32_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(feature = "internal-checker")]
     pub(super) projected_struct_literals: HashMap<OccurrenceOrdinal, usize>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) prepared_callable_value_uses: HashMap<OccurrenceOrdinal, SourceSpan>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -6723,6 +6725,8 @@ impl OccurrenceStructure {
             projected_f32_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_struct_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            prepared_callable_value_uses: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -8353,6 +8357,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             );
             self.structure.checked_types.expressions.insert(ordinal, ty);
         }
+        #[cfg(feature = "internal-checker")]
+        let census_callable = matches!(self.structure.checked_types.expressions.get(&ordinal),
+            Some(ScalarType::Callable { .. }));
         #[cfg(any(test, feature = "internal-checker"))]
         if let Some(marker) = self.occurrence_typing.take_checker_directive(expression) {
             use super::checker_directive::PreparedCheckerDirective;
@@ -8651,6 +8658,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let identity = resolver.plain_name(name, names);
             if let Some(identity) = identity {
                 if let PlainNameIdentity::ModuleValue(target) = &identity {
+                    #[cfg(feature = "internal-checker")]
+                    if census_callable {
+                        self.structure.prepared_callable_value_uses.insert(ordinal, target.clone());
+                    }
                     if typed_callable {
                         self.callable_escapes.insert(target.clone());
                     }
@@ -8685,6 +8696,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(identity) = identity {
                 if let InitializationName::Storage(InitializationStorage::Module(span)) = identity {
+                    #[cfg(feature = "internal-checker")]
+                    if census_callable {
+                        self.structure.prepared_callable_value_uses.insert(ordinal, SourceSpan::new((*source).clone(), span));
+                    }
                     if typed_callable {
                         self.callable_escapes.insert(SourceSpan::new((*source).clone(), span));
                     }
@@ -8712,6 +8727,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     let ScalarExpression::Member { name, .. } = expression else {
                         unreachable!("prepared member occurrence");
                     };
+                    #[cfg(feature = "internal-checker")]
+                    if census_callable {
+                        if let Some(span) = resolver.declarations.value_token(target, name) {
+                            self.structure.prepared_callable_value_uses.insert(ordinal, SourceSpan::new(target.clone(), span));
+                        }
+                    }
                     if typed_callable {
                         if let Some(span) = resolver.declarations.value_token(target, name) {
                             self.callable_escapes.insert(SourceSpan::new(target.clone(), span));
@@ -8804,6 +8825,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         Self::storage_use(&mut self.structure, declarations, source, receiver, ordinal,
                             ModuleStorageRole::Project),
                     _ => {}
+                }
+                #[cfg(feature = "internal-checker")]
+                if census_callable {
+                    if let InitializationMember::Module { declaration, .. } = &identity {
+                        self.structure.prepared_callable_value_uses.insert(ordinal, declaration.clone());
+                    }
                 }
                 if typed_callable {
                     if let InitializationMember::Module { declaration, .. } = &identity {
