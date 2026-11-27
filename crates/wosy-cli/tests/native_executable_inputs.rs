@@ -68,7 +68,11 @@ fn worker(store: Arc<SourceStore>) -> SourceStorageWorker {
 #[ignore = "explicit fixture child entry"]
 fn native_v3_child() {
     let args = |name| std::env::var(name).unwrap();
-    let selection: BuildSourceSelection = serde_json::from_str(&args("WOSY_V3_SELECTION")).unwrap();
+    let selection = BuildSourceSelection {
+        root: wosy_protocol::NodeId::parse_hex(&args("WOSY_V3_ROOT")).unwrap(),
+        project: args("WOSY_V3_PROJECT"),
+        target: args("WOSY_V3_TARGET"),
+    };
     let path = args("WOSY_V3_ENDPOINT");
     let profile = args("WOSY_V3_PROFILE");
     let activator = args("WOSY_V3_PARENT_PID").parse().unwrap();
@@ -117,7 +121,9 @@ fn launch(exe: &Path, store: &Path, endpoint: &Path, selected: &BuildSourceSelec
     let mut child = OwnedChild(Command::new(exe).args(["--exact", "native_v3_child", "--ignored", "--nocapture"])
         .env("WOSY_V3_STORE", store)
         .env("WOSY_V3_ENDPOINT", endpoint)
-        .env("WOSY_V3_SELECTION", serde_json::to_string(selected).unwrap())
+        .env("WOSY_V3_ROOT", selected.root.hex())
+        .env("WOSY_V3_PROJECT", &selected.project)
+        .env("WOSY_V3_TARGET", &selected.target)
         .env("WOSY_V3_PROFILE", profile)
         .env("WOSY_V3_PARENT_PID", std::process::id().to_string())
         .stdout(Stdio::piped()).spawn().unwrap());
