@@ -2035,6 +2035,9 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
+                        if matches!(ty, ScalarType::Array { element, .. } if matches!(element.as_ref(), ScalarType::Struct(_))) {
+                            projected_storage.observe_aggregate(declaration.clone());
+                        }
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
                             projected_storage.observe_array(declaration, ty, cells.into_iter());
                         }
@@ -2054,7 +2057,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             passive_generation = generation + 1;
             completed_passive.clear();
             if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
-                visits, projected_storage, failures)? {
+                visits, projected_storage, &storage, failures)? {
                 projected_storage.settle(|declaration, index, observed| {
                     if &declaration.source != source { return None; }
                     let value = storage.get_mut(&declaration.range)?;
@@ -2108,6 +2111,7 @@ fn try_observed_projected_storage_call(
     site: OccurrenceOrdinal,
     visits: &[InitializationVisit],
     storage: &mut super::checker_flow::ProjectedStorage,
+    initialized: &HashMap<ByteSpan, InitializerValue<'_>>,
     failures: &mut Option<&mut OrderedFailures>,
 ) -> Result<bool, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }) =
@@ -2133,7 +2137,11 @@ fn try_observed_projected_storage_call(
         for effect in &plan.effects {
             if effect.owner != target { continue; }
             match &effect.operation {
-                ordered_float_prefix::Effect::Read { at, declaration, index: None } => { prefix_reads.insert((declaration.clone(), *at)); }
+                ordered_float_prefix::Effect::Read { storage_site, declaration, index, .. } => {
+                    use super::reference::ModuleStorageRole;
+                    let role = if index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read };
+                    prefix_reads.insert((declaration.clone(), *storage_site, role));
+                }
                 ordered_float_prefix::Effect::Call { at, .. } => { prefix_calls.insert(*at); }
                 _ => {}
             }
@@ -2185,9 +2193,13 @@ fn try_observed_projected_storage_call(
     let mut prefix_history = None;
     if let Some(plan) = &plan {
         let mut prefix_work = work.get();
-        let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index| {
-            if index.is_some() { return None; }
-            storage.observed_atom(declaration)
+        let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index, field| {
+            match (index, field) {
+                (None, None) => storage.observed_atom(declaration),
+                (Some(index), Some(field)) if &declaration.source == source && storage.has_observed_aggregate(declaration) =>
+                    observed_fixed_nominal_f32_field(initialized.get(&declaration.range)?, index, field),
+                _ => None,
+            }
         }, trace.is_some(), &mut prefix_work, |owner, at| {
             if owner.0 != target.0 { return None; }
             Some(wosy_syntax::SourceSpan::new(source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
@@ -2762,6 +2774,24 @@ enum PassiveLiteral<'a> {
     Nominal(&'a super::ScalarStructId, Box<[Self]>),
     // Share immutable semantic data, not Wosy locations or runtime storage.
     Copy(std::rc::Rc<Self>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_fixed_nominal_f32_field(value: &InitializerValue<'_>, index: u64,
+    field: &super::ScalarStructFieldId) -> Option<ObservedExactValue> {
+    let InitializerValue::PassiveAggregate { ty: ScalarType::Array { element, length, .. }, value, .. } = value else { return None; };
+    let ScalarType::Struct(expected) = element.as_ref() else { return None; };
+    if expected != &field.structure || index >= *length { return None; }
+    fn original<'v,'a>(mut value: &'v PassiveLiteral<'a>) -> &'v PassiveLiteral<'a> {
+        while let PassiveLiteral::Copy(next) = value { value = next; }
+        value
+    }
+    let PassiveLiteral::Array(values) = original(value) else { return None; };
+    if u64::try_from(values.len()).ok()? != *length { return None; }
+    let PassiveLiteral::Nominal(actual, fields) = original(values.get(usize::try_from(index).ok()?)?) else { return None; };
+    if *actual != expected { return None; }
+    let PassiveLiteral::Float(ranked_float::Atom::Single(bits)) = original(fields.get(field.index)?) else { return None; };
+    Some(ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -19803,8 +19833,8 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             assert_eq!(plan.bindings.len(), 1);
             let mut reads = 0usize;
             let expected = ExactF32::checked_bits(0.25f32.to_bits()).unwrap();
-            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index| {
-                if index.is_some() || declaration.source != source { return None; }
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index, field| {
+                if field.is_some() || index.is_some() || declaration.source != source { return None; }
                 reads += 1;
                 (reads <= 2).then_some(ExactValue::F32(expected))
             }, true, &mut 0, |(module, item), at| {
@@ -19845,8 +19875,8 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let plan = ordered_float_prefix::plan_prefix::<false>(project, calls, (0,item)).unwrap();
             let mut reads = 0usize;
             let mut work = 0usize;
-            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index| {
-                if index.is_some() || declaration.source != source { return None; }
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index, field| {
+                if field.is_some() || index.is_some() || declaration.source != source { return None; }
                 reads += 1;
                 Some(ExactValue::F32(ExactF32::checked_bits(0.25f32.to_bits())?))
             }, true, &mut work, |(module, item), at| {
@@ -19904,6 +19934,67 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_flight_easing_keeps_original_call_and_rounding_order() {
+        let app = source("src/main.w", "observed-flight-eased-unit");
+        let program = r#"%%start
+            struct copy RenderPose { f32 x; f32 heading; }
+            RenderPose first = {.x=0.0;.heading=0.25;};
+            RenderPose second = {.x=0.0;.heading=0.5;};
+            RenderPose[2] presented_pose = [first,second];
+            i32 wreck_age = 13;
+            bool wreck_entered = false;
+            f32 wreck_alpha = 0.0;
+            i16 status = 5;
+            f32(i32) float_i = fn(a) { core.sint_to_float<f32>(a) };
+            f32(f32,f32,f32) clamp = fn(v,lo,hi) { if (v < lo) { lo } else { if (v > hi) { hi } else { v } } };
+            f32(f32) eased_unit = fn(value) {
+                f32 t = clamp(value,0.0,1.0);
+                t*t*(3.0-2.0*t)
+            };
+            f32(f32) wrap = fn(a) { if (a > 3.14159265) { a - 6.28318530 } else { if (a < -3.14159265) { a + 6.28318530 } else { a } } };
+            f32(f32) sin_small = fn(a) {
+                f32 u = if (a > 1.57079633) { 3.14159265 - a } else { if (a < -1.57079633) { -3.14159265 - a } else { a } };
+                f32 d = u*u;
+                u*(1.0-d*(0.166666667-d*(0.008333333-d*0.000198413)))
+            };
+            f32(f32) cos_small = fn(a) { sin_small(wrap(a + 1.57079633)) };
+            unit() render = fn {
+                bool wrecking = wreck_age >= 0;
+                f32 wreck_time = if (wrecking && !wreck_entered) { float_i(wreck_age)+wreck_alpha } else { 0.0 };
+                f32 wreck_blend = eased_unit(wreck_time/13.0);
+                f32 orbit = eased_unit(wreck_time/34.0);
+                f32 p_heading = presented_pose[0].heading;
+                f32 hp = sin_small(p_heading);
+                f32 hz0 = cos_small(p_heading);
+                bool active = wreck_blend == 1.0 && orbit > 0.0 && orbit < 1.0
+                    && hp > 0.24 && hp < 0.26 && hz0 > 0.96 && hz0 < 0.98;
+                if (active) { status = 37; } else { status = 19; };
+            };
+            render();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (age, index, code) in [("13", 0, 37), ("-1", 0, 19), ("13", 1, 19)] {
+                let text = program.replace("wreck_age = 13", &format!("wreck_age = {age}"))
+                    .replace("presented_pose[0]", &format!("presented_pose[{index}]"));
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let report = prepare().run().unwrap();
+                let (capped, _, trace, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped, report.directives);
+                assert_eq!(capped[0].code(), &BigInt::from(code));
+                for call in ["eased_unit(wreck_time/13.0)", "eased_unit(wreck_time/34.0)", "clamp(value,0.0,1.0)", "sin_small(p_heading)", "cos_small(p_heading)"] {
+                    let start = text.find(call).unwrap() as u32;
+                    assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start+call.len() as u32))));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn original_frame_computes_current_short_circuited_finite_f32_time() {
         use ordered_float_prefix::ExactValue;
         use super::super::checker_flow::projected_f32::ExactF32;
@@ -19935,8 +20026,8 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let run = |age: i32, entered: Option<bool>, alpha: Option<u32>| {
                 let formals = alpha.and_then(ExactF32::checked_bits).map(|value| (formal.clone(), ExactValue::F32(value))).into_iter().collect();
                 let mut reads = 0;
-                let result = ordered_float_prefix::evaluate_observed_prefix(&plan, formals, |decl, index| {
-                    if index.is_some() || decl.source != source { return None; }
+                let result = ordered_float_prefix::evaluate_observed_prefix(&plan, formals, |decl, index, field| {
+                    if field.is_some() || index.is_some() || decl.source != source { return None; }
                     reads += 1;
                     match &text[decl.range.start as usize..decl.range.end as usize] {
                         "wreck_age" => Some(ExactValue::Integer(ScalarType::I32, BigInt::from(age))),

@@ -1791,6 +1791,7 @@ pub(super) struct ProjectedStorage {
     fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
     changes: StorageDelta,
     f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
+    aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1823,6 +1824,14 @@ impl ProjectedStorage {
             }
         }
         Some(())
+    }
+
+    pub(super) fn observe_aggregate(&mut self, declaration: wosy_syntax::SourceSpan) {
+        Rc::make_mut(&mut self.aggregate_initial).insert(declaration);
+    }
+
+    pub(super) fn has_observed_aggregate(&self, declaration: &wosy_syntax::SourceSpan) -> bool {
+        self.aggregate_initial.contains(declaration)
     }
 
     pub(super) fn observe_f32(&mut self, declaration: wosy_syntax::SourceSpan, bits: u32) {
@@ -12132,7 +12141,7 @@ pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Opti
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallSites, prefix: usize,
-    prefix_reads: &HashSet<(wosy_syntax::SourceSpan, OccurrenceOrdinal)>, prefix_calls: &HashSet<OccurrenceOrdinal>,
+    prefix_reads: &HashSet<(wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole)>, prefix_calls: &HashSet<OccurrenceOrdinal>,
 ) -> Option<bool> {
     use super::reference::ModuleStorageRole;
     if !calls.checker_returns_unit() || calls.contextual_formal().is_some()
@@ -12185,7 +12194,7 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
     }
     if !calls.structure.module_storage_uses.iter().all(|(declaration, uses)|
         uses.iter().all(|(site, role)| covered.contains(&(declaration.clone(), *site, *role))
-            || (*role == ModuleStorageRole::Read && prefix_reads.contains(&(declaration.clone(), *site))))) {
+            || prefix_reads.contains(&(declaration.clone(), *site, *role)))) {
         return None;
     }
     Some(writes || !covered.is_empty() || !prefix_reads.is_empty())

@@ -9,7 +9,7 @@ type EffectId = usize;
 pub(super) enum Effect {
     Sequence { at: OccurrenceOrdinal, operands: Vec<EffectId>, kind: SequenceKind },
     LocalRead { at: OccurrenceOrdinal, binding: ReferenceBindingId, version: Option<EffectId> },
-    Read { at: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64> },
+    Read { at: OccurrenceOrdinal, storage_site: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64> },
     Field { at: OccurrenceOrdinal, field: super::super::ScalarStructFieldId, receiver: EffectId },
     Branch { at: OccurrenceOrdinal, condition: EffectId, yes: EffectId, no: EffectId },
     ShortCircuit { at: OccurrenceOrdinal, conjunction: bool, left: EffectId, right: EffectId },
@@ -374,7 +374,7 @@ impl<'a> Planner<'a> {
                             },
                             PlainNameIdentity::ModuleValue(declaration) => {
                                 frame.module_value(declaration, ty)?;
-                                Effect::Read { at, declaration: declaration.clone(), index: None }
+                                Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None }
                             }
                             _ => return None,
                         },
@@ -384,7 +384,7 @@ impl<'a> Planner<'a> {
                             frame.module_value(declaration, &ScalarType::Struct(field.structure.clone()))?;
                             let receiver = self.certificate.effects.len();
                             self.certificate.effects.push(EffectRecord { owner: frame.target,
-                                operation: Effect::Read { at, declaration: declaration.clone(), index: None },
+                                operation: Effect::Read { at, storage_site: at, declaration: declaration.clone(), index: None },
                             });
                             Effect::Field { at, field: field.clone(), receiver }
                         }
@@ -580,7 +580,7 @@ impl Frame<'_> {
         } else if !value_type(ty) { return None; }
         let NamedPlaceRootIdentity::ModuleValue(declaration) = self.prepared.prepared_named_place_root(*base)? else { return None; };
         self.module_value(declaration, base_type)?;
-        Some(Effect::Read { at, declaration: declaration.clone(), index: Some(constant) })
+        Some(Effect::Read { at, storage_site: *base, declaration: declaration.clone(), index: Some(constant) })
     }
 }
 
@@ -648,7 +648,7 @@ type ObservedResult = (Vec<ExactValue>, Option<ObservedTrace>);
 pub(super) fn evaluate_observed_prefix(
     certificate: &PrefixCertificate,
     mut formals: HashMap<ReferenceBindingId, ExactValue>,
-    mut read: impl FnMut(&SourceSpan, Option<u64>) -> Option<ExactValue>,
+    mut read: impl FnMut(&SourceSpan, Option<u64>, Option<&super::super::ScalarStructFieldId>) -> Option<ExactValue>,
     trace: bool,
     work: &mut usize,
     resolve_span: impl Fn(PreparedCallable, OccurrenceOrdinal) -> Option<SourceSpan>,
@@ -675,7 +675,9 @@ pub(super) fn evaluate_observed_prefix(
             (SequenceKind::Integer(ty, value), []) => Integer(ty.clone(), value.clone()),
             (SequenceKind::Float(ranked_float::Atom::Single(bits)), []) => F32(ExactF32::checked_bits(*bits)?),
             (SequenceKind::Unary(UnaryOperator::LogicalNot), [Boolean(value)]) => Boolean(!value),
-            (SequenceKind::Binary(BinaryOperator::Add), [F32(left), F32(right)]) => F32(left.add(*right)?),
+            (SequenceKind::Unary(UnaryOperator::Negate), [F32(value)]) => F32(value.negate()),
+            (SequenceKind::Binary(op @ (BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide)),
+                [F32(left), F32(right)]) => F32(left.binary(op, *right)?),
             (SequenceKind::Binary(op), [F32(left), F32(right)]) => Boolean(
                 super::super::symbolic_integer::IntegerRelation::from_operator(op)?
                     .accepts(f32::from_bits(left.0).partial_cmp(&f32::from_bits(right.0))?)),
@@ -711,7 +713,7 @@ pub(super) fn evaluate_observed_prefix(
                 let record = certificate.effects.get(at)?;
                 match &record.operation {
                     Effect::LocalRead { binding, .. } => values.push(scope.borrow().get(binding)?.clone()),
-                    Effect::Read { declaration, index, .. } => values.push(read(declaration, *index)?),
+                    Effect::Read { declaration, index, .. } => values.push(read(declaration, *index, None)?),
                     Effect::Branch { at, condition, yes, no } => {
                         pending.push(Work::Select(record.owner, *at, *yes, *no, Rc::clone(&scope)));
                         pending.push(Work::Eval(*condition, scope));
@@ -730,7 +732,12 @@ pub(super) fn evaluate_observed_prefix(
                         pending.push(Work::Call(record.owner, *at, *function, ty, arguments.len()));
                         pending.extend(arguments.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
                     }
-                    Effect::Field { .. } => return None,
+                    Effect::Field { field, receiver, .. } => {
+                        let receiver = certificate.effects.get(*receiver)?;
+                        if receiver.owner != record.owner { return None; }
+                        let Effect::Read { declaration, index: Some(index), .. } = &receiver.operation else { return None; };
+                        values.push(read(declaration, Some(*index), Some(field))?);
+                    }
                 }
             }
             Work::Select(owner, at, yes, no, scope) => {
