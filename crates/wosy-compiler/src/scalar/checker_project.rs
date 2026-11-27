@@ -11875,104 +11875,13 @@ struct ClosedAuthoredHistories<'run> {
 
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
-    fn execute_frame(
-        &self, body: &FunctionCallSites, entry: Option<&super::checker_flow::CallableHistoryEntry>,
-        step_owner: Option<usize>, nested: Option<&mut super::checker_flow::CallableHistoryCallHandler<'_>>,
-        select: impl FnMut(IntegerCheckFailure<'_>, Vec<super::checker_flow::CallableHistoryStep>) -> Option<bool>,
-    ) -> Option<super::checker_flow::CallableHistoryCall> {
-        use super::checker_flow::{CallableHistoryCall as Receipt, CallableHistoryCompletion as Completion, HistoryFrameEffects};
-        if !body.checker_returns_unit() {
-            let [result] = body.boundary.results.as_slice() else { return None; };
-            return super::checker_flow::trace_closed_projected_scalar_return(body, entry?.clone(), &result.ty, step_owner, self.work, nested);
-        }
-        let capture = entry.is_some();
-        let inputs = entry.map_or(IntegerRequirementEntry::Arbitrary, |row| IntegerRequirementEntry::UnitHistory(row.clone()));
-        let effects = if !body.structure.checker_selected_snapshots.is_empty() { HistoryFrameEffects::Snapshot }
-            else if body.structure.has_ordinary_contextual_places() { HistoryFrameEffects::LexicalContext } else { HistoryFrameEffects::None };
-        let (result, pieces) = super::checker_flow::search_callable_history_frame(body, inputs, self.work, step_owner,
-            capture, effects, nested, select)?;
-        Some(match result {
-            Completion::LimitReached => Receipt::LimitReached,
-            Completion::Exhausted(active) => {
-                self.observed.set(self.observed.get() || active);
-                Receipt::UnitPartitions(pieces)
-            }
-        })
-    }
-
-    /// The interpreter calls synchronously into a nested frame. Keep suspended
-    /// frames and their completed call receipts on the heap, not the host stack.
-    fn visit_unit(&self, root: PreparedCallable) -> Option<(super::checker_flow::CallableHistoryCompletion, Vec<super::checker_flow::UnitHistoryPiece>)> {
-        use super::checker_flow::{CallableHistoryCall as Receipt, CallableHistoryCompletion as Completion,
-            CallableHistoryEntry as Entry, CallableHistoryStep as Step};
-        struct Call { site: OccurrenceOrdinal, target: PreparedCallable, entry: Entry, prefix: Vec<Step> }
-        struct Frame {
-            target: PreparedCallable, incoming: Option<Call>,
-            returned: Vec<(Call, Receipt)>, reported: usize,
-        }
-        let mut stack = vec![Frame { target: root, incoming: None, returned: Vec::new(), reported: 0 }];
-        let mut prefix = Vec::new();
-        loop {
-            let frame = stack.last_mut()?;
-            let target = frame.target;
-            let body = self.calls.function_body(target.0, target.1, None)?;
-            let step_owner = (target.0 != root.0).then_some(target.0);
-            let mut position = 0;
-            let mut pending = None;
-            let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
-                argument: NestedIntegerArgument<'_>, steps: Vec<Step>| {
-                if !std::ptr::eq(body, caller) { return None; }
-                let child = symbolic_history_call_target(self.project, self.calls, target.0, target.1, body, site, signature)?;
-                if child.0 != target.0 && !completed_history_namespace(self.project, target.0, child.0, self.visits) { return None; }
-                let entry = argument.callable_history_entry(&signature.parameters, self.work)?;
-                let index = position;
-                position += 1;
-                if let Some((call, receipt)) = frame.returned.get(index) {
-                    if call.site != site || call.target != child || call.entry != entry || call.prefix != steps { return None; }
-                    return Some(receipt.clone());
-                }
-                let child_body = self.calls.function_body(child.0, child.1, None)?;
-                if child_body.structure.checker_direct_targets.is_empty() {
-                    // No suspension or parent rewalk for ordinary leaves. Keep the receipt
-                    // only because a later nested call may require resuming this parent.
-                    let child_prefix = || prefix.iter().chain(&steps).copied().collect::<Vec<_>>();
-                    let receipt = self.execute_frame(child_body, Some(&entry), (child.0 != root.0).then_some(child.0),
-                        None, |failure, suffix| (self.record)(child, failure, &child_prefix(), suffix))?;
-                    frame.returned.push((Call { site, target: child, entry, prefix: steps }, receipt.clone()));
-                    return Some(receipt);
-                }
-                pending = Some(Call { site, target: child, entry, prefix: steps });
-                None
-            };
-            let handler = (!body.call_occurrences.is_empty())
-                .then_some(&mut nested as &mut super::checker_flow::CallableHistoryCallHandler<'_>);
-            let mut count = 0;
-            let seen = frame.reported;
-            let result = self.execute_frame(body, frame.incoming.as_ref().map(|call| &call.entry), step_owner,
-                handler, |failure, steps| {
-                    count += 1;
-                    if count <= seen { return Some(false); }
-                    (self.record)(target, failure, &prefix, steps)
-                });
-            if matches!(result, Some(Receipt::LimitReached)) { return Some((Completion::LimitReached, Vec::new())); }
-            if let Some(call) = pending {
-                if result.is_some() || count < seen || position != frame.returned.len() + 1 { return None; }
-                frame.reported = count;
-                let child = call.target;
-                prefix.extend_from_slice(&call.prefix);
-                stack.push(Frame { target: child, incoming: Some(call), returned: Vec::new(), reported: 0 });
-            } else {
-                let receipt = result?;
-                if count < seen || position != frame.returned.len() { return None; }
-                if frame.incoming.is_none() {
-                    let Receipt::UnitPartitions(pieces) = receipt else { return None; };
-                    return Some((Completion::Exhausted(self.observed.get()), pieces));
-                }
-                let call = stack.pop()?.incoming?;
-                prefix.truncate(prefix.len().checked_sub(call.prefix.len())?);
-                stack.last_mut()?.returned.push((call, receipt));
-            }
-        }
+    fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, |target| self.calls.function_body(target.0, target.1, None),
+            |parent, body, site, signature| {
+                let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
+                if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
+                Some(child)
+            }, |target, failure, steps| (self.record)(target, failure, &[], steps))
     }
 }
 
@@ -12031,7 +11940,7 @@ fn collect_complete_unit_history<const ENTRY_EVIDENCE: bool>(
         Some(false)
     };
     let graph = ClosedAuthoredHistories { project, calls, visits, work: &work, observed: &nested_active, record: &record };
-    let (CallableHistoryCompletion::Exhausted(active), _) =
+    let CallableHistoryCompletion::Exhausted(active) =
         graph.visit_unit(target).ok_or(ProjectCheck::Unsupported)?
     else { return Err(ProjectCheck::Unsupported); };
     Ok(active || nested_active.get())
@@ -12201,7 +12110,7 @@ fn collect_unreached_authored_paths(
             expected == InitializationVisit::Completed) {
             search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
         } else {
-            graph.visit_unit((ordinal, item)).map(|(completion, _)| completion)
+            graph.visit_unit((ordinal, item))
         }.ok_or(ProjectCheck::Unsupported)?;
         match result {
             CallableHistoryCompletion::Exhausted(observed) => active |= observed || nested_active.get(),
@@ -21444,6 +21353,53 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                     ByteSpan::new(start, start+11))));
                 let main = prepare(&text, ScalarCheckerScope::MainFlowOnly).run().unwrap();
                 assert!(main.directives.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn sequential_nonleaf_calls_visit_linear_items_and_keep_both_return_partitions() {
+        use super::super::checker_flow::PROJECTED_ITEM_VISITS;
+        use std::num::NonZeroUsize;
+        let src = source("src/main.w", "wide-projected-call-history");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let mut last = None;
+            for width in [8,16,32] {
+                let prefix = r#"%%start
+unit(f32,u8) leaf = fn(dt,x) { if (x < 128) { core.narrow(x < 64, {.stdout="";.stderr="narrow";.code=5;.files=[];}); }; };
+unit(f32,u8) wrapper = fn(dt,x) { leaf(dt,x); };
+unit(f32,u8) entry = fn(dt,x) {
+"#;
+                let text = format!("{prefix}{}core.require(x < 250, {}); core.require(x < 240, {}); }};\n%%end",
+                    "wrapper(dt,x);\n".repeat(width), OUTPUT.replace(".code = 1", ".code = 11"),
+                    OUTPUT.replace(".code = 1", ".code = 13"));
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&src,&text), Vec::new())], [], vec![src.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                PROJECTED_ITEM_VISITS.with(|count| count.set(0));
+                let all = prepare().run().unwrap().directives;
+                let visits = PROJECTED_ITEM_VISITS.with(|count| count.replace(0));
+                let (capped, done, trace, active) = prepare().search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+                let first_visits = PROJECTED_ITEM_VISITS.with(|count| count.replace(0));
+                assert!(active);
+                assert_eq!(done, StartupAuthoredCompletion::LimitReached);
+                assert_eq!(all.iter().map(|f| f.code().clone()).collect::<Vec<_>>(), [11,13].map(BigInt::from));
+                assert_eq!(capped, all[..1]);
+                assert!(all[0].witness.intervals_at(0,0).unwrap().eq([(&BigInt::from(250), &BigInt::from(255))]));
+                assert!(all[1].witness.intervals_at(0,0).unwrap().eq([(&BigInt::from(240), &BigInt::from(249))]));
+                for (pos, call) in text.match_indices("wrapper(dt,x)") {
+                    assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(src.clone(),
+                        ByteSpan::new(pos as u32, (pos+call.len()) as u32))));
+                }
+                eprintln!("projected history calls={width} item visits: exhaustive={visits}, capped={first_visits}");
+                assert!(visits > width && first_visits > width);
+                if let Some((prior, first_prior)) = last {
+                    assert!(visits <= 2*prior+12 && first_visits <= 2*first_prior+12,
+                        "revisited program prefixes at width {width}: all {prior} -> {visits}, capped {first_prior} -> {first_visits}");
+                }
+                last = Some((visits,first_visits));
             }
         }
     }
