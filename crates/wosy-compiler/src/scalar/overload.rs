@@ -646,8 +646,11 @@ pub(super) fn record_project_overload_selections(
     #[cfg(test)]
     let _recording = observations::RecordingScope::new();
     for (ordinal, module) in project.modules.iter_mut().enumerate() {
-        let scope = &environment.modules[ordinal].scope;
         let overloads = environment.lookup(ordinal);
+        if overloads.is_empty() {
+            continue;
+        }
+        let scope = &environment.modules[ordinal].scope;
         for item in &mut module.items {
             match item {
                 ScalarItem::Binding(binding) => {
@@ -1452,6 +1455,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn project_recorder_only_skips_modules_with_no_visible_overload() {
+        let mut project = project(2, 4, 4, 2);
+        project.modules[0].items.retain(|item| {
+            !matches!(item, ScalarItem::Function(function) if !function.overload_arms.is_empty())
+        });
+        let parsed = parse_source(
+            source(2),
+            "%%start\nu8(u8) identity = fn(value) { value };\nu8 result = identity(7);\n%%end".into(),
+            &[],
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let validated = derive_scalar_program(&parsed.result);
+        assert!(validated.diagnostics.is_empty(), "{:?}", validated.diagnostics);
+        let ordinary = ScalarModule::from_program(validated.program, Vec::new());
+        let untouched = ordinary.items.clone();
+        project.initialization_order.push(ordinary.source.clone());
+        project.modules.push(ordinary);
+
+        let environment = ScalarOverloadEnvironment::project(&project.modules);
+        assert!(environment.modules[0].declarations.is_empty());
+        assert!(environment.lookup(0).contains_key("peer.choose"));
+        assert!(environment.lookup(2).is_empty());
+        record_project_overload_selections(&mut project, &environment);
+        assert_selections(&project.modules[0].items, 4, 2, true);
+        assert_eq!(project.modules[2].items, untouched);
     }
 
     #[test]
