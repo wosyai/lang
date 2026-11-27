@@ -17,8 +17,6 @@ use super::super::{
 use rowan::{ast::SyntaxNodePtr, GreenNode};
 use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind, WosyLanguage};
 
-const MAX_DIRECT_STARTUP_CALLS: usize = 16;
-const MAX_PAIR_STARTUP_HOPS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectComptimeArgument {
@@ -162,7 +160,7 @@ impl<const ARITY: usize> DirectStartupComptimePlan<ARITY> {
     }
 }
 
-/// One eager scalar tail and at most sixteen direct literal startup calls to
+/// One eager scalar tail and direct literal startup calls to
 /// that same declaration. Authenticate the entire ordinary startup list
 /// before emitting anything. Equal tuples share one evaluator only within
 /// this exact analysis; this does not define a reusable ComptimeKey.
@@ -222,7 +220,7 @@ impl ForwardedPairStartupComptimePlan {
 pub fn derive_forwarded_pair_startup_comptime_plan(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<ForwardedPairStartupComptimePlan, ClosedComptimeRejection> {
-    with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+    with_verified_startup_calls::<2, _>(fresh, id, layout, false,
         StartupEntry::OneForwarder, |calls, body, name_span, forwarding| {
             let VerifiedStartupPaths::OneForwarder(forwarding) = forwarding else {
                 return Err(ClosedComptimeRejection::Emitter("verified tail hop disappeared".into()));
@@ -320,7 +318,7 @@ impl PairStartupBranchSelection {
 /// declaration. Hop indices address the owning plan's authored edge table.
 #[derive(Clone, Debug)]
 pub struct PairStartupCallPath {
-    hops: Vec<usize>,
+    hops: std::sync::Arc<[usize]>,
     positions: [usize; 2],
     branch: Option<PairStartupBranchSelection>,
 }
@@ -565,8 +563,8 @@ impl PairStartupCallGraphComptimePlan {
     }
 }
 
-/// Inspect the selected comptime function and up to eight safe local
-/// forwarders, followed by at most sixteen ordinary startup bindings. A
+/// Inspect the selected comptime function and safe local forwarders,
+/// followed by ordinary startup bindings. A
 /// binding may call the comptime function directly or enter any checked
 /// acyclic forwarding path through complete tail calls. A startup may
 /// enter a selector whose first formal is a proven Boolean at that call.
@@ -596,7 +594,7 @@ pub fn derive_pair_startup_call_graph_wasip1_stdout(
 fn derive_pair_startup_graph_with_delivery(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, max_wasip1_stdout: Option<usize>,
 ) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
-    with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+    with_verified_startup_calls::<2, _>(fresh, id, layout, false,
         StartupEntry::PairCallGraph { retain_cst: max_wasip1_stdout.is_some() }, |calls, body, name_span, proof| {
             let VerifiedStartupPaths::Graph { site, hops, selectors, paths, order, ordinary } = proof else {
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
@@ -611,7 +609,7 @@ fn derive_pair_startup_graph_with_delivery(
 fn derive_direct_startup<const ARITY: usize>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
-    with_verified_startup_calls::<ARITY, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
+    with_verified_startup_calls::<ARITY, _>(fresh, id, layout, false,
         StartupEntry::Direct, |calls, body, name_span, _| {
             emit_startup_plan(id, layout, body, name_span, calls, None)
         })
@@ -677,7 +675,7 @@ fn with_verified_direct_call<T>(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
     observe: impl FnOnce(InspectedDirectComptimeCall, &ScalarBlock, ByteSpan) -> Result<T, ClosedComptimeRejection>,
 ) -> Result<T, ClosedComptimeRejection> {
-    with_verified_startup_calls::<1, _>(fresh, id, layout, 1, StartupEntry::Direct, |mut calls, body, name_span, _| {
+    with_verified_startup_calls::<1, _>(fresh, id, layout, true, StartupEntry::Direct, |mut calls, body, name_span, _| {
         let call = calls.pop().ok_or_else(|| ClosedComptimeRejection::Emitter("verified single call disappeared".into()))?;
         observe(call, body, name_span)
     })
@@ -706,7 +704,7 @@ enum VerifiedStartupPaths {
 // The analytical project stays private. The continuation is called only
 // after every edge, startup occurrence and exact formal read were verified.
 fn with_verified_startup_calls<const ARITY: usize, T>(
-    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, limit: usize, entry: StartupEntry,
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, single: bool, entry: StartupEntry,
     observe: impl FnOnce(
         Vec<InspectedDirectComptimeCall<ARITY>>, &ScalarBlock, ByteSpan, VerifiedStartupPaths,
     ) -> Result<T, ClosedComptimeRejection>,
@@ -749,9 +747,6 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             while let Some(declaration) = authored_items.peek().and_then(|item| only(item.children()))
                 .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
             {
-                if forwarders.len() == MAX_PAIR_STARTUP_HOPS {
-                    return Err(unsupported("comptime startup forwarding declaration limit exceeded"));
-                }
                 if !safe_forwarder(&declaration) {
                     return Err(unsupported("comptime startup requires safe authored forwarding declarations"));
                 }
@@ -767,8 +762,8 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             return Err(unsupported("each authored startup item must be one ordinary binding"));
         };
         count += 1;
-        if count > limit {
-            return Err(unsupported("direct comptime startup call limit exceeded"));
+        if single && count > 1 {
+            return Err(unsupported("single-call projection requires exactly one startup initializer"));
         }
         if let Some(cst_initializers) = &mut cst_initializers {
             let initializer = binding.children().find(|node| node.kind() == SyntaxKind::OutputList)
@@ -924,6 +919,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
     let routes = if matches!(entry, StartupEntry::PairCallGraph { .. }) {
         verified_pair_paths(&graph, &hops, &selectors, &unsupported)?
     } else { Vec::new() };
+    let mut materialized = std::collections::HashMap::new();
     let mut selected = Vec::with_capacity(count);
     let mut paths = Vec::new();
     let mut order = Vec::new();
@@ -991,9 +987,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
                 };
                 match if value { when_true } else { when_false } {
                     ResolvedPairAlternative::Forward(path) => {
-                        let mut path = path.clone();
-                        path.branch = Some(choice);
-                        Some(path)
+                        Some(path.materialize(&graph, &hops, &mut materialized, Some(choice)))
                     }
                     ResolvedPairAlternative::ReturnFormal(formal) => {
                         // The bypass excludes this comptime site, not the
@@ -1019,7 +1013,7 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
             }
             Some(ResolvedPairRoute::Plain(path)) => {
                 if arguments.len() != ARITY { return Err(unsupported("the exact literal tuple arity is required")); }
-                Some(path.clone())
+                Some(path.materialize(&graph, &hops, &mut materialized, None))
             }
             None => None,
         };
@@ -1174,13 +1168,44 @@ enum CheckedPairAlternative {
 }
 
 enum ResolvedPairRoute<'a> {
-    Plain(PairStartupCallPath),
+    Plain(VerifiedPairSuffix),
     Select { selector: usize, when_true: ResolvedPairAlternative<'a>, when_false: ResolvedPairAlternative<'a> },
 }
 
 enum ResolvedPairAlternative<'a> {
-    Forward(PairStartupCallPath),
+    Forward(VerifiedPairSuffix),
     ReturnFormal(&'a PairStartupHopInput),
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedPairSuffix {
+    first_edge: Option<usize>,
+    positions: [usize; 2],
+}
+
+impl VerifiedPairSuffix {
+    fn materialize(
+        self,
+        graph: &[PairGraphNode],
+        edges: &[IndexedPairHop],
+        paths: &mut std::collections::HashMap<Option<usize>, std::sync::Arc<[usize]>>,
+        branch: Option<PairStartupBranchSelection>,
+    ) -> PairStartupCallPath {
+        let hops = paths.entry(self.first_edge).or_insert_with(|| {
+            let mut hops = Vec::new();
+            let mut current = self.first_edge;
+            while let Some(edge) = current {
+                hops.push(edge);
+                current = match graph[edges[edge].target] {
+                    PairGraphNode::Plain(next) => Some(next),
+                    PairGraphNode::Terminal => None,
+                    PairGraphNode::Selector(_) => unreachable!("verified suffix contains only pure hops"),
+                };
+            }
+            hops.into()
+        });
+        PairStartupCallPath { hops: hops.clone(), positions: self.positions, branch }
+    }
 }
 
 fn verified_pair_paths<'a>(
@@ -1193,26 +1218,35 @@ fn verified_pair_paths<'a>(
     struct Proof<'a> {
         graph: &'a [PairGraphNode],
         hops: &'a [IndexedPairHop],
-        complete: Vec<Option<PairStartupCallPath>>,
+        complete: Vec<Option<VerifiedPairSuffix>>,
         active: Vec<bool>,
         unsupported: &'a dyn Fn(&'static str) -> ClosedComptimeRejection,
     }
     impl Proof<'_> {
-        fn visit(&mut self, index: usize) -> Result<PairStartupCallPath, ClosedComptimeRejection> {
-            if let Some(path) = &self.complete[index] { return Ok(path.clone()); }
-            let PairGraphNode::Plain(edge) = self.graph[index] else {
-                return Err((self.unsupported)("conditional forwarder may only be selected by an ordinary startup initializer"));
+        fn visit(&mut self, mut index: usize) -> Result<VerifiedPairSuffix, ClosedComptimeRejection> {
+            // Walk original declarations iteratively; a route ends at a
+            // completed suffix, an unsupported transfer, or the first repeated node.
+            let mut pending = Vec::new();
+            let mut suffix = loop {
+                if let Some(path) = self.complete[index] { break path; }
+                let PairGraphNode::Plain(edge) = self.graph[index] else {
+                    return Err((self.unsupported)("conditional forwarder may only be selected by an ordinary startup initializer"));
+                };
+                if self.active[index] {
+                    return Err(ClosedComptimeRejection::Unsupported {
+                        site: self.hops[edge].edge.tail_call.clone(), feature: "comptime startup forwarding contains a cycle",
+                    });
+                }
+                self.active[index] = true;
+                pending.push((index, edge));
+                index = self.hops[edge].target;
             };
-            if self.active[index] {
-                return Err(ClosedComptimeRejection::Unsupported {
-                    site: self.hops[edge].edge.tail_call.clone(), feature: "comptime startup forwarding contains a cycle",
-                });
+            for (index, edge) in pending.into_iter().rev() {
+                suffix = self.prepend(edge, suffix);
+                self.active[index] = false;
+                self.complete[index] = Some(suffix);
             }
-            self.active[index] = true;
-            let path = self.through(edge)?;
-            self.active[index] = false;
-            self.complete[index] = Some(path.clone());
-            Ok(path)
+            Ok(suffix)
         }
 
         fn alternative<'a>(&mut self, branch: &'a PairStartupBranch) -> Result<ResolvedPairAlternative<'a>, ClosedComptimeRejection> {
@@ -1222,22 +1256,23 @@ fn verified_pair_paths<'a>(
             }
         }
 
-        fn through(&mut self, index: usize) -> Result<PairStartupCallPath, ClosedComptimeRejection> {
-            let hop = &self.hops[index];
-            let target = hop.target;
-            let positions = hop.edge.positions();
-            let suffix = self.visit(target)?;
-            let positions = suffix.positions.map(|position| positions[position]);
-            let mut hops = Vec::with_capacity(suffix.hops.len() + 1);
-            hops.push(index);
-            hops.extend(suffix.hops);
-            Ok(PairStartupCallPath { hops, positions, branch: None })
+        fn through(&mut self, index: usize) -> Result<VerifiedPairSuffix, ClosedComptimeRejection> {
+            let suffix = self.visit(self.hops[index].target)?;
+            Ok(self.prepend(index, suffix))
+        }
+
+        fn prepend(&self, index: usize, suffix: VerifiedPairSuffix) -> VerifiedPairSuffix {
+            let positions = self.hops[index].edge.positions();
+            VerifiedPairSuffix {
+                first_edge: Some(index),
+                positions: suffix.positions.map(|position| positions[position]),
+            }
         }
     }
     let mut proof = Proof {
         graph, hops, complete: vec![None; graph.len()], active: vec![false; graph.len()], unsupported,
     };
-    proof.complete[0] = Some(PairStartupCallPath { hops: Vec::new(), positions: [0, 1], branch: None });
+    proof.complete[0] = Some(VerifiedPairSuffix { first_edge: None, positions: [0, 1] });
     graph.iter().enumerate().map(|(index, node)| match *node {
         PairGraphNode::Selector(selector) => {
             let selection = &selectors[selector];
@@ -1590,12 +1625,12 @@ mod tests {
             }
             assert_ne!(seven.llvm().to_text(), nine.llvm().to_text());
             assert!(matches!(inspect_direct_function_comptime(&authored, "value", layout),
-                Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. })));
+                Err(ClosedComptimeRejection::Unsupported { feature: "single-call projection requires exactly one startup initializer", .. })));
         }
     }
 
     #[test]
-    fn direct_startup_plan_refuses_a_late_unproven_call_and_caps_the_entire_list() {
+    fn direct_startup_plan_refuses_a_late_unproven_call_and_preserves_long_lists() {
         let layout = ScalarTargetLayout::WASM32;
         let computed = fresh(&format!(
             "{STARTUP_FUNCTION}\ni32 first = solve(7);\ni32 second = solve(first);"
@@ -1611,18 +1646,20 @@ mod tests {
             Err(ClosedComptimeRejection::Unsupported { feature: "expected a direct ordinary initializer call", .. })));
 
         let mut full = STARTUP_FUNCTION.to_owned();
-        for index in 0..MAX_DIRECT_STARTUP_CALLS {
+        for index in 0..23 {
             full.push_str(&format!("\ni32 result_{index} = solve(7);"));
         }
         let at_limit = derive_direct_startup_comptime_plan(&fresh(&full), "value", layout).unwrap();
-        assert_eq!(at_limit.calls().len(), MAX_DIRECT_STARTUP_CALLS);
+        assert_eq!(at_limit.calls().len(), 23);
         assert_eq!(at_limit.evaluators().len(), 1);
         assert!(at_limit.calls().iter().all(|call| call.evaluator_index() == 0));
         full.push_str("\ni32 last = solve(7);");
         let over = fresh(&full);
         assert!(over.result().is_valid());
-        assert!(matches!(derive_direct_startup_comptime_plan(&over, "value", layout),
-            Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. })));
+        let extended = derive_direct_startup_comptime_plan(&over, "value", layout).unwrap();
+        assert_eq!(extended.calls().len(), 24);
+        assert_eq!(extended.evaluators().len(), 1);
+        assert_eq!(extended.evaluators()[0].llvm().to_text(), at_limit.evaluators()[0].llvm().to_text());
     }
 
     #[test]
@@ -1895,7 +1932,7 @@ mod tests {
     #[test]
     fn pair_call_graph_proves_zero_evaluators_when_all_checked_slots_bypass_the_site() {
         let mut text = selectors_with_bypass();
-        for slot in 0..MAX_DIRECT_STARTUP_CALLS {
+        for slot in 0..23 {
             text.push_str(&format!("\nu32 skip_{slot} = choose(false, 1, {slot});"));
         }
         let source = fresh(&text);
@@ -1904,18 +1941,14 @@ mod tests {
                 .unwrap_or_else(|error| panic!("empty evaluation plan on {layout:?}: {error:?}"));
             assert_eq!(plan.calls().len(), 0);
             assert!(plan.evaluators().is_empty());
-            assert_eq!(plan.occurrences().len(), MAX_DIRECT_STARTUP_CALLS);
+            assert_eq!(plan.occurrences().len(), 23);
             for (index, slot) in plan.occurrences().enumerate() {
                 let PairStartupOccurrence::Bypass(slot) = slot else { panic!("only ordinary returns"); };
                 assert_eq!(spelling(&source, slot.destination()), format!("skip_{index}"));
                 assert_eq!(slot.returned_value(), DirectComptimeArgument::U32(u32::try_from(index).unwrap()));
             }
         }
-        text.push_str("\nu32 skip_over_limit = choose(false, 1, 17);");
-        assert!(matches!(
-            derive_pair_startup_call_graph_comptime_plan(&fresh(&text), "value", ScalarTargetLayout::NATIVE64),
-            Err(ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. }),
-        ));
+
     }
 
     #[test]
@@ -2176,8 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_call_graph_checks_full_declared_hop_and_startup_bounds() {
-        let layout = ScalarTargetLayout::WASM32;
+    fn pair_call_graph_preserves_long_finite_paths_and_startup() {
         let authored = |hops: usize, calls: usize| {
             use std::fmt::Write;
             let mut authored = PAIRED_FUNCTION.to_owned();
@@ -2192,29 +2224,41 @@ mod tests {
             }
             fresh(&authored)
         };
-        let edge = authored(MAX_PAIR_STARTUP_HOPS, MAX_DIRECT_STARTUP_CALLS);
-        assert!(edge.result().is_valid());
-        let plan = derive_pair_startup_call_graph_comptime_plan(&edge, "value", layout)
-            .unwrap_or_else(|error| panic!("full bounded graph: {error:?}"));
-        assert_eq!(plan.hops().len(), MAX_PAIR_STARTUP_HOPS);
-        assert_eq!(plan.calls().len(), MAX_DIRECT_STARTUP_CALLS);
-        assert_eq!(plan.evaluators().len(), 1);
-        let expected: Vec<_> = (0..MAX_PAIR_STARTUP_HOPS).rev().collect();
-        for (call, path) in plan.calls() {
-            assert_eq!(path.hop_indices(), expected);
-            assert_eq!(path.startup_argument_positions(), [0, 1]);
-            assert_eq!(call.facts().tuple(), [DirectComptimeArgument::U32(7), DirectComptimeArgument::U32(9)]);
+        let (hops, calls) = (96, 128);
+        let source = authored(hops, calls);
+        assert!(source.result().is_valid());
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let plan = derive_pair_startup_call_graph_comptime_plan(&source, "value", layout).unwrap();
+            assert_eq!(plan.hops().len(), hops);
+            assert_eq!(plan.calls().len(), calls);
+            assert_eq!(plan.evaluators().len(), 1);
+            let expected: Vec<_> = (0..hops).rev().collect();
+            let shared = plan.calls().next().unwrap().1.hop_indices();
+            for (call, path) in plan.calls() {
+                assert_eq!(path.hop_indices(), expected);
+                assert!(std::ptr::eq(path.hop_indices(), shared));
+                assert_eq!(path.startup_argument_positions(), [0, 1]);
+                assert_eq!(call.facts().tuple(), [DirectComptimeArgument::U32(7), DirectComptimeArgument::U32(9)]);
+            }
+            let baseline = derive_pair_startup_call_graph_comptime_plan(&authored(0, 1), "value", layout).unwrap();
+            assert_eq!(plan.evaluators()[0].llvm().to_text(), baseline.evaluators()[0].llvm().to_text());
         }
 
-        for (hops, calls, expected) in [
-            (MAX_PAIR_STARTUP_HOPS + 1, MAX_DIRECT_STARTUP_CALLS, "comptime startup forwarding declaration limit exceeded"),
-            (MAX_PAIR_STARTUP_HOPS, MAX_DIRECT_STARTUP_CALLS + 1, "direct comptime startup call limit exceeded"),
-        ] {
-            let source = authored(hops, calls);
-            assert!(source.result().is_valid());
-            assert!(matches!(derive_pair_startup_call_graph_comptime_plan(&source, "value", layout),
-                Err(ClosedComptimeRejection::Unsupported { feature, .. }) if feature == expected));
+        let wasm = |source| derive_pair_startup_call_graph_wasip1_stdout(source, "value", 128)
+            .unwrap().into_bounded_wasip1_output(1 << 20).unwrap();
+        let long = wasm(&source);
+        let short = wasm(&authored(0, 1));
+        assert_eq!(long.evaluators().len(), 1);
+        assert_eq!(long.evaluators()[0].bytes(), short.evaluators()[0].bytes());
+        let retained = long.ordinary_continuation();
+        for (index, (node, occurrence)) in retained.initializers().enumerate() {
+            assert_eq!(node.text().to_string(), "relay_95(7, 9)");
+            assert_eq!(node.ancestors().last().unwrap(), retained.canonical_cst().root);
+            let PairStartupOccurrence::Specialization(call, _) = occurrence else { panic!("exact selected route"); };
+            assert_eq!(call.evaluator_index(), 0);
+            assert!(index < calls);
         }
+        assert_eq!(retained.initializers().len(), calls);
     }
 
 

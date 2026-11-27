@@ -479,7 +479,7 @@ async fn startup_plan_retains_ordered_old_root_and_checks_total_egress() {
             .all(|(left, right)| left.digest() == right.digest() && left.bytes() == right.bytes()));
         assert!(matches!(current.project_direct_function_comptime(request("value", layout)).await.unwrap(),
             RootedDirectFunctionComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
-                ClosedComptimeRejection::Unsupported { feature: "direct comptime startup call limit exceeded", .. }))));
+                ClosedComptimeRejection::Unsupported { feature: "single-call projection requires exactly one startup initializer", .. }))));
     }
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
     drop((retained, current));
