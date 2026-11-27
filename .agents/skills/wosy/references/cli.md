@@ -40,6 +40,48 @@ Compiles the full reachable source graph:
 
 Fails with `build rejected by syntax diagnostics`, `build rejected by CST derivation diagnostics`, or `build rejected by semantic diagnostics`. Missing imports fail as `M0001: missing module <package>::<path>`; cycles fail as `M0003: import cycle`.
 
+## `wosy check`
+
+Use `wosy check [TARGET] [--profile PROFILE]` to analyze the selected target
+without building or running it.
+
+- **Default (`--declared-package`):** Check the main flow and symbolically check
+  unused functions in the current package. Set `[package].source_root` to a
+  package-relative source directory containing the target entry and library
+  sources. Use real directories and regular `.w` files, not symlinks. The
+  scan skips nested packages; unimported module initializers do not run.
+- **`--main-flow-only`:** Check only the reachable main flow. This scope does
+  not require `source_root` and cannot be combined with `--declared-package`.
+- **`--dependencies`:** Also check every resolved dependency, including
+  transitive dependencies. Each uses its own primary target, default profile,
+  and declared-package scope, even when the root uses `--main-flow-only`.
+  Install locked Git dependencies with `wosy dep sync` first. Check does not
+  fetch or install dependencies.
+
+For a named proof, declare the function and its proof in a `.w` source:
+
+```wosy
+%%start
+u8(u8) echo = fn(input) { input };
+proof preserves_input for echo(x) -> (out) ensures (out == core.old(x)) {}
+%%end
+```
+
+Run the default package check to verify it even if `echo` is unused.
+Check verifies applicable proofs; a successful Build does not prove them.
+
+On completion, the first nonzero code from a failing `core.require` or
+`core.narrow` sets the exit status. With no such code, a refuted proof exits 1;
+otherwise the check exits 0. Invalid input, unsupported analysis, or output
+errors exit 2. The selected authored code must fit in `0..=255`.
+
+Directives can write to stdout, stderr, or files. File output requires a
+Linux host, regardless of target. Request distinct unused filenames
+directly under `.wosy/outputs/check/`.
+No authored output is published before preparation succeeds, though failed
+preparation can leave empty directories. Output is then published in order;
+a later I/O failure can leave earlier output in place.
+
 ## `wosy run [TARGET] --profile dev [-- ARGS...]`
 
 Loads `.wosy/artifacts/<target>/<profile>/<main_artifact>/artifact-manifest.json`, rehashes every observed source and `wosy.toml`, and compares source identity, configuration identity, artifact identity, backend, output, builder identity, runner identity, compiler identity, LLVM identity, and builder toolchain identity. Any mismatch fails with `artifact manifest is stale`. A missing executable fails with `artifact is missing: ...`. Otherwise it invokes `<runner_command...> <runner_args...> <manifest_path> -- <ARGS...>` and returns the child exit code as a byte.

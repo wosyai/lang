@@ -1154,7 +1154,8 @@ pub(super) mod tests {
     fn prepared() -> FunctionCallSites {
         let span = ByteSpan::new(0, 100);
         FunctionCallSites {
-            boundary: CallableBoundary { parameters: vec![], results: vec![], root_outputs: vec![], generics: vec![] },
+            boundary: CallableBoundary { parameters: vec![], results: vec![], root_outputs: vec![], generics: vec![], checker_parameter_bindings: None },
+            contextual_owner: (span, span), contextual_formal: None, contextual_calls: None,
             sites: vec![], arms: vec![], occurrences: vec![], call_occurrences: vec![],
             imported_shared_readers: HashMap::new(),
             local_shared_call_families: HashMap::new(),
@@ -1177,8 +1178,8 @@ pub(super) mod tests {
             name: "inert".into(), name_span: span,
             signature: ScalarType::Callable { parameters: vec![], outputs: ScalarOutputSequence { outputs: vec![], span } },
             parameters: vec![], parameter_spans: vec![],
-            body: ScalarBlock { items: vec![], terminated_items: vec![], expressions: vec![], final_output_values: vec![], span, unsafe_context: false },
-            span, generic_parameters: vec![], overload_arms: vec![],
+            body: ScalarBlock { items: vec![], terminated_items: vec![], final_output_values: vec![], span, unsafe_context: false },
+            span, generic_parameters: vec![], overload_arms: vec![], runtime_enum_match: None,
             reference_cfg: ScalarReferenceCfg {
                 facts: vec![], points: vec![], initial_points: vec![], allocations: BTreeSet::new(),
                 specialized_policies: vec![], primary_call_points: HashMap::new(), runtime_array_read_sites: HashMap::new(), runtime_array_child_sites: Vec::new(), runtime_array_exclusive_sites: HashMap::new(), runtime_array_field_sites: HashMap::new(), observed_runtime_allocations: None, guarded_scalar_allocation: None,

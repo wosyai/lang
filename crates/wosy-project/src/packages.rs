@@ -1,5 +1,5 @@
 use super::{
-    dependency_document, dependency_package_table, load_dependency_package, parse_dependencies, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
+    dependency_document, dependency_package_table, load_dependency_from_document, load_dependency_package, parse_dependencies, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -179,18 +179,45 @@ impl GitProject {
 
 }
 
+pub(super) struct SelectedDependencyManifest {
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) root: PathBuf,
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) document: toml_edit::ImDocument<String>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    pub(super) dependencies: BTreeMap<String, DependencyDeclaration>,
+}
+
 pub(super) fn resolve_installed(
     snapshot: &ProjectSnapshot,
     root: &Path,
     package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
-) -> Result<BTreeMap<String, ResolvedPackage>, String> {
+    selected: Option<&str>, capture_all: bool,
+) -> Result<(BTreeMap<String, ResolvedPackage>, BTreeMap<String, SelectedDependencyManifest>), String> {
     let mut git = None;
+    let mut captured = BTreeMap::new();
     let resolution = graph::resolve(root, package, dependencies, |binding, parent, declaration| {
         let name = declaration.name.as_str();
         match binding {
+            graph::Binding::Local(actual) if capture_all || Some(name) == selected => {
+                if !std::fs::symlink_metadata(actual.join("wosy.toml")).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(format!("dependency {name} manifest is not a regular non-aliased file"));
+                }
+                let diagnostic = |error: crate::DependencyResolutionError| error.diagnostics[0].message.clone();
+                let document = dependency_document(actual, declaration, None, None).map_err(diagnostic)?;
+                let (package, dependencies) =
+                    load_dependency_from_document(actual.clone(), declaration, None, &document).map_err(diagnostic)?;
+                captured.insert(name.to_owned(), SelectedDependencyManifest {
+                    root: actual.clone(), document, dependencies: dependencies.clone(),
+                });
+                Ok((package, dependencies).into())
+            }
             graph::Binding::Local(_) => load_local(parent, declaration, None),
             graph::Binding::Git(requirement) => {
+                if selected.is_some() {
+                    return Err("direct dependency checking in a Git dependency graph is unsupported".to_owned());
+                }
                 let pin = snapshot.pin_for(name, requirement)?;
                 if git.is_none() {
                     git = Some(snapshot.git_project()?);
@@ -200,7 +227,22 @@ pub(super) fn resolve_installed(
                 let installed = git.installed(name, pin)?
                     .ok_or_else(|| format!("dependency {name} is not materialized; run wosy dep sync"))?;
                 installed.require_stack(name, stack)?;
-                let mut loaded = load_git(root, declaration, installed.checkout, pin, None)?;
+                let mut loaded = if capture_all {
+                    let path = root.join(DEPS).join(name);
+                    let diagnostic = |error: crate::DependencyResolutionError| error.diagnostics[0].message.clone();
+                    let document = dependency_document(&path, declaration, Some(&installed.checkout), None).map_err(diagnostic)?;
+                    let (mut package, dependencies) = load_dependency_from_document(path.clone(), declaration,
+                        Some(installed.checkout), &document).map_err(diagnostic)?;
+                    package.git_pin_identity = Some(pin.input_identity());
+                    captured.insert(name.to_owned(), SelectedDependencyManifest {
+                        root: path, document, dependencies: dependencies.clone(),
+                    });
+                    let mut loaded: graph::LoadedPackage = (package, dependencies).into();
+                    loaded.revision = Some(pin.revision.clone());
+                    loaded
+                } else {
+                    load_git(root, declaration, installed.checkout, pin, None)?
+                };
                 loaded.source.as_mut().expect("Git source binding").patch_stack_id = Some(stack);
                 Ok(loaded)
 
@@ -208,7 +250,7 @@ pub(super) fn resolve_installed(
         }
     })?;
     snapshot.check_reached(&resolution.git_packages)?;
-    Ok(resolution.packages)
+    Ok((resolution.packages, captured))
 }
 
 fn load_local(

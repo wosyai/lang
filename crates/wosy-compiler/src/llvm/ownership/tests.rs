@@ -39,7 +39,6 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
                 value,
             })
             .collect(),
-        expressions: values,
         span: ByteSpan { start, end },
         unsafe_context: false,
     };
@@ -178,6 +177,7 @@ fn projected_checked_return(independent_scalar_if: bool) -> ScalarFunction {
         parameter_spans: vec![span],
         body,
         span,
+        runtime_enum_match: None,
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg::unsealed_for_test(facts, points),

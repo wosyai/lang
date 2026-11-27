@@ -26,19 +26,13 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
         let ScalarItem::Function(parent) = &mut program.items[3] else {
             panic!("overload")
         };
-        let shared = expression_span(&parent.overload_arms[0].body.expressions[0]);
+        let shared = expression_span(parent.overload_arms[0].body.expressions().next().unwrap());
         let original_metadata = parent
             .overload_arms
             .iter()
             .map(|arm| (arm.span, arm.name_span, arm.parameter_spans.clone()))
             .collect::<Vec<_>>();
         let second = &mut parent.overload_arms[1].body;
-        for expression in &mut second.expressions {
-            let ScalarExpression::Call { span, .. } = expression else {
-                panic!("arm call")
-            };
-            *span = shared;
-        }
         for item in &mut second.items {
             let ScalarBlockItem::Expression(ScalarExpression::Call { span, .. }) = item else {
                 panic!("arm call item")
@@ -94,6 +88,11 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
         let module = ScalarModule::from_program(program.clone(), Vec::new());
         let project_calls = ProjectCallSiteResults {
             duplicate_sources: HashSet::new(),
+            checker_targets: Vec::new(),
+            #[cfg(feature = "internal-checker")]
+            nested_proof_targets: Default::default(),
+            #[cfg(feature = "internal-checker")]
+            nested_scalar_routes: Default::default(),
             modules: vec![Ok(calls)],
         };
         let scope = layout::observations::Scope::new();

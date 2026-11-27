@@ -27,6 +27,428 @@ fn validate_text(text: &str) -> ScalarValidation {
 }
 
 #[test]
+fn canonical_contextual_places_preserve_spans_and_storage_roles() {
+    let text = r#"%%start
+        i8() counter = fn {
+            i8 core.context.count = -1;
+            core.context.count = 2;
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let places = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::ContextualPlace)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    assert_eq!(places.len(), 3);
+    assert!(places.windows(2).all(|pair| pair[0].end < pair[1].start));
+    for span in &places {
+        assert_eq!(text[span.start as usize..span.end as usize].trim_end(), "core.context.count");
+    }
+    let derived = derive_scalar_declarations_from_cst(canonical);
+    assert_eq!(derived.items.len(), 1);
+    assert!(derived.diagnostics().is_empty());
+    assert_eq!(derived.contextual_places.resolved.len(), places.len());
+}
+
+#[test]
+fn contextual_storage_preparation_resolves_prior_rhs_and_restores_outer_storage() {
+    let text = r#"%%start
+        i8(i8) counter = fn(selector) {
+            i8 core.context.count = 1;
+            if (selector < 0) {
+                i8 core.context.count = core.context.count;
+                core.context.count = 2;
+            };
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    let places = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::ContextualPlace)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    let plan = declaration.contextual_places;
+    assert_eq!(plan.declarations.len(), 2);
+    let [outer, inner] = plan.declarations.as_slice() else { unreachable!() };
+    assert_eq!(outer.ty, ScalarType::I8);
+    assert_eq!(inner.ty, ScalarType::I8);
+    assert_eq!(outer.declaration.range, places[0]);
+    assert_eq!(inner.declaration.range, places[1]);
+    assert_ne!(outer.scope, inner.scope);
+    use contextual::ContextualRole::{Assign, Declare, Read};
+    assert_eq!(places.iter().map(|span| {
+        let occurrence = plan.resolved[span];
+        (occurrence.storage, occurrence.role)
+    }).collect::<Vec<_>>(), [(0, Declare), (1, Declare), (0, Read), (1, Assign), (0, Read)]);
+    assert_eq!(outer.binding.declaration_span, places[0]);
+    assert_eq!(inner.binding.declaration_span, places[1]);
+    assert_eq!(outer.binding.function_span, inner.binding.function_span);
+    assert_ne!(outer.binding, inner.binding);
+
+    for (body, expected) in [
+        ("i8 core.context.count = 1; i8 core.context.count = 2; 0", "already declared"),
+        ("i8 core.context.count = 1; if (selector < 0) { i16 core.context.count = 2; }; 0", "one static type"),
+        ("i8 core.context.count = core.context.count; 0", "inherited contextual"),
+    ] {
+        let text = format!("%%start\ni8(i8) counter = fn(selector) {{ {body} }};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declaration = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declaration.diagnostics().iter().any(|diagnostic| diagnostic.message.contains(expected)));
+    }
+}
+
+#[test]
+fn inherited_contextual_requirements_keep_checked_type_evidence_separate_from_local_storage() {
+    let text = r#"%%start
+        i8() needed = fn {
+            core.context.credit = 1;
+            core.context.credit
+        };
+        bool() unknown = fn { core.context.external };
+        i8() provider = fn {
+            i8 core.context.credit = 2;
+            if (core.context.credit == 2) {
+                i8 core.context.credit = 3;
+                core.context.credit = 4;
+            };
+            core.context.credit
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    let plan = &declaration.contextual_places;
+    assert!(declaration.items.is_empty(), "metadata must not admit unsupported implicit arguments");
+    assert_eq!(declaration.diagnostics().len(), 3);
+    assert!(declaration.diagnostics().iter().all(|diagnostic| diagnostic.message.contains("inherited contextual")));
+    let [write, read, unknown] = plan.inherited.as_slice() else { panic!("{:?}", plan.inherited); };
+    use contextual::ContextualRole::{Assign, Read};
+    assert_eq!((&*write.name, write.role, &*read.name, read.role), ("credit", Assign, "credit", Read));
+    assert_eq!(write.function, read.function);
+    assert_ne!(write.function, unknown.function);
+    let functions = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    assert_eq!([write.function, unknown.function], [functions[0], functions[1]]);
+    assert_eq!((&*unknown.name, unknown.role, unknown.local_type_declaration), ("external", Read, None));
+    assert_eq!(write.local_type_declaration, read.local_type_declaration);
+    let evidence = &plan.declarations[write.local_type_declaration.unwrap()];
+    assert_eq!(evidence.ty, ScalarType::I8);
+    assert_eq!(evidence.binding.function_span, functions[2]);
+    assert_eq!(plan.declarations.len(), 2);
+    assert_ne!(plan.declarations[0].binding, plan.declarations[1].binding);
+    for occurrence in &plan.inherited {
+        assert!(!plan.resolved.contains_key(&occurrence.span));
+    }
+}
+
+#[test]
+fn project_contextual_type_authority_preserves_distinct_same_body_storage() {
+    let first = module_source("src/first.w");
+    let second = module_source("src/second.w");
+    let declaration = |source: SourceIdentity, name: &str, ty: &str| {
+        let text = format!(
+            "%%start\n{ty}() {name} = fn {{ {ty} core.context.count = 1; core.context.count }};\n%%end"
+        );
+        let parsed = parse_source(source, text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics().is_empty());
+        declarations
+    };
+    let prepare = |second_type: &str| {
+        let left = declaration(first.clone(), "left", "i8");
+        let right = declaration(second.clone(), "right", second_type);
+        let left_storage = &left.contextual_places.declarations[0];
+        let right_storage = &right.contextual_places.declarations[0];
+        assert_ne!(left_storage.binding, right_storage.binding);
+        let spans = (left_storage.declaration.clone(), right_storage.declaration.clone());
+        let prepared = prepare_scalar_project(
+            vec![(left, Vec::new()), (right, Vec::new())],
+            vec![first.clone(), second.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        );
+        (prepared, spans)
+    };
+    let (valid, _) = prepare("i8");
+    let valid = valid.unwrap_or_else(|rejection| panic!("{:?}", rejection.into_ordered_diagnostics()));
+    assert_eq!(valid.project().modules.len(), 2);
+    let (invalid, (first_span, second_span)) = prepare("i16");
+    let Err(rejection) = invalid else { panic!("accepted conflicting contextual types"); };
+    let diagnostics = rejection.into_ordered_diagnostics();
+    let [diagnostic] = diagnostics.as_slice() else { panic!("{diagnostics:?}"); };
+    assert_eq!(diagnostic.message, "contextual name must have one static type");
+    let [primary, secondary] = diagnostic.labels.as_slice() else { panic!("{diagnostic:?}"); };
+    assert_eq!(primary.kind, DiagnosticLabelKind::Primary);
+    assert_eq!(primary.span, second_span);
+    assert_eq!(secondary.kind, DiagnosticLabelKind::Secondary);
+    assert_eq!(secondary.span, first_span);
+}
+
+#[test]
+fn rejected_contextual_project_resolves_type_evidence_but_not_storage() {
+    let consumer = module_source("src/consumer.w");
+    let provider = module_source("src/provider.w");
+    let other = module_source("src/other.w");
+    let declare = |source: &SourceIdentity, body: &str| {
+        let parsed = parse_source(source.clone(), format!("%%start\n{body}\n%%end"), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    let check = |extra: Option<&str>| {
+        let mut declarations = vec![
+            (declare(&consumer, "i8() consume = fn { core.context.credits }; i8() missing = fn { core.context.unknown };"), Vec::new()),
+            (declare(&provider, "i8() supply = fn { i8 core.context.credits = 1; if (core.context.credits == 1) { i8 core.context.credits = 2; }; core.context.credits };"), Vec::new()),
+        ];
+        if let Some(extra) = extra {
+            declarations.push((declare(&other, extra), Vec::new()));
+        }
+        let result = prepare_scalar_project(
+            declarations, vec![consumer.clone(), provider.clone(), other.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        );
+        let Err(rejection) = result else { panic!("a type catalog is not an implicit call ABI"); };
+        rejection.into_ordered_diagnostics()
+    };
+    let diagnostics = check(None);
+    let [typed, missing] = diagnostics.as_slice() else { panic!("{diagnostics:?}"); };
+    assert_eq!(typed.labels.len(), 2);
+    assert_eq!(typed.labels[0].span.source, consumer);
+    assert_eq!(typed.labels[1].span.source, provider);
+    assert!(typed.labels[1].message.contains("call binding is not resolved"));
+    assert_eq!(missing.labels.len(), 1);
+    for conflict in [
+        "i16() wrong = fn { i16 core.context.credits = 1; core.context.credits };",
+        "i8() wrong = fn { i8 core.context.credits = 1; if (core.context.credits == 1) { i16 core.context.credits = 2; }; core.context.credits };",
+    ] {
+        let diagnostics = check(Some(conflict));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message.contains("one static type")));
+        let inherited = diagnostics.iter().filter(|diagnostic| diagnostic.message.contains("inherited contextual")).collect::<Vec<_>>();
+        assert_eq!(inherited.len(), 2);
+        assert!(inherited.iter().all(|diagnostic| diagnostic.labels.len() == 1),
+            "ambiguous global type declarations must never be reported as evidence");
+    }
+}
+
+#[test]
+fn dormant_contextual_call_receipt_authenticates_transitive_requirements_and_shadowing() {
+    use contextual::{DormantContextRejection, DormantContextSupply};
+    let text = r#"%%start
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        unit() relay = fn { consume(); };
+        unit() entry = fn {
+            i8 core.context.credit = 3;
+            relay();
+            if (true) {
+                i8 core.context.credit = 2;
+                relay();
+            };
+            relay();
+        };
+        entry();
+    %%end"#;
+    let parse = |text: &str| {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        parsed.result
+    };
+    let inputs = || ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 };
+    let parsed = parse(text);
+    let receipt = contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap();
+    assert_eq!(receipt.ty, ScalarType::I8);
+    let [forward, enter, shadow, restore] = receipt.edges.as_slice() else { panic!("{:?}", receipt.edges); };
+    let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+    assert_eq!((snippet(forward.occurrence), snippet(forward.target)), ("consume()", "consume"));
+    let DormantContextSupply::Formal(relay) = forward.supplied else { panic!("expected inferred relay formal"); };
+    assert!(snippet(relay).starts_with("unit() relay"));
+    let DormantContextSupply::Lexical(outer) = enter.supplied else { panic!("expected outer binding"); };
+    let DormantContextSupply::Lexical(inner) = shadow.supplied else { panic!("expected inner binding"); };
+    assert_eq!(snippet(enter.occurrence), "relay()");
+    assert_eq!(snippet(shadow.occurrence), "relay()");
+    assert_eq!(snippet(restore.occurrence), "relay()");
+    assert_eq!(snippet(enter.target), "relay");
+    // The ContextualPlace CST node owns the trivia immediately before `=`.
+    assert_eq!(snippet(outer), "core.context.credit ");
+    assert_eq!(snippet(inner), "core.context.credit ");
+    assert_eq!(outer.start as usize, text.find("core.context.credit = 3").unwrap());
+    assert_eq!(inner.start as usize, text.find("core.context.credit = 2").unwrap());
+    assert_ne!(outer, inner);
+    assert_eq!(restore.supplied, DormantContextSupply::Lexical(outer));
+    for (layout, variant) in [
+        (ScalarTargetLayout::NATIVE64, text.to_owned()),
+        (ScalarTargetLayout::WASM32, text.to_owned()),
+    ] {
+        let parsed = parse(&variant);
+        let ordinary = derive_scalar_declarations_from_cst(parsed.canonical_cst());
+        assert!(prepare_scalar_project(vec![(ordinary, Vec::new())], vec![source()],
+            ScalarPreparationInputs { target_layout: layout }).is_err());
+    }
+    let missing = text.replace("i8 core.context.credit = 3;", "");
+    let parsed = parse(&missing);
+    let missing_root = contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap_err();
+    let DormantContextRejection::MissingAtRoot(call) = missing_root else { panic!("{missing_root:?}"); };
+    assert_eq!(&missing[call.start as usize..call.end as usize], "entry()");
+    let wrong = text.replace("i8 core.context.credit = 2", "i16 core.context.credit = 2");
+    let parsed = parse(&wrong);
+    assert_eq!(contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap_err(), DormantContextRejection::Unsupported);
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn project_contextual_formal_type_materializes_before_namespace_call_preparation() {
+    let app = module_source("src/main.w");
+    let leaf = module_source("src/leaf.w");
+    let other = module_source("src/other.w");
+    let app_text = r#"%%start
+        remote = namespace package "src/leaf.w";
+        unit() entry = fn {
+            u8 core.context.credit = 3;
+            remote.consume();
+        };
+        entry();
+    %%end"#;
+    let leaf_text = r#"%%start
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        proof debit for consume() -> (null)
+            ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+    %%end"#;
+    let source = |identity: &SourceIdentity, text: &str, pending: bool| {
+        let parsed = parse_source(identity.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations(parsed.result.canonical_cst(), pending, pending, false, None, None, #[cfg(feature = "internal-checker")] false)
+    };
+    let bindings = || vec![ScalarNamespaceBinding {
+        binding: "remote".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0),
+    }];
+    let inputs = || ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 };
+    let consumer = source(&leaf, leaf_text, true);
+    assert!(consumer.diagnostics.is_empty() && consumer.contextual_places.has_pending_formals);
+    assert!(consumer.contextual_places.declarations.is_empty());
+    assert!(prepare_scalar_project(
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, leaf_text, true), Vec::new())],
+        vec![app.clone(), leaf.clone()], inputs(),
+    ).is_err(), "ordinary build cannot own unresolved formal operands");
+    let (project, calls) = contextual::prepare_project_contextual_types(
+        vec![(consumer, Vec::new()), (source(&app, app_text, false), bindings())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).expect("one checked type, from the actual project declaration");
+    let [ScalarItem::Function(function)] = project.modules[0].items.as_slice() else { panic!("one leaf"); };
+    let [ScalarBlockItem::Assignment(assignment)] = function.body.items.as_slice() else { panic!("one typed write"); };
+    let ScalarPlace::Contextual { binding: destination, ty: destination_ty, .. } = &assignment.targets[0].place
+        else { panic!("checked contextual destination"); };
+    let ScalarExpression::Binary { left, .. } = &assignment.values[0] else { panic!("checked subtraction"); };
+    let ScalarExpression::Contextual { binding: prior, ty: old_ty, .. } = left.as_ref()
+        else { panic!("checked contextual read"); };
+    assert_eq!((destination_ty, old_ty), (&ScalarType::U8, &ScalarType::U8));
+    assert_eq!(prior, destination);
+    assert_eq!(prior.source, leaf);
+    assert_eq!(prior.kind, ReferenceBindingKind::ContextualFormal);
+    let caller_item = project.modules[1].items.iter().position(|item| matches!(item,
+        ScalarItem::Function(function) if function.name == "entry")).unwrap();
+    let caller = calls.function_body(1, caller_item, None).unwrap();
+    let [call] = caller.call_occurrences.as_slice() else { panic!("one namespace call"); };
+    assert!(matches!(&caller.resolved_call_site(call.ordinal).unwrap().target,
+        ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }
+        if source == &leaf && *declaration_span == function.name_span));
+    assert!(calls.function_body(0, 0, None).unwrap().contextual_formal().is_none(),
+        "typed occurrence authority does not install call transport");
+
+    let foreign = SourceIdentity::new(app.project.clone(), "foreign".into(), "src/foreign.w".into(), "r1".into());
+    let foreign_text = "%%start unit() provider = fn { u8 core.context.credit = 1; }; %%end";
+    for foreign_first in [false, true] {
+        let provider = (source(&foreign, foreign_text, false), Vec::new());
+        let mut declarations = vec![(source(&leaf, leaf_text, true), Vec::new()),
+            (source(&app, app_text, false), bindings())];
+        if foreign_first { declarations.insert(0, provider); }
+        else { declarations.push(provider); }
+        let result = contextual::prepare_project_contextual_types(
+            declarations, vec![app.clone(), leaf.clone(), foreign.clone()], inputs(), true,
+        );
+        let (project, _) = result.unwrap_or_else(|error| panic!("same-type foreign declarations cannot hide a local provider (foreign first: {foreign_first}): {error:?}"));
+        let provider = project.modules.iter().find(|module| module.source == leaf).unwrap();
+        let [ScalarItem::Function(function)] = provider.items.as_slice() else { panic!("one leaf"); };
+        let [ScalarBlockItem::Assignment(assignment)] = function.body.items.as_slice() else { panic!("one typed write"); };
+        assert!(matches!(&assignment.targets[0].place, ScalarPlace::Contextual { binding, ty: ScalarType::U8, .. }
+            if binding.source == leaf && binding.kind == ReferenceBindingKind::ContextualFormal));
+    }
+    let foreign_only = contextual::prepare_project_contextual_types(
+        vec![(source(&foreign, foreign_text, false), Vec::new()),
+            (source(&leaf, leaf_text, true), Vec::new())],
+        vec![leaf.clone(), foreign.clone()], inputs(), true,
+    );
+    let Err(error) = foreign_only else { panic!("foreign type cannot substitute for a same-package provider"); };
+    assert!(error.diagnostics.iter().any(|item| item.message.contains("no unambiguous checked project type")));
+
+    let (prepared, _) = contextual::prepare_contextual_transport_graph(
+        vec![(source(&leaf, leaf_text, true), Vec::new()), (source(&app, app_text, false), bindings())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).expect("canonical namespace graph supplies a real lexical binding");
+    let leaf_call = prepared.function_calls(0, 0);
+    let (formal, formal_type) = leaf_call.contextual_formal().unwrap();
+    let root_call = prepared.function_calls(1, caller_item);
+    let [call] = root_call.call_occurrences.as_slice() else { panic!("one namespace call"); };
+    let (supplier, supplier_type) = root_call.contextual_argument(call.ordinal).unwrap();
+    assert_eq!((formal_type, supplier_type), (&ScalarType::U8, &ScalarType::U8));
+    assert_eq!((&formal.source, &supplier.source), (&leaf, &app));
+    assert_ne!(formal, supplier);
+    assert_eq!(supplier.kind, ReferenceBindingKind::Declared);
+    let initializer = leaf_text.replace("%%end", "consume(); %%end");
+    assert!(contextual::prepare_contextual_transport_graph(
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, &initializer, true), Vec::new())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).is_err(), "imported initializer must remain inert in this profile");
+
+    for declarations in [
+        vec![(source(&app, &app_text.replace("u8 core.context.credit = 3;", ""), false), bindings()),
+            (source(&leaf, leaf_text, true), Vec::new())],
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, leaf_text, true), Vec::new()),
+            (source(&other, "%%start unit() shadow = fn { i8 core.context.credit = 1; }; %%end", false), Vec::new())],
+    ] {
+        let result = contextual::prepare_project_contextual_types(declarations, vec![app.clone(), leaf.clone()], inputs(), true);
+        let Err(error) = result else { panic!("missing or conflicting project type must refuse"); };
+        assert!(error.diagnostics.iter().any(|item| item.message.contains("no unambiguous checked project type")));
+    }
+}
+
+#[test]
+fn qualified_old_does_not_become_contextual_storage() {
+    let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    assert!(!canonical.root.descendants().any(|node| node.kind() == SyntaxKind::ContextualPlace));
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    assert!(declaration.contextual_places.declarations.is_empty());
+    assert!(declaration.diagnostics().is_empty());
+}
+
+#[test]
+fn contextual_nested_assignment_is_rejected_before_scalar_derivation() {
+    let text = r#"%%start
+        unit(i8) sink = fn(incoming) { if (incoming == 0) {}; };
+        i8() counter = fn {
+            i8 core.context.count = 1;
+            sink((core.context.count = 2));
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declaration = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    assert!(declaration.items.is_empty());
+    let diagnostics = declaration.diagnostics();
+    let [diagnostic] = diagnostics else { panic!("{diagnostics:?}"); };
+    assert!(diagnostic.message.contains("standalone assignment statement"));
+    let span = diagnostic.labels[0].span.range;
+    let write = text.find("core.context.count = 2").unwrap() as u32;
+    assert_eq!(span.start, write);
+    assert!(span.end <= write + "core.context.count ".len() as u32);
+}
+
+#[test]
 fn source_aggregate_copy_policies_in_both_validators() {
     for (text, expected, invalid_modifier) in [
             (
@@ -536,7 +958,7 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         panic!("function")
     };
     let mut function = function.clone();
-    let read_span = expression_span(&function.body.expressions[0]);
+    let read_span = expression_span(function.body.expressions().next().unwrap());
     let calls =
         reference::test_function_call_sites(&validated.program.source, &function, &HashMap::new());
     let errors = record_function_reference_origins(
@@ -1149,7 +1571,7 @@ fn indexed_dereference_of_fixed_array_is_a_canonical_read_place() {
         ScalarItem::Function(function) => Some(function),
         _ => None,
     }).unwrap();
-    let expression = function.body.expressions.last().unwrap();
+    let expression = function.body.expressions().last().unwrap();
     assert!(matches!(expression, ScalarExpression::IndexedRead {
         place: ScalarPlace::Index { base, index, .. }, ..
     } if matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
@@ -1490,7 +1912,7 @@ fn terminal_unsafe_block_derives_one_final_output() {
             assert_eq!(body.final_output_values.len(), 1);
             assert_eq!(body.items.len(), item_count);
             assert_eq!(body.terminated_items, vec![false; item_count]);
-            assert_eq!(body.expressions.len(), item_count);
+            assert_eq!(body.expressions().count(), item_count);
             let output = &body.final_output_values[0];
             assert_eq!(output.position, 0);
             let start = source_text.rfind(final_expression).expect("final unsafe") as u32;
@@ -5409,7 +5831,17 @@ fn unsafe_statement_and_unit_output_remain_statements_in_both_pipelines() {
             };
             let body = &function.body;
             assert_eq!(body.items.len(), body.terminated_items.len());
-            assert_eq!(body.items.len(), body.expressions.len());
+            assert_eq!(body.items.len(), body.expressions().count());
+            for (expression, item) in body.expressions().zip(&body.items) {
+                let ScalarBlockItem::Expression(original) = item else { panic!("expected expression") };
+                assert!(std::ptr::eq(expression, original));
+            }
+            let wire = serde_json::to_value(body).unwrap();
+            assert_eq!(
+                wire["expressions"],
+                serde_json::to_value(body.expressions().collect::<Vec<_>>()).unwrap(),
+            );
+            assert_eq!(serde_json::from_value::<ScalarBlock>(wire).unwrap(), *body);
             assert_eq!(body.final_output_values.len(), final_output_count);
             assert_eq!(body.terminated_items, terminated_items);
         }
@@ -5422,9 +5854,9 @@ fn derives_zero_payload_enum_tags_and_equality() {
             "%%start\nenum Status { first; second; third; }\nStatus value = Status::second;\nbool equal = value == Status::second;\n%%end",
         );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-    assert_eq!(result.program.enums[0].variants[0].tag, 0);
-    assert_eq!(result.program.enums[0].variants[1].tag, 1);
-    assert_eq!(result.program.enums[0].variants[2].tag, 2);
+    assert_eq!(result.program.enums[0].variants()[0].tag, 0);
+    assert_eq!(result.program.enums[0].variants()[1].tag, 1);
+    assert_eq!(result.program.enums[0].variants()[2].tag, 2);
 }
 
 #[test]
@@ -8757,6 +9189,166 @@ fn float_literals_keep_exact_values_and_separator_rules() {
 }
 
 #[test]
+fn build_checks_unsupported_projection_in_an_admitted_proof_before_lowering() {
+    let text = "%%start\nstruct copy Reading { u8 value; }\nReading(u8) make = fn(x) { { .value = x; } };\nu8() result = fn { 42 };\nproof projected for result() -> (out) ensures ((make(42)).value[0] == out) {}\n%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let root = parsed.result.canonical_cst();
+    assert!(derive_scalar_declarations_from_cst(root).diagnostics().is_empty());
+    let build = derive_scalar_build_declarations_from_cst(root);
+    let [diagnostic] = build.diagnostics() else { panic!("{:?}", build.diagnostics()) };
+    assert_eq!(diagnostic.code, "B0003");
+    assert_eq!(diagnostic.message, "an indexed call result field is not supported");
+}
+
+#[test]
+fn build_types_authored_match_arms_without_proving_or_lowering_them() {
+    let valid = r#"%%start
+        enum Path { first; second; never; }
+        enum Unrelated { first; second; never; }
+        u8(u8) identity = fn(x) { x };
+        proof choose for identity(arg) -> (out) ensures (out == 0) {
+            match (if (arg == 0) { Path.first } else { Path.second }) {
+                first { core.show(out == 0); }
+                second { core.show(out == 0); }
+                never { core.show(out == 100); }
+            }
+        }
+        u8 result = identity(5);
+    %%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout })
+        };
+        // False theorem and false shows are well typed; Build never proves them.
+        assert!(prepare(valid).is_ok());
+        for (invalid, expected) in [
+            (valid.replace("never { core.show(out == 100); }", ""), Some("must cover every enum variant")),
+            (valid.replace("never {", "first {"), Some("duplicate or unknown enum variant")),
+            (valid.replace("Path.second", "Unrelated.second"), Some("mixes enum declarations")),
+            (valid.replace("arg == 0", "arg"), None),
+            (valid.replace("out == 100", "missing_name == 100"), None),
+        ] {
+            let Err(rejected) = prepare(&invalid) else { panic!("invalid authored match accepted"); };
+            let diagnostics = rejected.into_ordered_diagnostics();
+            assert!(!diagnostics.is_empty());
+            if let Some(expected) = expected {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.message.contains(expected)), "{diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_enum_payload_layout_keeps_target_and_source_slot_order() {
+    let text = r#"%%start
+        enum Plain { a; }
+        enum Ground { empty; pair(u8, *?u8); bytes(u16[3]); }
+        enum Wide { aligned(u128); bigger(u8[21]); }
+        enum Pending { cyclic(Pending); }
+        enum TooLargeForWasi { overflow(u8[4294967296]); }
+        u8(u8) identity = fn(x) { x };
+        u8 example = identity(6);
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for (target_layout, pointer_offset, payload_size, total) in [
+        (ScalarTargetLayout::NATIVE64, 8, 16, 24),
+        (ScalarTargetLayout::WASM32, 4, 8, 12),
+    ] {
+        let canonical = parsed.result.canonical_cst();
+        let declarations = derive_scalar_build_declarations_from_cst(canonical);
+        let prepared = prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout }).unwrap();
+        let module = &prepared.project().modules[0];
+        let [plain, ground, wide, pending, large] = module.enums.as_slice() else { panic!("canonical declarations"); };
+        assert!(module.layouts.enum_payload(&plain.id).is_none());
+        assert!(module.layouts.enum_payload(&pending.id).is_none());
+        assert_eq!(module.layouts.enum_payload(&large.id).is_some(), target_layout == ScalarTargetLayout::NATIVE64);
+        let layout = module.layouts.enum_payload(&ground.id).unwrap();
+        assert_eq!(layout.target, target_layout);
+        assert_eq!(layout.payload_storage, ScalarLayout { size: payload_size, alignment: pointer_offset });
+        assert_eq!(layout.layout, ScalarLayout { size: total, alignment: pointer_offset });
+        assert_eq!(layout.payload_offset, pointer_offset);
+        let [empty, pair, bytes] = layout.variants.as_slice() else { panic!("canonical variant layout order"); };
+        assert_eq!((empty.tag, pair.tag, bytes.tag), (0, 1, 2));
+        assert_eq!(empty.layout, ScalarLayout { size: 0, alignment: 1 });
+        assert_eq!(pair.slots[1].offset_in_payload, pointer_offset);
+        assert_eq!(pair.slots[1].layout, ScalarLayout { size: pointer_offset, alignment: pointer_offset });
+        let origin = pair.slots[1].source_type.span;
+        assert_eq!(&text[origin.start as usize..origin.end as usize], "*?u8");
+        assert_eq!(bytes.layout, ScalarLayout { size: 6, alignment: 2 });
+        let wide = module.layouts.enum_payload(&wide.id).unwrap();
+        assert_eq!(wide.payload_offset, 16);
+        assert_eq!(wide.payload_storage, ScalarLayout { size: 32, alignment: 16 });
+        assert_eq!(wide.layout, ScalarLayout { size: 48, alignment: 16 });
+        let json = serde_json::to_value(&module.layouts).unwrap();
+        let roundtrip: ScalarTargetLayouts = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, module.layouts);
+        let legacy = derive_scalar_program_from_cst_with_layout(canonical, target_layout);
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+        assert_eq!(legacy.program.layouts, module.layouts);
+    }
+}
+
+#[test]
+fn enum_layout_gate_is_recomputed_from_serialized_variant_slots() {
+    let parsed = parse_source(source(), "%%start enum TagOnly { active; } enum HasPayload { none; some(u8); } %%end".to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let [plain, payload] = declarations.enums.as_slice() else { panic!("two canonical enums"); };
+    assert!(plain.has_tag_only_layout());
+    assert!(!payload.has_tag_only_layout());
+    for (enumeration, tag_only) in [(plain, true), (payload, false)] {
+        let mut json = serde_json::to_value(enumeration).unwrap();
+        assert!(json["variants"].is_array());
+        assert!(json.get("has_payload").is_none());
+        assert!(json["variants"][0].get("payload").is_none());
+        // The cache is never wire authority, including for old tag-only rows.
+        json["has_payload"] = serde_json::Value::Bool(tag_only);
+        let restored: ScalarEnum = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, *enumeration);
+        assert_eq!(restored.has_tag_only_layout(), tag_only);
+    }
+}
+
+#[test]
+fn build_scopes_authored_payload_bindings_without_runtime_materialization() {
+    let valid = r#"%%start
+        enum Result { got(u8); absent; }
+        u8(u8) identity = fn(n) { n };
+        proof p for identity(n) -> (out) ensures (out == 0) {
+            match (if (n == 0) { Result.absent } else { Result.got(n) }) {
+                got(value) { core.show(out == value); }
+                absent { core.show(out == 0); }
+            }
+        }
+        u8 used = identity(5);
+    %%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout })
+        };
+        assert!(prepare(valid).is_ok());
+        for invalid in [
+            valid.replace("absent { core.show(out == 0); }", "absent { core.show(out == value); }"),
+            valid.replace("Result.got(n)", "Result.got(256)"),
+            valid.replace("got(value)", "got(out)"),
+            valid.replace("%%end", "Result runtime = Result.got(1); %%end"),
+            valid.replace("%%end", "Result runtime = Result.absent; %%end"),
+        ] {
+            let Err(rejected) = prepare(&invalid) else { panic!("unsupported payload context accepted"); };
+            assert!(!rejected.into_ordered_diagnostics().is_empty());
+        }
+    }
+}
+
+#[test]
 fn cst_literal_diagnostics_keep_category_order_and_exact_spans() {
     let text = r#"%%start
 struct Bounds { i32[-3] first; i32[0b2] second; }
@@ -8813,6 +9405,49 @@ std.utf8 second_string = "\v";
     });
     assert_eq!(derive_scalar_diagnostics_from_cst(canonical), expected);
 }
+
+
+#[test]
+fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
+        if node.kind == kind && node.text.starts_with(spelling) {
+            return node.clone();
+        }
+        for child in &node.children {
+            if let Element::Node(child) = child {
+                if child.text.contains(spelling) {
+                    return find(child, kind, spelling);
+                }
+            }
+        }
+        panic!("missing declaration {spelling}");
+    }
+    let text = "%%start
+struct First { i32 value; }
+enum Early { zero; }
+struct Last { i32 value; }
+enum Late { one; }
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
+    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
+    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
+    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
+        _ => None,
+    }).unwrap();
+    selected.children.extend([Element::Node(last), Element::Node(late)]);
+    snapshot.root.children.push(Element::Node(first));
+    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
+    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
+    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
+}
+
 
 #[test]
 fn reports_malformed_string_escapes_at_their_exact_spans() {
@@ -14356,47 +14991,6 @@ unit(Pair) inspect = fn(owner) {
                 "{diagnostics:?}");
         }
     }
-}
-
-#[test]
-fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
-    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
-    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
-        if node.kind == kind && node.text.starts_with(spelling) {
-            return node.clone();
-        }
-        for child in &node.children {
-            if let Element::Node(child) = child {
-                if child.text.contains(spelling) {
-                    return find(child, kind, spelling);
-                }
-            }
-        }
-        panic!("missing declaration {spelling}");
-    }
-    let text = "%%start
-struct First { i32 value; }
-enum Early { zero; }
-struct Last { i32 value; }
-enum Late { one; }
-%%end";
-    let parsed = parse_source(source(), text.into(), &[]);
-    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-    let mut snapshot = parsed.result.canonical_cst().snapshot();
-    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
-    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
-    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
-    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
-        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
-        _ => None,
-    }).unwrap();
-    selected.children.extend([Element::Node(last), Element::Node(late)]);
-    snapshot.root.children.push(Element::Node(first));
-    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
-    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
-        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
-    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
-        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
 }
 
 #[test]

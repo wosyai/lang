@@ -396,6 +396,7 @@ fn check_isolated_arm_with_capture(
     // spelling is not lexable, so it cannot shadow a name or be called.
     let arm = ScalarFunction { name: String::new(), name_span: span, signature, parameters,
         parameter_spans, body, span, generic_parameters: Vec::new(), overload_arms: Vec::new(),
+        runtime_enum_match: None,
         reference_cfg: ScalarReferenceCfg {
             facts: Vec::new(), points: Vec::new(), initial_points: Vec::new(), allocations: BTreeSet::new(),
             specialized_policies: Vec::new(), observed_runtime_allocations: None, guarded_scalar_allocation: None,

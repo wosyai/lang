@@ -13,11 +13,38 @@ pub struct ScalarAggregateLayout {
     pub fields: Vec<ScalarFieldLayout>,
 }
 
+/// Prepared representation of a payload-bearing declaration on one target.
+/// This data describes storage only, not construction, ownership or ABI lowering.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnumPayloadLayout {
+    pub target: ScalarTargetLayout,
+    pub layout: ScalarLayout,
+    pub payload_offset: u64,
+    pub payload_storage: ScalarLayout,
+    pub variants: Vec<ScalarEnumVariantLayout>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnumVariantLayout {
+    pub tag: u32,
+    pub layout: ScalarLayout,
+    pub slots: Vec<ScalarEnumPayloadSlotLayout>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarEnumPayloadSlotLayout {
+    pub source_type: ScalarTypeArgument,
+    pub offset_in_payload: u64,
+    pub layout: ScalarLayout,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScalarTargetLayouts {
     pub target: ScalarTargetLayout,
     #[serde(with = "aggregate_entries")]
     aggregates: BTreeMap<ScalarStructId, ScalarAggregateLayout>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "enum_payload_entries")]
+    enum_payloads: BTreeMap<ScalarEnumId, ScalarEnumPayloadLayout>,
 }
 
 mod aggregate_entries {
@@ -82,16 +109,43 @@ mod aggregate_entries {
     }
 }
 
+mod enum_payload_entries {
+    use super::*;
+
+    pub(super) fn serialize<S>(layouts: &BTreeMap<ScalarEnumId, ScalarEnumPayloadLayout>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        serializer.collect_seq(layouts)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<ScalarEnumId, ScalarEnumPayloadLayout>, D::Error>
+    where D: serde::Deserializer<'de> {
+        let entries = Vec::<(ScalarEnumId, ScalarEnumPayloadLayout)>::deserialize(deserializer)?;
+        let count = entries.len();
+        let layouts = entries.into_iter().collect::<BTreeMap<_, _>>();
+        if layouts.len() != count {
+            return Err(serde::de::Error::custom("duplicate enum payload layout ID"));
+        }
+        Ok(layouts)
+    }
+}
+
 impl ScalarTargetLayouts {
     pub fn new(target: ScalarTargetLayout) -> Self {
         Self {
             target,
             aggregates: BTreeMap::new(),
+            enum_payloads: BTreeMap::new(),
         }
     }
 
     pub fn aggregate(&self, id: &ScalarStructId) -> Option<&ScalarAggregateLayout> {
         self.aggregates.get(id)
+    }
+
+    /// Payload-free declarations have no sum-storage record. Unsupported
+    /// payload types, targets and sizes also never produce a record.
+    pub fn enum_payload(&self, id: &ScalarEnumId) -> Option<&ScalarEnumPayloadLayout> {
+        self.enum_payloads.get(id).filter(|layout| layout.target == self.target)
     }
 
     pub fn field(&self, id: &ScalarStructFieldId) -> Option<&ScalarFieldLayout> {
@@ -149,6 +203,7 @@ pub(super) fn resolve_program_struct_layouts(
     program.layouts = ScalarTargetLayouts {
         target: program.target_layout,
         aggregates: compute_layouts(&declarations, diagnostics),
+        enum_payloads: compute_enum_payloads(&program.enums, program.target_layout),
     };
 }
 
@@ -171,6 +226,7 @@ pub(super) fn resolve_project_struct_layouts(
         .collect::<Vec<_>>();
     let mut results = compute_layouts(&declarations, diagnostics);
     for module in &mut project.modules {
+        module.layouts.enum_payloads = compute_enum_payloads(&module.enums, module.target_layout);
         for structure in &module.structs {
             let (id, result) = results
                 .remove_entry(&structure.id)
@@ -179,6 +235,69 @@ pub(super) fn resolve_project_struct_layouts(
         }
     }
     assert!(results.is_empty());
+}
+
+fn compute_enum_payloads(enums: &[ScalarEnum], target: ScalarTargetLayout) -> BTreeMap<ScalarEnumId, ScalarEnumPayloadLayout> {
+    enums.iter().filter(|enumeration| !enumeration.has_tag_only_layout())
+        .filter_map(|enumeration| compute_enum_payload(enumeration, target)
+            .map(|layout| (enumeration.id.clone(), layout))).collect()
+}
+
+fn compute_enum_payload(enumeration: &ScalarEnum, target: ScalarTargetLayout) -> Option<ScalarEnumPayloadLayout> {
+    let maximum_size = match target {
+        ScalarTargetLayout::WASM32 => u64::from(u32::MAX),
+        ScalarTargetLayout::NATIVE64 => u64::MAX,
+        _ => return None,
+    };
+    let tag = layout_for_type(&ScalarType::U32, target).ok()?;
+    let mut payload_alignment = 1;
+    let mut biggest_payload = 0;
+    let mut variants = Vec::with_capacity(enumeration.variants().len());
+    for (ordinal, variant) in enumeration.variants().iter().enumerate() {
+        if u32::try_from(ordinal).ok()? != variant.tag { return None; }
+        let mut offset = 0;
+        let mut alignment = 1;
+        let mut slots = Vec::with_capacity(variant.payload.len());
+        for slot in &variant.payload {
+            let layout = ground_payload_type_layout(&slot.ty, target)?;
+            let (offset_in_payload, next) = checked_layout_offset(offset, &layout)?;
+            alignment = alignment.max(layout.alignment);
+            slots.push(ScalarEnumPayloadSlotLayout { source_type: slot.clone(), offset_in_payload, layout });
+            offset = next;
+        }
+        let size = checked_align_offset(offset, alignment)?;
+        payload_alignment = payload_alignment.max(alignment);
+        biggest_payload = biggest_payload.max(size);
+        variants.push(ScalarEnumVariantLayout { tag: variant.tag, layout: ScalarLayout { size, alignment }, slots });
+    }
+    let payload_storage = ScalarLayout {
+        size: checked_align_offset(biggest_payload, payload_alignment)?,
+        alignment: payload_alignment,
+    };
+    let (payload_offset, end) = checked_layout_offset(tag.size, &payload_storage)?;
+    let alignment = tag.alignment.max(payload_alignment);
+    let size = checked_align_offset(end, alignment)?;
+    if size > maximum_size { return None; }
+    Some(ScalarEnumPayloadLayout { target, layout: ScalarLayout { size, alignment }, payload_offset, payload_storage, variants })
+}
+
+// Do not route unsupported types through the ordinary layout function's
+// zero-size fallback. In particular, named sums and checked owns/loans need
+// declaration and provenance facts not produced by this preparation stage.
+fn ground_payload_type_layout(ty: &ScalarType, target: ScalarTargetLayout) -> Option<ScalarLayout> {
+    let mut leaf = ty;
+    while let ScalarType::Array { element, .. } = leaf { leaf = element; }
+    match leaf {
+        ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128
+        | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+        | ScalarType::Char | ScalarType::F32 | ScalarType::F64 => {}
+        ScalarType::RawPointer(inner) if matches!(inner.as_ref(),
+            ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128
+            | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128
+            | ScalarType::Char | ScalarType::F32 | ScalarType::F64) => {}
+        _ => return None,
+    }
+    layout_for_type(ty, target).ok()
 }
 
 fn compute_layouts(

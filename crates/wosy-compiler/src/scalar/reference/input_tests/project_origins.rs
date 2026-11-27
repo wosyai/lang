@@ -11,6 +11,7 @@ fn raw_module(path: &str, text: &str, target: ScalarTargetLayout) -> ScalarModul
         structs,
         enums,
         diagnostics,
+        ..
     } = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let mut module = ScalarModule::new(source, items, Vec::new());
@@ -507,6 +508,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         callable_escapes: HashSet::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
+                        initializer_predicates: HashMap::new(),
                         short_circuits: HashMap::new(),
                     }
                 )),

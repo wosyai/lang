@@ -28,7 +28,7 @@ pub(super) fn resolve_program_types(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(program.enums.iter().map(|enumeration| {
+        .chain(program.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -306,7 +306,7 @@ pub(super) fn resolve_program_places(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(program.enums.iter().map(|enumeration| {
+        .chain(program.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -414,7 +414,9 @@ fn resolve_item_places(
                     owners,
                 );
             }
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if binding.contextual_storage().is_none() {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            }
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_places(
             expression,
@@ -510,6 +512,8 @@ fn resolve_expression_places(
             for argument in arguments { resolve_expression_places(argument, scope, program, names, unsafe_context, overloads, owners); }
         }
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
+        ScalarExpression::RuntimeMatch(_) => {},
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_place(
@@ -693,10 +697,10 @@ fn resolve_expression_places(
             *enum_tag = program
                 .enums
                 .iter()
-                .find(|enumeration| enumeration.name == *receiver)
+                .find(|enumeration| enumeration.name == *receiver && enumeration.has_tag_only_layout())
                 .and_then(|enumeration| {
                     enumeration
-                        .variants
+                        .variants()
                         .iter()
                         .find(|variant| variant.name == *name)
                 })
@@ -723,6 +727,7 @@ fn resolve_place(
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => resolve_expression_places(
             pointer,
@@ -744,6 +749,7 @@ fn resolve_place(
                 owners,
             );
             let base_type = match base.as_ref() {
+                ScalarPlace::Contextual { ty, .. } => ty.clone(),
                 ScalarPlace::Dereference { pointer, .. } => {
                     let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type(
@@ -1021,7 +1027,7 @@ fn resolve_expression_types_project(
     }
 }
 
-fn resolve_type_in_project(
+pub(super) fn resolve_type_in_project(
     ty: &ScalarType,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
@@ -1154,7 +1160,7 @@ pub(super) fn resolve_module_places(
                 ScalarType::Struct(structure.id.clone()),
             )
         })
-        .chain(module.enums.iter().map(|enumeration| {
+        .chain(module.enums.iter().filter(|enumeration| enumeration.has_tag_only_layout()).map(|enumeration| {
             (
                 enumeration.name.clone(),
                 ScalarType::Enum(enumeration.id.clone()),
@@ -1283,7 +1289,9 @@ fn resolve_item_module_places(
                     owners,
                 );
             }
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if binding.contextual_storage().is_none() {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            }
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_module_places(
             expression,
@@ -1403,6 +1411,12 @@ fn resolve_expression_module_places(
             for argument in arguments { resolve_expression_module_places(argument, scope, module, modules, names, unsafe_context, declarations, current_module, overloads, owners); }
         }
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
+        ScalarExpression::RuntimeMatch(_) => {},
+        ScalarExpression::Contextual { binding, ty, .. } => {
+            if *ty == ScalarType::Error && matches!(binding.kind, ReferenceBindingKind::ContextualFormal) {
+                if let Some(checked) = declarations.contextual_formal_type(binding) { *ty = checked.clone(); }
+            }
+        }
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_module_place(
@@ -1648,7 +1662,7 @@ pub(super) fn enum_member_in_module(
     let enumeration = module
         .enums
         .iter()
-        .find(|enumeration| enumeration.name == receiver)
+        .find(|enumeration| enumeration.name == receiver && enumeration.has_tag_only_layout())
         .or_else(|| {
             receiver.split_once('.').and_then(|(namespace, enum_name)| {
                 module
@@ -1663,13 +1677,14 @@ pub(super) fn enum_member_in_module(
                     .and_then(|target| {
                         target.enums.iter().find(|enumeration| {
                             enumeration.name == enum_name
+                                && enumeration.has_tag_only_layout()
                                 && !is_module_private_name(&enumeration.name)
                         })
                     })
             })
         })?;
     enumeration
-        .variants
+        .variants()
         .iter()
         .find(|variant| variant.name == name)
         .map(|variant| (enumeration.id.clone(), variant.tag))
@@ -1688,6 +1703,11 @@ fn resolve_module_place(
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
+        ScalarPlace::Contextual { binding, ty, .. } => {
+            if *ty == ScalarType::Error && matches!(binding.kind, ReferenceBindingKind::ContextualFormal) {
+                if let Some(checked) = declarations.contextual_formal_type(binding) { *ty = checked.clone(); }
+            }
+        }
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => resolve_expression_module_places(
             pointer,
@@ -1715,6 +1735,7 @@ fn resolve_module_place(
                 owners,
             );
             let base_type = match base.as_ref() {
+                ScalarPlace::Contextual { ty, .. } => ty.clone(),
                 ScalarPlace::Dereference { pointer, .. } => {
                     let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type_in_module(

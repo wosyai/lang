@@ -754,11 +754,13 @@ fn emit_initializer_test_input(
             &module.items,
             region,
             &module.structs,
+            &module.enums,
             &module.layouts,
             module.target_layout,
             input,
             &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
+            None,
             super::PartitionMetadata::Full,
             &[],
         ),
@@ -1264,11 +1266,13 @@ i32 nested = unsafe { echo(33) };
                 &module.items,
                 region,
                 &module.structs,
+                &module.enums,
                 &module.layouts,
                 target_layout,
                 input,
                 &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
+                None,
                 super::PartitionMetadata::Full,
                 &[],
             )
@@ -3717,6 +3721,62 @@ fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
     }
 }
 
+#[test]
+fn ordinary_build_read_projection_is_exact_owner_and_artifact_neutral() {
+    let text = r#"%%start
+        u8(u64) read_index = fn(index) {
+            u8[2] data = [1, 2];
+            data[index]
+        };
+        u8(*u8) read_pointer = fn(pointer) { *pointer };
+    %%end"#;
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, target);
+        let validated = analyze_scalar_build(&prepared);
+        assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
+        let before = emit_scalar_build_single_module_llvm(&validated).unwrap().to_text();
+        let [ScalarItem::Function(array), ScalarItem::Function(shared)] = prepared.project().modules[0].items.as_slice()
+            else { panic!("ordinary prepared callable pair"); };
+        let indexed = prepared.bind_callable_body_call_nodes(0, 0, None, &array.body).unwrap();
+        let dereference = prepared.bind_callable_body_call_nodes(0, 1, None, &shared.body).unwrap();
+        let [ScalarBlockItem::LocalBinding(data), ScalarBlockItem::Expression(read)] = array.body.items.as_slice()
+            else { panic!("fixed-array value read"); };
+        let [ScalarBlockItem::Expression(pointer)] = shared.body.items.as_slice()
+            else { panic!("direct checked-reference value read"); };
+        let crate::ScalarExpression::IndexedRead { place, .. } = read else { panic!("indexed read AST"); };
+        let crate::ScalarPlace::Index { base, index, .. } = place else { panic!("indexed place AST"); };
+        let shape = indexed.fixed_index_read(read).unwrap();
+        assert_eq!(shape.extent, 2);
+        assert_eq!(shape.result, &ScalarType::U8);
+        assert_eq!(shape.base_binding.declaration_span, data.name_span);
+        assert_eq!(shape.index_binding.declaration_span, array.parameter_spans[0]);
+        assert!(indexed.expression_ordinal(read).is_some() && indexed.expression_ordinal(index).is_some());
+        assert_ne!(indexed.place_ordinal(place), indexed.place_ordinal(base));
+        assert_ne!(shape.read, shape.index);
+        assert_ne!(shape.place, shape.base);
+        let shape = dereference.shared_checked_read(pointer).unwrap();
+        assert_eq!(shape.binding.declaration_span, shared.parameter_spans[0]);
+        assert_eq!(shape.result, &ScalarType::U8);
+        assert!(indexed.fixed_index_read(&read.clone()).is_none());
+        assert!(dereference.shared_checked_read(&pointer.clone()).is_none());
+        assert!(indexed.shared_checked_read(pointer).is_none());
+        assert!(dereference.fixed_index_read(read).is_none());
+        let distinct = prepare_initializer_test(text, target);
+        let ScalarItem::Function(copy_array) = &distinct.project().modules[0].items[0] else { unreachable!(); };
+        let ScalarBlockItem::Expression(copy_read) = &copy_array.body.items[1] else { unreachable!(); };
+        assert!(indexed.fixed_index_read(copy_read).is_none());
+        let rebound = prepared.bind_callable_body_call_nodes(0, 0, None, &copy_array.body).unwrap();
+        assert!(rebound.expression_ordinal(copy_read).is_some());
+        assert!(rebound.fixed_index_read(copy_read).is_none());
+        let cloned = shared.body.clone();
+        let ScalarBlockItem::Expression(cloned_read) = &cloned.items[0] else { unreachable!(); };
+        let rebound = prepared.bind_callable_body_call_nodes(0, 1, None, &cloned).unwrap();
+        assert!(rebound.expression_ordinal(cloned_read).is_some());
+        assert!(rebound.shared_checked_read(cloned_read).is_none());
+        assert_eq!(emit_scalar_build_single_module_llvm(&validated).unwrap().to_text(), before);
+    }
+}
+
 fn length_loaded_for_runtime_array(llvm: &str) -> &str {
     loaded_runtime_extent_parameter(llvm, "length")
 }
@@ -4363,6 +4423,124 @@ fn retains_core_runtime_declarations_when_serializing_wasm_externs() {
         "{llvm}"
     );
     assert!(llvm.contains("wasm-import-module\"=\"host\""), "{llvm}");
+}
+
+#[test]
+fn emits_internal_contextual_pointer_transport_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) identity = fn(value) { value };
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        unit() relay = fn { consume(); };
+        unit() entry = fn {
+            i8 core.context.credit = 3;
+            relay();
+            if (core.context.credit != 2) { core.system_panic(); };
+            if (true) {
+                i8 core.context.credit = 20;
+                relay();
+                if (core.context.credit != 19) { core.system_panic(); };
+            };
+            relay();
+            i8 count = identity(core.context.credit);
+            if (count != 1) { core.system_panic(); };
+        };
+        entry();
+    %%end"#;
+    for (target, target_layout) in [("native", ScalarTargetLayout::NATIVE64), ("wasm", ScalarTargetLayout::WASM32)] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout },
+        ).expect("authenticated contextual graph");
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = super::emit_scalar_build_project_llvm_text(&build).expect("verified contextual LLVM");
+        let name = |name| project_function_name(&source, name);
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("relay"))), "{ir}");
+        assert!(ir.contains(&format!("define void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("define i8 @{}(i8 %value)", name("identity"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        let relay_prefix = format!("call void @{}(ptr ", name("relay"));
+        let pointers = ir.lines().filter_map(|line| line.split_once(&relay_prefix).map(|(_, tail)| tail)).collect::<Vec<_>>();
+        let [outer, inner, restored] = pointers.as_slice() else { panic!("{ir}"); };
+        assert_ne!(outer, inner);
+        assert_eq!(outer, restored);
+        if std::env::var_os("WOSY_CONTEXTUAL_EMIT_TEST_IR").is_some() {
+            eprintln!("WOSY-CONTEXT-IR-START-{target}\n{ir}WOSY-CONTEXT-IR-END-{target}");
+        }
+    }
+
+    for invalid in [
+        text.replace("i8 core.context.credit = 3;", ""),
+        text.replace("i8 core.context.credit = 20", "i16 core.context.credit = 20"),
+    ] {
+        let parsed = parse_source(source.clone(), invalid, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        ).is_err());
+    }
+}
+
+#[test]
+fn emits_contextual_scoped_integer_places_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) counter = fn(selector) {
+            i8 core.context.count = 1;
+            if (selector < 0) {
+                i8 core.context.count = core.context.count;
+                core.context.count = 2;
+            } else {
+                core.context.count = 3;
+            };
+            core.context.count
+        };
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        let llvm = emit_scalar_llvm(&validation).expect("contextual integer cells").to_text();
+        assert_eq!(llvm.lines().filter(|line|
+            line.trim_start().starts_with("%contextual") && line.contains(" = alloca i8")
+        ).count(), 2, "{llvm}");
+        assert!(llvm.contains("store i8 2"), "{llvm}");
+        assert!(llvm.contains("store i8 3"), "{llvm}");
+    }
+}
+
+#[test]
+fn emits_contextual_scoped_bool_places_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        bool(bool) toggle = fn(live) {
+            bool core.context.ready = false;
+            if (live) {
+                bool core.context.ready = core.context.ready;
+                core.context.ready = true;
+                if (!core.context.ready) { core.system_panic(); };
+            } else {
+                core.context.ready = true;
+            };
+            core.context.ready
+        };
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        let llvm = emit_scalar_llvm(&validation).expect("contextual bool cells").to_text();
+        assert_eq!(llvm.lines().filter(|line|
+            line.trim_start().starts_with("%contextual") && line.contains(" = alloca i1")
+        ).count(), 2, "{llvm}");
+        assert!(llvm.contains("store i1 false"), "{llvm}");
+        assert!(llvm.contains("store i1 true"), "{llvm}");
+    }
 }
 
 #[test]
@@ -5232,6 +5410,44 @@ fn emits_float_conversions_for_single_file_and_project() {
     assert!(project.contains("fptoui"), "{project}");
     assert!(project.contains("fptrunc"), "{project}");
     assert!(project.contains("fpext"), "{project}");
+}
+
+#[test]
+fn lowers_wrapping_addition_at_each_integer_width_without_no_wrap_flags() {
+    let mut text = String::from("%%start\nunit(*!u32) increment = fn(p) { *p = *p +@ 1; };\n");
+    for ty in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128"] {
+        text += &format!("{ty}({ty}, {ty}) wrap_{ty} = fn(a, b) {{ a +@ b }}; wrap_{ty}(1, 2);\n");
+    }
+    text += "%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(&text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let standalone = derive_scalar_program_with_layout(&parse_source(source, text.clone(), &[]).result, layout);
+        assert!(standalone.diagnostics.is_empty(), "{:?}", standalone.diagnostics);
+        for partition in [
+            emit_scalar_llvm(&standalone),
+            emit_scalar_build_single_module_llvm(&checked),
+            emit_scalar_build_project_llvm(&checked),
+        ] {
+            let ir = partition.unwrap().to_text();
+            for width in [8, 16, 32, 64, 128] {
+                assert!(ir.contains(&format!("add i{width} ")), "{layout:?}: {ir}");
+            }
+            assert!(!ir.contains("add nsw") && !ir.contains("add nuw"), "{layout:?}: {ir}");
+        }
+    }
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    for invalid in [
+        "f32(f32, f32) bad = fn(a, b) { a +@ b };",
+        "bool(bool, bool) bad = fn(a, b) { a +@ b };",
+        "u16(u16, u8) bad = fn(a, b) { a +@ b };",
+    ] {
+        let text = format!("%%start {invalid} %%end");
+        let standalone = derive_scalar_program_with_layout(&parse_source(source.clone(), text, &[]).result, ScalarTargetLayout::NATIVE64);
+        assert!(!standalone.diagnostics.is_empty(), "{invalid}");
+    }
 }
 
 #[test]
@@ -8716,27 +8932,44 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
-fn ordinary_result_transport_declines_legacy_source_and_aggregate_forwarding() {
-    let pair = "struct Pair { u8 tag; u64 total; }";
-    for body in [
-        "Pair() old_make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() _make = fn { old_make() }; u64() verify = fn { Pair value = _make(); value.total };",
-        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { _make() };",
-        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { Pair value = _make(); value };",
-    ] {
-        let text = format!("%%start\n{pair}\n{body}\n%%end");
-        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-            let prepared = prepare_initializer_test(&text, layout);
-            let checked = analyze_scalar_build(&prepared);
-            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-            let source = &prepared.project().modules[0].source;
-            for (producer, llvm) in [
-                ("_make".to_owned(), emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
-                (project_function_name(source, "_make"), emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
-            ] {
-                let legacy = format!("define ptr @{producer}(");
-                assert!(llvm.contains(&legacy), "{llvm}");
-                assert!(!llvm.contains("ordinary_result_destination"), "{llvm}");
-            }
+fn private_projection_remains_at_exact_binding_assignment_and_branch_sites() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+u64 trace = 0;
+u64(u64) record = fn(digit) { trace = trace * 10 + digit; digit };
+Pair(u64) _make_pair = fn(seed) { { .tag = 7; .value = seed; } };
+u64(bool) read_slots = fn(selected) {
+    u64 before = record(1);
+    u64 value = _make_pair(record(2)).value;
+    value = value + (if (selected) { (_make_pair(record(3))).value } else { 11 });
+    u64 after = record(4);
+    before + value + after
+};
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, partition) in [
+            (false, emit_scalar_build_single_module_llvm(&checked).unwrap()),
+            (true, emit_scalar_build_project_llvm(&checked).unwrap()),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_make_pair");
+            let record = symbol("record");
+            let reader = symbol("read_slots");
+            let llvm = partition.to_text();
+            assert!(llvm.contains(&format!("define internal void @{producer}(")), "{llvm}");
+            let reader = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            let constructor_call = format!("call void @{producer}(");
+            let trace_call = format!("call i64 @{record}(");
+            assert_eq!(reader.matches(&constructor_call).count(), 2, "{reader}");
+            assert_eq!(reader.matches(&trace_call).count(), 4, "{reader}");
+            assert_eq!(reader.lines().filter(|line| line.trim_start().starts_with("%ordinary_result_destination")
+                && line.contains("alloca [16 x i8], align 8")).count(), 2, "{reader}");
+            assert!(!reader.contains("call ptr "), "{reader}");
         }
     }
 }
@@ -8760,6 +8993,311 @@ fn assert_ordinary_copy_fallback(text: &str, layout: ScalarTargetLayout, produce
         assert!(!body.contains("ret ptr"), "{body}");
         assert!(llvm.contains(&format!("call {shape} @{symbol}(")), "{llvm}");
         assert!(llvm.contains("inline_result_storage"), "{llvm}");
+    }
+}
+
+#[test]
+fn private_projection_refuses_same_producer_when_an_aggregate_assignment_is_unproved() {
+    let text = "%%start
+struct copy Pair { u64 value; }
+Pair(u64) _make_pair = fn(seed) { { .value = seed; } };
+u64(u64) read_value = fn(seed) { u64 word = _make_pair(seed).value; word };
+u64(u64) replace_value = fn(seed) {
+    Pair item = { .value = 13; };
+    u64 original = item.value;
+    item = _make_pair(seed);
+    original + item.value
+};
+%%end";
+    assert_ordinary_copy_fallback(text, ScalarTargetLayout::WASM32, "_make_pair", 8);
+}
+
+#[test]
+fn private_terminal_global_copy_snapshot_checks_each_arm_and_copies_before_return() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+u32 side = 0;
+Pair[2] left = [{ .tag = 1; .value = 40; }, { .tag = 2; .value = 42; }];
+Pair[2] right = [{ .tag = 3; .value = 70; }, { .tag = 4; .value = 71; }];
+Pair(u64) _pick = fn(index) { if (side == 0) { left[index] } else { right[index] } };
+u64(u64) read_direct = fn(index) { _pick(index).value };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (partition, project) in [
+            (emit_scalar_build_single_module_llvm(&checked).unwrap(), false),
+            (emit_scalar_build_project_llvm(&checked).unwrap(), true),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_pick");
+            let reader = symbol("read_direct");
+            let llvm = partition.to_text();
+            let producer_body = llvm.split_once(&format!("define internal void @{producer}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            assert_eq!(producer_body.matches("icmp uge i64").count(), 2, "{producer_body}");
+            assert_eq!(producer_body.matches("@__wosy_core_system_panic()").count(), 2, "{producer_body}");
+            assert!(producer_body.contains("phi ptr "), "{producer_body}");
+            let copy = producer_body.find("@llvm.memmove.").expect("copy before returning");
+            assert!(copy < producer_body.find("ret void").unwrap(), "{producer_body}");
+            assert!(!producer_body.contains("ret ptr"), "{producer_body}");
+            let reader_body = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            assert_eq!(reader_body.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(reader_body.contains("ordinary_result_destination"));
+            assert!(reader_body.contains("load i64, ptr %value"));
+        }
+    }
+}
+
+#[test]
+fn private_terminal_global_copy_snapshot_refuses_calling_conditions_and_computed_indexes() {
+    for (condition, index) in [("choose()", "index"), ("side == 0", "index + 1")] {
+        let text = format!("%%start
+struct copy Pair {{ u64 value; }}
+u32 side = 0;
+bool() choose = fn {{ side == 0 }};
+Pair[2] left = [{{ .value = 40; }}, {{ .value = 42; }}];
+Pair[2] right = [{{ .value = 70; }}, {{ .value = 71; }}];
+Pair(u64) _pick = fn(index) {{ if ({condition}) {{ left[{index}] }} else {{ right[index] }} }};
+u64(u64) read_direct = fn(index) {{ _pick(index).value }};
+%%end");
+        assert_ordinary_copy_fallback(&text, ScalarTargetLayout::WASM32, "_pick", 8);
+    }
+}
+
+#[test]
+fn closed_copy_result_uses_caller_storage_for_all_exact_consumers() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .value = seed; } };
+u64(u64) read_named = fn(seed) { Pair item = _make(seed); item.value };
+u64(u64) read_direct = fn(seed) { _make(seed).value };
+u64(u64) read_grouped = fn(seed) { (_make(seed)).value };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (partition, project) in [
+            (emit_scalar_build_single_module_llvm(&checked).unwrap(), false),
+            (emit_scalar_build_project_llvm(&checked).unwrap(), true),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_make");
+            let llvm = partition.to_text();
+            assert_eq!(llvm.matches(&format!("define internal void @{producer}(")).count(), 1);
+            for reader in ["read_named", "read_direct", "read_grouped"] {
+                let reader = symbol(reader);
+                let body = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                    .1.split_once("\n}").unwrap().0;
+                let call = format!("call void @{producer}(");
+                assert_eq!(body.matches(&call).count(), 1);
+                assert!(body.lines().any(|line| line.contains(&call)
+                    && line.ends_with(", ptr %ordinary_result_destination)")), "{body}");
+                assert!(!body.contains("call ptr "), "{body}");
+            }
+        }
+    }
+}
+
+#[test]
+fn closed_copy_result_refuses_every_consumer_when_any_use_is_unproved() {
+    let prefix = "%%start
+struct copy Pair { u8 tag; u64 value; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .value = seed; } };
+u64(u64) read_named = fn(seed) { Pair item = _make(seed); item.value };
+Pair(u64) retain_value = fn(seed) { _make(seed) };
+";
+    let text = format!("{prefix}u64(u64) read_direct = fn(seed) {{ _make(seed).value }};\n%%end");
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        assert_ordinary_copy_fallback(&text, layout, "_make", 16);
+    }
+}
+
+#[test]
+fn value_field_projection_loads_only_from_proven_caller_storage() {
+    for expression in ["_make(seed).value", "(_make(seed)).value"] {
+        let text = format!("%%start
+struct copy Pair {{ u8 tag; u64 value; }}
+Pair(u64) _make = fn(seed) {{ {{ .tag = 7; .value = seed; }} }};
+u64(u64) verify = fn(seed) {{ {expression} }};
+%%end");
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (make, verify, partition) in [
+                ("_make".to_owned(), "verify".to_owned(),
+                    emit_scalar_build_single_module_llvm(&checked).unwrap()),
+                (project_function_name(source, "_make"), project_function_name(source, "verify"),
+                    emit_scalar_build_project_llvm(&checked).unwrap()),
+            ] {
+                let llvm = partition.to_text();
+                assert!(llvm.contains(&format!("define internal void @{make}(")), "{llvm}");
+                let verify = llvm.split_once(&format!("define i64 @{verify}(")).unwrap()
+                    .1.split_once("\n}").unwrap().0;
+                assert_eq!(verify.matches(&format!("call void @{make}(")).count(), 1);
+                assert!(verify.contains("%ordinary_result_destination = alloca [16 x i8], align 8"));
+                assert!(verify.contains("load i64, ptr %value"), "{verify}");
+                assert!(!verify.contains("call ptr "), "{verify}");
+            }
+        }
+    }
+}
+
+#[test]
+fn value_field_projection_uses_ordinary_value_when_the_caller_slot_is_unproved() {
+    let text = "%%start
+struct copy Pair { i32 value; }
+Pair(i32) make = fn(seed) { { .value = seed; } };
+i32(i32) verify = fn(seed) { make(seed).value };
+%%end";
+    assert_ordinary_copy_fallback(text, ScalarTargetLayout::WASM32, "make", 4);
+}
+
+#[test]
+fn value_field_projection_reports_the_selected_field_for_typing_errors() {
+    for (structure, field, message) in [
+        ("struct Pair { i32 value; }", "value", "field value receiver must be a copy struct"),
+        ("struct copy Pair { i32 value; }", "missing", "unknown struct field"),
+    ] {
+        let text = format!("%%start
+{structure}
+Pair(i32) _make = fn(seed) {{ {{ .value = seed; }} }};
+i32(i32) verify = fn(seed) {{ _make(seed).{field} }};
+%%end");
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let start = text.rfind(field).unwrap() as u32;
+        let parsed = parse_source(source.clone(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let rejected = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        );
+        let error = rejected.err().expect("unsupported field type");
+        let diagnostic = error.diagnostics.iter().find(|diagnostic| diagnostic.message == message)
+            .expect("field diagnostic");
+        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, start + field.len() as u32));
+    }
+}
+
+#[test]
+fn closed_copy_parameter_result_writes_caller_storage_before_returning() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 total; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .total = seed; } };
+u64(u64) verify = fn(seed) { Pair item = _make(seed); item.total };
+%%end";
+    for (layout, size_ty) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (producer, caller, partition) in [
+            ("_make".to_owned(), "verify".to_owned(),
+                emit_scalar_build_single_module_llvm(&checked).unwrap()),
+            (project_function_name(source, "_make"), project_function_name(source, "verify"),
+                emit_scalar_build_project_llvm(&checked).unwrap()),
+        ] {
+            let llvm = partition.to_text();
+            let (_, tail) = llvm.split_once(&format!("define internal void @{producer}(i64 %seed, ptr "))
+                .expect("checked caller destination parameter");
+            let (destination, body) = tail.split_once(')').expect("producer parameters");
+            let (body, _) = body.split_once("\n}").expect("producer end");
+            let copy = body.lines().find(|line| line.contains("@llvm.memmove.")
+                && line.contains(&format!("ptr align 1 {destination},"))
+                && line.contains(&format!("{size_ty} 16, i1 false")))
+                .expect("aligned result bytes copied into caller destination");
+            assert!(body.contains("store i64 %seed"), "{body}");
+            assert!(body.find(copy).unwrap() < body.find("ret void").unwrap(), "{body}");
+            assert!(!body.contains("ret ptr"), "{body}");
+
+            let caller = llvm.split_once(&format!("define i64 @{caller}(")).expect("caller")
+                .1.split_once("\n}").expect("caller end").0;
+            assert!(caller.contains("alloca [16 x i8], align 8"), "{caller}");
+            assert_eq!(caller.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(caller.lines().any(|line| line.contains(&format!("call void @{producer}("))
+                && line.ends_with(", ptr %ordinary_result_destination)")), "{caller}");
+            assert!(caller.contains("ret i64 "), "{caller}");
+        }
+    }
+}
+
+#[test]
+fn closed_nested_copy_local_result_uses_caller_storage_for_scalar_projection() {
+    let text = "%%start
+struct copy Part { u8 tag; u64 score; }
+struct copy Bundle { Part selected; u64 other; }
+Bundle() _make_bundle = fn {
+    Bundle prepared_value = { .selected = { .tag = 7; .score = 41; }; .other = 17; };
+    prepared_value
+};
+u64() observe = fn { Bundle received = _make_bundle(); received.selected.score };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let checked_project = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&checked_project);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &checked_project.project().modules[0].source;
+        for (producer, caller, partition) in [
+            ("_make_bundle".to_owned(), "observe".to_owned(),
+                emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+            (project_function_name(source, "_make_bundle"), project_function_name(source, "observe"),
+                emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+        ] {
+            let producer_body = partition.split_once(&format!("define internal void @{producer}("))
+                .expect("producer caller-owned boundary").1.split_once("\n}").unwrap().0;
+            let (producer_args, producer_ir) = producer_body.split_once(')').unwrap();
+            let destination = producer_args.strip_prefix("ptr ").expect("caller storage parameter");
+            let transfer = producer_ir.lines().find(|line| {
+                line.contains("@llvm.memmove.")
+                    && line.contains(&format!("ptr align 1 {destination},"))
+                    && (line.contains("i32 24, i1 false") || line.contains("i64 24, i1 false"))
+            }).expect("layout-sized pre-return transfer");
+            assert!(producer_ir.find(transfer).unwrap() < producer_ir.find("ret void").unwrap());
+            assert!(!producer_ir.contains("ret ptr"), "{producer_ir}");
+            let caller_ir = partition.split_once(&format!("define i64 @{caller}("))
+                .expect("ordinary scalar caller").1.split_once("\n}").unwrap().0;
+            assert_eq!(caller_ir.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(caller_ir.contains("alloca [24 x i8], align 8"), "{caller_ir}");
+            assert!(caller_ir.contains("ordinary_result_destination"), "{caller_ir}");
+            assert!(caller_ir.contains("ret i64"), "{caller_ir}");
+        }
+    }
+}
+
+#[test]
+fn ordinary_result_transport_declines_legacy_source_and_aggregate_forwarding() {
+    let pair = "struct Pair { u8 tag; u64 total; }";
+    for body in [
+        "Pair() old_make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() _make = fn { old_make() }; u64() verify = fn { Pair value = _make(); value.total };",
+        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { _make() };",
+        "Pair() _make = fn { Pair item = { .tag = 7; .total = 19; }; item }; Pair() forward = fn { Pair value = _make(); value };",
+    ] {
+        let text = format!("%%start\n{pair}\n{body}\n%%end");
+        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (producer, llvm) in [
+                ("_make".to_owned(), emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+                (project_function_name(source, "_make"), emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+            ] {
+                let legacy = format!("define ptr @{producer}(");
+                assert!(llvm.contains(&legacy), "{llvm}");
+                assert!(!llvm.contains("ordinary_result_destination"), "{llvm}");
+            }
+        }
     }
 }
 
@@ -10529,119 +11067,7 @@ fn guarded_fallible_composed_conditions_keep_one_presence_and_one_cleanup() {
 }
 
 #[test]
-fn closed_nested_copy_local_result_uses_caller_storage_for_scalar_projection() {
-    let text = "%%start
-struct copy Part { u8 tag; u64 score; }
-struct copy Bundle { Part selected; u64 other; }
-Bundle() _make_bundle = fn {
-    Bundle prepared_value = { .selected = { .tag = 7; .score = 41; }; .other = 17; };
-    prepared_value
-};
-u64() observe = fn { Bundle received = _make_bundle(); received.selected.score };
-%%end";
-    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-        let checked_project = prepare_initializer_test(text, layout);
-        let checked = analyze_scalar_build(&checked_project);
-        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-        let source = &checked_project.project().modules[0].source;
-        for (producer, caller, partition) in [
-            ("_make_bundle".to_owned(), "observe".to_owned(),
-                emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
-            (project_function_name(source, "_make_bundle"), project_function_name(source, "observe"),
-                emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
-        ] {
-            let producer_body = partition.split_once(&format!("define internal void @{producer}("))
-                .expect("producer caller-owned boundary").1.split_once("\n}").unwrap().0;
-            let (producer_args, producer_ir) = producer_body.split_once(')').unwrap();
-            let destination = producer_args.strip_prefix("ptr ").expect("caller storage parameter");
-            let transfer = producer_ir.lines().find(|line| {
-                line.contains("@llvm.memmove.")
-                    && line.contains(&format!("ptr align 1 {destination},"))
-                    && (line.contains("i32 24, i1 false") || line.contains("i64 24, i1 false"))
-            }).expect("layout-sized pre-return transfer");
-            assert!(producer_ir.find(transfer).unwrap() < producer_ir.find("ret void").unwrap());
-            assert!(!producer_ir.contains("ret ptr"), "{producer_ir}");
-            let caller_ir = partition.split_once(&format!("define i64 @{caller}("))
-                .expect("ordinary scalar caller").1.split_once("\n}").unwrap().0;
-            assert_eq!(caller_ir.matches(&format!("call void @{producer}(")).count(), 1);
-            assert!(caller_ir.contains("alloca [24 x i8], align 8"), "{caller_ir}");
-            assert!(caller_ir.contains("ordinary_result_destination"), "{caller_ir}");
-            assert!(caller_ir.contains("ret i64"), "{caller_ir}");
-        }
-    }
-}
-
-#[test]
-fn value_field_projection_loads_only_from_proven_caller_storage() {
-    for expression in ["_make(seed).value", "(_make(seed)).value"] {
-        let text = format!("%%start
-struct copy Pair {{ u8 tag; u64 value; }}
-Pair(u64) _make = fn(seed) {{ {{ .tag = 7; .value = seed; }} }};
-u64(u64) verify = fn(seed) {{ {expression} }};
-%%end");
-        for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-            let prepared = prepare_initializer_test(&text, layout);
-            let checked = analyze_scalar_build(&prepared);
-            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-            let source = &prepared.project().modules[0].source;
-            for (make, verify, partition) in [
-                ("_make".to_owned(), "verify".to_owned(),
-                    emit_scalar_build_single_module_llvm(&checked).unwrap()),
-                (project_function_name(source, "_make"), project_function_name(source, "verify"),
-                    emit_scalar_build_project_llvm(&checked).unwrap()),
-            ] {
-                let llvm = partition.to_text();
-                assert!(llvm.contains(&format!("define internal void @{make}(")), "{llvm}");
-                let verify = llvm.split_once(&format!("define i64 @{verify}(")).unwrap()
-                    .1.split_once("\n}").unwrap().0;
-                assert_eq!(verify.matches(&format!("call void @{make}(")).count(), 1);
-                assert!(verify.contains("%ordinary_result_destination = alloca [16 x i8], align 8"));
-                assert!(verify.contains("load i64, ptr %value"), "{verify}");
-                assert!(!verify.contains("call ptr "), "{verify}");
-            }
-        }
-    }
-}
-
-#[test]
-fn value_field_projection_uses_ordinary_value_when_the_caller_slot_is_unproved() {
-    let text = "%%start
-struct copy Pair { i32 value; }
-Pair(i32) make = fn(seed) { { .value = seed; } };
-i32(i32) verify = fn(seed) { make(seed).value };
-%%end";
-    assert_ordinary_copy_fallback(text, ScalarTargetLayout::WASM32, "make", 4);
-}
-
-#[test]
-fn value_field_projection_reports_the_selected_field_for_typing_errors() {
-    for (structure, field, message) in [
-        ("struct Pair { i32 value; }", "value", "field value receiver must be a copy struct"),
-        ("struct copy Pair { i32 value; }", "missing", "unknown struct field"),
-    ] {
-        let text = format!("%%start
-{structure}
-Pair(i32) _make = fn(seed) {{ {{ .value = seed; }} }};
-i32(i32) verify = fn(seed) {{ _make(seed).{field} }};
-%%end");
-        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
-        let start = text.rfind(field).unwrap() as u32;
-        let parsed = parse_source(source.clone(), text, &[]);
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let rejected = prepare_scalar_project(
-            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
-            vec![source],
-            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
-        );
-        let error = rejected.err().expect("unsupported field type");
-        let diagnostic = error.diagnostics.iter().find(|diagnostic| diagnostic.message == message)
-            .expect("field diagnostic");
-        assert_eq!(diagnostic.labels[0].span.range, ByteSpan::new(start, start + field.len() as u32));
-    }
-}
-
-#[test]
-fn closed_copy_parameter_result_writes_caller_storage_before_returning() {
+fn closed_copy_parameter_result_writes_caller_storage_before_returning_other_parent() {
     let text = "%%start
 struct copy Pair { u8 tag; u64 total; }
 Pair(u64) _make = fn(seed) { { .tag = 7; .total = seed; } };
@@ -10871,49 +11297,6 @@ shapes.Bundle() second = fn {
 }
 
 #[test]
-fn private_projection_remains_at_exact_binding_assignment_and_branch_sites() {
-    let text = "%%start
-struct copy Pair { u8 tag; u64 value; }
-u64 trace = 0;
-u64(u64) record = fn(digit) { trace = trace * 10 + digit; digit };
-Pair(u64) _make_pair = fn(seed) { { .tag = 7; .value = seed; } };
-u64(bool) read_slots = fn(selected) {
-    u64 before = record(1);
-    u64 value = _make_pair(record(2)).value;
-    value = value + (if (selected) { (_make_pair(record(3))).value } else { 11 });
-    u64 after = record(4);
-    before + value + after
-};
-%%end";
-    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-        let prepared = prepare_initializer_test(text, layout);
-        let checked = analyze_scalar_build(&prepared);
-        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-        let source = &prepared.project().modules[0].source;
-        for (project, partition) in [
-            (false, emit_scalar_build_single_module_llvm(&checked).unwrap()),
-            (true, emit_scalar_build_project_llvm(&checked).unwrap()),
-        ] {
-            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
-            let producer = symbol("_make_pair");
-            let record = symbol("record");
-            let reader = symbol("read_slots");
-            let llvm = partition.to_text();
-            assert!(llvm.contains(&format!("define internal void @{producer}(")), "{llvm}");
-            let reader = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
-                .1.split_once("\n}").unwrap().0;
-            let constructor_call = format!("call void @{producer}(");
-            let trace_call = format!("call i64 @{record}(");
-            assert_eq!(reader.matches(&constructor_call).count(), 2, "{reader}");
-            assert_eq!(reader.matches(&trace_call).count(), 4, "{reader}");
-            assert_eq!(reader.lines().filter(|line| line.trim_start().starts_with("%ordinary_result_destination")
-                && line.contains("alloca [16 x i8], align 8")).count(), 2, "{reader}");
-            assert!(!reader.contains("call ptr "), "{reader}");
-        }
-    }
-}
-
-#[test]
 fn private_projection_uses_inline_when_an_aggregate_assignment_is_unproved() {
     let text = "%%start
 struct copy Pair { u64 value; }
@@ -10927,46 +11310,6 @@ u64(u64) replace_value = fn(seed) {
 };
 %%end";
     assert_ordinary_copy_fallback(text, ScalarTargetLayout::WASM32, "_make_pair", 8);
-}
-
-#[test]
-fn private_terminal_global_copy_snapshot_checks_each_arm_and_copies_before_return() {
-    let text = "%%start
-struct copy Pair { u8 tag; u64 value; }
-u32 side = 0;
-Pair[2] left = [{ .tag = 1; .value = 40; }, { .tag = 2; .value = 42; }];
-Pair[2] right = [{ .tag = 3; .value = 70; }, { .tag = 4; .value = 71; }];
-Pair(u64) _pick = fn(index) { if (side == 0) { left[index] } else { right[index] } };
-u64(u64) read_direct = fn(index) { _pick(index).value };
-%%end";
-    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-        let prepared = prepare_initializer_test(text, layout);
-        let checked = analyze_scalar_build(&prepared);
-        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
-        let source = &prepared.project().modules[0].source;
-        for (partition, project) in [
-            (emit_scalar_build_single_module_llvm(&checked).unwrap(), false),
-            (emit_scalar_build_project_llvm(&checked).unwrap(), true),
-        ] {
-            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
-            let producer = symbol("_pick");
-            let reader = symbol("read_direct");
-            let llvm = partition.to_text();
-            let producer_body = llvm.split_once(&format!("define internal void @{producer}(")).unwrap()
-                .1.split_once("\n}").unwrap().0;
-            assert_eq!(producer_body.matches("icmp uge i64").count(), 2, "{producer_body}");
-            assert_eq!(producer_body.matches("@__wosy_core_system_panic()").count(), 2, "{producer_body}");
-            assert!(producer_body.contains("phi ptr "), "{producer_body}");
-            let copy = producer_body.find("@llvm.memmove.").expect("copy before returning");
-            assert!(copy < producer_body.find("ret void").unwrap(), "{producer_body}");
-            assert!(!producer_body.contains("ret ptr"), "{producer_body}");
-            let reader_body = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
-                .1.split_once("\n}").unwrap().0;
-            assert_eq!(reader_body.matches(&format!("call void @{producer}(")).count(), 1);
-            assert!(reader_body.contains("ordinary_result_destination"));
-            assert!(reader_body.contains("load i64, ptr %value"));
-        }
-    }
 }
 
 #[test]
@@ -19941,5 +20284,45 @@ u8 observed = observe();
         }
         assert!(!producer.contains("alloca"), "{producer}");
         eprintln!("fixed backing target {target:?}\n{ir}");
+    }
+}
+
+#[test]
+fn inline_copy_result_uses_only_canonical_tag_only_enum_declarations() {
+    let text = "%%start enum copy Tag { plain; } enum copy Payload { plain; value(u8); } %%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let module = &prepared.project().modules[0];
+        let [tag, payload] = module.enums.as_slice() else { panic!("two canonical enum declarations") };
+        let shape = super::InlineResultShapes::new(&[], module.enums.iter());
+        let fixed = |id| shape.fixed_inline(&ScalarType::Enum(id), &mut std::collections::HashMap::new());
+        assert!(fixed(tag.id.clone()));
+        assert!(!fixed(payload.id.clone()));
+        let missing = crate::scalar::ScalarEnumId { index: usize::MAX, ..tag.id.clone() };
+        assert!(!fixed(missing));
+    }
+}
+
+#[test]
+fn prepared_ordered_bitwise_comparisons_use_checked_integer_signedness() {
+    let source = r#"%%start
+        bool(u32) below_unsigned = fn(input) { (1 | input) < 2 };
+        bool(i32) below_signed = fn(input) { (1 | input) < 2 };
+        u32 unsigned_input = 17;
+        i32 signed_input = 17;
+        (1 | unsigned_input) < 2;
+        (1 | signed_input) < 2;
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for ir in [
+            emit_scalar_build_single_module_llvm(&build).unwrap().to_text(),
+            emit_scalar_build_project_llvm(&build).unwrap().to_text(),
+        ] {
+            assert_eq!(ir.matches("icmp ult i32").count(), 2, "{ir}");
+            assert_eq!(ir.matches("icmp slt i32").count(), 2, "{ir}");
+        }
     }
 }

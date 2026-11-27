@@ -37,6 +37,7 @@ fn checked_tail_conditional_publishes_one_producer_with_ordered_outputs() {
         parameter_spans: Vec::new(),
         span: body.span,
         body,
+        runtime_enum_match: None,
         generic_parameters: Vec::new(),
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
@@ -218,6 +219,7 @@ fn check_detached_tail_conditional(text: &str, check: impl Fn(&ScalarReferenceCf
             parameter_spans,
             span: wosy_syntax::byte_span(&node),
             body,
+            runtime_enum_match: None,
             generic_parameters: Vec::new(),
             overload_arms: Vec::new(),
             reference_cfg: ScalarReferenceCfg {

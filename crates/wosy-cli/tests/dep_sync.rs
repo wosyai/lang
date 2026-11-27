@@ -1049,6 +1049,89 @@ fn update_replays_patches_and_rejects_conflict_divergence_and_dirty_replacements
     assert_eq!(fs::read(checkout.join("upstream-added.txt")).unwrap(), b"nonconflicting\n");
 }
 
+#[cfg(feature = "internal-checker")]
+#[test]
+fn independent_check_uses_installed_git_primary_namespaces_and_patched_dormant_sources() {
+    let fixture = Fixture::new();
+    let (repo, _) = make_monorepo(&fixture);
+    let remote = repo.join("packages/remote_lib");
+    let leaf = repo.join("packages/leaf_lib");
+    let manifest = |name: &str, dep: &str, output: &str| format!(r#"
+[package]
+name = "{name}"
+default_target = "own"
+source_root = "src"
+[comments]
+categories = []
+[builders]
+[runners]
+[targets.own]
+root = "src/primary.w"
+default_profile = "checked"
+[targets.own.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.own.artifacts.main.profiles.checked]
+backend = "llvm"
+output = "{output}"
+builder = "never"
+run_runner = "never"
+[targets.own.profiles.checked]
+main_artifact = "main"
+{dep}
+"#);
+    let demand = |mark: &str, code: u8| format!(
+        r#"core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files = []; }});"#,
+    );
+    fs::write(remote.join("wosy.toml"), manifest("remote_lib", "[dependencies.leaf_lib]\npath = \"../leaf_lib\"", "wasm-wasip1")).unwrap();
+    fs::write(leaf.join("wosy.toml"), manifest("leaf_lib", "", "native")).unwrap();
+    fs::write(remote.join("src/primary.w"), format!(r#"%%start
+local = namespace remote_lib "nested/dependency.w";
+{}
+%%end"#, demand("remote", 4))).unwrap();
+    // This checked source is not any selected primary, and is reached via the
+    // managed primary's same-package namespace while resolving the graph.
+    fs::write(remote.join(GIT_SOURCE), format!("%%start\n{}\n%%end", demand("namespace", 5))).unwrap();
+    fs::write(leaf.join("src/primary.w"), format!("%%start\n{}\n%%end", demand("leaf", 3))).unwrap();
+    let dormant = |mark: &str| format!(r#"%%start
+unit(u8) unused = fn(value) {{
+    core.require(value < 1, {{ .stdout = "{mark}"; .stderr = ""; .code = 6; .files = []; }});
+}};
+%%end"#);
+    fs::write(leaf.join("src/dormant.w"), dormant("base")).unwrap();
+    commit(&repo, "Add independent checked primary targets");
+
+    let project = fixture.0.join("consumer");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("wosy.toml"), manifest("app", "", "native")).unwrap();
+    fs::write(project.join("src/primary.w"), format!("%%start\n{}\n%%end", demand("unexpected", 9).replace("false", "true"))).unwrap();
+    expect_success(&wosy(&project, &["dep", "add", "../upstream", "--path", "packages/remote_lib"]));
+    let check = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_wosy"))
+        .current_dir(&project).env("PATH", "").args(args).output().unwrap();
+    let locked = fs::read(project.join("wosy.lock")).unwrap();
+    let missing = check(&["check", "--profile", "checked", "--dependencies"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("dependency remote_lib is not materialized"));
+    assert!(!project.join("deps/leaf_lib").exists());
+    assert!(!project.join("deps/remote_lib").exists());
+    assert_eq!(fs::read(project.join("wosy.lock")).unwrap(), locked);
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    fs::write(project.join("deps/leaf_lib/src/dormant.w"), dormant("patched")).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let lock = fs::read(project.join("wosy.lock")).unwrap();
+
+    // Checking consumes the installed verification and patch receipts, with
+    // no executable Git (nor builder or runner) available.
+    let plain = check(&["check", "--profile", "checked"]);
+    assert!(plain.status.success(), "{plain:?}");
+    assert!(plain.stdout.is_empty() && plain.stderr.is_empty());
+    let checked = check(&["check", "--profile", "checked", "--dependencies"]);
+    assert_eq!(checked.status.code(), Some(3), "{checked:?}");
+    assert_eq!(checked.stdout, b"leafpatchednamespaceremote");
+    assert!(checked.stderr.is_empty());
+    assert_eq!(fs::read(project.join("wosy.lock")).unwrap(), lock);
+}
+
 #[test]
 fn a_transitive_git_checkout_uses_the_same_snapshot_and_replay() {
     let fixture = Fixture::new();

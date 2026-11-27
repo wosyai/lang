@@ -21,6 +21,10 @@ impl ScalarProgramTyping<'_> {
     }
 }
 
+type ProjectStructIndex = std::rc::Rc<std::cell::OnceCell<
+    BTreeMap<std::rc::Rc<ScalarStructId>, (usize, usize)>,
+>>;
+
 pub(super) struct ScalarModuleTyping<'a> {
     pub source: &'a SourceIdentity,
     pub members: &'a BTreeMap<String, ScalarType>,
@@ -28,11 +32,13 @@ pub(super) struct ScalarModuleTyping<'a> {
     pub structs: &'a [ScalarStruct],
     pub enums: &'a [ScalarEnum],
     pub target_layout: ScalarTargetLayout,
+    pub struct_index: ProjectStructIndex,
 }
 
 pub(super) fn split_module_typing(
     modules: &mut [ScalarModule],
 ) -> (Vec<ScalarModuleTyping<'_>>, Vec<&mut [ScalarItem]>) {
+    let struct_index = ProjectStructIndex::default();
     modules
         .iter_mut()
         .map(|module| {
@@ -44,6 +50,7 @@ pub(super) fn split_module_typing(
                     structs: &module.structs,
                     enums: &module.enums,
                     target_layout: module.target_layout,
+                    struct_index: struct_index.clone(),
                 },
                 module.items.as_mut_slice(),
             )
@@ -392,7 +399,9 @@ fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
 
 pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.span(),
         ScalarExpression::Name { span, .. }
+        | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Float { span, .. }
@@ -1293,6 +1302,13 @@ pub(super) fn block_item_type_in_module(
                 overloads,
                 inference,
             ) };
+            #[cfg(feature = "internal-checker")]
+            if matches!(binding.receivers.as_slice(), [receiver] if receiver.contextual_storage.is_none())
+                && actual == binding.declared_type
+                && (actual == ScalarType::Bool || is_integer_type(&actual))
+            {
+                inference.note_ordinary_snapshot_read(&binding.value, scope);
+            }
             validate_output_receivers_in_module(
                 &binding.value,
                 &binding.receivers,
@@ -1322,6 +1338,9 @@ pub(super) fn block_item_type_in_module(
                     overloads,
                     inference,
                 );
+            if binding.contextual_storage().is_some() {
+                return ScalarType::Unit;
+            }
             if declare_module_name(
                 module,
                 &binding.name,
@@ -3224,10 +3243,10 @@ fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
 // Leaves and obvious non-float shapes need no cache access. Check both
 // children shallowly before following a composite, so ordinary arithmetic
 // spines with a named or integer operand have no recursive shape walk.
-fn is_homogeneous_bitwise(operator: &BinaryOperator) -> bool {
+fn is_homogeneous_integer_operator(operator: &BinaryOperator) -> bool {
     matches!(
         operator,
-        BinaryOperator::BitAnd
+        BinaryOperator::WrappingAdd | BinaryOperator::BitAnd
             | BinaryOperator::BitOr
             | BinaryOperator::BitXor
             | BinaryOperator::ShiftLeft
@@ -3247,7 +3266,7 @@ fn is_integer_literal_operand(expression: &ScalarExpression) -> bool {
     }
 }
 
-fn infer_bitwise_operands(
+fn infer_homogeneous_integer_operands(
     left: &ScalarExpression,
     right: &ScalarExpression,
     mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
@@ -3402,8 +3421,25 @@ fn float_literal_fits_type(value: f64, ty: &ScalarType) -> bool {
     }
 }
 
-fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
-    let (minimum, maximum) = match ty {
+pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<std::borrow::Cow<'_, BigInt>> {
+    match expression {
+        ScalarExpression::Integer { value, .. } => Some(std::borrow::Cow::Borrowed(value)),
+        ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } => {
+            let ScalarExpression::Integer { value, .. } = operand.as_ref() else {
+                return None;
+            };
+            Some(std::borrow::Cow::Owned(-value))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
+    integer_bounds(ty).is_some_and(|(minimum, maximum)| value >= &minimum && value <= &maximum)
+}
+
+pub(super) fn integer_bounds(ty: &ScalarType) -> Option<(BigInt, BigInt)> {
+    Some(match ty {
         ScalarType::I8 => (BigInt::from(i8::MIN), BigInt::from(i8::MAX)),
         ScalarType::I16 => (BigInt::from(i16::MIN), BigInt::from(i16::MAX)),
         ScalarType::I32 => (BigInt::from(i32::MIN), BigInt::from(i32::MAX)),
@@ -3414,9 +3450,21 @@ fn integer_literal_fits_type(value: &BigInt, ty: &ScalarType) -> bool {
         ScalarType::U32 => (BigInt::from(0), BigInt::from(u32::MAX)),
         ScalarType::U64 => (BigInt::from(0), BigInt::from(u64::MAX)),
         ScalarType::U128 => (BigInt::from(0), BigInt::from(u128::MAX)),
-        _ => return false,
-    };
-    value >= &minimum && value <= &maximum
+        _ => return None,
+    })
+}
+
+// Numeric bounds come only from the fixed-width checked integer type.
+// Two in-type operands can cross its full modulus at most once.
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn wrapping_integer_sum(
+    left: &BigInt, right: &BigInt, min: &BigInt, max: &BigInt,
+) -> Option<BigInt> {
+    if left < min || left > max || right < min || right > max { return None; }
+    let sum = left + right;
+    Some(if &sum < min { sum + (max - min + 1u8) }
+        else if &sum > max { sum - (max - min + 1u8) }
+        else { sum })
 }
 
 pub(super) fn expression_type_in_module(
@@ -3459,6 +3507,118 @@ fn check_expression_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    #[cfg(any(test, feature = "internal-checker"))]
+    if inference.checker_directives_enabled() {
+        if let Some(directive) = super::checker_directive::CheckerDirective::from_expression(expression) {
+            let directive = match directive {
+                Ok(directive) => directive,
+                Err(error) => {
+                    diagnostics.push(module_diagnostic(
+                        module,
+                        "B0003",
+                        error.kind.message(),
+                        error.span,
+                    ));
+                    return ScalarType::Error;
+                }
+            };
+            let previous_diagnostics = diagnostics.len();
+            let condition = expression_type_in_module_expected(
+                directive.condition,
+                Some(&ScalarType::Bool),
+                scope,
+                visible_names,
+                folded_names,
+                module,
+                modules,
+                diagnostics,
+                unsafe_context,
+                overloads,
+                inference,
+            );
+            expect_module_type(
+                module,
+                &ScalarType::Bool,
+                &condition,
+                expression_span(directive.condition),
+                diagnostics,
+            );
+            #[cfg(feature = "internal-checker")]
+            let configured_output = directive.output.explicit_with_state(|expression| {
+                use super::checker_directive::{CheckerAggregateProjection, CheckerStateSelection, CheckerStateType};
+                if let ScalarExpression::Member { receiver, name, enum_tag: None, .. } = expression {
+                    let ScalarType::Struct(owner) = scope.get(receiver)? else { return None; };
+                    let (owner, field) = checked_authored_snapshot_field(owner, name, modules)?;
+                    let ty = &field.ty;
+                    if *ty != ScalarType::Bool && !is_integer_type(ty) { return None; }
+                    let selection = CheckerStateSelection::LexicalProjection {
+                        receiver: receiver.as_str().into(),
+                        component: CheckerAggregateProjection::Nominal { owner, field: field.id.index },
+                    };
+                    return Some((selection, CheckerStateType::Scalar(ty.clone())));
+                }
+                if let Some((name, index)) = super::checker_directive::direct_array_index(expression) {
+                    let ScalarType::Array { element, length, .. } = scope.get(name)? else { return None; };
+                    let ScalarExpression::Integer { value, .. } = index else { return None; };
+                    let index = usize::try_from(value).ok()?;
+                    if index >= 64 || u64::try_from(index).ok()? >= *length || *length > 64
+                        || (element.as_ref() != &ScalarType::Bool && !is_integer_type(element))
+                    {
+                        return None;
+                    }
+                    let selection = CheckerStateSelection::LexicalProjection {
+                        receiver: name.into(),
+                        component: CheckerAggregateProjection::FixedArray { length: *length, index },
+                    };
+                    return Some((selection, CheckerStateType::Scalar(element.as_ref().clone())));
+                }
+                if !matches!(expression, ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. })
+                {
+                    return None;
+                }
+                let ty = expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
+                    unsafe_context, overloads, inference,
+                );
+                let selection = match expression {
+                    ScalarExpression::Name { name, .. } => CheckerStateSelection::Lexical(name.as_str().into()),
+                    ScalarExpression::Contextual { binding, .. } => CheckerStateSelection::Binding(binding.clone()),
+                    _ => return None,
+                };
+                match ty {
+                    ScalarType::Struct(id) if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
+                        Some((selection, CheckerStateType::Nominal(inference.shared_snapshot_type(id)))),
+                    ScalarType::Array { .. } if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
+                        Some((selection, CheckerStateType::FixedArray)),
+                    ty if ty == ScalarType::Bool || is_integer_type(&ty) =>
+                        Some((selection, CheckerStateType::Scalar(ty))),
+                    _ => None,
+                }
+            });
+            #[cfg(not(feature = "internal-checker"))]
+            let configured_output = directive.output.explicit_literal();
+            let Some(output) = configured_output else {
+                diagnostics.push(module_diagnostic(
+                    module,
+                    "B0003",
+                    "checker directive requires supported concrete output selections",
+                    expression_span(expression),
+                ));
+                return ScalarType::Error;
+            };
+            if !matches!(condition, ScalarType::Bool) || diagnostics.len() != previous_diagnostics {
+                return ScalarType::Error;
+            }
+            inference.record_checker_directive(
+                expression,
+                super::checker_directive::CheckedDirectiveMarker {
+                    operation: directive.operation,
+                    output,
+                },
+            );
+            return ScalarType::Unit;
+        }
+    }
     match expression {
         ScalarExpression::GeneratedArray { span, .. } => {
             diagnostics.push(module_diagnostic(module, "B0003", "generated array requires an exact prepared fixed array owner", *span));
@@ -3468,6 +3628,7 @@ fn check_expression_type_in_module(
             diagnostics.push(module_diagnostic(module, "B0003", "inline callable lacks its prepared fixed array owner", *span));
             ScalarType::Error
         }
+        ScalarExpression::RuntimeMatch(site) => site.ty().clone(),
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
@@ -3491,7 +3652,7 @@ fn check_expression_type_in_module(
                 }
             }
         }
-        ScalarExpression::Name { name, span } if name == "null" => {
+        ScalarExpression::Name { name, span } if is_null_literal_name(name) => {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0003",
@@ -3592,6 +3753,7 @@ fn check_expression_type_in_module(
             ));
             ScalarType::Error
         }
+        ScalarExpression::Contextual { ty, .. } => ty.clone(),
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -3763,7 +3925,7 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
-            if is_homogeneous_bitwise(operator) {
+            if is_homogeneous_integer_operator(operator) {
                 return check_expression_type_in_module_expected(
                     expression, None, scope, visible_names, folded_names, module, modules,
                     diagnostics, unsafe_context, overloads, inference,
@@ -3867,14 +4029,7 @@ fn check_expression_type_in_module(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             if boolean {
                 expect_module_type(module, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_module_type(module, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -3882,7 +4037,7 @@ fn check_expression_type_in_module(
             } else if comparison {
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
-            } else if bitwise {
+            } else if integer_operator {
                 expect_module_integer(module, &left_type, *span, diagnostics);
                 expect_module_integer(module, &right_type, *span, diagnostics);
                 expect_module_type(module, &left_type, &right_type, *span, diagnostics);
@@ -4464,6 +4619,34 @@ fn check_expression_type_in_module(
     }
 }
 
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn typecheck_proof_where(
+    source: &SourceIdentity,
+    target_layout: ScalarTargetLayout,
+    expression: &ScalarExpression,
+    inputs: impl Iterator<Item = (String, ScalarType)>,
+) -> Result<(), Vec<super::Diagnostic>> {
+    let members = BTreeMap::new();
+    let module = ScalarModuleTyping {
+        source, members: &members, namespace_bindings: &[], structs: &[], enums: &[], target_layout,
+        struct_index: Default::default(),
+    };
+    let scope = inputs.collect::<BTreeMap<_, _>>();
+    let visible = scope.keys().cloned().collect::<BTreeSet<_>>();
+    let owners = ScalarAssignmentOwners::new(&[]);
+    let overloads = ScalarOverloadEnvironment::single(source, &[]);
+    let mut inference = ScalarInferenceBuilder::new(&owners);
+    let mut diagnostics = Vec::new();
+    let ty = expression_type_in_module_expected(
+        expression, Some(&ScalarType::Bool), &scope, &visible, &BTreeMap::new(),
+        &module, std::slice::from_ref(&module), &mut diagnostics, false, &overloads.typing(0), &mut inference,
+    );
+    if ty != ScalarType::Bool && diagnostics.is_empty() {
+        diagnostics.push(module_diagnostic(&module, "B0003", "proof where clause must have type bool", expression_span(expression)));
+    }
+    if diagnostics.is_empty() { Ok(()) } else { Err(diagnostics) }
+}
+
 pub(super) fn expression_type_in_module_expected(
     expression: &ScalarExpression,
     expected: Option<&ScalarType>,
@@ -4509,6 +4692,33 @@ fn check_expression_type_in_module_expected(
 ) -> ScalarType {
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
+    }
+    if let Some(entry) = inference.proof_entry_scope {
+        match expression {
+            ScalarExpression::Name { name, span } if name == "_" => {
+                if let Some((ty, first, multiple)) = &mut inference.proof_rewrite_hole {
+                    if let Some(first) = first {
+                        *multiple |= first != span;
+                    } else {
+                        *first = Some(*span);
+                    }
+                    return (*ty).clone();
+                }
+            }
+            ScalarExpression::Call { receiver: Some(receiver), name, type_arguments, arguments, span, .. }
+                if receiver == "core" && name == "old" => {
+                if let [argument] = arguments.as_slice() {
+                    if type_arguments.is_empty() {
+                        let visible = entry.keys().cloned().collect::<BTreeSet<_>>();
+                        return expression_type_in_module_expected(argument, expected, entry, &visible, folded_names,
+                            module, modules, diagnostics, unsafe_context, overloads, inference);
+                    }
+                }
+                diagnostics.push(module_diagnostic(module, "B0004", "core.old requires one proof entry expression", *span));
+                return ScalarType::Error;
+            }
+            _ => {}
+        }
     }
     if let ScalarExpression::Call {
         receiver,
@@ -4718,7 +4928,7 @@ fn check_expression_type_in_module_expected(
         return then_type;
     }
     if let ScalarExpression::Name { name, span } = expression {
-        if name == "null" {
+        if is_null_literal_name(name) {
             if let Some(
                 pointer @ ScalarType::RawPointer(_) | pointer @ ScalarType::CheckedReference { .. },
             ) = expected
@@ -4947,14 +5157,7 @@ fn check_expression_type_in_module_expected(
                 | BinaryOperator::GreaterEqual
         );
         let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-        let bitwise = matches!(
-            operator,
-            BinaryOperator::BitAnd
-                | BinaryOperator::BitOr
-                | BinaryOperator::BitXor
-                | BinaryOperator::ShiftLeft
-                | BinaryOperator::ShiftRight
-        );
+        let integer_operator = is_homogeneous_integer_operator(operator);
         let arithmetic_context = expected.filter(|ty| {
             matches!(
                 ty,
@@ -4981,8 +5184,8 @@ fn check_expression_type_in_module_expected(
             );
         }
         let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if bitwise && arithmetic_context.is_none() {
-            infer_bitwise_operands(left, right, |operand, expected| {
+        let (left_type, right_type) = if integer_operator && arithmetic_context.is_none() {
+            infer_homogeneous_integer_operands(left, right, |operand, expected| {
                 expression_type_in_module_expected(
                     operand, expected, scope, visible_names, folded_names, module, modules,
                     diagnostics, unsafe_context, overloads, inference,
@@ -5121,7 +5324,7 @@ fn check_expression_type_in_module_expected(
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
             return ScalarType::Bool;
         }
-        if bitwise {
+        if integer_operator {
             expect_module_integer(module, &left_type, *span, diagnostics);
             expect_module_integer(module, &right_type, *span, diagnostics);
             expect_module_type(module, &left_type, &right_type, *span, diagnostics);
@@ -5200,6 +5403,35 @@ fn utf8_type_from_context(
         .map(|structure| ScalarType::Struct(structure.id.clone()))
 }
 
+fn checked_project_struct<'a, 'm>(
+    owner: &ScalarStructId,
+    modules: &'m [ScalarModuleTyping<'a>],
+) -> Option<(&'m std::rc::Rc<ScalarStructId>, &'a ScalarStruct)> {
+    let index = modules.first()?.struct_index.get_or_init(|| {
+        let mut index = BTreeMap::new();
+        for (module, typing) in modules.iter().enumerate() {
+            for (slot, structure) in typing.structs.iter().enumerate() {
+                index.entry(std::rc::Rc::new(structure.id.clone())).or_insert((module, slot));
+            }
+        }
+        index
+    });
+    let (shared_owner, &(module, slot)) = index.get_key_value(owner)?;
+    Some((shared_owner, modules.get(module)?.structs.get(slot)?))
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_authored_snapshot_field<'a>(
+    owner: &ScalarStructId, name: &str, modules: &[ScalarModuleTyping<'a>],
+) -> Option<(std::rc::Rc<ScalarStructId>, &'a ScalarStructField)> {
+    let (shared_owner, structure) = checked_project_struct(owner, modules)?;
+    // A shape with more than 64 fields cannot pass the corresponding
+    // snapshot node budget regardless of what this selection names.
+    if structure.fields.len() > 64 { return None; }
+    let field = structure.fields.iter().find(|field| field.name == name)?;
+    Some((shared_owner.clone(), field))
+}
+
 fn checked_value_field<'a>(
     receiver: &ScalarType,
     name: &str,
@@ -5272,6 +5504,7 @@ fn member_field_in_module<'a>(
 
 fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => true,
         ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
         ScalarPlace::Dereference { .. } => true,
@@ -5756,6 +5989,7 @@ fn writable_place_contains_raw_dereference(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => false,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
             writable_place_contains_raw_dereference(
@@ -5793,6 +6027,7 @@ fn writable_place_contains_raw_dereference_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => false,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
             writable_place_contains_raw_dereference_in_module(
@@ -5831,7 +6066,7 @@ fn writable_path_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
-        ScalarPlace::Name { .. } => check_place_type(
+        ScalarPlace::Name { .. } | ScalarPlace::Contextual { .. } => check_place_type(
             place,
             scope,
             program,
@@ -5952,7 +6187,7 @@ fn writable_path_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
-        ScalarPlace::Name { .. } => check_place_type_in_module(
+        ScalarPlace::Name { .. } | ScalarPlace::Contextual { .. } => check_place_type_in_module(
             place,
             scope,
             module,
@@ -6151,6 +6386,11 @@ fn check_place_type(
     mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
+        ScalarPlace::Contextual { ty, .. } if !matches!(mode, PlaceTypeMode::RawAddress) => ty.clone(),
+        ScalarPlace::Contextual { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0003", "contextual address is not supported", *span));
+            ScalarType::Error
+        }
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -6310,6 +6550,11 @@ fn check_place_type_in_module(
     mode: PlaceTypeMode,
 ) -> ScalarType {
     match place {
+        ScalarPlace::Contextual { ty, .. } if !matches!(mode, PlaceTypeMode::RawAddress) => ty.clone(),
+        ScalarPlace::Contextual { span, .. } => {
+            diagnostics.push(module_diagnostic(module, "B0003", "contextual address is not supported", *span));
+            ScalarType::Error
+        }
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -6539,6 +6784,7 @@ fn checked_dereference_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
+        ScalarPlace::Contextual { .. } => ScalarType::Error,
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
             pointer,
             *span,
@@ -6655,6 +6901,7 @@ fn checked_dereference_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let (dereference, pointer, dereference_span, field) = match place {
+        ScalarPlace::Contextual { .. } => return ScalarType::Error,
         ScalarPlace::Dereference { pointer, span } => (place, pointer, *span, None),
         ScalarPlace::Field {
             base,
@@ -6998,6 +7245,7 @@ fn pending_fallible_operator(
 ) -> Option<ByteSpan> {
     let operator = binding.fallible_assignment?;
     let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
+    if receiver.contextual_storage.is_some() { return Some(operator); }
     let array_element = |element: &ScalarType, value: &ScalarExpression| match value {
         ScalarExpression::Integer { .. } => true,
         ScalarExpression::Name { name, .. } => scope.get(name) == Some(element),
@@ -7281,6 +7529,8 @@ fn validate_unit_if_position(
 ) {
     match expression {
         ScalarExpression::AnonymousCallable { .. } | ScalarExpression::GeneratedArray { .. } => {}
+        ScalarExpression::RuntimeMatch(_) => {},
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -7367,6 +7617,7 @@ fn validate_unit_if_position_in_place(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Dereference { pointer, .. } => {
             validate_unit_if_position(pointer, false, source, diagnostics)
         }
@@ -7384,6 +7635,7 @@ fn validate_unit_if_position_in_place(
 pub(super) fn operator(value: &str) -> BinaryOperator {
     match value {
         "+" => BinaryOperator::Add,
+        "+@" => BinaryOperator::WrappingAdd,
         "-" => BinaryOperator::Subtract,
         "*" => BinaryOperator::Multiply,
         "/" => BinaryOperator::Divide,
@@ -7878,12 +8130,14 @@ impl<'tree> StaticUseAnalyzer<'tree> {
                 } else {
                     self.expression(&binding.value);
                 }
-                let name = binding.name.as_str();
-                let previous = self.visible.insert(name, binding.span);
-                if nested {
-                    self.scope_changes.push((name, previous));
+                if binding.contextual_storage().is_none() {
+                    let name = binding.name.as_str();
+                    let previous = self.visible.insert(name, binding.span);
+                    if nested {
+                        self.scope_changes.push((name, previous));
+                    }
+                    self.declarations.push(binding.span);
                 }
-                self.declarations.push(binding.span);
             }
             ScalarBlockItem::Expression(expression) => self.expression(expression),
             ScalarBlockItem::Assignment(assignment) => {
@@ -7906,6 +8160,8 @@ impl<'tree> StaticUseAnalyzer<'tree> {
                 self.expression(factory);
                 self.expression(count);
             }
+            ScalarExpression::RuntimeMatch(site) => site.for_each_input_name(|name| self.use_name(name)),
+            ScalarExpression::Contextual { .. } => {},
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
             ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
@@ -7977,6 +8233,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
 
     fn place(&mut self, place: &'tree ScalarPlace) {
         match place {
+            ScalarPlace::Contextual { .. } => {},
             ScalarPlace::Name { name, .. } => self.use_name(name),
             ScalarPlace::Field { base, .. } => self.place(base),
             ScalarPlace::Dereference { pointer, .. } => self.expression(pointer),
@@ -8007,6 +8264,9 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
         .filter_map(|item| match item {
             ScalarItem::Function(function) => {
                 let mut analyzer = StaticUseAnalyzer::new(function);
+                if let Some(plan) = &function.runtime_enum_match {
+                    plan.for_each_formal_read(|_, declaration| { analyzer.used_spans.insert(declaration); });
+                }
                 for item in &function.body.items {
                     analyzer.item(item, false);
                 }
@@ -8296,6 +8556,9 @@ fn block_item_type(
                 overloads,
                 inference,
             );
+            if binding.contextual_storage().is_some() {
+                return ScalarType::Unit;
+            }
             if declare_program_name(
                 program,
                 &binding.name,
@@ -8552,6 +8815,7 @@ fn assignment_target_distinctness<'a>(
 
 fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => false,
         ScalarPlace::Field { base, .. } => place_contains_dynamic_index(base),
         ScalarPlace::Index { base, index, .. } => {
@@ -8607,6 +8871,7 @@ fn check_expression_type(
             diagnostics.push(diagnostic(program, "B0003", "inline callable lacks its prepared fixed array owner", *span));
             ScalarType::Error
         }
+        ScalarExpression::RuntimeMatch(site) => site.ty().clone(),
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));
@@ -8697,7 +8962,7 @@ fn check_expression_type(
             ));
             ScalarType::Error
         }
-        ScalarExpression::Name { name, span } if name == "null" => {
+        ScalarExpression::Name { name, span } if is_null_literal_name(name) => {
             diagnostics.push(diagnostic(
                 program,
                 "B0003",
@@ -8706,6 +8971,7 @@ fn check_expression_type(
             ));
             ScalarType::Error
         }
+        ScalarExpression::Contextual { ty, .. } => ty.clone(),
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -8720,7 +8986,7 @@ fn check_expression_type(
         } => match program
             .enums
             .iter()
-            .find(|enumeration| enumeration.name == *receiver)
+            .find(|enumeration| enumeration.name == *receiver && enumeration.has_tag_only_layout())
         {
             Some(enumeration) => {
                 if let Some(tag) = *enum_tag {
@@ -8885,8 +9151,8 @@ fn check_expression_type(
                     inference,
                 );
             }
-            let (left_type, right_type) = if is_homogeneous_bitwise(operator) {
-                infer_bitwise_operands(left, right, |operand, expected| {
+            let (left_type, right_type) = if is_homogeneous_integer_operator(operator) {
+                infer_homogeneous_integer_operands(left, right, |operand, expected| {
                     if let Some(expected) = expected {
                         expression_type_expected(
                             operand, expected, scope, visible_names, folded_names, program,
@@ -8952,14 +9218,7 @@ fn check_expression_type(
                     | BinaryOperator::GreaterEqual
             );
             let boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             if boolean {
                 expect_type(program, &ScalarType::Bool, &left_type, *span, diagnostics);
                 expect_type(program, &ScalarType::Bool, &right_type, *span, diagnostics);
@@ -8967,7 +9226,7 @@ fn check_expression_type(
             } else if comparison {
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 ScalarType::Bool
-            } else if bitwise {
+            } else if integer_operator {
                 expect_integer(program, &left_type, *span, diagnostics);
                 expect_integer(program, &right_type, *span, diagnostics);
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
@@ -9826,7 +10085,7 @@ fn check_expression_type_expected(
             }
             return then_type;
         }
-        if matches!(expression, ScalarExpression::Name { name, .. } if name == "null")
+        if matches!(expression, ScalarExpression::Name { name, .. } if is_null_literal_name(name))
             && matches!(
                 expected,
                 ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. }
@@ -9922,14 +10181,7 @@ fn check_expression_type_expected(
                     | ScalarType::F32
                     | ScalarType::F64
             );
-            let bitwise = matches!(
-                operator,
-                BinaryOperator::BitAnd
-                    | BinaryOperator::BitOr
-                    | BinaryOperator::BitXor
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-            );
+            let integer_operator = is_homogeneous_integer_operator(operator);
             let bool_context = ScalarType::Bool;
             let (left_type, right_type) = if comparison && is_null_expression(left) {
                 let right_type = expression_type(
@@ -10078,7 +10330,7 @@ fn check_expression_type_expected(
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
                 return ScalarType::Bool;
             }
-            if bitwise {
+            if integer_operator {
                 expect_integer(program, &left_type, *span, diagnostics);
                 expect_integer(program, &right_type, *span, diagnostics);
                 expect_type(program, &left_type, &right_type, *span, diagnostics);
@@ -10224,9 +10476,13 @@ fn check_expression_type_expected(
     }
 }
 
+pub(super) fn is_null_literal_name(name: &str) -> bool {
+    name == "null"
+}
+
 fn is_null_expression(expression: &ScalarExpression) -> bool {
     match expression {
-        ScalarExpression::Name { name, .. } => name == "null",
+        ScalarExpression::Name { name, .. } => is_null_literal_name(name),
         ScalarExpression::If {
             then_branch,
             else_branch,

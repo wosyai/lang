@@ -15,6 +15,9 @@ impl PreparedProgram {
                 structs: program.structs.clone(),
                 enums: program.enums.clone(),
                 diagnostics: Vec::new(),
+                contextual_places: contextual::ContextualPlaces::default(),
+                build_proofs: Vec::new(),
+                runtime_enum_matches: Vec::new(),
             },
             program.target_layout,
         )
@@ -105,6 +108,96 @@ impl PreparedProgram {
             program: self.program,
             diagnostics: errors.into_iter().map(|error| error.diagnostic()).collect(),
         }
+    }
+}
+
+/// Read-only borrowed view of one immutable prepared project and its
+/// canonical occurrences, not a checker result or Build authorization.
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+pub(super) struct PreparedOccurrenceSnapshot<'a> {
+    project: &'a ScalarProject,
+    calls: &'a reference::ProjectCallSiteResults,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // No proof or emission consumer.
+pub(super) enum PreparedReadKind { FixedIndex, SharedCheckedReference }
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq)]
+pub(super) enum PreparedReadShape<'a> {
+    FixedIndex(reference::FixedIndexReadShape<'a>),
+    SharedCheckedReference(reference::SharedCheckedReadShape<'a>),
+}
+
+/// No serialization, proof verdict or authority to match backend helpers.
+#[cfg(feature = "internal-checker")]
+pub(super) struct PreparedReadOccurrence<'a> {
+    snapshot: PreparedOccurrenceSnapshot<'a>,
+    body: &'a reference::FunctionCallSites,
+    module: usize,
+    item: usize,
+    read: reference::OccurrenceOrdinal,
+    kind: PreparedReadKind,
+    shape: PreparedReadShape<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PreparedOccurrenceSnapshot<'a> {
+    pub(super) fn from_checker(prepared: &'a super::checker_project::PreparedCheckerProject) -> Self {
+        let (project, calls) = prepared.parts();
+        Self { project, calls }
+    }
+
+    pub(super) fn monomorphic_body(self, module: usize, item: usize)
+        -> Option<(&'a ScalarFunction, &'a reference::FunctionCallSites)>
+    {
+        let ScalarItem::Function(function) = self.project.modules.get(module)?.items.get(item)? else { return None; };
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
+        Some((function, self.calls.function_body(module, item, None)?))
+    }
+
+    #[allow(dead_code)] // No proof or emission consumer.
+    pub(super) fn read(
+        self, module: usize, item: usize, read: reference::OccurrenceOrdinal, kind: PreparedReadKind,
+    ) -> Option<PreparedReadOccurrence<'a>> {
+        let (_, body) = self.monomorphic_body(module, item)?;
+        let shape = match kind {
+            PreparedReadKind::FixedIndex => PreparedReadShape::FixedIndex(body.fixed_index_read_shape(read)?),
+            PreparedReadKind::SharedCheckedReference => PreparedReadShape::SharedCheckedReference(body.shared_checked_read_shape(read)?),
+        };
+        Some(PreparedReadOccurrence { snapshot: self, body, module, item, read, kind, shape })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)] // No proof or emission consumer.
+impl PreparedReadOccurrence<'_> {
+    pub(super) fn shape(&self) -> &PreparedReadShape<'_> { &self.shape }
+
+    pub(super) fn target_layout(&self) -> ScalarTargetLayout {
+        self.snapshot.project.modules[self.module].target_layout
+    }
+
+    pub(super) fn matches(
+        &self, snapshot: PreparedOccurrenceSnapshot<'_>, module: usize, item: usize,
+        read: reference::OccurrenceOrdinal, kind: PreparedReadKind,
+    ) -> bool {
+        std::ptr::eq(self.snapshot.project, snapshot.project)
+            && std::ptr::eq(self.snapshot.calls, snapshot.calls)
+            && (self.module, self.item, self.read, self.kind) == (module, item, read, kind)
+            && snapshot.monomorphic_body(module, item).is_some_and(|(_, body)| std::ptr::eq(self.body, body))
+    }
+}
+
+/// Sealed by the preparation owner, never inferred from a shape match.
+pub(in crate::scalar) struct OriginalReadBody<'a>(&'a ScalarBlock);
+
+impl OriginalReadBody<'_> {
+    pub(in crate::scalar) fn matches(&self, body: &ScalarBlock) -> bool {
+        std::ptr::eq(self.0, body)
     }
 }
 
@@ -218,6 +311,49 @@ impl ScalarProjectPreparationRejection {
     }
 }
 
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_project_occurrences(
+    result: (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    checker_targets: &[reference::CheckerTargetQuery<'_>],
+) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    prepare_project_occurrences_for(result, None, checker_targets)
+}
+
+fn prepare_project_occurrences_for(
+    (validation, occurrence_typing): (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    isolated_anonymous_arm: Option<ByteSpan>,
+    #[cfg(any(test, feature = "internal-checker"))] checker_targets: &[reference::CheckerTargetQuery<'_>],
+) -> Result<(ScalarProject, reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    if !validation.diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection::extraction_or_typing(
+            validation,
+        ));
+    }
+    let project = validation.project;
+    let calls = if let Some(isolated) = isolated_anonymous_arm {
+        reference::resolve_project_call_sites_with_occurrences_for(&project.modules, occurrence_typing, Some(isolated))
+    } else {
+        #[cfg(not(any(test, feature = "internal-checker")))]
+        { reference::resolve_project_call_sites_with_occurrences(&project.modules, occurrence_typing) }
+        #[cfg(any(test, feature = "internal-checker"))]
+        { reference::resolve_project_call_sites_with_checker_targets(&project.modules, occurrence_typing, checker_targets) }
+    };
+    let diagnostics = calls
+        .lookup_errors()
+        .map(ReferenceAnalysisError::diagnostic)
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        return Err(ScalarProjectPreparationRejection {
+            inspection: ScalarProjectValidation {
+                project,
+                diagnostics,
+            },
+            kind: ProjectPreparationRejectionKind::StaticLookup(calls),
+        });
+    }
+    Ok((project, calls))
+}
+
 impl PreparedScalarProject {
     #[cfg(test)]
     pub(super) fn function_calls(
@@ -229,14 +365,15 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        Self::new_with_access(project, None)
+        Self::new_with_access(project, None, &HashMap::new())
     }
 
     pub(super) fn new_with_access(
         project: ScalarProject,
         access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
+        build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
     ) -> Result<Self, ScalarProjectPreparationRejection> {
-        Self::new_impl(project, access, None)
+        Self::new_impl(project, access, build_proofs, None)
     }
 
     pub(super) fn new_anonymous_arm(
@@ -249,16 +386,20 @@ impl PreparedScalarProject {
             && module.members.is_empty() && module.structs.is_empty() && module.enums.is_empty());
         let span = arm.span;
         let source = module.source.clone();
-        Self::new_impl(ScalarProject::new(vec![module], vec![source]), None, Some(span))
+        Self::new_impl(ScalarProject::new(vec![module], vec![source]), None, &HashMap::new(), Some(span))
     }
 
     fn new_impl(
         project: ScalarProject,
         access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
+        build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
         isolated_anonymous_arm: Option<ByteSpan>,
     ) -> Result<Self, ScalarProjectPreparationRejection> {
         let (mut validation, mut occurrence_typing) =
-            super::typecheck_scalar_project_with_occurrences_for(project, isolated_anonymous_arm);
+            super::typecheck_scalar_project_with_build_proofs(
+                project, HashMap::new(), build_proofs, isolated_anonymous_arm,
+                #[cfg(any(test, feature = "internal-checker"))] false,
+            );
         if !validation.diagnostics.is_empty() {
             return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
         }
@@ -283,7 +424,7 @@ impl PreparedScalarProject {
                 validation.diagnostics = diagnostics;
                 return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
             }
-            let ScalarSourceDeclarations { source, items, structs, enums, diagnostics } =
+            let ScalarSourceDeclarations { source, items, structs, enums, diagnostics, .. } =
                 derive_scalar_declarations_from_cst(fresh.result().canonical_cst());
             if !diagnostics.is_empty() {
                 validation.diagnostics = diagnostics;
@@ -314,25 +455,10 @@ impl PreparedScalarProject {
         }
         let generated_count = occurrence_typing.iter().map(PreparationOccurrenceTyping::generated_callable_count).sum::<usize>();
         let inline_count = occurrence_typing.iter().map(PreparationOccurrenceTyping::anonymous_element_count).sum::<usize>();
-        let project = validation.project;
-        let calls = reference::resolve_project_call_sites_with_occurrences_for(
-            &project.modules,
-            occurrence_typing,
-            isolated_anonymous_arm,
-        );
-        let diagnostics = calls
-            .lookup_errors()
-            .map(ReferenceAnalysisError::diagnostic)
-            .collect::<Vec<_>>();
-        if !diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection {
-                inspection: ScalarProjectValidation {
-                    project,
-                    diagnostics,
-                },
-                kind: ProjectPreparationRejectionKind::StaticLookup(calls),
-            });
-        }
+        let (project, calls) = prepare_project_occurrences_for(
+            (validation, occurrence_typing), isolated_anonymous_arm,
+            #[cfg(any(test, feature = "internal-checker"))] &[],
+        )?;
         let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new(), root_array_uses: Default::default() };
         if inline_count != 0 {
             if isolated_anonymous_arm.is_some() {
@@ -415,6 +541,32 @@ impl PreparedScalarProject {
         self.checked_access.as_ref()
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn from_contextual_transport(project: ScalarProject, calls: reference::ProjectCallSiteResults) -> Self {
+        Self {
+            project, calls, checked_access: None, require_release_checked_access: false,
+            root_array_uses: Default::default(), generated_callables: BTreeMap::new(),
+            inline_arms: BTreeMap::new(),
+        }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn contextual_formal(&self, module: usize, item: usize, arm: Option<usize>)
+        -> Option<(&ReferenceBindingId, &ScalarType)>
+    {
+        self.calls.function_body(module, item, arm)?.contextual_formal()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn into_contextual_parts(self) -> (ScalarProject, reference::ProjectCallSiteResults) {
+        (self.project, self.calls)
+    }
+
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn occurrence_snapshot(&self) -> PreparedOccurrenceSnapshot<'_> {
+        PreparedOccurrenceSnapshot { project: &self.project, calls: &self.calls }
+    }
+
     pub fn project(&self) -> &ScalarProject {
         &self.project
     }
@@ -493,7 +645,15 @@ impl PreparedScalarProject {
                     module.source,
                 )
             })?;
-        control::CallableBodyCallNodes::bind(&module.source, body, calls, checked_proof)
+        let mut bound = control::CallableBodyCallNodes::bind(&module.source, body, calls, checked_proof)?;
+        if let (None, Some(ScalarItem::Function(function))) = (arm_index, module.items.get(item_ordinal)) {
+            if function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                && std::ptr::eq(&function.body, body)
+            {
+                bound.seal_original_read_body(body, OriginalReadBody(&function.body));
+            }
+        }
+        Ok(bound)
     }
 
     #[cfg(test)]
@@ -551,6 +711,23 @@ pub struct ScalarBuildValidation<'a> {
 }
 
 impl<'a> ScalarBuildValidation<'a> {
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(crate) fn pointer_caller_effect(
+        &self, module: usize, caller: usize, callee: usize, claimed: &BigInt,
+    ) -> Option<reference::pointer_call::CallerPointeeEffect<'_>> {
+        self.results.pointer_caller_effect(&self.prepared.project.modules, &self.prepared.calls,
+            module, caller, callee, claimed, None)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    #[allow(dead_code)]
+    pub(crate) fn pointer_entry_wrapping_write(
+        &self, module: usize, item: usize,
+    ) -> Option<reference::pointer_entry::EntryPointeeWrite<'_>> {
+        self.results.pointer_entry_wrapping_write(&self.prepared.project.modules, &self.prepared.calls, module, item)
+    }
+
     pub(super) fn into_reference_results(self) -> reference::ProjectReferenceResults {
         self.results
     }
@@ -604,6 +781,57 @@ impl<'a> ScalarBuildValidation<'a> {
         };
         self.prepared
             .bind_body_with_proof(module, item, None, &function.body, proof)
+    }
+
+    pub(crate) fn bind_runtime_enum_initializer<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction, nodes: &control::CallableBodyCallNodes<'_>,
+    ) -> Result<Option<(&'b runtime_enum_match::Occurrence, &'b ScalarEnumPayloadLayout)>, String> {
+        let Some(position) = nodes.runtime_match_binding() else { return Ok(None); };
+        let Some((preceding, remainder)) = function.body.items.split_at_checked(position) else {
+            return Err("missing runtime enum initializer position".into());
+        };
+        let Some(ScalarBlockItem::LocalBinding(binding)) = remainder.first() else {
+            return Err("missing runtime enum initializer binding".into());
+        };
+        let ScalarExpression::RuntimeMatch(site) = &binding.value else {
+            return Err("missing runtime enum initializer occurrence".into());
+        };
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum initializer module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum initializer callable".to_owned());
+        };
+        if !std::ptr::eq(original, function) || self.reference_cfg(module, item, None).is_none()
+            || !site.0.authenticates_initializer(&owner.source, function, binding)
+            || nodes.canonical_expression_type(&binding.value) != Some(site.ty())
+        {
+            return Err("runtime enum initializer requires its checked original lexical binding".to_owned());
+        }
+        if !preceding.is_empty() && !self.callable_point_facts(module, item, None)
+            .is_some_and(|facts| site.0.authenticates_prefix(preceding, nodes, facts))
+        {
+            return Err("runtime match prefix must contain checked pure primitive locals".into());
+        }
+        let layout = owner.layouts.enum_payload(&site.0.enumeration)
+            .ok_or("missing freshly prepared runtime enum initializer layout")?;
+        Ok(Some((site, layout)))
+    }
+
+    pub(crate) fn bind_runtime_enum_match<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction,
+    ) -> Result<&'b runtime_enum_match::Plan, String> {
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum callable".to_owned());
+        };
+        let plan = original.runtime_enum_match.as_deref().ok_or("missing runtime enum source plan")?;
+        let cfg = self.reference_cfg(module, item, None).ok_or("missing canonical runtime enum reference check")?;
+        if !std::ptr::eq(original, function) || !plan.authenticates(&owner.source, function)
+            || !cfg.facts.is_empty() || !cfg.allocations.is_empty() || !cfg.specialized_policies.is_empty()
+            || !cfg.primary_call_points.is_empty()
+        {
+            return Err("runtime enum match is not the sealed primitive Build body".to_owned());
+        }
+        Ok(plan)
     }
 
     pub(crate) fn reference_cfg(

@@ -1,0 +1,548 @@
+use std::{collections::BTreeMap, ffi::OsStr, io::{self, Write}, path::{Component, Path, PathBuf}};
+
+use wosy_compiler::{
+    prepare_loaded_scalar_ordered_local_proof_contexts, CheckedOutputTargets, MainFlowProofReceipt,
+    PreparedScalarOrderedCheck, ScalarCheckerScope,
+    ScalarCheckerTextFile, ScalarOrderedCheckerFailure, ScalarOrderedCheckerOutcome,
+    ScalarPreparationInputs, ScalarTargetLayout,
+};
+use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext, SourceIdentity};
+
+use crate::canonical_loader::{
+    declared_package_proof_paths, load_canonical_project_inputs, load_explicit_dormant_proof_sources, CanonicalLoadFailure,
+    CanonicalLoadPurpose,
+};
+
+pub(crate) struct ConfiguredCheckReceipt {
+    pub(crate) root: PathBuf,
+    pub(crate) outcome: Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome>,
+    pub(crate) texts: BTreeMap<SourceIdentity, String>,
+}
+
+struct PreparedConfiguredCheckReceipt {
+    root: PathBuf,
+    check: Result<PreparedScalarOrderedCheck, ScalarOrderedCheckerOutcome>,
+    texts: BTreeMap<SourceIdentity, String>,
+}
+
+impl PreparedConfiguredCheckReceipt {
+    fn run(self) -> ConfiguredCheckReceipt {
+        ConfiguredCheckReceipt {
+            root: self.root,
+            outcome: self.check.and_then(PreparedScalarOrderedCheck::run),
+            texts: self.texts,
+        }
+    }
+}
+
+pub(crate) struct PlannedCheckPublication<'a> {
+    pub(crate) report: &'a MainFlowProofReceipt,
+    pub(crate) texts: &'a BTreeMap<SourceIdentity, String>,
+    pub(crate) status: InternalCheckStatus<'a>,
+    pub(crate) effects: Vec<PlannedCheckEffect<'a>>,
+}
+
+pub(crate) enum PlannedCheckEffect<'a> {
+    Stdout(&'a [u8]),
+    Stderr(&'a [u8]),
+    DeferredFile {
+        relative: PathBuf,
+        request: &'a ScalarCheckerTextFile,
+        source: &'a wosy_syntax::SourceIdentity,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum CheckPublicationError<'a> {
+    Incomplete(&'a ScalarOrderedCheckerOutcome),
+    InvalidPath {
+        source: &'a wosy_syntax::SourceIdentity,
+        request: &'a ScalarCheckerTextFile,
+    },
+    ConflictingPath {
+        source: &'a wosy_syntax::SourceIdentity,
+        request: &'a ScalarCheckerTextFile,
+    },
+}
+
+impl ConfiguredCheckReceipt {
+    pub(crate) fn plan_publication(&self) -> Result<PlannedCheckPublication<'_>, CheckPublicationError<'_>> {
+        let report = self.outcome.as_ref().map_err(CheckPublicationError::Incomplete)?;
+        plan_publication_for(report, &self.texts, std::iter::once(report))
+    }
+}
+
+pub(crate) fn plan_publication_for<'a>(
+    first: &'a MainFlowProofReceipt, texts: &'a BTreeMap<SourceIdentity, String>,
+    reports: impl IntoIterator<Item = &'a MainFlowProofReceipt>,
+) -> Result<PlannedCheckPublication<'a>, CheckPublicationError<'a>> {
+    let mut effects = Vec::new();
+    let mut seen = CheckedOutputTargets::default();
+    let mut status = InternalCheckStatus::Zero;
+    for report in reports {
+        let next = OrderedCheckEffects::new(&report.directives).visit_with_origin(|origin, effect| {
+            let planned = match effect {
+                InternalCheckEffect::Stdout(bytes) => PlannedCheckEffect::Stdout(bytes),
+                InternalCheckEffect::Stderr(bytes) => PlannedCheckEffect::Stderr(bytes),
+                InternalCheckEffect::DeferredFile(request) => {
+                    let source = &origin.source;
+                    let relative = normalized_output_path(&request.path)
+                        .ok_or(CheckPublicationError::InvalidPath { source, request })?;
+                    if !seen.insert(&request.path) {
+                        return Err(CheckPublicationError::ConflictingPath { source, request });
+                    }
+                    PlannedCheckEffect::DeferredFile { relative, request, source }
+                }
+            };
+            effects.push(planned);
+            Ok(())
+        })?;
+        if matches!(status, InternalCheckStatus::Zero) { status = next; }
+    }
+    Ok(PlannedCheckPublication { report: first, texts, status, effects })
+}
+
+pub(crate) enum CheckPublicationPreflightError {
+    UnsupportedFilePublication,
+    ExitStatusOutsideByteRange,
+    File(io::Error),
+}
+
+pub(crate) struct PreparedCheckPublication<'a> {
+    status: u8,
+    effects: &'a [PlannedCheckEffect<'a>],
+    #[cfg(target_os = "linux")]
+    files: Option<file_publication::PreparedFiles>,
+}
+
+#[cfg(target_os = "linux")]
+#[path = "check_file_publication.rs"]
+mod file_publication;
+
+impl PlannedCheckPublication<'_> {
+    pub(crate) fn prepare(&self, root: &Path) -> Result<PreparedCheckPublication<'_>, CheckPublicationPreflightError> {
+        let status = match &self.status {
+            InternalCheckStatus::Zero => 0,
+            InternalCheckStatus::FirstNonzero(report) => u8::try_from(report.code())
+                .map_err(|_| CheckPublicationPreflightError::ExitStatusOutsideByteRange)?,
+        };
+        let requests = self.effects.iter().filter_map(|effect| match effect {
+            PlannedCheckEffect::DeferredFile { relative, request, .. } => Some((relative.as_path(), request.text.as_ref())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        if requests.iter().any(|(path, _)| path.components().count() != 1)
+            || (!cfg!(target_os = "linux") && !requests.is_empty())
+        {
+            return Err(CheckPublicationPreflightError::UnsupportedFilePublication);
+        }
+        #[cfg(target_os = "linux")]
+        let files = if requests.is_empty() {
+            None
+        } else {
+            Some(file_publication::PreparedFiles::new(root, &requests)
+                .map_err(CheckPublicationPreflightError::File)?)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = root;
+        Ok(PreparedCheckPublication {
+            status, effects: &self.effects,
+            #[cfg(target_os = "linux")]
+            files,
+        })
+    }
+}
+
+impl PreparedCheckPublication<'_> {
+    pub(crate) fn publish(self, stdout: &mut impl Write, stderr: &mut impl Write) -> io::Result<u8> {
+        #[cfg(target_os = "linux")]
+        let mut staged = self.files.as_ref().map(|files| files.payloads.iter());
+        for effect in self.effects {
+            match effect {
+                PlannedCheckEffect::Stdout(bytes) => {
+                    stdout.write_all(bytes)?;
+                    stdout.flush()?;
+                }
+                PlannedCheckEffect::Stderr(bytes) => {
+                    stderr.write_all(bytes)?;
+                    stderr.flush()?;
+                }
+                PlannedCheckEffect::DeferredFile { relative, .. } => {
+                    #[cfg(target_os = "linux")]
+                    self.files.as_ref().expect("file preflight").publish(
+                        staged.as_mut().and_then(Iterator::next).expect("one staged payload per request"), relative,
+                    )?;
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = relative;
+                        unreachable!("file publication is not supported on this platform");
+                    }
+                }
+            }
+        }
+        Ok(self.status)
+    }
+}
+
+fn normalized_output_path(requested: &str) -> Option<PathBuf> {
+    if requested.as_bytes().contains(&0) {
+        return None;
+    }
+    let mut path = PathBuf::new();
+    for component in Path::new(requested).components() {
+        match component {
+            Component::Normal(name) => {
+                let mut standalone = Path::new(name).components();
+                if standalone.next() != Some(Component::Normal(name)) || standalone.next().is_some() {
+                    return None;
+                }
+                path.push(name);
+            }
+            Component::CurDir => {},
+            Component::ParentDir if path.pop() => {},
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    let mut components = path.components();
+    (matches!(components.next(), Some(Component::Normal(_)))
+        && components.all(|component| matches!(component, Component::Normal(_)))).then_some(path)
+}
+
+pub(crate) enum ConfiguredCheckLoadError {
+    Root,
+    Manifest(String),
+    Target,
+    Profile,
+    Layout,
+    Dependency(String),
+    Canonical(CanonicalLoadFailure),
+    DormantPath,
+    Dormant(CanonicalLoadFailure),
+    PackageSourceRoot(String),
+}
+
+pub(crate) fn check_target(
+    root: &Path,
+    target: Option<&str>,
+    profile: &str,
+    scope: ScalarCheckerScope,
+    dormant_paths: Vec<&OsStr>,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    configured_target(root, target, profile, scope, Some(dormant_paths))
+}
+
+enum DormantSelection<'a> {
+    Explicit(Vec<&'a OsStr>),
+    DeclaredPackage(PackageRelativePath),
+}
+
+pub(crate) fn check_declared_package_target(
+    root: &Path, target: Option<&str>, profile: &str,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    configured_target(root, target, profile, ScalarCheckerScope::CurrentPackage, None)
+}
+
+fn configured_target(
+    root: &Path, target: Option<&str>, profile: &str,
+    scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    prepare_configured_target(root, target, profile, scope, dormant_paths).map(PreparedConfiguredCheckReceipt::run)
+}
+
+fn prepare_configured_target(
+    root: &Path, target: Option<&str>, profile: &str,
+    scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = root.canonicalize().map_err(|_| LoadError::Root)?;
+    let (configuration, manifest) =
+        ProjectConfiguration::load_with_manifest(&root).map_err(LoadError::Manifest)?;
+    prepare_target_from_manifest(&root, &configuration, &manifest, target, profile, scope, dormant_paths)
+}
+
+fn prepare_target_from_manifest(
+    root: &Path, configuration: &ProjectConfiguration, manifest: &toml_edit::ImDocument<String>,
+    target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let target = configuration.resolve_target(target).map_err(|_| LoadError::Target)?;
+    let project = ProjectContext::from_manifest(root, &target, manifest.as_table())
+        .map_err(|_| LoadError::Target)?;
+    let (_, _, artifact, _) = configuration.artifact_profile(&target, profile)
+        .map_err(|_| LoadError::Profile)?;
+    let layout = artifact.target_layout().map_err(|_| LoadError::Layout)?;
+    let selection = match dormant_paths {
+        Some(paths) => DormantSelection::Explicit(paths),
+        None => DormantSelection::DeclaredPackage(
+            ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
+        ),
+    };
+    prepare_configured_proof_scope(&project, configuration, layout, scope, selection, None)
+}
+
+pub(crate) fn check_target_with_dependencies(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    map_dependency_owners(root, target, profile, scope, PreparedConfiguredCheckReceipt::run)
+}
+
+fn map_dependency_owners<T>(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    mut visit: impl FnMut(PreparedConfiguredCheckReceipt) -> T,
+) -> Result<Vec<T>, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = root.canonicalize().map_err(|_| LoadError::Root)?;
+    let (configuration, manifest, dependencies) = ProjectConfiguration::load_with_dependency_check_targets(&root)
+        .map_err(LoadError::Dependency)?;
+    let mut receipts = Vec::with_capacity(1 + dependencies.len());
+    receipts.push(visit(prepare_target_from_manifest(&root, &configuration, &manifest, target, profile, scope,
+        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?));
+    for dependency in dependencies {
+        receipts.push(visit(prepare_resolved_dependency_primary(&dependency)?));
+    }
+    Ok(receipts)
+}
+
+/// Bounded configured routes classify each exact prepared owner before
+/// publishing. No unbounded fallback for mixed proof/authored dependencies.
+pub(crate) fn check_targets_with_private_authored_limit(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    let prepared = map_dependency_owners(root, target, profile, scope, std::convert::identity)?;
+    Ok(run_private_prepared_owners(prepared, limit))
+}
+
+pub(crate) fn check_target_with_private_authored_limit(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    let prepared = prepare_configured_target(root, target, profile, scope,
+        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?;
+    Ok(run_private_prepared_owners(vec![prepared], limit))
+}
+
+fn run_private_prepared_owners(
+    prepared: Vec<PreparedConfiguredCheckReceipt>, limit: std::num::NonZeroUsize,
+) -> Vec<ConfiguredCheckReceipt> {
+    // Input failures precede selection and any staged output, even if a
+    // previous package would exhaust the shared authored quota.
+    if let Some(index) = prepared.iter().position(|receipt| receipt.check.is_err()) {
+        let receipt = prepared.into_iter().nth(index).expect("found prepared failure");
+        return vec![receipt.run()];
+    }
+    enum Owner {
+        ProofFree(wosy_compiler::PreparedStartupAuthoredCheck),
+        Primary(PreparedScalarOrderedCheck),
+        DependencyProofOnly(PreparedScalarOrderedCheck),
+        DependencyBoundedProof(PreparedScalarOrderedCheck),
+    }
+    let mut owners = Vec::with_capacity(prepared.len());
+    for (index, PreparedConfiguredCheckReceipt { root, texts, check }) in prepared.into_iter().enumerate() {
+        let classified = check.and_then(|check| {
+            if index == 0 {
+                return Ok(Owner::Primary(check));
+            }
+            if check.is_private_named_without_authored_paths()? {
+                Ok(Owner::DependencyProofOnly(check))
+            } else if check.supports_private_proof_authored_dependency() {
+                Ok(Owner::DependencyBoundedProof(check))
+            } else {
+                check.into_startup_authored_owner().map(Owner::ProofFree)
+            }
+        });
+        let owner = match classified {
+            Ok(owner) => owner,
+            Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
+        };
+        owners.push((root, texts, owner));
+    }
+    let mut remaining = limit.get();
+    let mut selected = Vec::new();
+    for (root, texts, owner) in owners {
+        let owner = match owner {
+            Owner::DependencyProofOnly(check) => {
+                let outcome = check.run().and_then(|report| {
+                    if report.directives.is_empty() { Ok(report) }
+                    else { Err(ScalarOrderedCheckerOutcome::Unsupported) }
+                });
+                if outcome.is_err() { return vec![ConfiguredCheckReceipt { root, outcome, texts }]; }
+                selected.push(ConfiguredCheckReceipt { root, outcome, texts });
+                continue;
+            }
+            Owner::DependencyBoundedProof(check) if remaining == 0 => {
+                let outcome = check.run_private_proofs_after_command_cap();
+                if outcome.is_err() { return vec![ConfiguredCheckReceipt { root, outcome, texts }]; }
+                selected.push(ConfiguredCheckReceipt { root, outcome, texts });
+                continue;
+            }
+            authored => authored,
+        };
+        let Some(cap) = std::num::NonZeroUsize::new(remaining) else { continue; };
+        let (report, completion) = match match owner {
+            Owner::ProofFree(owner) => owner.run_report(cap),
+            Owner::Primary(owner) | Owner::DependencyBoundedProof(owner) => owner.run_private_authored_root(cap),
+            Owner::DependencyProofOnly(_) => unreachable!("formal owners do not use the authored quota"),
+        } {
+            Ok(report) => report,
+            Err(error) => return vec![ConfiguredCheckReceipt { root, outcome: Err(error), texts }],
+        };
+        let Some(completion) = completion else {
+            // A verified contextual veto does not select or spend a path.
+            if report.contextual_diagnostic.is_none() || !report.directives.is_empty() {
+                return vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }];
+            }
+            selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
+            continue;
+        };
+        let Some(next) = remaining.checked_sub(report.directives.len()).filter(|next|
+            (*next == 0) == (completion == wosy_compiler::StartupAuthoredCompletion::LimitReached))
+        else {
+            return vec![ConfiguredCheckReceipt { root, outcome: Err(ScalarOrderedCheckerOutcome::Unsupported), texts }];
+        };
+        remaining = next;
+        selected.push(ConfiguredCheckReceipt { root, outcome: Ok(report), texts });
+    }
+    selected
+}
+
+pub(crate) fn check_direct_dependency_primary(
+    root: &Path, dependency: &str,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = root.canonicalize().map_err(|_| LoadError::Root)?;
+    let (_, _, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(&root, dependency, None, None)
+        .map_err(LoadError::Dependency)?;
+    prepare_resolved_dependency_primary(&selection).map(PreparedConfiguredCheckReceipt::run)
+}
+
+fn prepare_resolved_dependency_primary(
+    selection: &wosy_project::DirectDependencyCheckTarget,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    prepare_configured_proof_scope(
+        &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
+        DormantSelection::DeclaredPackage(selection.source_directory.clone()), selection.git_checkout.as_ref(),
+    )
+}
+
+fn prepare_configured_proof_scope(
+    project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
+    scope: ScalarCheckerScope, selection: DormantSelection<'_>,
+    checkout: Option<&wosy_project::packages::GitDirectory>,
+) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = project.root.as_path();
+    let target_layout = ScalarTargetLayout {
+        pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment,
+    };
+    let (purpose, dormant_paths) = match selection {
+        DormantSelection::Explicit(paths) => {
+            if checkout.is_some() { return Err(LoadError::DormantPath); }
+            let paths = if scope == ScalarCheckerScope::CurrentPackage {
+                paths.into_iter().map(|path| PackageRelativePath::new(path.into()))
+                    .collect::<Result<Vec<_>, _>>().map_err(|_| LoadError::DormantPath)?
+            } else {
+                Vec::new()
+            };
+            (CanonicalLoadPurpose::LocalProofs, (paths, false))
+        }
+        DormantSelection::DeclaredPackage(directory) => {
+            let paths = declared_package_proof_paths(root, project, configuration, &directory, checkout)
+                .map_err(LoadError::Dormant)?;
+            let sources = paths.iter().cloned().collect();
+            (CanonicalLoadPurpose::PackageProofs(sources, checkout.cloned()), (paths, true))
+        }
+    };
+    let mut loaded = load_canonical_project_inputs(root, project, configuration, purpose, || {})
+        .map_err(LoadError::Canonical)?;
+    let (mut paths, discovered) = dormant_paths;
+    if discovered {
+        paths.retain(|path| !loaded.proofs.contains_key(path));
+    }
+    let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts, checkout)
+        .map_err(LoadError::Dormant)?;
+    let check = prepare_loaded_scalar_ordered_local_proof_contexts(
+        loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
+        ScalarPreparationInputs { target_layout }, scope, dormant,
+    );
+    Ok(PreparedConfiguredCheckReceipt { root: root.to_owned(), check, texts: loaded.texts })
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum InternalCheckStatus<'a> {
+    Zero,
+    FirstNonzero(&'a ScalarOrderedCheckerFailure),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum InternalCheckEffect<'a> {
+    Stdout(&'a [u8]),
+    Stderr(&'a [u8]),
+    DeferredFile(&'a ScalarCheckerTextFile),
+}
+
+pub(crate) struct OrderedCheckEffects<'a> {
+    reports: &'a [ScalarOrderedCheckerFailure],
+}
+
+impl<'a> OrderedCheckEffects<'a> {
+    pub(crate) fn new(reports: &'a [ScalarOrderedCheckerFailure]) -> Self {
+        Self { reports }
+    }
+
+    pub(crate) fn selected_status(self) -> InternalCheckStatus<'a> {
+        self.reports.iter().find(|report| report.code().bits() != 0)
+            .map_or(InternalCheckStatus::Zero, InternalCheckStatus::FirstNonzero)
+    }
+
+    pub(crate) fn visit_authored_effects<E>(
+        self,
+        mut sink: impl FnMut(InternalCheckEffect<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.visit_with_origin(|_, effect| sink(effect)).map(|_| ())
+    }
+
+    fn visit_with_origin<E>(
+        self,
+        mut sink: impl FnMut(&'a ScalarOrderedCheckerFailure, InternalCheckEffect<'a>) -> Result<(), E>,
+    ) -> Result<InternalCheckStatus<'a>, E> {
+        let mut status = InternalCheckStatus::Zero;
+        for report in self.reports {
+            if matches!(status, InternalCheckStatus::Zero) && report.code().bits() != 0 {
+                status = InternalCheckStatus::FirstNonzero(report);
+            }
+            if !report.stdout().is_empty() {
+                sink(report, InternalCheckEffect::Stdout(report.stdout()))?;
+            }
+            if !report.stderr().is_empty() {
+                sink(report, InternalCheckEffect::Stderr(report.stderr()))?;
+            }
+            for file in report.files() {
+                sink(report, InternalCheckEffect::DeferredFile(file))?;
+            }
+        }
+        Ok(status)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_output_path;
+    use std::path::Path;
+
+    #[test]
+    fn planned_output_paths_remain_relative_after_normalization() {
+        assert_eq!(normalized_output_path("sub/../preview.txt").as_deref(), Some(Path::new("preview.txt")));
+        for path in ["/absolute.txt", "../escape.txt", "sub/../..", "sub/..", "", "nul\0.txt"] {
+            assert!(normalized_output_path(path).is_none(), "{path:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn planned_output_paths_reject_drive_prefixes_in_interior_components() {
+        for path in ["C:/absolute.txt", "sub/C:drive-relative.txt", "sub/../C:drive-relative.txt"] {
+            assert!(normalized_output_path(path).is_none(), "{path:?}");
+        }
+    }
+}

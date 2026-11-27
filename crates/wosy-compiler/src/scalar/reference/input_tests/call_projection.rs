@@ -14,6 +14,7 @@ fn binding_and_assignment_projections_retain_each_nested_call_producer_once() {
             structs,
             enums,
             diagnostics,
+            ..
         } = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
         assert!(diagnostics.is_empty());
         let order = vec![source.clone()];

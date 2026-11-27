@@ -60,6 +60,49 @@ impl GitDirectory {
         }
     }
 
+    /// List declared checker sources through the verified package handle.
+    /// Display paths are relative labels only; no host path is opened.
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn declared_checker_sources(
+        &self, source: &crate::PackageRelativePath,
+    ) -> Result<Vec<crate::PackageRelativePath>, String> {
+        let base = source.as_path();
+        let reserved = |name: &std::ffi::OsStr| matches!(name.to_str(),
+            Some(".git" | ".wosy" | "deps" | "patches" | "references"));
+        if base.components().any(|part| matches!(part, Component::Normal(name) if reserved(name))) {
+            return Err("declared package source root uses a reserved directory".to_owned());
+        }
+        let source_directory = self.directory(base)?.ok_or_else(|| "declared Git package source root is missing".to_owned())?;
+        let mut paths = Vec::new();
+        let mut pending = vec![(base.to_path_buf(), source_directory)];
+        while let Some((path, directory)) = pending.pop() {
+            if let Some(manifest) = directory.read_text(Path::new("wosy.toml"))? {
+                crate::ProjectContext::package_identity_from_text(manifest)?;
+                if path == base { return Err("declared package source root is a separate package".to_owned()); }
+                continue;
+            }
+            let mut entries = directory.entries().map_err(|error| describe(&path, error))?;
+            entries.sort();
+            for name in entries {
+                if reserved(&name) { continue; }
+                let name = Path::new(&name);
+                one_component(name).map_err(|error| describe(name, error))?;
+                let child = path.join(name);
+                let file = directory.open(name)?.ok_or_else(|| format!("Git package entry {} disappeared", child.display()))?;
+                let ty = file.metadata().map_err(|error| describe(&child, error))?.file_type();
+                if ty.is_dir() {
+                    pending.push((child, Self::new(file)?));
+                } else if child.extension().is_some_and(|extension| extension == "w") {
+                    if !ty.is_file() { return Err(format!("Git package source {} is not a regular file", child.display())); }
+                    paths.push(crate::PackageRelativePath::new(child)?);
+                }
+            }
+        }
+        paths.sort_unstable();
+        Ok(paths)
+    }
+
     pub(crate) fn read_text(&self, relative: &Path) -> Result<Option<String>, String> {
         let Some(mut file) = self.source(relative)? else { return Ok(None) };
         let mut text = String::new();

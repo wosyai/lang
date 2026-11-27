@@ -21,6 +21,7 @@ pub(crate) struct InitializerCallNodes<'a> {
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     float_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     integer_conversion_sources: HashMap<*const ScalarExpression, &'a ScalarType>,
+    ordered_comparison_operands: HashMap<*const ScalarExpression, &'a ScalarType>,
     checked_local_arrays: HashSet<*const ScalarBinding>,
     checked_local_indexes: HashMap<*const ScalarPlace, (*const ScalarPlace, ByteSpan)>,
     checked_immediate_element_addresses: HashMap<*const ScalarExpression, &'a ScalarType>,
@@ -97,6 +98,7 @@ impl<'a> InitializerCallNodes<'a> {
             members: HashMap::with_capacity(topology.identities.members.len()),
             float_types: HashMap::new(),
             integer_conversion_sources: HashMap::new(),
+            ordered_comparison_operands: HashMap::new(),
             checked_local_arrays: HashSet::new(),
             checked_local_indexes: HashMap::new(),
             checked_immediate_element_addresses: HashMap::new(),
@@ -161,6 +163,20 @@ impl<'a> InitializerCallNodes<'a> {
         let mut immediate_shared_reads = HashMap::new();
         let mut named_shared_reads = HashMap::new();
         let mut bind_type = |ordinal, expression: &'a ScalarExpression| {
+            use super::super::BinaryOperator;
+            if let ScalarExpression::Binary { operator, left, .. } = expression {
+                if matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
+                {
+                    if let Some(Node::Expression(lhs)) =
+                        topology.structure.edges.get(&(Parent::Expression(ordinal), Edge::BinaryLeft))
+                    {
+                        if let Some(ty) = topology.structure.checked_types.expressions.get(lhs) {
+                            nodes.ordered_comparison_operands.insert(std::ptr::from_ref(left.as_ref()), ty);
+                        }
+                    }
+                }
+            }
             if record_initializer_places {
                 match expression {
                     ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, .. }, .. }
@@ -465,6 +481,13 @@ impl<'a> InitializerCallNodes<'a> {
         self.float_types.get(&std::ptr::from_ref(expression)).copied()
     }
 
+    pub(crate) fn checked_ordered_comparison_operand(
+        &self,
+        operand: &ScalarExpression,
+    ) -> Option<&'a ScalarType> {
+        self.ordered_comparison_operands.get(&std::ptr::from_ref(operand)).copied()
+    }
+
     pub(crate) fn checked_integer_conversion_source(
         &self,
         operand: &ScalarExpression,
@@ -517,6 +540,7 @@ use crate::scalar::reference::self_tail::checked::CheckedForwardingProof;
 use crate::scalar::{CfgPointId, ScalarReferenceCfg};
 
 pub(crate) struct CallableBodyCallNodes<'a> {
+    original_read_body: Option<super::super::static_calls::OriginalReadBody<'a>>,
     source: &'a SourceIdentity,
     targets: HashMap<*const ScalarExpression, &'a ResolvedCallTarget>,
     self_tail_candidates: HashMap<*const ScalarExpression, &'a ScalarExpression>,
@@ -534,6 +558,7 @@ struct CallableProofNodes<'a> {
     initializer_bindings: bool,
     initializer_allocations: Vec<&'a ScalarBinding>,
     initializer_shared_holders: Vec<&'a ScalarBinding>,
+    runtime_match_binding: Option<usize>,
     expressions: HashMap<*const ScalarExpression, OccurrenceOrdinal>,
     places: HashMap<*const ScalarPlace, OccurrenceOrdinal>,
     bindings: HashMap<*const ScalarBinding, BlockPosition>,
@@ -1025,6 +1050,42 @@ impl<'a> CallableBodyCallNodes<'a> {
             calls.structure.callful_arguments.contains(&OccurrenceOrdinal(ordinal)))
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn contextual_argument(&self, expression: &ScalarExpression) -> Option<(&'a crate::scalar::ReferenceBindingId, &'a ScalarType)> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.contextual_argument(ordinal)
+    }
+
+    pub(in crate::scalar) fn seal_original_read_body(
+        &mut self, body: &ScalarBlock, seal: super::super::static_calls::OriginalReadBody<'a>,
+    ) {
+        if seal.matches(body) { self.original_read_body = Some(seal); }
+    }
+
+    /// Structural identity of this original ordinary scalar read. This
+    /// does not certify a bound, resolve a helper, or authorize emission.
+    #[allow(dead_code)] // Retained-helper integration is a separate phase.
+    pub(crate) fn fixed_index_read(
+        &self, expression: &ScalarExpression,
+    ) -> Option<super::super::reference::FixedIndexReadShape<'a>> {
+        self.original_read_body.as_ref()?;
+        if !matches!(expression, ScalarExpression::IndexedRead { .. }) { return None; }
+        let read = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.fixed_index_read_shape(read)
+    }
+
+    /// Same structural query as Check uses, but borrowed from this one
+    /// existing typed body. No non-null or ownership result is implied.
+    #[allow(dead_code)]
+    pub(crate) fn shared_checked_read(
+        &self, expression: &ScalarExpression,
+    ) -> Option<super::super::reference::SharedCheckedReadShape<'a>> {
+        self.original_read_body.as_ref()?;
+        if !matches!(expression, ScalarExpression::Dereference { .. }) { return None; }
+        let read = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.shared_checked_read_shape(read)
+    }
+
     pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
         self.proof_nodes
             .expressions
@@ -1168,6 +1229,7 @@ impl<'a> CallableBodyCallNodes<'a> {
             )
             .collect();
         let mut nodes = Self {
+            original_read_body: None,
             source,
             targets: HashMap::with_capacity(targets_by_ordinal.len()),
             self_tail_candidates: HashMap::with_capacity(calls.self_tail_candidates.len()),
@@ -1274,6 +1336,17 @@ impl<'a> CallableBodyCallNodes<'a> {
             .values()
             .copied()
             .chain(self.checked_self_tail.map(|(node, _)| node))
+    }
+
+    /// Look up the checked type of an exact expression in the bound body.
+    /// Unlike the self-tail cache, this does not require a tail candidate.
+    pub(crate) fn runtime_match_binding(&self) -> Option<usize> {
+        self.proof_nodes.runtime_match_binding
+    }
+
+    pub(crate) fn canonical_expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
+        let ordinal = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.structure.checked_types.expressions.get(ordinal)
     }
 
     pub(crate) fn expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
@@ -1537,6 +1610,8 @@ impl<'a> Binder<'a, '_> {
                     self.expression(parent, Edge::CallArgument(index), argument)?;
                 }
             }
+            ScalarExpression::RuntimeMatch(_) => {},
+            ScalarExpression::Contextual { .. } => {}
             ScalarExpression::Call { arguments, .. } => {
                 (self.bind_call)(ordinal, expression)?;
                 for (index, argument) in arguments.iter().enumerate() {
@@ -1610,6 +1685,7 @@ impl<'a> Binder<'a, '_> {
         }
         let parent = Parent::Place(ordinal);
         match place {
+            ScalarPlace::Contextual { .. } => Ok(()),
             ScalarPlace::Name { .. } => {
                 if let Some(bind_named_place) = &mut self.bind_named_place {
                     bind_named_place(ordinal, place);
@@ -1685,6 +1761,12 @@ impl<'a> Binder<'a, '_> {
                 {
                     nodes.initializer_shared_holders.push(binding);
                 }
+            }
+            if nodes.calls.is_some() && block == self.structure.root
+                && matches!(&binding.value, ScalarExpression::RuntimeMatch(_))
+                && nodes.runtime_match_binding.replace(item).is_some()
+            {
+                return Err("multiple runtime match initializers in one source block are not supported".to_owned());
             }
             if nodes.calls.is_some() || nodes.initializer_bindings {
                 nodes

@@ -92,6 +92,14 @@ pub(super) struct PreparationOccurrenceTyping {
     generated_callable_count: usize,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    checker_directives: HashMap<*const ScalarExpression, super::checker_directive::CheckedDirectiveMarker>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    checker_enabled: bool,
+    #[cfg(feature = "internal-checker")]
+    snapshot_types: std::collections::BTreeSet<std::rc::Rc<super::ScalarStructId>>,
+    #[cfg(feature = "internal-checker")]
+    snapshot_array_demand: bool,
 }
 
 struct CheckedExpressionType {
@@ -117,6 +125,49 @@ impl PreparationOccurrenceTyping {
 
     pub(super) fn take_copy_struct_literal(&mut self, value: &ScalarExpression) -> bool {
         self.copy_struct_literals.remove(&std::ptr::from_ref(value))
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn checker_directives_enabled(&self) -> bool {
+        self.checker_enabled
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_demands_snapshot(&self, ty: &ScalarType) -> bool {
+        match ty {
+            ScalarType::Struct(id) => self.snapshot_types.contains(id),
+            ScalarType::Array { .. } => self.snapshot_array_demand,
+            _ => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn take_checker_directive(
+        &mut self,
+        expression: &ScalarExpression,
+    ) -> Option<super::checker_directive::CheckedDirectiveMarker> {
+        if !self.checker_enabled {
+            return None;
+        }
+        self.checker_directives.remove(&std::ptr::from_ref(expression))
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn checked_expression_type(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&ScalarType> {
+        self.expressions
+            .get(&std::ptr::from_ref(expression))
+            .map(|checked| &checked.ty)
+    }
+
+    #[cfg(test)]
+    pub(super) fn checked_call_signature(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&CheckedCallSignature> {
+        self.calls.get(&std::ptr::from_ref(expression))
     }
 
     pub(super) fn take_literal_field(
@@ -224,6 +275,9 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     nominate_local_runtime_write: bool,
     suppress_checked_occurrences: bool,
     anonymous_element_sites: HashSet<*const ScalarExpression>,
+    // Only populated by Build proof typing. These never affect runtime preparation.
+    pub(super) proof_entry_scope: Option<&'a BTreeMap<String, ScalarType>>,
+    pub(super) proof_rewrite_hole: Option<(&'a ScalarType, Option<ByteSpan>, bool)>,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -238,6 +292,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
             nominate_local_runtime_write: false,
             suppress_checked_occurrences: true,
             anonymous_element_sites: HashSet::new(),
+            proof_entry_scope: None,
+            proof_rewrite_hole: None,
         }
     }
 
@@ -317,6 +373,89 @@ impl<'a> ScalarInferenceBuilder<'a> {
         is_raw
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn enable_checker_directives(&mut self, enabled: bool) {
+        self.occurrences.checker_enabled = enabled;
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn checker_directives_enabled(&self) -> bool {
+        self.occurrences.checker_enabled
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn shared_snapshot_type(&self, id: super::ScalarStructId) -> std::rc::Rc<super::ScalarStructId> {
+        self.occurrences.snapshot_types.get(&id).cloned().unwrap_or_else(|| std::rc::Rc::new(id))
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn record_checker_directive(
+        &mut self,
+        expression: &ScalarExpression,
+        #[allow(unused_mut)] mut marker: super::checker_directive::CheckedDirectiveMarker,
+    ) {
+        if !self.suppress_checked_occurrences {
+            #[cfg(feature = "internal-checker")]
+            {
+                use super::checker_directive::CheckerCode;
+                if let CheckerCode::Projection(selection, ..) = &mut marker.output.code_value {
+                    self.record_snapshot_demand(selection, None);
+                }
+                for file in marker.output.state_files.iter_mut() {
+                    self.record_snapshot_demand(&mut file.selection, Some(&mut file.ty));
+                }
+            }
+            self.occurrences
+                .checker_directives
+                .insert(std::ptr::from_ref(expression), marker);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn note_ordinary_snapshot_read(
+        &mut self, expression: &ScalarExpression, scope: &BTreeMap<String, ScalarType>,
+    ) {
+        if !self.occurrences.checker_enabled || self.suppress_checked_occurrences { return; }
+        if let Some((name, _)) = super::checker_directive::array_index_chain(expression) {
+            if matches!(scope.get(name), Some(ScalarType::Array { length: 1..=64, .. })) {
+                self.occurrences.snapshot_array_demand = true;
+            }
+            return;
+        }
+        if !matches!(expression, ScalarExpression::Member { .. }) { return; }
+        let Some(CheckedMember::DirectField(field)) =
+            self.occurrences.members.get(&std::ptr::from_ref(expression)) else { return; };
+        if !self.occurrences.snapshot_types.contains(&field.structure) {
+            self.occurrences.snapshot_types.insert(std::rc::Rc::new(field.structure.clone()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn record_snapshot_demand(
+        &mut self,
+        selection: &mut super::checker_directive::CheckerStateSelection,
+        ty: Option<&mut super::checker_directive::CheckerStateType>,
+    ) {
+        use super::checker_directive::{CheckerAggregateProjection, CheckerStateSelection, CheckerStateType};
+        let nominal = match (selection, ty) {
+            (CheckerStateSelection::LexicalProjection {
+                component: CheckerAggregateProjection::Nominal { owner, .. }, ..
+            }, _) | (_, Some(CheckerStateType::Nominal(owner))) => owner,
+            (CheckerStateSelection::LexicalProjection {
+                component: CheckerAggregateProjection::FixedArray { .. }, ..
+            }, _) | (_, Some(CheckerStateType::FixedArray)) => {
+                self.occurrences.snapshot_array_demand = true;
+                return;
+            }
+            _ => return,
+        };
+        if let Some(shared) = self.occurrences.snapshot_types.get(nominal.as_ref()) {
+            if !std::rc::Rc::ptr_eq(nominal, shared) { *nominal = shared.clone(); }
+        } else {
+            self.occurrences.snapshot_types.insert(nominal.clone());
+        }
+    }
+
     pub(super) fn record_expression_type(
         &mut self,
         expression: &ScalarExpression,
@@ -392,7 +531,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
                 ScalarPlace::Dereference { pointer, .. } => return self.occurrences.expressions
                     .get(&std::ptr::from_ref(pointer.as_ref()))
                     .is_some_and(|entry| matches!(entry.ty, ScalarType::RawPointer(_))),
-                ScalarPlace::Name { .. } => return false,
+                ScalarPlace::Name { .. } | ScalarPlace::Contextual { .. } => return false,
             }
         }
     }

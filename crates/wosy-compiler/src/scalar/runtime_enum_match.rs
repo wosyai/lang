@@ -1,0 +1,1069 @@
+//! Guarded source preparation for the ordinary runtime enum match. This sealed body carries only checked, scope-limited scalar values.
+use super::{proof_match::{AuthoredMatch, RuntimeSelector},
+    typecheck::{concrete_integer_literal, integer_literal_fits_type},
+    *};
+
+mod primitive;
+pub(crate) use primitive::{IntegerExpression, IntegerKind};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub(crate) source: SourceIdentity,
+    pub(crate) owner: ByteSpan,
+    pub(crate) span: ByteSpan,
+    pub(crate) enumeration: ScalarEnumId,
+    name_span: ByteSpan,
+    inputs: Vec<(ByteSpan, ScalarType)>,
+    initializer: bool,
+    input_names: Vec<String>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) check_transfer: Option<MatchTransfer<ByteSpan>>,
+    pub(crate) prefix: Vec<PrefixInput>,
+    pub(crate) outputs: Vec<ScalarType>,
+    pub(crate) selector: TypedSelector,
+    pub(crate) local: Option<LexicalEnumBinding>,
+    pub(crate) arms: Vec<TypedArm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixInput {
+    pub(crate) name: String,
+    pub(crate) declaration: ByteSpan,
+    pub(crate) ty: ScalarType,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchTransfer<T> {
+    Value { lane: MatchLane<T>, guard: Option<(ByteSpan, bool)> },
+    Select { condition_span: ByteSpan, condition: MatchCondition<T>, yes: MatchLane<T>, no: MatchLane<T> },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MatchLane<T> {
+    pub(super) arm_scope: ByteSpan,
+    pub(super) output: MatchValue<T>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchCondition<T> {
+    Boolean(T),
+    Integer { binding: T, ty: ScalarType, relation: super::symbolic_integer::IntegerRelation, bound: BigInt },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchValue<T> {
+    Literal(BigInt),
+    Copy(T),
+    WrappingAdd { source: MatchAddend<T>, offset: BigInt },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MatchAddend<T> {
+    Literal(BigInt),
+    Copy(T),
+}
+
+#[cfg(feature = "internal-checker")]
+fn wrapping_literal_operand(expression: &IntegerExpression) -> Option<(&IntegerKind, &BigInt)> {
+    let IntegerKind::Binary { operator: BinaryOperator::WrappingAdd, operands } = &expression.kind else { return None; };
+    let [left, right] = operands.as_ref();
+    if left.ty != expression.ty || right.ty != expression.ty { return None; }
+    match (&left.kind, &right.kind) {
+        (value @ (IntegerKind::Formal(_) | IntegerKind::Payload(_)), IntegerKind::Literal(offset))
+        | (IntegerKind::Literal(offset), value @ (IntegerKind::Formal(_) | IntegerKind::Payload(_))) =>
+            Some((value, offset)),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl MatchTransfer<ByteSpan> {
+    pub(super) fn bind<T>(&self, result: &ScalarType, resolve: impl Fn(ByteSpan, &ScalarType) -> Option<T>) -> Option<MatchTransfer<T>> {
+        let value = |value: &MatchValue<ByteSpan>| Some(match value {
+            MatchValue::Literal(value) => MatchValue::Literal(value.clone()),
+            MatchValue::Copy(span) => MatchValue::Copy(resolve(*span, result)?),
+            MatchValue::WrappingAdd { source, offset } => MatchValue::WrappingAdd {
+                source: match source {
+                    MatchAddend::Literal(value) => MatchAddend::Literal(value.clone()),
+                    MatchAddend::Copy(span) => MatchAddend::Copy(resolve(*span, result)?),
+                },
+                offset: offset.clone(),
+            },
+        });
+        let lane = |lane: &MatchLane<ByteSpan>| Some(MatchLane {
+            arm_scope: lane.arm_scope, output: value(&lane.output)?,
+        });
+        Some(match self {
+            Self::Value { lane: selected, guard } => MatchTransfer::Value { lane: lane(selected)?, guard: *guard },
+            Self::Select { condition_span, condition, yes, no } => MatchTransfer::Select {
+                condition_span: *condition_span,
+                condition: match condition {
+                    MatchCondition::Boolean(binding) => MatchCondition::Boolean(resolve(*binding, &ScalarType::Bool)?),
+                    MatchCondition::Integer { binding, ty, relation, bound } => MatchCondition::Integer {
+                        binding: resolve(*binding, ty)?, ty: ty.clone(), relation: *relation, bound: bound.clone(),
+                    },
+                },
+                yes: lane(yes)?, no: lane(no)?,
+            },
+        })
+    }
+}
+
+/// Opaque source-prepared value occurrence; raw/serialized IR has no constructor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Occurrence(pub(crate) std::sync::Arc<Plan>);
+
+impl Occurrence {
+    pub(crate) fn for_each_input_name(&self, mut visit: impl FnMut(&str)) {
+        self.0.for_each_formal_read(|_, declaration| {
+            if let Ok(index) = self.0.inputs.binary_search_by_key(&declaration.start, |(span, _)| span.start) {
+                visit(&self.0.input_names[index]);
+            } else if let Ok(index) = self.0.prefix.binary_search_by_key(&declaration.start, |input| input.declaration.start) {
+                visit(&self.0.prefix[index].name);
+            }
+        });
+    }
+
+    pub(crate) fn ty(&self) -> &ScalarType { &self.0.outputs[0] }
+    pub(crate) fn span(&self) -> ByteSpan { self.0.span }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LexicalEnumBinding {
+    enumeration: ScalarEnumId,
+    declaration: ByteSpan,
+    initializer: ByteSpan,
+    read: ByteSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TypedSelector {
+    Constructor { tag: u32, span: ByteSpan, payload: Vec<(ByteSpan, Operand)> },
+    If { #[cfg(feature = "internal-checker")] condition_span: ByteSpan, predicate: Predicate, yes: Box<Self>, no: Box<Self> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Operand { Literal(BigInt), Formal(ByteSpan), Expression(IntegerExpression) }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Predicate {
+    Constant(bool),
+    Formal { use_span: ByteSpan, declaration: ByteSpan },
+    Compare { operator: BinaryOperator, operands: Box<[IntegerExpression; 2]> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TypedArm {
+    pub(crate) tag: u32,
+    pub(crate) scope: ByteSpan,
+    pub(crate) bindings: Vec<CaseBinding>,
+    pub(crate) results: Vec<ArmResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaseBinding {
+    pub(crate) slot: usize,
+    pub(crate) declaration: ByteSpan,
+    pub(crate) ty: ScalarType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ArmResult {
+    Literal { value: BigInt, span: ByteSpan },
+    Payload { slot: usize, use_span: ByteSpan },
+    Expression(IntegerExpression),
+}
+
+pub(crate) fn diagnostic(source: &SourceIdentity, span: ByteSpan, message: &str) -> Diagnostic {
+    Diagnostic { code: "B0003".to_owned(), severity: DiagnosticSeverity::Error,
+        message: message.to_owned(), labels: vec![DiagnosticLabel { kind: DiagnosticLabelKind::Primary,
+            span: SourceSpan::new(source.clone(), span), message: message.to_owned() }], notes: Vec::new() }
+}
+
+type Formals = HashMap<String, (ByteSpan, ScalarType)>;
+
+pub(crate) fn prepare(source: &SourceIdentity, enums: &[ScalarEnum], body: &CstNode, work: &mut usize) -> Result<Plan, Diagnostic> {
+    let span = wosy_syntax::byte_span(body);
+    let error = |message| diagnostic(source, span, message);
+    let initializer = body.kind() == SyntaxKind::RuntimeMatchExpr;
+    let (owner, initializer_type, prefix) = if initializer {
+        let parent = |node: &CstNode, kind| node.parent().filter(|node| node.kind() == kind)
+            .ok_or_else(|| error("runtime match expression requires one scalar local initializer"));
+        let expression = parent(body, SyntaxKind::Expression)?;
+        let outputs = parent(&expression, SyntaxKind::OutputList)?;
+        let binding = parent(&outputs, SyntaxKind::LocalBinding)?;
+        let item = parent(&binding, SyntaxKind::BlockItem)?;
+        let block = parent(&item, SyntaxKind::Block)?;
+        let owner = parent(&block, SyntaxKind::FunctionDecl)?;
+        if outputs.children().count() != 1 {
+            return Err(error("runtime match initializer requires one output"));
+        }
+        let mut prefix = Vec::new();
+        for previous in block.children().take_while(|node| node != &item) {
+            let fail = || diagnostic(source, wosy_syntax::byte_span(&previous),
+                "runtime match initializer requires a prefix of ordinary primitive locals");
+            analysis_budget::charge_call_work(work, 1).ok_or_else(|| error("runtime match prefix exceeds analysis limits"))?;
+            let previous = previous.children().find(|node| node.kind() == SyntaxKind::LocalBinding).ok_or_else(fail)?;
+            let receivers = previous.children().find(|node| node.kind() == SyntaxKind::ReceiverList).ok_or_else(fail)?;
+            let mut receivers = receivers.children();
+            let receiver = receivers.next().ok_or_else(fail)?;
+            if receivers.next().is_some() { return Err(fail()); }
+            let name = direct_token(&receiver, SyntaxKind::Identifier).ok_or_else(fail)?;
+            let ty = receiver.children().find(|node| node.kind() == SyntaxKind::TypeSpec).ok_or_else(fail)?;
+            let ty = derive_type(&ty);
+            if ty != ScalarType::Bool && !is_integer_type(&ty) { return Err(fail()); }
+            prefix.push(PrefixInput { name: name.text().to_owned(), declaration: token_span(&name), ty });
+        }
+        let receivers = binding.children().find(|node| node.kind() == SyntaxKind::ReceiverList)
+            .ok_or_else(|| error("missing runtime match initializer receiver"))?;
+        let mut receivers = receivers.children().filter(|node| node.kind() == SyntaxKind::Receiver);
+        let receiver = receivers.next().ok_or_else(|| error("missing runtime match initializer receiver"))?;
+        if receivers.next().is_some() || direct_token(&receiver, SyntaxKind::Identifier).is_none() {
+            return Err(error("runtime match initializer requires exactly one lexical receiver"));
+        }
+        let ty = receiver.children().find(|node| node.kind() == SyntaxKind::TypeSpec)
+            .ok_or_else(|| error("missing runtime match initializer receiver type"))?;
+        (owner, Some(derive_type(&ty)), prefix)
+    } else {
+        let owner = body.parent().filter(|owner| owner.kind() == SyntaxKind::FunctionDecl)
+            .ok_or_else(|| error("runtime match must be the sole result of a named function"))?;
+        (owner, None, Vec::new())
+    };
+    if owner.parent().is_some_and(|parent| parent.kind() == SyntaxKind::GenericFunctionDecl)
+        || owner.children_with_tokens().any(|element| element.kind() == SyntaxKind::Unsafe)
+    {
+        return Err(error("runtime enum match requires a safe nongeneric function"));
+    }
+    let signature = owner.children().find(|node| node.kind() == SyntaxKind::CallableType)
+        .ok_or_else(|| error("missing runtime enum match signature"))?;
+    let ScalarType::Callable { outputs, parameters } = derive_type(&signature) else {
+        return Err(error("invalid runtime enum match signature"));
+    };
+    let output_types = if let Some(ty) = initializer_type {
+        vec![ty]
+    } else {
+        outputs.outputs.into_iter().map(|output| output.ty).collect()
+    };
+    if output_types.is_empty() || !output_types.iter().all(is_integer_type)
+        || !parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool)
+    {
+        return Err(error("runtime enum match requires scalar integer results and primitive formals"));
+    }
+    analysis_budget::charge_call_work(work, output_types.len()).ok_or_else(||
+        error("runtime enum output sequence exceeds analysis limits"))?;
+    let names = owner.children().find(|node| node.kind() == SyntaxKind::Parameters).into_iter()
+        .flat_map(|parameters| parameters.children_with_tokens()).filter_map(|element| element.into_token())
+        .filter(|token| token.kind() == SyntaxKind::Identifier).collect::<Vec<_>>();
+    if names.len() != parameters.len() { return Err(error("runtime match parameter arity mismatch")); }
+    let input_rows = names.iter().map(token_span).zip(parameters.iter().cloned()).collect();
+    let input_names = if initializer {
+        analysis_budget::charge_call_work(work, names.len()).ok_or_else(|| error("runtime enum formals exceed analysis limits"))?;
+        names.iter().map(|name| name.text().to_owned()).collect()
+    } else { Vec::new() };
+    let mut formals = Formals::with_capacity(names.len());
+    for (name, ty) in names.into_iter().zip(parameters) {
+        if typecheck::is_null_literal_name(name.text()) || formals.insert(name.text().to_owned(), (token_span(&name), ty)).is_some() {
+            return Err(diagnostic(source, token_span(&name), "duplicate or reserved runtime match parameter"));
+        }
+    }
+    for input in &prefix {
+        if typecheck::is_null_literal_name(&input.name)
+            || formals.insert(input.name.clone(), (input.declaration, input.ty.clone())).is_some()
+        {
+            return Err(diagnostic(source, input.declaration, "runtime match prefix requires fresh scalar locals"));
+        }
+    }
+    let (matching, local) = if initializer {
+        (body.children().find(|node| node.kind() == SyntaxKind::ProofMatch)
+            .ok_or_else(|| error("missing runtime match selector and arms"))?, None)
+    } else {
+        let mut parts = body.children();
+        let first = parts.next().ok_or_else(|| error("missing runtime match selector and arms"))?;
+        if first.kind() == SyntaxKind::ProofMatch && parts.next().is_none() {
+            (first, None)
+        } else if first.kind() == SyntaxKind::BlockItem {
+            let matching = parts.next().filter(|node| node.kind() == SyntaxKind::ProofMatch)
+                .ok_or_else(|| error("runtime enum match allows only one preceding immutable enum local"))?;
+            if parts.next().is_some() {
+                return Err(error("runtime enum match must be the final result"));
+            }
+            let declaration = first.children().find(|part| part.kind() == SyntaxKind::LocalBinding)
+                .ok_or_else(|| error("runtime enum match allows only a preceding immutable enum local"))?;
+            let receivers = declaration.children().find(|part| part.kind() == SyntaxKind::ReceiverList)
+                .ok_or_else(|| error("runtime enum match requires an initialized enum local"))?;
+            let mut receivers = receivers.children().filter(|part| part.kind() == SyntaxKind::Receiver);
+            let receiver = receivers.next().ok_or_else(|| error("missing runtime enum local receiver"))?;
+            if receivers.next().is_some() {
+                return Err(error("runtime enum match requires exactly one enum receiver"));
+            }
+            let ty = receiver.children().find(|part| part.kind() == SyntaxKind::TypeSpec)
+                .ok_or_else(|| error("missing runtime enum local type"))?;
+            let mut semantic = semantic_children(&ty);
+            let Some(ty_name) = semantic.next().and_then(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::TypeName) else {
+                return Err(diagnostic(source, wosy_syntax::byte_span(&ty), "runtime enum local needs a simple same-source enum type"));
+            };
+            if semantic.next().is_some() {
+                return Err(diagnostic(source, wosy_syntax::byte_span(&ty), "runtime enum local needs a simple same-source enum type"));
+            }
+            let name = direct_token(&receiver, SyntaxKind::Identifier)
+                .ok_or_else(|| error("missing runtime enum local name"))?;
+            if formals.contains_key(name.text()) || typecheck::is_null_literal_name(name.text()) {
+                return Err(diagnostic(source, token_span(&name), "runtime enum local must be fresh"));
+            }
+            let output = declaration.children().find(|part| part.kind() == SyntaxKind::OutputList)
+                .ok_or_else(|| error("missing runtime enum local initializer"))?;
+            let mut outputs = output.children().filter(|part| part.kind() == SyntaxKind::Expression);
+            let initializer = outputs.next().ok_or_else(|| error("missing runtime enum local initializer"))?;
+            if outputs.next().is_some() {
+                return Err(error("runtime enum match requires exactly one enum initializer"));
+            }
+            (matching, Some((name, ty_name, initializer)))
+        } else {
+            return Err(error("runtime enum match allows only one preceding immutable enum local"));
+        }
+    };
+    let matching = AuthoredMatch::prepare_with_initializer(&matching, local.as_ref().map(|(_, _, node)| node.clone()))
+        .map_err(|error| diagnostic(source, error.span, error.message))?;
+    let resolved = matching.resolve_runtime(source, enums, work)
+        .map_err(|error| diagnostic(source, error.span, error.message))?;
+    if resolved.enumeration.copy_modifier_span.is_none() || resolved.enumeration.has_tag_only_layout() {
+        return Err(error("runtime enum payload match requires a payload-bearing enum copy declaration"));
+    }
+    let local_binding = local.as_ref().map(|(name, ty, initializer)| {
+        let type_span = token_span(ty);
+        if ty.text() != resolved.enumeration.name.as_str() {
+            return Err(diagnostic(source, type_span, "runtime enum local type does not match its initializer enum"));
+        }
+        let use_span = match matching.lexical_selector() {
+            Some(ScalarExpression::Name { name: used, span }) if used == name.text() => *span,
+            Some(selector) => return Err(diagnostic(source, typecheck::expression_span(selector),
+                "runtime match must read the preceding enum local")),
+            None => return Err(error("missing preceding runtime enum local read")),
+        };
+        Ok(LexicalEnumBinding { enumeration: resolved.enumeration.id.clone(), declaration: token_span(name),
+            initializer: wosy_syntax::byte_span(initializer), read: use_span })
+    }).transpose()?;
+    let selector = typed_selector(source, &formals, resolved.selector, work)?;
+    let arms = resolved.arms.into_iter().map(|arm| {
+        let scope = arm.body.span;
+        let arm_error = |message| diagnostic(source, scope, message);
+        let returned = &arm.body.final_output_values;
+        if returned.len() != output_types.len() {
+            return Err(arm_error("runtime enum arms must match the function output arity"));
+        }
+        if arm.body.items.len() != returned.len()
+            || arm.body.terminated_items.len() != returned.len()
+            || arm.body.terminated_items.iter().any(|terminated| *terminated)
+        {
+            return Err(arm_error("runtime enum arms must return a direct primitive output sequence"));
+        }
+        analysis_budget::charge_call_work(work, returned.len()).ok_or_else(||
+            arm_error("runtime enum output sequence exceeds analysis limits"))?;
+        let bindings = arm.binders.iter().zip(arm.binder_spans).enumerate().map(|(slot, ((name, ty), declaration))| {
+            if formals.contains_key(*name) || typecheck::is_null_literal_name(name)
+                || local.as_ref().is_some_and(|(binding, ..)| binding.text() == *name) {
+                return Err(diagnostic(source, declaration, "runtime enum payload binder must be fresh"));
+            }
+            Ok(CaseBinding { slot, declaration, ty: (*ty).clone() })
+        }).collect::<Result<Vec<_>, _>>()?;
+        let slots = arm.binders.iter().enumerate().map(|(slot, (name, _))| (*name, slot))
+            .collect::<HashMap<_, _>>();
+        let names = |name: &str| slots.get(name).map(|&slot| (bindings[slot].ty.clone(), IntegerKind::Payload(slot)));
+        let results = returned.iter().zip(&output_types).map(|(returned, result)| {
+            if let ScalarExpression::Name { name, span } = &returned.value {
+                let Some(&slot) = slots.get(name.as_str()) else {
+                    return Err(diagnostic(source, *span, "runtime enum arm result must name its own payload binder"));
+                };
+                if bindings[slot].ty != *result {
+                    return Err(diagnostic(source, *span, "runtime enum payload result type differs from the function output"));
+                }
+                Ok(ArmResult::Payload { slot, use_span: *span })
+            } else if let Some(literal) = concrete_integer_literal(&returned.value) {
+                if !integer_literal_fits_type(&literal, result) {
+                    return Err(diagnostic(source, returned.span, "runtime enum arm literal does not fit the function output"));
+                }
+                Ok(ArmResult::Literal { value: literal.into_owned(), span: returned.span })
+            } else {
+                Ok(ArmResult::Expression(primitive::compile(source, &returned.value, result, &names, work, 0)?))
+            }
+        }).collect::<Result<_, _>>()?;
+        Ok(TypedArm { tag: arm.tag, scope, bindings, results })
+    }).collect::<Result<_, _>>()?;
+    let name_span = direct_token(&owner, SyntaxKind::Identifier).as_ref().map(token_span)
+        .ok_or_else(|| error("missing runtime enum match callable name"))?;
+    Ok(Plan { source: source.clone(), owner: wosy_syntax::byte_span(&owner), span, name_span, inputs: input_rows, initializer, input_names, prefix,
+        enumeration: resolved.enumeration.id.clone(), outputs: output_types, selector, local: local_binding, arms,
+        #[cfg(feature = "internal-checker")]
+        check_transfer: None,
+    })
+}
+
+impl Plan {
+    pub(super) fn for_each_formal_read(&self, mut visit: impl FnMut(ByteSpan, ByteSpan)) {
+        let mut pending = vec![&self.selector];
+        while let Some(selector) = pending.pop() {
+            match selector {
+                TypedSelector::Constructor { payload, .. } => {
+                    for (use_span, operand) in payload {
+                        match operand {
+                            Operand::Formal(declaration) => visit(*use_span, *declaration),
+                            Operand::Expression(expression) => expression.for_each_formal(&mut visit),
+                            Operand::Literal(_) => {}
+                        }
+                    }
+                }
+                TypedSelector::If { predicate, yes, no, .. } => {
+                    match predicate {
+                        Predicate::Formal { use_span, declaration } => visit(*use_span, *declaration),
+                        Predicate::Compare { operands, .. } => {
+                            operands[0].for_each_formal(&mut visit);
+                            operands[1].for_each_formal(&mut visit);
+                        }
+                        Predicate::Constant(_) => {}
+                    }
+                    pending.push(no);
+                    pending.push(yes);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn prepare_check_transfer(&mut self, work: &mut usize) -> Option<()> {
+        if !self.initializer || self.prefix.len() > 4 || self.outputs.len() != 1 { return None; }
+        // This is projection of already-typed leaves, not evaluation. Check
+        // never silently omits effects or unsupported computations in a case.
+        analysis_budget::charge_call_work(work, self.arms.len().checked_add(1)?)?;
+        for arm in &self.arms {
+            match arm.results.as_slice() {
+                [ArmResult::Literal { .. } | ArmResult::Payload { .. }] => {}
+                [ArmResult::Expression(expression)] if expression.ty == self.outputs[0]
+                    && matches!(wrapping_literal_operand(expression), Some((IntegerKind::Payload(_), _))) => {}
+                _ => return None,
+            }
+        }
+        let value = |selector: &TypedSelector, work: &mut usize| {
+            let TypedSelector::Constructor { tag, payload, .. } = selector else { return None; };
+            analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?.checked_add(1)?)?;
+            let arm = self.arms.iter().find(|arm| arm.tag == *tag)?;
+            let [result] = arm.results.as_slice() else { return None; };
+            let lane = |output| Some(MatchLane { arm_scope: arm.scope, output });
+            let (slot, wrapping_offset) = match result {
+                ArmResult::Literal { value, .. } => {
+                    if payload.iter().any(|(_, operand)| matches!(operand, Operand::Expression(_))) { return None; }
+                    return lane(MatchValue::Literal(value.clone()));
+                }
+                ArmResult::Payload { slot, .. } => (*slot, None),
+                ArmResult::Expression(expression) => {
+                    let (IntegerKind::Payload(slot), offset) = wrapping_literal_operand(expression)? else { return None; };
+                    (*slot, Some(offset))
+                }
+            };
+            if payload.iter().enumerate().any(|(index, (_, operand))|
+                matches!(operand, Operand::Expression(_)) && (index != slot || wrapping_offset.is_some()))
+            {
+                return None;
+            }
+            let operand = &payload.get(slot)?.1;
+            if let Some(offset) = wrapping_offset {
+                let source = match operand {
+                    Operand::Literal(value) => MatchAddend::Literal(value.clone()),
+                    Operand::Formal(span) => MatchAddend::Copy(*span),
+                    Operand::Expression(_) => return None,
+                };
+                return lane(MatchValue::WrappingAdd { source, offset: offset.clone() });
+            }
+            lane(match operand {
+                Operand::Literal(value) => MatchValue::Literal(value.clone()),
+                Operand::Formal(span) => MatchValue::Copy(*span),
+                Operand::Expression(expression) if expression.ty == self.outputs[0] => {
+                    let (IntegerKind::Formal(span), offset) = wrapping_literal_operand(expression)? else { return None; };
+                    MatchValue::WrappingAdd { source: MatchAddend::Copy(*span), offset: offset.clone() }
+                }
+                Operand::Expression(_) => return None,
+            })
+        };
+        self.check_transfer = Some(match &self.selector {
+            TypedSelector::Constructor { .. } => MatchTransfer::Value { lane: value(&self.selector, work)?, guard: None },
+            TypedSelector::If { condition_span, predicate, yes, no } => {
+                let yes = value(yes, work)?;
+                let no = value(no, work)?;
+                match predicate {
+                    Predicate::Constant(flag) => MatchTransfer::Value { lane: if *flag { yes } else { no }, guard: Some((*condition_span, *flag)) },
+                    Predicate::Formal { declaration, .. } => MatchTransfer::Select {
+                        condition_span: *condition_span, condition: MatchCondition::Boolean(*declaration), yes, no,
+                    },
+                    Predicate::Compare { operator, operands } => {
+                        let mut relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+                        let [left, right] = operands.as_ref();
+                        if left.ty != right.ty || !is_integer_type(&left.ty) { return None; }
+                        let (binding, bound) = match (&left.kind, &right.kind) {
+                            (IntegerKind::Formal(binding), IntegerKind::Literal(bound)) => (*binding, bound),
+                            (IntegerKind::Literal(bound), IntegerKind::Formal(binding)) => {
+                                relation = relation.reversed();
+                                (*binding, bound)
+                            }
+                            _ => return None,
+                        };
+                        analysis_budget::charge_call_work(work, 2)?;
+                        MatchTransfer::Select {
+                            condition_span: *condition_span,
+                            condition: MatchCondition::Integer { binding, ty: left.ty.clone(), relation, bound: bound.clone() },
+                            yes, no,
+                        }
+                    }
+                }
+            }
+        });
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checked_input(&self, span: ByteSpan) -> Option<(&str, &ScalarType)> {
+        if let Ok(index) = self.inputs.binary_search_by_key(&span.start, |(span, _)| span.start) {
+            let (declared, ty) = &self.inputs[index];
+            return (*declared == span).then_some((self.input_names.get(index)?.as_str(), ty));
+        }
+        self.prefix.iter().find(|input| input.declaration == span).map(|input| (input.name.as_str(), &input.ty))
+    }
+
+    pub(super) fn is_initializer(&self) -> bool { self.initializer }
+
+    pub(crate) fn input_spans(&self) -> impl Iterator<Item = ByteSpan> + '_ {
+        self.inputs.iter().map(|(span, _)| *span)
+    }
+
+    pub(super) fn authenticates_prefix(
+        &self, preceding: &[ScalarBlockItem], nodes: &super::control::CallableBodyCallNodes<'_>,
+        facts: &super::control::CallablePointFacts,
+    ) -> bool {
+        if preceding.len() != self.prefix.len() { return false; }
+        let mut work = 0;
+        self.prefix.iter().zip(preceding).all(|(input, item)| {
+            let ScalarBlockItem::LocalBinding(binding) = item else { return false; };
+            !binding.is_allocation && binding.contextual_storage().is_none()
+                && binding.receivers.len() == 1 && binding.output_values.len() == 1
+                && binding.name == input.name && binding.name_span == input.declaration
+                && binding.declared_type == input.ty
+                && nodes.canonical_expression_type(&binding.value) == Some(&input.ty)
+                && matches!(nodes.binding_definition(facts, binding, 0),
+                    Some(super::control::BindingDefinition::Initialized { value, .. })
+                        if nodes.evaluation_point(facts, &binding.value) == Some(value))
+                && pure_prefix_value(&binding.value, &mut work)
+        })
+    }
+
+    pub(super) fn authenticates_initializer(&self, source: &SourceIdentity, function: &ScalarFunction,
+        binding: &ScalarBinding,
+    ) -> bool {
+        let ScalarType::Callable { parameters, .. } = &function.signature else { return false; };
+        self.initializer && &self.source == source && &self.enumeration.source == source
+            && self.owner == function.span && self.name_span == function.name_span
+            && function.overload_arms.is_empty() && function.generic_parameters.is_empty()
+            && self.local.is_none() && !binding.is_allocation && binding.contextual_storage().is_none()
+            && binding.receivers.len() == 1 && binding.output_values.len() == 1
+            && binding.span.start <= self.span.start && self.span.end <= binding.span.end
+            && self.outputs.as_slice() == std::slice::from_ref(&binding.declared_type)
+            && self.inputs.len() == function.parameter_spans.len() && self.inputs.len() == parameters.len()
+            && self.inputs.iter().zip(function.parameter_spans.iter().zip(parameters))
+                .all(|((declared, ty), (actual, actual_ty))| declared == actual && ty == actual_ty)
+            && self.input_names == function.parameters
+    }
+
+    pub(crate) fn authenticates(&self, source: &SourceIdentity, function: &ScalarFunction) -> bool {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else { return false; };
+        !self.initializer && &self.source == source && &self.enumeration.source == source && self.owner == function.span
+            && self.name_span == function.name_span && self.span == function.body.span
+            && function.body.items.is_empty() && function.body.final_output_values.is_empty()
+            && function.overload_arms.is_empty() && function.generic_parameters.is_empty()
+            && self.local.as_ref().is_none_or(|local| local.enumeration == self.enumeration
+                && self.span.start <= local.declaration.start && local.declaration.end <= local.initializer.start
+                && local.initializer.end <= local.read.start && local.read.end <= self.span.end)
+            && self.inputs.len() == function.parameter_spans.len()
+            && self.inputs.len() == parameters.len()
+            && self.inputs.iter().zip(function.parameter_spans.iter().zip(parameters))
+                .all(|((declared, ty), (actual, actual_ty))| declared == actual && ty == actual_ty)
+            && outputs.outputs.iter().map(|output| &output.ty).eq(self.outputs.iter())
+    }
+}
+
+// Prefix locals remain ordinary statements. This guard classifies their
+// source-derived typed expressions without interpreting or re-evaluating them.
+fn pure_prefix_value(value: &ScalarExpression, work: &mut usize) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        if analysis_budget::charge_call_work(work, 1).is_none() { return false; }
+        match value {
+            ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } => {}
+            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot, operand, .. } =>
+                pending.push(operand),
+            ScalarExpression::Binary { operator: BinaryOperator::WrappingAdd | BinaryOperator::BitOr
+                | BinaryOperator::BitXor | BinaryOperator::BitAnd, left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn typed_selector(source: &SourceIdentity, formals: &Formals, selector: RuntimeSelector<'_>,
+    work: &mut usize,
+) -> Result<TypedSelector, Diagnostic> {
+    let names = |name: &str| formals.get(name).map(|(span, ty)| (ty.clone(), IntegerKind::Formal(*span)));
+    match selector {
+        RuntimeSelector::Variant { tag, payload: arguments, span } => {
+            let payload = arguments.into_iter().map(|(argument, ty)| {
+                let typed = primitive::compile(source, argument, ty, &names, work, 0)?;
+                let span = typed.span;
+                let operand = match typed.kind {
+                    IntegerKind::Literal(value) => Operand::Literal(value),
+                    IntegerKind::Formal(declaration) => Operand::Formal(declaration),
+                    _ => Operand::Expression(typed),
+                };
+                Ok((span, operand))
+            }).collect::<Result<_, _>>()?;
+            Ok(TypedSelector::Constructor { tag, span, payload })
+        }
+        RuntimeSelector::If { condition, then_branch, else_branch } => {
+            let predicate = match condition {
+                ScalarExpression::Boolean { value, .. } => Predicate::Constant(*value),
+                ScalarExpression::Name { name, span } if matches!(formals.get(name), Some((_, ScalarType::Bool))) => {
+                    Predicate::Formal { use_span: *span, declaration: formals[name].0 }
+                }
+                ScalarExpression::Binary { operator, left, right, span }
+                    if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
+                        | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual) => {
+                    let ty = primitive::comparison_type(left, right, formals, work).ok_or_else(||
+                        diagnostic(source, *span, "runtime enum comparison needs a typed integer formal"))?;
+                    let left = primitive::compile(source, left, &ty, &names, work, 0)?;
+                    let right = primitive::compile(source, right, &ty, &names, work, 0)?;
+                    Predicate::Compare { operator: operator.clone(), operands: Box::new([left, right]) }
+                }
+                _ => return Err(diagnostic(source, typecheck::expression_span(condition),
+                    "runtime enum selector requires a Boolean literal, immutable Boolean formal, or typed integer comparison")),
+            };
+            Ok(TypedSelector::If { #[cfg(feature = "internal-checker")] condition_span: typecheck::expression_span(condition), predicate, yes: Box::new(typed_selector(source, formals, *then_branch, work)?),
+                no: Box::new(typed_selector(source, formals, *else_branch, work)?) })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_runtime_match_prepares_typed_positional_bindings_but_is_not_emittable() {
+        let text = r#"%%start
+            enum copy Region { left(u8); right(u8, u16); }
+            u8(bool, u8) choose = fn(flag, input) {
+                match (if (flag) { Region.left(input) } else { Region.right(9, 256) }) {
+                    right(selected, other) { selected }
+                    left(bound) { bound }
+                }
+            };
+        %%end"#;
+        let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+        let parse = |text: &str| {
+            let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+        };
+        let declarations = parse(text);
+        assert!(declarations.items.is_empty());
+        let [plan] = declarations.runtime_enum_matches.as_slice() else { panic!("{:?}", declarations.diagnostics); };
+        assert_eq!(plan.enumeration.source, source);
+        assert_eq!(plan.enumeration.index, 0);
+        assert_eq!(plan.outputs, [ScalarType::U8]);
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        let TypedSelector::If { predicate: Predicate::Formal { use_span, declaration }, yes, no, .. } = &plan.selector
+            else { panic!("resolved runtime condition"); };
+        assert_eq!(snippet(*use_span), "flag");
+        assert_eq!(snippet(*declaration), "flag");
+        assert_ne!(use_span, declaration);
+        let TypedSelector::Constructor { tag: 0, span, payload } = yes.as_ref() else { panic!("left variant"); };
+        assert_eq!(snippet(*span), "Region.left(input)");
+        let [(usage, Operand::Formal(formal))] = payload.as_slice() else { panic!("one formal payload"); };
+        assert_eq!(snippet(*usage), "input");
+        assert_eq!(snippet(*formal), "input");
+        assert_ne!(usage, formal);
+        assert!(matches!(no.as_ref(), TypedSelector::Constructor { tag: 1, payload, .. } if payload.len() == 2));
+        let [right, left] = plan.arms.as_slice() else { panic!("authored arm order"); };
+        assert_eq!((right.tag, left.tag), (1, 0));
+        assert_eq!(right.bindings[0].slot, 0);
+        assert_eq!(right.bindings[1].ty, ScalarType::U16);
+        assert_eq!(snippet(right.bindings[1].declaration), "other");
+        assert!(matches!(right.results.as_slice(), [ArmResult::Payload { slot: 0, .. }]));
+        assert!(declarations.diagnostics.iter().any(|diagnostic| diagnostic.message == "typed runtime enum match is not yet eligible for this preparation route"));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            assert!(prepare_scalar_project(vec![(parse(text), Vec::new())], vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).is_err());
+        }
+        for (invalid, reason) in [
+            (text.replace("enum copy", "enum"), "enum copy"),
+            (text.replace("if (flag)", "if (input)"), "Boolean formal"),
+            (text.replace("Region.right(9, 256)", "Region.right(256, 9)"), "does not fit"),
+            (text.replace("right(selected, other)", "right(selected)"), "payload arity"),
+            (text.replace("right(selected, other)", "right(selected, selected)"), "duplicate"),
+            (text.replace("{ selected }", "{ other }"), "function output"),
+            (text.replace("{ selected }", "{ bound }"), "its own payload binder"),
+            (text.replace("left(bound) { bound }", ""), "cover every enum variant"),
+        ] {
+            let rejected = parse(&invalid);
+            assert!(rejected.runtime_enum_matches.is_empty());
+            assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_match_uses_real_tagged_storage_on_native_and_wasi() {
+    let text = r#"%%start
+        enum copy Region { left(u8); right(u8, u16); }
+        u8(bool, u8) choose = fn(flag, input) {
+            match (if (flag) { Region.left(input) } else { Region.right(9, 256) }) {
+                right(selected, other) { selected }
+                left(bound) { bound }
+            }
+        };
+        u8 x = choose(true, 17);
+        u8 y = choose(false, 29);
+        if (x != 17 || y != 9) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let unused_text = format!("{}%%end", text.split_once("u8 x =").unwrap().0)
+        .replace("u8(bool, u8) choose = fn(flag, input)", "u8(bool, u8, u8) choose = fn(flag, input, unused)");
+    let unused = crate::parse_source(source.clone(), unused_text.clone(), &[]);
+    assert!(unused.diagnostics.is_empty(), "{:?}", unused.diagnostics);
+    let rejected = prepare_scalar_project(
+        vec![(derive_scalar_build_declarations_from_cst(unused.result.canonical_cst()), Vec::new())],
+        vec![source.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+    ).err().expect("runtime enum Build still rejects unused formals");
+    let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics); };
+    let span = diagnostic.labels[0].span.range;
+    assert_eq!(diagnostic.code, "B0009");
+    assert_eq!(&unused_text[span.start as usize..span.end as usize], "unused");
+    let lib = SourceIdentity::new("p".into(), "pkg".into(), "src/lib.w".into(), "test".into());
+    let owner_text = format!("{}%%end", text.split_once("u8 x =").unwrap().0);
+    let owner = crate::parse_source(lib.clone(), owner_text, &[]);
+    let consumer_text = r#"%%start
+        library = namespace pkg "src/lib.w";
+        u8 x = library.choose(true, 17);
+        u8 y = library.choose(false, 29);
+        if (x != 17 || y != 9) { core.system_panic(); };
+    %%end"#;
+    let consumer = crate::parse_source(source.clone(), consumer_text.to_owned(), &[]);
+    assert!(owner.diagnostics.is_empty() && consumer.diagnostics.is_empty());
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        ).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let llvm = emit(&analyzed).unwrap();
+            assert!(llvm.contains("enum.match.storage = alloca"));
+            assert!(llvm.contains("switch i32"));
+            assert!(llvm.contains("store i16 256"));
+            assert!(llvm.contains("load i8"));
+        }
+        // Public raw serialization cannot install a source-only body seal.
+        let encoded = serde_json::to_value(prepared.project()).unwrap();
+        let decoded: ScalarProject = serde_json::from_value(encoded).unwrap();
+        let raw = validate_scalar_project(decoded);
+        assert!(!raw.diagnostics.is_empty());
+        let prepared = prepare_scalar_project(
+            vec![
+                (derive_scalar_build_declarations_from_cst(consumer.result.canonical_cst()), vec![
+                    ScalarNamespaceBinding { binding: "library".to_owned(), target: lib.clone(), span: ByteSpan::new(0, 0) },
+                ]),
+                (derive_scalar_build_declarations_from_cst(owner.result.canonical_cst()), Vec::new()),
+            ], vec![source.clone(), lib.clone()], ScalarPreparationInputs { target_layout },
+        ).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
+        let llvm = crate::emit_scalar_build_project_llvm_text(&analyzed).unwrap();
+        assert!(llvm.contains("enum.match.storage = alloca") && llvm.contains("switch i32"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_lexical_binding_is_the_sole_match_input() {
+    let text = r#"%%start
+        enum copy Region { left(u8); right(u8, u16); }
+        enum copy Other { left(u8); right(u8, u16); }
+        u8(bool, u8) choose = fn(flag, input) {
+            Region selected = if (flag) { Region.left(input) } else { Region.right(9, 256) };
+            match (selected) {
+                right(value, other) { value }
+                left(bound) { bound }
+            }
+        };
+        u8 x = choose(true, 17);
+        u8 y = choose(false, 29);
+        if (x != 17 || y != 9) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target_layout).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[0] else {
+            panic!("prepared lexical runtime match owner");
+        };
+        let plan = function.runtime_enum_match.as_deref().unwrap();
+        let local = plan.local.as_ref().unwrap();
+        let at = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(at(local.declaration), "selected");
+        assert_eq!(at(local.read), "selected");
+        assert_ne!(local.declaration, local.read);
+        assert_eq!(local.enumeration, plan.enumeration);
+        assert!(at(local.initializer).starts_with("if (flag)"));
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let llvm = emit(&analyzed).unwrap();
+            assert_eq!(llvm.matches("enum.local.storage = alloca").count(), 1);
+            assert!(llvm.contains("switch i32") && llvm.contains("store i16 256"));
+        }
+    }
+    for (invalid, reason) in [
+        (text.replace("Region selected = ", "Other selected = "), "does not match its initializer"),
+        (text.replace("Region selected = ", "Region[1] selected = "), "simple same-source enum type"),
+        (text.replace("match (selected)", "match (input)"), "must read the preceding"),
+        (text.replace("Region selected", "Region input").replace("match (selected)", "match (input)"), "must be fresh"),
+        (text.replace("left(bound) { bound }", "left(selected) { selected }"), "binder must be fresh"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime enum binding");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_typed_primitive_regions_share_ordinary_integer_lowering() {
+    let text = r#"%%start
+        enum copy Region { negative(i8, i8); positive(i8); }
+        i8(i8) choose = fn(input) {
+            Region chosen = if (input < 0) { Region.negative(input +@ -1, 3) } else { Region.positive(input | 2) };
+            match (chosen) {
+                negative(value, delta) { value +@ delta }
+                positive(value) { value ^ 1 }
+            }
+        };
+        i8 negative = choose(-128);
+        i8 positive = choose(0);
+        i8 expected_negative = -126;
+        if (negative != expected_negative || positive != 3) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("icmp slt i8"));
+            assert!(ir.contains("add i8") && ir.contains("or i8") && ir.contains("xor i8"));
+            assert!(ir.contains("switch i32") && ir.contains("enum.local.storage"));
+        }
+    }
+    for invalid in [
+        text.replace("input +@ -1", "input + -1"),
+        text.replace("value +@ delta", "value +@ input"),
+        text.replace("input | 2", "input / 2"),
+        text.replace("input | 2", "input | 128"),
+        text.replace("negative(i8, i8)", "negative(i8, u8)"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime primitive expression");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{:?}", rejected.diagnostics);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_runtime_enum_match_returns_authentic_positional_output_sequences() {
+    let text = r#"%%start
+        enum copy Region { left(u8, u16); right(u16, u8); }
+        (u8, u16)(bool, u8) choose = fn(flag, input) {
+            Region selected = if (flag) { Region.left(input, 256) } else { Region.right(513, input | 2) };
+            match (selected) {
+                right(wide, narrow) { narrow ^ 1, wide }
+                left(narrow, wide) { narrow, wide }
+            }
+        };
+        u8 a, u16 b = choose(true, 17);
+        u8 c, u16 d = choose(false, 24);
+        if (a != 17 || b != 256 || c != 27 || d != 513) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let prepare = |text: &str, target_layout| {
+        let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        prepare_scalar_project(
+            vec![(derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout },
+        )
+    };
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare(text, target).unwrap();
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[0] else { panic!("function owner"); };
+        let plan = function.runtime_enum_match.as_deref().unwrap();
+        assert_eq!(plan.outputs, [ScalarType::U8, ScalarType::U16]);
+        assert!(matches!(plan.arms[0].results.as_slice(), [ArmResult::Expression(_), ArmResult::Payload { slot: 0, .. }]));
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("switch i32") && ir.contains("insertvalue { i8, i16 }") && ir.contains("ret { i8, i16 }"));
+            assert!(ir.contains("extractvalue { i8, i16 }"));
+            assert!(ir.contains("enum.match.continue:"));
+            assert!(ir.contains("phi i8") && ir.contains("phi i16"));
+            assert_eq!(ir.matches("ret { i8, i16 }").count(), 1);
+        }
+    }
+    for (invalid, reason) in [
+        (text.replace("{ narrow, wide }", "{ narrow }"), "output arity"),
+        (text.replace("{ narrow, wide }", "{ wide, narrow }"), "differs from the function output"),
+        (text.replace("{ narrow, wide }", "{ narrow, wide, 1 }"), "output arity"),
+        (text.replace("(u8, u16)(bool", "(u8, *u16)(bool"), "scalar integer results"),
+    ] {
+        let rejected = prepare(&invalid, ScalarTargetLayout::NATIVE64).err().expect("invalid runtime enum output sequence");
+        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)), "{:?}", rejected.diagnostics);
+    }
+}
+
+#[test]
+fn prepared_runtime_enum_match_as_ordinary_lexical_initializer() {
+    let text = r#"%%start
+        enum copy Region { left(u8, u16); right(u16, u8); }
+        (u16)(bool, u8) choose = fn(flag, input) {
+            u16 selected = match (if (flag) { Region.left(input, 256) } else { Region.right(513, input | 2) }) {
+                right(wide, narrow) { wide }
+                left(narrow, wide) { wide ^ 1 }
+            };
+            u16 transformed = selected +@ 2;
+            transformed
+        };
+        u16 a = choose(true, 17);
+        u16 b = choose(false, 24);
+        if (a != 259 || b != 515) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    let parse = |text: &str| crate::parse_source(source.clone(), text.to_owned(), &[]);
+    let parsed = parse(text);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+    let non_build = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    assert!(non_build.diagnostics.iter().any(|diagnostic| diagnostic.message.contains("not yet eligible")),
+        "{:?}", non_build.diagnostics);
+
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics.is_empty(), "{:?}", declarations.diagnostics);
+        let prepared = prepare_scalar_project(
+            vec![(declarations, Vec::new())], vec![source.clone()], ScalarPreparationInputs { target_layout },
+        ).unwrap();
+        let ScalarItem::Function(function) = &prepared.project().modules[0].items[0] else { panic!("function owner"); };
+        assert!(function.runtime_enum_match.is_none(), "the ordinary callable path must own the initializer");
+        let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::LocalBinding(_), ScalarBlockItem::Expression(_)] =
+            &function.body.items[..] else { panic!("ordinary binding/continuation"); };
+        let ScalarExpression::RuntimeMatch(site) = &binding.value else { panic!("first-class scalar match"); };
+        assert_eq!(site.ty(), &ScalarType::U16);
+        assert!(serde_json::to_string(&binding.value).is_err(), "runtime authority is not wire data");
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(analyzed.diagnostics().is_empty(), "{:?}", analyzed.diagnostics());
+        let cfg = analyzed.reference_cfg(0, 0, None).expect("ordinary callable CFG");
+        let point = cfg.points.iter().find(|point| matches!(&point.kind,
+            CfgPointKind::Evaluate(ScalarExpression::RuntimeMatch(occurrence)) if occurrence == site))
+            .expect("typed initializer evaluates in the original CFG");
+        assert!(cfg.points.iter().any(|successor| point.successors.contains(&successor.id)
+            && matches!(successor.kind, CfgPointKind::Bind { .. })));
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("switch i32") && ir.contains("phi i16"));
+            let continuation = ir.split("enum.match.continue:").nth(1).expect("ordinary continuation");
+            assert!(continuation.contains("store i16") && continuation.contains("add i16"));
+        }
+    }
+
+    for (invalid, reason) in [
+        (text.replace("u16 selected =", "u8 selected ="), "payload result type differs"),
+        (text.replace("left(narrow, wide) { wide ^ 1 }", "right(narrow, wide) { wide ^ 1 }"), "duplicate or unknown"),
+        (text.replace("u16 selected =", "input = 1; u16 selected ="), "requires a prefix of ordinary primitive locals"),
+        (text.replace("wide ^ 1", "wide / 1"), "total integer operator"),
+    ] {
+        let parsed = parse(&invalid);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(reason)),
+            "{:?}", declarations.diagnostics);
+    }
+}
+
+#[test]
+fn prepared_runtime_enum_match_uses_ordered_lexical_prefix_values() {
+    let text = r#"%%start
+        enum copy Region { left(u8, u16); right(u16, u8); }
+        (u16)(bool, u16) choose = fn(flag, input) {
+            bool alternate = !flag;
+            u16 second = input +@ 256;
+            u16 selected = match (if (alternate) { Region.left(17, second) } else { Region.right(second | 1, 24) }) {
+                right(wide, narrow) { wide }
+                left(narrow, wide) { wide ^ 2 }
+            };
+            u16 transformed = selected +@ 2;
+            transformed
+        };
+        u16 a = choose(false, 256);
+        u16 b = choose(true, 256);
+        if (a != 516 || b != 515) { core.system_panic(); };
+    %%end"#;
+    let source = SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "test".into());
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source.clone()],
+                ScalarPreparationInputs { target_layout })
+        };
+        let prepared = prepare(text).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        for emit in [crate::emit_scalar_build_single_module_llvm_text, crate::emit_scalar_build_project_llvm_text] {
+            let ir = emit(&analyzed).unwrap();
+            assert!(ir.contains("enum.match.lexical") && ir.contains("phi i16"));
+            assert!(ir.contains("load i16, ptr %second"));
+            assert!(ir.contains("load i1, ptr %alternate"));
+        }
+        let invalid = text.replace("input +@ 256", "(if (flag) { input } else { 1 })");
+        let prepared = prepare(&invalid).unwrap();
+        let analyzed = analyze_scalar_build(&prepared);
+        assert!(crate::emit_scalar_build_single_module_llvm_text(&analyzed).unwrap_err().contains("checked pure primitive locals"));
+    }
+}

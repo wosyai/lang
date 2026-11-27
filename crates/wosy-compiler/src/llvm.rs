@@ -223,6 +223,8 @@ struct EmitState<'ctx, 'module> {
     prepared_render: bool,
     require_release_checked_access: bool,
 
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
@@ -240,6 +242,8 @@ struct EmitState<'ctx, 'module> {
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: StorageBindings<'ctx>,
+    contextual_storage: BTreeMap<std::rc::Rc<crate::scalar::ReferenceBindingId>, (PointerValue<'ctx>, ScalarType)>,
+    contextual_installs: Vec<std::rc::Rc<crate::scalar::ReferenceBindingId>>,
     return_bindings: BTreeMap<String, ScalarExpression>,
     fresh_return_outputs: BTreeSet<usize>,
     branch_return_outputs: ownership::ReturnBranches,
@@ -685,11 +689,13 @@ fn emit_scalar_llvm_with_metadata(
         &program.items,
         prepared.initialization_region(),
         &program.structs,
+        &program.enums,
         &program.layouts,
         program.target_layout,
         GenericInitializerInput::RawStandalone(&prepared),
         &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
+        None,
         metadata,
         &[],
     )
@@ -901,14 +907,43 @@ fn emit_scalar_build_single_module_with_metadata(
         &module.items,
         initialization_region,
         &module.structs,
+        &module.enums,
         &module.layouts,
         module.target_layout,
         GenericInitializerInput::PreparedRows(prepared),
         &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
+        Some(validation),
         metadata,
         exports,
     )
+}
+
+fn emit_prepared_runtime_enum<'ctx>(
+    context: &'ctx Context, builder: &Builder<'ctx>, functions: &BTreeMap<String, FunctionValue<'ctx>>,
+    name: &str, function: &ScalarFunction, build: Option<&ScalarBuildValidation<'_>>,
+    module: usize, item: usize, original_body_bound: bool, target: ScalarTargetLayout,
+) -> Result<(), String> {
+    let build = build.filter(|_| original_body_bound)
+        .ok_or("runtime enum match requires its original prepared Build body")?;
+    let source = build.prepared().project().modules.get(module).ok_or("missing runtime enum Build module")?;
+    let plan = build.bind_runtime_enum_match(module, item, function)?;
+    let emitted = *functions.get(name).ok_or("missing runtime enum match function")?;
+    builder.position_at_end(context.append_basic_block(emitted, "entry"));
+    let values = runtime_enum_match::emit_values(context, builder, emitted, source, function, plan, target)?;
+    if let [value] = values.as_slice() {
+        builder.build_return(Some(value)).map_err(memory::builder_error)?;
+    } else {
+        let ScalarType::Callable { outputs, .. } = &function.signature else {
+            return Err("missing prepared runtime enum callable outputs".into());
+        };
+        let values = values.into_iter().map(EmitValue::Basic).collect();
+        let EmitValue::Aggregate { value, .. } = memory::build_aggregate_at(context, builder, target, outputs, values)? else {
+            return Err("missing prepared runtime enum multi-output return".into());
+        };
+        builder.build_return(Some(&value)).map_err(memory::builder_error)?;
+    }
+    Ok(())
 }
 
 fn emit_single_module_llvm<'a>(
@@ -916,6 +951,7 @@ fn emit_single_module_llvm<'a>(
     items: &'a [ScalarItem],
     initialization_region: &'a ModuleInitializationRegion,
     structs: &[ScalarStruct],
+    enums: &[crate::scalar::ScalarEnum],
     layouts: &ScalarTargetLayouts,
     target_layout: ScalarTargetLayout,
     generic_input: GenericInitializerInput<'a>,
@@ -925,6 +961,7 @@ fn emit_single_module_llvm<'a>(
         Option<usize>,
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
+    project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
     exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
@@ -944,7 +981,7 @@ fn emit_single_module_llvm<'a>(
     let builder = context.create_builder();
     let layouts = crate::scalar::layout::ScalarLayoutIndex::program(layouts);
     let structs = structs.iter().collect::<Vec<_>>();
-    let inline_results = InlineResultShapes::new(&structs);
+    let inline_results = InlineResultShapes::new(&structs, enums.iter());
     let mut globals = BTreeMap::new();
     for item in items {
         if let ScalarItem::Binding(binding) = item {
@@ -1174,9 +1211,22 @@ fn emit_single_module_llvm<'a>(
     };
     for (function, cfg, name, item, arm) in definitions {
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
+        if function.runtime_enum_match.is_some() {
+            if generic_input.contextual_formal(0, item, arm).is_some() {
+                return Err("runtime match cannot use a contextual ABI formal".into());
+            }
+            emit_prepared_runtime_enum(&context, &builder, &functions, name, function, project_build,
+                0, item, arm.is_none() && nodes.is_some(), target_layout)?;
+            continue;
+        }
         emit_function(
             prepared_render,
             generic_input.requires_release_checked_access(),
+            match (project_build, nodes.as_ref()) {
+                (Some(build), Some(nodes)) if arm.is_none() =>
+                    build.bind_runtime_enum_initializer(0, item, function, nodes)?,
+                _ => None,
+            },
             aggregates.body(0, item, arm),
             &context,
             &builder,
@@ -1372,7 +1422,7 @@ fn emit_project_llvm<'a>(
         .iter()
         .flat_map(|module| module.structs.iter())
         .collect::<Vec<_>>();
-    let inline_results = InlineResultShapes::new(&all_structs);
+    let inline_results = InlineResultShapes::new(&all_structs, modules.iter().flat_map(|module| &module.enums));
     let layouts = crate::scalar::layout::ScalarLayoutIndex::project(&project.modules);
     let module_name = modules
         .first()
@@ -1606,10 +1656,30 @@ fn emit_project_llvm<'a>(
                 if plan.is_some_and(|plan| plan.private_runtime_portable_formal) {
                     private_runtime_portable_symbols.insert(name.clone());
                 }
+                let mut definition_type = aggregate_transfer::definition_type(
+                    &context, function, cfg, target_layout, &inline_results, &layouts, plan,
+                )?;
+                let contextual = generic_input.contextual_formal(module_ordinal, item_ordinal, None).is_some();
+                if contextual {
+                    if !prepared_render || plan.is_some() || root_array_accessors.contains_key(name)
+                        || definition_type.count_param_types() as usize != function.parameters.len()
+                        || !dynamic_return_outputs(function.span, cfg).is_empty()
+                    {
+                        return Err("contextual ABI cannot share aggregate or ownership sidecars".into());
+                    }
+                    let mut parameters = definition_type.get_param_types().into_iter().map(Into::into)
+                        .collect::<Vec<inkwell::types::BasicMetadataTypeEnum<'_>>>();
+                    parameters.push(context.ptr_type(inkwell::AddressSpace::default()).into());
+                    definition_type = match definition_type.get_return_type() {
+                        Some(ty) => ty.fn_type(&parameters, false),
+                        None => context.void_type().fn_type(&parameters, false),
+                    };
+                }
                 let value = module.add_function(
                     &name,
-                    aggregate_transfer::definition_type(&context, function, cfg, target_layout, &inline_results, &layouts, plan)?,
-                    if root_array_accessors.contains_key(name) { Some(Linkage::Private) }
+                    definition_type,
+                    if contextual { Some(Linkage::Internal) }
+                    else if root_array_accessors.contains_key(name) { Some(Linkage::Private) }
                     else { aggregate_transfer::linkage(plan) },
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
@@ -1828,7 +1898,7 @@ fn emit_project_llvm<'a>(
     for (ordinal, name, arm) in &anonymous_definitions {
         let nodes = arm.typed_nodes()?;
         emit_function(
-            true, false, None, &context, &builder, &functions, &call_targets, &signatures,
+            true, false, None, None, &context, &builder, &functions, &call_targets, &signatures,
             &runtime_array_results, &dynamic_owner_outputs, &globals, arm.function(), arm.cfg(),
             Some(&nodes), &initializer_symbols, name, &names.scopes[ordered_positions[*ordinal]],
             &module, &all_structs, &layouts, target_layout,
@@ -1863,9 +1933,23 @@ fn emit_project_llvm<'a>(
             }
             _ => generic_input.bind_body(ordinal, item, arm, &function.body)?,
         };
+        if function.runtime_enum_match.is_some() {
+            if generic_input.contextual_formal(ordinal, item, arm).is_some() {
+                return Err("runtime match cannot use a contextual ABI formal".into());
+            }
+            emit_prepared_runtime_enum(&context, &builder, &functions, name, function, project_build,
+                ordinal, item, original && arm.is_none() && nodes.is_some(), target_layout)?;
+            continue;
+        }
         emit_project_function(
             prepared_render,
+            match (project_build, nodes.as_ref()) {
+                (Some(build), Some(nodes)) if original && arm.is_none() =>
+                    build.bind_runtime_enum_initializer(ordinal, item, function, nodes)?,
+                _ => None,
+            },
             aggregates.body(ordinal, item, arm),
+            generic_input.contextual_formal(ordinal, item, arm),
             &context,
             &builder,
             &functions,
@@ -2252,13 +2336,15 @@ fn function_value_result(
 struct InlineResultShapes<'a> {
     definitions: HashMap<&'a crate::scalar::ScalarStructId, &'a ScalarStruct>,
     fixed: std::cell::RefCell<HashMap<&'a crate::scalar::ScalarStructId, bool>>,
+    tag_only_enums: std::collections::BTreeSet<&'a crate::scalar::ScalarEnumId>,
 }
 
 impl<'a> InlineResultShapes<'a> {
-    fn new(structs: &[&'a ScalarStruct]) -> Self {
+    fn new(structs: &[&'a ScalarStruct], enums: impl Iterator<Item = &'a crate::scalar::ScalarEnum>) -> Self {
         Self {
             definitions: structs.iter().map(|&decl| (&decl.id, decl)).collect(),
             fixed: Default::default(),
+            tag_only_enums: enums.filter(|decl| decl.has_tag_only_layout()).map(|decl| &decl.id).collect(),
         }
     }
 
@@ -2268,7 +2354,10 @@ impl<'a> InlineResultShapes<'a> {
         memo: &mut HashMap<&'a crate::scalar::ScalarStructId, bool>,
     ) -> bool {
         match ty {
-            ScalarType::Bool | ScalarType::Char | ScalarType::Enum(_) | ScalarType::F32 | ScalarType::F64 => true,
+            ScalarType::Bool | ScalarType::Char | ScalarType::F32 | ScalarType::F64 => true,
+            // Dev3's scoped runtime payload enum route is not the i32 tag
+            // ABI used by ordinary storage. Require the exact declaration.
+            ScalarType::Enum(id) => self.tag_only_enums.contains(id),
             ty if integer_width(ty).is_some() => true,
             ScalarType::Array { element, .. } => self.fixed_inline(element, memo),
             ScalarType::Struct(id) => {
@@ -2358,6 +2447,7 @@ mod local_callable;
 pub(crate) use local_callable::closed_scalar_target;
 mod portable_reborrow;
 mod memory;
+mod runtime_enum_match;
 use memory::{
     aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
     emit_array_literal, emit_place_value, emit_place_value_in_project, emit_struct_literal,
@@ -2445,6 +2535,20 @@ fn store_binding_outputs<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
+    if let [receiver] = binding.receivers.as_slice() {
+        if let Some(id) = &receiver.contextual_storage {
+            let value = take_basic(value)?;
+            let slot = entry_storage_alloca(context, state, &receiver.ty, "contextual")?;
+            state.builder.build_store(slot, value).map_err(builder_error)?;
+            let id = std::rc::Rc::new(id.clone());
+            let std::collections::btree_map::Entry::Vacant(entry) = state.contextual_storage.entry(id.clone()) else {
+                return Err("duplicate prepared LLVM contextual storage".to_owned());
+            };
+            entry.insert((slot, receiver.ty.clone()));
+            state.contextual_installs.push(id);
+            return Ok(());
+        }
+    }
     if local_callable::store_binding(context, state, binding, &value)? {
         return Ok(());
     }
@@ -3223,6 +3327,8 @@ fn emit_project_binding_value<'ctx, 'module>(
 fn emit_function<'ctx, 'module>(
     prepared_render: bool,
     require_release_checked_access: bool,
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -3268,6 +3374,7 @@ fn emit_function<'ctx, 'module>(
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access,
+        runtime_enum_initializer,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -3289,6 +3396,8 @@ fn emit_function<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: StorageBindings::default(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -3489,6 +3598,7 @@ fn emit_main<'ctx, 'module>(
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access,
+        runtime_enum_initializer: None,
         aggregate: None,
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
@@ -3506,6 +3616,8 @@ fn emit_main<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: StorageBindings::default(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -3597,7 +3709,10 @@ fn emit_main<'ctx, 'module>(
 
 fn emit_project_function<'ctx, 'module>(
     prepared_render: bool,
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
+    contextual_formal: Option<(&crate::scalar::ReferenceBindingId, &ScalarType)>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -3647,6 +3762,7 @@ fn emit_project_function<'ctx, 'module>(
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access: project_names.require_release_checked_access,
+        runtime_enum_initializer,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -3668,6 +3784,8 @@ fn emit_project_function<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: StorageBindings::default(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -3708,6 +3826,19 @@ fn emit_project_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    if let Some((binding, ty)) = contextual_formal {
+        if !prepared_render || aggregate_plan.is_some() || array_descriptor_forward.is_some()
+            || value.count_params() as usize != function.parameters.len() + 1
+            || !dynamic_return_outputs(function.span, reference_cfg).is_empty()
+        {
+            return Err("unexpected contextual formal ABI".into());
+        }
+        let Some(BasicValueEnum::PointerValue(pointer)) = value.get_nth_param(function.parameters.len() as u32) else {
+            return Err("missing contextual pointer formal".into());
+        };
+        pointer.set_name("wosy_context");
+        state.contextual_storage.insert(std::rc::Rc::new(binding.clone()), (pointer, ty.clone()));
+    }
     use aggregate_transfer::ArrayDescriptorForward;
     if let Some(call) = array_descriptor_forward {
         return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Owned);
@@ -3893,6 +4024,7 @@ fn emit_project_main<'ctx, 'module>(
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access: names.require_release_checked_access,
+        runtime_enum_initializer: None,
         aggregate: None,
         initializer_aggregate: None,
         initializer_nodes: None,
@@ -3910,6 +4042,8 @@ fn emit_project_main<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: StorageBindings::default(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -4281,6 +4415,7 @@ fn emit_block_at<'ctx, 'module>(
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage_scope = state.storage.enter_scope();
+    let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -4321,6 +4456,9 @@ fn emit_block_at<'ctx, 'module>(
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage.leave_scope(storage_scope);
+    for id in state.contextual_installs.drain(contextual_depth..) {
+        state.contextual_storage.remove(id.as_ref());
+    }
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()
@@ -4363,6 +4501,7 @@ fn emit_project_block_at<'ctx, 'module>(
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage_scope = state.storage.enter_scope();
+    let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -4422,6 +4561,9 @@ fn emit_project_block_at<'ctx, 'module>(
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage.leave_scope(storage_scope);
+    for id in state.contextual_installs.drain(contextual_depth..) {
+        state.contextual_storage.remove(id.as_ref());
+    }
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()
@@ -5073,6 +5215,14 @@ fn retain_assignment_destination<'ctx>(
         return Ok(AssignmentDestination::Unit);
     }
     match &target.place {
+        crate::ScalarPlace::Contextual { binding, ty: expected, .. } => {
+            let (pointer, stored) = state.contextual_storage.get(binding)
+                .ok_or_else(|| "missing prepared LLVM contextual destination".to_owned())?;
+            if stored != expected || expected != ty {
+                return Err("invalid prepared LLVM contextual destination type".to_owned());
+            }
+            Ok(AssignmentDestination::Existing(*pointer))
+        }
         crate::ScalarPlace::Name { name, .. } => {
             match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
                 state
@@ -5670,6 +5820,8 @@ fn assignment_place_type<'ctx, 'module>(
     place: &crate::ScalarPlace,
 ) -> Option<ScalarType> {
     match place {
+        crate::ScalarPlace::Contextual { binding, ty, .. } => state.contextual_storage.get(binding)
+            .and_then(|(_, stored)| (stored == ty).then(|| ty.clone())),
         crate::ScalarPlace::Name { name, .. } => state
             .storage
             .get(name.as_str())
@@ -6416,7 +6568,7 @@ enum GenericInitializerInput<'a> {
     PreparedRows(&'a crate::PreparedScalarProject),
 }
 
-impl GenericInitializerInput<'_> {
+impl<'a> GenericInitializerInput<'a> {
     fn requires_release_checked_access(&self) -> bool {
         matches!(self, Self::PreparedRows(prepared) if prepared.requires_release_checked_access())
     }
@@ -6427,6 +6579,17 @@ impl GenericInitializerInput<'_> {
 
     fn has_closed_shared_scalar_reader(self, module: usize, declaration: wosy_syntax::ByteSpan) -> bool {
         matches!(self, Self::PreparedRows(prepared) if prepared.has_closed_shared_scalar_reader(module, declaration))
+    }
+
+    fn contextual_formal(self, module: usize, item: usize, arm: Option<usize>)
+        -> Option<(&'a crate::scalar::ReferenceBindingId, &'a ScalarType)>
+    {
+        #[cfg(any(test, feature = "internal-checker"))]
+        if let Self::PreparedRows(prepared) = self {
+            return prepared.contextual_formal(module, item, arm);
+        }
+        let _ = (module, item, arm);
+        None
     }
 
     fn visit_body_overloads(
@@ -6450,13 +6613,13 @@ impl GenericInitializerInput<'_> {
         }
     }
 
-    fn bind_body<'a>(
-        &'a self,
+    fn bind_body<'b>(
+        &'b self,
         module: usize,
         item: usize,
         arm: Option<usize>,
-        body: &'a ScalarBlock,
-    ) -> Result<Option<CallableBodyCallNodes<'a>>, String> {
+        body: &'b ScalarBlock,
+    ) -> Result<Option<CallableBodyCallNodes<'b>>, String> {
         match self {
             Self::RawStandalone(prepared) => prepared.bind_body(item, arm, body).map(Some),
             Self::RawProject(prepared) | Self::PreparedRows(prepared) => prepared

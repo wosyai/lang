@@ -1,0 +1,11 @@
+import subprocess
+import sys
+
+partition, output_dir, manifest, runtime = sys.argv[1:]
+objects = [output_dir + "/" + name + ".o" for name in ("main", "start", "runtime")]
+for source, destination in zip((partition, "scripts/start.ll", runtime), objects):
+    subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir", source, "-o", destination], check=True)
+subprocess.run(
+    ["wasm-ld", "--no-entry", "--allow-undefined", "--export=_start", *objects, "-o", output_dir + "/main"],
+    check=True,
+)

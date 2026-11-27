@@ -6,6 +6,9 @@ use wosy_syntax::{
 };
 
 mod scalar;
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub use scalar::derive_scalar_check_declarations_from_cst;
 pub use llvm::{
     emit_scalar_build_project_artifact_llvm, emit_scalar_build_project_llvm,
     emit_scalar_build_project_llvm_text, emit_scalar_build_single_module_artifact_llvm,
@@ -14,13 +17,14 @@ pub use llvm::{
     LlvmValueType,
 };
 pub use scalar::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
+    analyze_scalar_build, derive_scalar_build_declarations_from_cst, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
     derive_scalar_program, derive_scalar_program_from_cst,
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
     prepare_scalar_project, prepare_scalar_project_with_access, validate_scalar_project, BinaryOperator, PreparedScalarProject,
     ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,
+    ScalarEnumPayloadLayout, ScalarEnumPayloadSlotLayout, ScalarEnumVariantLayout,
     ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction, ScalarInitializationNode,
     ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
     ScalarOutputReceiver, ScalarOutputSequence, ScalarPlace, ScalarPreparationInputs,
@@ -29,6 +33,10 @@ pub use scalar::{
     ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
     ScalarValidation, UnaryOperator,
 };
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub use scalar::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, prepare_loaded_scalar_ordered_local_proof_contexts, PreparedScalarOrderedCheck, PreparedStartupAuthoredCheck, StartupAuthoredCompletion, MainFlowProofReceipt, ContextualProofDiagnostic, MainFlowProofDiagnostic, MainFlowProofInvocation, ScalarCheckerProofLiteral, SymbolicProofDiagnostic, ScalarCheckerIeeeEntry, ScalarCheckerIeeeValue, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarCheckerTextFile, CheckedOutputTargets};
 
 mod llvm;
 
@@ -512,13 +520,53 @@ pub fn parse_source(
     text: String,
     configured_comments: &[String],
 ) -> ParseOutput {
-    let result = wosy_syntax::parse(source, text, configured_comments);
-    let diagnostics = parse_diagnostics(&result);
-    ParseOutput {
-        result,
-        diagnostics,
-    }
+    parsed_source_output(wosy_syntax::parse(source, text, configured_comments))
 }
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_proof_source(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_configured_proof_source(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_configured_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_configured_root_proof_source(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_configured_root_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
+fn parse_proof_source_for(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+    derive: impl FnOnce(&wosy_syntax::CanonicalCstRoot) -> ScalarProofDeclarations,
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    let output = parsed_source_output(wosy_syntax::parse_proof_module(source, text, configured_comments));
+    if !output.result.is_valid() {
+        return Err(output);
+    }
+    let proof = derive(output.result.canonical_cst());
+    Ok((output.result.text, proof))
+}
+
+fn parsed_source_output(result: ParseResult) -> ParseOutput {
+    let diagnostics = parse_diagnostics(&result);
+    ParseOutput { result, diagnostics }
+}
+
 
 pub fn parse_source_with_snapshot(
     source: SourceIdentity,

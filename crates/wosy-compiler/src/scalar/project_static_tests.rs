@@ -20,6 +20,7 @@ fn raw_project(text: &str, target_layout: ScalarTargetLayout) -> ScalarProject {
         structs,
         enums,
         diagnostics,
+        ..
     } = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let initialization_order = vec![source.clone()];
