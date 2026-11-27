@@ -53,7 +53,7 @@ mod framed_session;
 #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
 mod native_diagnostics;
 #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
-pub use native_diagnostics::NativeKnownDiagnostics;
+pub use native_diagnostics::{NativeKnownDiagnostics, NativeKnownExecutableInputs};
 mod grammar_receipts;
 mod installed_git_scope;
 mod derivation_image;

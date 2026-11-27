@@ -226,6 +226,34 @@ impl SqliteSourceState {
         }, Recovery::NativeKnown).await
     }
 
+    /// Explicit native V3 observation through the project activator's own
+    /// direct child. The pinned selection comes from activation, not the
+    /// socket; an executable digest alone never grants this route. No
+    /// artifact write, builder run, cache reuse or default CLI change.
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    pub async fn native_owned_executable_builder_inputs(
+        &mut self, directory: &std::path::Path, child: &mut std::process::Child, executable: &File,
+        selected: &BuildSourceSelection, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        max_partition_bytes: usize, output: PathBuf,
+    ) -> Result<AcknowledgedOrdinaryLlvm<AcknowledgedOrdinaryBuilderInputs>> {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let expected_peer = AuthorizedOrdinaryBuilderPeer::from_open_executable(executable.try_clone()?)?;
+        require_diagnostic_time(deadline)?;
+        let mut child = Some(child);
+        self.live_executable_builder_inputs(&selected.target, profile, deadline.saturating_duration_since(Instant::now()),
+            max_authored_source_bytes, max_partition_bytes, &expected_peer, output,
+            |actual| {
+                let child = child.take();
+                async move {
+                    if &actual != selected {
+                        return Err("native V3 source differs from the activated selection".into());
+                    }
+                    let child = child.ok_or("native V3 activation can only open one connection")?;
+                    Ok(wosy_protocol::native_diagnostics::connect_owned_child(directory, child, executable).await?)
+                }
+            }).await
+    }
+
     /// Explicit local-adapter request for ordinary authored LLVM (not an
     /// incremental Build verdict). The adapter owns its dedicated stream
     /// and grants the separate server capability for exactly this source.

@@ -37,6 +37,22 @@ impl NativeDiagnosticListener {
         require_peer(&stream, self.endpoint.owner)?;
         Ok(stream)
     }
+
+    /// The private V3 listener is activated by the direct parent and only
+    /// returns a stream to that explicitly selected, still-current parent.
+    pub async fn accept_direct_parent(&self, expected_parent: u32) -> io::Result<UnixStream> {
+        let parent = || rustix::process::getppid()
+            .and_then(|pid| u32::try_from(pid.as_raw_pid()).ok());
+        if parent() != Some(expected_parent) {
+            return Err(invalid("local diagnostic activator is not the direct parent"));
+        }
+        let stream = self.accept().await?;
+        let peer = stream.peer_cred()?.pid().and_then(|pid| u32::try_from(pid).ok());
+        if peer != Some(expected_parent) || parent() != Some(expected_parent) {
+            return Err(invalid("local diagnostic peer is not the direct parent"));
+        }
+        Ok(stream)
+    }
 }
 
 /// Connect to the configured private socket, not a path received over the

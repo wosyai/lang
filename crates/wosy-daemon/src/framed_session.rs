@@ -41,11 +41,12 @@ struct ProjectionScope {
     declaration_bytes: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct OrdinaryLlvmScope {
     limits: BaseCstAdmissionLimits,
     bytes: usize,
     version: u16,
+    pinned_profile: Option<String>,
 }
 
 enum Opening {
@@ -116,6 +117,7 @@ impl SourceStorageWorker {
     ) -> Result<BuildSessionEnd> {
         let ordinary_llvm = Some(OrdinaryLlvmScope {
             limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version: ORDINARY_LLVM_PROJECTION_VERSION,
+            pinned_profile: None,
         });
         self.serve_selected_session(stream, selected, lifetime,
             Opening::Recoverable { replay, limits, ordinary_llvm }, None).await
@@ -146,10 +148,23 @@ impl SourceStorageWorker {
         limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration, version: u16,
     ) -> Result<BuildSessionEnd> {
         let ordinary_llvm = Some(OrdinaryLlvmScope {
-            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version,
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version, pinned_profile: None,
         });
         self.serve_selected_session(stream, selected, lifetime,
             Opening::Recoverable { replay: None, limits, ordinary_llvm }, None).await
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    pub(super) async fn serve_native_executable_inputs_before<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, profile: String,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration, cutoff: Instant,
+    ) -> Result<BuildSessionEnd> {
+        let ordinary_llvm = Some(OrdinaryLlvmScope {
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES),
+            version: ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, pinned_profile: Some(profile),
+        });
+        self.serve_selected_session(stream, selected, lifetime,
+            Opening::Recoverable { replay: None, limits, ordinary_llvm }, Some(cutoff)).await
     }
 
     /// Only the NativeKnown host passes a non-renewable authority cut.
@@ -265,10 +280,11 @@ impl SourceStorageWorker {
 
 async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     session: &BuildDiagnosticSession<'_>, frames: &mut SessionFrameReader, input: &mut R,
-    output: &mut W, projection: Option<&ProjectionScope>, ordinary_llvm: Option<OrdinaryLlvmScope>,
+    output: &mut W, projection: Option<&ProjectionScope>, mut ordinary_llvm: Option<OrdinaryLlvmScope>,
 ) -> Result<Close> {
     let mut owner = None;
     let cutoff = session.hard_deadline();
+    let native_v3 = ordinary_llvm.as_ref().is_some_and(|scope| scope.pinned_profile.is_some());
     loop {
         if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
         let Some(deadline) = session.deadline() else { return Ok(Close::Deadline); };
@@ -279,6 +295,12 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         };
         if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
         let (id, operation) = match request? {
+            Some(Command { id, request: Request::Analyze { .. } }) if native_v3 => {
+                if !send(output, deadline, cutoff, id, Reply::Refused { reason: Refusal::AnalysisUnavailable }).await? {
+                    return Ok(Close::Deadline);
+                }
+                continue;
+            }
             Some(Command { id, request: Request::Analyze { request } }) => (id, Operation::Analyze(request)),
             Some(Command { id, request: Request::ProjectBaseDeclarations { version, proposal } }) => {
                 let refusal = if version != BASE_DECLARATION_PROJECTION_VERSION {
@@ -302,7 +324,11 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             Some(Command { id, request: Request::ProjectOrdinaryLlvm { version, profile } }) => {
                 let supported = matches!(version, ORDINARY_LLVM_PROJECTION_VERSION | ORDINARY_LLVM_BUILDER_INPUT_VERSION | ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION);
-                if let Some(scope) = ordinary_llvm.filter(|scope| scope.version == version && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES) {
+                let scope = ordinary_llvm.as_ref().filter(|scope| scope.version == version
+                    && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES
+                    && scope.pinned_profile.as_ref().is_none_or(|selected| selected == &profile)).cloned();
+                if let Some(scope) = scope {
+                    if native_v3 { ordinary_llvm = None; }
                     (id, Operation::OrdinaryLlvm(scope, version, profile))
                 } else {
                     let reason = if !supported { Refusal::UnsupportedVersion }
