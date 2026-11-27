@@ -1753,6 +1753,8 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     // segment. Never defer analysis of possibly effectful intervening items.
     #[cfg(feature = "internal-checker")]
     let mut passive_generation = 0usize;
+    #[cfg(feature = "internal-checker")]
+    let mut completed_qualifiers = HashMap::new();
     for (generation, step) in region.steps.iter().enumerate() {
         #[cfg(not(feature = "internal-checker"))]
         let _ = generation;
@@ -1778,6 +1780,8 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             )? == StartupLane::Empty {
                 return Ok(StartupLane::Empty);
             }
+            #[cfg(feature = "internal-checker")]
+            completed_qualifiers.insert(*binding_span,target);
             continue;
         }
         let checked_item = checked_items.next().filter(|item| item.position == step.item)
@@ -1819,6 +1823,20 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     (ScalarType::Bool, ScalarExpression::Boolean { .. })
                     | (ScalarType::Char, ScalarExpression::Char { .. })));
             #[cfg(feature = "internal-checker")]
+            let passive_import = passive_receiver.and_then(|receiver| {
+                if !actual.permits_authored_startup_scalars() || !matches!(&binding.value, ScalarExpression::Member { .. }) { return None; }
+                let effects = failures.as_deref_mut()?;
+                if !effects.contextual_proofs.entries.is_empty() || effects.mixed_startup.is_some()
+                    || effects.startup_search.as_ref().is_some_and(|trace| !trace.borrow().proof_free_scalar_initializers)
+                { return None; }
+                let result = completed_nominal_initializer_copy(
+                    topology, source, outputs.primary, &receiver.ty, visits, ordinals, project,
+                    &completed_qualifiers, completed_passive,
+                )?;
+                super::checker_flow::charge_call_work(&mut effects.passive_literal_work,1)?;
+                Some(result)
+            });
+            #[cfg(feature = "internal-checker")]
             let passive_return = passive_receiver.and_then(|receiver| {
                 if !actual.permits_authored_startup_scalars() || !matches!(receiver.ty, ScalarType::Struct(_))
                     || !matches!(&binding.value, ScalarExpression::Call { receiver: Some(_), arguments, .. } if arguments.is_empty())
@@ -1833,7 +1851,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 )
             });
             #[cfg(feature = "internal-checker")]
-            if !passive_literal && !passive_scalar && passive_return.is_none() {
+            if !passive_literal && !passive_scalar && passive_return.is_none() && passive_import.is_none() {
                 passive_generation = generation + 1;
                 // Namespace completion alone does not guarantee a value is
                 // unchanged across a later executable initializer.
@@ -1841,7 +1859,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 projected_storage.forget();
             }
             #[cfg(feature = "internal-checker")]
-            if startup_trace_requested(failures) && !passive_literal && passive_return.is_none()
+            if startup_trace_requested(failures) && !passive_literal && passive_return.is_none() && passive_import.is_none()
                 && passive_float.is_none() && passive_integer.is_none() && passive_enum.is_none()
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
@@ -1904,6 +1922,11 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     super::checker_flow::charge_call_work(&mut effects.passive_literal_work, 1)
                         .ok_or(ProjectCheck::Unsupported)?;
                     InitializerValue::PassiveFloat { _atom: passive_float.ok_or(ProjectCheck::Unsupported)? }
+                },
+                #[cfg(feature = "internal-checker")]
+                (ty, _) if passive_import.is_some() => {
+                    let (value,depth) = passive_import.ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::PassiveAggregate { ty,generation:passive_generation,depth,value }
                 },
                 #[cfg(feature = "internal-checker")]
                 (ty, _) if passive_return.is_some() => {
@@ -2841,6 +2864,33 @@ enum InitializerValue<'a> {
         depth: usize,
         value: std::rc::Rc<PassiveLiteral<'a>>,
     },
+}
+
+#[cfg(feature = "internal-checker")]
+fn completed_nominal_initializer_copy<'p>(
+    topology: &ModuleInitializationTopology, caller: &SourceIdentity, at: OccurrenceOrdinal,
+    expected: &ScalarType, visits: &[InitializationVisit], ordinals: &HashMap<&'p SourceIdentity,usize>,
+    project: &'p ScalarProject, qualifiers: &HashMap<ByteSpan,&SourceIdentity>,
+    captured: &CompletedPassiveStorage<'p>,
+) -> Option<(Rc<PassiveLiteral<'p>>,usize)> {
+    let ScalarType::Struct(id) = expected else { return None; };
+    if topology.structure.checked_types.expressions.get(&at)? != expected { return None; }
+    let super::control::InitializationMember::Module { qualifier, declaration, .. } =
+        topology.identities.members.get(&at)? else { return None; };
+    if caller == &declaration.source || &id.source != &declaration.source
+        || *qualifiers.get(qualifier)? != &declaration.source
+    { return None; }
+    let ordinal = *ordinals.get(&declaration.source)?;
+    if !completed_namespace_owner(caller,&declaration.source,ordinal,Some(visits)) { return None; }
+    let owner = project.modules.get(ordinal)?;
+    if owner.source != declaration.source
+        || !owner.structs.get(id.index).is_some_and(|nominal| &nominal.id == id && nominal.copy_policy == super::CopyPolicy::Copy)
+    { return None; }
+    // The table contains only the final independently checked passive
+    // generation; an unknown executable transition clears it before use.
+    let InitializerValue::PassiveAggregate { ty,value,depth,.. } =
+        captured.get(&ordinal)?.get(&declaration.range)? else { return None; };
+    (expected == *ty).then(|| (Rc::clone(value),*depth))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -19420,6 +19470,45 @@ mod tests {
                 assert!(matches!(prepare(&separated, scope).run_private_authored_root(NonZeroUsize::MIN),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 assert!(matches!(prepare(&separated, scope).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn passive_qualified_nominal_copy_requires_completed_current_copy_source() {
+        let app = source("src/main.w","completed-qualified-nominal-copy");
+        let lib = source("src/lib.w","completed-qualified-nominal-provider");
+        let provider = "%%start struct copy Part { i32 section; f32 x; } Part empty={.section=2;.x=0.75;}; %%end";
+        let positive = |middle: &str| format!(r#"%%start
+            station = namespace demo "src/lib.w";
+            {middle}
+            station.Part hull_piece=station.empty;
+            core.require(true,{OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for capped in [false,true] {
+                let run = |text: &str, provider: &str, source: &SourceIdentity| {
+                    let binding = text.find("station =").unwrap();
+                    let end = binding + text[binding..].find(';').unwrap()+1;
+                    let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                            binding:"station".into(),target:source.clone(),span:ByteSpan::new(binding as u32,end as u32),
+                        }]),(declarations(source,provider),vec![])],[],vec![app.clone(),source.clone()],
+                        ScalarPreparationInputs { target_layout },ScalarCheckerScope::CurrentPackage,Vec::new(),
+                    )?;
+                    if capped { prepared.run_private_authored_root(std::num::NonZeroUsize::MIN).map(|(report,_)| report) }
+                    else { prepared.run() }
+                };
+                let valid = run(&positive("bool harmless=true;"),provider,&lib)
+                    .unwrap_or_else(|error| panic!("typed Copy import {target_layout:?} capped={capped}: {error:?}"));
+                assert!(valid.active && valid.directives.is_empty());
+                assert!(matches!(run(&positive(&format!("core.require(true,{OUTPUT});")),provider,&lib),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                let noncopy = provider.replace("struct copy Part","struct Part");
+                assert!(matches!(run(&positive(""),&noncopy,&lib), Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
+                let other = SourceIdentity { package:"another-package".into(), ..lib.clone() };
+                assert!(matches!(run(&positive(""),provider,&other),Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
             }
         }
     }
