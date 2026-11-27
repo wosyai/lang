@@ -2086,6 +2086,8 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                         }
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
                             projected_storage.observe_array(declaration, ty, cells.into_iter());
+                        } else if fixed_f32_array_type(ty) {
+                            projected_storage.observe_aggregate(declaration);
                         }
                     }
                     _ => {}
@@ -2337,6 +2339,11 @@ fn try_observed_projected_storage_call(
         let ObservedExactValue::F32(value) = observed_nominal_f32_field(initialized.get(&cell.declaration.range)?, cell.index, &field)? else { return None; };
         Some(value)
     };
+    let read_array = |storage: &super::checker_flow::ProjectedStorage, cell: &super::checker_flow::observed_f32_array::Cell| {
+        if &cell.declaration.source != source || !storage.has_observed_aggregate(&cell.declaration) { return None; }
+        if let Some(value) = storage.observed_f32_array_element(cell) { return Some((value,1)); }
+        observed_passive_f32_array_element(initialized.get(&cell.declaration.range)?, &cell.indices)
+    };
     let mut prefix = Vec::new();
     let mut prefix_history = None;
     if let Some(plan) = &plan {
@@ -2438,7 +2445,7 @@ fn try_observed_projected_storage_call(
         getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call), Some(&scalar_getter), Some(&frontiers),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -3048,6 +3055,34 @@ fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
     if *actual != &field.structure { return None; }
     let PassiveLiteral::Float(ranked_float::Atom::Single(bits)) = original(fields.get(field.index)?) else { return None; };
     Some(ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?))
+}
+
+#[cfg(feature = "internal-checker")]
+fn fixed_f32_array_type(mut ty: &ScalarType) -> bool {
+    if !matches!(ty,ScalarType::Array { .. }) { return false; }
+    while let ScalarType::Array { element,.. } = ty { ty = element; }
+    *ty == ScalarType::F32
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_passive_f32_array_element(value: &InitializerValue<'_>, indices: &[u64])
+    -> Option<(super::checker_flow::projected_f32::ExactF32,usize)> {
+    let InitializerValue::PassiveAggregate { mut ty,value,.. } = value else { return None; };
+    let mut value = value.as_ref();
+    let mut work = 1usize;
+    for &index in indices {
+        let ScalarType::Array { element,length,.. } = ty else { return None; };
+        work = work.checked_add(1)?;
+        while let PassiveLiteral::Copy(next) = value { value = next; work = work.checked_add(1)?; }
+        let PassiveLiteral::Array(cells) = value else { return None; };
+        if u64::try_from(cells.len()).ok()? != *length || index >= *length { return None; }
+        value = cells.get(usize::try_from(index).ok()?)?;
+        ty = element;
+    }
+    if *ty != ScalarType::F32 { return None; }
+    while let PassiveLiteral::Copy(next) = value { value = next; work = work.checked_add(1)?; }
+    let PassiveLiteral::Float(ranked_float::Atom::Single(bits)) = value else { return None; };
+    Some((super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?,work))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12526,7 +12561,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -24734,6 +24769,84 @@ unit(u8) parent = fn(a) {
                 assert!(matches!(prepare(program).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
             eprintln!("Orbital original index_range {target_layout:?}: empty and failed-provider return, live recursion remains unadmitted");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine (packing algorithms not exercised)"]
+    fn pinned_orbital_pt_carries_eight_current_mesh_lanes_to_index_vertex() {
+        use std::num::NonZeroUsize;
+        let engine = std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let fragment = |from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=engine[start..].find(until).unwrap()+start;
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let vertex=fragment("unit(i32,u64,u64,u64,u64) index_vertex=", "unit(i32,i32) static_partition=");
+        let pt=fragment("bool robot_turn=false;", "unit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let packing=r#"%%start
+            i32 score=0;
+            i32() report=fn{score};
+            unit(i32,f32,f32,f32,f32,f32,f32,f32,f32) put=fn(i,x,y,z,r,g,b,s,l){
+                score=0;
+                if(i==4097){score=512;};
+                if(x==1.125){score=score+1;};
+                if(y== -2.25){score=score+2;};
+                if(z==3.5){score=score+4;};
+                if(r==0.125){score=score+8;};
+                if(g==0.25){score=score+16;};
+                if(b==0.375){score=score+32;};
+                if(s== -4.5){score=score+64;};
+                if(l==0.625){score=score+128;};
+            };
+        %%end"#;
+        let text=format!(r#"%%start
+            packing=namespace demo "mesh-lanes.w";
+            {mesh}
+            i32 count=4097;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32 received=0; i32 adjacent=0;
+            {pt}
+            {vertex}
+            unit() launch=fn {{
+                pt(1.125,-2.25,3.5,-4.5);
+                index_vertex(4097,1,0,0,1);
+                received=packing.report();
+                index_vertex(1,0,0,0,1);
+                adjacent=packing.report();
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=received;.files=[{{.path="adjacent.json";.state=adjacent;}}];}});
+        %%end"#);
+        let bad=text.replace("index_vertex(4097,1,0,0,1)", "index_vertex(4097,5,0,0,1)");
+        let app=source("src/main.w","pinned-orbital-productive-vertex");
+        let provider=source("src/mesh-lanes.w","mesh-lane-test-observer");
+        let binding=r#"packing=namespace demo "mesh-lanes.w";"#;
+        let start=text.find(binding).unwrap() as u32;
+        let put="packing.put(";
+        let put_start=text.find(put).unwrap() as u32;
+        let put_end=text[put_start as usize..].find(");").unwrap() as u32 + put_start + 1;
+        let put_span=wosy_syntax::SourceSpan::new(app.clone(),ByteSpan::new(put_start,put_end));
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(), target:provider.clone(),
+                    span:ByteSpan::new(start,start+binding.len() as u32),
+                }]),(declarations(&provider,packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let all=prepare(&text).run().unwrap();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(767));
+            assert_eq!(report.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":0}\n");
+            let (capped,_,trace,_)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(all.directives,capped);
+            assert!(trace.contains_return(&put_span));
+            assert!(matches!(prepare(&bad).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            eprintln!("Orbital pt/index_vertex {target_layout:?}: eight live lanes 255, untouched copied neighbor 0, checked out-of-range rejected");
         }
     }
 

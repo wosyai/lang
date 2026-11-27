@@ -1781,6 +1781,8 @@ pub(super) mod projected_f32;
 mod storage_delta;
 #[cfg(feature = "internal-checker")]
 mod observed_integer;
+#[cfg(feature = "internal-checker")]
+pub(super) mod observed_f32_array;
 
 #[cfg(feature = "internal-checker")]
 use storage_delta::StorageDelta;
@@ -1808,6 +1810,7 @@ pub(super) struct ProjectedStorage {
     f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
     aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
+    f32_array_updates: StorageDelta<observed_f32_array::Cell, projected_f32::ExactF32>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1839,6 +1842,16 @@ impl ProjectedStorage {
                 *scalar = value;
             }
         }
+        Some(())
+    }
+
+    pub(super) fn observed_f32_array_element(&self, cell: &observed_f32_array::Cell) -> Option<projected_f32::ExactF32> {
+        self.f32_array_updates.get(cell).copied()
+    }
+
+    fn overwrite_f32_array_element(&mut self, cell: observed_f32_array::Cell, value: projected_f32::ExactF32) -> Option<()> {
+        if !self.has_observed_aggregate(&cell.declaration) { return None; }
+        self.f32_array_updates.insert(cell,value);
         Some(())
     }
 
@@ -2303,6 +2316,8 @@ struct IntegerRoots<'a> {
     observed_float_field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
     #[cfg(feature = "internal-checker")]
     observed_float_call: Option<&'a ObservedFloatCall<'a>>,
+    #[cfg(feature = "internal-checker")]
+    observed_f32_array_read: Option<&'a observed_f32_array::Read<'a>>,
     #[cfg(feature = "internal-checker")]
     observed_scalar_getter: Option<&'a ObservedScalarGetter<'a>>,
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
@@ -5484,16 +5499,24 @@ pub(super) fn take_observed_unit_argument_evaluations() -> usize {
 #[cfg(feature = "internal-checker")]
 fn compute_observed_unit_operands(calls: &FunctionCallSites, expression: OccurrenceOrdinal,
     signature: &CheckedCallSignature, roots: &IntegerRoots<'_>, row: &mut IntegerRow,
-) -> Option<ComputedUnitOperands> {
+) -> Option<(ComputedUnitOperands, Vec<(usize,projected_f32::ExactF32)>)> {
     let mut out = Vec::new();
-    if roots.observed_float_field_read.is_none() || !row.has_projected_storage() { return Some(out); }
+    let mut floats = Vec::new();
+    if roots.observed_float_field_read.is_none() || !row.has_projected_storage() { return Some((out,floats)); }
     for (slot, parameter) in signature.parameters.iter().enumerate() {
-        if !is_integer_type(parameter) { continue; }
+        if !is_integer_type(parameter) && *parameter != ScalarType::F32 { continue; }
         let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
             OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
         ))? else { return None; };
-        if !calls.structure.prepared_range_binary.contains_key(argument) { continue; }
         if calls.structure.checked_types.expressions.get(argument)? != parameter { return None; }
+        if *parameter == ScalarType::F32 {
+            let value = if let Some(place) = observed_f32_array::expression(calls,*argument) {
+                observed_f32_array::read(calls,place,roots,row)?
+            } else { exact_observed_float_operand(calls,*argument,row)? };
+            floats.push((slot,value));
+            continue;
+        }
+        if !calls.structure.prepared_range_binary.contains_key(argument) { continue; }
         // Only literal and lexical arithmetic leaves are admitted. The
         // same evaluator rejects a storage read, getter, or any other call
         // before consuming an effect in this lane.
@@ -5502,7 +5525,7 @@ fn compute_observed_unit_operands(calls: &FunctionCallSites, expression: Occurre
         let value = observed_integer::evaluate_pure_argument(calls,*argument,roots,row)?;
         out.push((slot,value));
     }
-    Some(out)
+    Some((out,floats))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9349,6 +9372,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         }
                         continue;
                     }
+                    if let Some((target,value)) = observed_f32_array::assignment(calls,group) {
+                        for row in &mut path.0 {
+                            let value = evaluate_current_float(calls,value,roots,row)?;
+                            let destination = target.address(calls,roots,row)?;
+                            Rc::make_mut(row.storage.as_mut()?).overwrite_f32_array_element(destination,value)?;
+                        }
+                        continue;
+                    }
                     if let Some((target, value)) = observed_float_write(calls, group) {
                         let read = roots.observed_float_field_read?;
                         for row in &mut path.0 {
@@ -12426,16 +12457,24 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
             match &item.kind {
                 BlockItemKind::Assignment { group } => {
                     if let Some((_, at)) = observed_local_float_write(calls, *group) {
-                        observed_float_expr_sites(calls, at, |field| {
-                            covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                        observed_float_expr_sites(calls, at, |declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
                         }, |at| { scalar_calls.insert(at); })?;
+                        continue;
+                    }
+                    if let Some((target,rhs)) = observed_f32_array::assignment(calls,*group) {
+                        covered.insert((target.declaration.clone(),target.site,ModuleStorageRole::Replace));
+                        observed_float_expr_sites(calls,rhs,|declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
+                        },|at| { scalar_calls.insert(at); })?;
+                        writes = true;
                         continue;
                     }
                     if let Some(write) = observed_float_struct_write(calls, *group) {
                         covered.insert((write.declaration.clone(), write.place, ModuleStorageRole::Replace));
                         for (_, at) in write.fields {
-                            observed_float_expr_sites(calls, at, |field| {
-                                covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                            observed_float_expr_sites(calls, at, |declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
                             }, |at| { scalar_calls.insert(at); })?;
                         }
                         writes = true;
@@ -12445,8 +12484,8 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                         covered.insert((target.declaration.clone(), target.site, ModuleStorageRole::Replace));
                         match value {
                             ObservedFloatRhs::Field(field) => { covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project)); }
-                            ObservedFloatRhs::Expression(at) => observed_float_expr_sites(calls, at, |field| {
-                                covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                            ObservedFloatRhs::Expression(at) => observed_float_expr_sites(calls, at, |declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
                             }, |at| { scalar_calls.insert(at); })?,
                             _ => {}
                         }
@@ -12498,8 +12537,8 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                             covered.insert((place.declaration.clone(), place.site, place.role()));
                         }, |at| { scalar_calls.insert(at); }, |_,_| {})?;
                     } else if receiver.ty == ScalarType::F32 && calls.structure.projected_f32_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) {
-                        observed_float_expr_sites(calls, outputs.primary, |field| {
-                            covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                        observed_float_expr_sites(calls, outputs.primary, |declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
                         }, |at| { scalar_calls.insert(at); })?;
                     } else if let Some((operand, _, _)) = calls.structure.checker_module_integer_comparisons.get(&outputs.primary) {
                         if receiver.ty != ScalarType::Bool || !calls.structure.checker_module_integer_comparison_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
@@ -12509,6 +12548,18 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+    for &site in calls.structure.checker_direct_targets.keys() {
+        let signature = calls.checked_call_signatures.get(&site)?;
+        if !matches!(signature.outputs.outputs.as_slice(),[out] if out.ty == ScalarType::Unit) { continue; }
+        for (slot,ty) in signature.parameters.iter().enumerate() {
+            if *ty != ScalarType::F32 { continue; }
+            let OccurrenceNode::Expression(at) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(site),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+            if let Some(place) = observed_f32_array::expression(calls,*at) {
+                covered.insert((place.declaration.clone(),place.site,ModuleStorageRole::Project));
             }
         }
     }
@@ -12773,13 +12824,25 @@ pub(super) type ObservedFloatCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrd
 
 #[cfg(feature = "internal-checker")]
 fn observed_float_expr_sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
-    mut read: impl FnMut(ObservedFloatPlace<'a>), mut call: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
+    mut read: impl FnMut(&'a wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole), mut call: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
+    use super::reference::ModuleStorageRole;
     let mut agenda = vec![at];
     while let Some(at) = agenda.pop() {
         let structure = &calls.structure;
         if structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
         if structure.projected_f32_literals.contains_key(&at) || matches!(calls.prepared_plain_name(at), Some(PlainNameIdentity::Lexical(_))) { continue; }
-        if let Some(place) = observed_float_read_expr(calls, at) { read(place); continue; }
+        if let Some(PlainNameIdentity::ModuleValue(declaration)) = calls.prepared_plain_name(at) {
+            read(declaration,at,ModuleStorageRole::Read);
+            continue;
+        }
+        if let Some(place) = observed_f32_array::expression(calls,at) {
+            read(place.declaration,place.site,ModuleStorageRole::Project);
+            continue;
+        }
+        if let Some(place) = observed_float_read_expr(calls, at) {
+            read(place.declaration,place.site,ModuleStorageRole::Project);
+            continue;
+        }
         if let Some((left, _, right)) = structure.projected_f32_math.get(&at) {
             agenda.push(*right);
             agenda.push(*left);
@@ -12833,6 +12896,16 @@ fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, root
         match work {
             Work::Eval(at) => {
                 if let Some(value) = exact_observed_float_operand(calls, at, row) { values.push(value); continue; }
+                if let Some(PlainNameIdentity::ModuleValue(declaration)) = calls.prepared_plain_name(at) {
+                    let super::checker_project::ObservedExactValue::F32(value) = row.storage.as_ref()?.observed_atom(declaration)?
+                        else { return None; };
+                    values.push(value);
+                    continue;
+                }
+                if let Some(place) = observed_f32_array::expression(calls,at) {
+                    values.push(observed_f32_array::read(calls,place,roots,row)?);
+                    continue;
+                }
                 if let Some(place) = observed_float_read_expr(calls, at) {
                     values.push(roots.observed_float_field_read?(row.storage.as_ref()?, &place.cell(roots,row)?)?);
                     continue;
