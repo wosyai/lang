@@ -1,4 +1,4 @@
-//! Typed, returning readonly prefix certificates. They are not Check results.
+//! Typed, ordered prefix certificates. They are not Check results.
 use super::*;
 use crate::scalar::reference::{BlockOrdinal, NamedPlaceRootIdentity, OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
 use wosy_syntax::SourceSpan;
@@ -8,6 +8,7 @@ type EffectId = usize;
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
     Sequence { at: OccurrenceOrdinal, operands: Vec<EffectId> },
+    LocalRead { at: OccurrenceOrdinal, binding: ReferenceBindingId, version: Option<EffectId> },
     Read { at: OccurrenceOrdinal, declaration: SourceSpan, index: Option<u64> },
     Field { at: OccurrenceOrdinal, field: super::super::ScalarStructFieldId, receiver: EffectId },
     Branch { at: OccurrenceOrdinal, condition: EffectId, yes: EffectId, no: EffectId },
@@ -28,11 +29,38 @@ pub(super) struct EffectRecord {
     pub(super) operation: Effect,
 }
 
+#[derive(Clone)]
+struct LocalFact {
+    ty: ScalarType,
+    // None denotes an arbitrary formal, not a known value.
+    version: Option<EffectId>,
+}
+
+pub(super) struct GuardedWrite {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) destination: OccurrenceOrdinal,
+    pub(super) prior: EffectId,
+    pub(super) assigned: EffectId,
+}
+
+pub(super) struct GuardedJoin {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) taken: EffectId,
+    pub(super) bypass: EffectId,
+}
+
+pub(super) struct GuardedTransfer {
+    pub(super) condition: EffectId,
+    pub(super) writes: Vec<GuardedWrite>,
+    pub(super) joins: Vec<GuardedJoin>,
+}
+
 #[derive(Default)]
 pub(super) struct PrefixCertificate {
     pub(super) effects: Vec<EffectRecord>,
     pub(super) bindings: Vec<BindingFact>,
     pub(super) callees: HashMap<PreparedCallable, FunctionEffects>,
+    pub(super) guarded: Option<GuardedTransfer>,
 }
 
 pub(super) struct FunctionEffects {
@@ -58,6 +86,18 @@ struct Planner<'a> {
 pub(super) fn prepare_readonly_prefix(
     prepared: &PreparedCheckerProject, initialization: &CheckedInitialization<'_>, target: PreparedCallable,
 ) -> Option<PrefixCertificate> {
+    prepare_prefix::<false>(prepared, initialization, target)
+}
+
+pub(super) fn prepare_guarded_prefix(
+    prepared: &PreparedCheckerProject, initialization: &CheckedInitialization<'_>, target: PreparedCallable,
+) -> Option<PrefixCertificate> {
+    prepare_prefix::<true>(prepared, initialization, target)
+}
+
+fn prepare_prefix<const GUARDED: bool>(
+    prepared: &PreparedCheckerProject, initialization: &CheckedInitialization<'_>, target: PreparedCallable,
+) -> Option<PrefixCertificate> {
     let (project, calls) = prepared.parts();
     let module = project.modules.get(target.0)?;
     if initialization.visits.get(target.0) != Some(&InitializationVisit::Completed)
@@ -69,6 +109,19 @@ pub(super) fn prepare_readonly_prefix(
     let mut locals = frame.formals()?;
     let checked = frame.prepared.structure.blocks.get(frame.prepared.structure.root.0)?;
     for (item, prepared) in frame.function.body.items.iter().zip(&checked.items) {
+        if GUARDED && matches!(item, ScalarBlockItem::Expression(ScalarExpression::UnitIf { .. })) {
+            let rewind = planner.certificate.effects.len();
+            let mut dependencies = Vec::new();
+            let mut installed = Vec::new();
+            let guarded = planner.guarded_transfer(&frame, item, prepared, &locals, &mut dependencies)
+                .and_then(|guarded| planner.seal_dependencies(dependencies, &mut installed).map(|()| guarded));
+            if guarded.is_none() {
+                planner.certificate.effects.truncate(rewind);
+                for target in installed { planner.certificate.callees.remove(&target); }
+            }
+            planner.certificate.guarded = guarded;
+            break;
+        }
         let rewind = planner.certificate.effects.len();
         let mut dependencies = Vec::new();
         let mut installed = Vec::new();
@@ -79,7 +132,7 @@ pub(super) fn prepare_readonly_prefix(
             for target in installed { planner.certificate.callees.remove(&target); }
             break;
         };
-        if locals.insert(binding.slot.clone(), binding.ty.clone()).is_some() { return None; }
+        if locals.insert(binding.slot.clone(), LocalFact { ty: binding.ty.clone(), version: Some(binding.returning_effect) }).is_some() { return None; }
         planner.certificate.bindings.push(binding);
     }
     (!planner.certificate.bindings.is_empty()).then_some(planner.certificate)
@@ -137,7 +190,7 @@ impl<'a> Planner<'a> {
         let mut deps = Vec::new();
         for (ast, prepared) in frame.function.body.items.iter().zip(preceding) {
             let fact = self.binding(&frame, ast, prepared, &locals, &mut deps)?;
-            if locals.insert(fact.slot.clone(), fact.ty.clone()).is_some() { return None; }
+            if locals.insert(fact.slot.clone(), LocalFact { ty: fact.ty.clone(), version: Some(fact.returning_effect) }).is_some() { return None; }
             bindings.push(fact);
         }
         let (tail, at) = frame.returned(&frame.function.body, structure.root, last)?;
@@ -148,7 +201,7 @@ impl<'a> Planner<'a> {
 
     fn binding(
         &mut self, frame: &Frame<'a>, item: &'a ScalarBlockItem, checked: &BlockItem,
-        locals: &HashMap<ReferenceBindingId, ScalarType>, deps: &mut Vec<PreparedCallable>,
+        locals: &HashMap<ReferenceBindingId, LocalFact>, deps: &mut Vec<PreparedCallable>,
     ) -> Option<BindingFact> {
         let ScalarBlockItem::LocalBinding(binding) = item else { return None; };
         let BlockItemKind::Binding(prepared) = &checked.kind else { return None; };
@@ -166,9 +219,61 @@ impl<'a> Planner<'a> {
         })
     }
 
+    fn guarded_transfer(
+        &mut self, frame: &Frame<'a>, item: &'a ScalarBlockItem, checked: &BlockItem,
+        locals: &HashMap<ReferenceBindingId, LocalFact>, deps: &mut Vec<PreparedCallable>,
+    ) -> Option<GuardedTransfer> {
+        let ScalarBlockItem::Expression(expr @ ScalarExpression::UnitIf { condition, then_branch, .. }) = item else { return None; };
+        let BlockItemKind::Evaluation { expression } = checked.kind else { return None; };
+        let ConditionalRegion::Unit { condition: test, then_block, fallthrough, .. } =
+            frame.prepared.conditionals.get(&expression)? else { return None; };
+        let structure = &frame.prepared.structure;
+        let parent = OccurrenceParent::Expression(expression);
+        if *fallthrough != expression || then_branch.unsafe_context
+            || frame.prepared.occurrences.get(expression.0)?.span != super::super::typecheck::expression_span(expr)
+            || structure.checked_types.expressions.get(&expression)? != &ScalarType::Unit
+            || structure.checker_contextual_occurrences.contains(&expression)
+            || structure.checked_types.expressions.get(test)? != &ScalarType::Bool
+            || structure.edges.get(&(parent, OccurrenceEdge::Condition)) != Some(&OccurrenceNode::Expression(*test))
+            || structure.edges.get(&(parent, OccurrenceEdge::ThenBranch)) != Some(&OccurrenceNode::Block(*then_block))
+        { return None; }
+        let block = structure.blocks.get(then_block.0)?;
+        if block.items.is_empty() || block.items.len() != then_branch.items.len() { return None; }
+        let condition = self.expression(frame, condition, *test, locals, deps)?;
+        let mut branch = locals.clone();
+        let mut writes = Vec::with_capacity(block.items.len());
+        let mut joins = Vec::<GuardedJoin>::new();
+        let mut by_binding = HashMap::new();
+        for (ast, checked) in then_branch.items.iter().zip(&block.items) {
+            let ScalarBlockItem::Assignment(assignment) = ast else { return None; };
+            let BlockItemKind::Assignment { group } = checked.kind else { return None; };
+            let [rhs] = assignment.values.as_slice() else { return None; };
+            if group.block != *then_block || group.item != checked.position { return None; }
+            let (binding, replacement, rhs_at, destination) = super::super::checker_flow::checked_scalar_assignment(frame.prepared, group)?;
+            let prior = branch.get(binding)?;
+            // Do not invent a generation for parameters, other types or aliased destinations.
+            if prior.ty != ScalarType::F32 || *replacement != prior.ty
+                || structure.checked_types.expressions.get(&rhs_at)? != replacement
+                || structure.checker_contextual_occurrences.contains(&destination)
+            { return None; }
+            let prior = prior.version?;
+            let assigned = self.expression(frame, rhs, rhs_at, &branch, deps)?;
+            branch.get_mut(binding)?.version = Some(assigned);
+            writes.push(GuardedWrite { binding: binding.clone(), destination, prior, assigned });
+            if let Some(&index) = by_binding.get(binding) {
+                let join: &mut GuardedJoin = joins.get_mut(index)?;
+                join.taken = assigned;
+            } else {
+                by_binding.insert(binding.clone(), joins.len());
+                joins.push(GuardedJoin { binding: binding.clone(), taken: assigned, bypass: prior });
+            }
+        }
+        Some(GuardedTransfer { condition, writes, joins })
+    }
+
     fn expression(
         &mut self, frame: &Frame<'a>, expression: &'a ScalarExpression, initial: OccurrenceOrdinal,
-        locals: &HashMap<ReferenceBindingId, ScalarType>, deps: &mut Vec<PreparedCallable>,
+        locals: &HashMap<ReferenceBindingId, LocalFact>, deps: &mut Vec<PreparedCallable>,
     ) -> Option<EffectId> {
         enum Work<'a> {
             Visit(OccurrenceOrdinal, &'a ScalarExpression),
@@ -209,8 +314,11 @@ impl<'a> Planner<'a> {
                     { return None; }
                     match expr {
                         ScalarExpression::Name { .. } if value_type(ty) => match frame.prepared.prepared_plain_name(at)? {
-                            PlainNameIdentity::Lexical(binding) if locals.get(binding) == Some(ty) =>
-                                Effect::Sequence { at, operands: Vec::new() },
+                            PlainNameIdentity::Lexical(binding) => {
+                                let current = locals.get(binding)?;
+                                if &current.ty != ty { return None; }
+                                Effect::LocalRead { at, binding: binding.clone(), version: current.version }
+                            },
                             PlainNameIdentity::ModuleValue(declaration) => {
                                 frame.module_value(declaration, ty)?;
                                 Effect::Read { at, declaration: declaration.clone(), index: None }
@@ -361,11 +469,11 @@ impl<'a> Planner<'a> {
 }
 
 impl Frame<'_> {
-    fn formals(&self) -> Option<HashMap<ReferenceBindingId, ScalarType>> {
+    fn formals(&self) -> Option<HashMap<ReferenceBindingId, LocalFact>> {
         let bindings = self.prepared.boundary.checker_parameter_bindings.as_deref()?;
         if bindings.len() != self.prepared.boundary.parameters.len() { return None; }
         bindings.iter().zip(&self.prepared.boundary.parameters).map(|(binding, slot)| {
-            value_type(&slot.ty).then(|| (binding.clone(), slot.ty.clone()))
+            value_type(&slot.ty).then(|| (binding.clone(), LocalFact { ty: slot.ty.clone(), version: None }))
         }).collect()
     }
 

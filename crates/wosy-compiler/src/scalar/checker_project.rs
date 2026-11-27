@@ -19424,7 +19424,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 };
 %%end"#;
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            let run = |text: &str, count: usize| {
+            let run = |text: &str, count: usize, expected_guard: Option<bool>| {
                 let prepared = prepare_checker_project(
                     vec![(declarations(&owner, text), Vec::new())], vec![owner.clone()],
                     ScalarPreparationInputs { target_layout },
@@ -19455,9 +19455,50 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                     }).collect();
                     assert_eq!(fields, ["heading", "pitch"], "captured read fields only; not the X/Y/Z writes");
                 }
+                assert!(certificate.guarded.is_none());
+                let guarded = ordered_float_prefix::prepare_guarded_prefix(&prepared, &initialization, (0,item)).unwrap();
+                assert_eq!(guarded.bindings.len(), count);
+                let Some(uses_written_ex) = expected_guard else {
+                    assert!(guarded.guarded.is_none());
+                    assert_eq!(guarded.effects.len(), certificate.effects.len(), "no partially stamped branch");
+                    assert_eq!(guarded.callees.len(), certificate.callees.len(), "no tentative dependencies");
+                    return;
+                };
+                let transfer = guarded.guarded.as_ref().expect("closed guarded local branch");
+                let name = |binding: &ReferenceBindingId| {
+                    let span = binding.declaration_span;
+                    &text[span.start as usize..span.end as usize]
+                };
+                let guard = certificate.bindings.iter().find(|binding| name(&binding.slot) == "parcel_interrupted").unwrap();
+                assert!(matches!(&guarded.effects[transfer.condition].operation,
+                    Effect::LocalRead { binding, version: Some(version), .. }
+                        if binding == &guard.slot && *version == guard.returning_effect));
+                assert_eq!(transfer.writes.iter().map(|w| name(&w.binding)).collect::<Vec<_>>(), ["ex", "ey", "ez"]);
+                assert_eq!(transfer.joins.iter().map(|j| name(&j.binding)).collect::<Vec<_>>(), ["ex", "ey", "ez"]);
+                for (write, join) in transfer.writes.iter().zip(&transfer.joins) {
+                    let old = certificate.bindings.iter().find(|binding| binding.slot == write.binding).unwrap().returning_effect;
+                    assert_eq!((write.prior, join.bypass, join.taken), (old, old, write.assigned));
+                    assert_eq!(join.binding, write.binding);
+                    assert!(transfer.condition < write.assigned);
+                }
+                assert!(transfer.writes.windows(2).all(|pair|
+                    pair[0].destination.0 < pair[1].destination.0 && pair[0].assigned < pair[1].assigned));
+                let [ex, ey, _] = transfer.writes.as_slice() else { unreachable!() };
+                if uses_written_ex {
+                    assert!(matches!(&guarded.effects[ey.assigned].operation,
+                        Effect::LocalRead { binding, version: Some(version), .. }
+                            if binding == &ex.binding && *version == ex.assigned));
+                } else {
+                    assert!(matches!(&guarded.effects[ey.assigned].operation, Effect::Field { .. }));
+                }
             };
-            run(excerpt, 33);
-            run(&excerpt.replace("f32 u = if", "camera_view=0.0; f32 u = if"), 5);
+            run(excerpt, 33, Some(false));
+            run(&excerpt.replace("ey = published_parcel_camera.y", "ey = ex"), 33, Some(true));
+            run(&excerpt.replace("ey = published_parcel_camera.y", "camera_view=0.0; ey = published_parcel_camera.y"), 33, None);
+            run(&excerpt.replace("ey = published_parcel_camera.y",
+                r#"core.require(false,{.stdout="";.stderr="guarded obligation";.code=7;.files=[];}); ey = published_parcel_camera.y"#),
+                33, None);
+            run(&excerpt.replace("f32 u = if", "camera_view=0.0; f32 u = if"), 5, None);
         }
     }
 
