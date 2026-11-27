@@ -1,12 +1,4 @@
-#!/usr/bin/env python3
-import json
-import subprocess
-import sys
-
-manifest_path = sys.argv[1]
-separator = sys.argv.index("--")
-arguments = sys.argv[separator + 1:]
-with open(manifest_path, encoding="utf-8") as file:
-    manifest = json.load(file)
-result = subprocess.run([manifest["executable"], *arguments])
-sys.exit(result.returncode)
+#!/bin/sh
+set -eu
+shift 2 # artifact manifest and --
+exec "${WOSY_ARTIFACT_EXECUTABLE:?missing artifact executable}" "$@"

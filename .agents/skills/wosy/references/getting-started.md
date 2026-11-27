@@ -2,11 +2,7 @@
 
 Wosy compiles statically typed `.w` programs to native and WebAssembly targets.
 
-## Prerequisites
-
-- The `wosy` binary on `PATH`.
-- LLVM 18.1.x reachable through the builder scripts.
-- Python 3 when using the reference `scripts/build-*` and `scripts/run-*` helpers.
+See the [installation requirements by workflow](../../../../README.md#getting-started).
 
 ## Create a project
 

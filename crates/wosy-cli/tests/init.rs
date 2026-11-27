@@ -116,11 +116,11 @@ fn init_creates_a_parseable_package_with_empty_lock_and_named_profiles() {
     assert_eq!(config.targets["app"].root, Path::new("src/main.w"));
     assert_eq!(
         config.builders["llvm_wasm"].command,
-        ["python3", "scripts/build-wasm"],
+        ["sh", "scripts/build-wasm"],
     );
     assert_eq!(
         config.runners["wasmtime"].command,
-        ["python3", "scripts/run-wasmtime"],
+        ["sh", "scripts/run-wasmtime"],
     );
     assert_eq!(
         config.targets["app"].artifacts["main"].profiles["dev"].output,

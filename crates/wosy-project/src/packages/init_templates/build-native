@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-import subprocess
-import sys
-
-partition, output_dir, manifest, runtime = sys.argv[1:]
-subprocess.run(["clang", "-x", "ir", partition, runtime, "-o", output_dir + "/main"], check=True)
+#!/bin/sh
+set -eu
+exec clang -x ir "$1" "$4" -o "$2/main"

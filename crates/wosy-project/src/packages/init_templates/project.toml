@@ -10,18 +10,18 @@ categories = [
 ]
 
 [builders.native]
-command = ["python3", "scripts/build-native"]
+command = ["sh", "scripts/build-native"]
 toolchain_identity = "llvm-18.1.x"
 
 [builders.llvm_wasm]
-command = ["python3", "scripts/build-wasm"]
+command = ["sh", "scripts/build-wasm"]
 toolchain_identity = "llvm-18.1.x"
 
 [runners.native]
-command = ["python3", "scripts/run-native"]
+command = ["sh", "scripts/run-native"]
 
 [runners.wasmtime]
-command = ["python3", "scripts/run-wasmtime"]
+command = ["sh", "scripts/run-wasmtime"]
 
 [targets.app]
 root = "src/main.w"

@@ -457,6 +457,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         &runner.command,
         &runner.args,
         &manifest_path,
+        &manifest.executable,
         arguments,
     )
 }
@@ -1707,6 +1708,7 @@ fn invoke_direct_with_arguments(
     command: &[String],
     configured_args: &[String],
     manifest: &std::path::Path,
+    artifact: &std::path::Path,
     arguments: &[String],
 ) -> Result<u8, String> {
     let executable = command
@@ -1716,6 +1718,7 @@ fn invoke_direct_with_arguments(
         .current_dir(root)
         .args(command.iter().skip(1))
         .args(configured_args)
+        .env("WOSY_ARTIFACT_EXECUTABLE", artifact)
         .arg(manifest)
         .arg("--")
         .args(arguments)

@@ -42,6 +42,19 @@ std.utf8 line = { .data = content; .length = size; };
 
 ## Getting started
 
+Put the `wosy` release binary on your `PATH`. Install only the tools for your workflow:
+
+| Workflow | Additional tools |
+| --- | --- |
+| Parse or check a project without Git dependencies | None |
+| Fetch or sync Git dependencies | Git |
+| Build and run a native project | Clang and your system's linker and development libraries |
+| Build WASM | Clang and `wasm-ld` |
+| Run a WASI build locally | Wasmtime |
+| Build Wosy itself from source | Rust and LLVM 18.1 development libraries |
+
+On Ubuntu 24.04, `sudo apt install clang build-essential` installs the native build tools. For Git dependencies, add `git`; for building WASM, add `lld`. The default Linux project scripts use the system shell, not Python. Windows and macOS support is not yet validated.
+
 [Create, build, and run a Wosy package](.agents/skills/wosy/references/getting-started.md).
 
 ## Documentation
