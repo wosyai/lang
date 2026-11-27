@@ -156,9 +156,29 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
     assert call("executable-builder-inputs", "dev", blocked, example, database=empty)["result"]["kind"] == "replay-required"
     assert not blocked.exists()
 
-    def executable_plans():
-        return {name: call("executable-builder-inputs", name, executable, example)["result"]
+    def executable_plans(destination=lambda _: executable):
+        return {name: call("executable-builder-inputs", name, destination(name), example)["result"]
                 for name in ("dev", "wasm")}
+
+    def build_fixture_plan(plan):
+        partition, output, pending_manifest, runtime = map(Path, plan["arguments"])
+        output.mkdir()
+        for path, field in ((partition, "partition"), (pending_manifest, "pending"), (runtime, "runtime")):
+            path.write_text(plan[field])
+        subprocess.run(plan["command"] + plan["configured_arguments"] + plan["arguments"],
+                       cwd=project, check=True, capture_output=True, timeout=30)
+        return output, pending_manifest
+
+    def run_profile(name, stale=False):
+        result = subprocess.run([ordinary, "run", "app", "--profile", name],
+                                cwd=project, capture_output=True, timeout=30)
+        if stale:
+            assert result.returncode == 1 and result.stderr == b"wosy: artifact manifest is stale\n", result
+        else:
+            assert result.returncode == 0 and not result.stdout and not result.stderr, result
+
+    def canonical_output(name):
+        return project / ".wosy/artifacts/app" / name / "main"
 
     initial = executable_plans()
     assert not executable.exists()
@@ -170,14 +190,54 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
         assert annotated[name]["root"] != initial[name]["root"]
         assert annotated[name]["executable_partition_digest"] == initial[name]["executable_partition_digest"]
         assert annotated[name]["partition"] == initial[name]["partition"]
+    # Build the exact normalized plan once with the fixture-owned builder.
+    # These are disposable project artifacts, not a production reuse path.
+    old_plans = executable_plans(canonical_output)
+    installed = {}
+    for name, plan in old_plans.items():
+        assert plan["partition"] == annotated[name]["partition"]
+        output = canonical_output(name)
+        shutil.rmtree(output)  # Earlier V2 parity artifact in this scratch project.
+        _, pending = build_fixture_plan(plan)
+        final_manifest = output / "artifact-manifest.json"
+        pending.rename(final_manifest)
+        binary = output / "main"
+        installed[name] = (final_manifest, binary, binary.stat(), binary.read_bytes())
+        run_profile(name)
+
     child.write_text(child.read_text().replace("i32 calls", "# WHY: inserted annotation\ni32 calls"))
     call("stage")
     call("submit-pending", "short_circuit_project", "src/main.w")
-    inserted = executable_plans()
+    inserted = executable_plans(canonical_output)
     for name in initial:
         assert inserted[name]["root"] != annotated[name]["root"]
         assert inserted[name]["executable_partition_digest"] == annotated[name]["executable_partition_digest"]
         assert inserted[name]["partition"] == annotated[name]["partition"]
+        run_profile(name, stale=True)
+        final_manifest, binary, original_stat, original_bytes = installed[name]
+        previous = json.loads(final_manifest.read_text())
+        refreshed = json.loads(inserted[name]["pending"])
+        assert refreshed["executable"] == previous["executable"] == str(binary)
+        assert refreshed["identity"]["llvm_input_identity"] == inserted[name]["executable_partition_digest"]
+        assert previous["identity"].pop("source_identity") != refreshed["identity"].pop("source_identity")
+        assert refreshed["identity"] == previous["identity"]
+        different = []
+        for old, new in zip(previous["source_observations"], refreshed["source_observations"], strict=True):
+            assert old["source"] == new["source"]
+            if old["content_revision"] != new["content_revision"]:
+                different.append(new["source"]["path"])
+        assert different == ["src/child.w"], different
+        # Fixture simulates ONLY the publication half, using fresh verified
+        # observations; no eligibility decision or builder skip is tested.
+        sibling = final_manifest.with_suffix(".next")
+        sibling.write_text(inserted[name]["pending"])
+        sibling.replace(final_manifest)
+        run_profile(name)
+        unchanged = binary.stat()
+        assert (unchanged.st_dev, unchanged.st_ino, unchanged.st_mtime_ns) == (
+            original_stat.st_dev, original_stat.st_ino, original_stat.st_mtime_ns
+        )
+        assert binary.read_bytes() == original_bytes
     child.write_text(child.read_text().replace("calls + 1", "calls + 2"))
     entry.write_text(entry.read_text().replace("fn { 42 }", "fn { 43 }"))
     call("stage")
@@ -187,13 +247,9 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
     for name, runner, magic in (("dev", "native", b"\x7fELF"), ("wasm", "wasmtime", b"\x00asm")):
         plan = changed[name]
         assert plan["executable_partition_digest"] != inserted[name]["executable_partition_digest"]
-        partition, output, pending_manifest, runtime = map(Path, plan["arguments"])
+        run_profile(name, stale=True)
+        output, pending_manifest = build_fixture_plan(plan)
         assert output == executable
-        output.mkdir()
-        for path, field in ((partition, "partition"), (pending_manifest, "pending"), (runtime, "runtime")):
-            path.write_text(plan[field])
-        subprocess.run(plan["command"] + plan["configured_arguments"] + plan["arguments"],
-                       cwd=project, check=True, capture_output=True, timeout=30)
         assert (output / "main").read_bytes().startswith(magic)
         subprocess.run(["python", f"scripts/run-{runner}", pending_manifest, "--"],
                        cwd=project, check=True, capture_output=True, timeout=30)
@@ -205,3 +261,5 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
         shutil.rmtree(output)
     print("V3: comment body edit and comment line insertion preserve normalized bytes and digest; code change alters digest;"
           " disposable Native64 and WASI link and run; no publication.")
+    print("Run freshness (fixture only): comment insertion invalidates prior manifest; atomically replacing verified"
+          " observations accepts the same Native64/WASI binary; code change invalidates it again.")
