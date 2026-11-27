@@ -24785,7 +24785,7 @@ unit(u8) parent = fn(a) {
         };
         let mesh=fragment("f32[8] vertex =", "f32[38] state =");
         let vertex=fragment("unit(i32,u64,u64,u64,u64) index_vertex=", "unit(i32,i32) static_partition=");
-        let pt=fragment("bool robot_turn=false;", "unit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
         let packing=r#"%%start
             i32 score=0;
             i32() report=fn{score};
