@@ -69,8 +69,6 @@ mod linux {
         path::PathBuf,
     };
 
-    const MAX_GLOBS: usize = 32;
-    const MAX_GLOB_BYTES: usize = 256;
     const MAX_DEPTH: usize = 32;
     const MAX_OBSERVED_METADATA_BYTES: u64 = 1 << 20;
     const MAX_MATCH_STEPS: usize = 4 << 20;
@@ -161,7 +159,6 @@ mod linux {
             let document = owner_manifest(directory, owner)?;
             let own = declarations(&document, site, "watch")?;
             let add = declarations(consumer_manifest, &format!("{owner}:{site}"), "watch_add")?;
-            if own.len() + add.len() > MAX_GLOBS { return Err("too many selected comptime watch globs".into()); }
             if !own.is_empty() {
                 resolve(directory, WatchRoot::OwningPackage, &own, &mut budget, &mut match_steps, &mut result)?;
             }
@@ -201,10 +198,11 @@ mod linux {
         let site = site.as_table_like().ok_or("selected comptime site must be a table")?;
         let Some(value) = site.get(field) else { return Ok(Vec::new()) };
         let globs = value.as_array().ok_or("selected comptime watch paths must be an array")?;
-        if globs.len() > MAX_GLOBS { return Err("too many selected comptime watch globs".into()); }
-        globs.iter().map(|value| {
+        let mut seen = BTreeSet::new();
+        let mut parsed = Vec::new();
+        for value in globs {
             let pattern = value.as_str().ok_or("a comptime watch glob must be a string")?;
-            if pattern.len() > MAX_GLOB_BYTES { return Err("comptime watch glob exceeds its byte limit".into()); }
+            if !seen.insert(pattern) { continue; }
             let parts: Vec<_> = pattern.split('/').collect();
             if parts.len() > MAX_DEPTH || parts.iter().any(|part| {
                 matches!(*part, "" | "." | "..")
@@ -213,8 +211,9 @@ mod linux {
             }) {
                 return Err("unsupported comptime watch glob; use relative components, *, ? or whole-component **".into());
             }
-            Ok(parts)
-        }).collect()
+            parsed.push(parts);
+        }
+        Ok(parsed)
     }
 
     fn resolve(

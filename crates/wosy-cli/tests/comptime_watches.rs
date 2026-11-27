@@ -173,6 +173,46 @@ fn merges_selected_owner_and_consumer_with_one_canonical_identity_per_match() {
 }
 
 #[test]
+fn finite_watch_patterns_preserve_every_owner_and_consumer_identity() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let nested = vec!["nested_component_keeps_each_segment_short"; 8].join("/");
+    let long_path = format!("{nested}/sample.txt");
+    let long_pattern = format!("{nested}/sam*.txt");
+    assert!(long_pattern.len() > 256);
+    fixture.put(&format!("assets/{long_path}"), "long");
+
+    let owner: Vec<_> = (0..33).map(|index| format!("many/item_{index:02}.txt")).collect();
+    let consumer: Vec<_> = (0..16).map(|index| format!("many/copy_{index:02}.txt")).collect();
+    for path in &owner { fixture.put(&format!("assets/{path}"), "owner"); }
+    for path in &consumer { fixture.put(&format!("app/{path}"), "consumer"); }
+
+    for (owner_count, consumer_count) in [(20, 16), (33, 1)] {
+        let mut patterns = owner[..owner_count].to_vec();
+        patterns.extend([long_pattern.clone(), long_pattern.clone(), long_path.clone()]);
+        fixture.put("assets/wosy.toml", PACKAGE.replace(
+            "[comptime.prepare]\nwatch = [\"schemas/**/*.json\", \"schemas/root.json\", \"schemas/caf?.txt\"]",
+            &format!("[comptime.prepare]\nwatch = {patterns:?}"),
+        ));
+        fixture.put("app/wosy.toml", APP.replace(
+            "watch_add = [\"recordings/**/*.json\", \"recordings/./unsupported.txt\"]",
+            &format!("watch_add = {:?}", &consumer[..consumer_count]),
+        ));
+        let expected: Vec<_> = owner[..owner_count].iter().map(|path| content(WatchRoot::OwningPackage, path, "owner"))
+            .chain([content(WatchRoot::OwningPackage, &long_path, "long")])
+            .chain(consumer[..consumer_count].iter().map(|path| content(WatchRoot::ConsumingProject, path, "consumer")))
+            .collect();
+        let observe_with = |files| prepare_comptime_watches(
+            &app, "app", "dev", "assets", "prepare", ComptimeWatchLimits { files, ..Default::default() },
+        );
+        let (_, watches) = observe_with(expected.len()).unwrap();
+        assert_eq!(rows(&watches), expected);
+        assert!(observe_with(expected.len() - 1).err().unwrap().contains("matched file limit"));
+    }
+    assert!(!app.join(".wosy").exists());
+}
+
+#[test]
 fn checks_selected_site_glob_dialect_and_shared_budget_without_ordinary_side_effects() {
     let fixture = Fixture::new();
     let app = fixture.app();
