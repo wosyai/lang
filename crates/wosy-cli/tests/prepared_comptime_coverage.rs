@@ -237,3 +237,126 @@ fn recovered_grammar_is_available_to_sparse_preparation_only_after_commit() {
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn changed_pending_entry_reuses_verified_parse_for_first_comptime_fragment() {
+    use wosy_compiler::{ClosedComptimeRejection, ScalarTargetLayout, ScalarType};
+    use wosy_daemon::{PendingFirstComptimeProjection, RootedClosedComptimeProjection,
+        RootedClosedComptimeRequest, RootedClosedComptimeRefusal};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::FileKey;
+
+    const SOURCE: &str = "%%start\n# WHY: é literal\ni32 answer = comptime fixture { i32 seed = 7; seed ^ 9 };\n%%end\n";
+    let fixture = Scratch::new();
+    let root = fixture.0.join("project");
+    fs::create_dir(&root).unwrap();
+    let manifest = root.join("wosy.toml");
+    let entry = root.join("main.w");
+    fs::write(&manifest, MANIFEST).unwrap();
+    fs::write(&entry, "%%start\ni32 answer = 14;\n%%end\n").unwrap();
+    let request = |layout| RootedClosedComptimeRequest {
+        profile: "dev".into(),
+        file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+        id: "fixture".into(), evaluator_layout: layout, source_limits: LIMITS, output_bytes: 1 << 20,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&root, CLIENT).unwrap();
+        let base = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(base.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", base.pending.unwrap()).unwrap());
+        let prior = client.acknowledged_build_source("app").unwrap().unwrap();
+
+        fs::write(&entry, SOURCE).unwrap();
+        let stage = client.stage("app").unwrap();
+        let pending = stage.pending.unwrap();
+        let mut previews = Vec::new();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (binding, proposal) = client.pending_base_cst_proposal("app", pending).unwrap();
+            let prepared = worker.prepare_pending_first_comptime(binding, proposal, request(layout), 1 << 20, TTL)
+                .await.unwrap();
+            let admitted = prepared.base().admission();
+            assert_eq!((admitted.base, admitted.proposed, admitted.attempt, admitted.validated_files),
+                (prior.root, pending.root(), pending.generation(), 1));
+            assert_eq!(prepared.base().authored_comptime_coverage(), Some(AuthoredComptimeCoverage::Present));
+            let Some(PendingFirstComptimeProjection::Candidate(RootedClosedComptimeProjection::Emitted(fragment))) =
+                prepared.projection() else { panic!("expected first entered comptime fragment"); };
+            let range = fragment.site.range;
+            assert_eq!(&SOURCE[range.start as usize..range.end as usize],
+                "comptime fixture { i32 seed = 7; seed ^ 9 }");
+            assert_eq!(fragment.source_root, pending.root());
+            assert_eq!(fragment.result_type, ScalarType::I32);
+            assert_eq!(fragment.evaluator_layout, layout);
+            previews.push((fragment.bytes.clone(), fragment.digest, fragment.site.clone(), fragment.authored_cst,
+                fragment.compiler_image));
+        }
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), prior);
+        assert!(store.snapshot(pending.root()).unwrap().is_none());
+
+        let (binding, proposal) = client.pending_base_cst_proposal("app", pending).unwrap();
+        let mut too_small = request(ScalarTargetLayout::NATIVE64);
+        too_small.output_bytes = 1;
+        let error = worker.prepare_pending_first_comptime(binding, proposal, too_small, 1 << 20, TTL).await.err().unwrap();
+        assert!(error.to_string().contains("output byte budget"));
+        assert!(store.snapshot(pending.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), prior);
+
+        let committed = client.publish_pending_base("app", pending, |binding, proposal| {
+            worker.publish_bound_base_source(binding, proposal, LIMITS, TTL)
+        }).await.unwrap();
+        assert!(matches!(committed, PendingBasePublication::Applied(_)));
+        let current = client.acknowledged_build_source("app").unwrap().unwrap();
+        let published = worker.open_build_diagnostics(current.clone(), TTL).await.unwrap().unwrap();
+        for (layout, preview) in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32].into_iter().zip(previews) {
+            let RootedClosedComptimeProjection::Emitted(fragment) = published.project_first_entry_comptime(request(layout)).await.unwrap()
+                else { panic!("published entry must yield the same ordinary fragment"); };
+            assert_eq!(preview, (fragment.bytes, fragment.digest, fragment.site, fragment.authored_cst, fragment.compiler_image));
+        }
+        published.release();
+
+        fs::write(&manifest, MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")).unwrap();
+        let staged = client.stage("app").unwrap();
+        assert_eq!((staged.parsed, staged.reused), (0, 1));
+        let attempt = staged.pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let prepared = worker.prepare_pending_first_comptime(binding, proposal, request(ScalarTargetLayout::WASM32), 1 << 20, TTL)
+            .await.unwrap();
+        assert_eq!(prepared.base().admission().validated_files, 0);
+        assert!(matches!(prepared.projection(), Some(PendingFirstComptimeProjection::EntryUnchanged)));
+        drop(prepared);
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert!(client.abandon("app", attempt).unwrap());
+
+        fs::write(&manifest, MANIFEST).unwrap();
+        fs::write(&entry, SOURCE.replace("i32 answer", "i32 earlier = 41;\ni32 answer")).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let prepared = worker.prepare_pending_first_comptime(binding, proposal, request(ScalarTargetLayout::NATIVE64), 1 << 20, TTL)
+            .await.unwrap();
+        assert!(matches!(prepared.projection(), Some(PendingFirstComptimeProjection::Candidate(
+            RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::Compiler(
+                ClosedComptimeRejection::PrecededByAuthoredItem { .. }))))));
+        drop(prepared);
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert!(client.abandon("app", attempt).unwrap());
+
+        fs::write(&entry, SOURCE.replace("i32 seed = 7; seed ^ 9", "core.comp_param(\"limit\", 7)")).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let prepared = worker.prepare_pending_first_comptime(binding, proposal, request(ScalarTargetLayout::NATIVE64), 1 << 20, TTL)
+            .await.unwrap();
+        assert!(matches!(prepared.projection(), Some(PendingFirstComptimeProjection::Candidate(
+            RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::ParameterAuthorityUnavailable { name, .. })))
+            if name == "limit"));
+        drop(prepared);
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), current);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

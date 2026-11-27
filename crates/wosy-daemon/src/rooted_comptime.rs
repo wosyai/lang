@@ -202,7 +202,36 @@ fn compiler_refusal(reason: ClosedComptimeRejection) -> RootedClosedComptimeRefu
     }
 }
 
+fn first_entry_candidate(
+    identity: RootedComptimeIdentity, fresh: &FreshParseResult, request: &RootedClosedComptimeRequest,
+) -> Result<SelectedComptime<RootedClosedComptimeFragment>> {
+    Ok(match derive_first_source_initializer_comptime(fresh, &request.id, request.evaluator_layout) {
+        Ok(fragment) => Ok(identity.fragment(fragment, request.output_bytes)?),
+        Err(reason) => Err(compiler_refusal(reason)),
+    })
+}
+
+fn closed_projection(answer: SelectedComptime<RootedClosedComptimeFragment>) -> RootedClosedComptimeProjection {
+    match answer {
+        Ok(fragment) => RootedClosedComptimeProjection::Emitted(fragment),
+        Err(reason) => RootedClosedComptimeProjection::Refused(reason),
+    }
+}
+
 impl SourceStore {
+    /// Textual evaluator projection from the selected file's already-verified
+    /// parse. The caller owns the exact proposal transaction and selector checks.
+    pub(super) fn project_first_comptime_from_pending_parse(
+        &self, root: NodeId, authored_cst: NodeId, target: String,
+        request: &RootedClosedComptimeRequest, fresh: &FreshParseResult,
+    ) -> Result<RootedClosedComptimeProjection> {
+        let Some(compiler_image) = self.derivation_image() else {
+            return Ok(RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::CompilerImageUnavailable));
+        };
+        let identity = RootedComptimeIdentity { root, authored_cst, compiler_image, target, profile: request.profile.clone() };
+        first_entry_candidate(identity, fresh, request).map(closed_projection)
+    }
+
     pub(super) fn project_closed_comptime_for_lease(
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest, scope: SiteScope,
     ) -> Result<RootedClosedComptimeProjection> {
@@ -212,8 +241,7 @@ impl SourceStore {
                 // parameter table. Even source defaults cannot be selected.
                 SiteScope::AuthoredFile => derive_closed_comptime_fragment(&input.fresh, &request.id,
                     request.evaluator_layout, |_| Some(ComptimeParameter::UnsupportedValue)),
-                SiteScope::FirstTargetInitializer => derive_first_source_initializer_comptime(
-                    &input.fresh, &request.id, request.evaluator_layout),
+                SiteScope::FirstTargetInitializer => return first_entry_candidate(input.source, &input.fresh, request),
                 SiteScope::DirectTargetCall => return Err("direct comptime requires its typed route".into()),
             };
             Ok(match derived {
@@ -221,10 +249,7 @@ impl SourceStore {
                 Err(reason) => Err(compiler_refusal(reason)),
             })
         })?;
-        Ok(match answer {
-            Ok(fragment) => RootedClosedComptimeProjection::Emitted(fragment),
-            Err(reason) => RootedClosedComptimeProjection::Refused(reason),
-        })
+        Ok(closed_projection(answer))
     }
 
     pub(super) fn project_direct_function_comptime_for_lease(
