@@ -36,6 +36,8 @@ printf 'fixture artifact' > "$3/main"
 [package]
 name = "app"
 default_target = "app"
+[comments]
+categories = []
 [builders.fixture]
 command = ["/bin/sh", "builder.sh"]
 args = ["selected"]
