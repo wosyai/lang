@@ -9,6 +9,7 @@ description: Write, build, or debug Wosy programs and packages.
 2. If the project pins Git dependencies, run `wosy dep sync` before building.
 3. Run `wosy build <target> --profile <profile>`, then `wosy run <target> --profile <profile>`. Finish when the build succeeds and the program produces the expected result.
 
+- Missing `wosy` or a builder tool? Read [installation](references/installation.md).
 - New Wosy project? Read [getting started](references/getting-started.md).
 - Editing `.w`? Read [syntax](references/syntax.md) and [types](references/types.md). For `core.*` operations, read [core](references/core.md). For checked reads, writes, or borrows, see [checked access](references/types.md#checked-access).
 - Configuring a package, namespace, or Wasm output? Read [project layout](references/project.md).

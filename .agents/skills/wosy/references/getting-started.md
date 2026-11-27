@@ -2,7 +2,7 @@
 
 Wosy compiles statically typed `.w` programs to native and WebAssembly targets.
 
-See the [installation requirements by workflow](../../../../README.md#getting-started).
+See the [installation requirements by workflow](installation.md).
 
 ## Create a project
 
