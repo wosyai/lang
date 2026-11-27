@@ -54,9 +54,13 @@ def prepare(release, work):
 
     diagnostics = {}
     tail = b"wosy: build rejected by semantic diagnostics\n"
+    # The native example uses Buffer::no_color. termcolor's Auto can
+    # still emit ANSI on captured stderr when TERM is set. Normalize the
+    # producer explicitly, not the diagnostic bytes under comparison.
+    oracle_env = {**os.environ, "NO_COLOR": "1"}
     for profile in ("dev", "native"):
         observed = subprocess.run([release / "wosy", "build", "app", "--profile", profile],
-                                  cwd=project, capture_output=True, timeout=30)
+                                  cwd=project, capture_output=True, timeout=30, env=oracle_env)
         assert observed.returncode == 1 and not observed.stdout and observed.stderr.endswith(tail), observed
         diagnostics[profile] = observed.stderr[:-len(tail)]
         assert b"item.w" in diagnostics[profile] and b"next" in diagnostics[profile]
@@ -89,6 +93,16 @@ def wait_until_listening(stdout, deadline):
         os.set_blocking(fd, True)
 
 
+def mismatch(expected, actual):
+    offset = next((i for i, (left, right) in enumerate(zip(expected, actual)) if left != right),
+                  min(len(expected), len(actual)))
+    start = max(0, offset - 8)
+    stop = offset + 8
+    return (f"diagnostic bytes differ at offset {offset}; expected {len(expected)} bytes,"
+            f" received {len(actual)} bytes; slices at {start}:"
+            f" expected={expected[start:stop].hex()}, actual={actual[start:stop].hex()}")
+
+
 def exchange(release, project, store, root, endpoint, profile, expected):
     started = time.monotonic()
     with subprocess.Popen(
@@ -110,7 +124,8 @@ def exchange(release, project, store, root, endpoint, profile, expected):
                 assert b"daemon needs source replay; this endpoint does not accept replay" in result.stderr, result
             else:
                 assert terminal == b"Disconnected\n", terminal
-                assert result.returncode == 0 and not result.stderr and result.stdout == expected, result
+                assert result.returncode == 0 and not result.stderr, result
+                assert result.stdout == expected, mismatch(expected, result.stdout)
         finally:
             if daemon.poll() is None:
                 daemon.kill()
