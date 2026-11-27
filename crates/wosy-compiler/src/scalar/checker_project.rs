@@ -1740,9 +1740,22 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 }
             } else { None };
             #[cfg(feature = "internal-checker")]
-            if !passive_literal { passive_generation = generation + 1; }
+            let passive_integer = if COLLECT && !binding.is_allocation && outputs.secondary.is_empty() {
+                match checked.receivers() {
+                    [receiver] if receiver.contextual_storage.is_none() && is_integer_type(&receiver.ty)
+                        && topology.occurrences.get(outputs.primary.0).is_some_and(|occurrence|
+                            occurrence.span == super::typecheck::expression_span(&binding.value)) => {
+                        failures.as_deref_mut().and_then(|effects| super::checker_flow::startup_checked_integer_constant(
+                            &binding.value, outputs.primary, structure, &receiver.ty, &mut effects.passive_literal_work))
+                    }
+                    _ => None,
+                }
+            } else { None };
             #[cfg(feature = "internal-checker")]
-            if startup_trace_requested(failures) && !passive_literal && passive_float.is_none()
+            if !passive_literal && passive_integer.is_none() { passive_generation = generation + 1; }
+            #[cfg(feature = "internal-checker")]
+            if startup_trace_requested(failures) && !passive_literal
+                && passive_float.is_none() && passive_integer.is_none()
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
                 && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
@@ -1867,6 +1880,9 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         .ok_or(ProjectCheck::Unsupported)?;
                     InitializerValue::Integer { ty, value: Cow::Owned(value.clone()) }
                 }
+                #[cfg(feature = "internal-checker")]
+                (ty, _) if passive_integer.is_some() =>
+                    InitializerValue::Integer { ty, value: Cow::Owned(passive_integer.ok_or(ProjectCheck::Unsupported)?) },
                 (ty, expression) if is_integer_type(ty)
                     || (COLLECT && matches!(ty, ScalarType::Bool | ScalarType::Char)
                         && matches!(expression, ScalarExpression::Call { .. })) =>
@@ -18652,6 +18668,47 @@ mod tests {
         let mut exhausted = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK - 1;
         assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_compound_integer_literal_does_not_invalidate_passive_array_snapshot() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "startup-closed-arithmetic-before-array-copy");
+        let text = |capacity: &str, assertion: &str, between: &str| format!(r#"%%start
+            f32[2] seed = [-0.0,1.0];
+            i32 capacity = {capacity};
+            i32 moving_capacity = 24*256;
+            {between}
+            f32[2][2] rows = [seed,seed];
+            core.require({assertion}, {OUTPUT});
+            core.require(moving_capacity==6144, {OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}\n{program}"));
+            let positive = text("9*4096", "capacity==36864", "");
+            let (valid, _) = prepare(&positive).run_private_authored_root(NonZeroUsize::MIN)
+                .unwrap_or_else(|error| panic!("valid startup arithmetic: {error:?}"));
+            let all = prepare(&positive).run().unwrap();
+            assert!(valid.active && all.active && valid.directives.is_empty() && all.directives.is_empty());
+
+            let wrong = text("9*4096", "capacity==36865", "");
+            let (negative, _) = prepare(&wrong).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(negative.directives.len(), 1);
+            assert_eq!(negative.directives, prepare(&wrong).run().unwrap().directives);
+            for program in [
+                text("(2147483647+1)-1", "capacity==2147483647", ""),
+                text("9/(4-4)", "capacity==0", ""),
+                text("9*4096", "capacity==36864", &format!("core.require(true, {OUTPUT});")),
+            ] {
+                assert!(matches!(prepare(&program).run_private_authored_root(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(matches!(prepare(&program).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]

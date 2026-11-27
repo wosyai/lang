@@ -1363,7 +1363,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 let (min, max) = super::typecheck::integer_bounds(ty)?;
                 #[cfg(test)]
                 AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-                nested_authored_integer_return(output, slot.expression, structure, ty, &min, &max)
+                nested_authored_integer_return(output, slot.expression, structure, ty, &min, &max, || Some(()))
             };
             let ScalarExpression::Binary { operator, left, right, .. } = output else {
                 return is_authored_composite(output).then(evaluate_closed).flatten();
@@ -1499,9 +1499,20 @@ fn is_authored_composite(expression: &ScalarExpression) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn startup_checked_integer_constant(
+    root: &ScalarExpression, ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure, ty: &ScalarType,
+    work: &mut usize,
+) -> Option<BigInt> {
+    if !is_authored_composite(root) { return None; }
+    let (min, max) = super::typecheck::integer_bounds(ty)?;
+    nested_authored_integer_return(root, ordinal, structure, ty, &min, &max,
+        || charge_call_work(work, 1))
+}
+
+#[cfg(feature = "internal-checker")]
 fn nested_authored_integer_return<'a>(
     root: &'a ScalarExpression, root_ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure,
-    ty: &ScalarType, min: &BigInt, max: &BigInt,
+    ty: &ScalarType, min: &BigInt, max: &BigInt, mut admit_node: impl FnMut() -> Option<()>,
 ) -> Option<BigInt> {
     type Node<'a> = (&'a ScalarExpression, OccurrenceOrdinal);
     enum Frame<'a> {
@@ -1513,6 +1524,7 @@ fn nested_authored_integer_return<'a>(
     let mut stack = Vec::new();
     let mut next = (root, root_ordinal);
     loop {
+        admit_node()?;
         let (expression, ordinal) = next;
         if structure.checked_types.expressions.get(&ordinal) != Some(ty) {
             return None;
