@@ -1863,6 +1863,8 @@ impl ProjectedStorage {
 
     pub(super) fn overwrite_u16_array_element(&mut self, cell:observed_f32_array::Cell, value:u16) -> Option<()> {
         if !self.has_observed_aggregate(&cell.declaration) { return None; }
+        #[cfg(test)]
+        OBSERVED_U16_WRITES.with(|writes| writes.borrow_mut().push((cell.clone(),value)));
         self.u16_array_updates.insert(cell,value);
         Some(())
     }
