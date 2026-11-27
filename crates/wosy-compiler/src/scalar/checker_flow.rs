@@ -1904,6 +1904,8 @@ struct IntegerRow {
     #[cfg(feature = "internal-checker")]
     observed_floats: Option<Rc<HashMap<ReferenceBindingId, projected_f32::ExactF32>>>,
     #[cfg(feature = "internal-checker")]
+    observed_float_writes: StorageDelta<ReferenceBindingId, projected_f32::ExactF32>,
+    #[cfg(feature = "internal-checker")]
     closed_radix: Option<Rc<ClosedRadixAxes>>,
 }
 
@@ -1916,12 +1918,32 @@ impl IntegerRow {
         #[cfg(feature = "internal-checker")]
         observed_floats: None,
         #[cfg(feature = "internal-checker")]
+        observed_float_writes: StorageDelta::default(),
+        #[cfg(feature = "internal-checker")]
         closed_radix: None,
     } }
 
     #[cfg(feature = "internal-checker")]
     fn install_observed_float(&mut self, name: ReferenceBindingId, value: projected_f32::ExactF32) -> Option<()> {
-        Rc::make_mut(self.observed_floats.get_or_insert_with(Default::default)).insert(name, value);
+        // A fresh execution of the same binding supersedes an earlier value.
+        if self.observed_float_writes.get(&name).is_some() {
+            self.observed_float_writes.insert(name, value);
+        } else {
+            Rc::make_mut(self.observed_floats.get_or_insert_with(Default::default)).insert(name, value);
+        }
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn read_observed_float(&self, name: &ReferenceBindingId) -> Option<projected_f32::ExactF32> {
+        self.observed_float_writes.get(name).or_else(|| self.observed_floats.as_ref()?.get(name)).copied()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn replace_observed_float(&mut self, name: &ReferenceBindingId, value: projected_f32::ExactF32) -> Option<()> {
+        // A resolved declaration alone is not evidence of a live value in this row.
+        self.read_observed_float(name)?;
+        self.observed_float_writes.insert(name.clone(), value);
         Some(())
     }
 
@@ -5483,7 +5505,7 @@ fn exact_observed_float_operand(calls: &FunctionCallSites, at: OccurrenceOrdinal
     if calls.structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
     if let Some(bits) = calls.structure.projected_f32_literals.get(&at) { return projected_f32::ExactF32::checked_bits(*bits); }
     let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(at)? else { return None; };
-    row.observed_floats.as_ref()?.get(binding).copied()
+    row.read_observed_float(binding)
 }
 
 enum NestedIntegerOperand<'a> {
@@ -9243,6 +9265,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
                 if roots.callable_history.is_some() {
+                    if let Some((binding, at)) = observed_local_float_write(calls, group) {
+                        for row in &mut path.0 {
+                            let value = evaluate_current_float(calls, at, roots, row)?;
+                            row.replace_observed_float(binding, value)?;
+                        }
+                        continue;
+                    }
                     if let Some(write) = observed_float_struct_write(calls, group) {
                         for row in &mut path.0 {
                             if !row.storage.as_ref()?.has_observed_aggregate(write.declaration) { return None; }
@@ -12288,6 +12317,12 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
             if BlockOrdinal(ordinal) == calls.structure.root && position < prefix { continue; }
             match &item.kind {
                 BlockItemKind::Assignment { group } => {
+                    if let Some((_, at)) = observed_local_float_write(calls, *group) {
+                        observed_float_expr_sites(calls, at, |field| {
+                            covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                        }, |at| { scalar_calls.insert(at); })?;
+                        continue;
+                    }
                     if let Some(write) = observed_float_struct_write(calls, *group) {
                         covered.insert((write.declaration.clone(), write.place, ModuleStorageRole::Replace));
                         for (_, at) in write.fields {
@@ -12454,6 +12489,42 @@ fn evaluate_observed_boolean(calls: &FunctionCallSites, condition: OccurrenceOrd
 }
 
 #[cfg(feature = "internal-checker")]
+fn observed_local_float_write(calls: &FunctionCallSites, position: BlockPosition) -> Option<(&ReferenceBindingId, OccurrenceOrdinal)> {
+    let (binding, ty, rhs, destination) = checked_scalar_assignment(calls, position)?;
+    if ty != &ScalarType::F32 || calls.structure.checked_types.expressions.get(&rhs)? != ty
+        || calls.structure.checked_types.places.get(&destination)? != ty
+        || binding.kind != super::ReferenceBindingKind::Declared
+    { return None; }
+    Some((binding, rhs))
+}
+
+#[cfg(feature = "internal-checker")]
+struct ObservedFloatChoice<'a> {
+    condition: OccurrenceOrdinal,
+    left: OccurrenceOrdinal,
+    right: OccurrenceOrdinal,
+    operator: &'a BinaryOperator,
+    yes: OccurrenceOrdinal,
+    no: OccurrenceOrdinal,
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_choice(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<ObservedFloatChoice<'_>> {
+    let structure = &calls.structure;
+    if structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
+    let ConditionalRegion::Value { condition, then_block, else_block, resume, .. } = calls.conditionals.get(&at)? else { return None; };
+    if *resume != at { return None; }
+    let (left, operator, right) = structure.projected_f32_comparisons.get(condition)?;
+    let result = |block: BlockOrdinal| {
+        let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None; };
+        let BlockItemKind::FinalOutput(slot) = item.kind else { return None; };
+        (slot.output == 0 && structure.checked_types.expressions.get(&slot.expression) == Some(&ScalarType::F32)).then_some(slot.expression)
+    };
+    Some(ObservedFloatChoice { condition: *condition, left: *left, right: *right, operator,
+        yes: result(*then_block)?, no: result(*else_block)? })
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) type ObservedFloatCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal, Vec<projected_f32::ExactF32>)
     -> Option<(projected_f32::ExactF32, Option<usize>, usize)> + 'a;
 
@@ -12469,6 +12540,10 @@ fn observed_float_expr_sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrd
         if let Some((left, _, right)) = structure.projected_f32_math.get(&at) {
             agenda.push(*right);
             agenda.push(*left);
+            continue;
+        }
+        if let Some(choice) = observed_float_choice(calls, at) {
+            agenda.extend([choice.no, choice.yes, choice.right, choice.left]);
             continue;
         }
         let args = observed_float_call_args(calls, at)?;
@@ -12504,7 +12579,9 @@ fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, root
     -> Option<projected_f32::ExactF32>
 {
     use projected_f32::ExactF32;
-    enum Work<'a> { Eval(OccurrenceOrdinal), Binary(&'a BinaryOperator), Call(OccurrenceOrdinal, usize) }
+    enum Work<'a> {
+        Eval(OccurrenceOrdinal), Binary(&'a BinaryOperator), Call(OccurrenceOrdinal, usize), Branch(ObservedFloatChoice<'a>),
+    }
     let tracker = roots.callable_history?;
     let mut pending = vec![Work::Eval(at)];
     let mut values = Vec::<ExactF32>::new();
@@ -12523,6 +12600,11 @@ fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, root
                     pending.push(Work::Eval(*left));
                     continue;
                 }
+                if let Some(choice) = observed_float_choice(calls, at) {
+                    let (left, right) = (choice.left, choice.right);
+                    pending.extend([Work::Branch(choice), Work::Eval(right), Work::Eval(left)]);
+                    continue;
+                }
                 let args = observed_float_call_args(calls, at)?;
                 tracker.borrow().charge(args.len())?;
                 pending.push(Work::Call(at, args.len()));
@@ -12532,6 +12614,17 @@ fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, root
                 let right = values.pop()?;
                 let left = values.pop()?;
                 values.push(left.binary(op, right)?);
+            }
+            Work::Branch(choice) => {
+                let right = f32::from_bits(values.pop()?.0);
+                let left = f32::from_bits(values.pop()?.0);
+                let selected = IntegerRelation::from_operator(choice.operator)?.accepts(left.partial_cmp(&right)?);
+                let span = calls.occurrences.get(choice.condition.0)?.span;
+                let mut tracker = tracker.borrow_mut();
+                let step = tracker.step_owner.map_or(CallableHistoryStep::Branch(span,selected),
+                    |owner| CallableHistoryStep::ProviderBranch(owner,span,selected));
+                tracker.append(row, step);
+                pending.push(Work::Eval(if selected { choice.yes } else { choice.no }));
             }
             Work::Call(at, arity) => {
                 let args = values.split_off(values.len().checked_sub(arity)?);

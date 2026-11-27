@@ -20028,6 +20028,60 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_eye_replacements_keep_current_lexical_version_and_lazy_clamp() {
+        let app = source("src/main.w", "observed-flight-eye-replacement");
+        let program = r#"%%start
+            struct copy ParcelCamera { f32 y; }
+            ParcelCamera published_parcel_camera = {.y=0.75;};
+            bool parcel_interrupted = FLAG;
+            i16 status = 5;
+            f32(f32) floor_eye = fn(value) { FLOOR };
+            f32(f32) keep_eye = fn(value) { KEEP };
+            unit() frame = fn {
+                f32 ey = 0.25;
+                if (parcel_interrupted) { ey = published_parcel_camera.y; };
+                ey = if (ey < 0.45) { floor_eye(0.45) } else { keep_eye(ey) };
+                published_parcel_camera = {.y=ey;};
+            };
+            unit() inspect = fn {
+                f32 observed = published_parcel_camera.y;
+                if (observed == 0.45) { status = 37; } else {
+                    if (observed == 0.75) { status = 19; } else { status = 11; };
+                };
+            };
+            frame(); inspect();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (flag, floor, keep, code, cells) in [
+                ("true", "1.0/(value-value)", "value", 19, 4),
+                ("false", "value", "1.0/(value-value)", 37, 3),
+            ] {
+                let build = |floor: &str, keep: &str| program.replace("FLAG",flag).replace("FLOOR",floor).replace("KEEP",keep);
+                let prepare = |text: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let text = build(floor, keep);
+                let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+                let report = prepare(&text).run().unwrap();
+                assert_eq!(super::super::checker_flow::take_observed_storage_delta_visits(), cells*17);
+                let (capped, _, trace, _) = prepare(&text).search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                let call = |value: &str| {
+                    let at = text.find(value).unwrap() as u32;
+                    wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(at,at+value.len() as u32))
+                };
+                assert_eq!(trace.contains_return(&call("keep_eye(ey)")), flag == "true");
+                assert_eq!(trace.contains_return(&call("floor_eye(0.45)")), flag == "false");
+                assert_eq!(capped, report.directives);
+                assert_eq!(capped[0].code(), &BigInt::from(code));
+                assert!(matches!(prepare(&build(keep,floor)).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn observed_parcel_camera_publication_retains_in_wreck_and_clears_on_coast() {
         let app = source("src/main.w", "observed-flight-camera-publication");
         let program = r#"%%start
