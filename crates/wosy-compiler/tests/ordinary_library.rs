@@ -4,7 +4,7 @@ use inkwell::module::Module;
 use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm,
-    parse_source, prepare_scalar_project, ScalarNamespaceBinding, ScalarPreparationInputs,
+    parse_source, prepare_scalar_project, prepare_scalar_project_with_access, ScalarNamespaceBinding, ScalarPreparationInputs,
     ScalarSourceDeclarations, ScalarTargetLayout,
 };
 use wosy_syntax::{ByteSpan, SourceIdentity};
@@ -162,7 +162,7 @@ fn assert_stdlib_print(text: &str, owning: bool) {
     let std = source("std", "src/bootstrap.w");
     let preview = source("std", "src/wasi/preview1.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let prepared = prepare_scalar_project(
+        let prepared = prepare_scalar_project_with_access(
             vec![
                 (declarations(&app, text), vec![namespace("std", &std)]),
                 (
@@ -179,6 +179,7 @@ fn assert_stdlib_print(text: &str, owning: bool) {
             ],
             vec![app.clone(), std.clone(), preview.clone()],
             ScalarPreparationInputs { target_layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
         )
         .unwrap_or_else(|e| panic!("{target_layout:?}: {:?}", e.diagnostics));
         let build = analyze_scalar_build(&prepared);
@@ -3192,7 +3193,7 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
     let preview = source("std", "src/wasi/preview1.w");
     let text = include_str!("../../../tests/fixtures/build/wasi_read_into/project/src/read_line_lf.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let prepared = prepare_scalar_project(
+        let prepared = prepare_scalar_project_with_access(
             vec![
                 (declarations(&app, text), vec![namespace("std", &std)]),
                 (
@@ -3206,6 +3207,7 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
             ],
             vec![app.clone(), std.clone(), preview.clone()],
             ScalarPreparationInputs { target_layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
         )
         .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
         let build = analyze_scalar_build(&prepared);
@@ -3224,12 +3226,9 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
         let allocated = lookup("_read_line_allocated");
         let discard = lookup("_read_line_discard_continue");
         let step = lookup("_read_line_discard_step");
-        // The one panic is the existing null check for the checked reborrow,
-        // not an extra call on the ordinary recurring path.
-        assert_eq!(
-            direct_calls(&module, &discard),
-            vec!["__wosy_core_system_panic".to_owned(), step.clone()]
-        );
+        // This scalar recurrence has no checked access. Its one ordinary
+        // call must feed an actual back-edge rather than a recursive call.
+        assert_eq!(direct_calls(&module, &discard), [step.clone()]);
         let blocks = module.get_function(&discard).unwrap().get_basic_blocks();
         let named_block = |name: &[u8]| {
             blocks
@@ -3239,26 +3238,65 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
                 .unwrap_or_else(|| panic!("{target_layout:?}: missing block {name:?}"))
         };
         let header = named_block(b"self_tail.header");
-        let failure = named_block(b"deref_null_panic");
-        let continuation = named_block(b"deref_null_continue");
-        let block_calls = |block: inkwell::basic_block::BasicBlock<'_>| {
-            block.get_instructions()
-                .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call)
-                .map(|instruction| {
-                    CallSiteValue::try_from(instruction).unwrap().get_called_fn_value()
-                        .expect("ordinary direct call").get_name().to_str().unwrap().to_owned()
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(block_calls(failure), vec!["__wosy_core_system_panic"]);
-        assert_eq!(block_calls(continuation), vec![step]);
-        assert_eq!(
-            failure.get_terminator().unwrap().get_opcode(),
-            InstructionOpcode::Unreachable
-        );
-        let backedge = continuation.get_terminator().unwrap();
+        let backedge = named_block(b"self_tail.then").get_terminator().unwrap();
         assert_eq!(backedge.get_opcode(), InstructionOpcode::Br);
         assert_eq!(backedge.get_operand(0).unwrap().block(), Some(header));
+
+        // The actual checked accesses must use the release module and the
+        // original borrowed descriptor, not a derived or local count.
+        let null = module.get_function(&lookup("check_non_null_address")).unwrap();
+        let bounds = module.get_function(&lookup("check_index_in_extent")).unwrap();
+        for helper in [null, bounds] {
+            assert_eq!(
+                direct_calls(&module, helper.get_name().to_str().unwrap()),
+                ["__wosy_core_system_panic"],
+            );
+        }
+        for (name, memory) in [
+            ("_read_line_load_byte", InstructionOpcode::Load),
+            ("_read_line_store_byte", InstructionOpcode::Store),
+        ] {
+            let function = module.get_function(&lookup(name)).unwrap();
+            let descriptor = function.get_first_param().unwrap();
+            let instructions: Vec<_> = function.get_first_basic_block().unwrap()
+                .get_instructions().collect();
+            let extract = |slot| instructions.iter().copied().find(|row| {
+                row.get_opcode() == InstructionOpcode::ExtractValue
+                    && row.get_indices() == [slot]
+                    && row.get_operand(0).unwrap().value() == Some(descriptor)
+            }).unwrap();
+            let call_position = |callee| instructions.iter().position(|row| {
+                row.get_opcode() == InstructionOpcode::Call
+                    && CallSiteValue::try_from(*row).unwrap().get_called_fn_value() == Some(callee)
+            }).unwrap();
+            let null_position = call_position(null);
+            let bounds_position = call_position(bounds);
+            let element = instructions.iter().position(|row| row.get_opcode() == InstructionOpcode::GetElementPtr)
+                .unwrap();
+            assert!(null_position < bounds_position && bounds_position < element);
+            fn operand<'ctx>(
+                row: inkwell::values::InstructionValue<'ctx>,
+                position: u32,
+            ) -> inkwell::values::BasicValueEnum<'ctx> {
+                row.get_operand(position).unwrap().value().unwrap()
+            }
+            assert_eq!(operand(instructions[null_position], 0).as_instruction_value(), Some(extract(0)));
+            assert_eq!(operand(instructions[bounds_position], 1).as_instruction_value(), Some(extract(1)));
+            let index = operand(instructions[bounds_position], 0).into_int_value();
+            assert_eq!(index.get_type().get_bit_width(), 64);
+            let address_index = operand(instructions[element], 1);
+            if target_layout == ScalarTargetLayout::WASM32 {
+                let truncate = address_index.as_instruction_value().unwrap();
+                assert_eq!(truncate.get_opcode(), InstructionOpcode::Trunc);
+                assert_eq!(operand(truncate, 0), index.as_basic_value_enum());
+                assert!(bounds_position < instructions.iter().position(|row| *row == truncate).unwrap());
+            } else {
+                assert_eq!(address_index, index.as_basic_value_enum());
+            }
+            let memory_pointer = u32::from(memory == InstructionOpcode::Store);
+            assert!(instructions[element + 1..].iter().any(|row| row.get_opcode() == memory
+                && operand(*row, memory_pointer).as_instruction_value() == Some(instructions[element])));
+        }
         let calls = direct_calls(&module, &allocated);
         assert!(direct_calls(&module, "main").contains(&read));
         assert!(direct_calls(&module, &read).contains(&allocated));
@@ -4095,7 +4133,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
     let app = source("private_checked_backing", "src/main.w");
     let values = source("package", "src/values.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        for (text, expected_transport, qualified) in [
+        for (variant, (text, expected_transport, qualified)) in [
             (positive, true, false), (unproved.as_str(), false, false),
             (passive.as_str(), true, false), (projecting_length.as_str(), true, false),
             (repeated_projection.as_str(), false, false), (consuming.as_str(), false, false),
@@ -4114,7 +4152,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             (wrapper_overwritten.as_str(), false, false), (wrapper_two_callers.as_str(), false, false),
             (wrapper_passive.as_str(), true, false), (wrapper_checked_reader.as_str(), true, false),
             (wrapper_consuming.as_str(), false, false),
-        ] {
+        ].into_iter().enumerate() {
             let (inputs, order) = if qualified {
                 (vec![(declarations(&app, text), vec![namespace("imported", &values)]),
                     (declarations(&values, "%%start\nu16 value = 0;\n%%end"), Vec::new())],
@@ -4122,14 +4160,17 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
             } else {
                 (vec![(declarations(&app, text), Vec::new())], vec![app.clone()])
             };
-            let prepared = prepare_scalar_project(
+            let prepared = prepare_scalar_project_with_access(
                 inputs,
                 order,
                 ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
             ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
             let build = analyze_scalar_build(&prepared);
             assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
-            let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+            let llvm = emit_scalar_build_project_llvm(&build)
+                .unwrap_or_else(|error| panic!("{target_layout:?}, variant {variant}: {error}"))
+                .to_text();
             let context = Context::create();
             let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "private-checked-backing");
             let module = context.create_module_from_ir(buffer).unwrap();
