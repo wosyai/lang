@@ -272,9 +272,20 @@ impl SqliteSourceState {
         };
         let builder = builder.ok_or("current source lacks an ordinary builder observation")?;
         let mut open = open;
-        self.live_partition_for_capture(captured, deadline, max_partition_bytes, OrdinaryLlvmMode::KnownBuilderInputs,
+        let answer = self.live_partition_for_capture(captured, deadline, max_partition_bytes, OrdinaryLlvmMode::KnownBuilderInputs,
             |selected, _| open(selected), |source, projection| bind_builder_inputs(source, builder, projection, expected_peer.0, output),
-        ).await
+        ).await?;
+        let AcknowledgedOrdinaryLlvm::Partition(plan) = &answer else { return Ok(answer); };
+        // This is a second observation, not an atomic snapshot. Each pass
+        // admits at most the same authored graph byte budget; both share one
+        // deadline. The plan still cannot authorize a later write or run.
+        match self.capture_live(target, profile, deadline, max_authored_source_bytes, false)? {
+            Ok(current) if current.captured.source.generation() == plan.source().generation()
+                && current.captured.selection() == plan.source().selection() => Ok(answer),
+            Ok(_) | Err(LiveCaptureRefusal::NotAcknowledged | LiveCaptureRefusal::StaleSelection) =>
+                Ok(AcknowledgedOrdinaryLlvm::StaleSelection),
+            Err(reason) => Ok(reason.into()),
+        }
     }
 
     async fn live_partition_for_capture<Open, Opening, Stream, Answer>(

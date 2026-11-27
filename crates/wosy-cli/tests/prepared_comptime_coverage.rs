@@ -1162,3 +1162,96 @@ u32 different = solve(7, 13);
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_v2_plan_reobserves_imported_source_after_real_framed_reply() {
+    use std::{cell::Cell, fs::File};
+    use tokio::io::duplex;
+    use wosy_cli::source_state::{AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer};
+    use wosy_daemon::BuildSessionEnd;
+    use wosy_protocol::{
+        encode_session_frame, write_encoded_session_frame, BuildSessionCommand, BuildSessionReply,
+        BuildSessionResponse, SessionFrameReader,
+    };
+
+    let fixture = Scratch::new();
+    let root = fixture.0.join("project");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("wosy.toml"), MANIFEST).unwrap();
+    fs::write(root.join("main.w"), BEFORE).unwrap();
+    let library = root.join("library.w");
+    fs::write(&library, ORDINARY_LIB).unwrap();
+    let output = fixture.0.join("must-not-write");
+    let bytes = BEFORE.len() + ORDINARY_LIB.len();
+    let expected = AuthorizedOrdinaryBuilderPeer::from_open_executable(File::open("/proc/self/exe").unwrap()).unwrap();
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&root, CLIENT).unwrap();
+        let base = client.stage("app").unwrap();
+        let initial = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(base.root, &initial.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", base.pending.unwrap()).unwrap());
+        let selected = client.acknowledged_build_source("app").unwrap().unwrap();
+
+        for replace_after_reply in [false, true] {
+            let (caller, mut downstream) = duplex(512);
+            let mut caller = Some(caller);
+            let (mut upstream, daemon) = duplex(512);
+            let plan = client.live_ordinary_builder_inputs("app", "dev", TTL, bytes, 1 << 20, &expected,
+                output.clone(), |capture| {
+                    assert_eq!(capture, selected);
+                    std::future::ready(Ok(caller.take().expect("known v2 path opens once")))
+                });
+            let service = worker.serve_known_ordinary_builder_input_session(daemon, selected.clone(), LIMITS, 1 << 20, TTL);
+            let library = &library;
+            let selected_root = base.root;
+            let relay = async move {
+                let (mut requests, mut replies) = (SessionFrameReader::default(), SessionFrameReader::default());
+                for round in 1..=3 {
+                    let request: BuildSessionCommand = requests.read(&mut downstream).await.unwrap().unwrap();
+                    let request = encode_session_frame(&request).unwrap();
+                    assert!(write_encoded_session_frame(&mut upstream, &request, || true).await.unwrap());
+                    let reply: BuildSessionResponse<wosy_compiler::Diagnostic> = replies.read(&mut upstream).await.unwrap().unwrap();
+                    if round == 2 {
+                        assert!(matches!(&reply.reply, BuildSessionReply::OrdinaryLlvmProjection { projection }
+                            if projection.source_root == selected_root && projection.builder.is_some()));
+                        if replace_after_reply {
+                            let changed = ORDINARY_LIB.replace("14", "15");
+                            assert_eq!(changed.len(), ORDINARY_LIB.len());
+                            fs::write(library, changed).unwrap();
+                        }
+                    }
+                    let reply = encode_session_frame(&reply).unwrap();
+                    assert!(write_encoded_session_frame(&mut downstream, &reply, || true).await.unwrap());
+                }
+            };
+            let (plan, end, ()) = tokio::join!(plan, service, relay);
+            assert_eq!(end.unwrap(), BuildSessionEnd::Disconnected);
+            let plan = plan.unwrap();
+            if replace_after_reply {
+                assert!(matches!(plan, AcknowledgedOrdinaryLlvm::WorkspaceChanged));
+            } else {
+                let AcknowledgedOrdinaryLlvm::Partition(plan) = plan else { panic!("unchanged graph at exact budget"); };
+                assert_eq!(plan.source().selection(), &selected);
+                assert!(!plan.partition().is_empty());
+            }
+            assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), selected);
+            assert!(!output.exists());
+        }
+        fs::write(&library, ORDINARY_LIB).unwrap();
+        let opens = Cell::new(0);
+        let below = client.live_ordinary_builder_inputs("app", "dev", TTL, bytes - 1, 1 << 20, &expected,
+            output.clone(), |_| {
+                opens.set(opens.get() + 1);
+                std::future::ready(Ok(duplex(512).0))
+            }).await;
+        assert!(below.err().unwrap().to_string().contains("live authored source exceeds the byte budget"));
+        assert_eq!(opens.get(), 0);
+        assert!(!output.exists());
+        drop(worker);
+        Arc::into_inner(store).unwrap().close().await.unwrap();
+    });
+}
