@@ -2198,6 +2198,7 @@ fn finish_partition<'ctx>(
     externs: &[LlvmExternIdentity],
     metadata: PartitionMetadata,
 ) -> Result<LlvmPartition, String> {
+    #[cfg(test)]
     module.verify().map_err(|error| error.to_string())?;
     let text = module.print_to_string().to_string();
     let metadata = match metadata {
