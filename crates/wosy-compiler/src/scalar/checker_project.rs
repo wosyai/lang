@@ -18985,6 +18985,53 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_float_guard_reuses_proven_singleton_affine_class_without_losing_witness() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-retire-fixed-affine");
+        let program = |claim: &str| format!(r#"%%start
+            f32(i32,i32,i32) route_value = fn(seed,row,column) {{
+                if (seed<2 || seed>3) {{ 0.0 }}
+                else {{
+                    i32 start=seed-1;
+                    i32 count=if (column==0) {{ 4 }} else {{ 4 }};
+                    if (row<0 || row>=count-start || column<0 || column>1) {{ 0.0 }}
+                    else {{
+                        i32 point=start+row;
+                        core.require({claim}, {OUTPUT});
+                        1.0
+                    }}
+                }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, capped: bool| {
+                let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap_or_else(|error| panic!("route preparation: {error:?}"));
+                if capped { prepared.run_private_authored_root(NonZeroUsize::MIN).map(|(result, _)| result) }
+                else { prepared.run() }
+            };
+            let good = program("point>=1 && point<=3");
+            let bad = program("point<=2 || seed!=3 || column!=1");
+            for capped in [true, false] {
+                let good = run(&good, capped).unwrap_or_else(|error| panic!("route closure: {error:?}"));
+                assert!(good.active && good.directives.is_empty());
+                let bad = run(&bad, capped).unwrap_or_else(|error| panic!("route witness: {error:?}"));
+                let [false_claim] = bad.directives.as_slice() else { panic!("one authored failure"); };
+                let axes: Vec<_> = false_claim.witness.axes().collect();
+                assert_eq!(axes.len(), 6);
+                assert!(axes.iter().all(|(_, ty)| **ty == ScalarType::I32));
+                for (axis, value) in [3, 1, 1, 2, 4, 3].into_iter().enumerate() {
+                    let value = BigInt::from(value);
+                    assert!(false_claim.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn dormant_float_coordinate_route_can_discard_only_readonly_leaves() {
         use std::num::NonZeroUsize;
         let owner = source("src/main.w", "dormant-float-coordinate-route");

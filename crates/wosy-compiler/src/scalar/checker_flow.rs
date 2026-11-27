@@ -11047,6 +11047,15 @@ impl IntegerInputs {
                 }
                 ComputedRowInteger::Affine(axis, transform) => {
                     let transform = Rc::new(transform);
+                    // A fixed independent class carries no remaining choice
+                    // that could be lost when this new view takes its slot.
+                    // Keep nonlocal entry transfers and live correlations.
+                    if row.entry.is_none() && row.affine.as_ref().is_some_and(|class| {
+                        !class.contains(row.canonical_axis(axis))
+                            && row[class.anchor].singleton_value().is_some()
+                    }) {
+                        row.affine = None;
+                    }
                     let meter = affine_work.as_mut().filter(|_| row.affine.is_some()).unwrap_or(&mut *work);
                     let plan = row.prepare_affine(axis, &row[axis], &transform, meter)?;
                     if matches!(&plan, AffineAppend::Member { .. }) {
