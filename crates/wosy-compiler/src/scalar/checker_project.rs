@@ -21396,7 +21396,9 @@ unit(f32,u8) entry = fn(dt,x) {
                 assert_eq!(all.iter().map(|f| f.code().clone()).collect::<Vec<_>>(), [11,13].map(BigInt::from));
                 assert_eq!(capped, all[..1]);
                 assert!(all[0].witness.intervals_at(0,0).unwrap().eq([(&BigInt::from(250), &BigInt::from(255))]));
-                assert!(all[1].witness.intervals_at(0,0).unwrap().eq([(&BigInt::from(240), &BigInt::from(249))]));
+                // A failing require is a report, not an assumed narrow on the next obligation.
+                let interval = all[1].witness.intervals_at(0,0).unwrap().collect::<Vec<_>>();
+                assert_eq!(interval, [(&BigInt::from(240), &BigInt::from(255))]);
                 for (pos, call) in text.match_indices("wrapper(dt,x)") {
                     assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(src.clone(),
                         ByteSpan::new(pos as u32, (pos+call.len()) as u32))));
