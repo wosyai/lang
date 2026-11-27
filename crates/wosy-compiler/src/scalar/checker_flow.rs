@@ -2303,6 +2303,8 @@ struct IntegerRoots<'a> {
     observed_float_field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
     #[cfg(feature = "internal-checker")]
     observed_float_call: Option<&'a ObservedFloatCall<'a>>,
+    #[cfg(feature = "internal-checker")]
+    observed_scalar_getter: Option<&'a ObservedScalarGetter<'a>>,
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
@@ -7974,11 +7976,13 @@ impl IntegerInputs {
         roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
         if roots.callable_history.is_none() { return Some(None); }
         let Some(guard) = observed_boolean_inputs(calls, condition) else { return Some(None); };
-        if guard.integer && roots.observed_float_field_read.is_none() { return Some(None); }
+        let getter = guard.calls.iter().any(|&site| observed_getter_signature(calls, site).is_some());
+        if (guard.integer && roots.observed_float_field_read.is_none())
+            || (getter && roots.observed_scalar_getter.is_none()) { return Some(None); }
         // A source-backed predicate must either consume its current cells or
-        // decline. Pure predicates, however, already have a symbolic route;
-        // do not preempt it when a participating lexical lane is not exact.
-        if guard.reads.is_empty() && (!guard.integer || !observed_locals_are_singletons(roots, self, &guard.locals)) {
+        // decline. Pure predicates keep the existing symbolic route.
+        if guard.reads.is_empty() && !getter
+            && (!guard.integer || !observed_locals_are_singletons(roots, self, &guard.locals)) {
             return Some(None);
         }
         let mut rows = [Self::default(), Self::default()];
@@ -9521,10 +9525,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             if roots.observed_float_field_read.is_some() {
                                 if let Some(identity) = structure.projected_integer_locals.get(&(block, item.position)) {
                                     let mut backed = false;
+                                    let mut getter = false;
                                     let mut locals = Vec::new();
-                                    if observed_integer::sites(calls, outputs.primary, |_| backed = true, |_| {},
+                                    if observed_integer::sites(calls, outputs.primary, |_| backed = true,
+                                        |site| getter |= observed_getter_signature(calls, site).is_some(),
                                         |binding, ty| locals.push((binding, ty))).is_some()
-                                        && (backed || observed_locals_are_singletons(roots, &path, &locals)) {
+                                        && (backed || getter && roots.observed_scalar_getter.is_some()
+                                            || observed_locals_are_singletons(roots, &path, &locals)) {
                                         for row in &mut path.0 {
                                             let value = observed_integer::evaluate(calls, outputs.primary, roots, row)?;
                                             row.cells.push(Rc::new(IntegerSet::singleton(&value)));
@@ -12450,6 +12457,7 @@ enum ObservedBoolean<'a> {
     Lexical(&'a ReferenceBindingId),
     Not(OccurrenceOrdinal),
     Integer(OccurrenceOrdinal, IntegerRelation, OccurrenceOrdinal),
+    Getter,
     ShortCircuit { left: OccurrenceOrdinal, right: OccurrenceOrdinal, when: bool },
 }
 
@@ -12473,6 +12481,7 @@ fn observed_boolean_node(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> 
             return Some(ObservedBoolean::Integer(*left, IntegerRelation::from_operator(operator)?, *right));
         }
     }
+    if observed_getter_signature(calls, site).is_some() { return Some(ObservedBoolean::Getter); }
     let branch = calls.short_circuits.get(&site)?;
     Some(ObservedBoolean::ShortCircuit { left: branch.left, right: branch.right, when: branch.evaluate_right_when })
 }
@@ -12492,6 +12501,7 @@ fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdin
     let mut inputs = ObservedBooleanInputs { locals: Vec::new(), reads: Vec::new(), calls: Vec::new(), integer: false };
     while let Some(site) = todo.pop() {
         match observed_boolean_node(calls, site)? {
+            ObservedBoolean::Getter => inputs.calls.push(site),
             ObservedBoolean::Module(declaration) => inputs.reads.push((declaration.clone(), site, ModuleStorageRole::Read)),
             ObservedBoolean::Not(operand) => todo.push(operand),
             ObservedBoolean::Integer(left, _, right) => {
@@ -12587,6 +12597,11 @@ fn evaluate_observed_boolean(calls: &FunctionCallSites, condition: OccurrenceOrd
                 if ty != &ScalarType::Bool { return None; }
                 bool_result_lane(row.get(axis)?.singleton_value()?)? == 1
             }
+            ObservedBoolean::Getter => {
+                let ObservedExactValue::Boolean(value) = evaluate_observed_getter(calls,site,roots,row)?
+                    else { return None; };
+                value
+            }
             ObservedBoolean::Integer(left, relation, right) => {
                 let left = observed_integer::evaluate(calls, left, roots, row)?;
                 let right = observed_integer::evaluate(calls, right, roots, row)?;
@@ -12651,6 +12666,33 @@ fn observed_float_choice(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Op
     };
     Some(ObservedFloatChoice { condition: *condition, left: *left, right: *right, operator,
         yes: result(*then_block)?, no: result(*else_block)? })
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) type ObservedScalarGetter<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal, &ProjectedStorage)
+    -> Option<super::checker_project::ObservedExactValue> + 'a;
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn observed_getter_signature(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> Option<&CheckedCallSignature> {
+    if !calls.structure.checker_direct_targets.contains_key(&site) { return None; }
+    let signature = calls.checked_call_signatures.get(&site)?;
+    let [out] = signature.outputs.outputs.as_slice() else { return None; };
+    (signature.parameters.is_empty() && (out.ty == ScalarType::Bool || is_integer_type(&out.ty))
+        && calls.structure.checked_types.expressions.get(&site) == Some(&out.ty)).then_some(signature)
+}
+
+#[cfg(feature = "internal-checker")]
+fn evaluate_observed_getter(calls: &FunctionCallSites, site: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    row: &mut IntegerRow) -> Option<super::checker_project::ObservedExactValue> {
+    let mut history = roots.callable_history?.borrow_mut();
+    history.charge(2)?;
+    let value = roots.observed_scalar_getter?(calls,site,row.storage.as_ref()?)?;
+    let span = calls.occurrences.get(site.0)?.span;
+    let call = history.boundary(span,false);
+    let returned = history.boundary(span,true);
+    history.append(row,call);
+    history.append(row,returned);
+    Some(value)
 }
 
 #[cfg(feature = "internal-checker")]

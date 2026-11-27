@@ -75,6 +75,7 @@ enum Expr<'a> {
     Module(Place<'a>),
     Binary(OccurrenceOrdinal,&'a BinaryOperator,OccurrenceOrdinal,&'a ScalarType),
     Extend(OccurrenceOrdinal),
+    Getter,
 }
 
 fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'_>> {
@@ -91,6 +92,7 @@ fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'
     if let Some((l,op,r)) = st.prepared_range_binary.get(&at) {
         return Some(Expr::Binary(*l,op,*r,ty));
     }
+    if observed_getter_signature(calls,at).is_some() { return Some(Expr::Getter); }
     use super::super::{CoreOperationId,ResolvedCallTarget};
     if calls.resolved_call_site(at)?.target != ResolvedCallTarget::Core(CoreOperationId::IntExtend) { return None; }
     let sig = calls.checked_call_signatures.get(&at)?;
@@ -116,13 +118,14 @@ pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
             }
             Expr::Binary(l,_,r,_) => todo.extend([r,l]),
             Expr::Extend(input) => { core(at); todo.push(input); }
+            Expr::Getter => core(at),
         }
     }
     Some(())
 }
 
 pub(super) fn evaluate(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
-    row: &IntegerRow) -> Option<BigInt> {
+    row: &mut IntegerRow) -> Option<BigInt> {
     enum Step<'a> { Eval(OccurrenceOrdinal), Read(Place<'a>), Apply(&'a BinaryOperator,&'a ScalarType), Extend }
     use Step::*;
     let charge = roots.callable_history?;
@@ -144,6 +147,11 @@ pub(super) fn evaluate(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: 
                     if let Some((_,i)) = index { todo.push(Eval(i)); }
                 }
                 Expr::Binary(l,op,r,ty) => todo.extend([Apply(op,ty),Eval(r),Eval(l)]),
+                Expr::Getter => {
+                    let super::super::checker_project::ObservedExactValue::Integer(_, value) =
+                        evaluate_observed_getter(calls,at,roots,row)? else { return None; };
+                    values.push(value);
+                }
                 Expr::Extend(input) => todo.extend([Extend,Eval(input)]),
             }
             Read(place) => {

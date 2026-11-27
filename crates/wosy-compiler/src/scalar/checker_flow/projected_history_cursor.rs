@@ -27,7 +27,8 @@ impl<'a> Machine<'a> {
     }
     fn enter(body: &'a FunctionCallSites, tracker: &'a RefCell<CallableHistories<'a>>, entry: Option<CallableHistoryEntry>,
         field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
-        math_call: Option<&'a ObservedFloatCall<'a>>) -> Option<Self> {
+        math_call: Option<&'a ObservedFloatCall<'a>>,
+        scalar_getter: Option<&'a ObservedScalarGetter<'a>>) -> Option<Self> {
         tracker.borrow().charge(body.occurrences.len().saturating_add(body.boundary.parameters.len()))?;
         if !body.checker_returns_unit() {
             let [result] = body.boundary.results.as_slice() else { return None; };
@@ -47,7 +48,7 @@ impl<'a> Machine<'a> {
         let ids = body.boundary.checker_parameter_bindings.as_deref()?;
         if ids.len() != body.boundary.parameters.len() { return None; }
         let snapshots = !body.structure.checker_selected_snapshots.is_empty();
-        let mut roots = IntegerRoots { callable_history: Some(tracker), observed_float_field_read: field_read, observed_float_call: math_call, allow_snapshot_history: snapshots,
+        let mut roots = IntegerRoots { callable_history: Some(tracker), observed_float_field_read: field_read, observed_float_call: math_call, observed_scalar_getter: scalar_getter, allow_snapshot_history: snapshots,
             allow_ordinary_affine_overwrites: snapshots,
             allow_ordinary_contextual_places: !snapshots && body.structure.has_ordinary_contextual_places(),
             ..IntegerRoots::default() };
@@ -73,6 +74,7 @@ pub(in super::super) fn drive_finite_history<'p>(
     observed_prefix: &[(&'p ReferenceBindingId, &'p ScalarType, super::super::checker_project::ObservedExactValue)],
     field_read: Option<&dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
     math_call: Option<&ObservedFloatCall<'_>>,
+    scalar_getter: Option<&ObservedScalarGetter<'_>>,
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
     mut record: impl FnMut(Target, IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
@@ -88,7 +90,7 @@ pub(in super::super) fn drive_finite_history<'p>(
         row.storage = Some(Rc::clone(storage));
         Some(CallableHistoryEntry(row))
     } else { None };
-    let mut machine = Machine::enter(body, &histories, entry, field_read, math_call)?;
+    let mut machine = Machine::enter(body, &histories, entry, field_read, math_call, scalar_getter)?;
     if !observed_prefix.is_empty() {
         if actual_storage.is_none() { return None; }
         let Machine::Unit { roots, block } = &mut machine else { return None; };
@@ -167,7 +169,7 @@ pub(in super::super) fn drive_finite_history<'p>(
                     }
                 }
                 pending.row += 1;
-                stack.push(Frame { target: child, machine: Machine::enter(child_body, &histories, Some(entry), field_read, math_call)?, pending: None });
+                stack.push(Frame { target: child, machine: Machine::enter(child_body, &histories, Some(entry), field_read, math_call, scalar_getter)?, pending: None });
                 continue;
             }
             if pending.row != cursor.path.0.len() || pending.receipts.len() != pending.row { return None; }

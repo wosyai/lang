@@ -2162,6 +2162,50 @@ thread_local! {
 }
 
 #[cfg(feature = "internal-checker")]
+struct PreparedScalarGetter<'a> {
+    declaration: &'a wosy_syntax::SourceSpan,
+    ty: &'a ScalarType,
+    negate: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PreparedScalarGetter<'a> {
+    fn from_body(body: &'a FunctionCallSites) -> Option<Self> {
+        use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+        if !body.boundary.parameters.is_empty() || body.contextual_formal().is_some()
+            || !body.arms.is_empty() || !body.call_occurrences.is_empty()
+            || !body.allocation_length_calls.is_empty() || !body.callable_escapes.is_empty()
+        { return None; }
+        let [result] = body.boundary.results.as_slice() else { return None; };
+        let root = body.structure.root;
+        let [block] = body.structure.blocks.as_slice() else { return None; };
+        if root.0 != 0 || block.unsafe_context { return None; }
+        let [item] = block.items.as_slice() else { return None; };
+        let BlockItemKind::FinalOutput(output) = item.kind else { return None; };
+        let at = output.expression;
+        let ty = &result.ty;
+        if output.output != 0 || body.structure.checked_types.expressions.get(&at)? != ty
+            || body.structure.edges.get(&(OccurrenceParent::Block(root),OccurrenceEdge::FinalOutput { item:output.item,output:0 }))
+                != Some(&OccurrenceNode::Expression(at))
+        { return None; }
+        let negated = if *ty == ScalarType::Bool { body.structure.observed_bool_negations.get(&at).copied() }
+            else if is_integer_type(ty) { None } else { return None; };
+        let place = negated.unwrap_or(at);
+        if body.structure.checked_types.expressions.get(&place)? != ty { return None; }
+        let PlainNameIdentity::ModuleValue(declaration) = body.prepared_plain_name(place)? else { return None; };
+        Some(Self { declaration,ty,negate:negated.is_some() })
+    }
+
+    fn evaluate(&self, storage: &super::checker_flow::ProjectedStorage) -> Option<ObservedExactValue> {
+        let result = storage.observed_atom(self.declaration)?;
+        if &result.ty() != self.ty { return None; }
+        if !self.negate { return Some(result); }
+        let ObservedExactValue::Boolean(value) = result else { return None; };
+        Some(ObservedExactValue::Boolean(!value))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn try_observed_projected_storage_call(
     actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     topology: &ModuleInitializationTopology,
@@ -2212,6 +2256,7 @@ fn try_observed_projected_storage_call(
     let mut visiting = HashSet::new();
     let mut complete = HashSet::new();
     let mut admitted = HashMap::new();
+    let mut getters = HashMap::new();
     let mut writes_or_reads_storage = false;
     while let Some(event) = todo.pop() {
         match event {
@@ -2227,7 +2272,25 @@ fn try_observed_projected_storage_call(
                 writes_or_reads_storage |= has_storage;
                 todo.push(Event::Exit(node));
                 for (site, &child) in &body.structure.checker_direct_targets {
-                    if scalar_calls.contains(site) { continue; }
+                    if scalar_calls.contains(site) {
+                        if node == target && prefix_calls.contains(site) { continue; }
+                        if let Some(signature) = super::checker_flow::observed_getter_signature(body,*site) {
+                            if child.0 != node.0 && visits.get(child.0) != Some(&InitializationVisit::Completed) {
+                                return Ok(false);
+                            }
+                            if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,*site,signature) != Some(child) {
+                                return Ok(false);
+                            }
+                            let Some(getter) = body_of(child).and_then(PreparedScalarGetter::from_body)
+                                else { return Ok(false); };
+                            if getter.declaration.source != actual.project.modules.get(child.0)
+                                .ok_or(ProjectCheck::MissingRootOccurrences)?.source {
+                                return Ok(false);
+                            }
+                            getters.insert((body as *const FunctionCallSites,*site),getter);
+                        }
+                        continue;
+                    }
                     if child.0 != node.0 && visits.get(child.0) != Some(&InitializationVisit::Completed) {
                         return Ok(false);
                     }
@@ -2359,8 +2422,11 @@ fn try_observed_projected_storage_call(
         }
         search.append(PathStep::Return(span.clone()))
     };
+    let scalar_getter = |body: &FunctionCallSites, site, storage: &super::checker_flow::ProjectedStorage| {
+        getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
+    };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call), Some(&scalar_getter),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -12448,7 +12514,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -24442,6 +24508,110 @@ unit(u8) parent = fn(a) {
                 assert!(path.contains_branch(guard.clone(),true));
                 eprintln!("Orbital prepared packing generation=1 next=37 ceiling=90 failed={failed} {target_layout:?}");
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Orbital indexed-pack provider"]
+    fn pinned_orbital_partition_getters_use_current_rows_and_short_circuit() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap());
+        let provider_text = std::fs::read_to_string(path).unwrap();
+        let app = source("src/main.w","pinned-partition-getter-consumer");
+        let provider = source("src/indexed-pack.w","pinned-partition-getter-provider");
+        let text = r#"%%start
+            packing = namespace demo "indexed-pack.w";
+            i32[2] motion_base = [30,38];
+            i32[2] motion_unique = [99,99];
+            i32 first = 0;
+            i32 second = 0;
+            unit(i32) store = fn(id) {
+                u64 i = core.int_extend<u64>(id);
+                motion_unique[i] = packing.end() - motion_base[i];
+            };
+            unit() launch = fn {
+                packing.start();
+                packing.partition(37,90);
+                if(packing.ok()){store(0);};
+                packing.partition(18,12);
+                if(packing.ok()){first=99;}else{store(1);};
+                if(false&&packing.ok()){first=99;};
+                first = motion_unique[0];
+                second = motion_unique[1];
+            };
+            launch();
+            core.narrow(false,{.stdout="";.stderr="";.code=first;.files=[
+                {.path="second.json";.state=second;}
+            ];});
+        %%end"#;
+        let at = |needle: &str| text.find(needle).unwrap() as u32;
+        let qualified = r#"packing = namespace demo "indexed-pack.w";"#;
+        let binding_start = at(qualified);
+        let getter = |prefix: &str, name: &str| {
+            let start = at(prefix) + prefix.find(name).unwrap() as u32;
+            SourceSpan::new(app.clone(), ByteSpan::new(start,start+name.len() as u32))
+        };
+        let end_call = getter("packing.end()", "packing.end()");
+        let first_ok = getter("if(packing.ok()){store(0);}", "packing.ok()");
+        let second_ok = getter("if(packing.ok()){first=99;}", "packing.ok()");
+        let dead_ok = getter("false&&packing.ok()", "packing.ok()");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text), vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),
+                    span:ByteSpan::new(binding_start,binding_start+qualified.len() as u32),
+                }]),(declarations(&provider,&provider_text),Vec::new())],
+                [], vec![app.clone(),provider.clone()], ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly, Vec::new(),
+            ).unwrap();
+            let all = prepare().run().unwrap();
+            let [one] = all.directives.as_slice() else { panic!("one selected report"); };
+            assert_eq!(one.code(),&BigInt::from(7));
+            assert_eq!(one.files()[0].text.as_ref(),b"{\"type\":{\"kind\":\"i32\"},\"value\":-1}\n");
+            let (capped,_,trace,_) = prepare().search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(capped,all.directives);
+            assert!(trace.contains_return(&first_ok));
+            assert!(trace.contains_return(&second_ok));
+            assert!(!trace.contains_return(&dead_ok));
+            let calls = trace.call_paths();
+            let [path] = calls.as_slice() else { panic!("one ordered path"); };
+            let getters = path.iter().filter(|site| [ &first_ok,&second_ok,&end_call,&dead_ok ].contains(site))
+                .collect::<Vec<_>>();
+            assert_eq!(getters,[&first_ok,&end_call,&second_ok,&end_call]);
+            eprintln!("Orbital same-row getters {target_layout:?}: valid=7, invalid=-1, two returns, no unevaluated call");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn observed_getter_admission_rejects_state_mutation_before_return() {
+        let app = source("src/main.w","readonly-provider-admission");
+        let text = r#"%%start
+            i32 cell = 6;
+            bool ready = true;
+            i32() read = fn { cell };
+            bool() opposite = fn { !ready };
+            i32() changes = fn { cell = 7; cell };
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_checker_project(vec![(declarations(&app,text),Vec::new())],
+                vec![app.clone()],ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let mut counted = 0;
+            for (item, declaration) in project.modules[0].items.iter().enumerate() {
+                let ScalarItem::Function(f) = declaration else { continue; };
+                let candidate = PreparedScalarGetter::from_body(calls.function_body(0,item,None).unwrap());
+                match f.name.as_str() {
+                    "read" => assert!(!candidate.unwrap().negate),
+                    "opposite" => assert!(candidate.unwrap().negate),
+                    "changes" => assert!(candidate.is_none()),
+                    _ => panic!("unexpected callable"),
+                }
+                counted += 1;
+            }
+            assert_eq!(counted,3);
         }
     }
 
