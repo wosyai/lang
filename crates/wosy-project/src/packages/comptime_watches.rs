@@ -61,7 +61,7 @@ mod linux {
     use super::*;
     use crate::packages::GitDirectory;
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeSet, HashMap},
         ffi::OsString,
         fs::{File, Metadata},
         io::Read,
@@ -70,7 +70,6 @@ mod linux {
     };
 
     const MAX_OBSERVED_METADATA_BYTES: u64 = 1 << 20;
-    const MAX_MATCH_STEPS: usize = 4 << 20;
 
     /// Authenticate the exact raw manifest before ordinary configuration
     /// resolution or watches. Both fixed metadata files and all owning
@@ -97,8 +96,7 @@ mod linux {
         let mut result = Vec::new();
         if !globs.is_empty() {
             let mut budget = watch_budget(scope.watch_limits);
-            let mut steps = MAX_MATCH_STEPS;
-            resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut steps, &mut result)?;
+            resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut result)?;
             order_watches(&mut result);
         }
         Ok((selected, result))
@@ -136,12 +134,11 @@ mod linux {
     ) -> Result<Vec<WatchedComptimeFile>, String> {
         let mut budget = watch_budget(limits);
         let mut result = Vec::new();
-        let mut match_steps = MAX_MATCH_STEPS;
         if owner == consumer_package {
             let globs = declarations(consumer_manifest, site, "watch")?;
             if !globs.is_empty() {
                 let directory = open_directory(consumer_root)?;
-                resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut match_steps, &mut result)?;
+                resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut result)?;
             }
         } else {
             let package = configuration.resolved_packages.get(owner)
@@ -159,11 +156,11 @@ mod linux {
             let own = declarations(&document, site, "watch")?;
             let add = declarations(consumer_manifest, &format!("{owner}:{site}"), "watch_add")?;
             if !own.is_empty() {
-                resolve(directory, WatchRoot::OwningPackage, &own, &mut budget, &mut match_steps, &mut result)?;
+                resolve(directory, WatchRoot::OwningPackage, &own, &mut budget, &mut result)?;
             }
             if !add.is_empty() {
                 let consumer = open_directory(consumer_root)?;
-                resolve(&consumer, WatchRoot::ConsumingProject, &add, &mut budget, &mut match_steps, &mut result)?;
+                resolve(&consumer, WatchRoot::ConsumingProject, &add, &mut budget, &mut result)?;
             }
         }
         order_watches(&mut result);
@@ -188,7 +185,8 @@ mod linux {
     }
 
     type Glob<'a> = Vec<&'a str>;
-    type Cursor = (usize, usize);
+    type Cursor = usize;
+    const ACCEPT: Cursor = 0;
 
     fn declarations<'a>(document: &'a ImDocument<String>, site: &str, field: &str) -> Result<Vec<Glob<'a>>, String> {
         let Some(table) = document.get("comptime") else { return Ok(Vec::new()) };
@@ -217,18 +215,90 @@ mod linux {
 
     fn resolve(
         directory: &GitDirectory, root: WatchRoot, patterns: &[Glob<'_>],
-        budget: &mut ComptimeWatchLimits, match_steps: &mut usize, result: &mut Vec<WatchedComptimeFile>,
+        budget: &mut ComptimeWatchLimits, result: &mut Vec<WatchedComptimeFile>,
     ) -> Result<(), String> {
-        let mut states = BTreeSet::new();
-        for index in 0..patterns.len() { epsilon_closure(patterns, (index, 0), &mut states); }
-        Walker { root, patterns, budget, match_steps, result }.walk(directory.clone(), states)
+        let (patterns, states) = Patterns::compile(patterns);
+        Walker { root, patterns, budget, result }.walk(directory.clone(), states)
+    }
+
+    struct Patterns<'p> {
+        components: Vec<Component<'p>>,
+        transitions: Vec<(usize, Cursor)>,
+    }
+
+    enum Component<'p> {
+        Exact(&'p str),
+        Recursive,
+        Wild { hidden: bool, matcher: WildComponent },
+    }
+
+    impl<'p> Patterns<'p> {
+        fn compile(globs: &[Glob<'p>]) -> (Self, BTreeSet<Cursor>) {
+            let mut patterns = Self { components: Vec::new(), transitions: Vec::new() };
+            let mut components = HashMap::new();
+            let mut suffixes = HashMap::new();
+            let mut start = BTreeSet::new();
+            for glob in globs {
+                let mut next = ACCEPT;
+                for &part in glob.iter().rev() {
+                    let component = *components.entry(part).or_insert_with(|| {
+                        let id = patterns.components.len();
+                        patterns.components.push(if part == "**" {
+                            Component::Recursive
+                        } else if part.contains(['*', '?']) {
+                            Component::Wild { hidden: part.starts_with('.'), matcher: WildComponent::compile(part) }
+                        } else {
+                            Component::Exact(part)
+                        });
+                        id
+                    });
+                    next = *suffixes.entry((component, next)).or_insert_with(|| {
+                        patterns.transitions.push((component, next));
+                        patterns.transitions.len()
+                    });
+                }
+                patterns.close(next, &mut start);
+            }
+            (patterns, start)
+        }
+
+        fn transition(&self, state: Cursor) -> Option<(usize, Cursor)> {
+            state.checked_sub(1).map(|index| self.transitions[index])
+        }
+
+        fn close(&self, mut state: Cursor, result: &mut BTreeSet<Cursor>) {
+            while result.insert(state) {
+                let Some((component, next)) = self.transition(state) else { break; };
+                if !matches!(self.components[component], Component::Recursive) { break; }
+                state = next;
+            }
+        }
+
+        fn after_name(&self, states: &BTreeSet<Cursor>, name: &str) -> BTreeSet<Cursor> {
+            let hidden = name.starts_with('.');
+            let mut evaluated = HashMap::new();
+            let mut result = BTreeSet::new();
+            for &state in states {
+                let Some((component, next)) = self.transition(state) else { continue; };
+                match &self.components[component] {
+                    Component::Recursive if !hidden => self.close(state, &mut result),
+                    Component::Exact(exact) if *exact == name => self.close(next, &mut result),
+                    Component::Wild { hidden: selects_hidden, matcher } if !hidden || *selects_hidden => {
+                        if *evaluated.entry(component).or_insert_with(|| matcher.matches(name)) {
+                            self.close(next, &mut result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            result
+        }
     }
 
     struct Walker<'a, 'p> {
         root: WatchRoot,
-        patterns: &'a [Glob<'p>],
+        patterns: Patterns<'p>,
         budget: &'a mut ComptimeWatchLimits,
-        match_steps: &'a mut usize,
         result: &'a mut Vec<WatchedComptimeFile>,
     }
 
@@ -241,10 +311,12 @@ mod linux {
 
     impl Walker<'_, '_> {
         fn frame(&self, directory: GitDirectory, states: BTreeSet<Cursor>) -> Result<DirectoryFrame, String> {
-            let names: Option<BTreeSet<OsString>> = states.iter().filter_map(|(p, c)| {
-                self.patterns[*p].get(*c)
-            }).map(|segment| (!segment.contains(['*', '?'])).then(|| OsString::from(segment)))
-                .collect();
+            let names: Option<BTreeSet<OsString>> = states.iter().filter_map(|&state| {
+                self.patterns.transition(state)
+            }).map(|(component, _)| match self.patterns.components[component] {
+                Component::Exact(part) => Some(OsString::from(part)),
+                _ => None,
+            }).collect();
             let listed = names.is_none();
             let names: Box<dyn Iterator<Item = _>> = if let Some(names) = names {
                 Box::new(names.into_iter().map(Ok))
@@ -279,20 +351,10 @@ mod linux {
         ) -> Result<Option<(GitDirectory, BTreeSet<Cursor>)>, String> {
             charge(&mut self.budget.entries, "comptime watch exceeds its entry limit")?;
             let name = name.to_str().ok_or("comptime watch encountered a non-UTF-8 path")?;
-            let mut next = BTreeSet::new();
-            for &(p, c) in states {
-                charge(self.match_steps, "comptime watch exceeds its pattern work limit")?;
-                let Some(segment) = self.patterns[p].get(c) else { continue };
-                if name.starts_with('.') && !segment.starts_with('.') { continue; }
-                if *segment == "**" {
-                    epsilon_closure(self.patterns, (p, c), &mut next);
-                } else if match_component(segment, name, self.match_steps)? {
-                    epsilon_closure(self.patterns, (p, c + 1), &mut next);
-                }
-            }
+            let next = self.patterns.after_name(states, name);
             if next.is_empty() { return Ok(None); }
-            let matches = next.iter().any(|&(p, c)| c == self.patterns[p].len());
-            let descend = next.iter().any(|&(p, c)| c < self.patterns[p].len());
+            let matches = next.contains(&ACCEPT);
+            let descend = next.len() > usize::from(matches);
             let Some(file) = dir.open(Path::new(name))? else {
                 return if listed { Err("comptime watch entry changed during observation".into()) } else { Ok(None) };
             };
@@ -344,34 +406,138 @@ mod linux {
         Ok(())
     }
 
-    fn epsilon_closure(patterns: &[Glob<'_>], (p, mut c): Cursor, set: &mut BTreeSet<Cursor>) {
-        while set.insert((p, c)) && patterns[p].get(c) == Some(&"**") { c += 1; }
+    /// Component syntax has no neighboring stars: the only whole-component
+    /// double star belongs to the path automaton. Thus one epsilon shift
+    /// closes all star states. Indices count Unicode scalars, not bytes.
+    struct WildComponent {
+        accept: usize,
+        minimum_chars: usize,
+        star: Vec<u64>,
+        any: Vec<u64>,
+        literal: HashMap<char, Vec<usize>>,
     }
 
-    /// Match one UTF-8 component with only the last wildcard retry.
-    fn match_component(mut pattern: &str, mut name: &str, steps: &mut usize) -> Result<bool, String> {
-        if !pattern.contains(['*', '?']) { return Ok(pattern == name); }
-        let mut retry: Option<(&str, &str)> = None;
-        while let Some(value) = name.chars().next() {
-            charge(steps, "comptime watch exceeds its pattern work limit")?;
-            match pattern.chars().next() {
-                Some('*') => {
-                    pattern = &pattern[1..];
-                    retry = Some((pattern, name));
-                }
-                Some(token) if token == '?' || token == value => {
-                    pattern = &pattern[token.len_utf8()..];
-                    name = &name[value.len_utf8()..];
-                }
-                _ => {
-                    let Some((suffix, remainder)) = retry else { return Ok(false) };
-                    let Some(previous) = remainder.chars().next() else { return Ok(false) };
-                    name = &remainder[previous.len_utf8()..];
-                    pattern = suffix;
-                    retry = Some((suffix, name));
+    impl WildComponent {
+        fn compile(pattern: &str) -> Self {
+            let accept = pattern.chars().count();
+            let words = accept / 64 + 1;
+            let mut component = Self { accept, minimum_chars: accept,
+                star: vec![0; words], any: vec![0; words], literal: HashMap::new() };
+            for (position, token) in pattern.chars().enumerate() {
+                match token {
+                    '*' => { component.minimum_chars -= 1; set_bit(&mut component.star, position); }
+                    '?' => set_bit(&mut component.any, position),
+                    literal => component.literal.entry(literal).or_default().push(position),
                 }
             }
+            component
         }
-        Ok(pattern.bytes().all(|byte| byte == b'*'))
+
+        fn matches(&self, name: &str) -> bool {
+            if name.chars().count() < self.minimum_chars { return false; }
+            let mut active = vec![0u64; self.star.len()];
+            active[0] = 1;
+            self.close(&mut active);
+            // Only observed name characters receive dense bit masks; the
+            // declaration itself keeps sparse literal positions.
+            let mut masks = HashMap::new();
+            for ch in name.chars() {
+                let mask = masks.entry(ch).or_insert_with(|| {
+                    let mut mask = self.any.clone();
+                    if let Some(positions) = self.literal.get(&ch) {
+                        for &position in positions { set_bit(&mut mask, position); }
+                    }
+                    mask
+                });
+                let mut carry = 0;
+                for ((word, &matches), &star) in active.iter_mut().zip(mask.iter()).zip(&self.star) {
+                    let advance = *word & matches;
+                    *word = (*word & star) | (advance << 1) | carry;
+                    carry = advance >> 63;
+                }
+                if active.iter().all(|&word| word == 0) { return false; }
+                self.close(&mut active);
+            }
+            active[self.accept / 64] & (1 << (self.accept % 64)) != 0
+        }
+
+        fn close(&self, active: &mut [u64]) {
+            let mut carry = 0;
+            for (word, &star) in active.iter_mut().zip(&self.star) {
+                let epsilon = *word & star;
+                *word |= (epsilon << 1) | carry;
+                carry = epsilon >> 63;
+            }
+        }
     }
+
+    fn set_bit(words: &mut [u64], position: usize) {
+        words[position / 64] |= 1 << (position % 64);
+    }
+    #[cfg(test)]
+    mod matcher_tests {
+        use super::*;
+
+        #[test]
+        fn component_word_matcher_agrees_with_small_exhaustive_unicode_oracle() {
+            fn oracle(tokens: &[char], name: &[char]) -> bool {
+                match tokens {
+                    [] => name.is_empty(),
+                    ['*', rest @ ..] => (0..=name.len()).any(|start| oracle(rest, &name[start..])),
+                    [head, rest @ ..] => name.split_first().is_some_and(|(first, tail)| {
+                        (*head == '?' || head == first) && oracle(rest, tail)
+                    }),
+                }
+            }
+            fn strings(alphabet: &[char], maximum: usize) -> Vec<String> {
+                let mut strings = vec![String::new()];
+                for _ in 0..maximum {
+                    let next: Vec<_> = strings.iter().flat_map(|prefix| {
+                        alphabet.iter().map(move |token| format!("{prefix}{token}"))
+                    }).collect();
+                    strings.extend(next);
+                    strings.sort_unstable();
+                    strings.dedup();
+                }
+                strings
+            }
+            let names = strings(&['a', 'b', 'é'], 3);
+            for pattern in strings(&['a', 'b', 'é', '*', '?'], 4) {
+                if pattern.contains("**") { continue; }
+                let tokens: Vec<_> = pattern.chars().collect();
+                let matcher = WildComponent::compile(&pattern);
+                for name in &names {
+                    assert_eq!(matcher.matches(name), oracle(&tokens, &name.chars().collect::<Vec<_>>()),
+                        "pattern {pattern:?}, name {name:?}");
+                }
+            }
+            for prefix in [62, 63, 64, 127] {
+                let pattern = format!("{}*?é", "a".repeat(prefix));
+                let positive = format!("{}xyé", "a".repeat(prefix));
+                let negative = format!("{}xyb", "a".repeat(prefix));
+                let matcher = WildComponent::compile(&pattern);
+                assert!(matcher.matches(&positive));
+                assert!(!matcher.matches(&negative));
+            }
+        }
+
+        #[test]
+        fn path_automaton_interns_suffixes_and_preserves_recursive_hidden_semantics() {
+            let (patterns, start) = Patterns::compile(&[
+                vec!["left", "**", ".té?t"],
+                vec!["right", "**", ".té?t"],
+                vec!["right", "**", "file*"],
+            ]);
+            assert_eq!(patterns.transitions.len(), 7);
+            let left = patterns.after_name(&start, "left");
+            let right = patterns.after_name(&start, "right");
+            assert!(left.is_subset(&right));
+            let child = patterns.after_name(&left, "child");
+            assert_eq!(child, left);
+            assert!(patterns.after_name(&left, ".hidden_dir").is_empty());
+            assert_eq!(patterns.after_name(&left, ".têst"), BTreeSet::new());
+            assert_eq!(patterns.after_name(&left, ".tést"), BTreeSet::from([ACCEPT]));
+        }
+    }
+
 }

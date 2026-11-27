@@ -249,6 +249,35 @@ fn anchored_watch_walk_accepts_deeper_literal_and_recursive_patterns() {
 }
 
 #[test]
+fn finite_wildcard_scan_finishes_even_when_the_old_pattern_retry_budget_would_hit() {
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let no_match = format!("scan/*{}b", "a".repeat(128));
+    let pattern = vec![no_match.as_str(), "scan/pass?.txt"];
+    fixture.put("assets/wosy.toml", PACKAGE.replace(
+        "watch = [\"schemas/**/*.json\", \"schemas/root.json\", \"schemas/caf?.txt\"]",
+        &format!("watch = {pattern:?}"),
+    ));
+    fixture.put("app/wosy.toml", APP.replace(
+        "watch_add = [\"recordings/**/*.json\", \"recordings/./unsupported.txt\"]", "watch_add = []",
+    ));
+    for index in 0..300 {
+        fixture.put(&format!("assets/scan/{}{index:03}", "a".repeat(252)), "");
+    }
+    fixture.put("assets/scan/passé.txt", "one match");
+    fixture.put("assets/scan/.passé.txt", "hidden");
+    let watch = |entries| prepare_comptime_watches(
+        &app, "app", "dev", "assets", "prepare", ComptimeWatchLimits { entries, files: 1,
+            content_bytes: 9 },
+    );
+    assert_eq!(rows(&watch(303).unwrap().1), [
+        content(WatchRoot::OwningPackage, "scan/passé.txt", "one match")
+    ]);
+    assert!(watch(302).err().unwrap().contains("entry limit"));
+    assert!(!app.join(".wosy").exists());
+}
+
+#[test]
 fn checks_selected_site_glob_dialect_and_shared_budget_without_ordinary_side_effects() {
     let fixture = Fixture::new();
     let app = fixture.app();
