@@ -20,6 +20,7 @@ pub(crate) struct InitializerCallNodes<'a> {
     members: HashMap<*const ScalarExpression, BoundInitializerMember<'a>>,
     float_types: HashMap<*const ScalarExpression, &'a ScalarType>,
     integer_conversion_sources: HashMap<*const ScalarExpression, &'a ScalarType>,
+    ordered_comparison_operands: HashMap<*const ScalarExpression, &'a ScalarType>,
     items: PhantomData<&'a [ScalarItem]>,
 }
 
@@ -46,6 +47,7 @@ impl<'a> InitializerCallNodes<'a> {
             members: HashMap::with_capacity(topology.identities.members.len()),
             float_types: HashMap::new(),
             integer_conversion_sources: HashMap::new(),
+            ordered_comparison_operands: HashMap::new(),
             items: PhantomData,
         };
         let mut bind_call = |ordinal: OccurrenceOrdinal, expression: &'a ScalarExpression| {
@@ -99,6 +101,20 @@ impl<'a> InitializerCallNodes<'a> {
             Ok(())
         };
         let mut bind_type = |ordinal, expression: &'a ScalarExpression| {
+            use super::super::BinaryOperator;
+            if let ScalarExpression::Binary { operator, left, .. } = expression {
+                if matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
+                {
+                    if let Some(Node::Expression(lhs)) =
+                        topology.structure.edges.get(&(Parent::Expression(ordinal), Edge::BinaryLeft))
+                    {
+                        if let Some(ty) = topology.structure.checked_types.expressions.get(lhs) {
+                            nodes.ordered_comparison_operands.insert(std::ptr::from_ref(left.as_ref()), ty);
+                        }
+                    }
+                }
+            }
             if matches!(expression, ScalarExpression::Float { .. }) {
                 if let Some(ty @ (ScalarType::F32 | ScalarType::F64)) =
                     topology.structure.checked_types.expressions.get(&ordinal)
@@ -128,6 +144,13 @@ impl<'a> InitializerCallNodes<'a> {
 
     pub(crate) fn checked_float_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
         self.float_types.get(&std::ptr::from_ref(expression)).copied()
+    }
+
+    pub(crate) fn checked_ordered_comparison_operand(
+        &self,
+        operand: &ScalarExpression,
+    ) -> Option<&'a ScalarType> {
+        self.ordered_comparison_operands.get(&std::ptr::from_ref(operand)).copied()
     }
 
     pub(crate) fn checked_integer_conversion_source(

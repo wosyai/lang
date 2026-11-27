@@ -5805,6 +5805,30 @@ fn emits_unit_if_with_then_and_merge_blocks_without_phi() {
 }
 
 #[test]
+fn prepared_ordered_bitwise_comparisons_use_checked_integer_signedness() {
+    let source = r#"%%start
+        bool(u32) below_unsigned = fn(input) { (1 | input) < 2 };
+        bool(i32) below_signed = fn(input) { (1 | input) < 2 };
+        u32 unsigned_input = 17;
+        i32 signed_input = 17;
+        (1 | unsigned_input) < 2;
+        (1 | signed_input) < 2;
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for ir in [
+            emit_scalar_build_single_module_llvm(&build).unwrap().to_text(),
+            emit_scalar_build_project_llvm(&build).unwrap().to_text(),
+        ] {
+            assert_eq!(ir.matches("icmp ult i32").count(), 2, "{ir}");
+            assert_eq!(ir.matches("icmp slt i32").count(), 2, "{ir}");
+        }
+    }
+}
+
+#[test]
 fn emits_float_types_literals_operations_and_comparisons() {
     let source = SourceIdentity::new(
         "project".into(),

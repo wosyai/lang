@@ -2548,12 +2548,30 @@ fn emit_binary_expression<'ctx, 'module>(
             return emit_binary_values(state, operator, left, EmitValue::Basic(right.into()), false);
         }
     }
-    let unsigned = match prepared_initializer_unsigned(state, left)? {
-        Some(unsigned) => unsigned,
-        None => match path {
-            ExpressionPath::Single => expression_is_unsigned(state, left),
-            ExpressionPath::Project { module, .. } => project_expression_is_unsigned(state, left, module),
-        },
+    let ordered_integer_unsigned = if state.prepared_render
+        && matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual
+            | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
+    {
+        state.body_call_nodes.and_then(|nodes| nodes.checked_expression_type(left))
+            .or_else(|| state.initializer_nodes.and_then(|nodes| nodes.checked_ordered_comparison_operand(left)))
+            .and_then(|ty| match ty {
+                ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128 => Some(true),
+                _ if is_signed_integer_type(ty) => Some(false),
+                _ => None,
+            })
+    } else {
+        None
+    };
+    let unsigned = if let Some(unsigned) = ordered_integer_unsigned {
+        unsigned
+    } else {
+        match prepared_initializer_unsigned(state, left)? {
+            Some(unsigned) => unsigned,
+            None => match path {
+                ExpressionPath::Single => expression_is_unsigned(state, left),
+                ExpressionPath::Project { module, .. } => project_expression_is_unsigned(state, left, module),
+            },
+        }
     };
     let left = path.emit(context, state, left)?;
     emit_binary_with_rhs(context, state, operator, left, right, path, unsigned)
