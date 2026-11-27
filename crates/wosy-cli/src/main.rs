@@ -233,10 +233,7 @@ fn finalize_ordinary_build(
     paths: BuilderInputPaths,
     inputs: PendingBuilderInputs,
 ) -> Result<(), String> {
-    let pending_bytes = serde_json::to_vec_pretty(&inputs.manifest).map_err(|error| error.to_string())?;
-    fs::write(&paths.pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
-    let arguments = paths.arguments();
-    invoke_direct(root, &inputs.builder.command, &inputs.builder.args, &arguments.each_ref().map(|arg| arg.as_ref()))?;
+    invoke_unpublished_builder(root, &paths, &inputs)?;
     let wosy_project::ArtifactManifest {
         identity,
         executable,
@@ -245,6 +242,18 @@ fn finalize_ordinary_build(
     publish_artifact(&paths.output, executable, identity, source_observations)?;
     fs::remove_file(paths.pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Invoke the already-selected builder without publishing a generation.
+fn invoke_unpublished_builder(
+    root: &std::path::Path,
+    paths: &BuilderInputPaths,
+    inputs: &PendingBuilderInputs,
+) -> Result<(), String> {
+    let pending_bytes = serde_json::to_vec_pretty(&inputs.manifest).map_err(|error| error.to_string())?;
+    fs::write(&paths.pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
+    let arguments = paths.arguments();
+    invoke_direct(root, &inputs.builder.command, &inputs.builder.args, &arguments.each_ref().map(|arg| arg.as_ref()))
 }
 
 struct HashingWriter<W> {
