@@ -2182,27 +2182,18 @@ fn try_observed_projected_storage_call(
     }
     let span = wosy_syntax::SourceSpan::new(source.clone(), topology.occurrences.get(site.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span);
     let mut prefix = Vec::new();
-    let mut prefix_steps = Vec::new();
+    let mut prefix_history = None;
     if let Some(plan) = &plan {
-        let values = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index| {
+        let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index| {
             if index.is_some() { return None; }
             storage.observed_atom(declaration)
-        }, |owner, at, step| {
-            if trace.is_some() {
-                use ordered_float_prefix::ObservedStep;
-                if owner.0 != target.0 { return None; }
-                let range = body_of(owner)?.occurrences.get(at.0)?.span;
-                let span = wosy_syntax::SourceSpan::new(source.clone(), range);
-                prefix_steps.push(match step {
-                    ObservedStep::Branch(accepted) => failure_search::PathStep::Branch { condition: span, accepted },
-                    ObservedStep::Call => failure_search::PathStep::Call(span),
-                    ObservedStep::Return => failure_search::PathStep::Return(span),
-                });
-            }
-            Some(())
+        }, trace.is_some(), |owner, at| {
+            if owner.0 != target.0 { return None; }
+            Some(wosy_syntax::SourceSpan::new(source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
         }).ok_or(ProjectCheck::Unsupported)?;
         if values.len() != plan.bindings.len() { return Err(ProjectCheck::Unsupported); }
         prefix.extend(plan.bindings.iter().zip(values).map(|(fact, value)| (&fact.slot, &fact.ty, value)));
+        prefix_history = evaluated;
     }
     let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
         use super::checker_flow::CallableHistoryStep;
@@ -2210,7 +2201,7 @@ fn try_observed_projected_storage_call(
         let Some(trace) = &trace else { return Some(()); };
         let mut search = trace.borrow_mut();
         search.append(PathStep::Call(span.clone()))?;
-        for step in std::mem::take(&mut prefix_steps) { search.append(step)?; }
+        if let Some(steps) = prefix_history.take() { search.append(PathStep::ObservedPrefix(Rc::new(steps)))?; }
         for step in history {
             let convert = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
             let step = match step {
@@ -19791,6 +19782,49 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn readonly_float_call_dag_reuses_values_and_keeps_shared_ordered_call_traces() {
+        use ordered_float_prefix::{ExactValue, ObservedStep};
+        use super::super::checker_flow::projected_f32::ExactF32;
+        let source = source("src/main.w", "float-shared-call-trace");
+        for depth in [8usize, 32, 128] {
+            let mut code = String::from("%%start\nf32 offset = 0.25; f32(f32) f0 = fn(x) { x+offset };\n");
+            for level in 1..=depth {
+                let prior = level - 1;
+                code.push_str(&format!("f32(f32) f{level} = fn(x) {{ f32 a = f{prior}(x); f32 b = f{prior}(x); if (a==b) {{ a }} else {{ b }} }};\n"));
+            }
+            code.push_str(&format!(r#"unit() root = fn {{ f32 total = f{depth}(0.0); core.require(total >= 0.0, {{.stdout="";.stderr="";.code=7;.files=[];}}); }}; %%end"#));
+            let prepared = prepare_checker_project(vec![(declarations(&source, &code), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 }).unwrap();
+            let (project, calls) = prepared.parts();
+            let item = project.modules[0].items.iter().position(|item| matches!(item, ScalarItem::Function(f) if f.name == "root")).unwrap();
+            let plan = ordered_float_prefix::plan_prefix::<false>(project, calls, (0,item)).unwrap();
+            assert_eq!(plan.bindings.len(), 1);
+            let mut reads = 0usize;
+            let expected = ExactF32::checked_bits(0.25f32.to_bits()).unwrap();
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index| {
+                if index.is_some() || declaration.source != source { return None; }
+                reads += 1;
+                (reads <= 2).then_some(ExactValue::F32(expected))
+            }, true, |(module, item), at| {
+                Some(wosy_syntax::SourceSpan::new(source.clone(), calls.function_body(module,item,None)?.occurrences.get(at.0)?.span))
+            }).unwrap();
+            let trace = trace.unwrap();
+            assert_eq!(values, [ExactValue::F32(expected)]);
+            assert_eq!(reads, 1);
+            assert_eq!(trace.segments.len(), depth+1);
+            assert!(matches!(trace.root.as_slice(), [ObservedStep::Call { nested, .. }] if *nested == depth));
+            for (level, steps) in trace.segments.iter().enumerate().skip(1) {
+                let [ObservedStep::Call { site: first, nested: left }, ObservedStep::Call { site: second, nested: right },
+                    ObservedStep::Branch { accepted: true, .. }] = steps.as_slice() else { panic!("expected retained calls and branch"); };
+                assert_ne!(first, second);
+                assert_eq!((*left,*right), (level-1,level-1));
+            }
+            eprintln!("readonly float DAG depth={depth} reads={reads} trace_segments={} physical_steps={}", trace.segments.len(), trace.root.len()+trace.segments.iter().map(Vec::len).sum::<usize>());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn projected_float_prefix_drives_real_initializer_storage_writeback() {
         let app = source("src/main.w", "observed-flight-prefix-state");
         let program = r#"%%start
@@ -19811,13 +19845,19 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
             for (age, expected) in [("-1", 19), ("0", 37)] {
                 let text = program.replace("wreck_age = -1", &format!("wreck_age = {age}"));
-                let owner = prepare_loaded_scalar_ordered_local_proof_contexts(
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
                     vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
                     ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
                 ).unwrap();
-                let report = owner.run().unwrap();
+                let report = prepare().run().unwrap();
                 let [failure] = report.directives.as_slice() else { panic!("one observed startup result"); };
                 assert_eq!(failure.code(), &BigInt::from(expected));
+                let (capped, _, trace, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped, report.directives);
+                let nested = "float_i(wreck_age)";
+                let offset = text.find(nested).unwrap() as u32;
+                let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
+                assert_eq!(trace.contains_return(&site), age == "0");
             }
         }
     }
@@ -19863,7 +19903,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                         "wreck_entered" => entered.map(ExactValue::Boolean),
                         _ => None,
                     }
-                }, |_, _, _| Some(()));
+                }, false, |_, _| None).map(|(values, _)| values);
                 (result, reads)
             };
             let f32_value = |bits| ExactValue::F32(ExactF32::checked_bits(bits).unwrap());

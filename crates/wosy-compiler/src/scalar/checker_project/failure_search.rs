@@ -8,6 +8,7 @@ use super::{OccurrenceOrdinal, PreparedCallable, ScalarType};
 pub(in super::super) enum PathStep {
     Startup(SourceIdentity),
     CallableRoot(SourceSpan),
+    ObservedPrefix(Rc<super::ordered_float_prefix::ObservedTrace>),
     Namespace { binding: SourceSpan, target: SourceIdentity },
     Call(SourceSpan),
     Return(SourceSpan),
@@ -152,7 +153,11 @@ impl StartUpSearch {
     }
 
     pub(in super::super) fn append(&mut self, step: PathStep) -> Option<()> {
-        super::super::checker_flow::charge_call_work(&mut self.work, 1)?;
+        let cost = if let PathStep::ObservedPrefix(trace) = &step {
+            trace.root.len().checked_add(trace.segments.iter().try_fold(1usize, |count, segment|
+                count.checked_add(segment.len().checked_add(1)?))?)?
+        } else { 1 };
+        super::super::checker_flow::charge_call_work(&mut self.work, cost)?;
         self.prefix.push(step);
         Some(())
     }
@@ -298,11 +303,22 @@ impl StartUpSearch {
 
     #[cfg(test)]
     pub(super) fn contains_return(&self, site: &SourceSpan) -> bool {
-        self.selected.iter().any(|path| path.steps.contains(&PathStep::Return(site.clone())))
+        self.selected.iter().any(|path| path.steps.iter().any(|step| match step {
+            PathStep::Return(actual) => actual == site,
+            PathStep::ObservedPrefix(trace) => trace.root.iter().chain(trace.segments.iter().flatten()).any(|event|
+                matches!(event, super::ordered_float_prefix::ObservedStep::Call { site: actual, .. } if actual == site)),
+            _ => false,
+        }))
     }
 
     #[cfg(test)]
     pub(super) fn contains_branch(&self, condition: SourceSpan, accepted: bool) -> bool {
-        self.selected.iter().any(|path| path.steps.contains(&PathStep::Branch { condition: condition.clone(), accepted }))
+        self.selected.iter().any(|path| path.steps.iter().any(|step| match step {
+            PathStep::Branch { condition: actual, accepted: decision } => actual == &condition && *decision == accepted,
+            PathStep::ObservedPrefix(trace) => trace.root.iter().chain(trace.segments.iter().flatten()).any(|event|
+                matches!(event, super::ordered_float_prefix::ObservedStep::Branch { site: actual, accepted: decision }
+                    if actual == &condition && *decision == accepted)),
+            _ => false,
+        }))
     }
 }

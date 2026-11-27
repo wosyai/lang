@@ -616,18 +616,46 @@ impl ExactValue {
 /// Execute only the reached certified operations on one authenticated row.
 /// The caller owns storage and supplies current reads and real call-entry
 /// formals. This cannot fill in any unknown value or publish a Check result.
-#[derive(Clone, Copy)]
-pub(super) enum ObservedStep { Branch(bool), Call, Return }
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(in super::super) enum ObservedStep {
+    Branch { site: SourceSpan, accepted: bool },
+    // Call and return bracket this exact nested trace. IDs are local to this
+    // activation's canonical postorder trace table.
+    Call { site: SourceSpan, nested: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(in super::super) struct ObservedTrace {
+    pub(super) root: Vec<ObservedStep>,
+    pub(super) segments: Vec<Vec<ObservedStep>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum MemoValue { Bool(bool), Int(BigInt), F32(u32) }
+
+impl From<&ExactValue> for MemoValue {
+    fn from(value: &ExactValue) -> Self {
+        match value {
+            ExactValue::Boolean(value) => Self::Bool(*value),
+            ExactValue::Integer(_, value) => Self::Int(value.clone()),
+            ExactValue::F32(value) => Self::F32(value.0),
+        }
+    }
+}
+
+type ObservedResult = (Vec<ExactValue>, Option<ObservedTrace>);
 
 pub(super) fn evaluate_observed_prefix(
     certificate: &PrefixCertificate,
     mut formals: HashMap<ReferenceBindingId, ExactValue>,
     mut read: impl FnMut(&SourceSpan, Option<u64>) -> Option<ExactValue>,
-    mut event: impl FnMut(PreparedCallable, OccurrenceOrdinal, ObservedStep) -> Option<()>,
-) -> Option<Vec<ExactValue>> {
+    trace: bool,
+    resolve_span: impl Fn(PreparedCallable, OccurrenceOrdinal) -> Option<SourceSpan>,
+) -> Option<ObservedResult> {
     use super::super::checker_flow::projected_f32::ExactF32;
     use std::cell::RefCell;
     type Locals = Rc<RefCell<HashMap<ReferenceBindingId, ExactValue>>>;
+    type Key = (PreparedCallable, Vec<MemoValue>);
     enum Work<'a> {
         Eval(EffectId, Locals),
         Bind(&'a BindingFact, Locals),
@@ -635,7 +663,7 @@ pub(super) fn evaluate_observed_prefix(
         Short(PreparedCallable, OccurrenceOrdinal, bool, EffectId, Locals),
         Sequence(&'a SequenceKind, usize),
         Call(PreparedCallable, OccurrenceOrdinal, Option<PreparedCallable>, &'a ScalarType, usize),
-        CheckedReturn(PreparedCallable, OccurrenceOrdinal, &'a ScalarType),
+        CheckedReturn(PreparedCallable, OccurrenceOrdinal, &'a ScalarType, Key),
         Publish,
         DropLocalResult,
     }
@@ -659,6 +687,13 @@ pub(super) fn evaluate_observed_prefix(
     let mut pending = Vec::new();
     let mut values = Vec::new();
     let mut published = Vec::new();
+    // Scoped to this activation: the reader authenticates one immutable module
+    // snapshot for the whole readonly prefix and all its callees. The checked
+    // target signature fixes integer width/signedness for each memo position.
+    let mut memo = HashMap::<Key, (ExactValue, Option<usize>)>::new();
+    let mut trace_stack = trace.then(|| vec![Vec::new()]);
+    let mut interned = HashMap::new();
+    let mut segments = Vec::new();
     for fact in certificate.bindings.iter().rev() {
         pending.push(Work::Publish);
         pending.push(Work::Bind(fact, Rc::clone(&locals)));
@@ -692,12 +727,16 @@ pub(super) fn evaluate_observed_prefix(
             }
             Work::Select(owner, at, yes, no, scope) => {
                 let ExactValue::Boolean(accepted) = values.pop()? else { return None; };
-                event(owner, at, ObservedStep::Branch(accepted))?;
+                if let Some(stack) = &mut trace_stack {
+                    stack.last_mut()?.push(ObservedStep::Branch { site: resolve_span(owner, at)?, accepted });
+                }
                 pending.push(Work::Eval(if accepted { yes } else { no }, scope));
             }
             Work::Short(owner, at, conjunction, right, scope) => {
                 let ExactValue::Boolean(left) = values.pop()? else { return None; };
-                event(owner, at, ObservedStep::Branch(left))?;
+                if let Some(stack) = &mut trace_stack {
+                    stack.last_mut()?.push(ObservedStep::Branch { site: resolve_span(owner, at)?, accepted: left });
+                }
                 if left == conjunction {
                     pending.push(Work::Eval(right, scope));
                 } else { values.push(ExactValue::Boolean(left)); }
@@ -718,11 +757,20 @@ pub(super) fn evaluate_observed_prefix(
                 if let Some(target) = target {
                     let function = certificate.callees.get(&target)?;
                     if args.len() != function.formals.len() { return None; }
-                    let nested = function.formals.iter().zip(args).map(|((slot, ty), value)|
-                        (value.ty() == *ty).then(|| (slot.clone(), value))).collect::<Option<HashMap<_, _>>>()?;
+                    if !function.formals.iter().zip(&args).all(|((_, ty), value)| value.ty() == *ty) { return None; }
+                    let key = (target, args.iter().map(MemoValue::from).collect());
+                    if let Some((value, nested)) = memo.get(&key) {
+                        if value.ty() != *result { return None; }
+                        if let Some(stack) = &mut trace_stack {
+                            stack.last_mut()?.push(ObservedStep::Call { site: resolve_span(owner, at)?, nested: (*nested)? });
+                        }
+                        values.push(value.clone());
+                        continue;
+                    }
+                    let nested = function.formals.iter().zip(args).map(|((slot, _), value)| (slot.clone(), value)).collect();
                     let scope = Rc::new(RefCell::new(nested));
-                    event(owner, at, ObservedStep::Call)?;
-                    pending.push(Work::CheckedReturn(owner, at, result));
+                    if let Some(stack) = &mut trace_stack { stack.push(Vec::new()); }
+                    pending.push(Work::CheckedReturn(owner, at, result, key));
                     pending.push(Work::Eval(function.returned, Rc::clone(&scope)));
                     for fact in function.bindings.iter().rev() {
                         pending.push(Work::DropLocalResult);
@@ -735,11 +783,28 @@ pub(super) fn evaluate_observed_prefix(
                     values.push(ExactValue::F32(ExactF32::signed_i32(i32::try_from(value).ok()?)));
                 }
             }
-            Work::CheckedReturn(owner, at, ty) => {
-                if values.last()?.ty() != *ty { return None; }
-                event(owner, at, ObservedStep::Return)?;
+            Work::CheckedReturn(owner, at, ty, key) => {
+                let value = values.last()?;
+                if value.ty() != *ty { return None; }
+                let nested = if let Some(stack) = &mut trace_stack {
+                    let steps = stack.pop()?;
+                    let id = *interned.entry(steps).or_insert_with_key(|steps| {
+                        let id = segments.len();
+                        segments.push(steps.clone());
+                        id
+                    });
+                    stack.last_mut()?.push(ObservedStep::Call { site: resolve_span(owner, at)?, nested: id });
+                    Some(id)
+                } else { None };
+                if memo.insert(key, (value.clone(), nested)).is_some() { return None; }
             }
         }
     }
-    values.is_empty().then_some(published)
+    if !values.is_empty() { return None; }
+    let trace = if let Some(mut stack) = trace_stack {
+        let root = stack.pop()?;
+        if !stack.is_empty() { return None; }
+        Some(ObservedTrace { root, segments })
+    } else { None };
+    Some((published, trace))
 }
