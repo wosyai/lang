@@ -111,6 +111,20 @@ impl SourceCallCensus {
         Some(out)
     }
 
+    #[cfg(test)]
+    pub(super) fn test_with_unassociated_first_call(
+        project: &ScalarProject, calls: &ProjectCallSiteResults, caller: PreparedCallable, callee: PreparedCallable,
+    ) -> Option<Vec<SourceUse>> {
+        let mut body = calls.function_body(caller.0,caller.1,None)?.clone();
+        body.call_occurrences.remove(0);
+        let owner = project.modules.get(callee.0)?;
+        let ScalarItem::Function(function) = owner.items.get(callee.1)? else { return None; };
+        let index = HashMap::from([((&owner.source,function.name_span),callee)]);
+        let mut census = Self { uses:HashMap::from([(callee,SourceUses::default())]), foreign_or_indirect:0 };
+        census.scan_function(&index,caller,&body)?;
+        Some(census.uses.remove(&callee)?.sites)
+    }
+
     fn note_foreign_or_indirect(&mut self) -> Option<()> {
         self.foreign_or_indirect = self.foreign_or_indirect.checked_add(1)?;
         Some(())

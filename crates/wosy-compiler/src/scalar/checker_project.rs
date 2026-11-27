@@ -20320,7 +20320,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             host = extern wasm "device" { unit(i32) output; };
             unit(i32) reached = fn(x) { host.output(x); };
             unit(i32) dormant = fn(x) { host.output(x); };
-            unit(unit(i32),i32) dispatch = fn(action, x) { action(x); };
+            unit((unit(i32)),i32) dispatch = fn(action, x) { action(x); };
             route = overload {
                 unit(i32) => fn(value) { reached(value); };
                 unit(i64) => fn(value) { reached(core.int_trunc<i32>(value)); };
@@ -20348,6 +20348,40 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             assert_eq!(used.escapes, vec![SourceOwner::Function { declaration:ordinary,arms:Vec::new() }]);
             assert!(unused.sites.is_empty() && unused.escapes.is_empty());
             assert!(result.foreign_or_indirect >= 3);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn source_call_census_keeps_generic_length_and_unassociated_uses_unresolved() {
+        use source_call_census::{SourceCallCensus, SourceOwner, SourceUseKind};
+        let identity = source("src/main.w","prepared-special-use-census");
+        let text = r#"%%start
+            generic T;
+            T(T) keep = fn(value) { value };
+            u64(u64) extent = fn(n) { n };
+            u64(u64) allocate = fn(n) { u8[extent(n)] bytes; bytes; extent(n) };
+            u8 retained = keep<u8>(4);
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepared = prepare_checker_project(vec![(declarations(&identity,text),vec![])], vec![identity.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let item = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let (keep,extent,allocate) = (item("keep"),item("extent"),item("allocate"));
+            let result = SourceCallCensus::build(project,calls,[keep,extent]).unwrap();
+            let [generic] = result.uses[&keep].sites.as_slice() else { panic!("one generic initializer"); };
+            assert_eq!(generic.owner,SourceOwner::Initialization(0));
+            assert_eq!(generic.kind,SourceUseKind::Generic);
+            let direct = result.uses[&extent].sites.iter().filter(|record| record.kind == SourceUseKind::Direct).count();
+            let length = result.uses[&extent].sites.iter().filter(|record| record.kind == SourceUseKind::AllocationLength).count();
+            assert_eq!((direct,length),(1,1));
+            let records = SourceCallCensus::test_with_unassociated_first_call(project,calls,allocate,extent).unwrap();
+            assert!(records.iter().any(|record| record.kind == SourceUseKind::Unassociated
+                && record.site.is_none() && record.signature.is_none()));
+            assert!(!records.iter().any(|record| record.kind == SourceUseKind::Direct));
+            assert!(records.iter().any(|record| record.kind == SourceUseKind::AllocationLength));
         }
     }
 
