@@ -20175,6 +20175,95 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn inductive_scalar_requirements_are_bound_to_the_exact_seed_activation() {
+        let app = source("src/main.w","inductive-scalar-authored-activation");
+        let program = r#"%%start
+            i32 keyboard=0;
+            i32(i32,i32) scan = fn(i,buttons) {
+                if (i<12) {
+                    i32 value = if((keyboard&(1<<i))!=0) {
+                        core.require(i>=0&&i<12,{.stdout="";.stderr="slot";.code=71;.files=[];});
+                        1
+                    } else {0};
+                    scan(i+1,buttons|value)
+                } else {buttons}
+            };
+            i32() sample=fn{scan(0,0)};
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (text,expected) in [
+                (program.to_owned(),true),
+                (program.replace("scan(0,0)","scan(-1,0)"),false),
+                (program.replace("scan(i+1,","scan(i-1,"),false),
+            ] {
+                let prepared = prepare_checker_project(vec![(declarations(&app,&text),vec![])], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }).unwrap();
+                let (project,calls) = prepared.parts();
+                let item = |name| project.modules[0].items.iter().position(|item|
+                    matches!(item,ScalarItem::Function(function) if function.name == name)).unwrap();
+                let (scan,sample) = ((0,item("scan")),(0,item("sample")));
+                let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
+                let seeds = envelopes.direct_edge_envelopes(sample,scan,&Vec::new()).unwrap();
+                let [seed] = seeds.as_slice() else { panic!("expected one original seed"); };
+                let range = |low,high| Some(range_envelopes::Envelope { low:BigInt::from(low),high:BigInt::from(high) });
+                let invariant = vec![range(0,12),range(i32::MIN,i32::MAX)];
+                let result = envelopes.prove_inductive_activation(seed,&invariant);
+                assert_eq!(result.is_some(),expected);
+                if let Some((steps,requirements)) = result {
+                    assert_eq!(steps.len(),1);
+                    assert_eq!(requirements.iter().map(|site| site.start as usize).collect::<Vec<_>>(),
+                        vec![text.find("core.require").unwrap()]);
+                }
+                // A separate symbolic call cannot take the seed proof.
+                assert!(envelopes.close_guarded_formals(scan).is_none());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Orbital Wosy sources"]
+    fn pinned_orbital_controls_induction_checks_the_source_activation() {
+        let dir = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
+        let controls_text = std::fs::read_to_string(dir.join("controls.w")).unwrap();
+        let math_text = std::fs::read_to_string(dir.join("presentation.w")).unwrap();
+        let controls = source("src/controls.w","pinned-orbital-controls");
+        let math = source("src/presentation.w","pinned-orbital-presentation");
+        let namespace = controls_text.find("math =").unwrap();
+        let end = namespace + controls_text[namespace..].find(';').unwrap() + 1;
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let modules = vec![(declarations(&controls,&controls_text),vec![ScalarNamespaceBinding {
+                binding:"math".into(),target:math.clone(),span:ByteSpan::new(namespace as u32,end as u32),
+            }]),(declarations(&math,&math_text),Vec::new())];
+            let prepared = prepare_checker_project(modules,vec![controls.clone(),math.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let module = project.modules.iter().position(|module| module.source==controls).unwrap();
+            let item = |name| project.modules[module].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(function) if function.name==name)).unwrap();
+            let (logical,command) = ((module,item("logical")),(module,item("command_mask")));
+            let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
+            let seeds = envelopes.direct_edge_envelopes(command,logical,&Vec::new()).unwrap();
+            let [seed] = seeds.as_slice() else { panic!("original command_mask edge changed"); };
+            let range = |low,high| Some(range_envelopes::Envelope { low:BigInt::from(low),high:BigInt::from(high) });
+            assert_eq!(seed.inputs.as_ref(),Some(&vec![range(0,0),range(0,0)]));
+            let invariant = vec![range(0,12),range(i32::MIN,i32::MAX)];
+            let (recursive,proof) = envelopes.prove_inductive_activation(seed,&invariant).unwrap();
+            let body = calls.function_body(logical.0,logical.1,None).unwrap();
+            assert_eq!(recursive.len(),1);
+            let recursive_at = body.occurrences[recursive[0].0].span.start as usize;
+            assert_eq!(recursive_at,controls_text.find("logical(i+1,mask|b)").unwrap());
+            assert_eq!(proof.iter().map(|site| site.start as usize).collect::<Vec<_>>(),
+                vec![controls_text.find("core.require").unwrap()]);
+            eprintln!("authored controls activation: seed bytes {}, backedge {recursive_at}, require byte {}",
+                calls.function_body(command.0,command.1,None).unwrap().occurrences[seed.site.0].span.start,
+                proof[0].start);
+            assert!(envelopes.close_guarded_formals(logical).is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn guarded_row_induction_authenticates_exact_seed_step_and_publish_site() {
         let app = source("src/main.w", "terrain-row-monotone-incoming-envelope");
         let program = r#"%%start

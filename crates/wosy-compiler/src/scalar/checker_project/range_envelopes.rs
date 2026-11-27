@@ -459,15 +459,21 @@ impl<'a> PreparedEnvelopes<'a> {
     /// Every remaining authored site and any unsupported history use the
     /// existing search; proving one call site never certifies other callers.
     pub(super) fn close_guarded_formals(&mut self, target: PreparedCallable) -> Option<Vec<ByteSpan>> {
+        let body = self.calls.function_body(target.0,target.1,None)?;
+        if !body.checker_returns_unit() { return None; }
+        self.requirements_in_envelope(target,initial_inputs(body)?)
+    }
+
+    fn requirements_in_envelope(&mut self, target: PreparedCallable, entry: Inputs) -> Option<Vec<ByteSpan>> {
         use crate::scalar::reference::CheckerOrdinaryBoolean;
-        let b = self.calls.function_body(target.0,target.1,None)?;
-        let st = &b.structure;
-        if st.checker_directives.is_empty() || !b.checker_returns_unit() || b.conditionals.is_empty() {
-            return None;
-        }
         let frame = self.frame_without_formal_mutation(target)?;
+        let b = frame.body;
+        let st = &b.structure;
+        if st.checker_directives.is_empty() || b.conditionals.is_empty()
+            || !contained(&initial_inputs(b)?,&entry)
+        { return None; }
         let parents = Self::parents(frame)?;
-        let mut known = HashMap::from([(OccurrenceParent::Block(st.root),Some(Rc::new(initial_inputs(b)?)))]);
+        let mut known = HashMap::from([(OccurrenceParent::Block(st.root),Some(Rc::new(entry)))]);
         let mut covered = Vec::new();
         for (&expression,directive) in &st.checker_directives {
             if directive.operation != CheckerOperation::Require { return None; }
@@ -496,6 +502,49 @@ impl<'a> PreparedEnvelopes<'a> {
             covered.push(b.occurrences.get(expression.0)?.span);
         }
         Some(covered)
+    }
+
+    /// A returning or nonreturning activation at one specific incoming
+    /// source occurrence. This result is not a package entry roster, and
+    /// cannot remove ordinary search for different callers.
+    pub(super) fn prove_inductive_activation(&mut self, initial: &IncomingRangeEdge,
+        invariant: &Inputs) -> Option<(Vec<OccurrenceOrdinal>, Vec<ByteSpan>)> {
+        let target = initial.callee;
+        self.verify_no_indirect_reentry(target)?;
+        let steps = self.guarded_self_induction(target,invariant,initial)?;
+        let requirements = self.requirements_in_envelope(target,invariant.clone())?;
+        Some((steps,requirements))
+    }
+
+    fn verify_no_indirect_reentry(&self, root: PreparedCallable) -> Option<()> {
+        use super::super::CoreOperationId;
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(target) = pending.pop() {
+            if !visited.insert(target) { continue; }
+            let body = self.calls.function_body(target.0,target.1,None)?;
+            if !body.arms.is_empty() || !body.callable_escapes.is_empty() || !body.allocation_length_calls.is_empty()
+                || !body.allocation_length_call_targets.is_empty() || body.structure.blocks.iter().any(|block| block.unsafe_context)
+            { return None; }
+            for call in &body.call_occurrences {
+                let at = call.ordinal;
+                let signature = body.checked_call_signatures.get(&at)?;
+                match &body.resolved_call_site(at)?.target {
+                    ResolvedCallTarget::Core(CoreOperationId::IntTrunc | CoreOperationId::IntExtend
+                        | CoreOperationId::UintToFloat | CoreOperationId::SintToFloat
+                        | CoreOperationId::FloatToSintTrunc | CoreOperationId::FloatToUintTrunc
+                        | CoreOperationId::FloatTrunc | CoreOperationId::FloatExtend) => {}
+                    ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. } => {
+                        let child = super::authenticate_prepared_direct_edge(self.project,self.calls,target.0,body,at,signature)?;
+                        if child == root {
+                            if target != root { return None; }
+                        } else { pending.push(child); }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Some(())
     }
 
     #[cfg(test)]
