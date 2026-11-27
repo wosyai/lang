@@ -7946,6 +7946,20 @@ impl IntegerInputs {
         Some(Some(rows))
     }
 
+    fn observed_boolean_guard(&self, calls: &FunctionCallSites, condition: OccurrenceOrdinal,
+        roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
+        if roots.callable_history.is_none() || calls.structure.module_storage_uses.is_empty()
+            || observed_boolean_modules(calls, condition).is_none_or(|reads| reads.is_empty()) {
+            return Some(None);
+        }
+        let mut rows = [Self::default(), Self::default()];
+        for row in &self.0 {
+            let selected = evaluate_observed_boolean(calls, condition, roots, row)?;
+            rows[usize::from(selected)].0.push(row.clone());
+        }
+        Some(Some(rows))
+    }
+
     fn observed_float_guard(&self, calls: &FunctionCallSites, site: OccurrenceOrdinal, roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
         if roots.observed_float_field_read.is_none() { return Some(None); }
         let Some((left, op, right)) = calls.structure.projected_f32_comparisons.get(&site) else { return Some(None); };
@@ -8843,7 +8857,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if let Some(projected) = path.observed_float_guard(calls, *condition, roots)? {
+                        let comparison = if let Some(projected) = path.observed_boolean_guard(calls, *condition, roots)? {
+                            Some(projected)
+                        } else if let Some(projected) = path.observed_float_guard(calls, *condition, roots)? {
                             Some(projected)
                         } else if let Some(compound) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
                             Some(compound)
@@ -12306,6 +12322,17 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                     covered.insert((write.declaration.clone(), site, ModuleStorageRole::Replace));
                     writes = true;
                 }
+                BlockItemKind::Evaluation { expression } => {
+                    let condition = match calls.conditionals.get(expression) {
+                        Some(ConditionalRegion::Unit { condition, .. }) => condition,
+                        Some(ConditionalRegion::Value { condition, .. })
+                            if calls.structure.checked_types.expressions.get(expression) == Some(&ScalarType::Unit) => condition,
+                        _ => continue,
+                    };
+                    if let Some(reads) = observed_boolean_modules(calls, *condition) {
+                        covered.extend(reads.into_iter().map(|(declaration, site)| (declaration.clone(), site, ModuleStorageRole::Read)));
+                    }
+                }
                 BlockItemKind::Binding(binding) => {
                     let ([receiver], BindingInitialization::Outputs(outputs)) =
                         (binding.receivers(), &binding.initialization) else { return None; };
@@ -12335,6 +12362,84 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
         return None;
     }
     Some((writes || !covered.is_empty() || !prefix_reads.is_empty(), scalar_calls))
+}
+
+#[cfg(feature = "internal-checker")]
+enum ObservedBoolean<'a> {
+    Literal(bool),
+    Module(&'a wosy_syntax::SourceSpan),
+    Lexical(&'a ReferenceBindingId),
+    Not(OccurrenceOrdinal),
+    ShortCircuit { left: OccurrenceOrdinal, right: OccurrenceOrdinal, when: bool },
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_boolean_node(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> Option<ObservedBoolean<'_>> {
+    if calls.structure.checked_types.expressions.get(&site)? != &ScalarType::Bool { return None; }
+    if let Some(value) = calls.structure.observed_bool_literals.get(&site) {
+        return Some(ObservedBoolean::Literal(*value));
+    }
+    match calls.prepared_plain_name(site) {
+        Some(PlainNameIdentity::ModuleValue(declaration)) => return Some(ObservedBoolean::Module(declaration)),
+        Some(PlainNameIdentity::Lexical(binding)) => return Some(ObservedBoolean::Lexical(binding)),
+        _ => {}
+    }
+    if let Some(operand) = calls.structure.observed_bool_negations.get(&site) {
+        return Some(ObservedBoolean::Not(*operand));
+    }
+    let branch = calls.short_circuits.get(&site)?;
+    Some(ObservedBoolean::ShortCircuit { left: branch.left, right: branch.right, when: branch.evaluate_right_when })
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_boolean_modules(calls: &FunctionCallSites, condition: OccurrenceOrdinal)
+    -> Option<Vec<(&wosy_syntax::SourceSpan, OccurrenceOrdinal)>> {
+    let mut todo = vec![condition];
+    let mut reads = Vec::new();
+    while let Some(site) = todo.pop() {
+        match observed_boolean_node(calls, site)? {
+            ObservedBoolean::Module(declaration) => reads.push((declaration, site)),
+            ObservedBoolean::Not(operand) => todo.push(operand),
+            ObservedBoolean::ShortCircuit { left, right, .. } => { todo.push(right); todo.push(left); }
+            ObservedBoolean::Literal(_) | ObservedBoolean::Lexical(_) => {}
+        }
+    }
+    Some(reads)
+}
+
+#[cfg(feature = "internal-checker")]
+fn evaluate_observed_boolean(calls: &FunctionCallSites, mut site: OccurrenceOrdinal,
+    roots: &IntegerRoots<'_>, row: &IntegerRow) -> Option<bool> {
+    use super::checker_project::ObservedExactValue;
+    let mut pending = Vec::new();
+    enum Resume { Not, Branch { right: OccurrenceOrdinal, when: bool } }
+    'evaluate: loop {
+        roots.callable_history?.borrow().charge(1)?;
+        let mut value = match observed_boolean_node(calls, site)? {
+            ObservedBoolean::Literal(value) => value,
+            ObservedBoolean::Module(declaration) => {
+                let ObservedExactValue::Boolean(value) = row.storage.as_ref()?.observed_atom(declaration)? else { return None; };
+                value
+            }
+            ObservedBoolean::Lexical(binding) => {
+                let (axis, ty) = roots.lookup(binding)?;
+                if ty != &ScalarType::Bool { return None; }
+                bool_result_lane(row.get(axis)?.singleton_value()?)? == 1
+            }
+            ObservedBoolean::Not(operand) => { pending.push(Resume::Not); site = operand; continue; }
+            ObservedBoolean::ShortCircuit { left, right, when } => {
+                pending.push(Resume::Branch { right, when }); site = left; continue;
+            }
+        };
+        while let Some(continuation) = pending.pop() {
+            match continuation {
+                Resume::Not => value = !value,
+                Resume::Branch { right, when } if value == when => { site = right; continue 'evaluate; }
+                Resume::Branch { .. } => {}
+            }
+        }
+        return Some(value);
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12612,15 +12717,15 @@ struct ProjectedIntegerStorageWrite<'a> {
     declaration: &'a wosy_syntax::SourceSpan,
     index: Option<usize>,
     ty: &'a ScalarType,
-    value: &'a BigInt,
+    value: Cow<'a, BigInt>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl ProjectedIntegerStorageWrite<'_> {
     fn apply(&self, storage: &mut ProjectedStorage) -> Option<()> {
         match self.index {
-            Some(index) => storage.overwrite_array_element(self.declaration, self.ty, index, self.value),
-            None => storage.overwrite_scalar(self.declaration, self.ty, self.value),
+            Some(index) => storage.overwrite_array_element(self.declaration, self.ty, index, &self.value),
+            None => storage.overwrite_scalar(self.declaration, self.ty, &self.value),
         }
     }
 }
@@ -12632,9 +12737,15 @@ fn projected_integer_storage_write(calls: &FunctionCallSites, position: BlockPos
     let [destination] = group.destinations().as_slice() else { return None; };
     if group.projected_outputs().len() != 0 { return None; }
     let AssignmentReplacement::Resolved(ty) = &destination.replacement else { return None; };
+    let site = destination.destination;
+    if ty == &ScalarType::Bool {
+        let Some(DirectDestinationIdentity::Module(declaration)) = calls.prepared_direct_destination(site) else { return None; };
+        let value = *calls.structure.observed_bool_literals.get(&rhs.expression)?;
+        return Some(ProjectedIntegerStorageWrite { declaration, index: None, ty, value: Cow::Owned(BigInt::from(u8::from(value))) });
+    }
     let value = calls.structure.checker_integer_literals.get(&rhs.expression)?;
     if !is_integer_type(ty) || !super::typecheck::integer_literal_fits_type(value, ty) { return None; }
-    let site = destination.destination;
+    let value = Cow::Borrowed(value);
     if let Some(DirectDestinationIdentity::Module(declaration)) = calls.prepared_direct_destination(site) {
         return Some(ProjectedIntegerStorageWrite { declaration, index: None, ty, value });
     }

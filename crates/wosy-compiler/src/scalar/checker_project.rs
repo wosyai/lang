@@ -20028,6 +20028,60 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_parcel_camera_publication_retains_in_wreck_and_clears_on_coast() {
+        let app = source("src/main.w", "observed-flight-camera-publication");
+        let program = r#"%%start
+            struct copy ParcelCamera { f32 heading; f32 pitch; }
+            ParcelCamera published_parcel_camera = {.heading=0.25;.pitch=0.0;};
+            bool parcel_camera_published = false;
+            bool following = false;
+            bool wrecking = false;
+            i16 status = 5;
+            unit() frame = fn {
+                if (following) {
+                    published_parcel_camera = {.heading=0.75;.pitch=published_parcel_camera.heading;};
+                    parcel_camera_published = true;
+                } else {
+                    if (!wrecking) { parcel_camera_published = false; };
+                };
+                if (wrecking && parcel_camera_published) {
+                    f32 heading = published_parcel_camera.heading;
+                    f32 pitch = published_parcel_camera.pitch;
+                    bool expected_camera = heading == 0.75 && pitch == 0.25;
+                    if (expected_camera) { status = 37; } else { status = 11; };
+                } else {
+                    if (parcel_camera_published) { status = 29; } else { status = 19; };
+                };
+            };
+            unit() follow = fn { following = true; wrecking = false; frame(); };
+            unit() wreck = fn { following = false; wrecking = true; frame(); };
+            unit() coast = fn { following = false; wrecking = false; frame(); };
+            TRAJECTORY
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (steps, expected, cells) in [
+                ("wreck();", 19, 3), ("follow();", 29, 6),
+                ("follow(); wreck();", 37, 9), ("follow(); wreck(); coast(); wreck();", 19, 16),
+            ] {
+                let text = program.replace("TRAJECTORY", steps);
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+                let report = prepare().run().unwrap();
+                assert_eq!(super::super::checker_flow::take_observed_storage_delta_visits(), cells*17,
+                    "only selected writes are charged: {steps}");
+                let (capped, _, _, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped, report.directives, "{steps}");
+                assert_eq!(capped[0].code(), &BigInt::from(expected), "{steps}");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn whole_observed_parcel_camera_write_keeps_old_rhs_and_preserves_field_order() {
         let app = source("src/main.w", "observed-flight-camera-literal-write");
         let program = r#"%%start
