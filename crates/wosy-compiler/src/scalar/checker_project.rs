@@ -1729,9 +1729,20 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     if receiver.contextual_storage.is_none()
                         && passive_startup_initializer(&receiver.ty, &binding.value));
             #[cfg(feature = "internal-checker")]
+            let passive_float = if COLLECT && !binding.is_allocation && outputs.secondary.is_empty() {
+                match checked.receivers() {
+                    [receiver] if receiver.contextual_storage.is_none()
+                        && structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
+                        && topology.occurrences.get(outputs.primary.0).is_some_and(|occurrence|
+                            occurrence.span == super::typecheck::expression_span(&binding.value)) =>
+                        ranked_float::Atom::literal(&binding.value, &receiver.ty),
+                    _ => None,
+                }
+            } else { None };
+            #[cfg(feature = "internal-checker")]
             if !passive_literal { passive_generation = generation + 1; }
             #[cfg(feature = "internal-checker")]
-            if startup_trace_requested(failures) && !passive_literal
+            if startup_trace_requested(failures) && !passive_literal && passive_float.is_none()
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
                 && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
@@ -1779,6 +1790,13 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
+                #[cfg(feature = "internal-checker")]
+                (ScalarType::F32 | ScalarType::F64, _) if passive_float.is_some() => {
+                    let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
+                    super::checker_flow::charge_call_work(&mut effects.passive_literal_work, 1)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::PassiveFloat { _atom: passive_float.ok_or(ProjectCheck::Unsupported)? }
+                },
                 #[cfg(feature = "internal-checker")]
                 (ty, expression) if passive_literal => {
                     let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
@@ -2391,6 +2409,8 @@ enum InitializerValue<'a> {
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
     #[cfg(feature = "internal-checker")]
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
+    #[cfg(feature = "internal-checker")]
+    PassiveFloat { _atom: ranked_float::Atom },
     // An exact typed value, not a license to access runtime storage.
     #[cfg(feature = "internal-checker")]
     PassiveAggregate {
@@ -11153,17 +11173,35 @@ fn closed_dormant_float_plan(
                 super::checker_flow::charge_call_work(&mut work, 16)?;
                 if let Some(effect) = closed_typed_unary(project, calls, target, body, slot.expression, ClosedUnaryKind::SignedFloat) {
                     plan.calls.push(effect);
-                } else if allow_module_reads {
-                    plan.reads.push(closed_fixed_float_read(source, body, slot.expression)?);
-                } else { return None; }
+                } else if !allow_module_reads {
+                    return None;
+                } else if closed_module_float_leaf(source, body, slot.expression) {
+                    plan.scalar_reads.push(slot.expression);
+                } else if let Some(read) = closed_fixed_float_read(source, body, slot.expression) {
+                    plan.reads.push(read);
+                } else {
+                    plan.readonly_calls.push(closed_readonly_float_tail(project, calls, target, body, slot.expression, &mut work)?);
+                }
             }
         }
     }
     // Unknown, nested or non-terminal calls cannot borrow a leaf's authority.
-    if !has_leaf || plan.calls.len() != body.call_occurrences.len() { return None; }
+    if !has_leaf || plan.calls.len().checked_add(plan.readonly_calls.len())? != body.call_occurrences.len() { return None; }
     plan.calls.sort_unstable_by_key(|effect| effect.site.0);
+    plan.readonly_calls.sort_unstable_by_key(|effect| effect.site.0);
     plan.reads.sort_unstable_by_key(|effect| effect.site.0);
-    if !plan.calls.iter().zip(&body.call_occurrences).all(|(effect, call)| effect.site == call.ordinal) { return None; }
+    plan.scalar_reads.sort_unstable_by_key(|site| site.0);
+    let mut unary = plan.calls.iter().map(|effect| effect.site).peekable();
+    let mut readonly = plan.readonly_calls.iter().map(|effect| effect.site).peekable();
+    for call in &body.call_occurrences {
+        let head = match (unary.peek(), readonly.peek()) {
+            (Some(a), Some(b)) if a.0 < b.0 => unary.next(),
+            (Some(_), Some(_)) | (None, Some(_)) => readonly.next(),
+            (Some(_), None) => unary.next(),
+            (None, None) => None,
+        };
+        if head != Some(call.ordinal) { return None; }
+    }
     Some(plan)
 }
 
@@ -11241,6 +11279,85 @@ fn typed_closed_unary_site(
         OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
     ))? else { return None; };
     (body.structure.checked_types.expressions.get(argument)? == input).then_some((*argument, input, &output.ty))
+}
+
+#[cfg(feature = "internal-checker")]
+fn closed_module_float_leaf(source: &SourceIdentity, body: &FunctionCallSites, site: OccurrenceOrdinal) -> bool {
+    use super::reference::PlainNameIdentity;
+    matches!(body.structure.checked_types.expressions.get(&site), Some(ScalarType::F32 | ScalarType::F64))
+        && matches!(body.prepared_plain_name(site), Some(PlainNameIdentity::ModuleValue(declaration))
+            if &declaration.source == source)
+}
+
+#[cfg(feature = "internal-checker")]
+fn closed_readonly_float_tail(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    body: &FunctionCallSites, site: OccurrenceOrdinal, work: &mut usize,
+) -> Option<super::checker_flow::ClosedReadonlyFloatTail> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let signature = body.checked_call_signatures.get(&site)?;
+    let [a, b] = signature.parameters.as_slice() else { return None; };
+    if !is_integer_type(a) || !is_integer_type(b) { return None; }
+    let [result] = signature.outputs.outputs.as_slice() else { return None; };
+    let ty = &result.ty;
+    if !matches!(ty, ScalarType::F32 | ScalarType::F64)
+        || body.structure.checked_types.expressions.get(&site)? != ty
+    { return None; }
+    let (ordinal, item) = *body.structure.checker_direct_targets.get(&site)?;
+    if ordinal != target.0 || item == target.1 { return None; }
+    let module = project.modules.get(ordinal)?;
+    let ScalarItem::Function(function) = module.items.get(item)? else { return None; };
+    let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+        &body.resolved_call_site(site)?.target else { return None; };
+    if *source != module.source || *declaration_span != function.name_span
+        || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+    { return None; }
+    let leaf = calls.function_body(ordinal, item, None)?;
+    super::checker_flow::charge_call_work(work, leaf.occurrences.len().checked_add(4)?)?;
+    if !leaf.checker_pure_calling_frame() || leaf.contextual_formal().is_some() || !leaf.callable_escapes.is_empty()
+        || !leaf.structure.module_storage_uses.is_empty() || !leaf.call_occurrences.is_empty()
+        || !leaf.structure.checker_direct_targets.is_empty()
+        || !leaf.boundary.parameters.iter().map(|entry| &entry.ty).eq([a, b])
+        || !matches!(leaf.boundary.results.as_slice(), [result] if &result.ty == ty)
+    { return None; }
+    let [first, second] = leaf.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    let structure = &leaf.structure;
+    for (block_id, block) in structure.blocks.iter().enumerate() {
+        let [item] = block.items.as_slice() else { return None; };
+        let BlockItemKind::FinalOutput(slot) = item.kind else { return None; };
+        if block.unsafe_context || slot.output != 0 || structure.checked_types.expressions.get(&slot.expression)? != ty
+            || structure.edges.get(&(OccurrenceParent::Block(super::reference::BlockOrdinal(block_id)), OccurrenceEdge::FinalOutput {
+                item: slot.item, output: 0,
+            })) != Some(&OccurrenceNode::Expression(slot.expression))
+        { return None; }
+        if let Some(ConditionalRegion::Value { condition, then_block, else_block, resume, .. }) = leaf.conditionals.get(&slot.expression) {
+            let parent = OccurrenceParent::Expression(slot.expression);
+            if *resume != slot.expression || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
+                || structure.edges.get(&(parent, OccurrenceEdge::Condition)) != Some(&OccurrenceNode::Expression(*condition))
+                || structure.edges.get(&(parent, OccurrenceEdge::ThenBranch)) != Some(&OccurrenceNode::Block(*then_block))
+                || structure.edges.get(&(parent, OccurrenceEdge::ElseBranch)) != Some(&OccurrenceNode::Block(*else_block))
+            { return None; }
+            match structure.checker_branches.get(condition)? {
+                CheckerPredicate::Boolean(_) => {}
+                CheckerPredicate::Integer(predicate) if (predicate.binding == *first && &predicate.ty == a)
+                    || (predicate.binding == *second && &predicate.ty == b) => {}
+                _ => return None,
+            }
+        } else if !structure.checker_literal_float_outputs.contains(&slot.expression)
+            && !closed_module_float_leaf(&module.source, leaf, slot.expression)
+        { return None; }
+    }
+    let argument = |slot, ty: &ScalarType| {
+        let OccurrenceNode::Expression(argument) = body.structure.edges.get(&(
+            OccurrenceParent::Expression(site), OccurrenceEdge::CallArgument(slot)
+        ))? else { return None; };
+        if body.structure.checked_types.expressions.get(argument)? != ty
+            || !(body.structure.checker_integer_literals.contains_key(argument)
+                || matches!(body.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(_))))
+        { return None; }
+        Some((*argument, ty.clone()))
+    };
+    Some(super::checker_flow::ClosedReadonlyFloatTail { site, arguments: [argument(0, a)?, argument(1, b)?] })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -18770,6 +18887,75 @@ mod tests {
             assert!(checked.active && checked.directives.is_empty());
             assert!(matches!(prepare(&overflow, layout, scope).run(),
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_float_coordinate_route_can_discard_only_readonly_leaves() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-coordinate-route");
+        let program = |claim: &str, float: &str, alternative: &str| format!(r#"%%start
+            f32 harbor_z = {float};
+            f32[2][3] table = [[-1.0,1.0],[-2.0,2.0],[-3.0,3.0]];
+            u64(i32) ix = fn(value) {{ core.int_extend<u64>(value) }};
+            f32(i32,i32) harbor = fn(point,column) {{
+                if (column==0) {{ if (point<2) {{ -4.55 }} else {{ 8.10 }} }}
+                else {{ if (point==0) {{ 62.10 }} else {{ {alternative} }} }}
+            }};
+            f32(i32,i32,i32) route_value = fn(count,row,column) {{
+                if (count<2 || count>3) {{ 0.0 }}
+                else {{
+                    i32 start=if (count==3) {{ 1 }} else {{ 0 }};
+                    if (row<0 || row>=count-start || column<0 || column>1) {{ 0.0 }}
+                    else {{
+                        i32 point=start+row;
+                        core.require({claim}, {OUTPUT});
+                        if (column==0) {{
+                            u64 n=ix(point); u64 c=ix(column);
+                            table[n][c]
+                        }} else {{
+                            if (point==0) {{ harbor_z }} else {{ harbor(point,column) }}
+                        }}
+                    }}
+                }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}\n{text}"));
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let good = program("point>=0 && point<=2", "-0.0", "harbor_z");
+            let (valid, _) = prepare(&good, scope).run_private_authored_root(NonZeroUsize::MIN)
+                .unwrap_or_else(|error| panic!("positive capped route: {error:?}"));
+            assert!(valid.active && valid.directives.is_empty());
+            assert!(prepare(&good, scope).run().unwrap().directives.is_empty());
+            let wrong = program("point<=1 || column!=0", "-0.0", "harbor_z");
+            let (bad, _) = prepare(&wrong, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(bad.directives, prepare(&wrong, scope).run().unwrap().directives);
+            let [failure] = bad.directives.as_slice() else { panic!("one false coordinate claim"); };
+            let axes: Vec<_> = failure.witness.axes().collect();
+            // Three function inputs plus two real lexical locals, never
+            // the temporary subtraction used to test the row bounds.
+            assert_eq!(axes.len(), 5);
+            assert!(axes.iter().all(|(_, ty)| **ty == ScalarType::I32));
+            for (axis, value) in [3, 1, 0, 1, 2].into_iter().enumerate() {
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]),
+                    "unexpected coordinate witness at axis {axis}: {failure:?}");
+            }
+            for unsupported in [
+                program("point>=0 && point<=2", "1.0+2.0", "harbor_z"),
+                program("point>=0 && point<=2", "-0.0", "harbor_z+1.0"),
+                program("point>=0 && point<=2", "-0.0", &format!("core.require(true, {OUTPUT}); harbor_z")),
+            ] {
+                assert!(matches!(prepare(&unsupported, scope).run_private_authored_root(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(matches!(prepare(&unsupported, scope).run(),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 

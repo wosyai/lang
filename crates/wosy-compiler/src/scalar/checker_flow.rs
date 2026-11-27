@@ -162,6 +162,10 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn closed_fixed_float_read(self, _: OccurrenceOrdinal) -> Option<&'a ClosedFixedFloatRead> { None }
     #[cfg(feature = "internal-checker")]
+    fn closed_scalar_float_read(self, _: OccurrenceOrdinal) -> bool { false }
+    #[cfg(feature = "internal-checker")]
+    fn closed_readonly_float_tail(self, _: OccurrenceOrdinal) -> Option<&'a ClosedReadonlyFloatTail> { None }
+    #[cfg(feature = "internal-checker")]
     fn allows_context_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
@@ -354,10 +358,18 @@ pub(super) struct ClosedFixedFloatRead {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) struct ClosedReadonlyFloatTail {
+    pub(super) site: OccurrenceOrdinal,
+    pub(super) arguments: [(OccurrenceOrdinal, ScalarType); 2],
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Default)]
 pub(super) struct ClosedFloatPlan {
     pub(super) calls: Vec<ClosedUnaryEffect>,
     pub(super) reads: Vec<ClosedFixedFloatRead>,
+    pub(super) scalar_reads: Vec<OccurrenceOrdinal>,
+    pub(super) readonly_calls: Vec<ClosedReadonlyFloatTail>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -379,6 +391,15 @@ impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
         let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return None; };
         let index = plan.reads.binary_search_by_key(&site.0, |effect| effect.site.0).ok()?;
         plan.reads.get(index)
+    }
+    fn closed_scalar_float_read(self, site: OccurrenceOrdinal) -> bool {
+        let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return false; };
+        plan.scalar_reads.binary_search_by_key(&site.0, |entry| entry.0).is_ok()
+    }
+    fn closed_readonly_float_tail(self, site: OccurrenceOrdinal) -> Option<&'a ClosedReadonlyFloatTail> {
+        let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return None; };
+        let index = plan.readonly_calls.binary_search_by_key(&site.0, |effect| effect.site.0).ok()?;
+        plan.readonly_calls.get(index)
     }
     fn allows_context_history(self) -> bool { matches!(self.1, HistoryFrameEffects::LexicalContext) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -8752,7 +8773,17 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 let (_, ty) = roots.lookup(binding)?;
                                 if ty != &conversion.input { return None; }
                             }
-                        } else {
+                        } else if let Some(readonly) = authored_return.closed_readonly_float_tail(slot.expression) {
+                            charge_call_work(roots.ordinary_local_work.get_or_insert(0), 12)?;
+                            for (argument, input) in &readonly.arguments {
+                                if scalar_call_literal(structure, *argument, input, false).is_none() {
+                                    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*argument)?
+                                        else { return None; };
+                                    let (_, ty) = roots.lookup(binding)?;
+                                    if ty != input { return None; }
+                                }
+                            }
+                        } else if !authored_return.closed_scalar_float_read(slot.expression) {
                             let read = authored_return.closed_fixed_float_read(slot.expression)?;
                             charge_call_work(roots.ordinary_local_work.get_or_insert(0), 13)?;
                             for (index, extent) in read.axes {
