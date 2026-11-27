@@ -8054,11 +8054,14 @@ impl IntegerInputs {
         if roots.callable_history.is_none() { return Some(None); }
         let Some(guard) = observed_boolean_inputs(calls, condition) else { return Some(None); };
         let getter = guard.calls.iter().any(|&site| observed_getter_signature(calls, site).is_some());
+        let pure = guard.calls.iter().any(|&site| calls.structure.checked_types.expressions.get(&site)
+            .is_some_and(|ty| observed_float_argument_sites(calls,site,ty).is_some()));
         if (guard.integer && roots.observed_float_field_read.is_none())
-            || (getter && roots.observed_scalar_getter.is_none()) { return Some(None); }
+            || (getter && roots.observed_scalar_getter.is_none())
+            || (pure && roots.observed_float_call.is_none()) { return Some(None); }
         // A source-backed predicate must either consume its current cells or
         // decline. Pure predicates keep the existing symbolic route.
-        if guard.reads.is_empty() && !getter
+        if guard.reads.is_empty() && !getter && !pure
             && (!guard.integer || !observed_locals_are_singletons(roots, self, &guard.locals)) {
             return Some(None);
         }
@@ -9615,7 +9618,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     let mut backed = false;
                                     let mut getter = false;
                                     let mut locals = Vec::new();
-                                    if observed_integer::sites(calls, outputs.primary, |_| backed = true,
+                                    if observed_integer::sites(calls, outputs.primary, |_,_,_| backed = true,
                                         |site| getter |= observed_getter_signature(calls, site).is_some(),
                                         |binding, ty| locals.push((binding, ty))).is_some()
                                         && (backed || getter && roots.observed_scalar_getter.is_some()
@@ -12503,7 +12506,7 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                     let Some(write) = projected_integer_storage_write(calls, *group) else {
                         let write = observed_integer::write(calls, *group)?;
                         covered.insert((write.place.declaration.clone(), write.place.site, ModuleStorageRole::Replace));
-                        write.reads(calls, |place| { covered.insert((place.declaration.clone(), place.site, place.role())); },
+                        write.reads(calls, |declaration,site,role| { covered.insert((declaration.clone(),site,role)); },
                             |at| { scalar_calls.insert(at); })?;
                         writes = true;
                         continue;
@@ -12540,9 +12543,9 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                             || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
                     } else if calls.structure.projected_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position))
-                        && observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}, |_,_| {}).is_some() {
-                        observed_integer::sites(calls, outputs.primary, |place| {
-                            covered.insert((place.declaration.clone(), place.site, place.role()));
+                        && observed_integer::sites(calls, outputs.primary, |_,_,_| {}, |_| {}, |_,_| {}).is_some() {
+                        observed_integer::sites(calls, outputs.primary, |declaration,site,role| {
+                            covered.insert((declaration.clone(),site,role));
                         }, |at| { scalar_calls.insert(at); }, |_,_| {})?;
                     } else if receiver.ty == ScalarType::F32 && calls.structure.projected_f32_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) {
                         observed_float_expr_sites(calls, outputs.primary, |declaration,site,role| {
@@ -12589,6 +12592,7 @@ enum ObservedBoolean<'a> {
     Not(OccurrenceOrdinal),
     Integer(OccurrenceOrdinal, IntegerRelation, OccurrenceOrdinal),
     Getter,
+    FromFloatCall(Vec<OccurrenceOrdinal>),
     ShortCircuit { left: OccurrenceOrdinal, right: OccurrenceOrdinal, when: bool },
 }
 
@@ -12613,6 +12617,7 @@ fn observed_boolean_node(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> 
         }
     }
     if observed_getter_signature(calls, site).is_some() { return Some(ObservedBoolean::Getter); }
+    if let Some(args) = observed_float_argument_sites(calls,site,&ScalarType::Bool) { return Some(ObservedBoolean::FromFloatCall(args)); }
     let branch = calls.short_circuits.get(&site)?;
     Some(ObservedBoolean::ShortCircuit { left: branch.left, right: branch.right, when: branch.evaluate_right_when })
 }
@@ -12633,13 +12638,21 @@ fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdin
     while let Some(site) = todo.pop() {
         match observed_boolean_node(calls, site)? {
             ObservedBoolean::Getter => inputs.calls.push(site),
+            ObservedBoolean::FromFloatCall(args) => {
+                inputs.calls.push(site);
+                for argument in args {
+                    if let Some(place) = observed_f32_array::expression(calls,argument) {
+                        inputs.reads.push((place.declaration.clone(),place.site,ModuleStorageRole::Project));
+                    }
+                }
+            }
             ObservedBoolean::Module(declaration) => inputs.reads.push((declaration.clone(), site, ModuleStorageRole::Read)),
             ObservedBoolean::Not(operand) => todo.push(operand),
             ObservedBoolean::Integer(left, _, right) => {
                 inputs.integer = true;
                 for operand in [left, right] {
-                    observed_integer::sites(calls, operand, |place| {
-                        inputs.reads.push((place.declaration.clone(), place.site, place.role()));
+                    observed_integer::sites(calls, operand, |declaration,site,role| {
+                        inputs.reads.push((declaration.clone(),site,role));
                     }, |at| inputs.calls.push(at), |binding,ty| inputs.locals.push((binding,ty)))?;
                 }
             }
@@ -12730,6 +12743,11 @@ fn evaluate_observed_boolean(calls: &FunctionCallSites, condition: OccurrenceOrd
             }
             ObservedBoolean::Getter => {
                 let ObservedExactValue::Boolean(value) = evaluate_observed_getter(calls,site,roots,row)?
+                    else { return None; };
+                value
+            }
+            ObservedBoolean::FromFloatCall(args) => {
+                let ObservedExactValue::Boolean(value)=evaluate_observed_scalar_from_f32(calls,site,&args,roots,row)?
                     else { return None; };
                 value
             }
@@ -12828,7 +12846,50 @@ fn evaluate_observed_getter(calls: &FunctionCallSites, site: OccurrenceOrdinal, 
 
 #[cfg(feature = "internal-checker")]
 pub(super) type ObservedFloatCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal, Vec<projected_f32::ExactF32>)
-    -> Option<(projected_f32::ExactF32, Option<usize>, usize)> + 'a;
+    -> Option<(super::checker_project::ObservedExactValue, Option<usize>, usize)> + 'a;
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_argument_sites(calls: &FunctionCallSites, at: OccurrenceOrdinal, result: &ScalarType) -> Option<Vec<OccurrenceOrdinal>> {
+    let signature = calls.checked_call_signatures.get(&at)?;
+    if !calls.structure.checker_direct_targets.contains_key(&at) || signature.parameters.is_empty()
+        || !signature.parameters.iter().all(|ty| *ty == ScalarType::F32)
+        || !matches!(signature.outputs.outputs.as_slice(),[out] if &out.ty == result) { return None; }
+    signature.parameters.iter().enumerate().map(|(slot,ty)| {
+        let OccurrenceNode::Expression(arg) = calls.structure.edges.get(&(
+            OccurrenceParent::Expression(at),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+        (calls.structure.checked_types.expressions.get(arg)? == ty).then_some(*arg)
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
+fn evaluate_observed_scalar_from_f32(calls: &FunctionCallSites, at: OccurrenceOrdinal,
+    args: &[OccurrenceOrdinal], roots: &IntegerRoots<'_>, row: &mut IntegerRow
+) -> Option<super::checker_project::ObservedExactValue> {
+    let tracker = roots.callable_history?;
+    tracker.borrow().charge(args.len())?;
+    let mut values = Vec::with_capacity(args.len());
+    for &arg in args {
+        values.push(if let Some(place) = observed_f32_array::expression(calls,arg) {
+            observed_f32_array::read(calls,place,roots,row)?
+        } else { exact_observed_float_operand(calls,arg,row)? });
+    }
+    apply_observed_float_call(calls,at,roots,row,values)
+}
+
+#[cfg(feature = "internal-checker")]
+fn apply_observed_float_call(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    row: &mut IntegerRow, args: Vec<projected_f32::ExactF32>) -> Option<super::checker_project::ObservedExactValue> {
+    let (value,trace,work) = roots.observed_float_call?(calls,at,args)?;
+    let span = calls.occurrences.get(at.0)?.span;
+    let mut tracker = roots.callable_history?.borrow_mut();
+    tracker.charge(work.saturating_add(2))?;
+    let enter=tracker.boundary(span,false);
+    tracker.append(row,enter);
+    if let Some(trace) = trace { tracker.append(row,CallableHistoryStep::ObservedFloatTrace(trace)); }
+    let leave=tracker.boundary(span,true);
+    tracker.append(row,leave);
+    Some(value)
+}
 
 #[cfg(feature = "internal-checker")]
 fn observed_float_expr_sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
@@ -12952,15 +13013,8 @@ fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, root
             }
             Work::Call(at, arity) => {
                 let args = values.split_off(values.len().checked_sub(arity)?);
-                let (value, trace, cost) = roots.observed_float_call?(calls, at, args)?;
-                tracker.borrow().charge(cost)?;
-                let span = calls.occurrences.get(at.0)?.span;
-                let mut tracker = tracker.borrow_mut();
-                let start = tracker.boundary(span, false);
-                tracker.append(row, start);
-                if let Some(trace) = trace { tracker.append(row, CallableHistoryStep::ObservedFloatTrace(trace)); }
-                let end = tracker.boundary(span, true);
-                tracker.append(row, end);
+                let super::checker_project::ObservedExactValue::F32(value) = apply_observed_float_call(calls,at,roots,row,args)?
+                    else { return None; };
                 values.push(value);
             }
         }

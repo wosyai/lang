@@ -76,6 +76,7 @@ enum Expr<'a> {
     Binary(OccurrenceOrdinal,&'a BinaryOperator,OccurrenceOrdinal,&'a ScalarType),
     Extend(OccurrenceOrdinal),
     Getter,
+    FromFloatCall(Vec<OccurrenceOrdinal>,&'a ScalarType),
 }
 
 fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'_>> {
@@ -93,6 +94,7 @@ fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'
         return Some(Expr::Binary(*l,op,*r,ty));
     }
     if observed_getter_signature(calls,at).is_some() { return Some(Expr::Getter); }
+    if let Some(args) = observed_float_argument_sites(calls,at,ty) { return Some(Expr::FromFloatCall(args,ty)); }
     use super::super::{CoreOperationId,ResolvedCallTarget};
     if calls.resolved_call_site(at)?.target != ResolvedCallTarget::Core(CoreOperationId::IntExtend) { return None; }
     let sig = calls.checked_call_signatures.get(&at)?;
@@ -105,7 +107,7 @@ fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'
 }
 
 pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
-    mut place: impl FnMut(&Place<'a>), mut core: impl FnMut(OccurrenceOrdinal),
+    mut place: impl FnMut(&'a Span,OccurrenceOrdinal,ModuleStorageRole), mut core: impl FnMut(OccurrenceOrdinal),
     mut local: impl FnMut(&'a ReferenceBindingId, &'a ScalarType)) -> Option<()> {
     let mut todo = vec![at];
     while let Some(at) = todo.pop() {
@@ -113,12 +115,20 @@ pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
             Expr::Literal(_) => {}
             Expr::Lexical(binding,ty) => local(binding,ty),
             Expr::Module(value) => {
-                place(&value);
+                place(value.declaration,value.site,value.role());
                 if let Some((_,i)) = value.index { todo.push(i); }
             }
             Expr::Binary(l,_,r,_) => todo.extend([r,l]),
             Expr::Extend(input) => { core(at); todo.push(input); }
             Expr::Getter => core(at),
+            Expr::FromFloatCall(args,_) => {
+                core(at);
+                for arg in args {
+                    if let Some(value) = observed_f32_array::expression(calls,arg) {
+                        place(value.declaration,value.site,ModuleStorageRole::Project);
+                    }
+                }
+            }
         }
     }
     Some(())
@@ -162,6 +172,13 @@ fn evaluate_in_lane(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &In
                     if !use_current_cells { return None; }
                     let super::super::checker_project::ObservedExactValue::Integer(_, value) =
                         evaluate_observed_getter(calls,at,roots,row)? else { return None; };
+                    values.push(value);
+                }
+                Expr::FromFloatCall(args,expected) => {
+                    if !use_current_cells { return None; }
+                    let super::super::checker_project::ObservedExactValue::Integer(ty,value)=
+                        evaluate_observed_scalar_from_f32(calls,at,&args,roots,row)? else { return None; };
+                    if &ty != expected { return None; }
                     values.push(value);
                 }
                 Expr::Extend(input) => {
@@ -212,7 +229,7 @@ impl Write<'_> {
     }
 
     pub(super) fn reads<'a>(&'a self,calls: &'a FunctionCallSites,
-        mut place: impl FnMut(&Place<'a>),mut core: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
+        mut place: impl FnMut(&'a Span,OccurrenceOrdinal,ModuleStorageRole),mut core: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
         sites(calls,self.right,&mut place,&mut core,|_,_| {})?;
         if let Some((_,i)) = self.place.index { sites(calls,i,place,core,|_,_| {})?; }
         Some(())

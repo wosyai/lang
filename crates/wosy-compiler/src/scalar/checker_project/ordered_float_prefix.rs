@@ -4,6 +4,7 @@ use crate::scalar::reference::{BlockOrdinal, NamedPlaceRootIdentity, OccurrenceE
 use wosy_syntax::SourceSpan;
 
 type EffectId = usize;
+use super::super::CoreOperationId;
 
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
@@ -13,7 +14,7 @@ pub(super) enum Effect {
     Field { at: OccurrenceOrdinal, field: super::super::ScalarStructFieldId, receiver: EffectId },
     Branch { at: OccurrenceOrdinal, condition: EffectId, yes: EffectId, no: EffectId },
     ShortCircuit { at: OccurrenceOrdinal, conjunction: bool, left: EffectId, right: EffectId },
-    Call { at: OccurrenceOrdinal, function: Option<PreparedCallable>, ty: ScalarType, arguments: Vec<EffectId> },
+    Call { at: OccurrenceOrdinal, function: Option<PreparedCallable>, core: Option<CoreOperationId>, ty: ScalarType, arguments: Vec<EffectId> },
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +91,7 @@ struct Planner<'a> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
     owner: usize,
+    exact_mixed: bool,
     certificate: PrefixCertificate,
 }
 
@@ -120,7 +122,7 @@ fn prepare_prefix<const GUARDED: bool>(
 pub(super) fn plan_prefix<const GUARDED: bool>(
     project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
 ) -> Option<PrefixCertificate> {
-    let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
+    let mut planner = Planner { project, calls, owner: target.0, exact_mixed: false, certificate: PrefixCertificate::default() };
     let frame = planner.frame(target)?;
     let mut locals = frame.formals()?;
     let checked = frame.prepared.structure.blocks.get(frame.prepared.structure.root.0)?;
@@ -161,7 +163,7 @@ pub(super) fn readonly_boolean_leaf(
     project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
     work: &mut usize,
 ) -> Option<()> {
-    let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
+    let mut planner = Planner { project, calls, owner: target.0, exact_mixed: false, certificate: PrefixCertificate::default() };
     let frame = planner.frame(target)?;
     let body = frame.prepared;
     let structure = &body.structure;
@@ -334,7 +336,7 @@ impl<'a> Planner<'a> {
             Field(OccurrenceOrdinal, super::super::ScalarStructFieldId),
             Branch(OccurrenceOrdinal),
             Short(OccurrenceOrdinal, bool),
-            Call(OccurrenceOrdinal, Option<PreparedCallable>, ScalarType, usize),
+            Call(OccurrenceOrdinal, Option<PreparedCallable>, Option<CoreOperationId>, ScalarType, usize),
         }
 
         let mut pending = vec![Work::Visit(initial, expression)];
@@ -359,7 +361,7 @@ impl<'a> Planner<'a> {
                     let left = operands.pop()?;
                     Effect::ShortCircuit { at, conjunction, left, right }
                 }
-                Work::Call(at, function, ty, arity) => Effect::Call { at, function, ty, arguments: take(&mut operands, arity)? },
+                Work::Call(at, function, core, ty, arity) => Effect::Call { at, function, core, ty, arguments: take(&mut operands, arity)? },
                 Work::Visit(at, expr) => {
                     let ty = structure.checked_types.expressions.get(&at)?;
                     if frame.prepared.occurrences.get(at.0)?.span != super::super::typecheck::expression_span(expr)
@@ -436,6 +438,8 @@ impl<'a> Planner<'a> {
                                 Less | LessEqual | Greater | GreaterEqual
                                     if *ty == ScalarType::Bool && (is_integer_type(kind) || float_type(kind)) => Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
                                 Add | Subtract | Multiply | Divide if float_type(ty) && kind == ty => Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
+                                BitAnd | BitXor | Multiply if self.exact_mixed && *ty == ScalarType::I64 && kind == ty =>
+                                    Work::Sequence(at, 2, SequenceKind::Binary(operator.clone())),
                                 _ => return None,
                             };
                             pending.push(op);
@@ -481,9 +485,17 @@ impl<'a> Planner<'a> {
                             if arguments.len() != signature.parameters.len()
                                 || !matches!(signature.outputs.outputs.as_slice(), [result] if &result.ty == ty)
                             { return None; }
-                            let target = match &frame.prepared.resolved_call_site(at)?.target {
-                                ResolvedCallTarget::Core(super::super::CoreOperationId::SintToFloat)
-                                    if float_type(ty) && matches!(signature.parameters.as_slice(), [arg] if is_signed_integer(arg)) => None,
+                            let (target,core) = match &frame.prepared.resolved_call_site(at)?.target {
+                                ResolvedCallTarget::Core(op @ CoreOperationId::SintToFloat)
+                                    if float_type(ty) && matches!(signature.parameters.as_slice(), [arg] if is_signed_integer(arg)) =>
+                                    (None,Some(*op)),
+                                ResolvedCallTarget::Core(op) if self.exact_mixed && match op {
+                                    CoreOperationId::FloatExtend => *ty == ScalarType::F64 && signature.parameters.as_slice() == [ScalarType::F32],
+                                    CoreOperationId::FloatToSintTrunc => *ty == ScalarType::I32 && signature.parameters.as_slice() == [ScalarType::F64],
+                                    CoreOperationId::IntExtend => *ty == ScalarType::I64 && signature.parameters.as_slice() == [ScalarType::I32],
+                                    CoreOperationId::IntTrunc => *ty == ScalarType::I32 && signature.parameters.as_slice() == [ScalarType::I64],
+                                    _ => false,
+                                } => (None,Some(*op)),
                                 ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } => {
                                     let target = *structure.checker_direct_targets.get(&at)?;
                                     let callee = self.frame(target)?;
@@ -492,11 +504,11 @@ impl<'a> Planner<'a> {
                                         || !matches!(callee.prepared.boundary.results.as_slice(), [result] if &result.ty == ty)
                                     { return None; }
                                     deps.push(target);
-                                    Some(target)
+                                    (Some(target),None)
                                 }
                                 _ => return None,
                             };
-                            pending.push(Work::Call(at, target, ty.clone(), arguments.len()));
+                            pending.push(Work::Call(at, target, core, ty.clone(), arguments.len()));
                             for (index, argument) in arguments.iter().enumerate().rev() {
                                 let argument_at = child(at, OccurrenceEdge::CallArgument(index))?;
                                 if structure.checked_types.expressions.get(&argument_at)? != signature.parameters.get(index)? {
@@ -601,6 +613,7 @@ pub(in super::super) enum ExactValue {
     Boolean(bool),
     Integer(ScalarType, BigInt),
     F32(super::super::checker_flow::projected_f32::ExactF32),
+    F64(u64),
 }
 
 impl ExactValue {
@@ -609,6 +622,7 @@ impl ExactValue {
             Self::Boolean(_) => ScalarType::Bool,
             Self::Integer(ty, _) => ty.clone(),
             Self::F32(_) => ScalarType::F32,
+            Self::F64(_) => ScalarType::F64,
         }
     }
 }
@@ -654,7 +668,7 @@ impl std::hash::Hash for ObservedTrace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum MemoValue { Bool(bool), Int(BigInt), F32(u32) }
+enum MemoValue { Bool(bool), Int(BigInt), F32(u32), F64(u64) }
 
 impl From<&ExactValue> for MemoValue {
     fn from(value: &ExactValue) -> Self {
@@ -662,6 +676,7 @@ impl From<&ExactValue> for MemoValue {
             ExactValue::Boolean(value) => Self::Bool(*value),
             ExactValue::Integer(_, value) => Self::Int(value.clone()),
             ExactValue::F32(value) => Self::F32(value.0),
+            ExactValue::F64(bits) => Self::F64(*bits),
         }
     }
 }
@@ -670,7 +685,7 @@ type ObservedResult = (Vec<ExactValue>, Option<ObservedTrace>);
 
 pub(super) fn plan_observed_math_call(project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable)
     -> Option<(PrefixCertificate, FunctionEffects)> {
-    let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
+    let mut planner = Planner { project, calls, owner: target.0, exact_mixed: true, certificate: PrefixCertificate::default() };
     let mut installed = Vec::new();
     planner.seal_dependencies(vec![target], &mut installed)?;
     // This math callback has no mutable/snapshot dependencies: even a typed
@@ -701,7 +716,7 @@ pub(super) fn evaluate_observed_prefix(
         Select(PreparedCallable, OccurrenceOrdinal, EffectId, EffectId, Locals),
         Short(PreparedCallable, OccurrenceOrdinal, bool, EffectId, Locals),
         Sequence(&'a SequenceKind, usize),
-        Call(PreparedCallable, OccurrenceOrdinal, Option<PreparedCallable>, &'a ScalarType, usize),
+        Call(PreparedCallable, OccurrenceOrdinal, Option<PreparedCallable>, Option<CoreOperationId>, &'a ScalarType, usize),
         CheckedReturn(PreparedCallable, OccurrenceOrdinal, &'a ScalarType, Key),
         Publish,
         DropLocalResult,
@@ -712,6 +727,23 @@ pub(super) fn evaluate_observed_prefix(
             (SequenceKind::Boolean(value), []) => Boolean(*value),
             (SequenceKind::Integer(ty, value), []) => Integer(ty.clone(), value.clone()),
             (SequenceKind::Float(ranked_float::Atom::Single(bits)), []) => F32(ExactF32::checked_bits(*bits)?),
+            (SequenceKind::Float(ranked_float::Atom::Double(bits)), []) if f64::from_bits(*bits).is_finite() => F64(*bits),
+            (SequenceKind::Binary(BinaryOperator::Multiply), [F64(left),F64(right)]) => {
+                let v=f64::from_bits(*left)*f64::from_bits(*right);
+                if !v.is_finite() { return None; }
+                F64(v.to_bits())
+            }
+            (SequenceKind::Binary(op @ (BinaryOperator::BitAnd | BinaryOperator::BitXor | BinaryOperator::Multiply)),
+                [Integer(ScalarType::I64,left),Integer(ScalarType::I64,right)]) => {
+                let (l,r)=(i64::try_from(left).ok()?,i64::try_from(right).ok()?);
+                let value=match op {
+                    BinaryOperator::BitAnd => l&r,
+                    BinaryOperator::BitXor => l^r,
+                    BinaryOperator::Multiply => l.checked_mul(r)?,
+                    _ => return None,
+                };
+                Integer(ScalarType::I64,value.into())
+            }
             (SequenceKind::Unary(UnaryOperator::LogicalNot), [Boolean(value)]) => Boolean(!value),
             (SequenceKind::Unary(UnaryOperator::Negate), [F32(value)]) => F32(value.negate()),
             (SequenceKind::Binary(op @ (BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide)),
@@ -770,9 +802,9 @@ pub(super) fn evaluate_observed_prefix(
                         pending.push(Work::Sequence(kind, operands.len()));
                         pending.extend(operands.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
                     }
-                    Effect::Call { at, function, arguments, ty } => {
+                    Effect::Call { at, function, core, arguments, ty } => {
                         charge_call_work(work, arguments.len())?;
-                        pending.push(Work::Call(record.owner, *at, *function, ty, arguments.len()));
+                        pending.push(Work::Call(record.owner, *at, *function, *core, ty, arguments.len()));
                         pending.extend(arguments.iter().rev().map(|id| Work::Eval(*id, Rc::clone(&scope))));
                     }
                     Effect::Field { field, receiver, .. } => {
@@ -813,7 +845,7 @@ pub(super) fn evaluate_observed_prefix(
                 let args = take(&mut values, arity)?;
                 values.push(compute(kind, args)?);
             }
-            Work::Call(owner, at, target, result, arity) => {
+            Work::Call(owner, at, target, core, result, arity) => {
                 charge_call_work(work, arity)?;
                 let args = take(&mut values, arity)?;
                 if let Some(target) = target {
@@ -846,9 +878,24 @@ pub(super) fn evaluate_observed_prefix(
                         pending.push(Work::Eval(fact.returning_effect, Rc::clone(&scope)));
                     }
                 } else {
-                    let [ExactValue::Integer(ScalarType::I32, value)] = args.as_slice() else { return None; };
-                    if *result != ScalarType::F32 { return None; }
-                    values.push(ExactValue::F32(ExactF32::signed_i32(i32::try_from(value).ok()?)));
+                    use ExactValue::{F32,F64,Integer};
+                    let value = match (core?,result,args.as_slice()) {
+                        (CoreOperationId::SintToFloat,ScalarType::F32,[Integer(ScalarType::I32,value)]) =>
+                            F32(ExactF32::signed_i32(i32::try_from(value).ok()?)),
+                        (CoreOperationId::FloatExtend,ScalarType::F64,[F32(value)]) =>
+                            F64(f64::from(f32::from_bits(value.0)).to_bits()),
+                        (CoreOperationId::FloatToSintTrunc,ScalarType::I32,[F64(bits)]) => {
+                            let v=f64::from_bits(*bits).trunc();
+                            if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&v) { return None; }
+                            Integer(ScalarType::I32,(v as i32).into())
+                        }
+                        (CoreOperationId::IntExtend,ScalarType::I64,[Integer(ScalarType::I32,value)]) =>
+                            Integer(ScalarType::I64,i64::from(i32::try_from(value).ok()?).into()),
+                        (CoreOperationId::IntTrunc,ScalarType::I32,[Integer(ScalarType::I64,value)]) =>
+                            Integer(ScalarType::I32,(i64::try_from(value).ok()? as i32).into()),
+                        _ => return None,
+                    };
+                    values.push(value);
                 }
             }
             Work::CheckedReturn(owner, at, ty, key) => {

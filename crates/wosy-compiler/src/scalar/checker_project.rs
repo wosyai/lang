@@ -2258,6 +2258,7 @@ fn try_observed_projected_storage_call(
     let mut visiting = HashSet::new();
     let mut complete = HashSet::new();
     let mut admitted = HashMap::new();
+    let mut observed_owners = HashMap::new();
     let mut getters = HashMap::new();
     let mut frontiers = HashMap::new();
     let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
@@ -2272,6 +2273,7 @@ fn try_observed_projected_storage_call(
             Event::Enter(node) if !complete.contains(&node) => {
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
+                observed_owners.insert(body as *const FunctionCallSites,node.0);
                 if node != target {
                     let recursive_sites = body.structure.checker_direct_targets.iter()
                         .filter_map(|(&site,&child)| (child == node).then_some(site));
@@ -2370,19 +2372,24 @@ fn try_observed_projected_storage_call(
     // Scoped to this observed activation. Plan leaves never contain runtime
     // storage and are indexed by authenticated target identity and bits.
     let math_plans = RefCell::new(HashMap::new());
-    type MathMemo = (Vec<u32>, super::checker_flow::projected_f32::ExactF32, Option<usize>);
+    type MathMemo = (Vec<u32>, ObservedExactValue, Option<usize>);
     let latest_math = RefCell::new(HashMap::<PreparedCallable, MathMemo>::new());
     let math_traces = RefCell::new(Vec::<Rc<ordered_float_prefix::ObservedTrace>>::new());
     let math_interned = RefCell::new(HashMap::<Rc<ordered_float_prefix::ObservedTrace>,usize>::new());
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
         use std::collections::hash_map::Entry;
         let signature = body.checked_call_signatures.get(&site)?;
-        let child = symbolic_math_effect_target(actual, target.0, body, site, signature)?;
+        let caller = *observed_owners.get(&(body as *const FunctionCallSites))?;
+        let [out] = signature.outputs.outputs.as_slice() else { return None; };
+        if !(out.ty == ScalarType::F32 || out.ty == ScalarType::Bool || is_integer_type(&out.ty))
+            || signature.parameters.is_empty() || !signature.parameters.iter().all(|ty| *ty == ScalarType::F32) { return None; }
+        let child = authenticate_prepared_direct_edge(actual.project,actual.calls,caller,body,site,signature)?;
+        if child.0 != caller && visits.get(child.0) != Some(&InitializationVisit::Completed) { return None; }
         let lookup_work = args.len().saturating_add(1);
         if let Some((_, value, trace)) = latest_math.borrow().get(&child).filter(|(known, _, _)|
             known.iter().copied().eq(args.iter().map(|value| value.0))) {
             #[cfg(test)] OBSERVED_MATH_HITS.with(|count| count.set(count.get() + 1));
-            return Some((*value, *trace, lookup_work));
+            return Some((value.clone(), *trace, lookup_work));
         }
         #[cfg(test)] OBSERVED_MATH_MISSES.with(|count| count.set(count.get() + 1));
         let bits = args.iter().map(|arg| arg.0).collect();
@@ -2396,10 +2403,12 @@ fn try_observed_projected_storage_call(
         let mut work = lookup_work;
         let (returned, nested) = ordered_float_prefix::evaluate_observed_prefix(plan, Some(root), values,
             |_,_,_| None, trace.is_some(), &mut work, |owner,at| {
-                if owner.0 != target.0 { return None; }
-                Some(wosy_syntax::SourceSpan::new(source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
+                if owner.0 != child.0 { return None; }
+                let owner_source = &actual.project.modules.get(owner.0)?.source;
+                Some(wosy_syntax::SourceSpan::new(owner_source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
             })?;
-        let [ObservedExactValue::F32(value)] = returned.as_slice() else { return None; };
+        let [value] = returned.as_slice() else { return None; };
+        if value.ty() != out.ty { return None; }
         let trace = nested.map(|trace| {
             let trace = Rc::new(trace);
             *math_interned.borrow_mut().entry(Rc::clone(&trace)).or_insert_with(|| {
@@ -2409,8 +2418,8 @@ fn try_observed_projected_storage_call(
                 id
             })
         });
-        latest_math.borrow_mut().insert(child, (bits, *value, trace));
-        Some((*value,trace,work))
+        latest_math.borrow_mut().insert(child, (bits, value.clone(), trace));
+        Some((value.clone(),trace,work))
     };
     let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
         use super::checker_flow::CallableHistoryStep;
@@ -2452,23 +2461,6 @@ fn try_observed_projected_storage_call(
     }
     *storage = Rc::unwrap_or_clone(current);
     Ok(true)
-}
-
-#[cfg(feature = "internal-checker")]
-fn symbolic_math_effect_target(
-    actual: &CheckedCalls<'_, impl ActualIntegerObserver>, owner: usize,
-    body: &FunctionCallSites, site: OccurrenceOrdinal, signature: &CheckedCallSignature,
-) -> Option<PreparedCallable> {
-    if !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::F32)
-        || signature.parameters.iter().any(|ty| *ty != ScalarType::F32) { return None; }
-    let &target = body.structure.checker_direct_targets.get(&site)?;
-    if target.0 != owner { return None; }
-    let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }
-        = &body.resolved_call_site(site)?.target else { return None; };
-    let (checked, _, _, function) = actual.validated_direct_body(&body.structure, site, source, *declaration_span).ok()?;
-    if checked != target || !function.boundary.parameters.iter().map(|parameter| &parameter.ty).eq(signature.parameters.iter())
-        || !matches!(function.boundary.results.as_slice(), [result] if result.ty == ScalarType::F32) { return None; }
-    Some(target)
 }
 
 fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
@@ -24847,6 +24839,77 @@ unit(u8) parent = fn(a) {
             assert!(trace.contains_return(&put_span));
             assert!(matches!(prepare(&bad).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             eprintln!("Orbital pt/index_vertex {target_layout:?}: eight live lanes 255, untouched copied neighbor 0, checked out-of-range rejected");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_provider_validates_and_hashes_eight_live_lanes() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let args=(0..8).map(|i| format!("mesh[1][0][0][1][{i}]")).collect::<Vec<_>>().join(",");
+        let text=format!(r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            {mesh}
+            i32 count=4097;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32 bucket=0; i32 rejected=0; i32 negative_limit=0;
+            {pt}
+            unit() launch=fn {{
+                pt(1.125,-2.25,3.5,-4.5);
+                if(packing.valid(mesh[1][0][0][1][0])){{bucket=packing.bin({args});}};
+                if(packing.valid(-100000.125)){{rejected=100;}}else{{rejected=1;}};
+                negative_limit=packing.bin(-524288.0,0.0,0.0,0.0,0.0,0.0,0.0,-0.0);
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=bucket;.files=[
+                {{.path="reject.json";.state=rejected;}},
+                {{.path="limit.json";.state=negative_limit;}}
+            ];}});
+        %%end"#);
+        let overflow=text.replace("packing.bin(-524288.0", "packing.bin(524288.0");
+        let app=source("src/main.w","pinned-orbital-productive-bin");
+        let provider=source("src/indexed-pack.w","pinned-orbital-original-bin-provider");
+        fn span(source:&SourceIdentity, text:&str, snippet:&str) -> SourceSpan {
+            let start=text.find(snippet).unwrap() as u32;
+            SourceSpan::new(source.clone(),ByteSpan::new(start,start+snippet.len() as u32))
+        }
+        let declaration=span(&app,&text,r#"packing=namespace demo "indexed-pack.w";"#);
+        let valid=span(&app,&text,"packing.valid(mesh[1][0][0][1][0])");
+        let reject=span(&app,&text,"packing.valid(-100000.125)");
+        let bin=span(&app,&text,&format!("packing.bin({args})"));
+        let mix=span(&provider,&packing,"mix(x,2166136261)");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:declaration.range,
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let all=prepare(&text).run().unwrap();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(30053));
+            assert_eq!(report.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":1}\n");
+            assert_eq!(report.files()[1].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":29029}\n");
+            let (capped,_,trace,_)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(all.directives,capped);
+            assert!(trace.contains_branch(valid.clone(),true));
+            assert!(trace.contains_branch(reject.clone(),false));
+            assert!(trace.contains_return(&bin));
+            assert!(trace.contains_return(&mix));
+            assert!(matches!(prepare(&overflow).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            eprintln!("Orbital original valid/mix/bin {target_layout:?}: current lanes hash 30053, finite invalid rejected, conversion endpoints checked");
         }
     }
 
