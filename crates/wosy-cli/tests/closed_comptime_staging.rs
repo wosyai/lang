@@ -418,6 +418,14 @@ Report result = comptime prepare {
             assert_eq!(prepared.read_stdout(ok, framing, 256).err(), Some(Error::Output(reason)), "{framing:?}");
         }
 
+        let large = authored.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
+        fs::write(&source, &large).unwrap();
+        let padded = prepare_project_comptime_stdout(&project, "app", "override", "prepare", layout).unwrap();
+        assert_ne!(padded.site().source.revision, prepared.site().source.revision);
+        let mut padded_stdout = Vec::new();
+        padded.write_literal_stdout(&mut padded_stdout, from_source.len()).unwrap();
+        assert_eq!(padded_stdout, produced);
+
         // Independent result, same id but a different source revision and
         // type. The earlier prepared result owns its original shape.
         fs::write(&source, "%%start\nbool answer = comptime prepare { true };\n%%end\n").unwrap();
@@ -526,6 +534,13 @@ Report result = comptime prepare {
         assert!(body.contains("ret [16 x i8] "), "{body}");
         assert!(!ir.contains("@ambient_function") && !ir.contains("@ambient_value"), "{ir}");
         assert!(!ir.contains("@printf"));
+        let large = text.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
+        fs::write(&source, &large).unwrap();
+        let padded = plan(layout).unwrap();
+        assert_ne!(padded.site().source.revision, evaluator.site().source.revision);
+        let mut padded_ir = Vec::new();
+        padded.write_evaluator_ir(&mut padded_ir, 1 << 16).unwrap();
+        assert_eq!(padded_ir, bytes);
         let (ir_path, modules, manifest) =
             (fixture.0.join("evaluator.ll"), fixture.0.join("modules"), fixture.0.join("manifest"));
         let builder = evaluator.builder(ClosedComptimePaths { evaluator_ir: &ir_path, output_dir: &modules, manifest: &manifest });

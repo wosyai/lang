@@ -10,7 +10,6 @@ use wosy_syntax::{
     byte_span, ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind,
 };
 
-pub const CLOSED_COMPTIME_MAX_SOURCE_BYTES: usize = 1 << 16;
 const FUNCTION: &str = "evaluate";
 
 mod direct;

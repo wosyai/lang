@@ -10,7 +10,7 @@ use wosy_compiler::{
     parse_source_with_snapshot, prepare_comptime_stdout, prepare_comptime_stdout_evaluator,
     prepare_comptime_wasip1_stdout_evaluator,
     ClosedComptimeRejection, ComptimeStdoutError, PreparedComptimeStdout, PreparedComptimeStdoutEvaluator,
-    ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    ScalarExpression, ScalarNamespaceBinding, ScalarTargetLayout, ScalarType,
 };
 use wosy_project::{ObservedClosedComptimeProfile, ProjectConfiguration, ProjectContext, SelectedComptimeTools};
 use wosy_syntax::{FreshParseResult, SourceIdentity, SourceSpan};
@@ -99,12 +99,12 @@ fn observe_project<T>(
     }
     let selection = ObservedClosedComptimeProfile::observe_input_declarations(&configuration, &manifest, target, profile)?;
     let context = ProjectContext::from_manifest(&root, target, manifest.as_table())?;
-    let mut remaining = wasip1_source_limit.unwrap_or(CLOSED_COMPTIME_MAX_SOURCE_BYTES);
+    let mut remaining = wasip1_source_limit;
     let mut authored = BTreeMap::new();
     let graph = project_sources::load_with_reader(&root, &context, &configuration, |path, opened| {
-        let (revision, text) = project_sources::read_bounded_regular_source(path, opened, remaining)
+        let (revision, text) = project_sources::read_regular_source(path, opened, remaining)
             .map_err(ClosedComptimePlanError::Project)?;
-        remaining -= text.len();
+        if let Some(bytes) = &mut remaining { *bytes -= text.len(); }
         Ok((revision, text))
     }, |source, revision, text| -> Result<_, ClosedComptimePlanError> {
         let path = source.path.as_path().to_str().ok_or("source path is not UTF-8").map_err(str::to_owned)?;

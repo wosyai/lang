@@ -4,7 +4,7 @@ use super::{
     derive_block, prepare_scalar_project, root_receiver_and_initializer, single_binding_type, span_of,
     BoundedStartupWasip1Evaluator, ClosedComptimeFragment, ClosedComptimeRejection, RootInitializer,
     ScalarBlockItem, ScalarExpression,
-    ScalarItem, ScalarPreparationInputs, ScalarTargetLayout, ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    ScalarItem, ScalarPreparationInputs, ScalarTargetLayout, ScalarType,
     FUNCTION,
 };
 use super::super::{
@@ -190,13 +190,14 @@ fn prepare(
     }
     let Some((entry, _)) = sources.first() else { return Err(Error::InvalidParse); };
     let mut remaining = match delivery {
-        Delivery::Wasip1 { max_authored_source_bytes, .. } => max_authored_source_bytes,
-        _ => CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+        Delivery::Wasip1 { max_authored_source_bytes, .. } => Some(max_authored_source_bytes),
+        _ => None,
     };
     for (fresh, _) in &sources {
         if !fresh.result().is_valid() { return Err(Error::InvalidParse); }
-        let size = fresh.result().text.len();
-        remaining = remaining.checked_sub(size).ok_or(Error::SourceLimit)?;
+        if let Some(bytes) = &mut remaining {
+            *bytes = bytes.checked_sub(fresh.result().text.len()).ok_or(Error::SourceLimit)?;
+        }
     }
     let parsed = (*entry).result();
     let qualify = |span| SourceSpan::new(parsed.source.clone(), span);

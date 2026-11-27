@@ -37,7 +37,7 @@ pub use scalar::{
 pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,
-    CLOSED_COMPTIME_MAX_SOURCE_BYTES};
+};
 pub use scalar::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,
     derive_direct_startup_comptime_plan, derive_forwarded_pair_startup_comptime_plan,
