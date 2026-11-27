@@ -1729,33 +1729,33 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     if receiver.contextual_storage.is_none()
                         && passive_startup_initializer(&receiver.ty, &binding.value));
             #[cfg(feature = "internal-checker")]
-            let passive_float = if COLLECT && !binding.is_allocation && outputs.secondary.is_empty() {
-                match checked.receivers() {
-                    [receiver] if receiver.contextual_storage.is_none()
-                        && structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
-                        && topology.occurrences.get(outputs.primary.0).is_some_and(|occurrence|
-                            occurrence.span == super::typecheck::expression_span(&binding.value)) =>
-                        ranked_float::Atom::literal(&binding.value, &receiver.ty),
-                    _ => None,
-                }
-            } else { None };
+            let passive_receiver = match checked.receivers() {
+                [receiver] if COLLECT && !binding.is_allocation && outputs.secondary.is_empty()
+                    && receiver.contextual_storage.is_none()
+                    && topology.occurrences.get(outputs.primary.0).is_some_and(|occurrence|
+                        occurrence.span == super::typecheck::expression_span(&binding.value)) => Some(receiver),
+                _ => None,
+            };
             #[cfg(feature = "internal-checker")]
-            let passive_integer = if COLLECT && !binding.is_allocation && outputs.secondary.is_empty() {
-                match checked.receivers() {
-                    [receiver] if receiver.contextual_storage.is_none() && is_integer_type(&receiver.ty)
-                        && topology.occurrences.get(outputs.primary.0).is_some_and(|occurrence|
-                            occurrence.span == super::typecheck::expression_span(&binding.value)) => {
-                        failures.as_deref_mut().and_then(|effects| super::checker_flow::startup_checked_integer_constant(
-                            &binding.value, outputs.primary, structure, &receiver.ty, &mut effects.passive_literal_work))
-                    }
-                    _ => None,
-                }
-            } else { None };
+            let passive_float = passive_receiver.and_then(|receiver|
+                ranked_float::Atom::literal(&binding.value, &receiver.ty));
+            #[cfg(feature = "internal-checker")]
+            let passive_integer = passive_receiver.filter(|receiver| is_integer_type(&receiver.ty)).and_then(|receiver|
+                failures.as_deref_mut().and_then(|effects| super::checker_flow::startup_checked_integer_constant(
+                    &binding.value, outputs.primary, structure, &receiver.ty, &mut effects.passive_literal_work)));
+            #[cfg(feature = "internal-checker")]
+            let passive_enum = passive_receiver.and_then(|receiver| {
+                use super::control::InitializationMember;
+                let ScalarType::Enum(expected) = &receiver.ty else { return None; };
+                let InitializationMember::Enum { enumeration, tag } = topology.identities.members.get(&outputs.primary)?
+                    else { return None; };
+                (enumeration == expected).then_some((enumeration, *tag))
+            });
             #[cfg(feature = "internal-checker")]
             if !passive_literal && passive_integer.is_none() { passive_generation = generation + 1; }
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures) && !passive_literal
-                && passive_float.is_none() && passive_integer.is_none()
+                && passive_float.is_none() && passive_integer.is_none() && passive_enum.is_none()
                 && !matches!(binding.value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
                 && !(matches!(binding.value, ScalarExpression::If { .. }) && startup_ordinary_scalars_requested(failures))
                 && !(matches!(binding.value, ScalarExpression::Call { .. }) && failures.as_ref()
@@ -1803,6 +1803,14 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
+                #[cfg(feature = "internal-checker")]
+                (ScalarType::Enum(_), _) if passive_enum.is_some() => {
+                    let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
+                    super::checker_flow::charge_call_work(&mut effects.passive_literal_work, 1)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    let (enumeration, tag) = passive_enum.ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::PassiveEnum { _enumeration: enumeration, _tag: tag }
+                },
                 #[cfg(feature = "internal-checker")]
                 (ScalarType::F32 | ScalarType::F64, _) if passive_float.is_some() => {
                     let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
@@ -2427,6 +2435,8 @@ enum InitializerValue<'a> {
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
     #[cfg(feature = "internal-checker")]
     PassiveFloat { _atom: ranked_float::Atom },
+    #[cfg(feature = "internal-checker")]
+    PassiveEnum { _enumeration: &'a super::ScalarEnumId, _tag: u32 },
     // An exact typed value, not a license to access runtime storage.
     #[cfg(feature = "internal-checker")]
     PassiveAggregate {
@@ -18668,6 +18678,39 @@ mod tests {
         let mut exhausted = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK - 1;
         assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
             .node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_prepared_enum_literal_passes_without_admitting_computed_enum() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "startup-enum-literal");
+        let text = |value: &str, assertion: &str| format!(r#"%%start
+            enum Phase {{ first; second; }}
+            Phase stage = {value};
+            i32 capacity = 9*4096;
+            core.require({assertion}, {OUTPUT});
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}\n{program}"));
+            for variant in ["Phase::first", "Phase::second"] {
+                let positive = text(variant, "capacity==36864");
+                let (cap, _) = prepare(&positive).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                let full = prepare(&positive).run().unwrap();
+                assert!(cap.active && full.active && cap.directives.is_empty() && full.directives.is_empty());
+            }
+            let wrong = text("Phase::second", "capacity==36865");
+            let (cap, _) = prepare(&wrong).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(cap.directives.len(), 1);
+            assert_eq!(cap.directives, prepare(&wrong).run().unwrap().directives);
+            let computed = text("if (true) { Phase::first } else { Phase::second }", "capacity==36864");
+            assert!(matches!(prepare(&computed).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(prepare(&computed).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]
