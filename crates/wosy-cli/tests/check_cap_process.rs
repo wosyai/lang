@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "internal-checker"))]
+#![cfg(all(any(target_os = "linux", target_os = "macos"), feature = "internal-checker"))]
 
 use std::fs;
 use std::path::Path;

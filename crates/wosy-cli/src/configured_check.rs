@@ -111,13 +111,21 @@ pub(crate) enum CheckPublicationPreflightError {
 pub(crate) struct PreparedCheckPublication<'a> {
     status: u8,
     effects: &'a [PlannedCheckEffect<'a>],
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     files: Option<file_publication::PreparedFiles>,
 }
 
 #[cfg(target_os = "linux")]
 #[path = "check_file_publication.rs"]
 mod file_publication;
+
+#[cfg(target_os = "macos")]
+#[path = "check_file_publication_macos.rs"]
+mod file_publication;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "check_file_publication_macos.rs"]
+mod macos_file_publication_tests;
 
 impl PlannedCheckPublication<'_> {
     pub(crate) fn prepare(&self, root: &Path) -> Result<PreparedCheckPublication<'_>, CheckPublicationPreflightError> {
@@ -131,22 +139,22 @@ impl PlannedCheckPublication<'_> {
             _ => None,
         }).collect::<Vec<_>>();
         if requests.iter().any(|(path, _)| path.components().count() != 1)
-            || (!cfg!(target_os = "linux") && !requests.is_empty())
+            || (!cfg!(any(target_os = "linux", target_os = "macos")) && !requests.is_empty())
         {
             return Err(CheckPublicationPreflightError::UnsupportedFilePublication);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let files = if requests.is_empty() {
             None
         } else {
             Some(file_publication::PreparedFiles::new(root, &requests)
                 .map_err(CheckPublicationPreflightError::File)?)
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = root;
         Ok(PreparedCheckPublication {
             status, effects: &self.effects,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             files,
         })
     }
@@ -154,7 +162,7 @@ impl PlannedCheckPublication<'_> {
 
 impl PreparedCheckPublication<'_> {
     pub(crate) fn publish(self, stdout: &mut impl Write, stderr: &mut impl Write) -> io::Result<u8> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut staged = self.files.as_ref().map(|files| files.payloads.iter());
         for effect in self.effects {
             match effect {
@@ -167,11 +175,11 @@ impl PreparedCheckPublication<'_> {
                     stderr.flush()?;
                 }
                 PlannedCheckEffect::DeferredFile { relative, .. } => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.files.as_ref().expect("file preflight").publish(
                         staged.as_mut().and_then(Iterator::next).expect("one staged payload per request"), relative,
                     )?;
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     {
                         let _ = relative;
                         unreachable!("file publication is not supported on this platform");
