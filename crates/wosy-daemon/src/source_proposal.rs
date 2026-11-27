@@ -396,10 +396,11 @@ pub(super) fn verified_authored_parse(
 
 /// Validate and provisionally install only the full canonical graph supplied
 /// by the already-acknowledged workspace. Records outside it are not inputs.
+/// A caller may retain the returned grammar evidence only after commit.
 pub(super) fn stage_reconciled_closure(
     tx: &mut Transaction, selected: &BuildSourceSelection, full: &Delta,
     limits: BaseCstAdmissionLimits, report: &mut PublishReport,
-) -> Result<usize> {
+) -> Result<(usize, VerifiedGrammarBatch)> {
     let mut graph = GraphWork { records: limits.records, record_bytes: limits.record_bytes, edges: limits.graph_edges };
     let mut supplied = BTreeMap::new();
     for (&id, bytes) in &full.nodes {
@@ -412,18 +413,20 @@ pub(super) fn stage_reconciled_closure(
     }
     let mut work = limits.cst_work();
     let mut validated_files = 0;
+    let mut grammar = VerifiedGrammarBatch::default();
     validate_snapshot_with(tx, selected.root, |config| {
         if !matches_source_scope(config, selected) {
             return Err("recovery source does not match the acknowledged workspace and target".into());
         }
         Ok(())
     }, |tx, file, categories| {
-        let (checked, _) = grammar_checked_file(tx, file, categories, FileTree::Both, &mut work)?;
+        let (checked, present) = grammar_checked_file(tx, file, categories, FileTree::Both, &mut work)?;
         admit_checked_namespace_authority(tx, file, checked, report)?;
+        grammar.verified(file, present);
         validated_files += 1;
         Ok(())
     })?;
-    Ok(validated_files)
+    Ok((validated_files, grammar))
 }
 
 impl BaseCstAdmissionLimits {

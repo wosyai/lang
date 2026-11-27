@@ -1,6 +1,7 @@
 //! Restore already-acknowledged source after loss of recomputable store data.
 use super::{
     check_source_marker, key, read_verified_node_with,
+    grammar_receipts::VerifiedGrammarBatch,
     source_proposal::{matches_source_scope, stage_reconciled_closure, take},
     storage_worker::QueryWorker,
     BaseCstAdmissionLimits, PublishReport, Result, SourceStorageWorker, SourceStore, SNAPSHOT_ROOTS,
@@ -19,7 +20,7 @@ pub enum SourceReconciliation {
 enum Plan {
     Known,
     ReplayRequired,
-    Write { transaction: Transaction, report: PublishReport, validated_files: usize },
+    Write { transaction: Transaction, report: PublishReport, validated_files: usize, grammar: VerifiedGrammarBatch },
 }
 
 impl SourceStorageWorker {
@@ -52,13 +53,16 @@ pub(super) async fn reconcile_on_worker(
         let plan = worker.phase(None, move |store| {
             reconciliation_plan(store, &selection, payload.as_deref(), limits)
         }).await?;
-        let (mut transaction, report, validated_files) = match plan {
+        let (mut transaction, report, validated_files, grammar) = match plan {
             Plan::Known => return Ok(SourceReconciliation::Known { root }),
             Plan::ReplayRequired => return Ok(SourceReconciliation::ReplayRequired { root }),
-            Plan::Write { transaction, report, validated_files } => (transaction, report, validated_files),
+            Plan::Write { transaction, report, validated_files, grammar } => (transaction, report, validated_files, grammar),
         };
         match transaction.commit().await {
-            Ok(()) => return Ok(SourceReconciliation::Restored { root, report, validated_files, conflicts }),
+            Ok(()) => {
+                worker.store.grammar_receipts.accept(grammar);
+                return Ok(SourceReconciliation::Restored { root, report, validated_files, conflicts });
+            }
             Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => {}
             Err(error) => return Err(error.into()),
         }
@@ -84,9 +88,9 @@ fn reconciliation_plan(
     let Some(replay) = replay else { return Ok(Plan::ReplayRequired) };
     tx.set_durability(Durability::Eventual);
     let mut report = PublishReport::default();
-    let validated_files = stage_reconciled_closure(&mut tx, selected, replay, limits, &mut report)?;
+    let (validated_files, grammar) = stage_reconciled_closure(&mut tx, selected, replay, limits, &mut report)?;
     tx.set(&marker, &root.0)?;
-    Ok(Plan::Write { transaction: tx, report, validated_files })
+    Ok(Plan::Write { transaction: tx, report, validated_files, grammar })
 }
 
 pub(super) fn checked_published_source_header(tx: &Transaction, root: NodeId) -> Result<SourceConfig> {

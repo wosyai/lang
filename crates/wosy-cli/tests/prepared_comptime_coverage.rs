@@ -1,6 +1,7 @@
 use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use wosy_cli::{source_recovery::ClientSourceLimits, source_state::{PendingBasePublication, ReplaySource, SourceAttempt, SqliteSourceState}};
-use wosy_daemon::{AuthoredComptimeCoverage, BaseCstAdmissionLimits, RootedLlvmProjection, SourceStorageWorker, SourceStore};
+use wosy_daemon::{AuthoredComptimeCoverage, BaseCstAdmissionLimits, RootedLlvmProjection, SourceReconciliation, SourceStorageWorker, SourceStore};
+use wosy_protocol::SourcePinReflection;
 
 const CLIENT: ClientSourceLimits = ClientSourceLimits { nodes: 25_000, encoded_bytes: 16 << 20 };
 const LIMITS: BaseCstAdmissionLimits = BaseCstAdmissionLimits {
@@ -136,6 +137,102 @@ fn prepared_coverage_requires_authentic_reused_grammar_and_tracks_exact_edits() 
         fs::write(&library, ORDINARY_LIB.replace("= 14", "= 19")).unwrap();
         let removed = client.stage("app").unwrap().pending.unwrap();
         assert_eq!(coverage(&mut client, &worker, &store, removed).await, AuthoredComptimeCoverage::Absent);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}
+
+#[test]
+fn recovered_grammar_is_available_to_sparse_preparation_only_after_commit() {
+    let fixture = Scratch::new();
+    let root = fixture.0.join("project");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("wosy.toml"), MANIFEST).unwrap();
+    fs::write(root.join("main.w"), BEFORE).unwrap();
+    let library = root.join("library.w");
+    fs::write(&library, ORDINARY_LIB).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker_for = |store: &Arc<SourceStore>| {
+            SourceStorageWorker::new(Arc::clone(store), tokio::runtime::Handle::current(), one, one, one).unwrap()
+        };
+        let prior_store = SourceStore::open(&fixture.0.join("prior"), 8 << 20).unwrap();
+        let mut client = SqliteSourceState::open(&root, CLIENT).unwrap();
+        let base = client.stage("app").unwrap();
+        let pending = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        prior_store.publish(base.root, &pending.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", base.pending.unwrap()).unwrap());
+        prior_store.close().await.unwrap();
+        drop(client);
+
+        // Reopen the actual acknowledged SQLite selection. The daemon only
+        // receives its immutable delta, even though the live dependency changed.
+        let mut client = SqliteSourceState::open(&root, CLIENT).unwrap();
+        let selected = client.acknowledged_build_source("app").unwrap().unwrap();
+        let replay = client.replay_acknowledged_source(&selected).unwrap().unwrap();
+        assert_eq!(selected.root, base.root);
+        assert_eq!((replay.source.parsed, replay.source.reused), (0, 0));
+        let pin = "retained-before-edit";
+        client.pin_selected_source("app", pin).unwrap();
+        let intent = client.source_pin_intent(pin).unwrap().unwrap();
+        let pinned_replay = client.replay_source_pin_intent(&intent).unwrap().unwrap();
+        assert_eq!(pinned_replay.source.root, selected.root);
+        fs::write(&library, ORDINARY_LIB.replace("= 14", "= 19")).unwrap();
+        let edited = client.stage("app").unwrap();
+        assert_eq!((edited.parsed, edited.reused), (1, 1));
+        let attempt = edited.pending.unwrap();
+
+        let lost = fixture.0.join("replacement");
+        let store = Arc::new(SourceStore::open(&lost, 8 << 20).unwrap());
+        let worker = worker_for(&store);
+        assert!(matches!(worker.reconcile_acknowledged_source(selected.clone(), None, LIMITS).await.unwrap(),
+            SourceReconciliation::ReplayRequired { root } if root == selected.root));
+        let restored = worker.reconcile_acknowledged_source(selected.clone(), Some(replay.source.delta), LIMITS).await.unwrap();
+        assert!(matches!(restored, SourceReconciliation::Restored { root, validated_files: 2, .. }
+            if root == selected.root));
+        assert_eq!(coverage(&mut client, &worker, &store, attempt).await, AuthoredComptimeCoverage::Absent);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+
+        // Reopening an existing marker does not restore a process-local memo.
+        let store = Arc::new(SourceStore::open(&lost, 8 << 20).unwrap());
+        let worker = worker_for(&store);
+        assert!(matches!(worker.reconcile_acknowledged_source(selected.clone(), None, LIMITS).await.unwrap(),
+            SourceReconciliation::Known { root } if root == selected.root));
+        assert_eq!(coverage(&mut client, &worker, &store, attempt).await, AuthoredComptimeCoverage::Unverified);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+
+        // Explicit named-pin restore takes the same canonical parser path,
+        // but installs its evidence only after the existing immediate pin transaction.
+        let store = Arc::new(SourceStore::open(&fixture.0.join("pin-replacement"), 8 << 20).unwrap());
+        let worker = worker_for(&store);
+        assert_eq!(worker.reflect_source_pin(intent.clone(), None, LIMITS).await.unwrap(), SourcePinReflection::ReplayRequired);
+        let reflected = worker.reflect_source_pin(intent.clone(), Some(pinned_replay.source.delta), LIMITS).await.unwrap();
+        assert_eq!(reflected, SourcePinReflection::Durable(intent));
+        assert!(client.confirms_source_pin_reflection(&reflected).unwrap());
+        assert_eq!(coverage(&mut client, &worker, &store, attempt).await, AuthoredComptimeCoverage::Absent);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+
+        let store = Arc::new(SourceStore::open(&fixture.0.join("rejected"), 8 << 20).unwrap());
+        let worker = worker_for(&store);
+        // Canonical graph traversal sees the exact entry first. This allows
+        // its full parse, but not the second file. Discard the whole staged batch.
+        let strict = BaseCstAdmissionLimits { authored_bytes: BEFORE.len(), ..LIMITS };
+        let replay = client.replay_acknowledged_source(&selected).unwrap().unwrap();
+        let denied = worker.reconcile_acknowledged_source(selected.clone(), Some(replay.source.delta), strict)
+            .await.err().unwrap();
+        assert!(denied.to_string().contains("authored byte budget"));
+        assert!(store.snapshot(selected.root).unwrap().is_none());
+        // Independent ordinary baseline publication is not grammar evidence.
+        // The edited dependency is checked, but a leaked entry witness would
+        // incorrectly turn this unsupported predecessor into proven absence.
+        let replay = client.replay_acknowledged_source(&selected).unwrap().unwrap();
+        store.publish(selected.root, &replay.source.delta).await.unwrap();
+        assert_eq!(coverage(&mut client, &worker, &store, attempt).await, AuthoredComptimeCoverage::Unverified);
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap(), selected);
         drop(worker);
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });

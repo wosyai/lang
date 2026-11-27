@@ -1,6 +1,7 @@
 //! Explicit durable pins for admitted source roots, scoped to their workspace.
 use super::{
     build_session::BuildRequestRejection, key, published_source, read_source_config, source_top,
+    grammar_receipts::VerifiedGrammarBatch,
     retention_plan::{SourceLease, SourceRead},
     source_proposal::{matches_source_scope, stage_reconciled_closure},
     source_reconciliation::{bounded_source_records, checked_published_source_header, checked_source_header_using},
@@ -358,7 +359,7 @@ enum Plan {
     Superseded,
     NameHeldByDirectPin,
     Confirmed,
-    Commit { transaction: Transaction, _read: Option<SourceRead> },
+    Commit { transaction: Transaction, _read: Option<SourceRead>, grammar: VerifiedGrammarBatch },
 }
 
 impl SourceStorageWorker {
@@ -386,8 +387,11 @@ impl SourceStorageWorker {
                     Plan::Superseded => return Ok(SourcePinReflection::Superseded),
                     Plan::NameHeldByDirectPin => return Ok(SourcePinReflection::NameHeldByDirectPin),
                     Plan::Confirmed => break,
-                    Plan::Commit { mut transaction, _read } => match transaction.commit().await {
-                        Ok(()) => break,
+                    Plan::Commit { mut transaction, _read, grammar } => match transaction.commit().await {
+                        Ok(()) => {
+                            worker.store.grammar_receipts.accept(grammar);
+                            break;
+                        }
                         Err(surrealkv::Error::TransactionWriteConflict) if conflicts == 0 => continue,
                         Err(error) => return Err(error.into()),
                     }
@@ -428,6 +432,7 @@ fn plan_reflection(
         }
     }
 
+    let mut grammar = VerifiedGrammarBatch::default();
     if retained {
         if read.is_some() {
             if !matches_source_scope(&checked_published_source_header(&tx, source.root)?, source) {
@@ -435,7 +440,7 @@ fn plan_reflection(
             }
         } else {
             let Some(replay) = replay else { return Ok(Plan::ReplayRequired); };
-            stage_reconciled_closure(&mut tx, source, replay, limits, &mut PublishReport::default())?;
+            (_, grammar) = stage_reconciled_closure(&mut tx, source, replay, limits, &mut PublishReport::default())?;
             tx.set(&super::key(SNAPSHOT_ROOTS, source.root), &source.root.0)?;
         }
     }
@@ -446,5 +451,5 @@ fn plan_reflection(
     if retained { store.tree.flush_wal(true)?; }
     tx.set_durability(Durability::Immediate);
     tx.set(&key, &owner.reflected_value(intent)?)?;
-    Ok(Plan::Commit { transaction: tx, _read: read })
+    Ok(Plan::Commit { transaction: tx, _read: read, grammar })
 }
