@@ -11699,6 +11699,14 @@ fn forwarded_float_history_frame(body: &FunctionCallSites) -> bool {
             forwarded.insert(*arg);
         }
     }
+    // A bare read of a by-value lexical formal as a discarded statement has no effect.
+    for ((parent, edge), node) in &body.structure.edges {
+        if let (OccurrenceParent::Block(_), OccurrenceEdge::ExpressionItem { .. }, OccurrenceNode::Expression(arg)) = (parent, edge, node) {
+            if matches!(body.prepared_plain_name(*arg), Some(PlainNameIdentity::Lexical(id)) if formals.contains_key(id)) {
+                forwarded.insert(*arg);
+            }
+        }
+    }
     // No float can influence a witness or a branch until its IEEE domain is represented.
     body.structure.checked_types.expressions.iter().all(|(arg, ty)| !float(ty) || forwarded.contains(arg))
 }
@@ -21367,7 +21375,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let mut last = None;
             for width in [8,16,32] {
                 let prefix = r#"%%start
-unit(f32,u8) leaf = fn(dt,x) { if (x < 128) { core.narrow(x < 64, {.stdout="";.stderr="narrow";.code=5;.files=[];}); }; };
+unit(f32,u8) leaf = fn(dt,x) { dt; if (x < 128) { core.narrow(x < 64, {.stdout="";.stderr="narrow";.code=5;.files=[];}); }; };
 unit(f32,u8) wrapper = fn(dt,x) { leaf(dt,x); };
 unit(f32,u8) entry = fn(dt,x) {
 "#;
@@ -21408,7 +21416,7 @@ unit(f32,u8) entry = fn(dt,x) {
     #[test]
     fn forwarded_mixed_history_exhausts_deep_finite_graph_without_duplicate_diagnostics() {
         let src = source("src/main.w", "deep-mixed-unit-history");
-        let mut text = String::from("%%start\nunit(f32,u8) layer0 = fn(dt,x) { };\n");
+        let mut text = String::from("%%start\nunit(f32,u8) layer0 = fn(dt,x) { dt; x; };\n");
         for level in 1..=32 {
             let prior = level - 1;
             text.push_str(&format!("unit(f32,u8) layer{level} = fn(dt,x) {{ layer{prior}(dt,x); }};\n"));
@@ -21434,6 +21442,7 @@ unit(f32,u8) entry = fn(dt,x) {
         let src = source("src/main.w", "mixed-unit-forwarding");
         let text = r#"%%start
 unit(f32,u8,f64,u8) leaf = fn(dt,first,aspect,last) {
+    dt; aspect;
     if (first < 128) { core.narrow(last < 64, {.stdout="";.stderr="callee narrow";.code=5;.files=[];}); };
 };
 unit(f64,u8,f32) frame = fn(aspect,x,dt) {
