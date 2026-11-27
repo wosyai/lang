@@ -159,6 +159,19 @@ impl<'a> PreparedOccurrenceSnapshot<'a> {
         Some((function, self.calls.function_body(module, item, None)?))
     }
 
+    /// Exercise the same occurrence binder used by LLVM without giving
+    /// the checker, or a reconstructed body, authority to alter emission.
+    #[cfg(test)]
+    pub(super) fn bind_original_read_body(
+        self, module: usize, item: usize,
+    ) -> Option<control::CallableBodyCallNodes<'a>> {
+        let (function, calls) = self.monomorphic_body(module, item)?;
+        let source = &self.project.modules.get(module)?.source;
+        let mut bound = control::CallableBodyCallNodes::bind(source, &function.body, calls, None).ok()?;
+        bound.seal_original_read_body(&function.body, OriginalReadBody(&function.body));
+        Some(bound)
+    }
+
     #[allow(dead_code)] // No proof or emission consumer.
     pub(super) fn read(
         self, module: usize, item: usize, read: reference::OccurrenceOrdinal, kind: PreparedReadKind,

@@ -5336,6 +5336,30 @@ mod prepared {
                     && matches!(seen.shape(), PreparedReadShape::FixedIndex(shape) if shape.extent == extent))
         }
 
+        /// Private admission probe. No lowering or fallback is selected
+        /// by this result; in particular a distinct Build preparation fails
+        /// even when all source-level fields look identical.
+        #[cfg(test)]
+        pub(super) fn matches_original_fixed_read(
+            &self,
+            snapshot: super::super::static_calls::PreparedOccurrenceSnapshot<'_>,
+            module: usize,
+            item: usize,
+            expression: &super::super::ScalarExpression,
+            extent: usize,
+        ) -> bool {
+            use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
+            let Some(bound) = snapshot.bind_original_read_body(module, item) else { return false; };
+            let Some(shape) = bound.fixed_index_read(expression) else { return false; };
+            let Some(seen) = self.reads.get(&(module, item, shape.read)) else { return false; };
+            seen.matches(snapshot, module, item, shape.read, PreparedReadKind::FixedIndex)
+                && matches!(seen.shape(), PreparedReadShape::FixedIndex(proved)
+                    if &shape == proved && shape.extent == extent
+                    && std::ptr::eq(shape.base_binding, proved.base_binding)
+                    && std::ptr::eq(shape.index_binding, proved.index_binding)
+                    && std::ptr::eq(shape.result, proved.result))
+        }
+
         #[cfg(test)]
         pub(super) fn observed_bodies(&self) -> usize { self.observed_bodies }
     }
@@ -21206,6 +21230,87 @@ mod tests {
             }
             assert!(matches!(prepare_with_init(&text.replace("i8 checked", "bool checked"), vec![src.clone()]),
                 Err(ProjectCheck::Invalid(_))));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn completed_fixed_index_proof_cannot_cross_into_ordinary_build() {
+        use super::super::static_calls::PreparedOccurrenceSnapshot;
+        fn operands<'a>(snapshot: PreparedOccurrenceSnapshot<'a>) -> (&'a ScalarExpression, &'a ScalarExpression) {
+            use super::super::{ScalarBlockItem, ScalarExpression};
+            let (function, _) = snapshot.monomorphic_body(0, 0).unwrap();
+            let [ScalarBlockItem::LocalBinding(_), ScalarBlockItem::LocalBinding(_),
+                ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. })] = function.body.items.as_slice()
+            else { panic!("fixture's canonical unit conditional"); };
+            let [ScalarBlockItem::LocalBinding(first), ScalarBlockItem::LocalBinding(second),
+                ScalarBlockItem::Expression(_), ScalarBlockItem::Expression(_)] = then_branch.items.as_slice()
+            else { panic!("fixture's original read sites"); };
+            (&first.value, &second.value)
+        }
+
+        let input = r#"%%start
+            unit(u64) inspect = fn(index) {
+                i8[2] pair = [3, 9];
+                i8[2] other = [4, 8];
+                if (index < 2) {
+                    i8 selected = pair[index];
+                    i8 neighbor = other[index];
+                    if (selected == 3) {};
+                    if (neighbor == 4) {};
+                };
+            };
+            unit(u8) verify = fn(value) { core.require(value >= 1, OUTPUT); };
+            verify(1);
+        %%end"#.replace("OUTPUT", OUTPUT);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let src = source("src/main.w", "fixed-index-admission");
+            let prepare_check = |source: &SourceIdentity| prepare_checker_project(
+                vec![(declarations(source, &input), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            ).unwrap();
+            let checker = prepare_check(&src);
+            let view = checker.occurrence_snapshot();
+            let (first, neighbor) = operands(view);
+            let read = view.bind_original_read_body(0, 0).unwrap().fixed_index_read(first).unwrap().read;
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&checker, 0, 0, read);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed), "{outcome:?}");
+            let proof = proof.expect("completed exact proof");
+            assert!(proof.matches_original_fixed_read(view, 0, 0, first, 2));
+            assert!(!proof.matches_original_fixed_read(view, 0, 0, first, 3));
+            assert!(!proof.matches_original_fixed_read(view, 0, 0, neighbor, 2));
+            assert!(!proof.matches_original_fixed_read(view, 0, 0, &(*first).clone(), 2));
+            let equal = prepare_check(&src);
+            let equal_view = equal.occurrence_snapshot();
+            assert!(!proof.matches_original_fixed_read(equal_view, 0, 0, operands(equal_view).0, 2));
+            let new_src = source("src/main.w", "fixed-index-admission-new-revision");
+            let stale = prepare_check(&new_src);
+            let stale_view = stale.occurrence_snapshot();
+            assert!(!proof.matches_original_fixed_read(stale_view, 0, 0, operands(stale_view).0, 2));
+
+            // Ordinary Build does not execute the checker directives. Keep
+            // the original function and compare the real checked release
+            // edge, not a synthetic emitter or a guest binary.
+            let build_input = format!("{}%%end", input.split_once("unit(u8) verify").unwrap().0);
+            let parsed = crate::parse_source(src.clone(), build_input, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let build = crate::prepare_scalar_project_with_access(
+                vec![(crate::derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![src.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|rejected| panic!("{:?}", rejected.into_ordered_diagnostics()));
+            let checked = crate::analyze_scalar_build(&build);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let before = crate::emit_scalar_build_project_llvm_text(&checked).unwrap();
+            let build_view = build.occurrence_snapshot();
+            let (build_first, _) = operands(build_view);
+            assert!(build_view.bind_original_read_body(0, 0).unwrap().fixed_index_read(build_first).is_some());
+            assert!(!proof.matches_original_fixed_read(build_view, 0, 0, build_first, 2));
+            let after = crate::emit_scalar_build_project_llvm_text(&checked).unwrap();
+            assert_eq!(before, after);
+            let helper = "check_index_in_extent".bytes().map(|value| format!("{value:02x}")).collect::<String>();
+            assert_eq!(after.lines().filter(|line| line.contains("call void @") && line.contains(&helper)).count(), 2,
+                "{after}");
         }
     }
 
