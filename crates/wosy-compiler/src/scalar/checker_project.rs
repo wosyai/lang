@@ -255,7 +255,7 @@ fn prepare_checked_package_scope(
     dormant: Vec<ScalarSourceDeclarations>,
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
-) -> Result<(PreparedCheckerProject, usize), ProjectCheck> {
+) -> Result<(PreparedCheckerProject<'static>, usize), ProjectCheck> {
     let mut raw_sources = HashSet::with_capacity(initialization_order.len());
     if initialization_order.is_empty()
         || initialization_order.len() != declarations.len()
@@ -538,7 +538,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
     policy: OrderedReachPolicy, evidence: E, mut effects: OrderedFailures,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
     let (project, _) = prepared.parts();
-    let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
+    let (root, ordinals) = startup_order(prepared.authored_startup_order(), &project.modules[..startup_count])?;
     let authored_roots = if E::CONTEXTUAL && scope == ScalarCheckerScope::MainFlowOnly {
         HashMap::new()
     } else {
@@ -566,7 +566,8 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
         ),
     }? };
     let finished_all_initialization = FIXED_INDEX_OBSERVATION
-        && initialization.visits.iter().all(|visit| *visit == InitializationVisit::Completed);
+        && initialization.visits[..prepared.authored_startup_order().len()].iter()
+            .all(|visit| *visit == InitializationVisit::Completed);
     for contextual in effects.contextual_proofs.entries.values_mut() {
         contextual.reached_at_startup = initialization.reached.contains(&contextual.target);
     }
@@ -906,7 +907,7 @@ fn prepare_contextual_check(
     sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, headers: Vec<(SourceIdentity, ContextualProofHeader)>,
     inputs: ScalarPreparationInputs, retain_observations: bool,
-) -> Result<(PreparedCheckerProject, OrderedFailures, usize), ProjectCheck> {
+) -> Result<(PreparedCheckerProject<'static>, OrderedFailures, usize), ProjectCheck> {
     let startup_count = initialization_order.len();
     let (prepared, context) = super::contextual::prepare_contextual_transport_graph_with_proof_root(
         sources, initialization_order, inputs, true, !retain_observations,
@@ -1535,17 +1536,23 @@ fn package_startup_order<'a>(
     project: &'a ScalarProject,
     startup: &'a [ScalarModule],
 ) -> Result<(&'a SourceIdentity, HashMap<&'a SourceIdentity, usize>), ProjectCheck> {
+    startup_order(&project.initialization_order, startup)
+}
+
+fn startup_order<'a>(
+    order: &'a [SourceIdentity], startup: &'a [ScalarModule],
+) -> Result<(&'a SourceIdentity, HashMap<&'a SourceIdentity, usize>), ProjectCheck> {
     let ordinals: HashMap<_, _> = startup.iter().enumerate()
         .map(|(ordinal, module)| (&module.source, ordinal)).collect();
     if ordinals.len() != startup.len() {
         return Err(ProjectCheck::AmbiguousRoot);
     }
-    let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;
-    if project.initialization_order.len() != ordinals.len() {
+    let root = order.first().ok_or(ProjectCheck::MissingRoot)?;
+    if order.len() != ordinals.len() {
         return Err(ProjectCheck::RootSourceOutsideInitOrder);
     }
     let mut seen = vec![false; ordinals.len()];
-    for source in &project.initialization_order {
+    for source in order {
         let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
         if std::mem::replace(&mut seen[ordinal], true) {
             return Err(ProjectCheck::AmbiguousRoot);
@@ -1555,7 +1562,7 @@ fn package_startup_order<'a>(
 }
 
 #[cfg(test)]
-fn check_package_initialization(prepared: &PreparedCheckerProject) -> Result<CheckedInitialization<'_>, ProjectCheck> {
+fn check_package_initialization<'a>(prepared: &'a PreparedCheckerProject<'_>) -> Result<CheckedInitialization<'a>, ProjectCheck> {
     let (root, ordinals) = package_initialization_order(prepared.parts().0)?;
     check_package_initialization_with_order(prepared, root, ordinals)
 }
@@ -5276,20 +5283,49 @@ pub(super) use prepared::PreparedCheckerProject;
 mod prepared {
     use super::*;
 
-    pub(in crate::scalar) struct PreparedCheckerProject {
-        project: ScalarProject,
-        calls: ProjectCallSiteResults,
+    pub(in crate::scalar) struct PreparedCheckerProject<'build>(CheckerProjectRows<'build>);
+
+    enum CheckerProjectRows<'build> {
+        Owned { project: ScalarProject, calls: ProjectCallSiteResults },
+        #[cfg(all(test, feature = "internal-checker"))]
+        SharedBuild { project: &'build ScalarProject, calls: &'build ProjectCallSiteResults },
+        #[cfg(not(all(test, feature = "internal-checker")))]
+        #[doc(hidden)]
+        _Lifetime(std::convert::Infallible, std::marker::PhantomData<&'build ()>),
     }
 
-    impl PreparedCheckerProject {
+    impl<'build> PreparedCheckerProject<'build> {
+        #[cfg(all(test, feature = "internal-checker"))]
+        pub(super) fn borrow_canonical_build(prepared: &'build super::super::PreparedScalarProject) -> Option<Self> {
+            let (project, calls) = prepared.shared_ordered_checker_parts()?;
+            Some(Self(CheckerProjectRows::SharedBuild { project, calls }))
+        }
+
+        fn owned(project: ScalarProject, calls: ProjectCallSiteResults) -> Self {
+            Self(CheckerProjectRows::Owned { project, calls })
+        }
+
+        // Only the authenticated Build leaf is outside the authored order.
+        pub(super) fn authored_startup_order(&self) -> &[SourceIdentity] {
+            let full = &self.parts().0.initialization_order;
+            #[cfg(all(test, feature = "internal-checker"))]
+            if matches!(&self.0, CheckerProjectRows::SharedBuild { .. }) { return &full[..1]; }
+            full
+        }
         #[cfg(feature = "internal-checker")]
         pub(super) fn from_contextual_transport(prepared: super::super::PreparedScalarProject) -> Self {
             let (project, calls) = prepared.into_contextual_parts();
-            Self { project, calls }
+            Self::owned(project, calls)
         }
 
         pub(in crate::scalar) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
-            (&self.project, &self.calls)
+            match &self.0 {
+                CheckerProjectRows::Owned { project, calls } => (project, calls),
+                #[cfg(all(test, feature = "internal-checker"))]
+                CheckerProjectRows::SharedBuild { project, calls } => (project, calls),
+                #[cfg(not(all(test, feature = "internal-checker")))]
+                CheckerProjectRows::_Lifetime(impossible, _) => match *impossible {},
+            }
         }
 
         #[cfg(feature = "internal-checker")]
@@ -5365,9 +5401,9 @@ mod prepared {
     }
 
     #[cfg(all(test, feature = "internal-checker"))]
-    pub(super) fn check_ordinary_package_with_fixed_index_observation(
-        prepared: &PreparedCheckerProject, module: usize, item: usize, occurrence: super::super::reference::OccurrenceOrdinal,
-    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'_>>) {
+    pub(super) fn check_ordinary_package_with_fixed_index_observation<'a>(
+        prepared: &'a PreparedCheckerProject<'_>, module: usize, item: usize, occurrence: super::super::reference::OccurrenceOrdinal,
+    ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'a>>) {
         check_ordinary_package_with_fixed_index_observations(prepared, &[(module, item, occurrence)])
     }
 
@@ -5378,13 +5414,15 @@ mod prepared {
     ) -> (ScalarOrderedCheckerOutcome, Option<CompletedFixedIndexCheck<'a>>) {
         use super::super::static_calls::{PreparedReadKind, PreparedReadShape};
         let snapshot = prepared.occurrence_snapshot();
-        let root = prepared.project.initialization_order.first();
+        let project = prepared.parts().0;
+        let startup_count = prepared.authored_startup_order().len();
+        let root = prepared.authored_startup_order().first();
         let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
         let mut seen = HashSet::new();
         if requests.len() <= MAX_FIXED_INDEX_OBSERVATION_REQUESTS {
             for &(module, item, occurrence) in requests {
                 if !seen.insert((module, item, occurrence)) { continue; }
-                let same_package = root.zip(prepared.project.modules.get(module))
+                let same_package = root.zip(project.modules.get(module).filter(|_| module < startup_count))
                     .is_some_and(|(root, candidate)| root.project == candidate.source.project
                         && root.package == candidate.source.package);
                 if !same_package { continue; }
@@ -5409,7 +5447,7 @@ mod prepared {
         // No caller-supplied scope/startup count/verdict, and nothing
         // publishes from partial initialization or a nonpassing Check.
         let run = run_prepared_ordered_check_profiles::<_, false, true>(
-            prepared, ScalarCheckerScope::CurrentPackage, prepared.project.modules.len(),
+            prepared, ScalarCheckerScope::CurrentPackage, startup_count,
             OrderedReachPolicy::Legacy, (), OrderedFailures::default(),
         );
         let finished = run.as_ref().is_ok_and(|run| run.finished_all_initialization);
@@ -5427,7 +5465,7 @@ mod prepared {
         declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
-    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+    ) -> Result<PreparedCheckerProject<'static>, ProjectCheck> {
         prepare_checker_project_impl(declarations, initialization_order, inputs, &[])
     }
 
@@ -5436,7 +5474,7 @@ mod prepared {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
         queries: &[CheckerTargetQuery<'_>],
-    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+    ) -> Result<PreparedCheckerProject<'static>, ProjectCheck> {
         prepare_checker_project_impl(declarations, initialization_order, inputs, queries)
     }
 
@@ -5445,14 +5483,14 @@ mod prepared {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
         queries: &[CheckerTargetQuery<'_>],
-    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+    ) -> Result<PreparedCheckerProject<'static>, ProjectCheck> {
         let (project, calls) = project_from_declarations(declarations, initialization_order, inputs)
             .and_then(|project| prepare_project_occurrences(
                 typecheck_scalar_project_in_mode(project, true),
                 queries,
             ))
             .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))?;
-        Ok(PreparedCheckerProject { project, calls })
+        Ok(PreparedCheckerProject::owned(project, calls))
     }
 }
 
@@ -6125,7 +6163,7 @@ enum OrderedProofPreparation {
 struct PreparedProofModule {
     source: SourceIdentity,
     proofs: HashMap<SourceIdentity, ModuleProofs>,
-    prepared: PreparedCheckerProject,
+    prepared: PreparedCheckerProject<'static>,
     #[cfg(feature = "internal-checker")]
     ordered_steps: Vec<Option<PreparedOrderedProofSteps>>,
     #[cfg(feature = "internal-checker")]
@@ -10497,8 +10535,8 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
 
 #[cfg(feature = "internal-checker")]
 enum PreparedConfiguredCheck {
-    Plain { owner: PreparedCheckerProject, startup_count: usize },
-    Contextual { owner: PreparedCheckerProject, effects: OrderedFailures, startup_count: usize },
+    Plain { owner: PreparedCheckerProject<'static>, startup_count: usize },
+    Contextual { owner: PreparedCheckerProject<'static>, effects: OrderedFailures, startup_count: usize },
     Mixed { owner: PreparedProofModule, ordinary_source: SourceIdentity,
         headers: Vec<(SourceIdentity, ContextualProofHeader)>, startup_count: usize, configured_root: bool },
     Named { owner: PreparedProofModule, startup_count: usize },
@@ -11011,7 +11049,7 @@ fn plan_closed_authored_roots(
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
 pub struct PreparedStartupAuthoredCheck {
-    owner: PreparedCheckerProject,
+    owner: PreparedCheckerProject<'static>,
     empty_root: Option<SourceIdentity>,
     callable_roots: Vec<PreparedCallable>,
     mandatory_startup_scalars: Vec<PreparedCallable>,
@@ -21311,6 +21349,120 @@ mod tests {
             let helper = "check_index_in_extent".bytes().map(|value| format!("{value:02x}")).collect::<String>();
             assert_eq!(after.lines().filter(|line| line.contains("call void @") && line.contains(&helper)).count(), 2,
                 "{after}");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn completed_fixed_index_observation_borrows_the_live_build_owner() {
+        use super::super::{ScalarBlockItem, ScalarExpression};
+        let text = r#"%%start
+            unit(u64) inspect = fn(index) {
+                i8[2] a = [3, 9];
+                i8[2] b = [4, 8];
+                if (index < 2) {
+                    i8 first = a[index];
+                    i8 second = b[index];
+                    if (first == 3) {};
+                    if (second == 4) {};
+                };
+            };
+            u8(*(u8[3]), u64) read = fn(pointer, index) { (*pointer)[index] };
+            unit(u8) verify = fn(value) { core.require(value >= 1, OUTPUT); };
+            verify(1);
+        %%end"#.replace("OUTPUT", OUTPUT);
+
+        for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = source("src/main.w", "shared-build-fixed-index");
+            let prepare = |source: &SourceIdentity, text: String| {
+                let parsed = crate::parse_source(source.clone(), text, &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                crate::PreparedScalarProject::prepare_single_source_with_ordered_checker(parsed.result.canonical_cst(), target)
+                    .unwrap_or_else(|error| panic!("{:?}", error.into_ordered_diagnostics())).unwrap()
+            };
+            let operands = |build: &crate::PreparedScalarProject| {
+                let view = build.occurrence_snapshot();
+                let (function, _) = view.monomorphic_body(0, 0).unwrap();
+                let [_, _, ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. })] = function.body.items.as_slice()
+                else { panic!("ordinary guard expected"); };
+                let [ScalarBlockItem::LocalBinding(first), ScalarBlockItem::LocalBinding(second), ..] = then_branch.items.as_slice()
+                else { panic!("two authored indexed reads expected"); };
+                let bound = view.bind_original_read_body(0, 0).unwrap();
+                let first = bound.fixed_index_read(&first.value).unwrap().read;
+                let second = bound.fixed_index_read(&second.value).unwrap().read;
+                (first, second)
+            };
+            let build = prepare(&source, text.clone());
+            let (first, second) = operands(&build);
+            let view = PreparedCheckerProject::borrow_canonical_build(&build).unwrap();
+            assert_eq!(view.authored_startup_order(), std::slice::from_ref(&source));
+            assert_eq!(view.parts().0.modules.len(), 2); // authored source + Build checked helper
+            let (outcome, proof) = prepared::check_ordinary_package_with_fixed_index_observation(&view, 0, 0, first);
+            assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Passed), "{outcome:?}");
+            let proof = proof.expect("completed only for the admitted same-owner read");
+            let validation = crate::analyze_scalar_build(&build);
+            assert!(validation.diagnostics().is_empty(), "{:?}", validation.diagnostics());
+            let (function, _) = build.occurrence_snapshot().monomorphic_body(0, 0).unwrap();
+            let bound = validation.bind_original_project_body(0, 0, function).unwrap();
+            let ScalarBlockItem::Expression(ScalarExpression::UnitIf { then_branch, .. }) = &function.body.items[2] else {
+                panic!("ordinary guard");
+            };
+            let [ScalarBlockItem::LocalBinding(read), ScalarBlockItem::LocalBinding(neighbor), ..] = then_branch.items.as_slice()
+            else { panic!("two authored reads"); };
+            assert_eq!(bound.fixed_index_read(&read.value).unwrap().read, first);
+            assert_eq!(bound.fixed_index_read(&neighbor.value).unwrap().read, second);
+            assert!(proof.matches_original_fixed_read(validation.prepared().occurrence_snapshot(), 0, 0, &read.value, 2));
+            assert!(!proof.matches_original_fixed_read(validation.prepared().occurrence_snapshot(), 0, 0, &neighbor.value, 2));
+            assert!(!proof.matches_original_fixed_read(validation.prepared().occurrence_snapshot(), 0, 0, &read.value, 3));
+            assert!(!proof.matches_original_fixed_read(validation.prepared().occurrence_snapshot(), 0, 0, &read.value.clone(), 2));
+
+            // Existing LLVM does not yet erase an authenticated Check
+            // directive on this shared route. This private admission is not
+            // a claim that the combined preparation emits an artifact.
+            let pending_emit = crate::emit_scalar_build_project_llvm_text(&validation).unwrap_err();
+            assert!(pending_emit.contains("missing callable body call target"), "{pending_emit}");
+
+            let runtime_only = format!("{}%%end", text.split_once("unit(u8) verify").unwrap().0);
+            let parsed = crate::parse_source(source.clone(), runtime_only.clone(), &[]);
+            let ordinary = crate::prepare_scalar_project_with_access(
+                vec![(crate::derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.into_ordered_diagnostics()));
+            assert!(PreparedCheckerProject::borrow_canonical_build(&ordinary).is_none());
+            let ordinary = crate::analyze_scalar_build(&ordinary);
+            let llvm = crate::emit_scalar_build_project_llvm_text(&ordinary).unwrap();
+            let same_route_without_directives = prepare(&source, runtime_only);
+            let sibling = crate::analyze_scalar_build(&same_route_without_directives);
+            assert_eq!(llvm, crate::emit_scalar_build_project_llvm_text(&sibling).unwrap());
+            for (name, amount) in [("check_index_in_extent", 3), ("check_non_null_address", 1)] {
+                let name = name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+                assert_eq!(llvm.lines().filter(|line| line.contains("call void @") && line.contains(&name)).count(), amount);
+            }
+
+            for revision in ["shared-build-fixed-index", "changed-revision"] {
+                let different_source = SourceIdentity::new(source.project.clone(), source.package.clone(), source.path.clone(), revision.into());
+                let other = prepare(&different_source, text.clone());
+                let other_view = PreparedCheckerProject::borrow_canonical_build(&other).unwrap();
+                assert!(!proof.describes(&other_view, 0, 0, operands(&other).0, 2));
+            }
+            for (rejected, expectation) in [
+                (text.replace("index < 2", "index <= 2"), false),
+                (text.replace("verify(1);", "verify(0);"), true),
+                (text.replace("verify(1);", ""), true),
+            ] {
+                let attempt = prepare(&source, rejected);
+                let candidate = PreparedCheckerProject::borrow_canonical_build(&attempt).unwrap();
+                let (outcome, result) = prepared::check_ordinary_package_with_fixed_index_observation(&candidate, 0, 0, operands(&attempt).0);
+                assert!(result.is_none(), "no evidence from a weakened guard or missing/failing startup");
+                if expectation { assert!(matches!(outcome, ScalarOrderedCheckerOutcome::Failed(_)), "{outcome:?}"); }
+            }
+
+            let named = text.replace("%%end", "u8(u8) echo = fn(input) { input }; proof explicit for echo(entry) -> (out) where (entry == 3) ensures (out == 3) {} %%end");
+            let named = crate::parse_source(source, named, &[]);
+            assert!(named.diagnostics.is_empty(), "{:?}", named.diagnostics);
+            assert!(crate::PreparedScalarProject::prepare_single_source_with_ordered_checker(named.result.canonical_cst(), target)
+                .unwrap_or_else(|error| panic!("{:?}", error.into_ordered_diagnostics())).is_none());
         }
     }
 
@@ -34070,7 +34222,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
     fn prepare_proof_target(
         source: &SourceIdentity,
         callable: &str,
-    ) -> Result<PreparedCheckerProject, ProjectCheck> {
+    ) -> Result<PreparedCheckerProject<'static>, ProjectCheck> {
         prepare_checker_project(
             vec![(declarations(source, callable), Vec::new())],
             vec![source.clone()],

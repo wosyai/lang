@@ -220,6 +220,8 @@ pub struct PreparedScalarProject {
     checked_access: Option<CheckedAccessDeclarations>,
 
     require_release_checked_access: bool,
+    #[cfg(all(test, feature = "internal-checker"))]
+    shared_checker_occurrences: bool,
     root_array_uses: reference::ClosedRootArrayUses,
     generated_callables: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedGeneratedCallable>,
     inline_arms: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedAnonymousCallable>,
@@ -386,7 +388,27 @@ impl PreparedScalarProject {
         access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
         build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
     ) -> Result<Self, ScalarProjectPreparationRejection> {
-        Self::new_impl(project, access, build_proofs, None)
+        Self::new_impl(project, access, build_proofs, None, #[cfg(feature = "internal-checker")] false)
+    }
+
+    /// Candidate-only Build preparation with the ordinary checker rows
+    /// installed by the same typing pass. Unsupported authored routes are
+    /// not reduced to the proof-free runtime projection.
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn prepare_single_source_with_ordered_checker(
+        canonical: &CanonicalCstRoot, target_layout: ScalarTargetLayout,
+    ) -> Result<Option<Self>, ScalarProjectPreparationRejection> {
+        let declaration = derive_scalar_build_declarations_from_cst(canonical);
+        if !declaration.build_proofs.is_empty() || !declaration.runtime_enum_matches.is_empty()
+            || canonical.root.descendants().any(|node| node.kind() == SyntaxKind::ContextualPlace)
+            || declaration.items.iter().any(|item| matches!(item, ScalarItem::Namespace(_)))
+        {
+            return Ok(None);
+        }
+        let project = project_from_declarations(vec![(declaration, Vec::new())], vec![canonical.source.clone()],
+            ScalarPreparationInputs { target_layout })?;
+        Self::new_impl(project, Some((wosy_stdlib_source::CheckedAccessComponent::linked(), target_layout)),
+            &HashMap::new(), None, true).map(Some)
     }
 
     pub(super) fn new_anonymous_arm(
@@ -399,7 +421,8 @@ impl PreparedScalarProject {
             && module.members.is_empty() && module.structs.is_empty() && module.enums.is_empty());
         let span = arm.span;
         let source = module.source.clone();
-        Self::new_impl(ScalarProject::new(vec![module], vec![source]), None, &HashMap::new(), Some(span))
+        Self::new_impl(ScalarProject::new(vec![module], vec![source]), None, &HashMap::new(), Some(span),
+            #[cfg(feature = "internal-checker")] false)
     }
 
     fn new_impl(
@@ -407,11 +430,13 @@ impl PreparedScalarProject {
         access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
         build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
         isolated_anonymous_arm: Option<ByteSpan>,
+        #[cfg(feature = "internal-checker")] shared_checker_occurrences: bool,
     ) -> Result<Self, ScalarProjectPreparationRejection> {
         let (mut validation, mut occurrence_typing) =
             super::typecheck_scalar_project_with_build_proofs(
                 project, HashMap::new(), build_proofs, isolated_anonymous_arm,
-                #[cfg(any(test, feature = "internal-checker"))] false,
+                #[cfg(feature = "internal-checker")] shared_checker_occurrences,
+                #[cfg(all(test, not(feature = "internal-checker")))] false,
             );
         if !validation.diagnostics.is_empty() {
             return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
@@ -472,7 +497,9 @@ impl PreparedScalarProject {
             (validation, occurrence_typing), isolated_anonymous_arm,
             #[cfg(any(test, feature = "internal-checker"))] &[],
         )?;
-        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new(), root_array_uses: Default::default() };
+        let mut prepared = Self { project, calls, checked_access, require_release_checked_access,
+            #[cfg(all(test, feature = "internal-checker"))] shared_checker_occurrences,
+            inline_arms: BTreeMap::new(), generated_callables: BTreeMap::new(), root_array_uses: Default::default() };
         if inline_count != 0 {
             if isolated_anonymous_arm.is_some() {
                 return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
@@ -558,6 +585,7 @@ impl PreparedScalarProject {
     pub(super) fn from_contextual_transport(project: ScalarProject, calls: reference::ProjectCallSiteResults) -> Self {
         Self {
             project, calls, checked_access: None, require_release_checked_access: false,
+            #[cfg(all(test, feature = "internal-checker"))] shared_checker_occurrences: false,
             root_array_uses: Default::default(), generated_callables: BTreeMap::new(),
             inline_arms: BTreeMap::new(),
         }
@@ -578,6 +606,18 @@ impl PreparedScalarProject {
     #[cfg(all(test, feature = "internal-checker"))]
     pub(super) fn occurrence_snapshot(&self) -> PreparedOccurrenceSnapshot<'_> {
         PreparedOccurrenceSnapshot { project: &self.project, calls: &self.calls }
+    }
+
+    /// Exact compiler-owned tables; no independently prepared lookup.
+    #[cfg(all(test, feature = "internal-checker"))]
+    pub(super) fn shared_ordered_checker_parts(&self) -> Option<(&ScalarProject, &reference::ProjectCallSiteResults)> {
+        if !self.shared_checker_occurrences { return None; }
+        let helper = &self.checked_access.as_ref()?.source;
+        let [authored, injected] = self.project.modules.as_slice() else { return None; };
+        let [first, last] = self.project.initialization_order.as_slice() else { return None; };
+        (&authored.source == first && &injected.source == helper && last == helper
+            && (first.project != helper.project || first.package != helper.package))
+            .then_some((&self.project, &self.calls))
     }
 
     pub fn project(&self) -> &ScalarProject {
