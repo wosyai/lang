@@ -69,7 +69,6 @@ mod linux {
         path::PathBuf,
     };
 
-    const MAX_DEPTH: usize = 32;
     const MAX_OBSERVED_METADATA_BYTES: u64 = 1 << 20;
     const MAX_MATCH_STEPS: usize = 4 << 20;
 
@@ -204,7 +203,7 @@ mod linux {
             let pattern = value.as_str().ok_or("a comptime watch glob must be a string")?;
             if !seen.insert(pattern) { continue; }
             let parts: Vec<_> = pattern.split('/').collect();
-            if parts.len() > MAX_DEPTH || parts.iter().any(|part| {
+            if parts.iter().any(|part| {
                 matches!(*part, "" | "." | "..")
                     || part.contains(['[', ']', '{', '}', '\\', '\0'])
                     || (*part != "**" && part.contains("**"))
@@ -222,7 +221,7 @@ mod linux {
     ) -> Result<(), String> {
         let mut states = BTreeSet::new();
         for index in 0..patterns.len() { epsilon_closure(patterns, (index, 0), &mut states); }
-        Walker { root, patterns, budget, match_steps, result }.directory(directory, &mut PathBuf::new(), 0, &states)
+        Walker { root, patterns, budget, match_steps, result }.walk(directory.clone(), states)
     }
 
     struct Walker<'a, 'p> {
@@ -233,29 +232,51 @@ mod linux {
         result: &'a mut Vec<WatchedComptimeFile>,
     }
 
+    struct DirectoryFrame {
+        directory: GitDirectory,
+        states: BTreeSet<Cursor>,
+        names: Box<dyn Iterator<Item = std::io::Result<OsString>>>,
+        listed: bool,
+    }
+
     impl Walker<'_, '_> {
-        fn directory(
-            &mut self, dir: &GitDirectory, path: &mut PathBuf, depth: usize, states: &BTreeSet<Cursor>,
-        ) -> Result<(), String> {
-            if depth >= MAX_DEPTH { return Err("comptime watch exceeds its directory depth limit".into()); }
+        fn frame(&self, directory: GitDirectory, states: BTreeSet<Cursor>) -> Result<DirectoryFrame, String> {
             let names: Option<BTreeSet<OsString>> = states.iter().filter_map(|(p, c)| {
                 self.patterns[*p].get(*c)
             }).map(|segment| (!segment.contains(['*', '?'])).then(|| OsString::from(segment)))
                 .collect();
-            if let Some(names) = names {
-                for name in names { self.entry(dir, path, depth, states, name, false)?; }
+            let listed = names.is_none();
+            let names: Box<dyn Iterator<Item = _>> = if let Some(names) = names {
+                Box::new(names.into_iter().map(Ok))
             } else {
-                for name in dir.entry_names().map_err(|error| error.to_string())? {
-                    self.entry(dir, path, depth, states, name.map_err(|error| error.to_string())?, true)?;
+                Box::new(directory.entry_names().map_err(|error| error.to_string())?)
+            };
+            Ok(DirectoryFrame { directory, states, names, listed })
+        }
+
+        fn walk(&mut self, directory: GitDirectory, states: BTreeSet<Cursor>) -> Result<(), String> {
+            // A frame owns its exact anchored directory and lazily scans its
+            // names. Descend before consuming the next sibling, just as DFS.
+            let mut stack = vec![self.frame(directory, states)?];
+            let mut path = PathBuf::new();
+            while let Some(frame) = stack.last_mut() {
+                let Some(next) = frame.names.next() else {
+                    stack.pop();
+                    path.pop();
+                    continue;
+                };
+                let name = next.map_err(|error| error.to_string())?;
+                if let Some((directory, states)) = self.entry(&frame.directory, &mut path, &frame.states, name, frame.listed)? {
+                    stack.push(self.frame(directory, states)?);
                 }
             }
             Ok(())
         }
 
         fn entry(
-            &mut self, dir: &GitDirectory, path: &mut PathBuf, depth: usize,
+            &mut self, dir: &GitDirectory, path: &mut PathBuf,
             states: &BTreeSet<Cursor>, name: OsString, listed: bool,
-        ) -> Result<(), String> {
+        ) -> Result<Option<(GitDirectory, BTreeSet<Cursor>)>, String> {
             charge(&mut self.budget.entries, "comptime watch exceeds its entry limit")?;
             let name = name.to_str().ok_or("comptime watch encountered a non-UTF-8 path")?;
             let mut next = BTreeSet::new();
@@ -269,21 +290,24 @@ mod linux {
                     epsilon_closure(self.patterns, (p, c + 1), &mut next);
                 }
             }
-            if next.is_empty() { return Ok(()); }
+            if next.is_empty() { return Ok(None); }
             let matches = next.iter().any(|&(p, c)| c == self.patterns[p].len());
             let descend = next.iter().any(|&(p, c)| c < self.patterns[p].len());
             let Some(file) = dir.open(Path::new(name))? else {
-                return if listed { Err("comptime watch entry changed during observation".into()) } else { Ok(()) };
+                return if listed { Err("comptime watch entry changed during observation".into()) } else { Ok(None) };
             };
             let metadata = file.metadata().map_err(|error| error.to_string())?;
-            path.push(name);
-            let result = if metadata.is_dir() && descend {
-                self.directory(&GitDirectory::new(file)?, path, depth + 1, &next)
-            } else if !metadata.is_dir() && matches {
-                self.file(file, metadata, path)
-            } else { Ok(()) };
-            path.pop();
-            result
+            if metadata.is_dir() && descend {
+                let directory = GitDirectory::new(file)?;
+                path.push(name);
+                return Ok(Some((directory, next)));
+            }
+            if !metadata.is_dir() && matches {
+                path.push(name);
+                self.file(file, metadata, path)?;
+                path.pop();
+            }
+            Ok(None)
         }
 
         fn file(&mut self, mut file: File, metadata: Metadata, path: &Path) -> Result<(), String> {

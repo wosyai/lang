@@ -213,6 +213,42 @@ fn finite_watch_patterns_preserve_every_owner_and_consumer_identity() {
 }
 
 #[test]
+fn anchored_watch_walk_accepts_deeper_literal_and_recursive_patterns() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let dirs = vec!["d"; 44].join("/");
+    let target = format!("{dirs}/target.txt");
+    fixture.put(&format!("assets/{target}"), "actual bytes");
+    fixture.put(&format!("assets/{dirs}/.hidden.txt"), "not selected");
+    fixture.put("app/wosy.toml", APP.replace(
+        "watch_add = [\"recordings/**/*.json\", \"recordings/./unsupported.txt\"]", "watch_add = []",
+    ));
+    let declare = |patterns: &[&str]| fixture.put("assets/wosy.toml", PACKAGE.replace(
+        "watch = [\"schemas/**/*.json\", \"schemas/root.json\", \"schemas/caf?.txt\"]",
+        &format!("watch = {patterns:?}"),
+    ));
+    let read = |entries| prepare_comptime_watches(
+        &app, "app", "dev", "assets", "prepare", ComptimeWatchLimits { entries, ..Default::default() },
+    );
+    let expected = [content(WatchRoot::OwningPackage, &target, "actual bytes")];
+
+    declare(&[&target]);
+    assert_eq!(rows(&read(45).unwrap().1), expected);
+    assert!(read(44).err().unwrap().contains("entry limit"));
+    declare(&[&target, "d/**/target.txt"]);
+    assert_eq!(rows(&read(256).unwrap().1), expected);
+
+    fixture.put("outside.txt", "outside");
+    symlink(fixture.0.join("outside.txt"), fixture.0.join(format!("assets/{dirs}/link.txt"))).unwrap();
+    let linked = format!("{dirs}/link.txt");
+    declare(&[&linked]);
+    assert!(read(256).is_err(), "a relevant symlink must not resolve outside the held root");
+    assert!(!app.join(".wosy").exists());
+}
+
+#[test]
 fn checks_selected_site_glob_dialect_and_shared_budget_without_ordinary_side_effects() {
     let fixture = Fixture::new();
     let app = fixture.app();
