@@ -6311,6 +6311,22 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerPreparedIntegerOperand {
+    Literal(BigInt),
+    Binding(ReferenceBindingId),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CheckerPreparedDifferenceComparison {
+    pub(super) lhs: ReferenceBindingId,
+    pub(super) rhs: [CheckerPreparedIntegerOperand; 2],
+    pub(super) ty: ScalarType,
+    pub(super) relation: super::symbolic_integer::IntegerRelation,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerOrdinaryBoolean {
     Constant(bool),
     Binding(ReferenceBindingId),
@@ -6318,6 +6334,7 @@ pub(super) enum CheckerOrdinaryBoolean {
     Call(OccurrenceOrdinal),
     Integer(super::checker_flow::IntegerPredicate),
     Lexical(CheckerOrdinaryIntegerComparison),
+    Difference(Box<CheckerPreparedDifferenceComparison>),
     And(Box<[Self; 2]>),
     Or(Box<[Self; 2]>),
     Not(Box<Self>),
@@ -8016,6 +8033,49 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             .unwrap_or(CheckerOrdinaryBoolean::Opaque))
     }
 
+    // Only already-walked branch expressions can authorize a computed
+    // scalar operand; checker directive arguments are a different pathway.
+    #[cfg(feature = "internal-checker")]
+    fn prepared_difference_comparison(
+        &self, expression: &ScalarExpression, comparison: OccurrenceOrdinal,
+    ) -> Option<CheckerPreparedDifferenceComparison> {
+        let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
+        let relation = super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+        let ScalarExpression::Name { .. } = left.as_ref() else { return None; };
+        let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left: sub_left, right: sub_right, .. } =
+            right.as_ref() else { return None; };
+        let child = |parent, edge| {
+            let OccurrenceNode::Expression(ordinal) = self.structure.edges.get(&(OccurrenceParent::Expression(parent), edge))?
+                else { return None; };
+            Some(*ordinal)
+        };
+        let lhs = child(comparison, OccurrenceEdge::BinaryLeft)?;
+        let rhs = child(comparison, OccurrenceEdge::BinaryRight)?;
+        let types = &self.structure.checked_types.expressions;
+        let ty = types.get(&lhs)?.clone();
+        if !is_integer_type(&ty) || types.get(&rhs)? != &ty || types.get(&comparison)? != &ScalarType::Bool {
+            return None;
+        }
+        let PlainNameFacts::Prepared(identities) = &self.plain_names else { return None; };
+        let PlainNameIdentity::Lexical(binding) = identities.get(&lhs)? else { return None; };
+        let operand = |node: &ScalarExpression, edge| {
+            let ordinal = child(rhs, edge)?;
+            if types.get(&ordinal)? != &ty || self.structure.checker_contextual_occurrences.contains(&ordinal) {
+                return None;
+            }
+            if let Some(value) = super::checker_flow::concrete_integer_literal(node)
+                .filter(|value| super::typecheck::integer_literal_fits_type(value, &ty))
+            {
+                return Some(CheckerPreparedIntegerOperand::Literal(value.into_owned()));
+            }
+            if !matches!(node, ScalarExpression::Name { .. }) { return None; }
+            let PlainNameIdentity::Lexical(source) = identities.get(&ordinal)? else { return None; };
+            Some(CheckerPreparedIntegerOperand::Binding(source.clone()))
+        };
+        let operands = [operand(sub_left, OccurrenceEdge::BinaryLeft)?, operand(sub_right, OccurrenceEdge::BinaryRight)?];
+        Some(CheckerPreparedDifferenceComparison { lhs: binding.clone(), rhs: operands, ty, relation })
+    }
+
     #[cfg(feature = "internal-checker")]
     fn prepare_ordinary_boolean(
         &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>,
@@ -8051,6 +8111,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     Boolean::Lexical(comparison)
                 } else if let Some(predicate) = self.ordinary_literal_predicate(expression, names, occurrence) {
                     Boolean::Integer(predicate)
+                } else if let Some(comparison) = occurrence.and_then(|site| self.prepared_difference_comparison(expression, site)) {
+                    Boolean::Difference(Box::new(comparison))
                 } else {
                     Boolean::Opaque
                 }

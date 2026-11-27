@@ -18794,6 +18794,60 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_float_row_guard_preserves_difference_and_correlated_witness() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-row-guard");
+        let text = |claim: &str| format!(r#"%%start
+            f32(i32,i32,i32) guard = fn(count,start,row) {{
+                if (count==4 && start>=0 && start<=2) {{
+                    if (row<0 || row>=count-start) {{ 0.0 }} else {{
+                        core.require({claim}, {OUTPUT}); 1.0
+                    }}
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}"));
+            let good = text("row<=3");
+            let wrong = text("row!=3");
+            let (positive, _) = prepare(&good).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(positive.active && positive.directives.is_empty());
+            let (negative, _) = prepare(&wrong).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(negative.directives, prepare(&wrong).run().unwrap().directives);
+            let [failure] = negative.directives.as_slice() else { panic!("one row-difference witness"); };
+            assert_eq!(failure.witness.axes().len(), 3, "temporary operand is not a witness axis");
+            for (axis, value) in [4, 0, 3].into_iter().enumerate() {
+                assert_eq!(failure.witness.axes().nth(axis).unwrap().1, &ScalarType::I32);
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+            }
+
+            let signed_edge = |count: i32| format!(r#"%%start
+                f32(i32,i32,i32) guard = fn(count,start,row) {{
+                    if (count=={count} && start==1) {{
+                        if (row<0 && row>=count-start) {{
+                            core.require(row<0, {OUTPUT}); 1.0
+                        }} else {{ 0.0 }}
+                    }} else {{ 0.0 }}
+                }};
+            %%end"#);
+            let fits = signed_edge(i32::MIN + 1);
+            let (verified, _) = prepare(&fits).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(verified.active && verified.directives.is_empty());
+            let complete = prepare(&fits).run().unwrap();
+            assert!(complete.active && complete.directives.is_empty());
+            let overflow = signed_edge(i32::MIN);
+            assert!(matches!(prepare(&overflow).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(prepare(&overflow).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_wide_actual_unit_history_checks_each_admitted_frame_once() {
         use failure_search::PathStep;
         use std::num::NonZeroUsize;

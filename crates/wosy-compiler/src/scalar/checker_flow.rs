@@ -2080,6 +2080,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_extended_scalar_locals: bool,
     #[cfg(feature = "internal-checker")]
+    closed_float_guards: bool,
+    #[cfg(feature = "internal-checker")]
     allow_snapshot_history: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
@@ -6997,6 +6999,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals() || authored_return.discards_closed_float_output(),
         #[cfg(feature = "internal-checker")]
+        closed_float_guards: authored_return.discards_closed_float_output(),
+        #[cfg(feature = "internal-checker")]
         allow_symbolic_contextual_bool: COLLECT && !USE_IMPORTED_BOUND
             && authored_return.allows_extended_scalar_locals() && calls.structure.checker_has_bool_contextual_declaration,
         #[cfg(feature = "internal-checker")]
@@ -7417,6 +7421,46 @@ impl IntegerInputs {
         Some(false)
     }
 
+    fn prepared_difference_comparison(
+        &self, comparison: &super::reference::CheckerPreparedDifferenceComparison,
+        roots: &IntegerRoots<'_>, selected: [bool; 2], work: &mut usize,
+    ) -> Option<[Self; 2]> {
+        use super::reference::CheckerPreparedIntegerOperand;
+        if !roots.closed_float_guards { return None; }
+        let left = roots.lookup(&comparison.lhs)?;
+        if left.1 != &comparison.ty { return None; }
+        let depth = roots.axes.len();
+        if self.0.iter().any(|row| row.len() != depth) { return None; }
+        fn operand<'a>(
+            term: &'a CheckerPreparedIntegerOperand, roots: &IntegerRoots<'_>, expected: &ScalarType,
+        ) -> Option<IntegerCalculationOperand<'a>> {
+            match term {
+                CheckerPreparedIntegerOperand::Literal(value) => Some((Some(value), None)),
+                CheckerPreparedIntegerOperand::Binding(binding) => {
+                    let (axis, ty) = roots.lookup(binding)?;
+                    (ty == expected).then_some((None, Some(axis)))
+                }
+            }
+        }
+        let lhs = operand(&comparison.rhs[0], roots, &comparison.ty)?;
+        let rhs = operand(&comparison.rhs[1], roots, &comparison.ty)?;
+        charge_partition_capture(work, self, depth)?;
+        let mut computed = Self(self.0.clone());
+        let mut local = Some(*work);
+        let mut affine = None;
+        computed.append_ordinary_calculation(
+            AuthoredIntegerOperation::Subtract, lhs, rhs, &comparison.ty, &mut local, &mut affine,
+        )?;
+        *work = local?;
+        charge_call_work(work, affine.unwrap_or(0))?;
+        let mut lanes = computed.ordinary_comparison([left.0, depth], comparison.relation, selected, work)?;
+        for lane in &mut lanes {
+            charge_partition_capture(work, lane, depth.checked_add(1)?)?;
+            lane.drop_locals(depth);
+        }
+        Some(lanes)
+    }
+
     fn ordinary_boolean(
         &self, condition: &super::reference::CheckerOrdinaryBoolean, roots: &IntegerRoots<'_>,
         selected: [bool; 2], work: &mut usize,
@@ -7468,6 +7512,8 @@ impl IntegerInputs {
                 let axes = prepared_comparison_axes(roots, comparison)?;
                 output = self.ordinary_comparison(axes, comparison.relation, selected, work)?;
             }
+            Boolean::Difference(comparison) =>
+                output = self.prepared_difference_comparison(comparison, roots, selected, work)?,
             Boolean::Not(value) => {
                 let [no, yes] = self.ordinary_boolean(value, roots, [selected[1], selected[0]], work,
                     child_history(OccurrenceEdge::UnaryOperand)?)?;
@@ -7518,7 +7564,7 @@ impl IntegerInputs {
     ) -> Option<Option<[Self; 2]>> {
         let Some(tracker) = roots.callable_history else { return Some(None); };
         let Some(tree) = calls.structure.checker_ordinary_booleans.get(&condition) else { return Some(None); };
-        if !call_free_history_boolean(tree) { return Some(None); }
+        if !call_free_history_boolean_with_difference(tree, roots.closed_float_guards) { return Some(None); }
         let mut work = tracker.borrow().work.get();
         let rows = self.ordinary_boolean(tree, roots, [true, true], &mut work, Some((calls, condition, tracker)))?;
         tracker.borrow().work.set(work);
@@ -7699,16 +7745,22 @@ fn project_callable_compound_directive<'a>(
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn call_free_history_boolean(condition: &super::reference::CheckerOrdinaryBoolean) -> bool {
+    call_free_history_boolean_with_difference(condition, false)
+}
+
+#[cfg(feature = "internal-checker")]
+fn call_free_history_boolean_with_difference(condition: &super::reference::CheckerOrdinaryBoolean, difference: bool) -> bool {
     use super::reference::CheckerOrdinaryBoolean as Boolean;
-    fn valid(node: &Boolean) -> bool {
+    fn valid(node: &Boolean, difference: bool) -> bool {
         match node {
-            Boolean::And(children) | Boolean::Or(children) => children.iter().all(valid),
-            Boolean::Not(inner) => valid(inner),
+            Boolean::And(children) | Boolean::Or(children) => children.iter().all(|child| valid(child, difference)),
+            Boolean::Not(inner) => valid(inner, difference),
             Boolean::Constant(_) | Boolean::Integer(_) | Boolean::Lexical(_) => true,
+            Boolean::Difference(_) => difference,
             _ => false,
         }
     }
-    matches!(condition, Boolean::And(_) | Boolean::Or(_)) && valid(condition)
+    matches!(condition, Boolean::And(_) | Boolean::Or(_)) && valid(condition, difference)
 }
 
 #[cfg(feature = "internal-checker")]
