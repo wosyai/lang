@@ -20178,7 +20178,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
     fn guarded_row_induction_authenticates_exact_seed_step_and_publish_site() {
         let app = source("src/main.w", "terrain-row-monotone-incoming-envelope");
         let program = r#"%%start
-            unit(i32,i32) publish = fn(x,z) {};
+            unit(i32,i32) publish = fn(x,z) { if (x == z) {}; };
             unit(i32,i32,i32) row = fn(x,z,east) {
                 if (x <= east) {
                     if (z >= -32) { publish(x,z); };
