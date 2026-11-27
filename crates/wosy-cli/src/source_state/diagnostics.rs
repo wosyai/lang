@@ -8,7 +8,7 @@ use wosy_protocol::{
     encode_session_frame, write_encoded_session_frame, BuildDiagnosticRequest, BuildDiagnosticResponse, BuildSessionCommand,
     BuildSessionCommandId, BuildSessionRefusal, BuildSessionReply, BuildSessionRequest,
     BuildSessionResponse, BuildSourceSelection, OrdinaryLlvmProjection, SessionFrameReader, BUILD_DIAGNOSTIC_VERSION,
-    BUILD_RECONCILIATION_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+    BUILD_RECONCILIATION_VERSION, ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
 };
 
 #[derive(Clone)]
@@ -148,7 +148,7 @@ impl CapturedBuildDiagnostics {
             || projection.profile != self.profile {
             return Err("ordinary LLVM reply did not match the captured source and profile".into());
         }
-        if projection.builder.is_some() != (version == ORDINARY_LLVM_BUILDER_INPUT_VERSION) {
+        if projection.builder.is_some() != matches!(version, ORDINARY_LLVM_BUILDER_INPUT_VERSION | ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION) {
             return Err("ordinary LLVM reply has different versioned builder evidence".into());
         }
         if projection.partition.len() > max_bytes {

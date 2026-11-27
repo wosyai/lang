@@ -15,7 +15,7 @@ use wosy_protocol::{
     BuildSessionRefusal as Refusal, BuildSessionReply, BuildSessionRequest as Request,
     write_encoded_session_frame, BuildSessionResponse, BuildSourceSelection, Delta, BASE_DECLARATION_PROJECTION_VERSION,
     OrdinaryLlvmBuilderWitness, OrdinaryLlvmProjection, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 
 type Reply = BuildSessionReply<Diagnostic>;
@@ -128,8 +128,25 @@ impl SourceStorageWorker {
         &self, stream: T, selected: BuildSourceSelection,
         limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration,
     ) -> Result<BuildSessionEnd> {
+        self.serve_known_builder_input_session(stream, selected, limits, max_partition_bytes, lifetime,
+            ORDINARY_LLVM_BUILDER_INPUT_VERSION).await
+    }
+
+    /// Explicitly scoped experimental executable projection. Never accepts replay.
+    pub async fn serve_known_executable_builder_input_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration,
+    ) -> Result<BuildSessionEnd> {
+        self.serve_known_builder_input_session(stream, selected, limits, max_partition_bytes, lifetime,
+            ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION).await
+    }
+
+    async fn serve_known_builder_input_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, lifetime: Duration, version: u16,
+    ) -> Result<BuildSessionEnd> {
         let ordinary_llvm = Some(OrdinaryLlvmScope {
-            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version: ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES), version,
         });
         self.serve_selected_session(stream, selected, lifetime,
             Opening::Recoverable { replay: None, limits, ordinary_llvm }, None).await
@@ -284,7 +301,7 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 continue;
             }
             Some(Command { id, request: Request::ProjectOrdinaryLlvm { version, profile } }) => {
-                let supported = matches!(version, ORDINARY_LLVM_PROJECTION_VERSION | ORDINARY_LLVM_BUILDER_INPUT_VERSION);
+                let supported = matches!(version, ORDINARY_LLVM_PROJECTION_VERSION | ORDINARY_LLVM_BUILDER_INPUT_VERSION | ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION);
                 if let Some(scope) = ordinary_llvm.filter(|scope| scope.version == version && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES) {
                     (id, Operation::OrdinaryLlvm(scope, version, profile))
                 } else {
@@ -324,7 +341,8 @@ async fn drive<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 scope.binding.clone(), proposal, scope.admission_limits, scope.declaration_bytes,
             ).await.map(Completed::Projection),
             Operation::OrdinaryLlvm(scope, version, profile) => session.project_ordinary_llvm_framed(
-                profile, scope.limits, scope.bytes, version == ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+                profile, scope.limits, scope.bytes, version != ORDINARY_LLVM_PROJECTION_VERSION,
+                version == ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION,
             ).await.map(|(projection, witness)| Completed::OrdinaryLlvm(version, projection, witness)),
         }
     };

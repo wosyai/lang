@@ -16,8 +16,13 @@ with tempfile.TemporaryDirectory() as temp:
     scripts = project / "scripts"
     for name in ("build-wasm", "run-wasmtime", "start.ll"):
         shutil.copyfile(fixtures / "shared_stdlib_local_dependency/project/scripts" / name, scripts / name)
+    wasm_builder = scripts / "build-wasm"
+    wasm_builder.write_text(wasm_builder.read_text().replace('"--export=_start",',
+                                                             '"--export=_start", "--export=fixture_answer",'))
+    entry = project / "src/main.w"
+    entry.write_text(entry.read_text().replace("%%end", "i32() answer = fn { 42 };\n%%end"))
     profile = project / "wosy.toml"
-    text = profile.read_text()
+    text = profile.read_text().replace("categories = []", 'categories = ["WHY"]')
     text = text.replace('command = ["python", "scripts/build-native"]\nargs = []',
                         'command = ["python", "scripts/capture-native"]\nargs = ["native-profile"]')
     profile.write_text(text + """
@@ -35,6 +40,9 @@ backend = "llvm"
 output = "wasm-wasip1"
 builder = "wasm"
 run_runner = "wasmtime"
+
+[targets.app.artifacts.main.profiles.wasm.exports]
+fixture_answer = "answer"
 
 [targets.app.profiles.wasm]
 main_artifact = "main"
@@ -139,3 +147,52 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
           " independent known-image refusal, no unknown-source replay, no opt-in write or publication.", timing)
     print("Cancel after the real LLVM reply is held: Native64 and WASI in both roles, same lease scope and unchanged SQLite,"
           " surviving plan byte-equal to isolated, actual PeerClosed plus Disconnected, no output.")
+
+    executable = base / "experimental"
+    call("executable-builder-inputs", "dev", executable, ordinary, refusal="different compiler image")
+    assert not executable.exists()
+    assert call("executable-builder-inputs", "dev", blocked, example, database=empty)["result"]["kind"] == "replay-required"
+    assert not blocked.exists()
+
+    def executable_plans():
+        return {name: call("executable-builder-inputs", name, executable, example)["result"]
+                for name in ("dev", "wasm")}
+
+    initial = executable_plans()
+    assert not executable.exists()
+    child = project / "src/child.w"
+    original = child.read_text()
+    child.write_text(original.replace("i32 calls", "# WHY: preview note\ni32 calls"))
+    call("stage")
+    call("submit-pending", "short_circuit_project", "src/main.w")
+    annotated = executable_plans()
+    for name in initial:
+        assert annotated[name]["root"] != initial[name]["root"]
+        assert annotated[name]["executable_partition_digest"] == initial[name]["executable_partition_digest"]
+        assert annotated[name]["partition"] == initial[name]["partition"]
+    child.write_text(child.read_text().replace("calls + 1", "calls + 2"))
+    call("stage")
+    call("submit-pending", "short_circuit_project", "src/main.w")
+    changed = executable_plans()
+    assert not executable.exists()
+    for name, runner, magic in (("dev", "native", b"\x7fELF"), ("wasm", "wasmtime", b"\x00asm")):
+        plan = changed[name]
+        assert plan["executable_partition_digest"] != annotated[name]["executable_partition_digest"]
+        partition, output, pending_manifest, runtime = map(Path, plan["arguments"])
+        assert output == executable
+        output.mkdir()
+        for path, field in ((partition, "partition"), (pending_manifest, "pending"), (runtime, "runtime")):
+            path.write_text(plan[field])
+        subprocess.run(plan["command"] + plan["configured_arguments"] + plan["arguments"],
+                       cwd=project, check=True, capture_output=True, timeout=30)
+        assert (output / "main").read_bytes().startswith(magic)
+        subprocess.run(["python", f"scripts/run-{runner}", pending_manifest, "--"],
+                       cwd=project, check=True, capture_output=True, timeout=30)
+        assert not (output / "artifact-manifest.json").exists()
+        if name == "wasm":
+            export = subprocess.check_output(["wasmtime", "run", "--invoke", "fixture_answer", output / "main"],
+                                             timeout=30)
+            assert export.strip() == b"42"
+        shutil.rmtree(output)
+    print("V3: comment-only revision preserves normalized bytes and digest; code change alters digest;"
+          " disposable Native64 and WASI link and run; no publication.")

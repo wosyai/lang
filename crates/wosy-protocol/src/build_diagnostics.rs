@@ -7,6 +7,8 @@ pub const BASE_DECLARATION_PROJECTION_VERSION: u16 = 1;
 pub const BUILD_RECONCILIATION_VERSION: u16 = 1;
 pub const ORDINARY_LLVM_PROJECTION_VERSION: u16 = 1;
 pub const ORDINARY_LLVM_BUILDER_INPUT_VERSION: u16 = 2;
+/// Explicit opt-in normalized executable partition, never ordinary Build authority.
+pub const ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION: u16 = 3;
 pub const MAX_ORDINARY_LLVM_PROFILE_BYTES: usize = 1024;
 
 /// Local adapter's already acknowledged SQLite selection. This is not a

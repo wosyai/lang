@@ -19,7 +19,7 @@ use wosy_project::PackageRelativePath;
 use wosy_protocol::{
     walk_cst, BuildDiagnosticResponse, BuildSessionRefusal, CstEvent, CstExpansionBudget,
     BuildSessionReply, BuildSessionRequest, BuildSourceSelection, FileEntry, FileKey, NodeId, OrdinaryLlvmProjection,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, MAX_SESSION_FRAME_BYTES, ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION,
     ORDINARY_LLVM_PROJECTION_VERSION,
 };
 use wosy_syntax::SourceIdentity;
@@ -87,6 +87,7 @@ pub struct AcknowledgedOrdinaryBuilderInputs {
     inputs: PendingBuilderInputs,
     partition: String,
     runtime: &'static str,
+    executable_partition_digest: Option<NodeId>,
 }
 
 impl AcknowledgedOrdinaryBuilderInputs {
@@ -96,6 +97,8 @@ impl AcknowledgedOrdinaryBuilderInputs {
     pub fn inputs(&self) -> &PendingBuilderInputs { &self.inputs }
     pub fn partition(&self) -> &str { &self.partition }
     pub fn runtime(&self) -> &'static str { self.runtime }
+    /// Comparison data for explicitly requested executable LLVM, not an artifact reuse key.
+    pub fn executable_partition_digest(&self) -> Option<NodeId> { self.executable_partition_digest }
 }
 
 struct LiveCapture {
@@ -137,6 +140,7 @@ enum Recovery {
 enum OrdinaryLlvmMode {
     Projection,
     KnownBuilderInputs,
+    KnownExecutableBuilderInputs,
 }
 
 impl SqliteSourceState {
@@ -265,6 +269,34 @@ impl SqliteSourceState {
         Opening: Future<Output = Result<Stream>>,
         Stream: AsyncRead + AsyncWrite + Unpin + 'static,
     {
+        self.live_builder_inputs(target, profile, timeout, max_authored_source_bytes, max_partition_bytes,
+            expected_peer, output, open, OrdinaryLlvmMode::KnownBuilderInputs).await
+    }
+
+    /// Explicit normalized projection. Its bytes can differ from ordinary Build;
+    /// the result is still inert and never authorizes a builder or reuse.
+    pub async fn live_executable_builder_inputs<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        max_partition_bytes: usize, expected_peer: &AuthorizedOrdinaryBuilderPeer, output: PathBuf, open: Open,
+    ) -> Result<AcknowledgedOrdinaryLlvm<AcknowledgedOrdinaryBuilderInputs>>
+    where
+        Open: FnMut(BuildSourceSelection) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        self.live_builder_inputs(target, profile, timeout, max_authored_source_bytes, max_partition_bytes,
+            expected_peer, output, open, OrdinaryLlvmMode::KnownExecutableBuilderInputs).await
+    }
+
+    async fn live_builder_inputs<Open, Opening, Stream>(
+        &mut self, target: &str, profile: &str, timeout: Duration, max_authored_source_bytes: usize,
+        max_partition_bytes: usize, expected_peer: &AuthorizedOrdinaryBuilderPeer, output: PathBuf, open: Open, mode: OrdinaryLlvmMode,
+    ) -> Result<AcknowledgedOrdinaryLlvm<AcknowledgedOrdinaryBuilderInputs>>
+    where
+        Open: FnMut(BuildSourceSelection) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
         let deadline = llvm_deadline(profile, timeout)?;
         let LiveCapture { captured, builder } = match self.capture_live(target, profile, deadline, max_authored_source_bytes, true)? {
             Ok(capture) => capture,
@@ -272,7 +304,7 @@ impl SqliteSourceState {
         };
         let builder = builder.ok_or("current source lacks an ordinary builder observation")?;
         let mut open = open;
-        let answer = self.live_partition_for_capture(captured, deadline, max_partition_bytes, OrdinaryLlvmMode::KnownBuilderInputs,
+        let answer = self.live_partition_for_capture(captured, deadline, max_partition_bytes, mode,
             |selected, _| open(selected), |source, projection| bind_builder_inputs(source, builder, projection, expected_peer.0, output),
         ).await?;
         let AcknowledgedOrdinaryLlvm::Partition(plan) = &answer else { return Ok(answer); };
@@ -302,6 +334,7 @@ impl SqliteSourceState {
         let (version, allow_replay) = match mode {
             OrdinaryLlvmMode::Projection => (ORDINARY_LLVM_PROJECTION_VERSION, true),
             OrdinaryLlvmMode::KnownBuilderInputs => (ORDINARY_LLVM_BUILDER_INPUT_VERSION, false),
+            OrdinaryLlvmMode::KnownExecutableBuilderInputs => (ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, false),
         };
         let answer = self.exchange_for_capture(&captured, deadline, open, allow_replay,
             |capture| capture.ordinary_llvm_request(version),
@@ -436,8 +469,9 @@ fn bind_builder_inputs(
     let paths = BuilderInputPaths::new(output);
     let inputs = pending_builder_inputs(&observed.configuration, observed.configuration_identity, target, &projection.profile,
         artifact, profile, observed.source, projection.digest.hex(), &paths.output)?;
+    let executable_partition_digest = (projection.version == ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION).then_some(projection.digest);
     Ok(AcknowledgedOrdinaryBuilderInputs { project: observed.project, source, paths, inputs,
-        partition: projection.partition, runtime })
+        partition: projection.partition, runtime, executable_partition_digest })
 }
 
 async fn open_stream<Open, Opening, Stream>(

@@ -292,14 +292,14 @@ impl BuildDiagnosticSession<'_> {
     }
 
     pub(super) async fn project_ordinary_llvm_framed(
-        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize, builder_inputs: bool,
+        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize, builder_inputs: bool, executable: bool,
     ) -> Result<(RootedLlvmProjection, Option<OrdinaryLlvmBuilderWitness>)> {
         let slot = self.worker.try_slot()?;
         let lease = Arc::clone(&self.lease);
         let (_observer, cancellation) = QueryCancellation::observe_before(self.hard_deadline());
         self.worker.spawn_reserved_query(slot, Some(cancellation.clone()), move |worker| async move {
-            worker.phase(None, move |store| store.project_framed_authored_ll(&lease, profile, limits,
-                output_bytes, builder_inputs, || QueryCancellation::check(Some(&cancellation)))).await
+            worker.phase(None, move |store| store.project_framed_ll(&lease, profile, limits,
+                output_bytes, builder_inputs, executable, || QueryCancellation::check(Some(&cancellation)))).await
         }).await?
     }
 

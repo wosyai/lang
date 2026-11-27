@@ -16,7 +16,7 @@ pub use build_diagnostics::{
     BuildDiagnosticResponse, BuildSourceSelection, BuildSessionCommand, BuildSessionCommandId,
     BuildSessionRefusal, BuildSessionReply, BuildSessionRequest, BuildSessionResponse, OrdinaryLlvmBuilderWitness, OrdinaryLlvmProjection,
     BASE_DECLARATION_PROJECTION_VERSION, BUILD_DIAGNOSTIC_VERSION, BUILD_RECONCILIATION_VERSION,
-    MAX_ORDINARY_LLVM_PROFILE_BYTES, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
+    MAX_ORDINARY_LLVM_PROFILE_BYTES, ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION, ORDINARY_LLVM_BUILDER_INPUT_VERSION, ORDINARY_LLVM_PROJECTION_VERSION,
 };
 #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
 pub mod native_diagnostics;

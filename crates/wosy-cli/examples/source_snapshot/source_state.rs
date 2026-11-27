@@ -52,11 +52,11 @@ pub(super) async fn run(
             let selected = client.acknowledged_build_source(&target)?.ok_or("fixture has no acknowledged source")?;
             super::saved_diagnostic::run(dir, selected, &name, profile.as_deref(), limit, mode.ends_with("-exit")).await?
         }
-        "ordinary-builder-inputs" => {
+        "ordinary-builder-inputs" | "executable-builder-inputs" => {
             let profile = args.next().ok_or("expected fixture builder profile")?;
             let output = args.next().ok_or("expected fixture output directory")?.into();
             let expected = args.next().ok_or("expected independently owned fixture image")?;
-            super::ordinary_builder_inputs::run(&mut client, dir, &target, &profile, output, Path::new(&expected)).await?
+            super::ordinary_builder_inputs::run(&mut client, dir, &target, &profile, output, Path::new(&expected), mode == "executable-builder-inputs").await?
         }
         "ordinary-builder-inputs-cancel" => {
             let held = args.next().ok_or("expected held fixture profile")?;

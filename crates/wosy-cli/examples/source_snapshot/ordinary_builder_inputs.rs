@@ -16,7 +16,7 @@ const PARTITION_BYTES: usize = 128 << 10;
 const TIME: Duration = Duration::from_secs(15);
 
 pub(super) async fn run(
-    client: &mut SqliteSourceState, path: &Path, target: &str, profile: &str, output: PathBuf, expected: &Path,
+    client: &mut SqliteSourceState, path: &Path, target: &str, profile: &str, output: PathBuf, expected: &Path, executable: bool,
 ) -> Result<serde_json::Value> {
     let daemon = Arc::new(SourceStore::open(path, 8 << 20)?);
     let bound = NonZeroUsize::new(2).unwrap();
@@ -26,19 +26,25 @@ pub(super) async fn run(
     let known = daemon.snapshot(selection.root)?.is_some();
     let mut jobs = RefCell::new(Vec::new());
     let start = Instant::now();
-    let answer = client.live_ordinary_builder_inputs(target, profile, TIME, SOURCE_BYTES, PARTITION_BYTES, &expected, output,
-        |selected| {
+    let open = |selected| {
             assert_eq!(selected, selection);
             let daemon = Arc::clone(&daemon);
             let (our, peer) = duplex(512);
             jobs.get_mut().push(tokio::spawn(async move {
                 let worker = SourceStorageWorker::new(daemon, tokio::runtime::Handle::current(), bound, bound, bound)?;
-                worker.serve_known_ordinary_builder_input_session(
-                    peer, selected, limits, PARTITION_BYTES, TIME,
-                ).await
+                if executable {
+                    worker.serve_known_executable_builder_input_session(peer, selected, limits, PARTITION_BYTES, TIME).await
+                } else {
+                    worker.serve_known_ordinary_builder_input_session(peer, selected, limits, PARTITION_BYTES, TIME).await
+                }
             }));
             std::future::ready(Ok(our))
-        }).await;
+        };
+    let answer = if executable {
+        client.live_executable_builder_inputs(target, profile, TIME, SOURCE_BYTES, PARTITION_BYTES, &expected, output, open).await
+    } else {
+        client.live_ordinary_builder_inputs(target, profile, TIME, SOURCE_BYTES, PARTITION_BYTES, &expected, output, open).await
+    };
     let elapsed = milliseconds(start);
     let mut jobs = jobs.into_inner();
     assert_eq!(jobs.len(), 1);
@@ -53,7 +59,14 @@ pub(super) async fn run(
     // Compare orderly close even when the expected image won't match.
     assert_eq!(close, BuildSessionEnd::Disconnected);
     let AcknowledgedOrdinaryLlvm::Partition(plan) = answer? else { return Err("fixture expected builder inputs".into()); };
-    fields(plan, elapsed)
+    let digest = plan.executable_partition_digest();
+    let mut result = fields(plan, elapsed)?;
+    if executable {
+        result["executable_partition_digest"] = serde_json::json!(digest.ok_or("missing executable comparison digest")?.hex());
+    } else {
+        assert!(digest.is_none());
+    }
+    Ok(result)
 }
 
 fn fields(plan: AcknowledgedOrdinaryBuilderInputs, elapsed: f64) -> Result<serde_json::Value> {

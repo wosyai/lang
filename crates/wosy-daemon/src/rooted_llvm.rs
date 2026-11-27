@@ -228,16 +228,17 @@ impl SourceStore {
         Ok(result)
     }
 
-    /// The framed authored projection is a no-publication route. Even
+    /// A framed projection is a no-publication route. Even
     /// newly parsed grammar evidence is not installed by this request.
-    pub(super) fn project_framed_authored_ll(
+    pub(super) fn project_framed_ll(
         &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits,
-        output_bytes: usize, builder_inputs: bool, check_active: impl Fn() -> Result<()>,
+        output_bytes: usize, builder_inputs: bool, executable: bool, check_active: impl Fn() -> Result<()>,
     ) -> Result<(RootedLlvmProjection, Option<OrdinaryLlvmBuilderWitness>)> {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let (answer, builder) = match self.plan_scalar(&tx, grant.root, profile, limits, RootedLlvmIdentity::Authored)? {
+        let identity = if executable { RootedLlvmIdentity::Executable } else { RootedLlvmIdentity::Authored };
+        let (answer, builder) = match self.plan_scalar(&tx, grant.root, profile, limits, identity)? {
             ScalarPlanning::Unsupported(reason) => (RootedLlvmProjection::Unsupported(reason), None),
             ScalarPlanning::Ready(plan) => {
                 let witness = if builder_inputs {
