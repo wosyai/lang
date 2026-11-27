@@ -179,3 +179,27 @@ raise SystemExit(subprocess.run([sys.argv[1], "run", manifest["executable"], *sy
     assert sorted(path.name for path in output.iterdir()) == ["artifact-manifest.json", "cold"]
     print("Controlled WASI scratch gate: real cold link and export 42, actual linker failure and stale source"
           " preserve the previous binary/manifest, real Run accepts only matching observations.")
+
+    # Model a legitimate reader which already resolved the previous manifest
+    # before publication. No concurrent mutation or race is injected here.
+    previous_reader = Path(json.loads(final.read_bytes())["executable"])
+    assert previous_reader == cold_binary
+    source.write_bytes(authored.replace(b"42", b"43"))
+    next_root = state("stage")["pending"]
+    assert next_root != staged
+    assert state("submit-pending", "app", "main.w")["selected"] == next_root
+    exact_inputs = tuple(path.read_bytes() for path in source_inputs)
+    run(stale=True)
+    assert generation("next") == "published"
+    assert invoked == ["cold", "failed", "stale", "next"]
+    run()
+    next_binary = Path(json.loads(final.read_bytes())["executable"])
+    assert next_binary == output / "next/main" and next_binary != previous_reader
+    assert (previous_reader.read_bytes(), previous_reader.stat().st_ino) == baseline[1:]
+    for binary, value in ((previous_reader, b"42"), (next_binary, b"43")):
+        result = subprocess.check_output([runner, "run", "--invoke", "fixture_answer", binary],
+                                         cwd=root, env=tools_env, timeout=30)
+        assert result.strip() == value
+    assert sorted(path.name for path in output.iterdir()) == ["artifact-manifest.json", "cold", "next"]
+    print("Sequential publication: normal Run follows generation 43; a reader holding the prior path"
+          " still executes generation 42 from the same inode and bytes.")
