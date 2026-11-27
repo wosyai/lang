@@ -782,6 +782,7 @@ dependencies = [
  "blake3",
  "clap",
  "codespan-reporting",
+ "libc",
  "rustix",
  "serde",
  "serde_json",

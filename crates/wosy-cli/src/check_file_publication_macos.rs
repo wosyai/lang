@@ -8,21 +8,22 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, Write},
+    os::fd::AsRawFd,
     path::{Component, Path},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 pub(super) struct PreparedFiles {
     destination: OwnedFd,
-    stage: Stage,
-    pub(super) payloads: Vec<OsString>,
+    _stage: Stage,
+    pub(super) payloads: Vec<File>,
 }
 
 struct Stage {
     parent: OwnedFd,
     directory: OwnedFd,
     name: String,
-    files: Vec<OsString>,
+    files: Vec<(OsString, (u64, u64))>,
 }
 
 fn open_directory(parent: impl AsFd, name: impl rustix::path::Arg) -> io::Result<OwnedFd> {
@@ -67,30 +68,36 @@ impl Stage {
             }
         };
         let directory = open_directory(&parent, name.as_str())?;
-        let metadata = fs::fstat(&directory)?;
+        let stage = Self { parent, directory, name, files: Vec::new() };
+        let metadata = fs::fstat(&stage.directory)?;
         if metadata.st_uid != geteuid().as_raw() || metadata.st_mode & 0o077 != 0
-            || metadata.st_dev != fs::fstat(&parent)?.st_dev
+            || metadata.st_dev != fs::fstat(&stage.parent)?.st_dev
         {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "check staging directory is not private"));
         }
-        Ok(Self { parent, directory, name, files: Vec::new() })
+        Ok(stage)
     }
 
-    fn write(&mut self, name: &OsStr, bytes: &[u8]) -> io::Result<OsString> {
+    fn write(&mut self, name: &OsStr, bytes: &[u8]) -> io::Result<File> {
         let mut file = File::from(fs::openat(
-            &self.directory, name, OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            &self.directory, name, OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )?);
-        self.files.push(name.to_owned());
+        self.files.push((name.to_owned(), file_identity(fs::fstat(&file)?)));
         file.write_all(bytes)?;
-        Ok(name.to_owned())
+        Ok(file)
     }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        for name in &self.files {
-            let _ = fs::unlinkat(&self.directory, name.as_os_str(), AtFlags::empty());
+        for (name, expected) in &self.files {
+            let name = name.as_os_str();
+            if fs::statat(&self.directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|current| file_identity(current) == *expected)
+            {
+                let _ = fs::unlinkat(&self.directory, name, AtFlags::empty());
+            }
         }
         if let (Ok(original), Ok(current)) = (
             fs::fstat(&self.directory),
@@ -121,13 +128,37 @@ impl PreparedFiles {
         // that alias on a case-insensitive or normalization-insensitive volume.
         let payloads = requests.iter().map(|(name, bytes)| stage.write(name.as_os_str(), bytes))
             .collect::<io::Result<_>>()?;
-        Ok(Self { destination, stage, payloads })
+        Ok(Self { destination, _stage: stage, payloads })
     }
 
-    pub(super) fn publish(&self, payload: &OsStr, request: &Path) -> io::Result<()> {
-        fs::linkat(&self.stage.directory, payload, &self.destination, request, AtFlags::empty())
-            .map_err(|error| io::Error::new(io::Error::from(error).kind(), format!("{}: {}", request.display(), io::Error::from(error))))
+    pub(super) fn publish(&self, payload: &File, request: &Path) -> io::Result<()> {
+        publish_from_descriptor(payload, &self.destination, request)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", request.display())))
     }
+}
+
+fn file_identity(stat: fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_from_descriptor(payload: &File, destination: &OwnedFd, request: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let leaf = CString::new(request.as_os_str().as_bytes())?;
+    // APFS clones the open source file, not a staging pathname, in one
+    // no-replace operation. Do not fall back to resolving the source by name.
+    // SAFETY: both descriptors are live and leaf is NUL-terminated.
+    let result = unsafe {
+        libc::fclonefileat(payload.as_raw_fd(), destination.as_raw_fd(), leaf.as_ptr(), 0)
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn publish_from_descriptor(payload: &File, destination: &OwnedFd, request: &Path) -> io::Result<()> {
+    let path = format!("/proc/self/fd/{}", payload.as_raw_fd());
+    Ok(fs::linkat(fs::CWD, path.as_str(), destination, request, AtFlags::SYMLINK_FOLLOW)?)
 }
 
 #[cfg(test)]
@@ -156,7 +187,7 @@ mod tests {
         let other = Path::new("other.json");
         let files = PreparedFiles::new(&root, &[(report, b"complete"), (other, b"second")]).unwrap();
         assert_eq!(fs::read_dir(output.join("check")).unwrap().count(), 0);
-        let stage = output.join(&files.stage.name);
+        let stage = output.join(&files._stage.name);
         assert_eq!(fs::metadata(&stage).unwrap().permissions().mode() & 0o077, 0);
         fs::write(output.join("check/other.json"), b"existing").unwrap();
         files.publish(&files.payloads[0], report).unwrap();
@@ -166,6 +197,22 @@ mod tests {
         assert_eq!(fs::read(output.join("check/report.json")).unwrap(), b"complete");
         assert_eq!(fs::read(output.join("check/other.json")).unwrap(), b"existing");
         assert_eq!(PreparedFiles::new(&root, &[(report, b"third")]).err().unwrap().kind(), io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publishing_uses_the_open_payload_not_its_staging_name() {
+        let root = temp();
+        let output = root.join(".wosy/outputs");
+        let report = Path::new("report.json");
+        let files = PreparedFiles::new(&root, &[(report, b"original")]).unwrap();
+        let stage = output.join(&files._stage.name);
+        fs::rename(stage.join(report), stage.join("moved")).unwrap();
+        fs::write(stage.join(report), b"other entry").unwrap();
+        files.publish(&files.payloads[0], report).unwrap();
+        drop(files);
+        assert_eq!(fs::read(output.join("check/report.json")).unwrap(), b"original");
+        assert_eq!(fs::read(stage.join(report)).unwrap(), b"other entry");
         fs::remove_dir_all(root).unwrap();
     }
 
