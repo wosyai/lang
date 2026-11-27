@@ -1375,10 +1375,10 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        if !Proof::ENABLED && closed_dormant_float_root(body) {
+        if let Some(plan) = (!Proof::ENABLED).then(|| closed_dormant_float_plan(project, calls, (ordinal, item), body)).flatten() {
             let work = std::cell::Cell::new(0);
             let mut first = None;
-            let completion = search_closed_dormant_float(body, &work, |failure, _steps| {
+            let completion = search_closed_dormant_float(body, &plan, &work, |failure, _steps| {
                 if COLLECT {
                     let effects = failures.as_deref_mut()?;
                     if ENTRY_EVIDENCE {
@@ -10990,7 +10990,7 @@ fn plan_closed_authored_roots(
             mandatory_startup_scalars.push((item, function.name_span));
             continue;
         }
-        if allow_startup_scalars && closed_dormant_float_root(body) {
+        if allow_startup_scalars && closed_dormant_float_plan(project, calls, (module, item), body).is_some() {
             super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
         } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
             &mut HashSet::new(), &mut history_work, 0).is_none() {
@@ -11116,28 +11116,115 @@ fn closed_affine_snapshot_history(body: &FunctionCallSites) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
-fn closed_dormant_float_root(body: &FunctionCallSites) -> bool {
-    matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::F32 | ScalarType::F64))
+fn closed_dormant_float_plan(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable, body: &FunctionCallSites,
+) -> Option<Vec<super::checker_flow::ClosedSignedFloatTail>> {
+    if !(matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::F32 | ScalarType::F64))
         && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
         && body.checker_closed_calling_frame() && body.contextual_formal().is_none()
-        && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
         && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
-        && body.structure.blocks.iter().all(|block| !block.unsafe_context
-            && block.items.iter().all(|item| {
-                let BlockItemKind::FinalOutput(slot) = item.kind else { return true; };
-                if !matches!(body.structure.checked_types.expressions.get(&slot.expression), Some(ScalarType::F32 | ScalarType::F64)) {
-                    return true;
-                }
-                body.structure.checker_literal_float_outputs.contains(&slot.expression)
-                    || matches!(body.conditionals.get(&slot.expression), Some(ConditionalRegion::Value { .. }))
-            }))
-        && !body.structure.checker_literal_float_outputs.is_empty()
-        && witness_history_directives(body, true)
+        && witness_history_directives(body, true))
+    { return None; }
+    let mut work = 0;
+    let mut plan = Vec::new();
+    let mut has_leaf = false;
+    for block in &body.structure.blocks {
+        if block.unsafe_context { return None; }
+        super::checker_flow::charge_call_work(&mut work, block.items.len().checked_add(1)?)?;
+        for item in &block.items {
+            let BlockItemKind::FinalOutput(slot) = item.kind else { continue; };
+            if !matches!(body.structure.checked_types.expressions.get(&slot.expression), Some(ScalarType::F32 | ScalarType::F64))
+            { continue; }
+            if matches!(body.conditionals.get(&slot.expression), Some(ConditionalRegion::Value { .. })) { continue; }
+            has_leaf = true;
+            if !body.structure.checker_literal_float_outputs.contains(&slot.expression) {
+                super::checker_flow::charge_call_work(&mut work, 16)?;
+                plan.push(closed_signed_float_tail(project, calls, target, body, slot.expression)?);
+            }
+        }
+    }
+    // Unknown, nested or non-terminal calls cannot borrow a leaf's authority.
+    if !has_leaf || plan.len() != body.call_occurrences.len() { return None; }
+    plan.sort_unstable_by_key(|tail| tail.site.0);
+    if !plan.iter().zip(&body.call_occurrences).all(|(tail, call)| tail.site == call.ordinal) { return None; }
+    Some(plan)
+}
+
+// A discarded return value does not license arbitrary code to execute.
+// Rely only on the original checked unary conversion, directly or through
+// an exact same-module declaration whose whole body is that conversion.
+#[cfg(feature = "internal-checker")]
+fn closed_signed_float_tail(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    body: &FunctionCallSites, site: OccurrenceOrdinal,
+) -> Option<super::checker_flow::ClosedSignedFloatTail> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let (argument, input, output) = typed_signed_float_tail_site(body, site)?;
+    let convert = |body: &FunctionCallSites, conversion: OccurrenceOrdinal| {
+        matches!(body.resolved_call_site(conversion)?.target, ResolvedCallTarget::Core(super::CoreOperationId::SintToFloat))
+            .then_some(())
+    };
+    match &body.resolved_call_site(site)?.target {
+        ResolvedCallTarget::Core(super::CoreOperationId::SintToFloat) => {}
+        ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } => {
+            let &(ordinal, item) = body.structure.checker_direct_targets.get(&site)?;
+            if ordinal != target.0 || item == target.1 { return None; }
+            let module = project.modules.get(ordinal)?;
+            let ScalarItem::Function(function) = module.items.get(item)? else { return None; };
+            if *source != module.source || *declaration_span != function.name_span
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+            { return None; }
+            let leaf = calls.function_body(ordinal, item, None)?;
+            if !leaf.checker_pure_calling_frame() || leaf.contextual_formal().is_some() || !leaf.callable_escapes.is_empty()
+                || !leaf.structure.module_storage_uses.is_empty() || !leaf.conditionals.is_empty()
+            { return None; }
+            let [formal] = leaf.boundary.parameters.as_slice() else { return None; };
+            let [binding] = leaf.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+            if &formal.ty != input || !matches!(leaf.boundary.results.as_slice(), [result] if &result.ty == output)
+            { return None; }
+            let root = leaf.structure.root;
+            let block = leaf.structure.blocks.get(root.0)?;
+            let [item] = block.items.as_slice() else { return None; };
+            let BlockItemKind::FinalOutput(final_slot) = item.kind else { return None; };
+            if block.unsafe_context || final_slot.output != 0
+                || leaf.structure.edges.get(&(OccurrenceParent::Block(root), OccurrenceEdge::FinalOutput {
+                    item: final_slot.item, output: 0,
+                })) != Some(&OccurrenceNode::Expression(final_slot.expression))
+            { return None; }
+            let [only_call] = leaf.call_occurrences.as_slice() else { return None; };
+            if only_call.ordinal != final_slot.expression { return None; }
+            let (forwarded, forwarded_ty, returned) = typed_signed_float_tail_site(leaf, final_slot.expression)?;
+            convert(leaf, final_slot.expression)?;
+            if forwarded_ty != input || returned != output
+                || !matches!(leaf.prepared_plain_name(forwarded), Some(PlainNameIdentity::Lexical(actual)) if actual == binding)
+            { return None; }
+        }
+        _ => return None,
+    }
+    Some(super::checker_flow::ClosedSignedFloatTail { site, argument, input: input.clone() })
+}
+
+#[cfg(feature = "internal-checker")]
+fn typed_signed_float_tail_site(body: &FunctionCallSites, call: OccurrenceOrdinal)
+    -> Option<(OccurrenceOrdinal, &ScalarType, &ScalarType)>
+{
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
+    let signature = body.checked_call_signatures.get(&call)?;
+    let [input] = signature.parameters.as_slice() else { return None; };
+    let [output] = signature.outputs.outputs.as_slice() else { return None; };
+    if !matches!(input, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)
+        || !matches!(output.ty, ScalarType::F32 | ScalarType::F64)
+        || body.structure.checked_types.expressions.get(&call)? != &output.ty
+    { return None; }
+    let OccurrenceNode::Expression(argument) = body.structure.edges.get(&(
+        OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
+    ))? else { return None; };
+    (body.structure.checked_types.expressions.get(argument)? == input).then_some((*argument, input, &output.ty))
 }
 
 #[cfg(feature = "internal-checker")]
 fn search_closed_dormant_float(
-    body: &FunctionCallSites, work: &std::cell::Cell<usize>,
+    body: &FunctionCallSites, plan: &[super::checker_flow::ClosedSignedFloatTail], work: &std::cell::Cell<usize>,
     select: impl FnMut(IntegerCheckFailure<'_>, Vec<super::checker_flow::CallableHistoryStep>) -> Option<bool>,
 ) -> Option<super::checker_flow::CallableHistoryCompletion> {
     let mut spent = work.get();
@@ -11145,7 +11232,7 @@ fn search_closed_dormant_float(
     work.set(spent);
     let (completion, _) = super::checker_flow::search_callable_history_frame(
         body, IntegerRequirementEntry::Arbitrary, work, None, false,
-        super::checker_flow::HistoryFrameEffects::ClosedFloatRoot, None, select,
+        super::checker_flow::HistoryFrameEffects::ClosedFloatRoot(plan), None, select,
     )?;
     Some(completion)
 }
@@ -11548,8 +11635,8 @@ fn collect_unreached_authored_paths(
         let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
             observed: &nested_active, record: &record };
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
-        let result = if closed_dormant_float_root(body) {
-            search_closed_dormant_float(body, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
+        let result = if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body) {
+            search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
         } else {
             graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[]).map(|(completion, _)| completion)
         }.ok_or(ProjectCheck::Unsupported)?;
@@ -18662,7 +18749,7 @@ mod tests {
             let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
                 vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
                 ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
-            ).ok().unwrap();
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}\n{program}"));
             let good = text("count>=2 && count<=10");
             let wrong = text("(count>=3 || key!=19) && count<=10");
             let (positive, _) = prepare(&good).run_private_authored_root(NonZeroUsize::MIN).unwrap();
@@ -18673,6 +18760,34 @@ mod tests {
             for (axis, value) in [19, -1, 0].into_iter().enumerate() {
                 let value = BigInt::from(value);
                 assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+            }
+            let direct_good = good.replace("2.0", "core.sint_to_float<f32>(count)");
+            let direct_bad = wrong.replace("2.0", "core.sint_to_float<f32>(count)");
+            let with_wrapper = |program: &str, body: &str| program.replace("%%start", &format!(
+                "%%start f32(i32) float_i = fn(value) {{ {body} }};"
+            )).replace("2.0", "float_i(count)");
+            let wrapped_good = with_wrapper(&good, "core.sint_to_float<f32>(value)");
+            let wrapped_bad = with_wrapper(&wrong, "core.sint_to_float<f32>(value)");
+            for program in [&direct_good, &wrapped_good] {
+                let (receipt, _) = prepare(program).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert!(receipt.active && receipt.directives.is_empty());
+                assert!(prepare(program).run().unwrap().directives.is_empty());
+            }
+            for program in [&direct_bad, &wrapped_bad] {
+                let (receipt, _) = prepare(program).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(receipt.directives, prepare(program).run().unwrap().directives);
+                let [failure] = receipt.directives.as_slice() else { panic!("one false route-count claim through conversion"); };
+                let key = BigInt::from(19);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&key, &key)]));
+            }
+            for refused in [
+                with_wrapper(&good, "if (value>=0) { 0.0 } else { 1.0 }"),
+                with_wrapper(&good, &format!("core.require(true, {OUTPUT}); core.sint_to_float<f32>(value)")),
+            ] {
+                assert!(matches!(prepare(&refused).run_private_authored_root(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(matches!(prepare(&refused).run(),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
     }

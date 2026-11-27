@@ -158,6 +158,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn discards_closed_float_output(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
+    fn closed_signed_float_tail(self, _: OccurrenceOrdinal) -> Option<&'a ClosedSignedFloatTail> { None }
+    #[cfg(feature = "internal-checker")]
     fn allows_context_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
@@ -329,18 +331,29 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-pub(super) enum HistoryFrameEffects { None, Snapshot, LexicalContext, ClosedFloatRoot }
+pub(super) enum HistoryFrameEffects<'a> { None, Snapshot, LexicalContext, ClosedFloatRoot(&'a [ClosedSignedFloatTail]) }
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ClosedSignedFloatTail {
+    pub(super) site: OccurrenceOrdinal,
+    pub(super) argument: OccurrenceOrdinal,
+    pub(super) input: ScalarType,
+}
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>, HistoryFrameEffects);
+struct TrackCallableHistory<'a>(&'a std::cell::RefCell<CallableHistories<'a>>, HistoryFrameEffects<'a>);
 
 #[cfg(feature = "internal-checker")]
 impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     const ENABLED: bool = false;
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
     fn allows_snapshot_history(self) -> bool { matches!(self.1, HistoryFrameEffects::Snapshot) }
-    fn discards_closed_float_output(self) -> bool { matches!(self.1, HistoryFrameEffects::ClosedFloatRoot) }
+    fn discards_closed_float_output(self) -> bool { matches!(self.1, HistoryFrameEffects::ClosedFloatRoot(_)) }
+    fn closed_signed_float_tail(self, site: OccurrenceOrdinal) -> Option<&'a ClosedSignedFloatTail> {
+        let HistoryFrameEffects::ClosedFloatRoot(effects) = self.1 else { return None; };
+        effects.binary_search_by_key(&site.0, |effect| effect.site.0).ok().and_then(|index| effects.get(index))
+    }
     fn allows_context_history(self) -> bool { matches!(self.1, HistoryFrameEffects::LexicalContext) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
@@ -3795,7 +3808,7 @@ pub(super) fn search_closed_callable_histories(
 #[cfg(feature = "internal-checker")]
 pub(super) fn search_callable_history_frame(
     calls: &FunctionCallSites, entry: IntegerRequirementEntry<'_>, work: &std::cell::Cell<usize>,
-    step_owner: Option<usize>, capture_unit: bool, frame_effects: HistoryFrameEffects, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
+    step_owner: Option<usize>, capture_unit: bool, frame_effects: HistoryFrameEffects<'_>, mut nested: Option<&mut CallableHistoryCallHandler<'_>>,
     mut select: impl FnMut(IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
 ) -> Option<(CallableHistoryCompletion, Vec<UnitHistoryPiece>)> {
     if capture_unit && (!calls.checker_returns_unit() || !(1..=2).contains(&calls.boundary.parameters.len())) { return None; }
@@ -8647,11 +8660,22 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if authored_return.discards_closed_float_output()
                     && tail == Some(ty) && matches!(ty, ScalarType::F32 | ScalarType::F64)
                 {
-                    if returns.is_some() || SUSPEND_CALL || !structure.checker_literal_float_outputs.contains(&slot.expression)
+                    if returns.is_some() || SUSPEND_CALL
                         || structure.edges.get(&(OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput {
                             item: slot.item, output: 0,
                         })) != Some(&OccurrenceNode::Expression(slot.expression))
                     { return None; }
+                    if !structure.checker_literal_float_outputs.contains(&slot.expression) {
+                        let conversion = authored_return.closed_signed_float_tail(slot.expression)?;
+                        let work = roots.ordinary_local_work.get_or_insert(0);
+                        charge_call_work(work, 12)?;
+                        if scalar_call_literal(structure, conversion.argument, &conversion.input, false).is_none() {
+                            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(conversion.argument)?
+                                else { return None; };
+                            let (_, ty) = roots.lookup(binding)?;
+                            if ty != &conversion.input { return None; }
+                        }
+                    }
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
                 }
