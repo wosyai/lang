@@ -170,14 +170,23 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
         assert annotated[name]["root"] != initial[name]["root"]
         assert annotated[name]["executable_partition_digest"] == initial[name]["executable_partition_digest"]
         assert annotated[name]["partition"] == initial[name]["partition"]
+    child.write_text(child.read_text().replace("i32 calls", "# WHY: inserted annotation\ni32 calls"))
+    call("stage")
+    call("submit-pending", "short_circuit_project", "src/main.w")
+    inserted = executable_plans()
+    for name in initial:
+        assert inserted[name]["root"] != annotated[name]["root"]
+        assert inserted[name]["executable_partition_digest"] == annotated[name]["executable_partition_digest"]
+        assert inserted[name]["partition"] == annotated[name]["partition"]
     child.write_text(child.read_text().replace("calls + 1", "calls + 2"))
+    entry.write_text(entry.read_text().replace("fn { 42 }", "fn { 43 }"))
     call("stage")
     call("submit-pending", "short_circuit_project", "src/main.w")
     changed = executable_plans()
     assert not executable.exists()
     for name, runner, magic in (("dev", "native", b"\x7fELF"), ("wasm", "wasmtime", b"\x00asm")):
         plan = changed[name]
-        assert plan["executable_partition_digest"] != annotated[name]["executable_partition_digest"]
+        assert plan["executable_partition_digest"] != inserted[name]["executable_partition_digest"]
         partition, output, pending_manifest, runtime = map(Path, plan["arguments"])
         assert output == executable
         output.mkdir()
@@ -192,7 +201,7 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
         if name == "wasm":
             export = subprocess.check_output(["wasmtime", "run", "--invoke", "fixture_answer", output / "main"],
                                              timeout=30)
-            assert export.strip() == b"42"
+            assert export.strip() == b"43"
         shutil.rmtree(output)
-    print("V3: comment-only revision preserves normalized bytes and digest; code change alters digest;"
+    print("V3: comment body edit and comment line insertion preserve normalized bytes and digest; code change alters digest;"
           " disposable Native64 and WASI link and run; no publication.")

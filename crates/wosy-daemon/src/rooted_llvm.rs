@@ -39,11 +39,18 @@ impl RootedLlvmIdentity {
         }
     }
 
-    fn owner(self, authored: SourceIdentity, executable: NodeId) -> (SourceIdentity, Option<SourceIdentity>) {
+    fn owner(self, authored: SourceIdentity, executable: NodeId, stable_symbols: bool) -> (SourceIdentity, Option<SourceIdentity>) {
         match self {
             Self::Authored => (authored, None),
             Self::Executable => (
-                SourceIdentity { revision: executable.hex(), ..authored.clone() }, Some(authored),
+                SourceIdentity { revision: if stable_symbols {
+                    // A framed V3 partition has one admitted source per
+                    // project/package/path. The emitter already encodes
+                    // package and path; use the slot's project, not a CST
+                    // revision, for its remaining symbol component.
+                    NodeId(blake3::derive_key("wosy LLVM v3 project symbol scope", authored.project.as_bytes())).hex()
+                } else { executable.hex() },
+                ..authored.clone() }, Some(authored),
             ),
         }
     }
@@ -115,6 +122,7 @@ pub(super) struct ScalarPlan {
     workspace: String,
     order: RootedOrder,
     receipt_key: Option<ExecutableLlvmKey>,
+    stable_symbols: bool,
 }
 
 pub(super) struct ScalarObservation<T> {
@@ -240,7 +248,11 @@ impl SourceStore {
         let identity = if executable { RootedLlvmIdentity::Executable } else { RootedLlvmIdentity::Authored };
         let (answer, builder) = match self.plan_scalar(&tx, grant.root, profile, limits, identity)? {
             ScalarPlanning::Unsupported(reason) => (RootedLlvmProjection::Unsupported(reason), None),
-            ScalarPlanning::Ready(plan) => {
+            ScalarPlanning::Ready(mut plan) => {
+                // Only framed experimental V3 uses new symbol identities.
+                // Do not look up or install internal executable receipts.
+                plan.stable_symbols = executable;
+                plan.receipt_key = None;
                 let witness = if builder_inputs {
                     let runtime = wosy_compiler::core_runtime(&plan.backend, &plan.output)?;
                     Some(OrdinaryLlvmBuilderWitness {
@@ -341,7 +353,7 @@ impl SourceStore {
         let layout = ScalarTargetLayout { pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment };
         Ok(ScalarPlanning::Ready(ScalarPlan {
             root, profile, exports: artifact.exports, backend: artifact.backend, output: artifact.output, layout,
-            parser: config.parser, identity, image, workspace, order, receipt_key,
+            parser: config.parser, identity, image, workspace, order, receipt_key, stable_symbols: false,
         }))
     }
 
@@ -397,7 +409,7 @@ impl SourceStore {
         use RootedLlvmRejection as Rejection;
         use RootedLlvmUnsupported as Unsupported;
 
-        let ScalarPlan { root, profile, layout, parser, identity, image, workspace, order, .. } = plan;
+        let ScalarPlan { root, profile, layout, parser, identity, image, workspace, order, stable_symbols, .. } = plan;
         let policy = parser.id();
         let module_count = order.modules.len();
         let mut grammar_verification = Duration::ZERO;
@@ -420,7 +432,7 @@ impl SourceStore {
                 return complete(ScalarOutcome::Unsupported(Unsupported::LegacySourcePath), 0, Duration::ZERO);
             }
             if !cache_hit {
-                let (owner, authored) = identity.owner(file_source(&module.file)?, module.file.executable);
+                let (owner, authored) = identity.owner(file_source(&module.file)?, module.file.executable, stable_symbols);
                 owners.push(owner);
                 original_owners.extend(authored);
             }
@@ -455,7 +467,10 @@ impl SourceStore {
             if cache_hit { continue; }
             let owner = &owners[ordinal];
             let selected = if let Some(original) = original_owners.next() {
-                authored_sources.insert(owner.clone(), (original, AuthoredSpanMap::from_comments(&checked.comments)));
+                let previous = authored_sources.insert(owner.clone(), (original, AuthoredSpanMap::from_comments(&checked.comments)));
+                if stable_symbols && previous.is_some() {
+                    return Err("executable LLVM selected two sources for one module identity".into());
+                }
                 checked.executable.ok_or("leased source has no executable CST")?
             } else {
                 let tree = checked.authored.ok_or("leased source has no authored CST")?;
