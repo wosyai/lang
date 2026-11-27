@@ -10,14 +10,14 @@ use super::{
 use super::super::{
     derive_scalar_declarations_from_cst, derive_scalar_declarations_with_embedding,
     typecheck::is_null_expression, EmbeddedComptimeExpression, ScalarNamespaceBinding, ScalarProject,
-    ScalarStructFieldId, ScalarStructId, ScalarStructLiteralField,
+    ScalarStruct, ScalarStructFieldId, ScalarStructId, ScalarStructLiteralField,
 };
 use crate::llvm::{emit_scalar_build_wasip1_comptime_stdout, Wasip1ComptimeOutput};
 use crate::{
     emit_scalar_build_project_artifact_llvm, emit_scalar_build_single_module_artifact_llvm, LlvmPartition,
     ScalarBlock, ScalarFunction, ScalarOutput, ScalarOutputSequence, UnaryOperator,
 };
-use std::{collections::HashMap, fmt, io::{self, Write}, sync::Arc};
+use std::{collections::HashMap, fmt, io::{self, Write}};
 use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceIdentity, SourceSpan, SyntaxKind};
 
 // Bound recursive AST representation as well as the parser's stack.
@@ -30,7 +30,7 @@ use literal::LiteralStdout;
 pub struct PreparedComptimeStdout {
     site: SourceSpan,
     result_type: ScalarType,
-    shape: Arc<Shape>,
+    shape: ShapePlan,
     literal: Option<LiteralStdout>,
 }
 
@@ -40,8 +40,8 @@ enum Shape {
     I32,
     U32,
     Utf8,
-    Array { count: usize, element: Arc<Shape> },
-    Struct(Vec<(String, Arc<Shape>)>),
+    Array { count: usize, element: usize },
+    Struct(Vec<(String, usize)>),
 }
 
 impl Shape {
@@ -318,9 +318,9 @@ fn prepare(
         (&binding.declared_type, literal_body)
     };
     let mut text_fields = matches!(delivery, Delivery::Wasip1 { .. }).then(HashMap::new);
-    let (shape, _) = shape_for(project, result_type, &mut HashMap::new(), &mut text_fields, 0)
+    let shape = shape_for(project, result_type, &mut text_fields, Some(MAX_VALUE_DEPTH))
         .ok_or_else(|| unsupported("unsupported resolved comptime stdout type"))?;
-    let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, value));
+    let literal = literal_body.and_then(|value| LiteralStdout::from_checked(&shape, shape.root, value));
     let llvm = match delivery {
         Delivery::Observe => None,
         Delivery::Detached => Some(if project.modules.len() == 1 {
@@ -382,54 +382,106 @@ fn closed_evaluator_body(body: &ScalarBlock) -> Option<ClosedBodyFacts> {
     Some(facts)
 }
 
+/// Nodes own only IDs of earlier nodes, so shared nominal subshapes
+/// need one row and dropping even a deep plan does not recurse.
+#[derive(Debug)]
+struct ShapePlan {
+    nodes: Vec<Shape>,
+    root: usize,
+}
+
+impl ShapePlan {
+    fn scalar(shape: Shape) -> Self {
+        Self { nodes: vec![shape], root: 0 }
+    }
+}
+
 fn shape_for<'a>(
-    project: &'a ScalarProject, ty: &ScalarType,
-    memo: &mut HashMap<ScalarStructId, (Arc<Shape>, usize)>,
+    project: &'a ScalarProject, ty: &'a ScalarType,
     text_fields: &mut Option<HashMap<ScalarStructId, [&'a ScalarStructFieldId; 2]>>,
-    depth: usize,
-) -> Option<(Arc<Shape>, usize)> {
-    if depth > MAX_VALUE_DEPTH { return None; }
-    if let Some(shape) = Shape::scalar(ty) { return Some((Arc::new(shape), 0)); }
-    let (kind, height) = match ty {
-        ScalarType::Array { element, length, .. } => {
-            let (element, child_height) = shape_for(project, element, memo, text_fields, depth + 1)?;
-            (Shape::Array { count: usize::try_from(*length).ok()?, element }, child_height + 1)
-        }
-        ScalarType::Struct(id) => {
-            if let Some((shape, height)) = memo.get(id) {
-                return (depth + height <= MAX_VALUE_DEPTH).then(|| (shape.clone(), *height));
+    max_depth: Option<usize>,
+) -> Option<ShapePlan> {
+    enum Task<'a> {
+        Enter(&'a ScalarType, usize),
+        Array(usize),
+        Struct(&'a ScalarStruct),
+    }
+    enum Visit { Active, Complete(usize, usize) }
+    let mut nodes = Vec::new();
+    let mut results = Vec::new();
+    let mut memo = HashMap::new();
+    let structs: HashMap<_, _> = project.modules.iter().flat_map(|module| &module.structs)
+        .map(|structure| (&structure.id, structure)).collect();
+    let mut tasks = vec![Task::Enter(ty, 0)];
+    while let Some(task) = tasks.pop() {
+        let (shape, height, complete) = match task {
+            Task::Enter(ty, depth) => {
+                if max_depth.is_some_and(|max| depth > max) { return None; }
+                if let Some(shape) = Shape::scalar(ty) {
+                    (shape, 0, None)
+                } else {
+                    match ty {
+                        ScalarType::Array { element, length, .. } => {
+                            tasks.push(Task::Array(usize::try_from(*length).ok()?));
+                            tasks.push(Task::Enter(element, depth + 1));
+                            continue;
+                        }
+                        ScalarType::Struct(id) => {
+                            match memo.get(id) {
+                                Some(Visit::Active) => return None,
+                                Some(&Visit::Complete(index, height)) => {
+                                    if max_depth.is_some_and(|max| height > max - depth) { return None; }
+                                    results.push((index, height));
+                                    continue;
+                                }
+                                None => {}
+                            }
+                            let structure = *structs.get(id)?;
+                            if id.source.package == "std" && structure.name == "utf8" {
+                                // The resolved standard text declaration, not a
+                                // same-spelled user struct or native bytes.
+                                let [data, length] = structure.fields.as_slice() else { return None; };
+                                if data.name != "data" || length.name != "length"
+                                    || !matches!(&data.ty, ScalarType::RawPointer(element) if **element == ScalarType::U8)
+                                    || length.ty != ScalarType::U64
+                                { return None; }
+                                if let Some(fields) = text_fields {
+                                    fields.insert(id.clone(), [&data.id, &length.id]);
+                                }
+                                (Shape::Utf8, 0, Some(&structure.id))
+                            } else {
+                                memo.insert(&structure.id, Visit::Active);
+                                tasks.push(Task::Struct(structure));
+                                tasks.extend(structure.fields.iter().rev().map(|field| Task::Enter(&field.ty, depth + 1)));
+                                continue;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
             }
-            let structure = project.modules.iter().find(|module| module.source == id.source)?
-                .structs.iter().find(|structure| structure.id == *id)?;
-            let (shape, height) = if id.source.package == "std" && structure.name == "utf8" {
-                // The resolved standard text declaration, not a same-spelled
-                // user struct or bytes of its native memory layout.
-                let [data, length] = structure.fields.as_slice() else { return None; };
-                if data.name != "data" || length.name != "length"
-                    || !matches!(&data.ty, ScalarType::RawPointer(element) if **element == ScalarType::U8)
-                    || length.ty != ScalarType::U64
-                { return None; }
-                if let Some(fields) = text_fields {
-                    fields.insert(id.clone(), [&data.id, &length.id]);
-                }
-                (Shape::Utf8, 0)
-            } else {
+            Task::Array(count) => {
+                let (element, height) = results.pop()?;
+                (Shape::Array { count, element }, height + 1, None)
+            }
+            Task::Struct(structure) => {
+                let first = results.len().checked_sub(structure.fields.len())?;
                 let mut height = 0;
-                let mut fields = Vec::with_capacity(structure.fields.len());
-                for field in &structure.fields {
-                    let (shape, child_height) = shape_for(project, &field.ty, memo, text_fields, depth + 1)?;
-                    height = height.max(child_height + 1);
-                    fields.push((field.name.clone(), shape));
-                }
-                (Shape::Struct(fields), height)
-            };
-            let shape = Arc::new(shape);
-            memo.insert(id.clone(), (shape.clone(), height));
-            return Some((shape, height));
-        }
-        _ => return None,
-    };
-    Some((Arc::new(kind), height))
+                let fields = structure.fields.iter().zip(results.drain(first..))
+                    .map(|(field, (index, child_height))| {
+                        height = height.max(child_height + 1);
+                        (field.name.clone(), index)
+                    }).collect();
+                (Shape::Struct(fields), height, Some(&structure.id))
+            }
+        };
+        let index = nodes.len();
+        if let Some(id) = complete { memo.insert(id, Visit::Complete(index, height)); }
+        nodes.push(shape);
+        results.push((index, height));
+    }
+    let [(root, _)] = results.as_slice() else { return None; };
+    Some(ShapePlan { nodes, root: *root })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -489,15 +541,15 @@ impl BoundedStartupWasip1Evaluator {
 
 fn parse_scalar(ty: &ScalarType, span: ByteSpan, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
     let shape = Shape::scalar(ty).ok_or(ComptimeStdoutError::UnsupportedResultType)?;
-    parse(&shape, span, stdout, max_bytes)
+    parse(&ShapePlan::scalar(shape), span, stdout, max_bytes)
 }
 
-fn parse(shape: &Shape, span: ByteSpan, stdout: &[u8], budget: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
+fn parse(shape: &ShapePlan, span: ByteSpan, stdout: &[u8], budget: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
     use ComptimeStdoutError as Error;
     if stdout.len() > budget { return Err(Error::ByteLimit); }
     let line = stdout.strip_suffix(b"\n").ok_or(Error::NonCanonical)?;
     let mut parser = Parser { input: line, span, field_bytes: budget };
-    let value = parser.value(shape)?;
+    let value = parser.value(shape, shape.root)?;
     if !parser.input.is_empty() { return Err(Error::NonCanonical); }
     Ok(value)
 }
@@ -516,10 +568,10 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn value(&mut self, shape: &Shape) -> Result<ScalarExpression, ComptimeStdoutError> {
+    fn value(&mut self, plan: &ShapePlan, index: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
         use ComptimeStdoutError as Error;
         let span = self.span;
-        match shape {
+        match &plan.nodes[index] {
             Shape::Bool => {
                 let value = if self.input.starts_with(b"true") {
                     self.eat(b"true")?;
@@ -544,7 +596,7 @@ impl Parser<'_> {
                 let mut elements = Vec::new();
                 for index in 0..*count {
                     if index != 0 { self.eat(b",")?; }
-                    elements.push(self.value(element)?);
+                    elements.push(self.value(plan, *element)?);
                 }
                 self.eat(b"]")?;
                 Ok(ScalarExpression::ArrayLiteral { elements, span })
@@ -554,7 +606,7 @@ impl Parser<'_> {
                 let mut fields = Vec::new();
                 for (index, (name, shape)) in expected.iter().enumerate() {
                     if index != 0 { self.eat(b",")?; }
-                    let value = self.value(shape)?;
+                    let value = self.value(plan, *shape)?;
                     self.field_bytes = self.field_bytes.checked_sub(name.len()).ok_or(Error::ByteLimit)?;
                     fields.push(ScalarStructLiteralField { name: name.clone(), name_span: span, span, value });
                 }
@@ -687,6 +739,43 @@ mod continuation_tests {
                 (derive_scalar_declarations_with_embedding(fresh.result().canonical_cst(), embedding), namespaces)
             }).collect();
             analyze(declarations, owner.order)
+        }
+    }
+
+    #[test]
+    fn shape_plan_keeps_deep_checked_declarations_as_flat_shared_rows() {
+        use std::fmt::Write;
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let mut source = "%%start\nstruct copy Level0 { u32 value; }\n".to_owned();
+            for index in 1..72 {
+                writeln!(source, "struct copy Level{index} {{ Level{} first; }}", index - 1).unwrap();
+            }
+            source.push_str("struct copy Top { Level71 first; Level71 second; }\n%%end\n");
+            let fresh = authored(source);
+            let identity = fresh.result().source.clone();
+            let prepared = prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(fresh.result().canonical_cst()), Vec::new())],
+                vec![identity], ScalarPreparationInputs { target_layout: layout },
+            ).unwrap_or_else(|error| panic!("{:?}", error.into_ordered_diagnostics()));
+            let project = prepared.project();
+            let top = project.modules[0].structs.iter().find(|structure| structure.name == "Top").unwrap();
+            let ty = ScalarType::Struct(top.id.clone());
+            assert!(shape_for(project, &ty, &mut None, Some(MAX_VALUE_DEPTH)).is_none());
+            let plan = shape_for(project, &ty, &mut None, None).expect("finite resolved nominal shape");
+            assert_eq!(plan.nodes.len(), 74); // one scalar and 73 declarations
+            let Shape::Struct(fields) = &plan.nodes[plan.root] else { panic!("Top shape"); };
+            let [(first, first_index), (second, second_index)] = fields.as_slice() else { panic!("Top fields"); };
+            assert_eq!((first.as_str(), second.as_str()), ("first", "second"));
+            assert_eq!(first_index, second_index);
+            let mut cursor = *first_index;
+            for index in (0..72).rev() {
+                let Shape::Struct(fields) = &plan.nodes[cursor] else { panic!("Level{index} shape"); };
+                let [(name, child)] = fields.as_slice() else { panic!("single field"); };
+                assert_eq!(name, if index == 0 { "value" } else { "first" });
+                assert!(*child < cursor);
+                cursor = *child;
+            }
+            assert!(matches!(plan.nodes[cursor], Shape::U32));
         }
     }
 

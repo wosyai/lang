@@ -1,5 +1,5 @@
 //! Canonical producer for already ordinary-checked closed literal values.
-use super::Shape;
+use super::{Shape, ShapePlan};
 use crate::{ScalarExpression, UnaryOperator};
 use std::{collections::HashMap, io::{self, Write}};
 
@@ -15,9 +15,9 @@ pub(super) enum LiteralStdout {
 impl LiteralStdout {
     /// A producer for literals, never a second evaluator. The ordinary
     /// compiler already checked the exact expected type and all fields.
-    pub(super) fn from_checked(shape: &Shape, expr: &ScalarExpression) -> Option<Self> {
+    pub(super) fn from_checked(plan: &ShapePlan, index: usize, expr: &ScalarExpression) -> Option<Self> {
         use ScalarExpression as Expr;
-        match (shape, expr) {
+        match (&plan.nodes[index], expr) {
             (Shape::Bool, Expr::Boolean { value, .. }) => Some(Self::Bool(*value)),
             (Shape::I32, Expr::Integer { value, .. }) => i32::try_from(value).ok().map(Self::I32),
             (Shape::I32, Expr::Unary { operator: UnaryOperator::Negate, operand, .. }) => {
@@ -28,12 +28,12 @@ impl LiteralStdout {
             (Shape::U32, Expr::Integer { value, .. }) => u32::try_from(value).ok().map(Self::U32),
             (Shape::Utf8, Expr::Utf8 { value, .. }) => Some(Self::Utf8(value.clone())),
             (Shape::Array { element, .. }, Expr::ArrayLiteral { elements, .. }) => elements.iter()
-                .map(|value| Self::from_checked(element, value)).collect::<Option<_>>().map(Self::Collection),
+                .map(|value| Self::from_checked(plan, *element, value)).collect::<Option<_>>().map(Self::Collection),
             (Shape::Struct(expected), Expr::StructLiteral { fields, .. }) => {
                 // The source may designate fields in any order. The output
                 // always uses the already resolved declaration order.
                 let values: HashMap<_, _> = fields.iter().map(|field| (field.name.as_str(), &field.value)).collect();
-                expected.iter().map(|(name, ty)| Self::from_checked(ty, values.get(name.as_str())?))
+                expected.iter().map(|(name, ty)| Self::from_checked(plan, *ty, values.get(name.as_str())?))
                     .collect::<Option<_>>().map(Self::Collection)
             }
             _ => None,
