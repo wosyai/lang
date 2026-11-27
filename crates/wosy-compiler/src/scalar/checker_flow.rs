@@ -1651,6 +1651,16 @@ enum AffineOverwrite {
     Replace(Option<Rc<IntegerAffineAxes>>),
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClosedRadixAxes {
+    input: usize,
+    quotient: Option<usize>,
+    remainder: Option<usize>,
+    radix: BigInt,
+    domain: Rc<IntegerSet>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
@@ -1660,12 +1670,16 @@ struct IntegerRow {
     projected_from: u16,
     #[cfg(feature = "internal-checker")]
     callable_history: usize,
+    #[cfg(feature = "internal-checker")]
+    closed_radix: Option<Rc<ClosedRadixAxes>>,
 }
 
 impl IntegerRow {
     fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, affine: None, entry: None, projected_from: 0,
         #[cfg(feature = "internal-checker")]
         callable_history: 0,
+        #[cfg(feature = "internal-checker")]
+        closed_radix: None,
     } }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
@@ -1764,6 +1778,13 @@ impl IntegerRow {
             }
         }
         self.replace_equal_group(canonical, set);
+    }
+
+    fn has_closed_radix(&self) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { self.closed_radix.is_some() }
+        #[cfg(not(feature = "internal-checker"))]
+        { false }
     }
 
     fn linked_axes(&self, first: usize, second: usize) -> bool {
@@ -2569,7 +2590,7 @@ impl IntegerInputs {
             let left = &mut self.0[0];
             let right = &other.0[0];
             let canonical = left.canonical_axis(axis);
-            if left.affine.is_none() && right.affine.is_none()
+            if left.affine.is_none() && right.affine.is_none() && !left.has_closed_radix() && !right.has_closed_radix()
                 && left.projected_from == right.projected_from && left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
                 left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
@@ -2628,7 +2649,7 @@ impl IntegerInputs {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
         for row in rows {
-            if row.affine.is_some() {
+            if row.affine.is_some() || row.has_closed_radix() {
                 joined.0.push(row);
                 continue;
             }
@@ -6958,9 +6979,9 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         parameters: boundary.parameters.len(),
         proof_reflexive_branches,
         #[cfg(feature = "internal-checker")]
-        allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
+        allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS || authored_return.discards_closed_float_output(),
         #[cfg(feature = "internal-checker")]
-        allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals(),
+        allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals() || authored_return.discards_closed_float_output(),
         #[cfg(feature = "internal-checker")]
         allow_symbolic_contextual_bool: COLLECT && !USE_IMPORTED_BOUND
             && authored_return.allows_extended_scalar_locals() && calls.structure.checker_has_bool_contextual_declaration,
@@ -6973,7 +6994,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             && calls.structure.has_ordinary_contextual_places(),
         #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: ((Authored::ALLOW_ORDINARY_INTEGER_LOCALS
-            || authored_return.allows_imported_condition_comparisons())
+            || authored_return.discards_closed_float_output() || authored_return.allows_imported_condition_comparisons())
             && calls.structure.has_ordinary_predicates()).then_some(0),
         #[cfg(feature = "internal-checker")]
         symbolic_context_work: Authored::OBSERVE_FIXED_ARRAY.then_some(0),
@@ -7832,6 +7853,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     let structure = &calls.structure;
     loop {
         #[cfg(feature = "internal-checker")]
+        if authored_return.discards_closed_float_output() && path.0.iter().any(IntegerRow::has_closed_radix) {
+            path = path.close_radix_rows(roots.ordinary_local_work.get_or_insert(0))?;
+        }
+        #[cfg(feature = "internal-checker")]
         if let Some(work) = &mut roots.symbolic_context_work {
             charge_partition_capture(work, &path, roots.axes.len())?;
         }
@@ -8003,6 +8028,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
+                    // No directive may see an enclosure as an exact row or
+                    // publish a witness assembled from independent marginals.
+                    #[cfg(feature = "internal-checker")]
+                    if authored_return.discards_closed_float_output() && path.0.iter().any(IntegerRow::has_closed_radix) {
+                        return None;
+                    }
                     #[cfg(feature = "internal-checker")]
                     if COLLECT && roots.allow_snapshot_history && directive.operation == CheckerOperation::Narrow
                         && matches!(directive.predicate, Some(CheckerPredicate::DirectiveDisjunction { .. }))
@@ -8076,7 +8107,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         continue;
                     }
                     #[cfg(feature = "internal-checker")]
-                    if COLLECT && roots.ordinary_comparison_work.is_some() {
+                    if COLLECT && roots.ordinary_comparison_work.is_some()
+                        && !(authored_return.discards_closed_float_output() && structure.checker_ordinary_booleans.get(&expression)
+                            .is_some_and(call_free_history_boolean))
+                    {
                         let require = directive.operation == CheckerOperation::Require;
                         if let Some([rejected, accepted]) = path.ordinary_predicate_at(
                             structure, expression, roots, [require, !require],
@@ -9357,8 +9391,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     | AuthoredIntegerOperation::Remainder)
                                 {
                                     if !roots.allow_extended_scalar_locals { return None; }
-                                    path = path.finite_ordinary_calculation(operation, left, right, &receiver.ty,
-                                        FiniteIntegerInstall::Append, roots.ordinary_local_work.get_or_insert(0))?;
+                                    let work = roots.ordinary_local_work.get_or_insert(0);
+                                    if authored_return.discards_closed_float_output() && block == structure.root
+                                        && matches!(operation, AuthoredIntegerOperation::Divide | AuthoredIntegerOperation::Remainder)
+                                        && left.1.is_some_and(|axis| axis < roots.parameters)
+                                        && right.0.is_some_and(|value| value.sign() == num_bigint::Sign::Plus)
+                                        && matches!(receiver.ty, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)
+                                    {
+                                        path = path.bind_closed_radix(operation, left.1?, right.0?, &receiver.ty, work)?;
+                                    } else {
+                                        path = path.finite_ordinary_calculation(operation, left, right, &receiver.ty,
+                                            FiniteIntegerInstall::Append, work)?;
+                                    }
                                 } else {
                                     path.append_ordinary_calculation(operation, left, right, &receiver.ty,
                                         &mut roots.ordinary_local_work, &mut roots.affine_work)?;
@@ -10604,6 +10648,100 @@ enum FiniteIntegerInstall {
 
 #[cfg(feature = "internal-checker")]
 impl IntegerInputs {
+    fn bind_closed_radix(
+        mut self, operation: AuthoredIntegerOperation, input: usize, radix: &BigInt, ty: &ScalarType, work: &mut usize,
+    ) -> Option<Self> {
+        let (min, max) = super::typecheck::integer_bounds(ty)?;
+        let domain = Rc::new(IntegerSet::closed_interval(min.clone(), max.clone())?);
+        charge_call_work(work, self.0.len().checked_mul(5)?.checked_add(1)?)?;
+        for row in &mut self.0 {
+            if row.entry.is_some() || row.affine.is_some() { return None; }
+            if let Some(exact) = row.get(input)?.singleton_value() {
+                let value = operation.apply(Cow::Borrowed(exact), Cow::Borrowed(radix), &min, &max)?;
+                row.push(Rc::new(IntegerSet::singleton(&value)));
+                continue;
+            }
+            let output = row.len();
+            let relation = row.closed_radix.get_or_insert_with(|| Rc::new(ClosedRadixAxes {
+                input, quotient: None, remainder: None, radix: radix.clone(), domain: Rc::clone(&domain),
+            }));
+            let relation = Rc::make_mut(relation);
+            if relation.input != input || &relation.radix != radix || relation.domain != domain { return None; }
+            let previous = match operation {
+                AuthoredIntegerOperation::Divide => relation.quotient.replace(output),
+                AuthoredIntegerOperation::Remainder => relation.remainder.replace(output),
+                _ => return None,
+            };
+            if previous.is_some() { return None; }
+            row.push(Rc::clone(&domain));
+        }
+        Some(self)
+    }
+
+    fn close_radix_rows(self, work: &mut usize) -> Option<Self> {
+        use super::symbolic_integer::signed_radix_projection;
+        const MAX_MATERIALIZED_RADIX_POINTS: usize = 64;
+        let mut remaining = MAX_MATERIALIZED_RADIX_POINTS;
+        let mut output = Vec::new();
+        for mut row in self.0 {
+            charge_call_work(work, 1)?;
+            let Some(relation) = row.closed_radix.as_ref().cloned() else { output.push(row); continue; };
+            if row.entry.is_some() || row.affine.is_some() { return None; }
+            let read = |axis: Option<usize>| match axis {
+                Some(axis) => row.get(axis).map(|set| set.as_ref()),
+                None => Some(relation.domain.as_ref()),
+            };
+            let Some(projected) = signed_radix_projection(row.get(relation.input)?, read(relation.quotient)?,
+                read(relation.remainder)?, &relation.radix, work)? else { continue; };
+            let input = IntegerSet::closed_interval(projected.first[0].clone(), projected.last[0].clone())?;
+            let input = match row[relation.input].intersection(&input) {
+                IntegerIntersection::Unchanged => Rc::clone(&row[relation.input]),
+                IntegerIntersection::Changed(input) => Rc::new(input),
+                IntegerIntersection::Empty => return None,
+            };
+            let endpoints = [Some(relation.input), relation.quotient, relation.remainder];
+            // All live endpoints denote different original bindings. Ordinary
+            // aliases may constrain a single endpoint, but never equate two.
+            for (i, axis) in endpoints.into_iter().enumerate() {
+                if let Some(axis) = axis {
+                    if endpoints[..i].iter().flatten().any(|other| row.canonical_axis(*other) == row.canonical_axis(axis)) {
+                        return None;
+                    }
+                }
+            }
+            let alias_pass = row.equal_axes().len().checked_add(1)?;
+            charge_call_work(work, alias_pass.checked_mul(3)?)?;
+            row.replace_domain(relation.input, input);
+            if let Some(axis) = relation.quotient { row.replace_domain(axis, Rc::new(projected.quotient)); }
+            if let Some(axis) = relation.remainder { row.replace_domain(axis, Rc::new(projected.remainder)); }
+            let width = (&projected.last[0] - &projected.first[0]) + 1u8;
+            let Ok(width) = usize::try_from(width) else { output.push(row); continue; };
+            if width > remaining { output.push(row); continue; }
+            remaining -= width;
+            let copy_cost = row.len().checked_add(alias_pass.checked_mul(4)?)?.checked_add(5)?;
+            charge_call_work(work, width.checked_mul(copy_cost)?)?;
+            let mut point = projected.first[0].clone();
+            for _ in 0..width {
+                if row[relation.input].contains(&point) {
+                    let quotient = &point / &relation.radix;
+                    let remainder = &point % &relation.radix;
+                    if relation.quotient.is_none_or(|axis| row[axis].contains(&quotient))
+                        && relation.remainder.is_none_or(|axis| row[axis].contains(&remainder))
+                    {
+                        let mut exact = row.clone();
+                        exact.closed_radix = None;
+                        for (axis, value) in endpoints.into_iter().zip([&point, &quotient, &remainder]) {
+                            if let Some(axis) = axis { exact.replace_domain(axis, Rc::new(IntegerSet::singleton(value))); }
+                        }
+                        output.push(exact);
+                    }
+                }
+                point += 1u8;
+            }
+        }
+        Some(Self(output))
+    }
+
     fn finite_ordinary_calculation(
         self, operation: AuthoredIntegerOperation, left: IntegerCalculationOperand<'_>,
         right: IntegerCalculationOperand<'_>, ty: &ScalarType,
@@ -10621,7 +10759,7 @@ impl IntegerInputs {
         let mut remaining = MAX_FINITE_ARITHMETIC_ATOMS;
         let mut output = Vec::new();
         for row in self.0 {
-            if row.affine.is_some() || row.entry.is_some() { return None; }
+            if row.affine.is_some() || row.entry.is_some() || row.has_closed_radix() { return None; }
             let domain = row.get(axis)?;
             charge_call_work(work, 1usize.checked_add(domain.interval_count())?)?;
             let alias_passes = match install { FiniteIntegerInstall::Append => 3, FiniteIntegerInstall::OverwriteSource => 7 };

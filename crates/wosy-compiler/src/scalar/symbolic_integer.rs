@@ -1219,3 +1219,171 @@ mod tests {
         assert_eq!(unchanged, unsigned);
     }
 }
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SignedRadixProjection {
+    pub(super) first: [BigInt; 3],
+    pub(super) last: [BigInt; 3],
+    pub(super) quotient: IntegerSet,
+    pub(super) remainder: IntegerSet,
+}
+
+/// Exact projections onto quotient/remainder and feasible extremal triples.
+/// The input *enclosure* between those triples is not an exact set: callers
+/// must retain this relation when narrowing or selecting a witness.
+#[cfg(feature = "internal-checker")]
+pub(super) fn signed_radix_projection(
+    input: &IntegerSet, quotient: &IntegerSet, remainder: &IntegerSet, radix: &BigInt, work: &mut usize,
+) -> Option<Option<SignedRadixProjection>> {
+    use super::checker_flow::charge_call_work;
+    use num_bigint::Sign;
+    if radix.sign() != Sign::Plus { return None; }
+    let mut first = None::<[BigInt; 3]>;
+    let mut last = None::<[BigInt; 3]>;
+    let mut quotient_components = Vec::new();
+    let mut remainder_components = Vec::new();
+    let zero = BigInt::from(0u8);
+    let minus_one = BigInt::from(-1i8);
+    let residue_max = radix - 1u8;
+    for negative in [false, true] {
+        let (operator, boundary) =
+            if negative { (BinaryOperator::LessEqual, &minus_one) } else { (BinaryOperator::GreaterEqual, &zero) };
+        charge_call_work(work, input.interval_count().checked_add(quotient.interval_count())?
+            .checked_add(remainder.interval_count())?.checked_add(1)?)?;
+        let input = input.keep(&operator, boundary)?.affine_unit(negative, &zero, false);
+        let quotient = quotient.affine_unit(negative, &zero, false);
+        let residues = remainder.affine_unit(negative, &zero, false);
+        let bounded = IntegerSet::closed_interval(zero.clone(), residue_max.clone())?;
+        let residues = match residues.intersection(&bounded) {
+            IntegerIntersection::Unchanged => residues,
+            IntegerIntersection::Changed(set) => set,
+            IntegerIntersection::Empty => continue,
+        };
+        let mut q_component = Vec::new();
+        let mut r_component = Vec::new();
+        for (input_lo, input_hi) in input.intervals() {
+            charge_call_work(work, 1)?;
+            let (ql0, qh0) = (input_lo / radix, input_hi / radix);
+            for (allowed_lo, allowed_hi) in quotient.intervals() {
+                let lookup = residues.interval_count().checked_ilog2().unwrap_or(0) as usize + 1;
+                charge_call_work(work, lookup.checked_mul(4)?.checked_add(1)?)?;
+                let mut ql = ql0.clone().max(allowed_lo.clone());
+                let mut qh = qh0.clone().min(allowed_hi.clone());
+                if ql > qh { continue; }
+                let window = |q: &BigInt| {
+                    let base = q * radix;
+                    let low = (&base).max(input_lo) - &base;
+                    let top = &base + &residue_max;
+                    let high = (&top).min(input_hi) - base;
+                    (low, high)
+                };
+                let (mut low, mut high) = window(&ql);
+                if residues.first_intersection_point(&low, &high).is_none() {
+                    ql += 1u8;
+                    if ql > qh { continue; }
+                    (low, high) = window(&ql);
+                }
+                let Some(rl) = residues.first_intersection_point(&low, &high).cloned() else { continue; };
+                let (mut last_low, mut last_high) = window(&qh);
+                if residues.first_intersection_point(&last_low, &last_high).is_none() {
+                    qh -= 1u8;
+                    if ql > qh { continue; }
+                    (last_low, last_high) = window(&qh);
+                }
+                let rh = last_intersection_point(&residues, &last_low, &last_high)?.clone();
+                q_component.push(IntegerSet::closed_interval(ql.clone(), qh.clone())?);
+
+                let q_distance = &qh - &ql;
+                if q_distance >= BigInt::from(2u8) {
+                    charge_call_work(work, residues.interval_count())?;
+                    r_component.push(residues.clone());
+                } else {
+                    for (low, high) in [(low, high), (last_low, last_high)]
+                        .into_iter().take(if q_distance.sign() == Sign::NoSign { 1 } else { 2 }) {
+                        charge_call_work(work, residues.interval_count())?;
+                        match residues.intersection(&IntegerSet::closed_interval(low, high)?) {
+                            IntegerIntersection::Unchanged => r_component.push(residues.clone()),
+                            IntegerIntersection::Changed(set) => r_component.push(set),
+                            IntegerIntersection::Empty => return None,
+                        }
+                    }
+                }
+                let first_abs = [(&ql * radix) + &rl, ql, rl];
+                let last_abs = [(&qh * radix) + &rh, qh, rh];
+                let (low, high) = if negative { (last_abs.map(|x| -x), first_abs.map(|x| -x)) } else { (first_abs, last_abs) };
+                if first.as_ref().is_none_or(|first| low[0] < first[0]) { first = Some(low); }
+                if last.as_ref().is_none_or(|last| high[0] > last[0]) { last = Some(high); }
+            }
+        }
+        quotient_components.push(metered_radix_union(&q_component, work)?.affine_unit(negative, &zero, false));
+        remainder_components.push(metered_radix_union(&r_component, work)?.affine_unit(negative, &zero, false));
+    }
+    let (Some(first), Some(last)) = (first, last) else { return Some(None); };
+    Some(Some(SignedRadixProjection {
+        first, last,
+        quotient: metered_radix_union(&quotient_components, work)?,
+        remainder: metered_radix_union(&remainder_components, work)?,
+    }))
+}
+
+#[cfg(feature = "internal-checker")]
+fn last_intersection_point<'a>(set: &'a IntegerSet, low: &BigInt, high: &'a BigInt) -> Option<&'a BigInt> {
+    let index = set.0.partition_point(|part| &part.first <= high).checked_sub(1)?;
+    let interval = set.0.get(index)?;
+    (low <= &interval.last).then_some(std::cmp::min(&interval.last, high))
+}
+
+#[cfg(feature = "internal-checker")]
+fn metered_radix_union(components: &[IntegerSet], work: &mut usize) -> Option<IntegerSet> {
+    let n = components.iter().try_fold(0usize, |n, component| n.checked_add(component.interval_count()))?;
+    super::checker_flow::charge_call_work(work, n.checked_mul(n.checked_ilog2().unwrap_or(0) as usize + 1)?.checked_add(1)?)?;
+    Some(IntegerSet::union(components))
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn signed_radix_projection_matches_exact_signed_pairs() {
+    let range = |low, high| IntegerSet::closed_interval(BigInt::from(low), BigInt::from(high)).unwrap();
+    let several = |terms: &[(i32, i32)]| IntegerSet::union(terms.iter().map(|&(low, high)| range(low, high)).collect::<Vec<_>>().iter());
+    for radix in [1, 2, 3, 4, 7] {
+        for input in [several(&[(-31, 32)]), several(&[(-31, -19), (-4, 3), (22, 32)]), range(-11, -2), range(4, 17)] {
+            for quotient in [range(-32, 32), range(-4, -2), range(0, 2), several(&[(-4, -3), (0, 0), (3, 5)])] {
+                for residue in [range(-32, 32), range(-2, 1), range(-4, -1), several(&[(-3, -2), (1, 2)])] {
+                    let expected = (-31..=32).filter_map(|x| {
+                        let values = [x, x / radix, x % radix].map(BigInt::from);
+                        (input.contains(&values[0]) && quotient.contains(&values[1]) && residue.contains(&values[2])).then_some(values)
+                    }).collect::<Vec<_>>();
+                    let mut work = 0;
+                    let found = signed_radix_projection(&input, &quotient, &residue, &BigInt::from(radix), &mut work).unwrap();
+                    if expected.is_empty() { assert!(found.is_none()); continue; }
+                    let found = found.unwrap();
+                    assert_eq!(Some(&found.first), expected.first());
+                    assert_eq!(Some(&found.last), expected.last());
+                    for value in -32..=32 {
+                        let value = BigInt::from(value);
+                        assert_eq!(found.quotient.contains(&value), expected.iter().any(|values| values[1] == value));
+                        assert_eq!(found.remainder.contains(&value), expected.iter().any(|values| values[2] == value));
+                    }
+                }
+            }
+        }
+    }
+    let input = range(i32::MIN, i32::MAX);
+    let quotient = range(1, i32::MAX);
+    let residue = range(2, 2);
+    let mut work = 0;
+    let found = signed_radix_projection(&input, &quotient, &residue, &BigInt::from(16), &mut work).unwrap().unwrap();
+    assert_eq!(found.first, [18, 1, 2].map(BigInt::from));
+    assert_eq!(found.last, [2_147_483_634, 134_217_727, 2].map(BigInt::from));
+    assert!(work < 200);
+    for (divisor, q) in [(1, i32::MIN), (16, -134_217_728)] {
+        let mut work = 0;
+        let expected = [i32::MIN, q, 0].map(BigInt::from);
+        let exact = signed_radix_projection(&input, &range(q, q), &range(0, 0), &BigInt::from(divisor), &mut work)
+            .unwrap().unwrap();
+        assert_eq!(exact.first, expected);
+        assert_eq!(exact.last, expected);
+        assert!(work < 200);
+    }
+    assert!(signed_radix_projection(&input, &quotient, &residue, &BigInt::from(-1), &mut 0).is_none());
+}

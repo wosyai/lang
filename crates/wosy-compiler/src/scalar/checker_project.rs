@@ -18488,6 +18488,150 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_float_integer_locals_preserve_correlated_quotient_and_remainder() {
+        use std::num::NonZeroUsize;
+        // This fixture bounds the key before arithmetic. The unrestricted
+        // signed input is intentionally not covered by finite enumeration.
+        let owner = source("src/main.w", "dormant-float-integer-locals");
+        let text = |claim: &str| format!(r#"%%start
+            f32(i32,i32,i32) routes = fn(key,row,column) {{
+                if (key>=16 && key<=39) {{
+                    i32 route=key/16;
+                    i32 leg=key%16;
+                    i32 previous=leg-1;
+                    i32 start=if (leg>0) {{ previous }} else {{ 0 }};
+                    i32 route_count=if (route==1) {{ 4 }} else {{ 10 }};
+                    if (leg>=route_count) {{ 0.0 }} else {{
+                        if (row==-1 && column==0) {{
+                            i32 count=route_count-start;
+                            core.require({claim}, {OUTPUT});
+                            2.0
+                        }} else {{ 0.0 }}
+                    }}
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        let prepare = |program: &str, target_layout| prepare_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+            ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).ok().unwrap();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let valid = text("count>=2 && count<=10");
+            let unsafe_claim = text("(count>=3 || key!=19) && count<=10");
+            let (valid, _) = prepare(&valid, layout).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(valid.active && valid.directives.is_empty());
+            let (bad, _) = prepare(&unsafe_claim, layout).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let full = prepare(&unsafe_claim, layout).run().unwrap();
+            assert_eq!(bad.directives, full.directives);
+            let [failure] = bad.directives.as_slice() else { panic!("one negative-control failure"); };
+            for (index, value) in [19, -1, 0].into_iter().enumerate() {
+                assert_eq!(failure.witness.axes().nth(index).unwrap().1, &ScalarType::I32);
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, index).unwrap().eq([(&value, &value)]));
+            }
+            let unbounded = text("count>=2").replace("key>=16 && key<=39", "true");
+            assert!(matches!(prepare(&unbounded, layout).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_float_signed_radix_cuts_original_arbitrary_key_before_witness() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-signed-radix");
+        let text = |claim: &str| format!(r#"%%start
+            f32(i32,i32,i32) routes = fn(key,row,column) {{
+                i32 route=key/16;
+                i32 leg=key%16;
+                if (row==-1 && column==0) {{
+                    if (route==1 && leg==3) {{
+                        core.require(key==19, {OUTPUT}); 2.0
+                    }} else {{
+                        if (route==-1 && leg==-3) {{
+                            core.require({claim}, {OUTPUT}); 1.0
+                        }} else {{ 0.0 }}
+                    }}
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        let prepare = |program: &str, target_layout, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+            ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+        ).ok().unwrap();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let valid = text("key==-19");
+            let wrong = text("key!=-19");
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let (valid, _) = prepare(&valid, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(valid.active && valid.directives.is_empty());
+            let (bad, _) = prepare(&wrong, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(bad.directives, prepare(&wrong, layout, scope).run().unwrap().directives);
+            let [failure] = bad.directives.as_slice() else { panic!("one signed-radix negative-control failure"); };
+            for (index, value) in [-19, -1, 0].into_iter().enumerate() {
+                assert_eq!(failure.witness.axes().nth(index).unwrap().1, &ScalarType::I32);
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, index).unwrap().eq([(&value, &value)]));
+            }
+            let (main, _) = prepare(&wrong, layout, ScalarCheckerScope::MainFlowOnly)
+                .run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(main.directives.is_empty());
+            let broad = wrong.replace("route==-1 && leg==-3", "route<0");
+            assert!(matches!(prepare(&broad, layout, scope).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let both = wrong.replace("%%end", &format!("core.require(false, {OUTPUT}); %%end"));
+            let (startup, _) = prepare(&both, layout, ScalarCheckerScope::MainFlowOnly)
+                .run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let (first, _) = prepare(&both, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let complete = prepare(&both, layout, scope).run().unwrap();
+            assert_eq!(first.directives, startup.directives);
+            assert_eq!(complete.directives.len(), 2);
+            assert_eq!(&complete.directives[..1], startup.directives.as_slice());
+            assert_eq!(&complete.directives[1..], bad.directives.as_slice());
+            let extreme = |divisor: i32, quotient: i32| format!(r#"%%start
+                f32(i32) inspect = fn(key) {{
+                    i32 quotient=key/{divisor}; i32 residue=key%{divisor};
+                    if (quotient=={quotient} && residue==0) {{
+                        core.require(key==-2147483648, {OUTPUT}); 1.0
+                    }} else {{ 0.0 }}
+                }};
+            %%end"#);
+            for (divisor, quotient) in [(1, i32::MIN), (16, -134_217_728)] {
+                let program = extreme(divisor, quotient);
+                let (result, completion) = prepare(&program, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert!(result.active && result.directives.is_empty());
+                assert_eq!(completion, Some(StartupAuthoredCompletion::Exhausted));
+                let impossible_claim = program.replace("key==-2147483648", "key!=-2147483648");
+                let (bad, _) = prepare(&impossible_claim, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+                assert_eq!(bad.directives, prepare(&impossible_claim, layout, scope).run().unwrap().directives);
+                let [failure] = bad.directives.as_slice() else { panic!("one typed extreme failure"); };
+                let min = BigInt::from(i32::MIN);
+                assert_eq!(failure.witness.axes().next().unwrap().1, &ScalarType::I32);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&min, &min)]));
+            }
+            // This operation is visited with the typed, exact i32::MIN
+            // input. It must fail closed; it cannot become a wrapped proof.
+            let overflow = format!(r#"%%start
+                f32(i32) inspect = fn(key) {{
+                    if (key==-2147483648) {{
+                        i32 value=key/-1;
+                        core.require(value==0, {OUTPUT}); 1.0
+                    }} else {{ 0.0 }}
+                }};
+            %%end"#);
+            assert!(matches!(prepare(&overflow, layout, scope).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let fits = overflow.replace("key==-2147483648", "key==-2147483647")
+                .replace("value==0", "value==2147483647");
+            let (checked, _) = prepare(&fits, layout, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(checked.active && checked.directives.is_empty());
+            assert!(matches!(prepare(&overflow, layout, scope).run(),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn private_wide_actual_unit_history_checks_each_admitted_frame_once() {
         use failure_search::PathStep;
         use std::num::NonZeroUsize;
