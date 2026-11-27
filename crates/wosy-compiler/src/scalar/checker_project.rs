@@ -1375,7 +1375,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        if let Some(plan) = (!Proof::ENABLED).then(|| closed_dormant_float_plan(project, calls, (ordinal, item), body)).flatten() {
+        if let Some(plan) = (!Proof::ENABLED).then(|| closed_dormant_float_plan(project, calls, (ordinal, item), body,
+            completed_visits.and_then(|visits| visits.get(ordinal)) == Some(&InitializationVisit::Completed))).flatten() {
             let work = std::cell::Cell::new(0);
             let mut first = None;
             let completion = search_closed_dormant_float(body, &plan, &work, |failure, _steps| {
@@ -10990,7 +10991,7 @@ fn plan_closed_authored_roots(
             mandatory_startup_scalars.push((item, function.name_span));
             continue;
         }
-        if allow_startup_scalars && closed_dormant_float_plan(project, calls, (module, item), body).is_some() {
+        if allow_startup_scalars && closed_dormant_float_plan(project, calls, (module, item), body, module < startup_count).is_some() {
             super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
         } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
             &mut HashSet::new(), &mut history_work, 0).is_none() {
@@ -11118,7 +11119,9 @@ fn closed_affine_snapshot_history(body: &FunctionCallSites) -> bool {
 #[cfg(feature = "internal-checker")]
 fn closed_dormant_float_plan(
     project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable, body: &FunctionCallSites,
-) -> Option<Vec<super::checker_flow::ClosedSignedFloatTail>> {
+    allow_module_reads: bool,
+) -> Option<super::checker_flow::ClosedFloatPlan> {
+    use super::checker_flow::{ClosedFloatPlan, ClosedUnaryKind};
     if !(matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::F32 | ScalarType::F64))
         && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
         && body.checker_closed_calling_frame() && body.contextual_formal().is_none()
@@ -11126,12 +11129,21 @@ fn closed_dormant_float_plan(
         && witness_history_directives(body, true))
     { return None; }
     let mut work = 0;
-    let mut plan = Vec::new();
+    let mut plan = ClosedFloatPlan::default();
     let mut has_leaf = false;
-    for block in &body.structure.blocks {
+    let source = &project.modules.get(target.0)?.source;
+    for (block_ordinal, block) in body.structure.blocks.iter().enumerate() {
         if block.unsafe_context { return None; }
         super::checker_flow::charge_call_work(&mut work, block.items.len().checked_add(1)?)?;
         for item in &block.items {
+            if let BlockItemKind::Binding(binding) = &item.kind {
+                if let Some(origin) = body.structure.checker_integer_call_locals.get(&(super::reference::BlockOrdinal(block_ordinal), item.position)) {
+                    let [receiver] = binding.receivers() else { return None; };
+                    if receiver.ty != ScalarType::U64 { return None; }
+                    super::checker_flow::charge_call_work(&mut work, 16)?;
+                    plan.calls.push(closed_typed_unary(project, calls, target, body, origin.call, ClosedUnaryKind::NonnegativeIndex)?);
+                }
+            }
             let BlockItemKind::FinalOutput(slot) = item.kind else { continue; };
             if !matches!(body.structure.checked_types.expressions.get(&slot.expression), Some(ScalarType::F32 | ScalarType::F64))
             { continue; }
@@ -11139,14 +11151,19 @@ fn closed_dormant_float_plan(
             has_leaf = true;
             if !body.structure.checker_literal_float_outputs.contains(&slot.expression) {
                 super::checker_flow::charge_call_work(&mut work, 16)?;
-                plan.push(closed_signed_float_tail(project, calls, target, body, slot.expression)?);
+                if let Some(effect) = closed_typed_unary(project, calls, target, body, slot.expression, ClosedUnaryKind::SignedFloat) {
+                    plan.calls.push(effect);
+                } else if allow_module_reads {
+                    plan.reads.push(closed_fixed_float_read(source, body, slot.expression)?);
+                } else { return None; }
             }
         }
     }
     // Unknown, nested or non-terminal calls cannot borrow a leaf's authority.
-    if !has_leaf || plan.len() != body.call_occurrences.len() { return None; }
-    plan.sort_unstable_by_key(|tail| tail.site.0);
-    if !plan.iter().zip(&body.call_occurrences).all(|(tail, call)| tail.site == call.ordinal) { return None; }
+    if !has_leaf || plan.calls.len() != body.call_occurrences.len() { return None; }
+    plan.calls.sort_unstable_by_key(|effect| effect.site.0);
+    plan.reads.sort_unstable_by_key(|effect| effect.site.0);
+    if !plan.calls.iter().zip(&body.call_occurrences).all(|(effect, call)| effect.site == call.ordinal) { return None; }
     Some(plan)
 }
 
@@ -11154,18 +11171,19 @@ fn closed_dormant_float_plan(
 // Rely only on the original checked unary conversion, directly or through
 // an exact same-module declaration whose whole body is that conversion.
 #[cfg(feature = "internal-checker")]
-fn closed_signed_float_tail(
+fn closed_typed_unary(
     project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
-    body: &FunctionCallSites, site: OccurrenceOrdinal,
-) -> Option<super::checker_flow::ClosedSignedFloatTail> {
+    body: &FunctionCallSites, site: OccurrenceOrdinal, kind: super::checker_flow::ClosedUnaryKind,
+) -> Option<super::checker_flow::ClosedUnaryEffect> {
+    use super::checker_flow::ClosedUnaryKind;
     use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
-    let (argument, input, output) = typed_signed_float_tail_site(body, site)?;
-    let convert = |body: &FunctionCallSites, conversion: OccurrenceOrdinal| {
-        matches!(body.resolved_call_site(conversion)?.target, ResolvedCallTarget::Core(super::CoreOperationId::SintToFloat))
-            .then_some(())
+    let (argument, input, output) = typed_closed_unary_site(body, site, kind)?;
+    let builtin = match kind {
+        ClosedUnaryKind::SignedFloat => super::CoreOperationId::SintToFloat,
+        ClosedUnaryKind::NonnegativeIndex => super::CoreOperationId::IntExtend,
     };
     match &body.resolved_call_site(site)?.target {
-        ResolvedCallTarget::Core(super::CoreOperationId::SintToFloat) => {}
+        ResolvedCallTarget::Core(operation) if *operation == builtin => {}
         ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } => {
             let &(ordinal, item) = body.structure.checker_direct_targets.get(&site)?;
             if ordinal != target.0 || item == target.1 { return None; }
@@ -11193,29 +11211,32 @@ fn closed_signed_float_tail(
             { return None; }
             let [only_call] = leaf.call_occurrences.as_slice() else { return None; };
             if only_call.ordinal != final_slot.expression { return None; }
-            let (forwarded, forwarded_ty, returned) = typed_signed_float_tail_site(leaf, final_slot.expression)?;
-            convert(leaf, final_slot.expression)?;
+            let (forwarded, forwarded_ty, returned) = typed_closed_unary_site(leaf, final_slot.expression, kind)?;
+            if leaf.resolved_call_site(final_slot.expression)?.target != ResolvedCallTarget::Core(builtin) { return None; }
             if forwarded_ty != input || returned != output
                 || !matches!(leaf.prepared_plain_name(forwarded), Some(PlainNameIdentity::Lexical(actual)) if actual == binding)
             { return None; }
         }
         _ => return None,
     }
-    Some(super::checker_flow::ClosedSignedFloatTail { site, argument, input: input.clone() })
+    Some(super::checker_flow::ClosedUnaryEffect { site, argument, input: input.clone(), kind })
 }
 
 #[cfg(feature = "internal-checker")]
-fn typed_signed_float_tail_site(body: &FunctionCallSites, call: OccurrenceOrdinal)
-    -> Option<(OccurrenceOrdinal, &ScalarType, &ScalarType)>
-{
+fn typed_closed_unary_site(
+    body: &FunctionCallSites, call: OccurrenceOrdinal, kind: super::checker_flow::ClosedUnaryKind,
+) -> Option<(OccurrenceOrdinal, &ScalarType, &ScalarType)> {
+    use super::checker_flow::ClosedUnaryKind;
     use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
     let signature = body.checked_call_signatures.get(&call)?;
     let [input] = signature.parameters.as_slice() else { return None; };
     let [output] = signature.outputs.outputs.as_slice() else { return None; };
-    if !matches!(input, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)
-        || !matches!(output.ty, ScalarType::F32 | ScalarType::F64)
-        || body.structure.checked_types.expressions.get(&call)? != &output.ty
-    { return None; }
+    if !match kind {
+        ClosedUnaryKind::SignedFloat => matches!(input, ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)
+            && matches!(output.ty, ScalarType::F32 | ScalarType::F64),
+        ClosedUnaryKind::NonnegativeIndex => matches!(input, ScalarType::I8 | ScalarType::I16 | ScalarType::I32)
+            && output.ty == ScalarType::U64,
+    } || body.structure.checked_types.expressions.get(&call)? != &output.ty { return None; }
     let OccurrenceNode::Expression(argument) = body.structure.edges.get(&(
         OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
     ))? else { return None; };
@@ -11223,8 +11244,42 @@ fn typed_signed_float_tail_site(body: &FunctionCallSites, call: OccurrenceOrdina
 }
 
 #[cfg(feature = "internal-checker")]
+fn closed_fixed_float_read(
+    source: &SourceIdentity, body: &FunctionCallSites, site: OccurrenceOrdinal,
+) -> Option<super::checker_flow::ClosedFixedFloatRead> {
+    use super::reference::{NamedPlaceRootIdentity, OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let structure = &body.structure;
+    let from_edge = |parent, edge| structure.edges.get(&(parent, edge)).copied();
+    let OccurrenceNode::Place(mut place) = from_edge(OccurrenceParent::Expression(site), OccurrenceEdge::ExpressionPlace)?
+        else { return None; };
+    let result = structure.checked_types.expressions.get(&site)?;
+    if !matches!(result, ScalarType::F32 | ScalarType::F64) || structure.checked_types.places.get(&place)? != result {
+        return None;
+    }
+    let mut axes = [None, None];
+    for axis in &mut axes {
+        let parent = OccurrenceParent::Place(place);
+        let OccurrenceNode::Expression(index) = from_edge(parent, OccurrenceEdge::PlaceIndex)? else { return None; };
+        let OccurrenceNode::Place(base) = from_edge(parent, OccurrenceEdge::PlaceBase)? else { return None; };
+        let ScalarType::Array { element, length, .. } = structure.checked_types.places.get(&base)?
+            else { return None; };
+        if *length == 0 || !super::scalar_type_equal(element, structure.checked_types.places.get(&place)?)
+            || structure.checked_types.expressions.get(&index)? != &ScalarType::U64
+            || !matches!(body.prepared_plain_name(index), Some(PlainNameIdentity::Lexical(_)))
+        { return None; }
+        *axis = Some((index, *length));
+        place = base;
+    }
+    let NamedPlaceRootIdentity::ModuleValue(declaration) = body.prepared_named_place_root(place)? else { return None; };
+    if &declaration.source != source || from_edge(OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex).is_some() {
+        return None;
+    }
+    Some(super::checker_flow::ClosedFixedFloatRead { site, axes: [axes[0]?, axes[1]?] })
+}
+
+#[cfg(feature = "internal-checker")]
 fn search_closed_dormant_float(
-    body: &FunctionCallSites, plan: &[super::checker_flow::ClosedSignedFloatTail], work: &std::cell::Cell<usize>,
+    body: &FunctionCallSites, plan: &super::checker_flow::ClosedFloatPlan, work: &std::cell::Cell<usize>,
     select: impl FnMut(IntegerCheckFailure<'_>, Vec<super::checker_flow::CallableHistoryStep>) -> Option<bool>,
 ) -> Option<super::checker_flow::CallableHistoryCompletion> {
     let mut spent = work.get();
@@ -11635,7 +11690,8 @@ fn collect_unreached_authored_paths(
         let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
             observed: &nested_active, record: &record };
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
-        let result = if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body) {
+        let result = if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body,
+            expected == InitializationVisit::Completed) {
             search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
         } else {
             graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[]).map(|(completion, _)| completion)
@@ -18843,6 +18899,49 @@ mod tests {
             assert!(matches!(prepare(&overflow).run_private_authored_root(NonZeroUsize::MIN),
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
             assert!(matches!(prepare(&overflow).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_float_checked_index_wrapper_and_fixed_module_table_respect_live_bounds() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-checked-table");
+        let text = |claim: &str| format!(r#"%%start
+            u64(i32) ix = fn(value) {{ core.int_extend<u64>(value) }};
+            f32[2][3] points = [[0.0,1.0],[2.0,3.0],[4.0,5.0]];
+            f32(i32,i32) coordinate = fn(row,column) {{
+                if (row>=0 && row<3 && column>=0 && column<2) {{
+                    core.require({claim}, {OUTPUT});
+                    u64 n=ix(row);
+                    u64 c=ix(column);
+                    points[n][c]
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}"));
+            let good = text("column>=0 && column<2");
+            let wrong = text("row!=2 || column!=1");
+            let (positive, _) = prepare(&good).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(positive.active && positive.directives.is_empty());
+            assert!(prepare(&good).run().unwrap().directives.is_empty());
+            let (negative, _) = prepare(&wrong).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(negative.directives, prepare(&wrong).run().unwrap().directives);
+            let [failure] = negative.directives.as_slice() else { panic!("one guarded table witness"); };
+            assert_eq!(failure.witness.axes().len(), 2);
+            for (axis, value) in [2, 1].into_iter().enumerate() {
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&value, &value)]));
+            }
+            for refused in [good.replace("row<3 && ", ""), good.replace("row>=0 && ", "")] {
+                assert!(matches!(prepare(&refused).run_private_authored_root(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(matches!(prepare(&refused).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 

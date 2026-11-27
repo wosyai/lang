@@ -158,7 +158,9 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn discards_closed_float_output(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
-    fn closed_signed_float_tail(self, _: OccurrenceOrdinal) -> Option<&'a ClosedSignedFloatTail> { None }
+    fn closed_unary_effect(self, _: OccurrenceOrdinal, _: ClosedUnaryKind) -> Option<&'a ClosedUnaryEffect> { None }
+    #[cfg(feature = "internal-checker")]
+    fn closed_fixed_float_read(self, _: OccurrenceOrdinal) -> Option<&'a ClosedFixedFloatRead> { None }
     #[cfg(feature = "internal-checker")]
     fn allows_context_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
@@ -331,13 +333,31 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-pub(super) enum HistoryFrameEffects<'a> { None, Snapshot, LexicalContext, ClosedFloatRoot(&'a [ClosedSignedFloatTail]) }
+pub(super) enum HistoryFrameEffects<'a> { None, Snapshot, LexicalContext, ClosedFloatRoot(&'a ClosedFloatPlan) }
 
 #[cfg(feature = "internal-checker")]
-pub(super) struct ClosedSignedFloatTail {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClosedUnaryKind { SignedFloat, NonnegativeIndex }
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ClosedUnaryEffect {
     pub(super) site: OccurrenceOrdinal,
     pub(super) argument: OccurrenceOrdinal,
     pub(super) input: ScalarType,
+    pub(super) kind: ClosedUnaryKind,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ClosedFixedFloatRead {
+    pub(super) site: OccurrenceOrdinal,
+    pub(super) axes: [(OccurrenceOrdinal, u64); 2],
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+pub(super) struct ClosedFloatPlan {
+    pub(super) calls: Vec<ClosedUnaryEffect>,
+    pub(super) reads: Vec<ClosedFixedFloatRead>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -350,9 +370,15 @@ impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
     fn allows_snapshot_history(self) -> bool { matches!(self.1, HistoryFrameEffects::Snapshot) }
     fn discards_closed_float_output(self) -> bool { matches!(self.1, HistoryFrameEffects::ClosedFloatRoot(_)) }
-    fn closed_signed_float_tail(self, site: OccurrenceOrdinal) -> Option<&'a ClosedSignedFloatTail> {
-        let HistoryFrameEffects::ClosedFloatRoot(effects) = self.1 else { return None; };
-        effects.binary_search_by_key(&site.0, |effect| effect.site.0).ok().and_then(|index| effects.get(index))
+    fn closed_unary_effect(self, site: OccurrenceOrdinal, kind: ClosedUnaryKind) -> Option<&'a ClosedUnaryEffect> {
+        let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return None; };
+        let index = plan.calls.binary_search_by_key(&site.0, |effect| effect.site.0).ok()?;
+        plan.calls.get(index).filter(|effect| effect.kind == kind)
+    }
+    fn closed_fixed_float_read(self, site: OccurrenceOrdinal) -> Option<&'a ClosedFixedFloatRead> {
+        let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return None; };
+        let index = plan.reads.binary_search_by_key(&site.0, |effect| effect.site.0).ok()?;
+        plan.reads.get(index)
     }
     fn allows_context_history(self) -> bool { matches!(self.1, HistoryFrameEffects::LexicalContext) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -8718,14 +8744,29 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         })) != Some(&OccurrenceNode::Expression(slot.expression))
                     { return None; }
                     if !structure.checker_literal_float_outputs.contains(&slot.expression) {
-                        let conversion = authored_return.closed_signed_float_tail(slot.expression)?;
-                        let work = roots.ordinary_local_work.get_or_insert(0);
-                        charge_call_work(work, 12)?;
-                        if scalar_call_literal(structure, conversion.argument, &conversion.input, false).is_none() {
-                            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(conversion.argument)?
-                                else { return None; };
-                            let (_, ty) = roots.lookup(binding)?;
-                            if ty != &conversion.input { return None; }
+                        if let Some(conversion) = authored_return.closed_unary_effect(slot.expression, ClosedUnaryKind::SignedFloat) {
+                            charge_call_work(roots.ordinary_local_work.get_or_insert(0), 12)?;
+                            if scalar_call_literal(structure, conversion.argument, &conversion.input, false).is_none() {
+                                let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(conversion.argument)?
+                                    else { return None; };
+                                let (_, ty) = roots.lookup(binding)?;
+                                if ty != &conversion.input { return None; }
+                            }
+                        } else {
+                            let read = authored_return.closed_fixed_float_read(slot.expression)?;
+                            charge_call_work(roots.ordinary_local_work.get_or_insert(0), 13)?;
+                            for (index, extent) in read.axes {
+                                let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(index)? else { return None; };
+                                let (axis, ty) = roots.lookup(binding)?;
+                                if *ty != ScalarType::U64 { return None; }
+                                let work = roots.ordinary_local_work.get_or_insert(0);
+                                let extent = BigInt::from(extent);
+                                for row in &path.0 {
+                                    charge_call_work(work, 1)?;
+                                    let (minimum, maximum) = row.get(axis)?.extremes()?;
+                                    if minimum.sign() == num_bigint::Sign::Minus || maximum >= &extent { return None; }
+                                }
+                            }
                         }
                     }
                     roots.truncate(depth);
@@ -9101,6 +9142,27 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         return None;
                     }
                     let [receiver] = binding.receivers() else { return None; };
+                    #[cfg(feature = "internal-checker")]
+                    if let Some(cast) = authored_return.closed_unary_effect(origin.call, ClosedUnaryKind::NonnegativeIndex) {
+                        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        if outputs.primary != origin.call || !outputs.secondary.is_empty()
+                            || receiver.ty != ScalarType::U64 || receiver.contextual_storage.is_some()
+                            || !matches!(origin.arguments.as_slice(), [(argument, CheckerIntegerCallArgument::PlainName)] if *argument == cast.argument)
+                        { return None; }
+                        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(cast.argument)? else { return None; };
+                        let (axis, ty) = roots.lookup(source)?;
+                        if ty != &cast.input { return None; }
+                        let work = roots.ordinary_local_work.get_or_insert(0);
+                        charge_call_work(work, path.0.len().checked_add(12)?)?;
+                        for row in &path.0 {
+                            if row.get(axis)?.extremes()?.0.sign() == num_bigint::Sign::Minus { return None; }
+                        }
+                        // A nonnegative, checked narrow signed value is
+                        // identical numerically in the verified u64 result.
+                        path.append_ordinary_copy(axis, roots)?;
+                        roots.add(&origin.binding, &receiver.ty);
+                        continue;
+                    }
                     let contextual = matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]);
                     #[cfg(feature = "internal-checker")]
                     let ordinary_contextual = roots.allow_ordinary_contextual_places;
