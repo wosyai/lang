@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory() as temp:
                                                              '"--export=_start", "--export=fixture_answer",'))
     entry = project / "src/main.w"
     entry.write_text(entry.read_text().replace("%%end", "i32() answer = fn { 42 };\n%%end"))
+    child = project / "src/child.w"
+    child.write_text(child.read_text().replace("i32 calls", "# WHY: original note\ni32 calls"))
     profile = project / "wosy.toml"
     text = profile.read_text().replace("categories = []", 'categories = ["WHY"]')
     text = text.replace('command = ["python", "scripts/build-native"]\nargs = []',
@@ -160,9 +162,7 @@ subprocess.run([sys.executable, "scripts/build-{backend}", *sys.argv[2:]], check
 
     initial = executable_plans()
     assert not executable.exists()
-    child = project / "src/child.w"
-    original = child.read_text()
-    child.write_text(original.replace("i32 calls", "# WHY: preview note\ni32 calls"))
+    child.write_text(child.read_text().replace("original note", "updated annotation with a longer body ☕"))
     call("stage")
     call("submit-pending", "short_circuit_project", "src/main.w")
     annotated = executable_plans()
