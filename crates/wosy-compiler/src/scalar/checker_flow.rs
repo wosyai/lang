@@ -2361,6 +2361,8 @@ struct IntegerRoots<'a> {
     callable_history: Option<&'a std::cell::RefCell<CallableHistories<'a>>>,
     #[cfg(feature = "internal-checker")]
     ready_history_call: Option<OccurrenceOrdinal>,
+    #[cfg(feature = "internal-checker")]
+    ready_unit_arguments: std::collections::VecDeque<(usize, ComputedUnitOperands)>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -5467,14 +5469,52 @@ impl ProjectedUnitHistory<'_> {
 }
 
 #[cfg(feature = "internal-checker")]
+type ComputedUnitOperands = Vec<(usize, BigInt)>;
+
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static OBSERVED_UNIT_ARGUMENT_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn take_observed_unit_argument_evaluations() -> usize {
+    OBSERVED_UNIT_ARGUMENT_EVALUATIONS.with(|total| total.replace(0))
+}
+
+#[cfg(feature = "internal-checker")]
+fn compute_observed_unit_operands(calls: &FunctionCallSites, expression: OccurrenceOrdinal,
+    signature: &CheckedCallSignature, roots: &IntegerRoots<'_>, row: &mut IntegerRow,
+) -> Option<ComputedUnitOperands> {
+    let mut out = Vec::new();
+    if roots.observed_float_field_read.is_none() || !row.has_projected_storage() { return Some(out); }
+    for (slot, parameter) in signature.parameters.iter().enumerate() {
+        if !is_integer_type(parameter) { continue; }
+        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
+            OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
+        ))? else { return None; };
+        if !calls.structure.prepared_range_binary.contains_key(argument) { continue; }
+        if calls.structure.checked_types.expressions.get(argument)? != parameter { return None; }
+        // Only literal and lexical arithmetic leaves are admitted. The
+        // same evaluator rejects a storage read, getter, or any other call
+        // before consuming an effect in this lane.
+        #[cfg(test)]
+        OBSERVED_UNIT_ARGUMENT_EVALUATIONS.with(|total| total.set(total.get().saturating_add(1)));
+        let value = observed_integer::evaluate_pure_argument(calls,*argument,roots,row)?;
+        out.push((slot,value));
+    }
+    Some(out)
+}
+
+#[cfg(feature = "internal-checker")]
 fn projected_unit_operands<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, signature: &'a CheckedCallSignature,
-    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, work: &mut usize,
+    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, computed: &'a [(usize, BigInt)], work: &mut usize,
 ) -> Option<Vec<CallableHistoryOperand<'a>>> {
     let [row] = path.0.as_slice() else { return None; };
     if row.has_closed_radix() { return None; }
     charge_call_work(work, signature.parameters.len())?;
     let mut operands = Vec::with_capacity(signature.parameters.len());
+    let mut computed = computed.iter().peekable();
     for (slot, parameter) in signature.parameters.iter().enumerate() {
         if matches!(parameter, ScalarType::F32 | ScalarType::F64) {
             // A read of a by-value formal returns normally, regardless of its IEEE bits.
@@ -5494,6 +5534,11 @@ fn projected_unit_operands<'a>(
                 .any(|(id, formal)| id == binding && &formal.ty == parameter) { return None; }
             continue;
         }
+        if computed.peek().is_some_and(|(index, _)| *index == slot) {
+            let (_, value) = computed.next()?;
+            operands.push(CallableHistoryOperand::Exact((parameter,value)));
+            continue;
+        }
         let operand = match nested_integer_operand(calls, expression, slot, roots, path, false, Some(work))? {
             NestedIntegerOperand::Exact((ty, value)) if ty == parameter => CallableHistoryOperand::Exact((ty, value)),
             NestedIntegerOperand::Axis(ty, axis) if ty == parameter => CallableHistoryOperand::Axis(ty, axis),
@@ -5501,6 +5546,7 @@ fn projected_unit_operands<'a>(
         };
         operands.push(operand);
     }
+    if computed.next().is_some() { return None; }
     Some(operands)
 }
 
@@ -8804,7 +8850,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         if !COLLECT { return None; }
                         let span = calls.occurrences.get(expression.0)?.span;
                         let mut survivors = IntegerInputs::default();
-                        for mut row in std::mem::take(&mut path.0) {
+                        for (index, mut row) in std::mem::take(&mut path.0).into_iter().enumerate() {
+                            let computed = if roots.ready_unit_arguments.front().is_some_and(|(row,_)| *row == index) {
+                                roots.ready_unit_arguments.pop_front()?.1
+                            } else { Vec::new() };
                             let mut tracker = histories.borrow_mut();
                             tracker.charge(row.len().saturating_add(3))?;
                             let call = tracker.boundary(span, false);
@@ -8813,7 +8862,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             drop(tracker);
                             let input = IntegerInputs(vec![row]);
                             let mut spent = histories.borrow().work.get();
-                            let operands = projected_unit_operands(calls, expression, signature, roots, &input, &mut spent)?;
+                            let operands = projected_unit_operands(calls, expression, signature, roots, &input, &computed, &mut spent)?;
                             histories.borrow().work.set(spent);
                             let projected = ProjectedUnitHistory { operands: &operands, row: input.0.first()? };
                             let domains_count = operands.len();

@@ -24586,6 +24586,71 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned unmodified Orbital indexed-pack provider"]
+    fn pinned_orbital_partition_computes_checked_arguments_once_before_call() {
+        use std::num::NonZeroUsize;
+        use super::super::checker_flow::take_observed_unit_argument_evaluations as evaluations;
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap());
+        let provider_text = std::fs::read_to_string(path).unwrap();
+        let app = source("src/main.w","pinned-partition-argument-consumer");
+        let provider = source("src/indexed-pack.w","pinned-partition-argument-provider");
+        let exact = r#"%%start
+            packing = namespace demo "indexed-pack.w";
+            i32 retained = 0;
+            unit(i32,i32) moving = fn(target,reserve) {
+                packing.partition(target,target+reserve);
+            };
+            unit(i32,i32) ordering = fn(target,reserve) {
+                packing.partition(target+1,target+reserve);
+            };
+            unit() launch = fn {
+                packing.start();
+                moving(37,53);
+                moving(18,-6);
+                retained=packing.end();
+            };
+            launch();
+            core.narrow(false,{.stdout="";.stderr="";.code=retained;.files=[];});
+        %%end"#;
+        let late_overflow = exact.replace("moving(18,-6)", "moving(2147483647,1)");
+        let early_overflow = exact.replace("moving(18,-6)", "ordering(2147483647,1)");
+        let prefix = r#"packing = namespace demo "indexed-pack.w";"#;
+        let binding = exact.find(prefix).unwrap() as u32;
+        let packed_site = "packing.partition(target,target+reserve)";
+        let start = exact.find(packed_site).unwrap() as u32;
+        let packed_site = wosy_syntax::SourceSpan::new(app.clone(),ByteSpan::new(start,start+packed_site.len() as u32));
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare = |text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(), target:provider.clone(),
+                    span:ByteSpan::new(binding,binding+prefix.len() as u32),
+                }]),(declarations(&provider,&provider_text),Vec::new())],
+                [],vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            evaluations();
+            let all = prepare(exact).run().unwrap();
+            assert_eq!(evaluations(),2);
+            let [report] = all.directives.as_slice() else { panic!("one result"); };
+            assert_eq!(report.code(),&BigInt::from(37));
+            let (capped,_,trace,_) = prepare(exact).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(evaluations(),2);
+            assert_eq!(capped,all.directives);
+            let paths = trace.call_paths();
+            let [steps] = paths.as_slice() else { panic!("one ordered path"); };
+            assert_eq!(steps.iter().filter(|at| *at==&packed_site).count(),2);
+            for bad in [&late_overflow,&early_overflow] {
+                assert!(matches!(prepare(bad).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                // One valid argument, then the first invalid argument.
+                // In ordering(), the second argument has not executed.
+                assert_eq!(evaluations(),2);
+            }
+            eprintln!("Orbital checked User Unit operands {target_layout:?}: two original arithmetic values, no replay, overflow remains unsupported");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn observed_getter_admission_rejects_state_mutation_before_return() {
         let app = source("src/main.w","readonly-provider-admission");
         let text = r#"%%start

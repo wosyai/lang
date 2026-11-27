@@ -126,6 +126,16 @@ pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
 
 pub(super) fn evaluate(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
     row: &mut IntegerRow) -> Option<BigInt> {
+    evaluate_in_lane(calls,at,roots,row,true)
+}
+
+pub(super) fn evaluate_pure_argument(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    row: &mut IntegerRow) -> Option<BigInt> {
+    evaluate_in_lane(calls,at,roots,row,false)
+}
+
+fn evaluate_in_lane(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    row: &mut IntegerRow, use_current_cells: bool) -> Option<BigInt> {
     enum Step<'a> { Eval(OccurrenceOrdinal), Read(Place<'a>), Apply(&'a BinaryOperator,&'a ScalarType), Extend }
     use Step::*;
     let charge = roots.callable_history?;
@@ -142,17 +152,22 @@ pub(super) fn evaluate(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: 
                     values.push(row.get(axis)?.singleton_value()?.clone());
                 }
                 Expr::Module(place) => {
+                    if !use_current_cells { return None; }
                     let index = place.index;
                     todo.push(Read(place));
                     if let Some((_,i)) = index { todo.push(Eval(i)); }
                 }
                 Expr::Binary(l,op,r,ty) => todo.extend([Apply(op,ty),Eval(r),Eval(l)]),
                 Expr::Getter => {
+                    if !use_current_cells { return None; }
                     let super::super::checker_project::ObservedExactValue::Integer(_, value) =
                         evaluate_observed_getter(calls,at,roots,row)? else { return None; };
                     values.push(value);
                 }
-                Expr::Extend(input) => todo.extend([Extend,Eval(input)]),
+                Expr::Extend(input) => {
+                    if !use_current_cells { return None; }
+                    todo.extend([Extend,Eval(input)]);
+                }
             }
             Read(place) => {
                 let index = if place.index.is_some() { Some(values.pop()?) } else { None };

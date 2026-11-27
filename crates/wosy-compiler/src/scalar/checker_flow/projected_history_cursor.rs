@@ -8,6 +8,7 @@ struct Pending<'a> {
     effect: ExactCallEffect<'a>,
     row: usize,
     receipts: VecDeque<CallableHistoryCall>,
+    computed: VecDeque<(usize, ComputedUnitOperands)>,
 }
 enum Machine<'a> {
     Unit { roots: IntegerRoots<'a>, block: IntegerBlockCursor },
@@ -130,13 +131,17 @@ pub(in super::super) fn drive_finite_history<'p>(
                 let span = body.occurrences.get(site.0)?.span;
                 histories.borrow().charge(row.len().saturating_add(2))?;
                 let mut path = IntegerInputs(vec![row.clone()]);
+                let is_unit = matches!(pending.effect, ExactCallEffect::Unit(_));
+                let computed = if is_unit {
+                    compute_observed_unit_operands(body,site,signature,roots,path.0.first_mut()?)?
+                } else { Vec::new() };
                 let mut tracker = histories.borrow_mut();
                 let mark = tracker.boundary(span, false);
                 tracker.append(path.0.first_mut()?, mark);
                 let mut fuel = work.get();
                 let mut entry = match pending.effect {
                     ExactCallEffect::Unit(_) => {
-                        let operands = projected_unit_operands(body, site, signature, roots, &path, &mut fuel)?;
+                        let operands = projected_unit_operands(body, site, signature, roots, &path, &computed, &mut fuel)?;
                         work.set(fuel);
                         ProjectedUnitHistory { operands: &operands, row: path.0.first()? }.entry(&signature.parameters, work)?
                     }
@@ -156,7 +161,7 @@ pub(in super::super) fn drive_finite_history<'p>(
                 drop(tracker);
                 let child = resolve(target, body, site, signature)?;
                 let child_body = body_of(child)?;
-                if matches!(pending.effect, ExactCallEffect::Unit(_)) && caller_row.has_projected_storage() {
+                if is_unit && caller_row.has_projected_storage() {
                     let ids = child_body.boundary.checker_parameter_bindings.as_deref()?;
                     if ids.len() != signature.parameters.len() { return None; }
                     for (slot, (ty,id)) in signature.parameters.iter().zip(ids).enumerate() {
@@ -168,6 +173,7 @@ pub(in super::super) fn drive_finite_history<'p>(
                         entry.0.install_observed_float(id.clone(), value)?;
                     }
                 }
+                if !computed.is_empty() { pending.computed.push_back((pending.row,computed)); }
                 pending.row += 1;
                 stack.push(Frame { target: child, machine: Machine::enter(child_body, &histories, Some(entry), field_read, math_call, scalar_getter)?, pending: None });
                 continue;
@@ -177,6 +183,8 @@ pub(in super::super) fn drive_finite_history<'p>(
             // Visit that item once with the now-owned receipts, then continue normally.
             cursor.next = cursor.next.checked_sub(1)?;
             roots.ready_history_call = Some(site);
+            if !roots.ready_unit_arguments.is_empty() { return None; }
+            roots.ready_unit_arguments = std::mem::take(&mut pending.computed);
             ready_site = Some(site);
             ready = std::mem::take(&mut pending.receipts);
             frame.pending = None;
@@ -237,9 +245,10 @@ pub(in super::super) fn drive_finite_history<'p>(
                 }
             }
         };
-        if !ready.is_empty() || frame.machine.parts().0.ready_history_call.is_some() { return None; }
+        let (roots, _) = frame.machine.parts();
+        if !ready.is_empty() || roots.ready_history_call.is_some() || !roots.ready_unit_arguments.is_empty() { return None; }
         match outcome {
-            Outcome::Park(effect) => frame.pending = Some(Pending { effect, row: 0, receipts: VecDeque::new() }),
+            Outcome::Park(effect) => frame.pending = Some(Pending { effect, row: 0, receipts: VecDeque::new(), computed: VecDeque::new() }),
             Outcome::Return(receipt) => {
                 stack.pop()?;
                 if let Some(parent) = stack.last_mut() { parent.pending.as_mut()?.receipts.push_back(receipt); }
