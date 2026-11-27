@@ -12556,7 +12556,7 @@ pub(super) fn assert_observed_guard_partition(calls: &FunctionCallSites) {
     assert!(matches!(interval.observed_boolean_guard(calls, pure, &roots), Some(None)));
     assert_eq!(work.get(), 0);
     let [no, yes] = interval.callable_compound_branch(calls, pure, &roots, [true,true]).unwrap().unwrap();
-    for value in 0..=15i32 {
+    for value in 0..=15i128 {
         assert_eq!(yes.includes_signed(&[value]), (7..11).contains(&value));
         assert_eq!(no.includes_signed(&[value]), !(7..11).contains(&value));
     }
