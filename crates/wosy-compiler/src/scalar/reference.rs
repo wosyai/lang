@@ -6500,6 +6500,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) projected_f32_math: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
     #[cfg(feature = "internal-checker")]
+    pub(super) projected_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
     pub(super) projected_f32_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(feature = "internal-checker")]
     pub(super) projected_struct_literals: HashMap<OccurrenceOrdinal, usize>,
@@ -6715,6 +6717,8 @@ impl OccurrenceStructure {
             projected_f32_comparisons: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_f32_math: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_integer_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_f32_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -10256,6 +10260,14 @@ impl StructuralWalker<'_, '_> {
                 }
                 #[cfg(feature = "internal-checker")]
                 if let (WalkMode::Callable(callable), BindingInitialization::Outputs(outputs)) = (&self.mode, &initialization) {
+                    if binding.receivers.len() == 1 && is_integer_type(&receiver.ty) && outputs.secondary.is_empty()
+                        && receiver.contextual_storage.is_none()
+                        && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
+                    {
+                        let resolver = callable.target_resolver;
+                        self.structure.projected_integer_locals.insert((position.block,position.item),
+                            lexical.reference_id(resolver.source,resolver.function_span));
+                    }
                     if binding.receivers.len() == 1 && receiver.ty == ScalarType::F32 && outputs.secondary.is_empty()
                         && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&ScalarType::F32) {
                         let resolver = callable.target_resolver;

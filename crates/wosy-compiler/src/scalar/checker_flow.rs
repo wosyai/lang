@@ -1779,6 +1779,8 @@ pub(super) mod projected_f32;
 
 #[cfg(feature = "internal-checker")]
 mod storage_delta;
+#[cfg(feature = "internal-checker")]
+mod observed_integer;
 
 #[cfg(feature = "internal-checker")]
 use storage_delta::StorageDelta;
@@ -7970,10 +7972,10 @@ impl IntegerInputs {
 
     fn observed_boolean_guard(&self, calls: &FunctionCallSites, condition: OccurrenceOrdinal,
         roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
-        if roots.callable_history.is_none() || calls.structure.module_storage_uses.is_empty()
-            || observed_boolean_modules(calls, condition).is_none_or(|reads| reads.is_empty()) {
-            return Some(None);
-        }
+        if roots.callable_history.is_none() { return Some(None); }
+        let Some(guard) = observed_boolean_inputs(calls, condition) else { return Some(None); };
+        if (guard.integer && roots.observed_float_field_read.is_none())
+            || (!guard.integer && guard.reads.is_empty()) { return Some(None); }
         let mut rows = [Self::default(), Self::default()];
         for mut row in self.0.iter().cloned() {
             let selected = evaluate_observed_boolean(calls, condition, roots, &mut row)?;
@@ -9310,6 +9312,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         }
                         continue;
                     }
+                    if roots.observed_float_field_read.is_some() {
+                        if let Some(write) = observed_integer::write(calls, group) {
+                            for row in &mut path.0 { write.apply(calls, roots, row)?; }
+                            continue;
+                        }
+                    }
                 }
                 #[cfg(feature = "internal-checker")]
                 if roots.allow_extended_scalar_locals && roots.allow_ordinary_contextual_places
@@ -9504,6 +9512,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 }
                                 roots.add(identity, &receiver.ty);
                                 continue;
+                            }
+                            if roots.observed_float_field_read.is_some() {
+                                if let Some(identity) = structure.projected_integer_locals.get(&(block, item.position)) {
+                                    if observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}).is_some() {
+                                        for row in &mut path.0 {
+                                            let value = observed_integer::evaluate(calls, outputs.primary, roots, row)?;
+                                            row.cells.push(Rc::new(IntegerSet::singleton(&value)));
+                                        }
+                                        roots.add(identity, &receiver.ty);
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     }
@@ -12306,7 +12326,7 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
         || !calls.structure.checker_selected_snapshots.is_empty()
         || !calls.structure.checker_ordinary_directive_calls.is_empty()
         || calls.boundary.parameters.iter().any(|parameter| !is_integer_type(&parameter.ty) && parameter.ty != ScalarType::F32)
-        || calls.call_occurrences.iter().any(|site| !prefix_calls.contains(&site.ordinal) && !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) {
+    {
         return None;
     }
     let mut covered = std::collections::HashSet::new();
@@ -12345,7 +12365,14 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                         writes = true;
                         continue;
                     }
-                    let write = projected_integer_storage_write(calls, *group)?;
+                    let Some(write) = projected_integer_storage_write(calls, *group) else {
+                        let write = observed_integer::write(calls, *group)?;
+                        covered.insert((write.place.declaration.clone(), write.place.site, ModuleStorageRole::Replace));
+                        write.reads(calls, |place| { covered.insert((place.declaration.clone(), place.site, place.role())); },
+                            |at| { scalar_calls.insert(at); })?;
+                        writes = true;
+                        continue;
+                    };
                     let assignment = calls.assignments.get(&(group.block, group.item))?;
                     let [destination] = assignment.destinations().as_slice() else { return None; };
                     let site = if write.index.is_some() {
@@ -12364,8 +12391,9 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                             if calls.structure.checked_types.expressions.get(expression) == Some(&ScalarType::Unit) => condition,
                         _ => continue,
                     };
-                    if let Some(reads) = observed_boolean_modules(calls, *condition) {
-                        covered.extend(reads.into_iter().map(|(declaration, site)| (declaration.clone(), site, ModuleStorageRole::Read)));
+                    if let Some(guard) = observed_boolean_inputs(calls, *condition) {
+                        covered.extend(guard.reads);
+                        scalar_calls.extend(guard.calls);
                     }
                 }
                 BlockItemKind::Binding(binding) => {
@@ -12376,6 +12404,11 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                         if !is_integer_type(&receiver.ty)
                             || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
+                    } else if calls.structure.projected_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position))
+                        && observed_integer::sites(calls, outputs.primary, |_| {}, |_| {}).is_some() {
+                        observed_integer::sites(calls, outputs.primary, |place| {
+                            covered.insert((place.declaration.clone(), place.site, place.role()));
+                        }, |at| { scalar_calls.insert(at); })?;
                     } else if receiver.ty == ScalarType::F32 && calls.structure.projected_f32_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) {
                         observed_float_expr_sites(calls, outputs.primary, |field| {
                             covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
@@ -12396,6 +12429,8 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
             || prefix_reads.contains(&(declaration.clone(), *site, *role)))) {
         return None;
     }
+    if calls.call_occurrences.iter().any(|site| !scalar_calls.contains(&site.ordinal)
+        && !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) { return None; }
     Some((writes || !covered.is_empty() || !prefix_reads.is_empty(), scalar_calls))
 }
 
@@ -12405,6 +12440,7 @@ enum ObservedBoolean<'a> {
     Module(&'a wosy_syntax::SourceSpan),
     Lexical(&'a ReferenceBindingId),
     Not(OccurrenceOrdinal),
+    Integer(OccurrenceOrdinal, IntegerRelation, OccurrenceOrdinal),
     ShortCircuit { left: OccurrenceOrdinal, right: OccurrenceOrdinal, when: bool },
 }
 
@@ -12422,24 +12458,45 @@ fn observed_boolean_node(calls: &FunctionCallSites, site: OccurrenceOrdinal) -> 
     if let Some(operand) = calls.structure.observed_bool_negations.get(&site) {
         return Some(ObservedBoolean::Not(*operand));
     }
+    if let Some((left, operator, right)) = calls.structure.prepared_range_binary.get(&site) {
+        let ty = calls.structure.checked_types.expressions.get(left)?;
+        if is_integer_type(ty) && calls.structure.checked_types.expressions.get(right)? == ty {
+            return Some(ObservedBoolean::Integer(*left, IntegerRelation::from_operator(operator)?, *right));
+        }
+    }
     let branch = calls.short_circuits.get(&site)?;
     Some(ObservedBoolean::ShortCircuit { left: branch.left, right: branch.right, when: branch.evaluate_right_when })
 }
 
 #[cfg(feature = "internal-checker")]
-fn observed_boolean_modules(calls: &FunctionCallSites, condition: OccurrenceOrdinal)
-    -> Option<Vec<(&wosy_syntax::SourceSpan, OccurrenceOrdinal)>> {
+struct ObservedBooleanInputs {
+    reads: Vec<(wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole)>,
+    calls: Vec<OccurrenceOrdinal>,
+    integer: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_boolean_inputs(calls: &FunctionCallSites, condition: OccurrenceOrdinal) -> Option<ObservedBooleanInputs> {
+    use super::reference::ModuleStorageRole;
     let mut todo = vec![condition];
-    let mut reads = Vec::new();
+    let mut inputs = ObservedBooleanInputs { reads: Vec::new(), calls: Vec::new(), integer: false };
     while let Some(site) = todo.pop() {
         match observed_boolean_node(calls, site)? {
-            ObservedBoolean::Module(declaration) => reads.push((declaration, site)),
+            ObservedBoolean::Module(declaration) => inputs.reads.push((declaration.clone(), site, ModuleStorageRole::Read)),
             ObservedBoolean::Not(operand) => todo.push(operand),
+            ObservedBoolean::Integer(left, _, right) => {
+                inputs.integer = true;
+                for operand in [left, right] {
+                    observed_integer::sites(calls, operand, |place| {
+                        inputs.reads.push((place.declaration.clone(), place.site, place.role()));
+                    }, |at| inputs.calls.push(at))?;
+                }
+            }
             ObservedBoolean::ShortCircuit { left, right, .. } => { todo.push(right); todo.push(left); }
             ObservedBoolean::Literal(_) | ObservedBoolean::Lexical(_) => {}
         }
     }
-    Some(reads)
+    Some(inputs)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12462,6 +12519,11 @@ fn evaluate_observed_boolean(calls: &FunctionCallSites, condition: OccurrenceOrd
                 let (axis, ty) = roots.lookup(binding)?;
                 if ty != &ScalarType::Bool { return None; }
                 bool_result_lane(row.get(axis)?.singleton_value()?)? == 1
+            }
+            ObservedBoolean::Integer(left, relation, right) => {
+                let left = observed_integer::evaluate(calls, left, roots, row)?;
+                let right = observed_integer::evaluate(calls, right, roots, row)?;
+                relation.accepts(left.cmp(&right))
             }
             ObservedBoolean::Not(operand) => { pending.push(Resume::Not); site = operand; continue; }
             ObservedBoolean::ShortCircuit { left, right, when } => {

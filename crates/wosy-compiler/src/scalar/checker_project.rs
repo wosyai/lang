@@ -23914,6 +23914,78 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_partition_preserves_published_integer_cells_on_failed_path() {
+        let app = source("src/main.w", "observed-partition-selected-cells");
+        let program = r#"%%start
+            bool failed = false;
+            i32 next_vertex = 8;
+            i32 ceiling = 12;
+            i32 generation = 2147483645;
+            i32[2] motion_base = [30, 38];
+            i32[2] motion_unique = [91, 92];
+            i32 room_partial = 0;
+            i32 first_cell = 0;
+            i32 second_cell = 0;
+            unit(i32,i32) partition = fn(base, limit) {
+                if (base < 0 || limit < base || limit > 20480 || generation >= 2147483646) {
+                    failed = true;
+                } else {
+                    generation = generation + 1;
+                    next_vertex = base;
+                    ceiling = limit;
+                };
+            };
+            unit(i32,i32) moving = fn(mask,id) {
+                if (id < 2 && mask > 0) {
+                    if (mask % 2 != 0) {
+                        room_partial = id + 1;
+                        u64 i = core.int_extend<u64>(id);
+                        i32 base = motion_base[i];
+                        motion_unique[i] = next_vertex - base;
+                    };
+                };
+            };
+            unit() launch = fn {
+                partition(37, 90); moving(1, 0);
+                partition(45, 100); moving(1, 1);
+                moving(0, -1);
+                first_cell = motion_unique[0];
+                second_cell = motion_unique[1];
+            };
+            launch();
+            core.narrow(false, {.stdout="";.stderr="";.code=next_vertex;.files=[
+                {.path="room.json";.state=room_partial;},
+                {.path="first.json";.state=first_cell;},
+                {.path="second.json";.state=second_cell;},
+                {.path="generation.json";.state=generation;},
+                {.path="ceiling.json";.state=ceiling;},
+                {.path="failed.json";.state=failed;}
+            ];});
+        %%end"#;
+        let out_of_bounds = program.replace("moving(0, -1)", "moving(1, -1)");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).unwrap().run();
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let exact = run(program, scope).unwrap();
+                let [failure] = exact.directives.as_slice() else { panic!("one sentinel output"); };
+                assert_eq!(failure.code(), &BigInt::from(37));
+                let files = failure.files();
+                assert_eq!(files[0].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":2}\n");
+                assert_eq!(files[1].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":7}\n");
+                assert_eq!(files[2].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":-1}\n");
+                assert_eq!(files[3].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":2147483646}\n");
+                assert_eq!(files[4].text.as_ref(), b"{\"type\":{\"kind\":\"i32\"},\"value\":90}\n");
+                assert_eq!(files[5].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
+                assert!(matches!(run(&out_of_bounds, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn observed_initializer_runs_nested_frames_that_grow_unique_storage_slots() {
         let app = source("src/main.w", "startup-nested-growing-state");
         for depth in [8usize, 32] {
