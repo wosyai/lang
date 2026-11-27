@@ -1374,6 +1374,30 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
+        #[cfg(feature = "internal-checker")]
+        if !Proof::ENABLED && closed_dormant_float_root(body) {
+            let work = std::cell::Cell::new(0);
+            let mut first = None;
+            let completion = search_closed_dormant_float(body, &work, |failure, _steps| {
+                if COLLECT {
+                    let effects = failures.as_deref_mut()?;
+                    if ENTRY_EVIDENCE {
+                        effects.capture_entry_evidence(body, function, &module.source, &failure);
+                    }
+                    effects.push_callable(body, &module.source, failure);
+                    Some(false)
+                } else {
+                    first = Some(project_failure(body, &module.source, failure));
+                    Some(true)
+                }
+            }).ok_or(ProjectCheck::Unsupported)?;
+            if let Some(failure) = first { return Err(failure); }
+            let super::checker_flow::CallableHistoryCompletion::Exhausted(observed) = completion else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            active |= observed;
+            continue;
+        }
         if !matches!(body.boundary.results.as_slice(), [result]
             if result.ty == ScalarType::Unit || is_integer_type(&result.ty)
                 || (COLLECT && ((result.ty == ScalarType::Bool && Proof::INTEGER_RETURN_PARTITIONS)
@@ -10966,7 +10990,9 @@ fn plan_closed_authored_roots(
             mandatory_startup_scalars.push((item, function.name_span));
             continue;
         }
-        if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
+        if allow_startup_scalars && closed_dormant_float_root(body) {
+            super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
+        } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
             &mut HashSet::new(), &mut history_work, 0).is_none() {
             return Err(ProjectCheck::Unsupported);
         }
@@ -11087,6 +11113,41 @@ fn closed_affine_snapshot_history(body: &FunctionCallSites) -> bool {
             && directive.output.state_files.iter().all(|file| matches!((&file.selection, &file.ty),
                 (CheckerStateSelection::Binding(_), CheckerStateType::Scalar(_))
                 | (CheckerStateSelection::Aggregate(_), CheckerStateType::Nominal(_)))))
+}
+
+#[cfg(feature = "internal-checker")]
+fn closed_dormant_float_root(body: &FunctionCallSites) -> bool {
+    matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::F32 | ScalarType::F64))
+        && body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+        && body.checker_closed_calling_frame() && body.contextual_formal().is_none()
+        && body.call_occurrences.is_empty() && body.structure.checker_direct_targets.is_empty()
+        && body.structure.module_storage_uses.is_empty() && body.callable_escapes.is_empty()
+        && body.structure.blocks.iter().all(|block| !block.unsafe_context
+            && block.items.iter().all(|item| {
+                let BlockItemKind::FinalOutput(slot) = item.kind else { return true; };
+                if !matches!(body.structure.checked_types.expressions.get(&slot.expression), Some(ScalarType::F32 | ScalarType::F64)) {
+                    return true;
+                }
+                body.structure.checker_literal_float_outputs.contains(&slot.expression)
+                    || matches!(body.conditionals.get(&slot.expression), Some(ConditionalRegion::Value { .. }))
+            }))
+        && !body.structure.checker_literal_float_outputs.is_empty()
+        && witness_history_directives(body, true)
+}
+
+#[cfg(feature = "internal-checker")]
+fn search_closed_dormant_float(
+    body: &FunctionCallSites, work: &std::cell::Cell<usize>,
+    select: impl FnMut(IntegerCheckFailure<'_>, Vec<super::checker_flow::CallableHistoryStep>) -> Option<bool>,
+) -> Option<super::checker_flow::CallableHistoryCompletion> {
+    let mut spent = work.get();
+    super::checker_flow::charge_call_work(&mut spent, body.occurrences.len())?;
+    work.set(spent);
+    let (completion, _) = super::checker_flow::search_callable_history_frame(
+        body, IntegerRequirementEntry::Arbitrary, work, None, false,
+        super::checker_flow::HistoryFrameEffects::ClosedFloatRoot, None, select,
+    )?;
+    Some(completion)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11486,8 +11547,12 @@ fn collect_unreached_authored_paths(
         let nested_active = std::cell::Cell::new(false);
         let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
             observed: &nested_active, record: &record };
-        let (result, _) = graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[])
-            .ok_or(ProjectCheck::Unsupported)?;
+        let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
+        let result = if closed_dormant_float_root(body) {
+            search_closed_dormant_float(body, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
+        } else {
+            graph.visit_unit((ordinal, item), IntegerRequirementEntry::Arbitrary, ordinal, 0, &[]).map(|(completion, _)| completion)
+        }.ok_or(ProjectCheck::Unsupported)?;
         match result {
             CallableHistoryCompletion::Exhausted(observed) => active |= observed || nested_active.get(),
             CallableHistoryCompletion::LimitReached if selected.borrow().0.remaining() == 0 => {
@@ -18373,6 +18438,52 @@ mod tests {
         assert!(matches!(&**parts, PassiveLiteral::Array(cells)
             if matches!(cells.as_ref(), [PassiveLiteral::Copy(link)] if std::rc::Rc::ptr_eq(link, row))));
         assert_eq!(work, 7);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn dormant_float_literal_return_preserves_typed_guarded_integer_obligations() {
+        use std::num::NonZeroUsize;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let owner = source("src/main.w", "dormant-float-literal");
+            let text = |claim: &str| format!(r#"%%start
+                f32(i32,i32,i32) routes = fn(key,row,column) {{
+                    if (key==19) {{
+                        if (row==-1) {{
+                            if (column==0) {{ core.require({claim}, {OUTPUT}); 2.0 }}
+                            else {{ 0.0 }}
+                        }} else {{ 0.0 }}
+                    }} else {{ 0.0 }}
+                }};
+            %%end"#);
+            let prepare = |text: &str, scope| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+            ).ok().unwrap();
+            let valid = text("key>=19 && key<=33");
+            let invalid = text("key!=19 && key<=33");
+            let scope = ScalarCheckerScope::CurrentPackage;
+            let (receipt, end) = prepare(&valid, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(receipt.active && receipt.directives.is_empty());
+            assert_eq!(end, Some(StartupAuthoredCompletion::Exhausted));
+            let (receipt, end) = prepare(&invalid, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("one negative-control failure"); };
+            for (index, value) in [19, -1, 0].into_iter().enumerate() {
+                assert_eq!(failure.witness.axes().nth(index).unwrap().1, &ScalarType::I32);
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, index).unwrap().eq([(&value, &value)]));
+            }
+            assert_eq!(end, Some(StartupAuthoredCompletion::LimitReached));
+            let full = prepare(&invalid, scope).run().unwrap();
+            assert_eq!(receipt.directives, full.directives);
+            assert!(prepare(&valid, scope).run().unwrap().directives.is_empty());
+            let (receipt, _) = prepare(&invalid, ScalarCheckerScope::MainFlowOnly)
+                .run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert!(receipt.directives.is_empty());
+            let computed = valid.replace("2.0", "1.0 + 1.0");
+            assert!(matches!(prepare(&computed, scope).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

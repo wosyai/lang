@@ -6414,6 +6414,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_literal_float_outputs: HashSet<OccurrenceOrdinal>,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_integer_final_operations: HashMap<OccurrenceOrdinal, (BinaryOperator, [OccurrenceOrdinal; 2])>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_integer_call_subtractions: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BigInt)>,
@@ -6603,6 +6605,8 @@ impl OccurrenceStructure {
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_literal_float_outputs: HashSet::new(),
             #[cfg(feature = "internal-checker")]
             checker_integer_final_operations: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -8372,6 +8376,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             if let Some(atom) = atom {
                 self.structure.checker_ordinary_literal_atoms.insert(ordinal, atom);
             }
+        }
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
+            && matches!(edge, OccurrenceEdge::FinalOutput { output: 0, .. })
+            && matches!(expression, ScalarExpression::Float { .. })
+            && matches!(self.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::F32 | ScalarType::F64))
+        {
+            self.structure.checker_literal_float_outputs.insert(ordinal);
         }
         #[cfg(any(test, feature = "internal-checker"))]
         let checked_scalar_pair_argument = checker_enabled

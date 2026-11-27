@@ -156,6 +156,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn allows_snapshot_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
+    fn discards_closed_float_output(self) -> bool { false }
+    #[cfg(feature = "internal-checker")]
     fn allows_context_history(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
     fn allows_imported_condition_comparisons(self) -> bool { false }
@@ -327,7 +329,7 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-pub(super) enum HistoryFrameEffects { None, Snapshot, LexicalContext }
+pub(super) enum HistoryFrameEffects { None, Snapshot, LexicalContext, ClosedFloatRoot }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
@@ -338,6 +340,7 @@ impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     const ENABLED: bool = false;
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
     fn allows_snapshot_history(self) -> bool { matches!(self.1, HistoryFrameEffects::Snapshot) }
+    fn discards_closed_float_output(self) -> bool { matches!(self.1, HistoryFrameEffects::ClosedFloatRoot) }
     fn allows_context_history(self) -> bool { matches!(self.1, HistoryFrameEffects::LexicalContext) }
     fn at(self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs) -> Option<&'a BigInt> { None }
@@ -4250,7 +4253,19 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
     #[cfg(not(feature = "internal-checker"))]
     let ordinary = false;
     let (tail, exact, projected) = match entry {
-        IntegerRequirementEntry::Arbitrary => (ordinary_tail_type(calls, ordinary), None, None),
+        IntegerRequirementEntry::Arbitrary => {
+            #[cfg(feature = "internal-checker")]
+            if scope.discards_closed_float_output() {
+                let ([result], [output]) = (calls.boundary.results.as_slice(), calls.boundary.root_outputs.as_slice()) else {
+                    return None;
+                };
+                if result.ty != output.ty || !matches!(result.ty, ScalarType::F32 | ScalarType::F64) { return None; }
+                // The canonical tail is still walked; only the literal result is unused.
+                return if handle_call.is_some() || allow_projected_calls || allow_contextual_local_transfers { None }
+                    else { collect_closed_float_requirements(calls, &result.ty, sink, scope) };
+            }
+            (ordinary_tail_type(calls, ordinary), None, None)
+        },
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
         #[cfg(feature = "internal-checker")]
         IntegerRequirementEntry::UnitHistory(CallableHistoryEntry(row)) => {
@@ -4278,6 +4293,22 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
         calls, tail, None, None, &mut [], exact, handle_call, Some(&mut collected), false, scope,
     )?.ok()? else { return None; };
     Some((active, collected.continuation))
+}
+
+#[cfg(feature = "internal-checker")]
+fn collect_closed_float_requirements<'a, Scoped: ScopedAuthoredReturn<'a>>(
+    calls: &'a FunctionCallSites, result: &'a ScalarType, sink: &mut dyn FnMut(IntegerCheckFailure<'a>), scope: Scoped,
+) -> Option<(bool, IntegerRequirementContinuation)> {
+    // Dormant roots have no receiving call. Walk every reachable guard and
+    // directive as usual; only the authenticated literal result is irrelevant.
+    let mut collection = IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false,
+        allow_contextual_local_transfers: false, sink,
+    };
+    let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
+        calls, Some(result), None, None, &mut [], None, None, Some(&mut collection), false, scope,
+    )?.ok()? else { return None; };
+    Some((active, collection.continuation))
 }
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
@@ -8569,6 +8600,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         path = IntegerInputs::default();
                         continue;
                     }
+                }
+                #[cfg(feature = "internal-checker")]
+                if authored_return.discards_closed_float_output()
+                    && tail == Some(ty) && matches!(ty, ScalarType::F32 | ScalarType::F64)
+                {
+                    if returns.is_some() || SUSPEND_CALL || !structure.checker_literal_float_outputs.contains(&slot.expression)
+                        || structure.edges.get(&(OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput {
+                            item: slot.item, output: 0,
+                        })) != Some(&OccurrenceNode::Expression(slot.expression))
+                    { return None; }
+                    roots.truncate(depth);
+                    return Some(IntegerControl::Returned);
                 }
                 let value = if let Some(value) = plain_typed_return(calls, &slot, ty, roots) {
                     value
