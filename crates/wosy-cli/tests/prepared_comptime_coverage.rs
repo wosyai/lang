@@ -554,3 +554,135 @@ fn client_shares_one_exact_proposal_and_respects_both_sqlite_freshness_cuts() {
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pending_pair_call_graph_matches_ordinary_ordered_specializations_and_bypasses() {
+    use wosy_cli::source_preparation::{prepare_pair_call_graph_comptime_input_facts, StartupComptimeInputSelection};
+    use wosy_project::packages::ComptimeWatchLimits;
+    use wosy_compiler::{DirectComptimeArgument, PairStartupOccurrence, ScalarTargetLayout};
+    use wosy_daemon::{PendingPairCallGraphComptimeProjection, RootedClosedComptimeRequest,
+        RootedPairCallGraphComptimeProjection};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::{FileKey, NodeId};
+
+    const PREFIX: &str = r#"%%start
+# WHY: startup com café ☕
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32(u32, u32) swap_data = fn(swap_left, swap_right) { solve(swap_right, swap_left) };
+u32(bool, u32, u32) choose = fn(select_path, data_left, data_right) {
+    if (select_path) { swap_data(data_left, data_right) } else { data_right }
+};
+u32 seed_value = choose(false, 1, 37);
+u32 carried = choose(false, 1, seed_value);
+"#;
+    const CALLS: &str = "u32 reached = choose(true, 7, carried);\nu32 same = solve(carried, 7);\nu32 changed = solve(13, 7);\n";
+    let source = format!("{PREFIX}{CALLS}%%end\n");
+    let manifest = MANIFEST.replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []");
+    let fixture = Scratch::new();
+    let project = fixture.0.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("wosy.toml"), manifest).unwrap();
+    let entry = project.join("main.w");
+    fs::write(&entry, "%%start\nu32 answer = 14;\n%%end\n").unwrap();
+
+    let request = |layout, output_bytes| RootedClosedComptimeRequest {
+        profile: "dev".into(),
+        file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+        id: "prepare".into(), evaluator_layout: layout, source_limits: LIMITS, output_bytes,
+    };
+    let ordinary = |layout| prepare_pair_call_graph_comptime_input_facts(&project, StartupComptimeInputSelection {
+        target: "app", profile: "dev", id: "prepare", evaluator_layout: layout,
+        watch_limits: ComptimeWatchLimits::default(), max_ir_bytes: 1 << 20,
+    }).unwrap();
+
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let initial = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(initial.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", initial.pending.unwrap()).unwrap());
+
+        fs::write(&entry, &source).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let layouts = [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32];
+        let observed = layouts.map(ordinary);
+        // Valid live content changes after preparation of the preceding
+        // immutable pending generation. The daemon must not reread it.
+        fs::write(&entry, source.replace("1, 37", "1, 41")).unwrap();
+
+        let mut native_bytes = 0;
+        for (layout, (ordinary_source, expected)) in layouts.into_iter().zip(observed) {
+            let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+            let prepared = worker.prepare_pending_pair_call_graph_comptime(binding, proposal,
+                request(layout, 1 << 20), 1 << 20, TTL).await.unwrap();
+            let admission = prepared.base().admission();
+            assert_eq!((admission.base, admission.proposed, admission.attempt, admission.validated_files),
+                (initial.root, attempt.root(), attempt.generation(), 1));
+            let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+                prepared.projection() else { panic!("expected an exact pending typed startup graph"); };
+            assert_eq!(ordinary_source.root, attempt.root());
+            assert_eq!(plan.source_root(), attempt.root());
+            assert_eq!(plan.authored_cst(), expected.authored_cst());
+            assert_eq!((plan.target(), plan.profile(), plan.id()), ("app", "dev", "prepare"));
+            assert_eq!(plan.evidence().site(), expected.evidence().site());
+            assert_eq!(plan.evidence().layout(), layout);
+            let actual = plan.evidence().occurrences().collect::<Vec<_>>();
+            let oracle = expected.evidence().occurrences().collect::<Vec<_>>();
+            assert_eq!((actual.len(), oracle.len()), (5, 5));
+            for (actual, oracle) in actual.iter().zip(&oracle) {
+                match (actual, oracle) {
+                    (PairStartupOccurrence::Bypass(actual), PairStartupOccurrence::Bypass(oracle)) => {
+                        assert_eq!(actual.call(), oracle.call());
+                        assert_eq!(actual.returned_argument(), oracle.returned_argument());
+                        assert_eq!(actual.returned_value(), DirectComptimeArgument::U32(37));
+                        assert_eq!(actual.returned_origin().prior_bypass_slot(), oracle.returned_origin().prior_bypass_slot());
+                    }
+                    (PairStartupOccurrence::Specialization(actual, path), PairStartupOccurrence::Specialization(oracle, oracle_path)) => {
+                        assert_eq!(actual.facts().destination(), oracle.facts().destination());
+                        assert_eq!(actual.facts().inputs().each_ref().map(|input| input.value()),
+                            oracle.facts().inputs().each_ref().map(|input| input.value()));
+                        assert_eq!(actual.evaluator_index(), oracle.evaluator_index());
+                        assert_eq!(path.hop_indices(), oracle_path.hop_indices());
+                    }
+                    _ => panic!("pending and ordinary startup disagree on reachability"),
+                }
+            }
+            assert_eq!(plan.evidence().calls().map(|(use_, _)| use_.evaluator_index()).collect::<Vec<_>>(), [0, 0, 1]);
+            assert_eq!((plan.evaluators().len(), expected.evaluator_irs().len()), (2, 2));
+            for (actual, oracle) in plan.evaluators().iter().zip(expected.evaluator_irs()) {
+                assert_eq!((actual.bytes().len(), actual.digest()), (oracle.bytes, NodeId(*oracle.blake3.as_bytes())));
+            }
+            if layout == ScalarTargetLayout::NATIVE64 {
+                native_bytes = plan.evaluators().iter().map(|ir| ir.bytes().len()).sum();
+            }
+            assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        }
+
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let denied = worker.prepare_pending_pair_call_graph_comptime(binding, proposal,
+            request(ScalarTargetLayout::NATIVE64, native_bytes - 1), 1 << 20, TTL).await.err().unwrap();
+        assert!(denied.to_string().contains("output byte budget"));
+        assert!(client.abandon("app", attempt).unwrap());
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+
+        fs::write(&entry, format!("{PREFIX}%%end\n")).unwrap();
+        let bypass = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", bypass).unwrap();
+        let prepared = worker.prepare_pending_pair_call_graph_comptime(binding, proposal,
+            request(ScalarTargetLayout::WASM32, 0), 1 << 20, TTL).await.unwrap();
+        let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+            prepared.projection() else { panic!("known bypasses require no evaluator budget"); };
+        assert_eq!(prepared.base().authored_comptime_coverage(), Some(AuthoredComptimeCoverage::Present));
+        assert_eq!((plan.evidence().occurrences().len(), plan.evidence().calls().len(), plan.evaluators().len()), (2, 0, 0));
+        assert!(plan.evidence().occurrences().all(|slot| matches!(slot, PairStartupOccurrence::Bypass(_))));
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, initial.root);
+        assert!(store.snapshot(bypass.root()).unwrap().is_none());
+        drop(prepared);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

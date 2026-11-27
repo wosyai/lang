@@ -5,6 +5,7 @@ use super::{
     project_declarations::UnpublishedDeclarations,
     retention_plan::{PreparedAllocation, SourceLease, SourceRead, MAX_RETAINED_DECLARATION_BYTES},
     RootedClosedComptimeProjection, RootedClosedComptimeRefusal, RootedClosedComptimeRequest,
+    RootedPairCallGraphComptimeProjection,
     CheckedFile, Expected, FileTree, Index, PreparedBaseModule, PublishReport, Result,
     SourceStorageWorker, SourceStore, INTERN, NODES, SNAPSHOT_ROOTS,
 };
@@ -136,12 +137,30 @@ impl PreparedPendingFirstComptime {
     }
 }
 
+/// Read-only owner of one pending startup graph. It cannot be exchanged
+/// for a source commit or a semantic result.
+pub struct PreparedPendingPairCallGraphComptime {
+    base: PreparedBaseDeclarations,
+    projection: PendingPairCallGraphComptimeProjection,
+}
+
+impl PreparedPendingPairCallGraphComptime {
+    pub fn base(&self) -> &PreparedBaseDeclarations { &self.base }
+
+    pub fn projection(&self) -> Option<&PendingPairCallGraphComptimeProjection> {
+        self.base.lease.finish_current(|| &self.projection)
+    }
+}
+
 #[derive(Debug)]
-pub enum PendingFirstComptimeProjection {
+pub enum PendingEntryComptimeProjection<Projection> {
     RequiresSingleModule,
     EntryUnchanged,
-    Candidate(RootedClosedComptimeProjection),
+    Candidate(Projection),
 }
+
+pub type PendingFirstComptimeProjection = PendingEntryComptimeProjection<RootedClosedComptimeProjection>;
+pub type PendingPairCallGraphComptimeProjection = PendingEntryComptimeProjection<RootedPairCallGraphComptimeProjection>;
 
 impl PendingFirstComptimeProjection {
     fn retained_bytes(&self) -> usize {
@@ -159,7 +178,7 @@ struct ValidatedProposal {
     work: CstWork,
     grammar: VerifiedGrammarBatch,
     authored_comptime: AuthoredComptimeCoverage,
-    selected_changed_parse: Option<FreshParseResult>,
+    selected_changed_parse: Option<(FreshParseResult, bool)>,
     authored_reparsed_files: usize,
 }
 
@@ -170,36 +189,81 @@ struct AdmissionInspection<'a> {
     prepared_changed: Option<VerifiedFileGrammar>,
 }
 
+struct SelectedPendingEntry<'a> {
+    file: &'a FileEntry,
+    fresh: FreshParseResult,
+    authored_comptime: bool,
+}
+
+enum PendingEntryRefusal {
+    RequiresSingleModule,
+    EntryUnchanged,
+    Refused(RootedClosedComptimeRefusal),
+}
+
+impl PendingEntryRefusal {
+    fn project<T>(self, refused: impl FnOnce(RootedClosedComptimeRefusal) -> T) -> PendingEntryComptimeProjection<T> {
+        match self {
+            Self::RequiresSingleModule => PendingEntryComptimeProjection::RequiresSingleModule,
+            Self::EntryUnchanged => PendingEntryComptimeProjection::EntryUnchanged,
+            Self::Refused(reason) => PendingEntryComptimeProjection::Candidate(refused(reason)),
+        }
+    }
+}
+
 impl ValidatedProposal {
+    fn selected_pending_entry(
+        &mut self, request: &RootedClosedComptimeRequest,
+    ) -> std::result::Result<SelectedPendingEntry<'_>, PendingEntryRefusal> {
+        use PendingEntryRefusal::Refused;
+        use RootedClosedComptimeRefusal as Refusal;
+        if !self.config.profiles.contains_key(&request.profile) {
+            return Err(Refused(Refusal::ProfileNotSelected));
+        }
+        let Some(file) = self.index.files.get(&request.file) else {
+            return Err(Refused(Refusal::FileNotRooted));
+        };
+        if request.file != self.config.entry {
+            return Err(Refused(Refusal::NotTargetEntry));
+        }
+        if self.index.files.len() != 1 {
+            return Err(PendingEntryRefusal::RequiresSingleModule);
+        }
+        if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
+            return Err(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit)));
+        }
+        let Some((fresh, authored_comptime)) = self.selected_changed_parse.take() else {
+            return Err(PendingEntryRefusal::EntryUnchanged);
+        };
+        Ok(SelectedPendingEntry { file, fresh, authored_comptime })
+    }
+
     fn pending_first_comptime(
         &mut self, store: &SourceStore, request: &RootedClosedComptimeRequest,
     ) -> Result<PendingFirstObservation> {
-        use PendingFirstComptimeProjection as Projection;
-        use RootedClosedComptimeProjection::Refused;
-        use RootedClosedComptimeRefusal as Refusal;
-
-        if !self.config.profiles.contains_key(&request.profile) {
-            return Ok(Projection::Candidate(Refused(Refusal::ProfileNotSelected)).into());
-        }
-        let Some(file) = self.index.files.get(&request.file) else {
-            return Ok(Projection::Candidate(Refused(Refusal::FileNotRooted)).into());
+        let root = self.admission.proposed;
+        let target = self.config.target.clone();
+        let entry = match self.selected_pending_entry(request) {
+            Ok(entry) => entry,
+            Err(reason) => return Ok(reason.project(RootedClosedComptimeProjection::Refused).into()),
         };
-        if request.file != self.config.entry {
-            return Ok(Projection::Candidate(Refused(Refusal::NotTargetEntry)).into());
-        }
-        if self.index.files.len() != 1 {
-            return Ok(Projection::RequiresSingleModule.into());
-        }
-        if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-            return Ok(Projection::Candidate(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit))).into());
-        }
-        let Some(fresh) = self.selected_changed_parse.take() else { return Ok(Projection::EntryUnchanged.into()) };
-        let projected = store.project_first_comptime_from_pending_parse(
-            self.admission.proposed, file.authored, self.config.target.clone(), request, &fresh,
-        )?;
+        let projected = store.project_first_comptime_from_pending_parse(root, entry.file.authored, target, request, &entry.fresh)?;
         let grammar = matches!(&projected, RootedClosedComptimeProjection::Emitted(_))
-            .then(|| VerifiedFileGrammar::for_checked(file, true));
-        Ok(PendingFirstObservation { projection: Projection::Candidate(projected), grammar })
+            .then(|| VerifiedFileGrammar::for_checked(entry.file, entry.authored_comptime));
+        Ok(PendingFirstObservation { projection: PendingFirstComptimeProjection::Candidate(projected), grammar })
+    }
+
+    fn pending_pair_call_graph(
+        &mut self, store: &SourceStore, request: &RootedClosedComptimeRequest,
+    ) -> Result<PendingPairCallGraphComptimeProjection> {
+        let root = self.admission.proposed;
+        let target = self.config.target.clone();
+        let entry = match self.selected_pending_entry(request) {
+            Ok(entry) => entry,
+            Err(reason) => return Ok(reason.project(RootedPairCallGraphComptimeProjection::Refused)),
+        };
+        let projected = store.project_pair_call_graph_from_pending_parse(root, entry.file.authored, target, request, &entry.fresh)?;
+        Ok(PendingPairCallGraphComptimeProjection::Candidate(projected))
     }
 }
 
@@ -348,7 +412,8 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
     ) -> Result<PreparedBaseDeclarations> {
-        let (base, _) = self.prepare_base_cst_observing(binding, proposal, limits, declaration_bytes, lease, None).await?;
+        let (base, _) = self.prepare_base_cst_observing(binding, proposal, limits, declaration_bytes, lease,
+            None, |_, _| Ok(((), 0))).await?;
         Ok(base)
     }
 
@@ -362,24 +427,47 @@ impl SourceStorageWorker {
         request.check_selector_bytes()?;
         let captured_binding = binding.clone();
         let (base, observation) = self.prepare_base_cst_observing(binding, proposal.into(), request.source_limits,
-            declaration_bytes, AdmissionLease::Open(lifetime), Some(request)).await?;
-        Ok(PreparedPendingFirstComptime { base, binding: captured_binding, observation: observation.expect("requested projection") })
+            declaration_bytes, AdmissionLease::Open(lifetime), Some(request.file.clone()), move |store, valid| {
+                let observation = valid.pending_first_comptime(store, &request)?;
+                let bytes = observation.projection.retained_bytes();
+                Ok((observation, bytes))
+            }).await?;
+        Ok(PreparedPendingFirstComptime { base, binding: captured_binding, observation })
     }
 
-    async fn prepare_base_cst_observing(
+    /// One local read-only finite pair call graph in the changed singleton entry.
+    /// This does not select a builder, runner, new source root or result.
+    pub async fn prepare_pending_pair_call_graph_comptime(
+        &self, binding: BaseCstProposalBinding, proposal: impl Into<Arc<BaseCstProposal>>,
+        request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration,
+    ) -> Result<PreparedPendingPairCallGraphComptime> {
+        request.check_selector_bytes()?;
+        let (base, projection) = self.prepare_base_cst_observing(binding, proposal.into(), request.source_limits,
+            declaration_bytes, AdmissionLease::Open(lifetime), Some(request.file.clone()), move |store, valid| {
+                let projection = valid.pending_pair_call_graph(store, &request)?;
+                let bytes = match &projection {
+                    PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan)) =>
+                        plan.evaluators().iter().map(|evaluator| evaluator.bytes().len()).sum(),
+                    _ => 0,
+                };
+                Ok((projection, bytes))
+            }).await?;
+        Ok(PreparedPendingPairCallGraphComptime { base, projection })
+    }
+
+    async fn prepare_base_cst_observing<T: Send + 'static>(
         &self, binding: BaseCstProposalBinding, proposal: impl Borrow<BaseCstProposal> + Send + 'static,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
-        first_comptime: Option<RootedClosedComptimeRequest>,
-    ) -> Result<(PreparedBaseDeclarations, Option<PendingFirstObservation>)> {
-        let selected_file = first_comptime.as_ref().map(|request| request.file.clone());
+        selected_file: Option<FileKey>,
+        observe: impl FnOnce(&SourceStore, &mut ValidatedProposal) -> Result<(T, usize)> + Send + 'static,
+    ) -> Result<(PreparedBaseDeclarations, T)> {
         let (owned, lease, read) = self.with_cst_admission(binding, proposal, limits, lease, true, selected_file,
             move |store, tx, mut valid| {
                 let mut allocation = store.source_reads.reserve_preparation()?;
-                let projection = first_comptime.as_ref().map(|request| valid.pending_first_comptime(store, request)).transpose()?;
+                let (projection, evaluator_bytes) = observe(store, &mut valid)?;
                 let ValidatedProposal { admission, config, index, mut work, authored_comptime, .. } = valid;
                 let declarations = store.prepare_unpublished_declarations(tx, &config.entry, index, &mut work,
                     declaration_bytes.min(MAX_RETAINED_DECLARATION_BYTES))?;
-                let evaluator_bytes = projection.as_ref().map_or(0, |observation| observation.projection.retained_bytes());
                 allocation.charge(declarations.declaration_bytes + evaluator_bytes)?;
                 let identity = prepared_identity(&admission, declarations.entry_projection, store.derivation_image());
                 Ok((identity, admission, declarations, authored_comptime, projection, allocation))
@@ -501,7 +589,7 @@ fn validate(
             let (checked, fresh, present) = grammar_checked_file(tx, file, categories, tree, &mut work)?;
             authored_reparsed_files += 1;
             if selected_file == Some(&key) && file.metadata.bytes as usize <= CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-                selected_changed_parse = Some(fresh);
+                selected_changed_parse = Some((fresh, present));
             }
             (checked, present)
         };

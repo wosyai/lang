@@ -11,7 +11,8 @@ use wosy_compiler::{
     derive_closed_comptime_fragment, derive_direct_function_comptime_fragment,
     derive_first_source_initializer_comptime, derive_forwarded_pair_startup_comptime_plan, ClosedComptimeFragment,
     ClosedComptimeRejection, ComptimeParameter, ComptimeParameterRejection, DirectStartupComptimePlan,
-    DirectStartupComptimeUse, InspectedDirectComptimeCall, PairStartupForwarding, ScalarTargetLayout, ScalarType,
+    derive_pair_startup_call_graph_comptime_plan, DirectStartupComptimeUse, InspectedDirectComptimeCall,
+    PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
@@ -163,6 +164,33 @@ pub enum RootedForwardedPairStartupComptimeProjection {
     Emitted(RootedForwardedPairStartupComptimePlan),
 }
 
+/// The compiler's ordered typed startup slots and candidate evaluator
+/// text for one pending source scope, not a whole-program or result receipt.
+#[derive(Debug)]
+pub struct RootedPairCallGraphComptimePlan {
+    source: RootedComptimeIdentity,
+    id: String,
+    evidence: PairStartupCallGraphEvidence,
+    evaluators: Vec<RootedStartupComptimeEvaluator>,
+}
+
+impl RootedPairCallGraphComptimePlan {
+    pub fn source_root(&self) -> NodeId { self.source.root }
+    pub fn authored_cst(&self) -> NodeId { self.source.authored_cst }
+    pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
+    pub fn target(&self) -> &str { &self.source.target }
+    pub fn profile(&self) -> &str { &self.source.profile }
+    pub fn id(&self) -> &str { &self.id }
+    pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
+}
+
+#[derive(Debug)]
+pub enum RootedPairCallGraphComptimeProjection {
+    Refused(RootedClosedComptimeRefusal),
+    Emitted(RootedPairCallGraphComptimePlan),
+}
+
 type StartupComptimeDerivation<const ARITY: usize> =
     fn(&FreshParseResult, &str, ScalarTargetLayout)
         -> std::result::Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection>;
@@ -218,18 +246,55 @@ fn closed_projection(answer: SelectedComptime<RootedClosedComptimeFragment>) -> 
     }
 }
 
+fn bounded_evaluators(
+    fragments: Vec<ClosedComptimeFragment>, output_bytes: usize,
+) -> Result<Vec<RootedStartupComptimeEvaluator>> {
+    let mut evaluators = Vec::with_capacity(fragments.len());
+    let mut remaining = output_bytes.min(MAX_EVALUATOR_IR_BYTES);
+    for fragment in fragments {
+        let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), remaining)?;
+        remaining -= bytes.len();
+        evaluators.push(RootedStartupComptimeEvaluator { bytes, digest });
+    }
+    Ok(evaluators)
+}
+
 impl SourceStore {
+    fn pending_comptime_identity(
+        &self, root: NodeId, authored_cst: NodeId, target: String, request: &RootedClosedComptimeRequest,
+    ) -> Option<RootedComptimeIdentity> {
+        let compiler_image = self.derivation_image()?;
+        Some(RootedComptimeIdentity { root, authored_cst, compiler_image, target, profile: request.profile.clone() })
+    }
+
     /// Textual evaluator projection from the selected file's already-verified
     /// parse. The caller owns the exact proposal transaction and selector checks.
     pub(super) fn project_first_comptime_from_pending_parse(
         &self, root: NodeId, authored_cst: NodeId, target: String,
         request: &RootedClosedComptimeRequest, fresh: &FreshParseResult,
     ) -> Result<RootedClosedComptimeProjection> {
-        let Some(compiler_image) = self.derivation_image() else {
+        let Some(identity) = self.pending_comptime_identity(root, authored_cst, target, request) else {
             return Ok(RootedClosedComptimeProjection::Refused(RootedClosedComptimeRefusal::CompilerImageUnavailable));
         };
-        let identity = RootedComptimeIdentity { root, authored_cst, compiler_image, target, profile: request.profile.clone() };
         first_entry_candidate(identity, fresh, request).map(closed_projection)
+    }
+
+    /// Project the ordinary finite graph from the same verified pending CST.
+    pub(super) fn project_pair_call_graph_from_pending_parse(
+        &self, root: NodeId, authored_cst: NodeId, target: String,
+        request: &RootedClosedComptimeRequest, fresh: &FreshParseResult,
+    ) -> Result<RootedPairCallGraphComptimeProjection> {
+        let Some(source) = self.pending_comptime_identity(root, authored_cst, target, request) else {
+            return Ok(RootedPairCallGraphComptimeProjection::Refused(RootedClosedComptimeRefusal::CompilerImageUnavailable));
+        };
+        let plan = match derive_pair_startup_call_graph_comptime_plan(fresh, &request.id, request.evaluator_layout) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(RootedPairCallGraphComptimeProjection::Refused(compiler_refusal(reason))),
+        };
+        let (evidence, fragments) = plan.into_parts();
+        Ok(RootedPairCallGraphComptimeProjection::Emitted(RootedPairCallGraphComptimePlan {
+            source, id: request.id.clone(), evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
+        }))
     }
 
     pub(super) fn project_closed_comptime_for_lease(
@@ -306,13 +371,7 @@ impl SourceStore {
                 Err(reason) => return Ok(Err(compiler_refusal(reason))),
             };
             let (calls, fragments) = plan.into_parts();
-            let mut evaluators = Vec::with_capacity(fragments.len());
-            let mut remaining = request.output_bytes.min(MAX_EVALUATOR_IR_BYTES);
-            for fragment in fragments {
-                let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), remaining)?;
-                remaining -= bytes.len();
-                evaluators.push(RootedStartupComptimeEvaluator { bytes, digest });
-            }
+            let evaluators = bounded_evaluators(fragments, request.output_bytes)?;
             Ok(Ok((evidence, RootedDirectStartupComptimePlan {
                 source: input.source, id: request.id.clone(), evaluator_layout: request.evaluator_layout,
                 calls, evaluators,

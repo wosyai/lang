@@ -87,14 +87,17 @@ pub use rooted_comptime::{
     RootedClosedComptimeFragment, RootedClosedComptimeProjection, RootedClosedComptimeRefusal,
     RootedClosedComptimeRequest, RootedDirectFunctionComptimeFragment, RootedDirectFunctionComptimeProjection,
     RootedDirectStartupComptimePlan, RootedDirectStartupComptimeProjection,
-    RootedForwardedPairStartupComptimePlan, RootedForwardedPairStartupComptimeProjection, RootedStartupComptimeEvaluator,
+    RootedForwardedPairStartupComptimePlan, RootedForwardedPairStartupComptimeProjection,
+    RootedPairCallGraphComptimePlan, RootedPairCallGraphComptimeProjection, RootedStartupComptimeEvaluator,
 };
 pub use rooted_llvm::{RootedLlvmIdentity, RootedLlvmOrigin, RootedLlvmPartition, RootedLlvmProjection, RootedLlvmRejection, RootedLlvmUnsupported};
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use source_proposal::{
-    AuthoredComptimeCoverage, BaseCstAdmission, BaseCstAdmissionLimits, PendingFirstComptimeProjection,
-    PreparedBaseIdentity, PreparedBaseDeclarations, PreparedPendingFirstComptime, PreparedSourcePublication,
+    AuthoredComptimeCoverage, BaseCstAdmission, BaseCstAdmissionLimits, PendingEntryComptimeProjection,
+    PendingFirstComptimeProjection, PendingPairCallGraphComptimeProjection,
+    PreparedBaseIdentity, PreparedBaseDeclarations, PreparedPendingFirstComptime,
+    PreparedPendingPairCallGraphComptime, PreparedSourcePublication,
 };
 pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
