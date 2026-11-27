@@ -1499,14 +1499,18 @@ fn is_authored_composite(expression: &ScalarExpression) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn startup_checked_integer_constant(
-    root: &ScalarExpression, ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure, ty: &ScalarType,
+pub(super) fn startup_checked_integer_constant<'a>(
+    root: &'a ScalarExpression, ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure, ty: &ScalarType,
     work: &mut usize,
-) -> Option<BigInt> {
-    if !is_authored_composite(root) { return None; }
+) -> Option<Cow<'a, BigInt>> {
+    if !is_authored_composite(root) {
+        if structure.checked_types.expressions.get(&ordinal)? != ty { return None; }
+        let value = concrete_integer_literal(root)?;
+        return super::typecheck::integer_literal_fits_type(&value, ty).then_some(value);
+    }
     let (min, max) = super::typecheck::integer_bounds(ty)?;
     nested_authored_integer_return(root, ordinal, structure, ty, &min, &max,
-        || charge_call_work(work, 1))
+        || charge_call_work(work, 1)).map(Cow::Owned)
 }
 
 #[cfg(feature = "internal-checker")]

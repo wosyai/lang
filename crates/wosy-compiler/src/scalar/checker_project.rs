@@ -1755,11 +1755,8 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     &binding.value, outputs.primary, structure, &receiver.ty, &mut effects.passive_literal_work)));
             #[cfg(feature = "internal-checker")]
             let passive_enum = passive_receiver.and_then(|receiver| {
-                use super::control::InitializationMember;
                 let ScalarType::Enum(expected) = &receiver.ty else { return None; };
-                let InitializationMember::Enum { enumeration, tag } = topology.identities.members.get(&outputs.primary)?
-                    else { return None; };
-                (enumeration == expected).then_some((enumeration, *tag))
+                prepared_passive_enum_tag(topology, outputs.primary, expected).map(|tag| (expected, tag))
             });
             #[cfg(feature = "internal-checker")]
             let passive_scalar = passive_integer.is_some() || passive_float.is_some() || passive_enum.is_some()
@@ -1941,7 +1938,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 }
                 #[cfg(feature = "internal-checker")]
                 (ty, _) if passive_integer.is_some() =>
-                    InitializerValue::Integer { ty, value: Cow::Owned(passive_integer.ok_or(ProjectCheck::Unsupported)?) },
+                    InitializerValue::Integer { ty, value: passive_integer.ok_or(ProjectCheck::Unsupported)? },
                 (ty, expression) if is_integer_type(ty)
                     || (COLLECT && matches!(ty, ScalarType::Bool | ScalarType::Char)
                         && matches!(expression, ScalarExpression::Call { .. })) =>
@@ -2511,13 +2508,20 @@ enum InitializerValue<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+fn prepared_passive_enum_tag(topology: &ModuleInitializationTopology, at: OccurrenceOrdinal, expected: &super::ScalarEnumId) -> Option<u32> {
+    let super::control::InitializationMember::Enum { enumeration, tag } = topology.identities.members.get(&at)?
+        else { return None; };
+    (enumeration == expected).then_some(*tag)
+}
+
+#[cfg(feature = "internal-checker")]
 fn passive_startup_initializer(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     match (ty, expression) {
         (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. }) => true,
         (ScalarType::Array { .. } | ScalarType::Struct(_), ScalarExpression::Name { .. }) => true,
         (ScalarType::Array { element, .. }, ScalarExpression::ArrayLiteral { .. }) =>
             is_integer_type(element) || matches!(element.as_ref(), ScalarType::Array { .. } | ScalarType::Struct(_)
-                | ScalarType::F32 | ScalarType::F64),
+                | ScalarType::Enum(_) | ScalarType::F32 | ScalarType::F64),
         _ => false,
     }
 }
@@ -2529,6 +2533,7 @@ enum PassiveLiteral<'a> {
     Character(char),
     Integer(&'a ScalarType, BigInt),
     Float(ranked_float::Atom),
+    Enum(&'a super::ScalarEnumId, u32),
     Array(Box<[Self]>),
     Nominal(&'a super::ScalarStructId, Box<[Self]>),
     // Share immutable semantic data, not Wosy locations or runtime storage.
@@ -2656,6 +2661,10 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
                 }
                 Some(PassiveLiteral::Nominal(id, values.into_iter().collect::<Option<Vec<_>>>()?.into_boxed_slice()))
             }
+            (ScalarType::Enum(expected), ScalarType::Enum(checked), _) if expected == checked => {
+                let PassiveCopySource::Current { topology, .. } = self.copies.as_ref()? else { return None; };
+                Some(PassiveLiteral::Enum(expected, prepared_passive_enum_tag(topology, at, expected)?))
+            }
             (ScalarType::Bool, ScalarType::Bool, ScalarExpression::Boolean { value, .. }) =>
                 Some(PassiveLiteral::Boolean(*value)),
             (ScalarType::Char, ScalarType::Char, ScalarExpression::Char { value, .. }) =>
@@ -2676,7 +2685,7 @@ fn passive_type_equal(expected: &ScalarType, typed: &ScalarType, depth: usize) -
     match (expected, typed) {
         (ScalarType::Array { element, length, .. }, ScalarType::Array { element: other, length: actual, .. }) =>
             depth > 0 && length == actual && passive_type_equal(element, other, depth - 1),
-        (ScalarType::Struct(_) | ScalarType::Bool | ScalarType::Char | ScalarType::F32 | ScalarType::F64, _) =>
+        (ScalarType::Struct(_) | ScalarType::Enum(_) | ScalarType::Bool | ScalarType::Char | ScalarType::F32 | ScalarType::F64, _) =>
             expected == typed,
         _ => is_integer_type(expected) && expected == typed,
     }
@@ -18758,9 +18767,13 @@ mod tests {
             u8[96] line=[{cells}];
             {barrier}
             bool dirty=true;
+            i32 material=2;
+            i32 signed=-7;
             f32 float_slot=-0.0;
             enum copy Mode {{ idle; ready; }}
             Mode mode=Mode::ready;
+            Mode[3] phases=[Mode::idle,Mode::ready,Mode::idle];
+            Mode[3] phases_copy=phases;
             u8[96] duplicate=line;
             u8[96][2] layer=[duplicate,line];
             u8[96][2][2] grid=[layer,layer];
