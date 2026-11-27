@@ -33,12 +33,6 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
             .map(|arm| (arm.span, arm.name_span, arm.parameter_spans.clone()))
             .collect::<Vec<_>>();
         let second = &mut parent.overload_arms[1].body;
-        for expression in &mut second.expressions {
-            let ScalarExpression::Call { span, .. } = expression else {
-                panic!("arm call")
-            };
-            *span = shared;
-        }
         for item in &mut second.items {
             let ScalarBlockItem::Expression(ScalarExpression::Call { span, .. }) = item else {
                 panic!("arm call item")
