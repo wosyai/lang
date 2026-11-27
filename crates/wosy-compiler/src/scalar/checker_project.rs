@@ -24677,7 +24677,7 @@ unit(u8) parent = fn(a) {
             packing = namespace demo "indexed-pack.w";
             i32 touched=0;
             i32 retained=0;
-            unit(i32,u64,u64,u64,u64) index_vertex=fn(i,p,a,j,k) {{ touched=i; }};
+            unit(i32,u64,u64,u64,u64) index_vertex=fn(i,p,a,j,k) {{ if(p==0&&a==0&&j==0&&k==3){{touched=i;}}; }};
             unit(i32,i32) index_range={index_range}
             unit() launch=fn {{
                 packing.start();
