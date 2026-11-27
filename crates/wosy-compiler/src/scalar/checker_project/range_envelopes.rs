@@ -42,8 +42,21 @@ impl Envelope {
 }
 
 type Inputs = Vec<Option<Envelope>>;
-type Key = (PreparedCallable, Inputs);
+type Key = (PreparedCallable, Rc<Inputs>);
+type Lanes = Option<Rc<Inputs>>;
 
+#[derive(Clone, Copy)]
+enum Need { Int, Bool(bool) }
+
+#[derive(Clone)]
+enum Answer { Int(Option<Envelope>), Bool(Lanes) }
+
+impl Answer {
+    fn bound(self) -> Option<Envelope> { if let Self::Int(bound) = self { bound } else { None } }
+    fn lanes(self) -> Option<Lanes> { if let Self::Bool(lanes) = self { Some(lanes) } else { None } }
+}
+
+#[derive(Clone, Copy)]
 struct Frame<'a> {
     body: &'a FunctionCallSites,
     target: PreparedCallable,
@@ -74,13 +87,18 @@ impl<'a> Frame<'a> {
 pub(super) struct PreparedEnvelopes<'a> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
-    integer: HashMap<Key, Envelope>,
-    active: HashSet<PreparedCallable>,
+    integer: HashMap<Key, Answer>,
+    boolean: HashMap<(Key,bool), Answer>,
+    #[cfg(test)]
+    work: [usize;3],
 }
 
 impl<'a> PreparedEnvelopes<'a> {
     pub(super) fn new(project: &'a ScalarProject, calls: &'a ProjectCallSiteResults) -> Self {
-        Self { project, calls, integer: HashMap::new(), active: HashSet::new() }
+        Self { project, calls, integer: HashMap::new(), boolean: HashMap::new(),
+            #[cfg(test)]
+            work: [0;3],
+        }
     }
 
     fn frame(&self, target: PreparedCallable) -> Option<Frame<'a>> {
@@ -100,153 +118,212 @@ impl<'a> PreparedEnvelopes<'a> {
         Some(Frame { body: function, target, ids })
     }
 
-    fn arguments(&mut self, frame: &Frame<'a>, e: OccurrenceOrdinal, inputs: &Inputs) -> Option<Key> {
-        let signature = frame.body.checked_call_signatures.get(&e)?;
-        let child = super::authenticate_prepared_direct_edge(self.project,self.calls,frame.target.0,frame.body,e,signature)?;
-        let auth = self.frame(child)?;
-        if !auth.body.boundary.parameters.iter().map(|p| &p.ty).eq(signature.parameters.iter())
-            || !auth.body.boundary.results.iter().map(|r| &r.ty).eq(signature.outputs.outputs.iter().map(|r| &r.ty))
-        { return None; }
-        let mut args = Vec::with_capacity(signature.parameters.len());
-        for (slot, ty) in signature.parameters.iter().enumerate() {
-            let OccurrenceNode::Expression(argument) = frame.body.structure.edges.get(&(
-                OccurrenceParent::Expression(e), OccurrenceEdge::CallArgument(slot)
-            ))? else { return None; };
-            if frame.body.structure.checked_types.expressions.get(argument)? != ty { return None; }
-            args.push(if is_integer_type(ty) {
-                Some(self.value(frame, *argument, inputs)?)
-            } else if *ty == ScalarType::Bool && (frame.formal(*argument).is_some()
-                || frame.body.structure.observed_bool_literals.contains_key(argument)) {
-                None
-            } else { return None; });
-        }
-        Some((child,args))
+    fn min_max(&self, frame: Frame<'a>, condition: OccurrenceOrdinal, yes: OccurrenceOrdinal, no: OccurrenceOrdinal,
+        input: &Inputs) -> Option<Envelope> {
+        // Recognize the source relation, not a helper's spelling.
+        let (left,op,right) = frame.body.structure.prepared_range_binary.get(&condition)?;
+        let (lhs,rhs,success,failure) = (frame.formal(*left)?,frame.formal(*right)?,frame.formal(yes)?,frame.formal(no)?);
+        let picks_left_on_true = (success,failure) == (lhs,rhs);
+        let picks_right_on_true = (success,failure) == (rhs,lhs);
+        if !picks_left_on_true && !picks_right_on_true { return None; }
+        use super::super::BinaryOperator::*;
+        let max = match op {
+            Less | LessEqual => picks_right_on_true,
+            Greater | GreaterEqual => picks_left_on_true,
+            _ => return None,
+        };
+        let (l,r) = (input.get(lhs)?.as_ref()?,input.get(rhs)?.as_ref()?);
+        let pick = if max { std::cmp::max } else { std::cmp::min };
+        Some(Envelope { low: pick(l.low.clone(),r.low.clone()), high: pick(l.high.clone(),r.high.clone()) })
     }
 
-    fn value(&mut self, frame: &Frame<'a>, e: OccurrenceOrdinal, inputs: &Inputs) -> Option<Envelope> {
-        let structure = &frame.body.structure;
-        let ty = structure.checked_types.expressions.get(&e)?;
-        if !is_integer_type(ty) { return None; }
-        if let Some(value) = structure.prepared_range_literals.get(&e) {
-            return super::super::typecheck::integer_literal_fits_type(value,ty).then(|| Envelope::exact(value.clone()));
+    fn facts(&mut self, frame: &Frame<'a>, site: OccurrenceOrdinal, want: bool, input: Inputs) -> Option<Option<Inputs>> {
+        self.evaluate(*frame,site,Need::Bool(want),Rc::new(input))?.lanes()
+            .map(|row| row.map(Rc::unwrap_or_clone))
+    }
+
+    fn evaluate(&mut self, root: Frame<'a>, at: OccurrenceOrdinal, need: Need, inputs: Rc<Inputs>) -> Option<Answer> {
+        enum Step<'a> {
+            Visit(Frame<'a>,OccurrenceOrdinal,Need,Rc<Inputs>),
+            Restrict(Frame<'a>,OccurrenceOrdinal,Need),
+            Join(Need,&'a ScalarType),
+            Arithmetic(&'a BinaryOperator,&'a ScalarType),
+            Compare(Frame<'a>,OccurrenceOrdinal,OccurrenceOrdinal,&'a BinaryOperator,bool,Rc<Inputs>),
+            Args(PreparedCallable,Vec<Option<OccurrenceOrdinal>>,Frame<'a>,Need,Rc<Inputs>),
+            Record(Key,Need),
+            Forward(Vec<Option<OccurrenceOrdinal>>,Frame<'a>,Rc<Inputs>),
         }
-        if let Some(idx) = frame.formal(e) { return inputs.get(idx)?.clone(); }
-        if let Some((left,op,right)) = structure.prepared_range_binary.get(&e) {
-            return self.value(frame,*left,inputs)?.binary(op,self.value(frame,*right,inputs)?,ty);
-        }
-        if let Some((condition, yes, no)) = frame.conditional(e) {
-            // Recognize the source relation of min/max, not its spelling.
-            // Both branch outputs must be the same two prepared operands.
-            if let Some((left,op,right)) = structure.prepared_range_binary.get(&condition) {
-                use super::super::BinaryOperator::*;
-                if let (Some(lhs),Some(rhs),Some(success),Some(failure)) =
-                    (frame.formal(*left), frame.formal(*right), frame.formal(yes), frame.formal(no))
-                {
-                    let picks_left_on_true = (success,failure) == (lhs,rhs);
-                    let picks_right_on_true = (success,failure) == (rhs,lhs);
-                    if picks_left_on_true || picks_right_on_true {
-                        let max = match op {
-                            Less | LessEqual => Some(picks_right_on_true),
-                            Greater | GreaterEqual => Some(picks_left_on_true),
-                            _ => None,
-                        };
-                        if let Some(max) = max {
-                            let (l,r) = (inputs.get(lhs)?.as_ref()?, inputs.get(rhs)?.as_ref()?);
-                            let pick = if max { std::cmp::max } else { std::cmp::min };
-                            return Some(Envelope { low: pick(l.low.clone(),r.low.clone()), high: pick(l.high.clone(),r.high.clone()) });
+        use Answer::{Bool, Int};
+        use Step::*;
+        let mut steps = vec![Visit(root,at,need,inputs)];
+        let mut values = Vec::<Answer>::new();
+        let mut active = HashSet::from([root.target]);
+        while let Some(step) = steps.pop() {
+            #[cfg(test)]
+            {
+                self.work[0] += 1;
+                self.work[2] = self.work[2].max(steps.len()+1);
+            }
+            match step {
+                Visit(frame,e,needed,input) => {
+                    let st = &frame.body.structure;
+                    let ty = st.checked_types.expressions.get(&e)?;
+                    match needed {
+                        Need::Int => {
+                            if !is_integer_type(ty) { return None; }
+                            if let Some(value) = st.prepared_range_literals.get(&e) {
+                                if !integer_literal_fits_type(value,ty) { return None; }
+                                values.push(Int(Some(Envelope::exact(value.clone()))));
+                                continue;
+                            }
+                            if let Some(i) = frame.formal(e) {
+                                values.push(Int(Some(input.get(i)?.clone()?)));
+                                continue;
+                            }
+                            if let Some((left,op,right)) = st.prepared_range_binary.get(&e) {
+                                steps.extend([Arithmetic(op,ty),Visit(frame,*right,Need::Int,Rc::clone(&input)),
+                                    Visit(frame,*left,Need::Int,input)]);
+                                continue;
+                            }
+                        }
+                        Need::Bool(want) => {
+                            if *ty != ScalarType::Bool { return None; }
+                            if let Some(value) = st.observed_bool_literals.get(&e) {
+                                values.push(Bool((want == *value).then_some(input)));
+                                continue;
+                            }
+                            if frame.formal(e).is_some() { values.push(Bool(Some(input))); continue; }
+                            if let Some(inner) = st.observed_bool_negations.get(&e) {
+                                steps.push(Visit(frame,*inner,Need::Bool(!want),input));
+                                continue;
+                            }
+                            if let Some(branch) = frame.body.short_circuits.get(&e) {
+                                let live = branch.evaluate_right_when;
+                                if want != live {
+                                    steps.extend([Join(needed,ty),Visit(frame,branch.left,Need::Bool(!live),Rc::clone(&input))]);
+                                }
+                                steps.extend([Restrict(frame,branch.right,needed),Visit(frame,branch.left,Need::Bool(live),input)]);
+                                continue;
+                            }
+                            if let Some((left,op,right)) = st.prepared_range_binary.get(&e) {
+                                steps.extend([Compare(frame,*left,*right,op,want,Rc::clone(&input)),
+                                    Visit(frame,*right,Need::Int,Rc::clone(&input)),Visit(frame,*left,Need::Int,input)]);
+                                continue;
+                            }
                         }
                     }
+                    if let Some((condition,yes,no)) = frame.conditional(e) {
+                        if matches!(needed, Need::Int) {
+                            if let Some(bound) = self.min_max(frame,condition,yes,no,&input) {
+                                values.push(Int(Some(bound)));
+                                continue;
+                            }
+                        }
+                        steps.extend([Join(needed,ty),Restrict(frame,no,needed),Visit(frame,condition,Need::Bool(false),Rc::clone(&input)),
+                            Restrict(frame,yes,needed),Visit(frame,condition,Need::Bool(true),input)]);
+                        continue;
+                    }
+                    let signature = frame.body.checked_call_signatures.get(&e)?;
+                    let child = super::authenticate_prepared_direct_edge(self.project,self.calls,frame.target.0,frame.body,e,signature)?;
+                    let mut slots = Vec::with_capacity(signature.parameters.len());
+                    for (slot,ty) in signature.parameters.iter().enumerate() {
+                        let OccurrenceNode::Expression(argument) = st.edges.get(&(
+                            OccurrenceParent::Expression(e),OccurrenceEdge::CallArgument(slot)
+                        ))? else { return None; };
+                        if st.checked_types.expressions.get(argument)? != ty { return None; }
+                        if is_integer_type(ty) { slots.push(Some(*argument)); }
+                        else if *ty == ScalarType::Bool && (frame.formal(*argument).is_some()
+                            || st.observed_bool_literals.contains_key(argument)) {
+                            slots.push(None);
+                        } else { return None; }
+                    }
+                    steps.push(Args(child,slots.clone(),frame,needed,Rc::clone(&input)));
+                    steps.extend(slots.into_iter().rev().flatten().map(|arg| Visit(frame,arg,Need::Int,Rc::clone(&input))));
+                }
+                Restrict(frame,next,need) => {
+                    match values.pop()?.lanes()? {
+                        Some(row) => steps.push(Visit(frame,next,need,row)),
+                        None => values.push(match need { Need::Int => Int(None), Need::Bool(_) => Bool(None) }),
+                    }
+                }
+                Join(need,ty) => {
+                    let (r,l) = (values.pop()?,values.pop()?);
+                    values.push(match (need,l,r) {
+                        (Need::Int,Int(Some(l)),Int(Some(r))) => Int(Some(l.hull(r))),
+                        (Need::Int,Int(l),Int(r)) => Int(l.or(r).or_else(|| Envelope::whole(ty))),
+                        (Need::Bool(_),Bool(l),Bool(r)) => Bool(join(l,r)),
+                        _ => return None,
+                    });
+                }
+                Arithmetic(op,ty) => {
+                    let (r,l) = (values.pop()?.bound()?,values.pop()?.bound()?);
+                    values.push(Int(Some(l.binary(op,r,ty)?)));
+                }
+                Compare(frame,left,right,op,want,mut input) => {
+                    let (r,l) = (values.pop()?.bound()?,values.pop()?.bound()?);
+                    let mut viable = true;
+                    for (site,other,reverse) in [(left,&r,false),(right,&l,true)] {
+                        if let Some(axis) = frame.formal(site) {
+                            let bound = Rc::make_mut(&mut input).get_mut(axis)?.as_mut()?;
+                            intersect_comparison(bound,op,want,other,reverse)?;
+                            viable &= bound.low <= bound.high;
+                        }
+                    }
+                    values.push(Bool(viable.then_some(input)));
+                }
+                Args(target,slots,frame,needed,outer) => {
+                    let args = slots.iter().rev().map(|slot| if slot.is_some() { Some(Some(values.pop()?.bound()?)) } else { Some(None) })
+                        .collect::<Option<Vec<_>>>()?.into_iter().rev().collect::<Vec<_>>();
+                    let key = (target,Rc::new(args));
+                    if matches!(needed,Need::Bool(_)) { steps.push(Forward(slots,frame,outer)); }
+                    let cached = match needed {
+                        Need::Int => self.integer.get(&key).cloned(),
+                        Need::Bool(want) => self.boolean.get(&(key.clone(),want)).cloned(),
+                    };
+                    if let Some(known) = cached {
+                        #[cfg(test)] { self.work[1] += 1; }
+                        values.push(known);
+                        continue;
+                    }
+                    if !active.insert(target) { return None; }
+                    let target = self.frame(target)?;
+                    let output = target.output(target.body.structure.root)?;
+                    let local = Rc::clone(&key.1);
+                    steps.extend([Record(key,needed),Visit(target,output,needed,local)]);
+                }
+                Record(key,needed) => {
+                    active.remove(&key.0);
+                    let value = values.last()?.clone();
+                    match needed {
+                        Need::Int => self.integer.insert(key,value),
+                        Need::Bool(want) => self.boolean.insert((key,want),value),
+                    };
+                }
+                Forward(slots,frame,mut outer) => {
+                    let narrowed = values.pop()?.lanes()?;
+                    let mut viable = narrowed.is_some();
+                    if let Some(row) = narrowed {
+                        if slots.len() != row.len() { return None; }
+                        for (slot,bounds) in slots.into_iter().zip(row.iter()) {
+                            let (Some(arg),Some(bounds)) = (slot,bounds) else { continue; };
+                            if let Some(axis) = frame.formal(arg) {
+                                let current = Rc::make_mut(&mut outer).get_mut(axis)?.as_mut()?;
+                                current.low = std::cmp::max(current.low.clone(),bounds.low.clone());
+                                current.high = std::cmp::min(current.high.clone(),bounds.high.clone());
+                                viable &= current.low <= current.high;
+                            }
+                        }
+                    }
+                    values.push(Bool(viable.then_some(outer)));
                 }
             }
-            let left = self.facts(frame, condition, true, inputs.clone())?;
-            let right = self.facts(frame, condition, false, inputs.clone())?;
-            return match (left,right) {
-                (Some(l),Some(r)) => Some(self.value(frame,yes,&l)?.hull(self.value(frame,no,&r)?)),
-                (Some(l),None) => self.value(frame,yes,&l),
-                (None,Some(r)) => self.value(frame,no,&r),
-                (None,None) => Envelope::whole(ty),
-            };
         }
-        let key = self.arguments(frame,e,inputs)?;
-        if let Some(value) = self.integer.get(&key) { return Some(value.clone()); }
-        if !self.active.insert(key.0) { return None; }
-        let evaluated = (|| {
-            let child = self.frame(key.0)?;
-            self.value(&child, child.output(child.body.structure.root)?, &key.1)
-        })();
-        self.active.remove(&key.0);
-        let value = evaluated?;
-        self.integer.insert(key,value.clone());
-        Some(value)
+        if values.len() != 1 { return None; }
+        values.pop()
     }
 
-    fn facts(&mut self, frame: &Frame<'a>, e: OccurrenceOrdinal, want: bool, mut input: Inputs) -> Option<Option<Inputs>> {
-        let structure = &frame.body.structure;
-        if structure.checked_types.expressions.get(&e)? != &ScalarType::Bool { return None; }
-        if let Some(value) = structure.observed_bool_literals.get(&e) { return Some((want == *value).then_some(input)); }
-        if frame.formal(e).is_some() { return Some(Some(input)); }
-        if let Some(inner) = structure.observed_bool_negations.get(&e) { return self.facts(frame,*inner,!want,input); }
-        if let Some(branch) = frame.body.short_circuits.get(&e) {
-            let continuing = branch.evaluate_right_when;
-            if want == continuing {
-                let Some(left) = self.facts(frame,branch.left,continuing,input)? else { return Some(None); };
-                return self.facts(frame,branch.right,want,left);
-            }
-            let bypass = self.facts(frame,branch.left,!continuing,input.clone())?;
-            let via_right = match self.facts(frame,branch.left,continuing,input)? {
-                Some(left) => self.facts(frame,branch.right,want,left)?,
-                None => None,
-            };
-            return Some(join(bypass,via_right));
-        }
-        if let Some((condition, yes, no)) = frame.conditional(e) {
-            let yes = match self.facts(frame,condition,true,input.clone())? {
-                Some(row) => self.facts(frame,yes,want,row)?,
-                None => None,
-            };
-            let no = match self.facts(frame,condition,false,input)? {
-                Some(row) => self.facts(frame,no,want,row)?,
-                None => None,
-            };
-            return Some(join(yes,no));
-        }
-        let Some((left,op,right)) = structure.prepared_range_binary.get(&e) else {
-            let key = self.arguments(frame,e,&input)?;
-            if !self.active.insert(key.0) { return None; }
-            let evaluated = (|| {
-                let child = self.frame(key.0)?;
-                self.facts(&child,child.output(child.body.structure.root)?,want,key.1)
-            })();
-            self.active.remove(&key.0);
-            let Some(row) = evaluated? else { return Some(None); };
-            for (slot,bounds) in row.into_iter().enumerate() {
-                let Some(bounds) = bounds else { continue; };
-                let OccurrenceNode::Expression(arg) = structure.edges.get(&(
-                    OccurrenceParent::Expression(e), OccurrenceEdge::CallArgument(slot),
-                ))? else { return None; };
-                if let Some(index) = frame.formal(*arg) {
-                    let current = input.get_mut(index)?.as_mut()?;
-                    current.low = std::cmp::max(current.low.clone(),bounds.low);
-                    current.high = std::cmp::min(current.high.clone(),bounds.high);
-                    if current.low > current.high { return Some(None); }
-                }
-            }
-            return Some(Some(input));
-        };
-        let right_bounds = self.value(frame,*right,&input)?;
-        let left_bounds = self.value(frame,*left,&input)?;
-        if let Some(index) = frame.formal(*left) {
-            let bound = input.get_mut(index)?.as_mut()?;
-            intersect_comparison(bound, op, want, &right_bounds, false)?;
-            if bound.low > bound.high { return Some(None); }
-        }
-        if let Some(index) = frame.formal(*right) {
-            let bound = input.get_mut(index)?.as_mut()?;
-            intersect_comparison(bound, op, want, &left_bounds, true)?;
-            if bound.low > bound.high { return Some(None); }
-        }
-        Some(Some(input))
-    }
+    #[cfg(test)]
+    pub(super) fn work(&self) -> [usize;3] { self.work }
 
     /// Close only obligations universal under exact same-call branch facts.
     /// Every remaining authored site and any unsupported history use the
@@ -314,10 +391,16 @@ impl<'a> PreparedEnvelopes<'a> {
     }
 
     #[cfg(test)]
-    pub(super) fn true_formal_envelopes(&mut self, target: PreparedCallable) -> Option<Inputs> {
+    pub(super) fn formal_envelopes(&mut self, target: PreparedCallable, want: bool) -> Option<Inputs> {
+        let frame = self.frame(target)?;
+        self.formal_envelopes_at(target,want,initial_inputs(frame.body)?)?
+    }
+
+    #[cfg(test)]
+    pub(super) fn formal_envelopes_at(&mut self, target: PreparedCallable, want: bool, input: Inputs) -> Option<Option<Inputs>> {
         let frame = self.frame(target)?;
         if !matches!(frame.body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool) { return None; }
-        self.facts(&frame, frame.output(frame.body.structure.root)?, true, initial_inputs(frame.body)?)?
+        self.facts(&frame, frame.output(frame.body.structure.root)?, want, input)
     }
 }
 
@@ -326,12 +409,15 @@ fn initial_inputs(body: &FunctionCallSites) -> Option<Inputs> {
         else { Envelope::whole(&p.ty).map(Some) }).collect()
 }
 
-fn join(left: Option<Inputs>, right: Option<Inputs>) -> Option<Inputs> {
+fn join(left: Lanes, right: Lanes) -> Lanes {
     match (left,right) {
-        (Some(left),Some(right)) => Some(left.into_iter().zip(right).map(|(l,r)| match (l,r) {
-            (Some(l),Some(r)) => Some(l.hull(r)),
-            _ => None,
-        }).collect()),
+        (Some(left),Some(right)) => {
+            if Rc::ptr_eq(&left,&right) { return Some(left); }
+            Some(Rc::new(Rc::unwrap_or_clone(left).into_iter().zip(Rc::unwrap_or_clone(right)).map(|(l,r)| match (l,r) {
+                (Some(l),Some(r)) => Some(l.hull(r)),
+                _ => None,
+            }).collect()))
+        }
         (left,right) => left.or(right),
     }
 }

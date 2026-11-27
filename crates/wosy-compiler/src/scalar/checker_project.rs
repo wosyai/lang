@@ -20175,6 +20175,48 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn typed_guard_dag_uses_iterative_frames_and_distinct_outcome_keys() {
+        let app = source("src/main.w", "typed-guard-dag-envelope");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for depth in [24,96,256] {
+                let mut program = "%%start\n bool(i32) check_0 = fn(x) { x>=0 && x<12 };\n".to_owned();
+                for i in 1..=depth {
+                    let child = i-1;
+                    use std::fmt::Write;
+                    writeln!(&mut program,"bool(i32) check_{i} = fn(x) {{ check_{child}(x) && check_{child}(x) }};").unwrap();
+                }
+                use std::fmt::Write;
+                writeln!(&mut program,
+                    "unit(i32) use_guard = fn(x) {{ if (check_{depth}(x)) {{ core.require(x>=0 && x<12, {{.stdout=\"\";.stderr=\"range\";.code=1;.files=[];}}); }}; }};\n%%end").unwrap();
+                let owner = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app,&program),Vec::new())],[],vec![app.clone()],
+                    ScalarPreparationInputs { target_layout },ScalarCheckerScope::CurrentPackage,Vec::new(),
+                ).unwrap().into_startup_authored_owner().unwrap();
+                assert_eq!(owner.proven_joins.len(),1);
+                let (project,calls) = owner.owner.parts();
+                let name = format!("check_{depth}");
+                let index = project.modules[0].items.iter().position(|item|
+                    matches!(item,ScalarItem::Function(function) if function.name == name)).unwrap();
+                let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
+                let yes = envelopes.formal_envelopes((0,index),true).unwrap();
+                let no = envelopes.formal_envelopes((0,index),false).unwrap();
+                assert_eq!(yes[0].as_ref().unwrap().low,BigInt::from(0));
+                assert_eq!(yes[0].as_ref().unwrap().high,BigInt::from(11));
+                assert_eq!((no[0].as_ref().unwrap().low.clone(),no[0].as_ref().unwrap().high.clone()),
+                    (BigInt::from(i32::MIN),BigInt::from(i32::MAX)));
+                assert_eq!(envelopes.formal_envelopes_at((0,index),false,yes.clone()),Some(None));
+                let denied = Some(range_envelopes::Envelope { low: BigInt::from(12), high: BigInt::from(12) });
+                assert_eq!(envelopes.formal_envelopes_at((0,index),true,vec![denied]),Some(None));
+                let [steps,hits,heap] = envelopes.work();
+                eprintln!("guard nesting={depth} steps={steps} cache_hits={hits} heap_frontier={heap}");
+                assert!(steps < 100*(depth+1) && hits >= depth && heap >= depth);
+                assert!(owner.run(std::num::NonZeroUsize::MIN).unwrap().0.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn typed_true_guard_imports_only_its_all_returning_branches_for_checked_formals() {
         let app = source("src/main.w", "terrain-independent-true-guard-envelope");
         let program = r#"%%start
@@ -20205,7 +20247,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let index = project.modules[0].items.iter().position(|item|
                 matches!(item, ScalarItem::Function(function) if function.name == "resident")).unwrap();
             let mut envelopes = range_envelopes::PreparedEnvelopes::new(project,calls);
-            let input = envelopes.true_formal_envelopes((0,index)).unwrap();
+            let input = envelopes.formal_envelopes((0,index),true).unwrap();
             for slot in 0..2 {
                 let range = input[slot].as_ref().unwrap();
                 assert_eq!((range.low.clone(),range.high.clone()),(BigInt::from(-32),BigInt::from(39)));
