@@ -7953,9 +7953,9 @@ impl IntegerInputs {
             return Some(None);
         }
         let mut rows = [Self::default(), Self::default()];
-        for row in &self.0 {
-            let selected = evaluate_observed_boolean(calls, condition, roots, row)?;
-            rows[usize::from(selected)].0.push(row.clone());
+        for mut row in self.0.iter().cloned() {
+            let selected = evaluate_observed_boolean(calls, condition, roots, &mut row)?;
+            rows[usize::from(selected)].0.push(row);
         }
         Some(Some(rows))
     }
@@ -12408,13 +12408,15 @@ fn observed_boolean_modules(calls: &FunctionCallSites, condition: OccurrenceOrdi
 }
 
 #[cfg(feature = "internal-checker")]
-fn evaluate_observed_boolean(calls: &FunctionCallSites, mut site: OccurrenceOrdinal,
-    roots: &IntegerRoots<'_>, row: &IntegerRow) -> Option<bool> {
+fn evaluate_observed_boolean(calls: &FunctionCallSites, condition: OccurrenceOrdinal,
+    roots: &IntegerRoots<'_>, row: &mut IntegerRow) -> Option<bool> {
     use super::checker_project::ObservedExactValue;
     let mut pending = Vec::new();
+    let mut site = condition;
+    let history = roots.callable_history?;
     enum Resume { Not, Branch { right: OccurrenceOrdinal, when: bool } }
     'evaluate: loop {
-        roots.callable_history?.borrow().charge(1)?;
+        history.borrow().charge(1)?;
         let mut value = match observed_boolean_node(calls, site)? {
             ObservedBoolean::Literal(value) => value,
             ObservedBoolean::Module(declaration) => {
@@ -12431,6 +12433,15 @@ fn evaluate_observed_boolean(calls: &FunctionCallSites, mut site: OccurrenceOrdi
                 pending.push(Resume::Branch { right, when }); site = left; continue;
             }
         };
+        // Outer condition is already recorded by the block cursor. Keep
+        // only actually evaluated child atoms, in evaluation order.
+        if site != condition {
+            let at = calls.occurrences.get(site.0)?.span;
+            let mut history = history.borrow_mut();
+            let step = history.step_owner.map_or(CallableHistoryStep::Branch(at,value),
+                |owner| CallableHistoryStep::ProviderBranch(owner,at,value));
+            history.append(row, step);
+        }
         while let Some(continuation) = pending.pop() {
             match continuation {
                 Resume::Not => value = !value,

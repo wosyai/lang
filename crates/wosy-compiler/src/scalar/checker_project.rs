@@ -20047,8 +20047,9 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 if (wrecking && parcel_camera_published) {
                     f32 heading = published_parcel_camera.heading;
                     f32 pitch = published_parcel_camera.pitch;
-                    bool expected_camera = heading == 0.75 && pitch == 0.25;
-                    if (expected_camera) { status = 37; } else { status = 11; };
+                    if (heading == 0.75) {
+                        if (pitch == 0.25) { status = 37; } else { status = 11; };
+                    } else { status = 13; };
                 } else {
                     if (parcel_camera_published) { status = 29; } else { status = 19; };
                 };
@@ -20073,7 +20074,12 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let report = prepare().run().unwrap();
                 assert_eq!(super::super::checker_flow::take_observed_storage_delta_visits(), cells*17,
                     "only selected writes are charged: {steps}");
-                let (capped, _, _, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                let (capped, _, trace, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                let operand = "parcel_camera_published";
+                let selected = text.find("wrecking && parcel_camera_published").unwrap() + "wrecking && ".len();
+                let span = || wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(selected as u32, (selected+operand.len()) as u32));
+                assert_eq!(trace.contains_branch(span(), true), steps.starts_with("follow(); wreck();"), "{steps}");
+                assert_eq!(trace.contains_branch(span(), false), steps == "wreck();" || steps.contains("coast(); wreck();"), "{steps}");
                 assert_eq!(capped, report.directives, "{steps}");
                 assert_eq!(capped[0].code(), &BigInt::from(expected), "{steps}");
             }
