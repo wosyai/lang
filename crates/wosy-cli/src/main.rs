@@ -286,7 +286,25 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     drop(document);
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
-    let manifest = load_artifact_manifest(&manifest_path)
+    let runner = validate_run_manifest(
+        &manifest_path, &configuration, &configuration_identity, &target_name, profile, artifact, artifact_profile,
+    )?;
+    invoke_direct_with_arguments(&root, &runner.command, &runner.args, &manifest_path, arguments)
+}
+
+/// Validate the manifest at the selected path; do not discover a second
+/// manifest or rewrite the path passed to the existing custom runner.
+/// This does not pin a mutable manifest across runner execution.
+fn validate_run_manifest<'a>(
+    manifest_path: &std::path::Path,
+    configuration: &'a ProjectConfiguration,
+    configuration_identity: &str,
+    target_name: &str,
+    profile: &str,
+    artifact: &wosy_project::ArtifactConfig,
+    artifact_profile: &wosy_project::ArtifactProfile,
+) -> Result<&'a wosy_project::RunnerConfig, String> {
+    let manifest = load_artifact_manifest(manifest_path)
         .map_err(|error| format!("artifact manifest error: {error}"))?;
     if manifest.identity.configuration_identity != configuration_identity {
         return Err("artifact manifest is stale".to_owned());
@@ -343,13 +361,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
             manifest.executable.display()
         ));
     }
-    invoke_direct_with_arguments(
-        &root,
-        &runner.command,
-        &runner.args,
-        &manifest_path,
-        arguments,
-    )
+    Ok(runner)
 }
 
 fn source_observation_path(observation: &SourceObservation) -> std::path::PathBuf {
