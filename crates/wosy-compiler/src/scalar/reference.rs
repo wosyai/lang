@@ -1795,7 +1795,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let ty = self.checked_member_type(ordinal, span)?;
                         Some((field, CheckedReadSource::PreparedMember { binding, ty }))
                     }
-                    Some(PreparedMemberIdentity::Other) => None,
+                    Some(PreparedMemberIdentity::ModuleDirect { .. } | PreparedMemberIdentity::Other) => None,
                     None => match self
                         .names
                         .get(receiver)
@@ -2645,7 +2645,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         (binding, field, self.checked_member_type(ordinal, *span)?)
                     }
-                    Some(PreparedMemberIdentity::Other) => return Ok(()),
+                    Some(PreparedMemberIdentity::ModuleDirect { .. } | PreparedMemberIdentity::Other) => return Ok(()),
                     None => {
                         let Some(binding) = self.names.get(receiver) else {
                             return Ok(());
@@ -6789,6 +6789,7 @@ enum PreparedMemberIdentity {
         binding: ReferenceBindingId,
         field: ScalarStructFieldId,
     },
+    ModuleDirect { declaration: SourceSpan, field: ScalarStructFieldId },
     Other,
 }
 
@@ -7008,8 +7009,18 @@ impl FunctionCallSites {
         };
         match rows.get(&ordinal)? {
             PreparedMemberIdentity::Lexical { binding, field } => Some((binding, field)),
-            PreparedMemberIdentity::Other => None,
+            PreparedMemberIdentity::ModuleDirect { .. } | PreparedMemberIdentity::Other => None,
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn prepared_module_direct_member(
+        &self,
+        ordinal: OccurrenceOrdinal,
+    ) -> Option<(&SourceSpan, &ScalarStructFieldId)> {
+        let MemberFacts::Prepared(rows) = &self.members else { return None; };
+        let PreparedMemberIdentity::ModuleDirect { declaration, field } = rows.get(&ordinal)? else { return None; };
+        Some((declaration, field))
     }
 
     pub(super) fn prepared_direct_destination(
@@ -8635,6 +8646,15 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         binding: binding.reference_id(resolver.source, resolver.function_span),
                         field,
                     })
+                }
+                (Some(CheckedMember::DirectField(field)), None) => {
+                    let module_field = resolver.declarations.binding(resolver.source, receiver)
+                        .filter(|(_, ty)| matches!(ty, ScalarType::Struct(id) if id == &field.structure))
+                        .map(|(span, _)| PreparedMemberIdentity::ModuleDirect {
+                            declaration: SourceSpan::new(resolver.source.clone(), span),
+                            field,
+                        });
+                    Some(module_field.unwrap_or(PreparedMemberIdentity::Other))
                 }
                 (Some(_), _) => Some(PreparedMemberIdentity::Other),
                 (None, _) => None,

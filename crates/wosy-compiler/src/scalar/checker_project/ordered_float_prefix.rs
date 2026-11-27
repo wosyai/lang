@@ -217,6 +217,16 @@ impl<'a> Planner<'a> {
                             }
                             _ => return None,
                         },
+                        ScalarExpression::Member { .. } if value_type(ty) => {
+                            let (declaration, field) = frame.prepared.prepared_module_direct_member(at)?;
+                            frame.field(&field.structure, field, ty)?;
+                            frame.module_value(declaration, &ScalarType::Struct(field.structure.clone()))?;
+                            let receiver = self.certificate.effects.len();
+                            self.certificate.effects.push(EffectRecord { owner: frame.target,
+                                operation: Effect::Read { at, declaration: declaration.clone(), index: None },
+                            });
+                            Effect::Field { at, field: field.clone(), receiver }
+                        }
                         ScalarExpression::IndexedRead { place, .. } => {
                             let OccurrenceNode::Place(place_at) = structure.edges.get(
                                 &(OccurrenceParent::Expression(at), OccurrenceEdge::ExpressionPlace),

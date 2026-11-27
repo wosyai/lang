@@ -19300,6 +19300,169 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn flight_camera_readonly_prefix_stops_before_original_guarded_assignments() {
+        use ordered_float_prefix::Effect;
+        let owner = source("src/main.w", "flight-camera-readonly-prefix");
+        // Published Flying Low camera prefix and its real helper bodies; the final
+        // synthetic require only keeps otherwise-later locals live in this excerpt.
+        let excerpt = r#"%%start
+struct copy RenderPose {
+	f32 x;
+	f32 y;
+	f32 z;
+	f32 heading;
+	f32 pitch;
+	f32 roll;
+}
+RenderPose empty_presentation = {
+	.x = 0.0; .y = 0.0; .z = 0.0; .heading = 0.0; .pitch = 0.0; .roll = 0.0;
+};
+RenderPose[2] presented_pose = [empty_presentation, empty_presentation];
+struct copy ParcelCamera {
+	f32 x; f32 y; f32 z;
+	f32 heading; f32 pitch; f32 roll;
+}
+ParcelCamera published_parcel_camera = { .x=0.0; .y=0.0; .z=0.0; .heading=0.0; .pitch=0.0; .roll=0.0; };
+f32 mail_heading = 0.0;
+f32 pouch_x = 0.0;
+f32 pouch_y = 0.0;
+f32 pouch_z = 0.0;
+f32 mail_shot = 0.0;
+bool parcel_camera_published = false;
+i32 wreck_age = -1;
+bool wreck_entered = false;
+f32 wreck_h = 0.0;
+f32 camera_view = 0.0;
+f32(f32, f32, f32) clamp = fn(v, lo, hi) { if (v < lo) { lo } else { if (v > hi) { hi } else { v } } };
+f32(f32) wrap = fn(a) { if (a > 3.14159265) { a - 6.28318530 } else { if (a < -3.14159265) { a + 6.28318530 } else { a } } };
+f32(f32) sin_small = fn(a) {
+	f32 u = if (a > 1.57079633) { 3.14159265 - a } else { if (a < -1.57079633) { -3.14159265 - a } else { a } };
+	f32 d = u * u;
+	u * (1.0 - d * (0.166666667 - d * (0.008333333 - d * 0.000198413)))
+};
+f32(f32) cos_small = fn(a) { sin_small(wrap(a + 1.57079633)) };
+f32(f32, f32, f32) blend = fn(a, b, r) { a + (b - a) * r };
+f32(i32) float_i = fn(a) { core.sint_to_float<f32>(a) };
+f32(f32) eased_unit = fn(value) {
+	f32 t = clamp(value,0.0,1.0);
+	t*t*(3.0-2.0*t)
+};
+unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
+	bool wrecking = wreck_age >= 0;
+	f32 wreck_time = if (wrecking && !wreck_entered) { float_i(wreck_age)+wreck_alpha } else { 0.0 };
+	f32 wreck_blend = eased_unit(wreck_time/13.0);
+	f32 orbit = eased_unit(wreck_time/34.0);
+	f32 p_heading = presented_pose[0].heading;
+	f32 hp = sin_small(p_heading);
+	f32 hz0 = cos_small(p_heading);
+	bool following = !wrecking && mail_shot > 0.0;
+	bool parcel_interrupted = wrecking && parcel_camera_published;
+	f32 wreck_heading = wrap(wreck_h-0.37*orbit);
+	f32 wreck_home_heading = if (parcel_interrupted) { published_parcel_camera.heading } else { p_heading };
+	f32 heading = if (wrecking) { wrap(wreck_home_heading+wrap(wreck_heading-wreck_home_heading)*wreck_blend) } else {
+		if (following) { wrap(p_heading+wrap(mail_heading-p_heading)*mail_shot) } else { p_heading }
+	};
+	f32 hx = if (wrecking || following) { sin_small(heading) } else { hp };
+	f32 hz = if (wrecking || following) { cos_small(heading) } else { hz0 };
+	f32 base_pitch = if (camera_view >= 1.0) { presented_pose[0].pitch } else { blend(-0.20+presented_pose[0].pitch*0.62,presented_pose[0].pitch,camera_view) };
+	f32 wreck_home_pitch = if (parcel_interrupted) { published_parcel_camera.pitch } else { base_pitch };
+	f32 pitch = if (wrecking) { blend(wreck_home_pitch,-0.27,wreck_blend) } else { if (following) { blend(base_pitch,-0.57,mail_shot) } else { base_pitch } };
+	f32 ps = sin_small(pitch);
+	f32 pc = cos_small(pitch);
+	f32 vx = hx*pc;
+	f32 vy = ps;
+	f32 vz = hz*pc;
+	f32 ux = -hx*ps;
+	f32 uy = pc;
+	f32 uz = -hz*ps;
+	f32 reach = blend(-17.5,0.75,camera_view);
+	f32 ex_home = presented_pose[0].x+hp*reach;
+	f32 eye_height = if (camera_view >= 1.0) { 0.82 } else { blend(5.3,0.82,camera_view) };
+	f32 ey_home = presented_pose[0].y+eye_height;
+	f32 ez_home = presented_pose[0].z+hz0*reach;
+	f32 ex = if (following) { blend(ex_home,pouch_x-sin_small(mail_heading)*7.0,mail_shot) } else { ex_home };
+	f32 ey = if (following) { blend(ey_home,pouch_y+4.52,mail_shot) } else { ey_home };
+	f32 ez = if (following) { blend(ez_home,pouch_z-cos_small(mail_heading)*7.0,mail_shot) } else { ez_home };
+	if (parcel_interrupted) {
+		ex = published_parcel_camera.x; ey = published_parcel_camera.y; ez = published_parcel_camera.z;
+	};
+    core.require(mail_status>=0 ||
+        !wrecking ||
+        wreck_time<0.0 ||
+        wreck_blend<0.0 ||
+        orbit<0.0 ||
+        p_heading<0.0 ||
+        hp<0.0 ||
+        hz0<0.0 ||
+        !following ||
+        !parcel_interrupted ||
+        wreck_heading<0.0 ||
+        wreck_home_heading<0.0 ||
+        heading<0.0 ||
+        hx<0.0 ||
+        hz<0.0 ||
+        base_pitch<0.0 ||
+        wreck_home_pitch<0.0 ||
+        pitch<0.0 ||
+        ps<0.0 ||
+        pc<0.0 ||
+        vx<0.0 ||
+        vy<0.0 ||
+        vz<0.0 ||
+        ux<0.0 ||
+        uy<0.0 ||
+        uz<0.0 ||
+        reach<0.0 ||
+        ex_home<0.0 ||
+        eye_height<0.0 ||
+        ey_home<0.0 ||
+        ez_home<0.0 ||
+        ex<0.0 ||
+        ey<0.0 ||
+        ez<0.0,
+        {.stdout="";.stderr="unconsumed test suffix";.code=9;.files=[];});
+};
+%%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, count: usize| {
+                let prepared = prepare_checker_project(
+                    vec![(declarations(&owner, text), Vec::new())], vec![owner.clone()],
+                    ScalarPreparationInputs { target_layout },
+                ).unwrap_or_else(|error| panic!("Flight camera preparation: {error:?}"));
+                let (project, _) = prepared.parts();
+                let module = &project.modules[0];
+                let item = module.items.iter().position(|item|
+                    matches!(item, ScalarItem::Function(f) if f.name == "frame")).unwrap();
+                let (root, ordinals) = package_startup_order(project, &project.modules).unwrap();
+                let mut effects = OrderedFailures::default();
+                let (initialization, _) = check_package_initialization_observing_with_policy::<_, true, true>(
+                    &prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+                ).expect("real ordered module initialization");
+                let certificate = ordered_float_prefix::prepare_readonly_prefix(&prepared, &initialization, (0,item)).unwrap();
+                let names: Vec<_> = certificate.bindings.iter().map(|binding| {
+                    let span = binding.slot.declaration_span;
+                    &text[span.start as usize..span.end as usize]
+                }).collect();
+                let expected = ["wrecking", "wreck_time", "wreck_blend", "orbit", "p_heading", "hp", "hz0", "following", "parcel_interrupted", "wreck_heading", "wreck_home_heading", "heading", "hx", "hz", "base_pitch", "wreck_home_pitch", "pitch", "ps", "pc", "vx", "vy", "vz", "ux", "uy", "uz", "reach", "ex_home", "eye_height", "ey_home", "ez_home", "ex", "ey", "ez"];
+                assert_eq!(names, &expected[..count]);
+                if count == expected.len() {
+                    assert_eq!(certificate.callees.len(), 7);
+                    let fields: Vec<_> = certificate.effects.iter().filter_map(|record| match &record.operation {
+                        Effect::Field { field, receiver, .. } if record.owner == (0,item)
+                            && matches!(certificate.effects[*receiver].operation, Effect::Read { index: None, .. }) =>
+                            Some(module.structs[field.structure.index].fields[field.index].name.as_str()),
+                        _ => None,
+                    }).collect();
+                    assert_eq!(fields, ["heading", "pitch"], "captured read fields only; not the X/Y/Z writes");
+                }
+            };
+            run(excerpt, 33);
+            run(&excerpt.replace("f32 u = if", "camera_view=0.0; f32 u = if"), 5);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_float_prefix_preserves_original_flight_calls_branches_and_checked_field_read() {
         use ordered_float_prefix::Effect;
         let owner = source("src/main.w", "flight-ordered-readonly-frame-prefix");
