@@ -22634,7 +22634,22 @@ unit(u8) parent = fn(a) {
                 vec![(declarations(&app, program), Vec::new())], [], vec![app.clone()],
                 ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
             ).unwrap();
-            let ordinary = prepare().run().unwrap();
+            let prepared = prepare();
+            let PreparedConfiguredCheck::Plain { owner, .. } = &prepared.owner else { panic!("expected plain initialized project"); };
+            let (project, calls) = owner.parts();
+            let mut classified = 0;
+            for (module, prepared_module) in project.modules.iter().enumerate() {
+                for (item, declaration) in prepared_module.items.iter().enumerate() {
+                    if let ScalarItem::Function(function) = declaration {
+                        let body = calls.function_body(module, item, None).unwrap();
+                        assert_eq!(super::super::checker_flow::projected_integer_storage_frame(body), Some(true),
+                            "typed runtime storage occurrences were not covered in {}", function.name);
+                        classified += 1;
+                    }
+                }
+            }
+            assert_eq!(classified, 2);
+            let ordinary = prepared.run().unwrap();
             assert_eq!(ordinary.directives.len(), 1);
             assert_eq!(ordinary.directives[0].code(), &BigInt::from(37));
         }

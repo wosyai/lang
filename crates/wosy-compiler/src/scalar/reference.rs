@@ -8518,7 +8518,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            ) || initializer_literal_argument || wide_rank_initializer_argument || checked_scalar_pair_argument
+            ) || (matches!(edge, OccurrenceEdge::PlaceIndex) && matches!(self.mode, WalkMode::Callable(_))
+                && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::U64))
+                || initializer_literal_argument || wide_rank_initializer_argument || checked_scalar_pair_argument
                 || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
