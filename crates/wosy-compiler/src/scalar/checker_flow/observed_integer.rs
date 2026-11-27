@@ -77,6 +77,7 @@ enum Expr<'a> {
     Extend(OccurrenceOrdinal),
     Getter,
     FromFloatCall(Vec<OccurrenceOrdinal>,&'a ScalarType),
+    ProviderCall(Vec<(OccurrenceOrdinal,&'a ScalarType)>),
 }
 
 fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'_>> {
@@ -95,6 +96,7 @@ fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Expr<'
     }
     if observed_getter_signature(calls,at).is_some() { return Some(Expr::Getter); }
     if let Some(args) = observed_float_argument_sites(calls,at,ty) { return Some(Expr::FromFloatCall(args,ty)); }
+    if let Some(args) = observed_mixed_provider_arguments(calls,at) { return Some(Expr::ProviderCall(args)); }
     use super::super::{CoreOperationId,ResolvedCallTarget};
     if calls.resolved_call_site(at)?.target != ResolvedCallTarget::Core(CoreOperationId::IntExtend) { return None; }
     let sig = calls.checked_call_signatures.get(&at)?;
@@ -126,6 +128,16 @@ pub(super) fn sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
                 for arg in args {
                     if let Some(value) = observed_f32_array::expression(calls,arg) {
                         place(value.declaration,value.site,ModuleStorageRole::Project);
+                    }
+                }
+            }
+            Expr::ProviderCall(args) => {
+                core(at);
+                for (arg,ty) in args {
+                    if *ty==ScalarType::F32 {
+                        if let Some(value)=observed_f32_array::expression(calls,arg) {
+                            place(value.declaration,value.site,ModuleStorageRole::Project);
+                        }
                     }
                 }
             }
@@ -173,6 +185,10 @@ fn evaluate_in_lane(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &In
                     let super::super::checker_project::ObservedExactValue::Integer(_, value) =
                         evaluate_observed_getter(calls,at,roots,row)? else { return None; };
                     values.push(value);
+                }
+                Expr::ProviderCall(args) => {
+                    if !use_current_cells { return None; }
+                    values.push(evaluate_observed_provider(calls,at,&args,roots,row)?);
                 }
                 Expr::FromFloatCall(args,expected) => {
                     if !use_current_cells { return None; }

@@ -10,10 +10,10 @@ pub(in super::super) struct Cell {
 
 pub(in super::super) type Read<'a> = dyn Fn(&ProjectedStorage, &Cell) -> Option<(projected_f32::ExactF32,usize)> + 'a;
 
-pub(super) struct Place<'a> {
-    pub(super) declaration: &'a Span,
+pub(in super::super) struct Place<'a> {
+    pub(in super::super) declaration: &'a Span,
     pub(super) site: OccurrenceOrdinal,
-    selectors: Vec<(OccurrenceOrdinal, u64)>,
+    pub(in super::super) selectors: Vec<(OccurrenceOrdinal, u64)>,
 }
 
 impl Place<'_> {
@@ -46,10 +46,10 @@ pub(super) fn read(calls: &FunctionCallSites, place: Place<'_>, roots: &IntegerR
     Some(value)
 }
 
-pub(super) fn place(calls: &FunctionCallSites, mut cursor: OccurrenceOrdinal) -> Option<Place<'_>> {
+pub(in super::super) fn typed_place<'a>(calls: &'a FunctionCallSites, mut cursor: OccurrenceOrdinal, ty: &ScalarType) -> Option<Place<'a>> {
     use super::super::reference::NamedPlaceRootIdentity;
     let structure = &calls.structure;
-    if structure.checked_types.places.get(&cursor)? != &ScalarType::F32 { return None; }
+    if structure.checked_types.places.get(&cursor)? != ty { return None; }
     let mut selectors = Vec::new();
     loop {
         let parent = OccurrenceParent::Place(cursor);
@@ -74,7 +74,7 @@ pub(super) fn expression(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Op
     if calls.structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
     let OccurrenceNode::Place(destination) = calls.structure.edges.get(&(
         OccurrenceParent::Expression(at),OccurrenceEdge::ExpressionPlace))? else { return None; };
-    place(calls,*destination)
+    typed_place(calls,*destination,&ScalarType::F32)
 }
 
 pub(super) fn assignment(calls: &FunctionCallSites, position: BlockPosition) -> Option<(Place<'_>,OccurrenceOrdinal)> {
@@ -84,5 +84,5 @@ pub(super) fn assignment(calls: &FunctionCallSites, position: BlockPosition) -> 
     if group.projected_outputs().len() != 0 || !matches!(destination.replacement,AssignmentReplacement::Resolved(ScalarType::F32))
         || calls.structure.checked_types.expressions.get(&rhs.expression)? != &ScalarType::F32
     { return None; }
-    Some((place(calls,destination.destination)?,rhs.expression))
+    Some((typed_place(calls,destination.destination,&ScalarType::F32)?,rhs.expression))
 }

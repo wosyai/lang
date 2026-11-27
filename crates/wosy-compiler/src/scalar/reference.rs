@@ -6488,6 +6488,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) prepared_range_binary: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
     #[cfg(feature = "internal-checker")]
+    pub(super) prepared_i32_bitwise: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
+    #[cfg(feature = "internal-checker")]
     pub(super) prepared_range_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_literals: HashMap<OccurrenceOrdinal, bool>,
@@ -6707,6 +6709,8 @@ impl OccurrenceStructure {
             projected_place_fields: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             prepared_range_binary: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            prepared_i32_bitwise: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             prepared_range_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -9468,6 +9472,9 @@ impl StructuralWalker<'_, '_> {
                                     | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)))
                         {
                             self.structure.prepared_range_binary.insert(ordinal, (left,operator.clone(),right));
+                        } else if *lhs==ScalarType::I32 && lhs==rhs && lhs==output
+                            && matches!(operator,BinaryOperator::BitAnd|BinaryOperator::BitXor) {
+                            self.structure.prepared_i32_bitwise.insert(ordinal,(left,operator.clone(),right));
                         }
                     }
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)

@@ -28,6 +28,8 @@ mod source_call_census;
 #[cfg_attr(not(test), allow(dead_code))]
 mod ordered_float_prefix;
 #[cfg(feature = "internal-checker")]
+mod stateful_provider;
+#[cfg(feature = "internal-checker")]
 pub(super) use ordered_float_prefix::ExactValue as ObservedExactValue;
 #[cfg(feature = "internal-checker")]
 mod rewrite;
@@ -2086,7 +2088,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                         }
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
                             projected_storage.observe_array(declaration, ty, cells.into_iter());
-                        } else if fixed_f32_array_type(ty) {
+                        } else if observed_nested_array_leaf(ty).is_some() {
                             projected_storage.observe_aggregate(declaration);
                         }
                     }
@@ -2105,7 +2107,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             passive_generation = generation + 1;
             completed_passive.clear();
             if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
-                visits, projected_storage, &storage, failures)? {
+                visits, projected_storage, &storage, completed_passive, ordinals, failures)? {
                 projected_storage.settle(|declaration, index, observed| {
                     if &declaration.source != source {
                         // A completed provider will not resume its local
@@ -2147,11 +2149,16 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     visits[ordinal] = InitializationVisit::Completed;
     #[cfg(feature = "internal-checker")]
     if COLLECT {
-        // Only nominal values of the most recent independently proven
-        // passive segment are useful to a qualified nominal initializer.
-        storage.retain(|_, value| matches!(value, InitializerValue::PassiveAggregate {
-            ty: ScalarType::Struct(_), generation, ..
-        } if *generation == passive_generation));
+        // Nominal copy still uses only the last passive generation. Array
+        // backing remains lazy and is usable only with the live observed
+        // provenance marker; an unknown initializer effect erases that marker.
+        storage.retain(|range,value| match value {
+            InitializerValue::PassiveAggregate { ty: ScalarType::Struct(_),generation,.. } =>
+                *generation == passive_generation,
+            InitializerValue::PassiveAggregate { ty,.. } if observed_nested_array_leaf(ty).is_some() =>
+                projected_storage.has_observed_aggregate(&wosy_syntax::SourceSpan::new(source.clone(),*range)),
+            _ => false,
+        });
         if !storage.is_empty() { completed_passive.insert(ordinal, storage); }
     }
     Ok(StartupLane::Feasible)
@@ -2216,6 +2223,8 @@ fn try_observed_projected_storage_call(
     visits: &[InitializationVisit],
     storage: &mut super::checker_flow::ProjectedStorage,
     initialized: &HashMap<ByteSpan, InitializerValue<'_>>,
+    completed: &CompletedPassiveStorage<'_>,
+    ordinals: &HashMap<&SourceIdentity,usize>,
     failures: &mut Option<&mut OrderedFailures>,
 ) -> Result<bool, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }) =
@@ -2341,10 +2350,27 @@ fn try_observed_projected_storage_call(
         let ObservedExactValue::F32(value) = observed_nominal_f32_field(initialized.get(&cell.declaration.range)?, cell.index, &field)? else { return None; };
         Some(value)
     };
-    let read_array = |storage: &super::checker_flow::ProjectedStorage, cell: &super::checker_flow::observed_f32_array::Cell| {
-        if &cell.declaration.source != source || !storage.has_observed_aggregate(&cell.declaration) { return None; }
-        if let Some(value) = storage.observed_f32_array_element(cell) { return Some((value,1)); }
-        observed_passive_f32_array_element(initialized.get(&cell.declaration.range)?, &cell.indices)
+    let observed_array_backing = |at: &wosy_syntax::SourceSpan| {
+        if &at.source == source { return initialized.get(&at.range); }
+        let owner = *ordinals.get(&at.source)?;
+        completed_namespace_owner(source,&at.source,owner,Some(visits)).then_some(())?;
+        completed.get(&owner)?.get(&at.range)
+    };
+    let read_array_atom = |storage: &super::checker_flow::ProjectedStorage,
+        cell: &super::checker_flow::observed_f32_array::Cell, ty:&ScalarType| {
+        if !storage.has_observed_aggregate(&cell.declaration) { return None; }
+        let overlay = match ty {
+            ScalarType::F32 => storage.observed_f32_array_element(cell).map(ObservedExactValue::F32),
+            ScalarType::I32 => storage.observed_i32_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::I32,n.into())),
+            _ => return None,
+        };
+        if let Some(atom) = overlay { return Some((atom,1)); }
+        observed_passive_array_element(observed_array_backing(&cell.declaration)?, &cell.indices,ty)
+    };
+    let read_array = |storage: &super::checker_flow::ProjectedStorage,
+        cell: &super::checker_flow::observed_f32_array::Cell| {
+        let (ObservedExactValue::F32(value),work)=read_array_atom(storage,cell,&ScalarType::F32)? else { return None; };
+        Some((value,work))
     };
     let mut prefix = Vec::new();
     let mut prefix_history = None;
@@ -2376,6 +2402,26 @@ fn try_observed_projected_storage_call(
     let latest_math = RefCell::new(HashMap::<PreparedCallable, MathMemo>::new());
     let math_traces = RefCell::new(Vec::<Rc<ordered_float_prefix::ObservedTrace>>::new());
     let math_interned = RefCell::new(HashMap::<Rc<ordered_float_prefix::ObservedTrace>,usize>::new());
+    let intern_trace = |trace: ordered_float_prefix::ObservedTrace| {
+        let trace = Rc::new(trace);
+        *math_interned.borrow_mut().entry(Rc::clone(&trace)).or_insert_with(|| {
+            let mut traces = math_traces.borrow_mut();
+            let id = traces.len();
+            traces.push(trace);
+            id
+        })
+    };
+    let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage| {
+        let signature=body.checked_call_signatures.get(&site)?;
+        let caller=*observed_owners.get(&(body as *const FunctionCallSites))?;
+        let child=authenticate_prepared_direct_edge(actual.project,actual.calls,caller,body,site,signature)?;
+        // Do not observe an ambient owner. The real namespace provider has
+        // finished initialization and shares this exact storage row.
+        if child.0==caller || !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
+            &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
+        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),&read_array_atom)?;
+        Some((value,result.map(&intern_trace),cost))
+    };
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
         use std::collections::hash_map::Entry;
         let signature = body.checked_call_signatures.get(&site)?;
@@ -2409,15 +2455,7 @@ fn try_observed_projected_storage_call(
             })?;
         let [value] = returned.as_slice() else { return None; };
         if value.ty() != out.ty { return None; }
-        let trace = nested.map(|trace| {
-            let trace = Rc::new(trace);
-            *math_interned.borrow_mut().entry(Rc::clone(&trace)).or_insert_with(|| {
-                let mut traces = math_traces.borrow_mut();
-                let id = traces.len();
-                traces.push(trace);
-                id
-            })
-        });
+        let trace = nested.map(&intern_trace);
         latest_math.borrow_mut().insert(child, (bits, value.clone(), trace));
         Some((value.clone(),trace,work))
     };
@@ -2454,7 +2492,7 @@ fn try_observed_projected_storage_call(
         getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&frontiers),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -3050,15 +3088,15 @@ fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
 }
 
 #[cfg(feature = "internal-checker")]
-fn fixed_f32_array_type(mut ty: &ScalarType) -> bool {
-    if !matches!(ty,ScalarType::Array { .. }) { return false; }
+fn observed_nested_array_leaf(mut ty: &ScalarType) -> Option<&ScalarType> {
+    if !matches!(ty,ScalarType::Array { .. }) { return None; }
     while let ScalarType::Array { element,.. } = ty { ty = element; }
-    *ty == ScalarType::F32
+    matches!(ty,ScalarType::I32 | ScalarType::F32).then_some(ty)
 }
 
 #[cfg(feature = "internal-checker")]
-fn observed_passive_f32_array_element(value: &InitializerValue<'_>, indices: &[u64])
-    -> Option<(super::checker_flow::projected_f32::ExactF32,usize)> {
+fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64], expected:&ScalarType)
+    -> Option<(ObservedExactValue,usize)> {
     let InitializerValue::PassiveAggregate { mut ty,value,.. } = value else { return None; };
     let mut value = value.as_ref();
     let mut work = 1usize;
@@ -3071,10 +3109,16 @@ fn observed_passive_f32_array_element(value: &InitializerValue<'_>, indices: &[u
         value = cells.get(usize::try_from(index).ok()?)?;
         ty = element;
     }
-    if *ty != ScalarType::F32 { return None; }
+    if ty != expected { return None; }
     while let PassiveLiteral::Copy(next) = value { value = next; work = work.checked_add(1)?; }
-    let PassiveLiteral::Float(ranked_float::Atom::Single(bits)) = value else { return None; };
-    Some((super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?,work))
+    let atom = match (ty,value) {
+        (ScalarType::F32,PassiveLiteral::Float(ranked_float::Atom::Single(bits))) =>
+            ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?),
+        (ScalarType::I32,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
+            ObservedExactValue::Integer(ScalarType::I32,value.clone()),
+        _ => return None,
+    };
+    Some((atom,work))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12553,7 +12597,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -24910,6 +24954,70 @@ unit(u8) parent = fn(a) {
             assert!(trace.contains_return(&mix));
             assert!(matches!(prepare(&overflow).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             eprintln!("Orbital original valid/mix/bin {target_layout:?}: current lanes hash 30053, finite invalid rejected, conversion endpoints checked");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital indexed-pack provider"]
+    fn pinned_orbital_find_inserts_reuses_and_advances_an_exact_probe() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let text=r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            i32 added=0; i32 repeat=0; i32 collision=0; i32 end=0; i32 exhausted=0; i32 capacity=0;
+            unit() launch=fn {
+                packing.start(); packing.partition(37,40);
+                added=packing.find(32767,4,1.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                repeat=packing.find(32767,4,1.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                collision=packing.find(32767,4,2.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                end=packing.end();
+                exhausted=packing.find(32768,0,1.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                packing.partition(44,44);
+                capacity=packing.find(7,4,1.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+            };
+            launch();
+            core.narrow(false,{.stdout="";.stderr="";.code=end;.files=[
+                {.path="added.json";.state=added;},{.path="repeat.json";.state=repeat;},
+                {.path="collision.json";.state=collision;},{.path="exhausted.json";.state=exhausted;},
+                {.path="capacity.json";.state=capacity;}
+            ];});
+        %%end"#;
+        let unknown=text.replace("packing.find(32767,4,2.125", "packing.find(32767,-1,2.125");
+        let bad_index=text.replace("packing.find(32767,4,2.125", "packing.find(32768,4,2.125");
+        let app=source("src/main.w","pinned-orbital-real-provider-find");
+        let provider=source("src/indexed-pack.w","pinned-orbital-original-find-provider");
+        fn span(source:&SourceIdentity, text:&str, snippet:&str) -> SourceSpan {
+            let start=text.find(snippet).unwrap() as u32;
+            SourceSpan::new(source.clone(),ByteSpan::new(start,start+snippet.len() as u32))
+        }
+        let ns=span(&app,text,r#"packing=namespace demo "indexed-pack.w";"#);
+        let insert=span(&provider,&packing,"write_vertex(chosen,x,y,z,r,g,b,s,l)");
+        let reuse=span(&provider,&packing,"equal_vertex(existing,x,y,z,r,g,b,s,l)");
+        let recurse=span(&provider,&packing,"find((at+1)&32767,remaining-1,x,y,z,r,g,b,s,l)");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ns.range,
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let all=prepare(text).run().unwrap();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(39));
+            assert_eq!(report.files().len(),5);
+            for (file,expected) in report.files().iter().zip([37,37,38,-1,-1]) {
+                assert_eq!(file.text.as_ref(),format!("{{\"type\":{{\"kind\":\"i32\"}},\"value\":{expected}}}\n").as_bytes());
+            }
+            let (capped,_,trace,_)=prepare(text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            assert_eq!(all.directives,capped);
+            for site in [&insert,&reuse,&recurse] { assert!(trace.contains_return(site),"{site:?}"); }
+            for program in [&unknown,&bad_index] {
+                assert!(matches!(prepare(program).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+            eprintln!("Orbital original find {target_layout:?}: insert 37, duplicate 37, wrap/probe 38, end 39, exhausted and capacity -1");
         }
     }
 

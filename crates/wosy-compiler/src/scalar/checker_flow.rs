@@ -1811,13 +1811,14 @@ pub(super) struct ProjectedStorage {
     aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
     f32_array_updates: StorageDelta<observed_f32_array::Cell, projected_f32::ExactF32>,
+    i32_array_updates: StorageDelta<observed_f32_array::Cell, i32>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl ProjectedStorage {
     pub(super) fn forget(&mut self) { *self = Self::default(); }
 
-    fn overwrite_scalar(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) -> Option<()> {
+    pub(super) fn overwrite_scalar(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) -> Option<()> {
         let (observed_type, _) = self.scalars.get(declaration)?;
         if observed_type != ty { return None; }
         self.changes.insert((declaration.clone(), None), Rc::new(IntegerSet::singleton(value)));
@@ -1845,11 +1846,21 @@ impl ProjectedStorage {
         Some(())
     }
 
+    pub(super) fn observed_i32_array_element(&self, cell: &observed_f32_array::Cell) -> Option<i32> {
+        self.i32_array_updates.get(cell).copied()
+    }
+
+    pub(super) fn overwrite_i32_array_element(&mut self, cell: observed_f32_array::Cell, value: i32) -> Option<()> {
+        if !self.has_observed_aggregate(&cell.declaration) { return None; }
+        self.i32_array_updates.insert(cell,value);
+        Some(())
+    }
+
     pub(super) fn observed_f32_array_element(&self, cell: &observed_f32_array::Cell) -> Option<projected_f32::ExactF32> {
         self.f32_array_updates.get(cell).copied()
     }
 
-    fn overwrite_f32_array_element(&mut self, cell: observed_f32_array::Cell, value: projected_f32::ExactF32) -> Option<()> {
+    pub(super) fn overwrite_f32_array_element(&mut self, cell: observed_f32_array::Cell, value: projected_f32::ExactF32) -> Option<()> {
         if !self.has_observed_aggregate(&cell.declaration) { return None; }
         self.f32_array_updates.insert(cell,value);
         Some(())
@@ -2320,6 +2331,8 @@ struct IntegerRoots<'a> {
     observed_f32_array_read: Option<&'a observed_f32_array::Read<'a>>,
     #[cfg(feature = "internal-checker")]
     observed_scalar_getter: Option<&'a ObservedScalarGetter<'a>>,
+    #[cfg(feature = "internal-checker")]
+    observed_provider_call: Option<&'a ObservedProviderCall<'a>>,
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
@@ -5494,6 +5507,17 @@ thread_local! {
 #[cfg(all(test, feature = "internal-checker"))]
 pub(super) fn take_observed_unit_argument_evaluations() -> usize {
     OBSERVED_UNIT_ARGUMENT_EVALUATIONS.with(|total| total.replace(0))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn apply_observed_integer_operator(ty:&ScalarType, op:&BinaryOperator, left:BigInt, right:BigInt) -> Option<BigInt> {
+    let (min,max)=super::typecheck::integer_bounds(ty)?;
+    let result=match op {
+        BinaryOperator::BitAnd => left & right,
+        BinaryOperator::BitXor => left ^ right,
+        _ => AuthoredIntegerOperation::checked(op)?.apply(Cow::Owned(left),Cow::Owned(right),&min,&max)?,
+    };
+    (min<=result && result<=max).then_some(result)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12845,6 +12869,48 @@ fn evaluate_observed_getter(calls: &FunctionCallSites, site: OccurrenceOrdinal, 
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) type ObservedProviderCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal,
+    Vec<super::checker_project::ObservedExactValue>, &mut ProjectedStorage)
+    -> Option<(super::checker_project::ObservedExactValue, Option<usize>, usize)> + 'a;
+
+#[cfg(feature = "internal-checker")]
+fn observed_mixed_provider_arguments(calls:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<Vec<(OccurrenceOrdinal,&ScalarType)>> {
+    let signature=calls.checked_call_signatures.get(&at)?;
+    if !calls.structure.checker_direct_targets.contains_key(&at)
+        || !signature.parameters.contains(&ScalarType::I32) || !signature.parameters.contains(&ScalarType::F32)
+        || !signature.parameters.iter().all(|ty| matches!(ty,ScalarType::I32|ScalarType::F32))
+        || !matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::I32)
+    { return None; }
+    signature.parameters.iter().enumerate().map(|(slot,ty)| {
+        let OccurrenceNode::Expression(arg)=calls.structure.edges.get(&(
+            OccurrenceParent::Expression(at),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+        (calls.structure.checked_types.expressions.get(arg)?==ty).then_some((*arg,ty))
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
+fn evaluate_observed_provider(calls:&FunctionCallSites,at:OccurrenceOrdinal,
+    args:&[(OccurrenceOrdinal,&ScalarType)],roots:&IntegerRoots<'_>,row:&mut IntegerRow) -> Option<BigInt> {
+    use super::checker_project::ObservedExactValue;
+    let tracker=roots.callable_history?;
+    tracker.borrow().charge(args.len())?;
+    let mut values=Vec::with_capacity(args.len());
+    for &(site,ty) in args {
+        values.push(match ty {
+            ScalarType::I32=>ObservedExactValue::Integer(ScalarType::I32,observed_integer::evaluate_pure_argument(calls,site,roots,row)?),
+            ScalarType::F32=>ObservedExactValue::F32(if let Some(place)=observed_f32_array::expression(calls,site) {
+                observed_f32_array::read(calls,place,roots,row)?
+            } else { exact_observed_float_operand(calls,site,row)? }),
+            _=>return None,
+        });
+    }
+    let (ObservedExactValue::Integer(ScalarType::I32,value),trace,work)=
+        roots.observed_provider_call?(calls,at,values,Rc::make_mut(row.storage.as_mut()?))? else { return None; };
+    append_observed_scalar_call(calls,at,roots,row,trace,work)?;
+    Some(value)
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) type ObservedFloatCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal, Vec<projected_f32::ExactF32>)
     -> Option<(super::checker_project::ObservedExactValue, Option<usize>, usize)> + 'a;
 
@@ -12880,6 +12946,13 @@ fn evaluate_observed_scalar_from_f32(calls: &FunctionCallSites, at: OccurrenceOr
 fn apply_observed_float_call(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
     row: &mut IntegerRow, args: Vec<projected_f32::ExactF32>) -> Option<super::checker_project::ObservedExactValue> {
     let (value,trace,work) = roots.observed_float_call?(calls,at,args)?;
+    append_observed_scalar_call(calls,at,roots,row,trace,work)?;
+    Some(value)
+}
+
+#[cfg(feature = "internal-checker")]
+fn append_observed_scalar_call(calls:&FunctionCallSites,at:OccurrenceOrdinal,roots:&IntegerRoots<'_>,
+    row:&mut IntegerRow,trace:Option<usize>,work:usize) -> Option<()> {
     let span = calls.occurrences.get(at.0)?.span;
     let mut tracker = roots.callable_history?.borrow_mut();
     tracker.charge(work.saturating_add(2))?;
@@ -12888,7 +12961,7 @@ fn apply_observed_float_call(calls: &FunctionCallSites, at: OccurrenceOrdinal, r
     if let Some(trace) = trace { tracker.append(row,CallableHistoryStep::ObservedFloatTrace(trace)); }
     let leave=tracker.boundary(span,true);
     tracker.append(row,leave);
-    Some(value)
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]

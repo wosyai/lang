@@ -647,7 +647,7 @@ pub(in super::super) struct ObservedTrace {
 }
 
 impl ObservedTrace {
-    fn new(root: Vec<ObservedStep>, segments: Vec<Vec<ObservedStep>>, work: &mut usize) -> Option<Self> {
+    pub(super) fn new(root: Vec<ObservedStep>, segments: Vec<Vec<ObservedStep>>, work: &mut usize) -> Option<Self> {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let physical_cost = segments.iter().fold(root.len().saturating_add(1), |cost, child|
             cost.saturating_add(child.len()).saturating_add(1));
