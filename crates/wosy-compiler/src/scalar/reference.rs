@@ -6432,6 +6432,10 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_module_integer_comparisons: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, BigInt)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_module_integer_comparison_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_literal_float_outputs: HashSet<OccurrenceOrdinal>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_integer_final_operations: HashMap<OccurrenceOrdinal, (BinaryOperator, [OccurrenceOrdinal; 2])>,
@@ -6623,6 +6627,10 @@ impl OccurrenceStructure {
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_module_integer_comparisons: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_module_integer_comparison_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_literal_float_outputs: HashSet::new(),
             #[cfg(feature = "internal-checker")]
@@ -9356,6 +9364,21 @@ impl StructuralWalker<'_, '_> {
                     self.expression_at(left, names, types, parent, OccurrenceEdge::BinaryLeft)?;
                 let right =
                     self.expression_at(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
+                #[cfg(feature = "internal-checker")]
+                if self.occurrence_typing.checker_directives_enabled() && matches!(self.mode, WalkMode::Callable(_)) {
+                    if let Some(comparison) = super::checker_flow::IntegerComparison::from_expression(expression) {
+                        let ty = self.structure.checked_types.expressions.get(&left);
+                        if matches!(&self.plain_names, PlainNameFacts::Prepared(names)
+                            if matches!(names.get(&left), Some(PlainNameIdentity::ModuleValue(_))))
+                            && ty.is_some_and(|ty| is_integer_type(ty)
+                                && self.structure.checked_types.expressions.get(&right) == Some(ty)
+                                && super::typecheck::integer_literal_fits_type(&comparison.bound, ty))
+                            && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool) {
+                            self.structure.checker_module_integer_comparisons.insert(ordinal,
+                                (left, operator.clone(), comparison.bound.into_owned()));
+                        }
+                    }
+                }
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
                     let evaluate_right_when = matches!(operator, BinaryOperator::And);
                     assert!(self
@@ -10124,6 +10147,15 @@ impl StructuralWalker<'_, '_> {
                         self.structure.checker_contextual_read_locals.insert(key, binding);
                     } else {
                         self.structure.checker_integer_locals.insert(key, binding);
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
+                if let (WalkMode::Callable(callable), BindingInitialization::Outputs(outputs)) = (&self.mode, &initialization) {
+                    if binding.receivers.len() == 1 && receiver.ty == ScalarType::Bool && outputs.secondary.is_empty()
+                        && self.structure.checker_module_integer_comparisons.contains_key(&outputs.primary) {
+                        let resolver = callable.target_resolver;
+                        self.structure.checker_module_integer_comparison_locals.insert((position.block, position.item),
+                            lexical.reference_id(resolver.source, resolver.function_span));
                     }
                 }
                 #[cfg(feature = "internal-checker")]

@@ -22619,6 +22619,36 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_module_integer_comparison_uses_current_not_initial_value() {
+        let app = source("src/main.w", "observed-module-signed-comparison");
+        let program = r#"%%start
+            i32 wreck_age = -1;
+            i16 initial_branch = 0;
+            i16 later_branch = 0;
+            unit() classify = fn {
+                bool wrecking = wreck_age >= 0;
+                if (wrecking) { later_branch = 37; } else { initial_branch = 19; };
+            };
+            unit() update = fn { classify(); wreck_age = 0; classify(); };
+            update();
+            core.narrow(false, { .stdout = ""; .stderr = ""; .code = later_branch; .files = [
+                { .path = "initial.json"; .state = initial_branch; }
+            ]; });
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let owner = prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let ordinary = owner.run().unwrap();
+            assert_eq!(ordinary.directives.len(), 1);
+            assert_eq!(ordinary.directives[0].code(), &BigInt::from(37));
+            assert_eq!(ordinary.directives[0].files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i16\"},\"value\":19}\n");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn selected_startup_receipt_sees_nested_scalar_and_array_effects_in_source_order() {
         let app = source("src/main.w", "startup-ordered-integer-state");
         let program = r#"%%start

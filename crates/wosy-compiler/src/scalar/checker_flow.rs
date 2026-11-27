@@ -9290,6 +9290,22 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 #[cfg(feature = "internal-checker")]
                 if roots.callable_history.is_some() {
                     if let ([receiver], BindingInitialization::Outputs(outputs)) = (binding.receivers(), &binding.initialization) {
+                        if receiver.contextual_storage.is_none() && outputs.secondary.is_empty() && receiver.ty == ScalarType::Bool {
+                            if let Some(identity) = structure.checker_module_integer_comparison_locals.get(&(block, item.position)) {
+                                let (operand, operator, literal) = structure.checker_module_integer_comparisons.get(&outputs.primary)?;
+                                let ty = structure.checked_types.expressions.get(operand)?;
+                                let place = projected_integer_storage_read(calls, *operand, ty)?;
+                                let relation = IntegerRelation::from_operator(operator)?;
+                                for row in &mut path.0 {
+                                    let value = place.read(row.storage.as_deref()?)?.singleton_value()?;
+                                    let result = u8::from(relation.accepts(value.cmp(literal)));
+                                    row.cells.push(Rc::new(IntegerSet::singleton(&BigInt::from(result))));
+                                }
+                                roots.add(identity, &receiver.ty);
+                                roots.ordinary_comparison_work.get_or_insert(0);
+                                continue;
+                            }
+                        }
                         if receiver.contextual_storage.is_none() && outputs.secondary.is_empty() && is_integer_type(&receiver.ty) {
                             if let Some(place) = projected_integer_storage_read(calls, outputs.primary, &receiver.ty) {
                                 let identity = structure.checker_integer_locals.get(&(block, item.position))?;
@@ -12123,6 +12139,11 @@ pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Opti
                         if !is_integer_type(&receiver.ty)
                             || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
+                    } else if let Some((operand, _, _)) = calls.structure.checker_module_integer_comparisons.get(&outputs.primary) {
+                        if receiver.ty != ScalarType::Bool || !calls.structure.checker_module_integer_comparison_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
+                        let ty = calls.structure.checked_types.expressions.get(operand)?;
+                        let read = projected_integer_storage_read(calls, *operand, ty)?;
+                        covered.insert((read.declaration.clone(), read.site, ModuleStorageRole::Read));
                     }
                 }
                 _ => {}
