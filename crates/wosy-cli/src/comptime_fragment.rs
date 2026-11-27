@@ -9,7 +9,7 @@ use wosy_compiler::{
     ClosedComptimeRejection, ComptimeParameter, Diagnostic, ScalarTargetLayout,
 };
 #[cfg(target_os = "linux")]
-use wosy_compiler::{derive_forwarded_pair_startup_comptime_plan, ForwardedPairStartupComptimePlan, CLOSED_COMPTIME_MAX_SOURCE_BYTES};
+use wosy_compiler::{derive_forwarded_pair_startup_comptime_plan, ForwardedPairStartupComptimePlan};
 use wosy_project::{
     declared_comptime_parameters, ContentRevision, DeclaredComptimeParameter, ObservedClosedComptimeProfile,
     ProjectConfiguration, ProjectContext, SelectedComptimeTools,
@@ -87,7 +87,7 @@ pub fn plan_forwarded_pair_comptime_startup(
         return Err(ClosedComptimePlanError::Project(format!("target {target} profile {profile} is missing")));
     }
     let entry = load_single_entry(&root, &project, &configuration, |path, opened| {
-        project_sources::read_bounded_regular_source(path, opened, CLOSED_COMPTIME_MAX_SOURCE_BYTES)
+        project_sources::read_regular_source(path, opened, None)
             .map_err(ClosedComptimePlanError::Project)
     })?;
     let plan = derive_forwarded_pair_startup_comptime_plan(&entry, id, evaluator_layout)

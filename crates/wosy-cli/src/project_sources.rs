@@ -59,20 +59,47 @@ pub(crate) fn read_source(
     Ok((revision(blake3::hash(text.as_bytes())), text))
 }
 
-/// Read one live regular source without admitting more than the preview's
-/// source budget. Retain one overflow sentinel only to detect growth.
+/// Read one live regular source under an explicit caller ceiling.
 #[cfg(target_os = "linux")]
 pub(crate) fn read_bounded_regular_source(
     path: &Path, opened: Option<fs::File>, max_bytes: usize,
 ) -> Result<(ContentRevision, String), String> {
+    read_regular_source(path, opened, Some(max_bytes))
+}
+
+/// Capture exactly one opened source. Without an explicit ceiling, use the
+/// opened file's measured length and fail if it changes during the read.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_regular_source(
+    path: &Path, opened: Option<fs::File>, max_bytes: Option<usize>,
+) -> Result<(ContentRevision, String), String> {
+    use std::os::unix::fs::MetadataExt;
+
     let read_error = |error| format!("failed to read {}: {error}", path.display());
-    let file = match opened { Some(file) => file, None => wosy_project::open_live_source(path).map_err(read_error)? };
-    let info = file.metadata().map_err(read_error)?;
-    if !info.is_file() { return Err("preview source must be a regular file".into()); }
-    if info.len() > max_bytes as u64 { return Err("preview source exceeds the authored byte budget".into()); }
+    let mut file = match opened { Some(file) => file, None => wosy_project::open_live_source(path).map_err(read_error)? };
+    let before = file.metadata().map_err(read_error)?;
+    if !before.is_file() { return Err("preview source must be a regular file".into()); }
+    let (limit, overflow) = if let Some(max) = max_bytes {
+        let limit = max as u64;
+        if before.len() > limit { return Err("preview source exceeds the authored byte budget".into()); }
+        (limit, "preview source exceeds the authored byte budget")
+    } else {
+        // Authored CST and source metadata represent byte offsets by u32.
+        let length = u32::try_from(before.len()).map_err(|_| "preview source exceeds the authored byte range")?;
+        (u64::from(length), "preview source changed during observation")
+    };
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64).read_to_end(&mut bytes).map_err(read_error)?;
-    if bytes.len() > max_bytes { return Err("preview source exceeds the authored byte budget".into()); }
+    (&mut file).take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(read_error)?;
+    if bytes.len() as u64 > limit { return Err(overflow.into()); }
+    if max_bytes.is_none() {
+        let after = file.metadata().map_err(read_error)?;
+        let version = |metadata: &fs::Metadata| {
+            (metadata.len(), metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec())
+        };
+        if bytes.len() as u64 != before.len() || version(&before) != version(&after) {
+            return Err("preview source changed during observation".into());
+        }
+    }
     let text = String::from_utf8(bytes).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     Ok((revision(blake3::hash(text.as_bytes())), text))
 }

@@ -469,7 +469,7 @@ fn prepare_from_observation(
         None if singleton => {
             #[cfg(target_os = "linux")]
             {
-                project_sources::read_bounded_regular_source(path, opened, wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES)
+                project_sources::read_regular_source(path, opened, None)
                     .map(|(id, text)| (id, Some(text))).map_err(Into::into)
             }
             #[cfg(not(target_os = "linux"))]

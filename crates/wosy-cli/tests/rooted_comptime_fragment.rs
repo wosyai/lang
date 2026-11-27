@@ -694,9 +694,17 @@ u32 changed = relay(7, 13);
     assert!(matches!(plan_forwarded_pair_comptime_startup(&project, "app", "missing", "value", ScalarTargetLayout::NATIVE64),
         Err(ClosedComptimePlanError::Project(message)) if message.contains("target app profile missing is missing")));
 
-    fs::write(project.join("src/main.w"), " ".repeat(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES + 1)).unwrap();
-    assert!(matches!(plan_forwarded_pair_comptime_startup(&project, "app", "dev", "value", ScalarTargetLayout::NATIVE64),
-        Err(ClosedComptimePlanError::Project(message)) if message.contains("authored byte budget")));
+    let large = updated_text.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
+    fs::write(project.join("src/main.w"), &large).unwrap();
+    for layout in layouts {
+        let actual = live(layout);
+        let ranged = actual.plan().forwarding().tail_call();
+        assert_eq!(ranged.source.revision, blake3::hash(large.as_bytes()).to_hex().as_str());
+        assert_eq!(&large[ranged.range.start as usize..ranged.range.end as usize], "solve(upstream_right, upstream_left)");
+        let retained = emitted_forwarded(current.project_forwarded_pair_startup_comptime(request("value", layout)).await.unwrap());
+        assert!(actual.plan().evaluators().iter().zip(retained.plan().evaluators())
+            .all(|(left, right)| left.llvm().to_text().as_bytes() == right.bytes()));
+    }
     assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, updated.root);
     drop((retained, current));
     drop((worker, client));

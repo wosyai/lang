@@ -660,8 +660,12 @@ fn forwarded_input_observation_refuses_out_of_scope_inputs_and_cumulative_budget
     let (_, exact) = prepare_forwarded_pair_comptime_input_facts(&app, scope).unwrap();
     assert_eq!(exact.evaluator_irs(), full.evaluator_irs());
 
-    fixture.put("app/src/main.w", " ".repeat(wosy_compiler::CLOSED_COMPTIME_MAX_SOURCE_BYTES + 1));
-    assert!(refuse(forwarded_scope(layout)).contains("authored byte budget"));
+    let large = FORWARDED_APP.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
+    fixture.put("app/src/main.w", &large);
+    let (ordinary, padded) = observe_forwarded(&app, layout);
+    assert_eq!(padded.evaluator_irs(), full.evaluator_irs());
+    assert_ne!(padded.authored_cst(), full.authored_cst());
+    assert_eq!(ordinary.root, prepare(&app, Some("app"), None).unwrap().root);
     // A real declared local namespace may not cause its source to be opened
     // when this exact consumer-singleton route is requested.
     fixture.put("app/wosy.toml", with_evaluator_tools());
@@ -761,7 +765,7 @@ fn assert_graph_facts(facts: &PairCallGraphComptimeInputFacts, text: &str, layou
 fn pair_graph_observation_binds_current_source_profile_watches_and_unchanged_mapping() {
     let fixture = Fixture::new();
     let app = fixture.app();
-    let text = graph_app();
+    let text = graph_app().replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
     fixture.put("app/wosy.toml", graph_manifest());
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         fixture.put("app/src/main.w", &text);
