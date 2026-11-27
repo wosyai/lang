@@ -192,6 +192,7 @@ struct AdmissionInspection<'a> {
 }
 
 struct SelectedPendingEntry<'a> {
+    artifact_profile: &'a wosy_project::ArtifactProfile,
     file: &'a FileEntry,
     fresh: FreshParseResult,
     authored_comptime: bool,
@@ -219,9 +220,9 @@ impl ValidatedProposal {
     ) -> std::result::Result<SelectedPendingEntry<'_>, PendingEntryRefusal> {
         use PendingEntryRefusal::Refused;
         use RootedClosedComptimeRefusal as Refusal;
-        if !self.config.profiles.contains_key(&request.profile) {
+        let Some(artifact_profile) = self.config.profiles.get(&request.profile) else {
             return Err(Refused(Refusal::ProfileNotSelected));
-        }
+        };
         let Some(file) = self.index.files.get(&request.file) else {
             return Err(Refused(Refusal::FileNotRooted));
         };
@@ -237,7 +238,7 @@ impl ValidatedProposal {
         let Some((fresh, authored_comptime)) = self.selected_changed_parse.take() else {
             return Err(PendingEntryRefusal::EntryUnchanged);
         };
-        Ok(SelectedPendingEntry { file, fresh, authored_comptime })
+        Ok(SelectedPendingEntry { artifact_profile, file, fresh, authored_comptime })
     }
 
     fn pending_first_comptime(
@@ -256,7 +257,7 @@ impl ValidatedProposal {
     }
 
     fn pending_pair_call_graph(
-        &mut self, store: &SourceStore, request: &RootedClosedComptimeRequest,
+        &mut self, store: &SourceStore, request: &RootedClosedComptimeRequest, max_wasip1_stdout: Option<usize>,
     ) -> Result<PendingPairCallGraphComptimeProjection> {
         let root = self.admission.proposed;
         let target = self.config.target.clone();
@@ -264,7 +265,16 @@ impl ValidatedProposal {
             Ok(entry) => entry,
             Err(reason) => return Ok(reason.project(RootedPairCallGraphComptimeProjection::Refused)),
         };
-        let projected = store.project_pair_call_graph_from_pending_parse(root, entry.file.authored, target, request, &entry.fresh)?;
+        if max_wasip1_stdout.is_some()
+            && (entry.artifact_profile.backend != "llvm" || entry.artifact_profile.output != "wasm-wasip1")
+        {
+            return Ok(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Refused(
+                RootedClosedComptimeRefusal::ProfileNotWasip1,
+            )));
+        }
+        let projected = store.project_pair_call_graph_from_pending_parse(
+            root, entry.file.authored, target, request, &entry.fresh, max_wasip1_stdout,
+        )?;
         Ok(PendingPairCallGraphComptimeProjection::Candidate(projected))
     }
 }
@@ -443,11 +453,28 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: impl Into<Arc<BaseCstProposal>>,
         request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration,
     ) -> Result<PreparedPendingPairCallGraphComptime> {
+        self.prepare_pending_pair_graph_delivery(binding, proposal.into(), request, declaration_bytes, lifetime, None).await
+    }
+
+    /// Explicit selected llvm/wasm-wasip1 profile preview. Use the same
+    /// admitted scalar plan and incumbent canonical stdout emitter. This
+    /// does not authorize a tool, launch, result, or source publication.
+    pub async fn prepare_pending_pair_call_graph_wasip1_stdout(
+        &self, binding: BaseCstProposalBinding, proposal: impl Into<Arc<BaseCstProposal>>,
+        request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration, max_stdout: usize,
+    ) -> Result<PreparedPendingPairCallGraphComptime> {
+        self.prepare_pending_pair_graph_delivery(binding, proposal.into(), request, declaration_bytes, lifetime, Some(max_stdout)).await
+    }
+
+    async fn prepare_pending_pair_graph_delivery(
+        &self, binding: BaseCstProposalBinding, proposal: Arc<BaseCstProposal>,
+        request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration, max_wasip1_stdout: Option<usize>,
+    ) -> Result<PreparedPendingPairCallGraphComptime> {
         request.check_selector_bytes()?;
         let captured_binding = binding.clone();
-        let (base, projection) = self.prepare_base_cst_observing(binding, proposal.into(), request.source_limits,
+        let (base, projection) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
             declaration_bytes, AdmissionLease::Open(lifetime), Some(request.file.clone()), move |store, valid| {
-                let projection = valid.pending_pair_call_graph(store, &request)?;
+                let projection = valid.pending_pair_call_graph(store, &request, max_wasip1_stdout)?;
                 let bytes = match &projection {
                     PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan)) =>
                         plan.evaluators().iter().map(|evaluator| evaluator.bytes().len()).sum(),

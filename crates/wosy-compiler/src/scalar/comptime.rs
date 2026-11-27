@@ -23,7 +23,8 @@ pub use stdout::{
 pub use direct::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,
     derive_direct_startup_comptime_plan, derive_forwarded_pair_startup_comptime_plan,
-    derive_pair_startup_call_graph_comptime_plan, inspect_direct_function_comptime,
+    derive_pair_startup_call_graph_comptime_plan, derive_pair_startup_call_graph_wasip1_stdout,
+    inspect_direct_function_comptime,
     DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
@@ -192,7 +193,7 @@ fn with_closed_comptime_occurrence<R>(
     let mut body = derive_block(&site.block);
     let parameter_uses = rewrite_body(&mut body, &result_type, &scope, &parameter)?;
     let fragment = emit_closed_evaluator(
-        id, scope(site.span), super::token_span(&site.id), layout, result_type, parameter_uses, body,
+        id, scope(site.span), super::token_span(&site.id), layout, result_type, parameter_uses, body, None,
     )?;
     Ok(inspect(fragment, parsed.canonical_cst(), &node, &initializer))
 }
@@ -202,6 +203,7 @@ fn with_closed_comptime_occurrence<R>(
 fn emit_closed_evaluator(
     id: &str, site: SourceSpan, name_span: ByteSpan, layout: ScalarTargetLayout,
     result_type: ScalarType, parameter_uses: Vec<ComptimeParameterUse>, body: ScalarBlock,
+    max_wasip1_stdout: Option<usize>,
 ) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
     let [output] = body.final_output_values.as_slice() else {
         return Err(ClosedComptimeRejection::Emitter("closed evaluator must have one output".into()));
@@ -231,7 +233,12 @@ fn emit_closed_evaluator(
     if !build.diagnostics().is_empty() {
         return Err(ClosedComptimeRejection::OrdinaryDiagnostics(build.diagnostics().to_vec()));
     }
-    let llvm = emit_scalar_build_single_module_artifact_llvm(&build).map_err(ClosedComptimeRejection::Emitter)?;
+    let llvm = match max_wasip1_stdout {
+        Some(max_stdout) => crate::llvm::emit_scalar_build_wasip1_comptime_stdout(&build, crate::llvm::Wasip1ComptimeOutput {
+            site: &site, ty: &result_type, max_stdout, text_fields: &std::collections::HashMap::new(), max_text_bytes: 0,
+        }),
+        None => emit_scalar_build_single_module_artifact_llvm(&build),
+    }.map_err(ClosedComptimeRejection::Emitter)?;
     Ok(ClosedComptimeFragment { id: id.into(), site, result_type, layout, parameter_uses, llvm })
 }
 

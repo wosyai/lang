@@ -788,3 +788,123 @@ fn trusted_pending_graph_observes_only_exact_consumer_config_and_live_watch_inpu
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pending_pair_graph_emits_incumbent_wasip1_stdout_for_distinct_scalar_tuples_only() {
+    use wosy_compiler::{ClosedComptimeRejection, ScalarTargetLayout};
+    use wosy_daemon::{PendingPairCallGraphComptimeProjection, RootedClosedComptimeRefusal, RootedClosedComptimeRequest,
+        RootedPairCallGraphComptimeProjection};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::FileKey;
+
+    fn body(ir: &str, symbol: &str) -> String {
+        let prefix = format!("@{symbol}(");
+        let mut lines = ir.lines();
+        assert!(lines.any(|line| line.starts_with("define ") && line.contains(&prefix)), "{symbol} definition");
+        lines.take_while(|line| *line != "}").collect::<Vec<_>>().join("\n")
+    }
+
+    const SOURCE: &str = r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32(bool, u32, u32) choose = fn(select_path, left, right) {
+    if (select_path) { solve(left, right) } else { right }
+};
+u32 skipped = choose(false, 7, 37);
+u32 reached = choose(true, 7, skipped);
+u32 same = solve(7, skipped);
+u32 changed = solve(7, 13);
+%%end
+"#;
+    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"") + r#"
+[targets.app.artifacts.main.profiles.native]
+backend = "llvm"
+output = "native"
+builder = "nominal"
+run_runner = "nominal"
+[targets.app.profiles.native]
+main_artifact = "main"
+"#;
+    let fixture = Scratch::new();
+    let project = fixture.0.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("wosy.toml"), manifest).unwrap();
+    let entry = project.join("main.w");
+    fs::write(&entry, "%%start\nu32 answer = 14;\n%%end\n").unwrap();
+    let request = |profile: &str, layout| RootedClosedComptimeRequest {
+        profile: profile.into(),
+        file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+        id: "prepare".into(), evaluator_layout: layout, source_limits: LIMITS, output_bytes: 1 << 20,
+    };
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let initial = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(initial.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", initial.pending.unwrap()).unwrap());
+
+        fs::write(&entry, SOURCE).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let detached = worker.prepare_pending_pair_call_graph_comptime(binding, proposal,
+            request("dev", ScalarTargetLayout::WASM32), 1 << 20, TTL).await.unwrap();
+        let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+            detached.projection() else { panic!("existing detached route must remain supported"); };
+        assert_eq!(plan.max_wasip1_stdout(), None);
+        let detached_body = plan.evaluators().iter().map(|evaluator| {
+            let ir = std::str::from_utf8(evaluator.bytes()).unwrap();
+            assert!(!ir.contains("wasi_snapshot_preview1"));
+            body(ir, "evaluate")
+        }).collect::<Vec<_>>();
+        drop(detached);
+
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let stdout = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding, proposal,
+            request("dev", ScalarTargetLayout::WASM32), 1 << 20, TTL, 11).await.unwrap();
+        let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+            stdout.projection() else { panic!("typed P1 stdout evaluator was not emitted"); };
+        assert_eq!(stdout.base().admission().validated_files, 1);
+        assert_eq!(plan.max_wasip1_stdout(), Some(11));
+        assert_eq!(plan.source_root(), attempt.root());
+        assert_eq!((plan.evidence().occurrences().len(), plan.evaluators().len()), (4, 2));
+        assert_eq!(plan.evidence().calls().map(|(call, _)| call.evaluator_index()).collect::<Vec<_>>(), [0, 0, 1]);
+        assert_eq!(detached_body.len(), 2);
+        for (index, evaluator) in plan.evaluators().iter().enumerate() {
+            let ir = std::str::from_utf8(evaluator.bytes()).unwrap();
+            assert_eq!(body(ir, "evaluate"), detached_body[index]);
+            assert!(ir.contains("\"wasm-import-module\"=\"wasi_snapshot_preview1\""));
+            assert!(ir.contains("\"wasm-import-name\"=\"fd_write\""));
+            let main = body(ir, "main");
+            assert!(main.contains("call i32 @evaluate()"));
+            assert!(main.contains("@fd_write(i32 1,"));
+            assert!(main.contains("store i8 10"));
+        }
+        drop(stdout);
+
+        for (profile, layout, limit, expected) in [
+            ("native", ScalarTargetLayout::WASM32, 11, 0),
+            ("dev", ScalarTargetLayout::NATIVE64, 11, 1),
+            ("dev", ScalarTargetLayout::WASM32, 10, 2),
+        ] {
+            let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+            let denied = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding, proposal,
+                request(profile, layout), 1 << 20, TTL, limit).await.unwrap();
+            let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Refused(reason))) =
+                denied.projection() else { panic!("unsupported output scope must not emit"); };
+            match (expected, reason) {
+                (0, RootedClosedComptimeRefusal::ProfileNotWasip1)
+                | (1, RootedClosedComptimeRefusal::Compiler(ClosedComptimeRejection::UnsupportedLayout)) => {}
+                (2, RootedClosedComptimeRefusal::Compiler(ClosedComptimeRejection::Emitter(error))) =>
+                    assert!(error.contains("stdout shape exceeds the selected byte budget")),
+                _ => panic!("unexpected stdout refusal: {reason:?}"),
+            }
+        }
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, initial.root);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

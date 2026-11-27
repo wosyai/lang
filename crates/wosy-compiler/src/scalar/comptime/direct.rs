@@ -127,7 +127,7 @@ pub fn derive_direct_function_comptime_fragment(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<DirectFunctionComptimeFragment, ClosedComptimeRejection> {
     with_verified_direct_call(fresh, id, layout, |facts, body, name_span| {
-        emit_bound_evaluator(id, layout, body, name_span, &facts)
+        emit_bound_evaluator(id, layout, body, name_span, &facts, None)
             .map(|evaluator| DirectFunctionComptimeFragment { facts, evaluator })
     })
 }
@@ -226,7 +226,7 @@ pub fn derive_forwarded_pair_startup_comptime_plan(
             let VerifiedStartupPaths::OneForwarder(forwarding) = forwarding else {
                 return Err(ClosedComptimeRejection::Emitter("verified tail hop disappeared".into()));
             };
-            let plan = emit_startup_plan(id, layout, body, name_span, calls)?;
+            let plan = emit_startup_plan(id, layout, body, name_span, calls, None)?;
             Ok(ForwardedPairStartupComptimePlan { forwarding, plan })
         })
 }
@@ -437,12 +437,27 @@ impl PairStartupCallGraphComptimePlan {
 pub fn derive_pair_startup_call_graph_comptime_plan(
     fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout,
 ) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
+    derive_pair_startup_graph_with_delivery(fresh, id, layout, None)
+}
+
+/// Route the existing checked bound scalar evaluator and its ordinary
+/// output type into the incumbent WASI preview1 stdout emitter. No tools,
+/// runtime, result, or permission to launch.
+pub fn derive_pair_startup_call_graph_wasip1_stdout(
+    fresh: &FreshParseResult, id: &str, max_stdout: usize,
+) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
+    derive_pair_startup_graph_with_delivery(fresh, id, ScalarTargetLayout::WASM32, Some(max_stdout))
+}
+
+fn derive_pair_startup_graph_with_delivery(
+    fresh: &FreshParseResult, id: &str, layout: ScalarTargetLayout, max_wasip1_stdout: Option<usize>,
+) -> Result<PairStartupCallGraphComptimePlan, ClosedComptimeRejection> {
     with_verified_startup_calls::<2, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
         StartupEntry::PairCallGraph, |calls, body, name_span, proof| {
             let VerifiedStartupPaths::Graph { site, hops, selectors, paths, order } = proof else {
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
             };
-            let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls)?.into_parts();
+            let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls, max_wasip1_stdout)?.into_parts();
             let evidence = PairStartupCallGraphEvidence { site_id: id.to_owned(), site, layout, calls, hops, selectors, paths, order };
             Ok(PairStartupCallGraphComptimePlan { evidence, evaluators })
         })
@@ -453,13 +468,13 @@ fn derive_direct_startup<const ARITY: usize>(
 ) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
     with_verified_startup_calls::<ARITY, _>(fresh, id, layout, MAX_DIRECT_STARTUP_CALLS,
         StartupEntry::Direct, |calls, body, name_span, _| {
-            emit_startup_plan(id, layout, body, name_span, calls)
+            emit_startup_plan(id, layout, body, name_span, calls, None)
         })
 }
 
 fn emit_startup_plan<const ARITY: usize>(
     id: &str, layout: ScalarTargetLayout, body: &ScalarBlock, name_span: ByteSpan,
-    calls: Vec<InspectedDirectComptimeCall<ARITY>>,
+    calls: Vec<InspectedDirectComptimeCall<ARITY>>, max_wasip1_stdout: Option<usize>,
 ) -> Result<DirectStartupComptimePlan<ARITY>, ClosedComptimeRejection> {
     let mut plan = DirectStartupComptimePlan {
         calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
@@ -472,7 +487,7 @@ fn emit_startup_plan<const ARITY: usize>(
             Some(index) => index,
             None => {
                 let index = plan.evaluators.len();
-                plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts)?);
+                plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts, max_wasip1_stdout)?);
                 values.push(tuple);
                 index
             }
@@ -484,7 +499,7 @@ fn emit_startup_plan<const ARITY: usize>(
 
 fn emit_bound_evaluator<const ARITY: usize>(
     id: &str, layout: ScalarTargetLayout, authored_body: &ScalarBlock, name_span: ByteSpan,
-    facts: &InspectedDirectComptimeCall<ARITY>,
+    facts: &InspectedDirectComptimeCall<ARITY>, max_wasip1_stdout: Option<usize>,
 ) -> Result<ClosedComptimeFragment, ClosedComptimeRejection> {
     let mut body = authored_body.clone();
     let ([ScalarBlockItem::Expression(item)], [expression], [output]) = (
@@ -510,7 +525,7 @@ fn emit_bound_evaluator<const ARITY: usize>(
     *expression = item.clone();
     output.value = item.clone();
     output.ty = facts.result.clone();
-    emit_closed_evaluator(id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body)
+    emit_closed_evaluator(id, facts.site.clone(), name_span, layout, facts.result.clone(), Vec::new(), body, max_wasip1_stdout)
 }
 
 fn with_verified_direct_call<T>(

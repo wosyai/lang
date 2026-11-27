@@ -11,7 +11,8 @@ use wosy_compiler::{
     derive_closed_comptime_fragment, derive_direct_function_comptime_fragment,
     derive_first_source_initializer_comptime, derive_forwarded_pair_startup_comptime_plan, ClosedComptimeFragment,
     ClosedComptimeRejection, ComptimeParameter, ComptimeParameterRejection, DirectStartupComptimePlan,
-    derive_pair_startup_call_graph_comptime_plan, DirectStartupComptimeUse, InspectedDirectComptimeCall,
+    derive_pair_startup_call_graph_comptime_plan, derive_pair_startup_call_graph_wasip1_stdout,
+    DirectStartupComptimeUse, InspectedDirectComptimeCall,
     PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
@@ -58,6 +59,7 @@ pub enum RootedClosedComptimeProjection {
 #[derive(Debug)]
 pub enum RootedClosedComptimeRefusal {
     ProfileNotSelected,
+    ProfileNotWasip1,
     FileNotRooted,
     NotTargetEntry,
     DirectCallRequiresSingleModule,
@@ -169,6 +171,7 @@ pub enum RootedForwardedPairStartupComptimeProjection {
 #[derive(Debug)]
 pub struct RootedPairCallGraphComptimePlan {
     source: RootedComptimeIdentity,
+    max_wasip1_stdout: Option<usize>,
     evidence: PairStartupCallGraphEvidence,
     evaluators: Vec<RootedStartupComptimeEvaluator>,
 }
@@ -181,6 +184,8 @@ impl RootedPairCallGraphComptimePlan {
     pub fn profile(&self) -> &str { &self.source.profile }
     pub fn id(&self) -> &str { self.evidence.site_id() }
     pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    /// Present only for the explicitly requested preview1 stdout delivery.
+    pub fn max_wasip1_stdout(&self) -> Option<usize> { self.max_wasip1_stdout }
     pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
 }
 
@@ -281,18 +286,24 @@ impl SourceStore {
     /// Project the ordinary finite graph from the same verified pending CST.
     pub(super) fn project_pair_call_graph_from_pending_parse(
         &self, root: NodeId, authored_cst: NodeId, target: String,
-        request: &RootedClosedComptimeRequest, fresh: &FreshParseResult,
+        request: &RootedClosedComptimeRequest, fresh: &FreshParseResult, max_wasip1_stdout: Option<usize>,
     ) -> Result<RootedPairCallGraphComptimeProjection> {
         let Some(source) = self.pending_comptime_identity(root, authored_cst, target, request) else {
             return Ok(RootedPairCallGraphComptimeProjection::Refused(RootedClosedComptimeRefusal::CompilerImageUnavailable));
         };
-        let plan = match derive_pair_startup_call_graph_comptime_plan(fresh, &request.id, request.evaluator_layout) {
+        let derived = match max_wasip1_stdout {
+            Some(max_stdout) if request.evaluator_layout == ScalarTargetLayout::WASM32 =>
+                derive_pair_startup_call_graph_wasip1_stdout(fresh, &request.id, max_stdout),
+            Some(_) => Err(ClosedComptimeRejection::UnsupportedLayout),
+            None => derive_pair_startup_call_graph_comptime_plan(fresh, &request.id, request.evaluator_layout),
+        };
+        let plan = match derived {
             Ok(plan) => plan,
             Err(reason) => return Ok(RootedPairCallGraphComptimeProjection::Refused(compiler_refusal(reason))),
         };
         let (evidence, fragments) = plan.into_parts();
         Ok(RootedPairCallGraphComptimeProjection::Emitted(RootedPairCallGraphComptimePlan {
-            source, evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
+            source, max_wasip1_stdout, evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
         }))
     }
 
