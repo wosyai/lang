@@ -456,6 +456,7 @@ trait OrderedRunEvidence: ActualIntegerObserver {
     type Symbolic<'a>: SymbolicRootProof where Self: 'a;
     type SymbolicReport: Default;
     const HAS_NAMED_ROOT: bool = false;
+    const IMMUTABLE_JOIN_REQUIREMENTS: bool = false;
 
     fn consume_mixed_startup(&mut self, _: MixedStartupTap) -> Result<MixedProofOrder, ProjectCheck> {
         Err(ProjectCheck::Unsupported)
@@ -502,6 +503,8 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
 
 #[cfg(feature = "internal-checker")]
 impl OrderedRunEvidence for ProofFreeOrderedEvidence {
+    const IMMUTABLE_JOIN_REQUIREMENTS: bool = true;
+
     type Symbolic<'a> = ProofFreeSymbolic;
     type SymbolicReport = ();
 
@@ -545,7 +548,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
     let (project, _) = prepared.parts();
     let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
-    let authored_roots = if E::CONTEXTUAL && scope == ScalarCheckerScope::MainFlowOnly {
+    let mut authored_roots = if E::CONTEXTUAL && scope == ScalarCheckerScope::MainFlowOnly {
         HashMap::new()
     } else {
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
@@ -555,6 +558,13 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
         }
         authored_roots
     };
+    // The unbounded command keeps its ordinary initialization and ordered
+    // failure walk. Only already-proved exact requirements leave the roster.
+    let verified_joins = if scope == ScalarCheckerScope::CurrentPackage && matches!(policy, OrderedReachPolicy::Closed)
+        && E::IMMUTABLE_JOIN_REQUIREMENTS && !PASSIVE_MIXED_STARTUP && effects.contextual_proofs.entries.is_empty()
+    {
+        prove_immutable_join_roots(prepared, &mut authored_roots)?
+    } else { Vec::new() };
     let (initialization, mut evidence) = if PASSIVE_MIXED_STARTUP {
         if !matches!(policy, OrderedReachPolicy::Closed) { return Err(ProjectCheck::Unsupported); }
         // Evaluate using precisely the ordinary contextual startup profile.
@@ -577,7 +587,7 @@ fn run_prepared_ordered_check_profiles<E: OrderedRunEvidence, const PASSIVE_MIXE
         contextual.reached_at_startup = initialization.reached.contains(&contextual.target);
     }
     effects.mixed_proof_order = effects.mixed_startup.take().map(|tap| evidence.consume_mixed_startup(tap)).transpose()?;
-    let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations;
+    let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations || !verified_joins.is_empty();
     let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
         let mut proof = evidence.symbolic();
         active |= match policy {
@@ -11628,29 +11638,40 @@ fn integer_literal_join_bounds<'a>(body: &'a FunctionCallSites, root: Occurrence
 }
 
 #[cfg(feature = "internal-checker")]
+fn prove_immutable_join_roots(
+    owner: &PreparedCheckerProject,
+    pending: &mut HashMap<usize, Vec<usize>>,
+) -> Result<Vec<wosy_syntax::SourceSpan>, ProjectCheck> {
+    let (project, calls) = owner.parts();
+    let mut proven = Vec::new();
+    for (&module, items) in pending.iter_mut() {
+        let source = &project.modules.get(module).ok_or(ProjectCheck::MissingRootOccurrences)?.source;
+        let mut kept = Vec::with_capacity(items.len());
+        for item in std::mem::take(items) {
+            let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            if let Some(sites) = immutable_integer_join_requirements(body) {
+                proven.extend(sites.into_iter().map(|span| wosy_syntax::SourceSpan::new(source.clone(), span)));
+            } else {
+                kept.push(item);
+            }
+        }
+        *items = kept;
+    }
+    pending.retain(|_, items| !items.is_empty());
+    proven.sort_unstable_by(|a,b| a.source.path.cmp(&b.source.path).then_with(|| a.range.start.cmp(&b.range.start)));
+    Ok(proven)
+}
+
+#[cfg(feature = "internal-checker")]
 fn plan_closed_authored_roots(
     owner: &PreparedCheckerProject, root: &SourceIdentity, startup_count: usize,
-    ordinals: &HashMap<&SourceIdentity, usize>, deferred: HashMap<usize, Vec<usize>>, allow_startup_scalars: bool,
+    ordinals: &HashMap<&SourceIdentity, usize>, mut deferred: HashMap<usize, Vec<usize>>, allow_startup_scalars: bool,
 ) -> Result<(Vec<PreparedCallable>, Vec<(usize, ByteSpan)>, Vec<wosy_syntax::SourceSpan>), ProjectCheck> {
     let (project, calls) = owner.parts();
     let mut callable_roots = Vec::new();
     let mut mandatory_startup_scalars = Vec::new();
-    let mut proven_joins = Vec::new();
-    let mut needed = HashSet::new();
-    for (module, items) in deferred {
-        let source = &project.modules.get(module).ok_or(ProjectCheck::MissingRootOccurrences)?.source;
-        for item in items {
-            let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            if allow_startup_scalars {
-                if let Some(sites) = immutable_integer_join_requirements(body) {
-                    proven_joins.extend(sites.into_iter().map(|span| wosy_syntax::SourceSpan::new(source.clone(), span)));
-                    continue;
-                }
-            }
-            needed.insert((module,item));
-        }
-    }
-    proven_joins.sort_unstable_by(|a,b| a.source.path.cmp(&b.source.path).then_with(|| a.range.start.cmp(&b.range.start)));
+    let proven_joins = if allow_startup_scalars { prove_immutable_join_roots(owner, &mut deferred)? } else { Vec::new() };
+    let mut needed = deferred.into_iter().flat_map(|(module,items)| items.into_iter().map(move |item| (module,item))).collect::<HashSet<_>>();
     if !needed.is_empty() {
         let callers = ordered_symbolic_callers(project, calls, root, None)?;
         let mut pending = needed.iter().copied().collect::<Vec<_>>();
@@ -20156,21 +20177,27 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
                 ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
             ).unwrap();
-            for cap in [std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MAX] {
-                let owner = prepare(program).into_startup_authored_owner().unwrap();
-                let spans = owner.proven_joins.iter().map(|span| span.range.start as usize).collect::<Vec<_>>();
-                let expected = program.match_indices("core.require").map(|(at,_)| at).collect::<Vec<_>>();
-                assert_eq!(spans, expected);
-                assert!(owner.callable_roots.is_empty());
-                let (failures, outcome, active) = owner.run(cap).unwrap();
-                assert!(failures.is_empty() && active && outcome == StartupAuthoredCompletion::Exhausted);
-            }
+            let all = prepare(program).run().unwrap();
+            assert!(all.active && all.directives.is_empty());
+            let owner = prepare(program).into_startup_authored_owner().unwrap();
+            let spans = owner.proven_joins.iter().map(|span| span.range.start as usize).collect::<Vec<_>>();
+            let expected = program.match_indices("core.require").map(|(at,_)| at).collect::<Vec<_>>();
+            assert_eq!(spans, expected);
+            assert!(owner.callable_roots.is_empty());
+            let (failures, outcome, active) = owner.run(std::num::NonZeroUsize::MIN).unwrap();
+            assert!(active && outcome == StartupAuthoredCompletion::Exhausted);
+            assert_eq!(failures, all.directives);
             let negatives = [
                 program.replace("n > 10) { 2 }", "n > 10) { 3 }"),
                 program.replace("core.require(view_code", "view_code = 3; core.require(view_code"),
                 program.replace("core.require(view_code", r#"core.require(false, {.stdout="";.stderr="extra";.code=33;.files=[];}); core.require(view_code"#),
             ];
             for text in negatives {
+                match prepare(&text).run() {
+                    Ok(report) => assert!(!report.directives.is_empty()),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported) => {}
+                    Err(other) => panic!("unexpected complete check outcome: {other:?}"),
+                }
                 let check = prepare(&text).into_startup_authored_owner();
                 match check {
                     Ok(owner) => {
