@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wosy_project::{packages::{match_installed_git_base_files, InstalledGitBase}, PackageRelativePath};
 use wosy_protocol::{
     partition_cst_files, BaseCstProposal, BaseCstProposalBinding, BaseDeclarationConnectionId,
@@ -108,23 +109,61 @@ impl SqliteSourceState {
         let Some((binding, proposal)) = self.proposal_if_current(target, attempt)? else {
             return Ok(PendingBasePublication::StaleAttempt);
         };
-        let current = |state: &super::SourceSelection| {
-            state.selected == Some(binding.selected.root) && state.pending == Some(attempt)
+        if !self.pending_base_is_current(&binding)? { return Ok(PendingBasePublication::StaleAttempt); }
+        let response = publish(binding.clone(), proposal).await?;
+        self.finish_pending_base_publication(&binding, response)
+    }
+
+    /// One local prepared source operation with an explicitly selected
+    /// trusted adapter. Both phases receive the same bounded canonical
+    /// proposal, constructed once. The client retains its share across both
+    /// calls and ends the SQLite read before invoking either callback.
+    ///
+    /// If the binding has advanced when preparation returns, do not start
+    /// publication. If it advances during an admitted commit, only the daemon root may
+    /// remain; the same SQLite compare-and-set as direct publication decides
+    /// selection. This is not a compile-time result or a Build/Check route.
+    pub async fn prepare_then_publish_pending_base<T, Prepare, Preparation, Publish, Publication>(
+        &mut self, target: &str, attempt: SourceAttempt, prepare: Prepare, publish: Publish,
+    ) -> Result<PendingBasePublication>
+    where
+        Prepare: FnOnce(BaseCstProposalBinding, Arc<BaseCstProposal>) -> Preparation,
+        Preparation: Future<Output = Result<T>>,
+        Publish: FnOnce(BaseCstProposalBinding, Arc<BaseCstProposal>, T) -> Publication,
+        Publication: Future<Output = Result<SourceDeltaPublication>>,
+    {
+        let Some((binding, proposal)) = self.proposal_if_current(target, attempt)? else {
+            return Ok(PendingBasePublication::StaleAttempt);
         };
-        if !current(&read_selection(&self.db, target)?) { return Ok(PendingBasePublication::StaleAttempt); }
-        let receipt = match publish(binding.clone(), proposal).await? {
-            SourceDeltaPublication::PredecessorMissing => return Ok(if current(&read_selection(&self.db, target)?) {
+        let proposal = Arc::new(proposal);
+        let prepared = prepare(binding.clone(), Arc::clone(&proposal)).await;
+        if !self.pending_base_is_current(&binding)? { return Ok(PendingBasePublication::StaleAttempt); }
+        let response = publish(binding.clone(), Arc::clone(&proposal), prepared?).await?;
+        self.finish_pending_base_publication(&binding, response)
+    }
+
+    fn pending_base_is_current(&self, binding: &BaseCstProposalBinding) -> Result<bool> {
+        let state = read_selection(&self.db, &binding.selected.target)?;
+        Ok(state.selected == Some(binding.selected.root)
+            && state.pending == Some(SourceAttempt::new(binding.proposed, binding.attempt)))
+    }
+
+    fn finish_pending_base_publication(
+        &self, binding: &BaseCstProposalBinding, response: SourceDeltaPublication,
+    ) -> Result<PendingBasePublication> {
+        let receipt = match response {
+            SourceDeltaPublication::PredecessorMissing => return Ok(if self.pending_base_is_current(binding)? {
                 PendingBasePublication::PredecessorMissing
             } else {
                 PendingBasePublication::StaleAttempt
             }),
-            SourceDeltaPublication::Committed(receipt) if receipt.binding == binding => receipt,
+            SourceDeltaPublication::Committed(receipt) if receipt.binding == *binding => receipt,
             SourceDeltaPublication::Committed(_) => return Err("committed base source receipt does not match the pending attempt".into()),
         };
         let applied = self.db.execute(
             "UPDATE source_targets SET selected = ?2, selected_generation = ?3, pending = NULL
              WHERE target = ?1 AND pending = ?2 AND generation = ?3 AND selected = ?4",
-            params![target, binding.proposed.0, binding.attempt, binding.selected.root.0],
+            params![binding.selected.target, binding.proposed.0, binding.attempt, binding.selected.root.0],
         )? == 1;
         Ok(if applied { PendingBasePublication::Applied(receipt) } else { PendingBasePublication::StaleAttempt })
     }

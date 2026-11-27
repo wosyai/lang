@@ -10,6 +10,7 @@ use super::{
 };
 use super::grammar_receipts::{GrammarReceipts, VerifiedFileGrammar, VerifiedGrammarBatch};
 use rowan::{NodeOrToken, WalkEvent};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -241,14 +242,14 @@ impl SourceStorageWorker {
         &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
         limits: BaseCstAdmissionLimits, lifetime: Duration,
     ) -> Result<SourceDeltaPublication> {
-        Ok(self.publish_base_source(binding, proposal, limits, PublicationLease::Open(lifetime)).await?.source)
+        Ok(self.publish_base_source(binding, Arc::new(proposal), limits, PublicationLease::Open(lifetime)).await?.source)
     }
 
     /// Consume the exact live preview accepted by this local store. The
     /// caller still uses the ordinary client acknowledgement compare-and-set;
     /// this publishes only canonical base source, never the evaluator/result.
     pub async fn publish_prepared_first_comptime_source(
-        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        &self, binding: BaseCstProposalBinding, proposal: impl Into<Arc<BaseCstProposal>>,
         prepared: PreparedPendingFirstComptime, limits: BaseCstAdmissionLimits,
     ) -> Result<PreparedSourcePublication> {
         if binding != prepared.binding || !Arc::ptr_eq(&self.retained_store(), &prepared.base._store) {
@@ -256,18 +257,17 @@ impl SourceStorageWorker {
         }
         let grammar = prepared.observation.grammar.ok_or("prepared source owner has no accepted entry fragment")?;
         let PreparedBaseDeclarations { lease, _read: read, .. } = prepared.base;
-        self.publish_base_source(binding, proposal, limits, PublicationLease::Prepared { lease, read, grammar }).await
+        self.publish_base_source(binding, proposal.into(), limits, PublicationLease::Prepared { lease, read, grammar }).await
     }
 
     async fn publish_base_source(
-        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        &self, binding: BaseCstProposalBinding, proposal: Arc<BaseCstProposal>,
         limits: BaseCstAdmissionLimits, admission: PublicationLease,
     ) -> Result<PreparedSourcePublication> {
         check_binding(&binding, &proposal)?;
         let slot = self.try_slot()?;
         self.spawn_reserved_query(slot, None, move |worker| async move {
             let binding = Arc::new(binding);
-            let proposal = Arc::new(proposal);
             let (lease, _prepared_read, prepared_changed) = match admission {
                 PublicationLease::Open(lifetime) => {
                     let selected = binding.selected.clone();
@@ -356,18 +356,18 @@ impl SourceStorageWorker {
     /// authored initializer can be compiled with no parameter authority.
     /// The existing selector's layout is a projection, not a builder grant.
     pub async fn prepare_pending_first_comptime(
-        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        &self, binding: BaseCstProposalBinding, proposal: impl Into<Arc<BaseCstProposal>>,
         request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration,
     ) -> Result<PreparedPendingFirstComptime> {
         request.check_selector_bytes()?;
         let captured_binding = binding.clone();
-        let (base, observation) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
+        let (base, observation) = self.prepare_base_cst_observing(binding, proposal.into(), request.source_limits,
             declaration_bytes, AdmissionLease::Open(lifetime), Some(request)).await?;
         Ok(PreparedPendingFirstComptime { base, binding: captured_binding, observation: observation.expect("requested projection") })
     }
 
     async fn prepare_base_cst_observing(
-        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        &self, binding: BaseCstProposalBinding, proposal: impl Borrow<BaseCstProposal> + Send + 'static,
         limits: BaseCstAdmissionLimits, declaration_bytes: usize, lease: AdmissionLease,
         first_comptime: Option<RootedClosedComptimeRequest>,
     ) -> Result<(PreparedBaseDeclarations, Option<PendingFirstObservation>)> {
@@ -393,12 +393,12 @@ impl SourceStorageWorker {
     }
 
     async fn with_cst_admission<T: Send + 'static>(
-        &self, binding: BaseCstProposalBinding, proposal: BaseCstProposal,
+        &self, binding: BaseCstProposalBinding, proposal: impl Borrow<BaseCstProposal> + Send + 'static,
         limits: BaseCstAdmissionLimits, admission_lease: AdmissionLease, observe_comptime: bool,
         selected_file: Option<FileKey>,
         use_validated: impl FnOnce(&SourceStore, &Transaction, ValidatedProposal) -> Result<T> + Send + 'static,
     ) -> Result<(T, Arc<SourceLease>, SourceRead)> {
-        check_binding(&binding, &proposal)?;
+        check_binding(&binding, proposal.borrow())?;
         let slot = self.try_slot()?;
         self.spawn_reserved(slot, move |store| {
             let lease = match admission_lease {
@@ -409,7 +409,7 @@ impl SourceStorageWorker {
             };
             let (mut tx, read) = store.begin_leased_source(lease.grant(), Mode::ReadWrite)?
                 .ok_or("base CST predecessor lease expired")?;
-            let validated = validate(&mut tx, &binding, &proposal, limits, None, AdmissionInspection {
+            let validated = validate(&mut tx, &binding, proposal.borrow(), limits, None, AdmissionInspection {
                 predecessor_grammar: observe_comptime.then_some(&store.grammar_receipts),
                 selected_file: selected_file.as_ref(), prepared_changed: None,
             })?;

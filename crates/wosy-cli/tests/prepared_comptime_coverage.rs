@@ -449,3 +449,108 @@ fn exact_pending_owner_can_commit_source_without_a_second_parser_run() {
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn client_shares_one_exact_proposal_and_respects_both_sqlite_freshness_cuts() {
+    use std::{cell::{Cell, RefCell}, path::Path, sync::Weak};
+    use wosy_compiler::ScalarTargetLayout;
+    use wosy_daemon::{PendingFirstComptimeProjection, RootedClosedComptimeProjection, RootedClosedComptimeRequest};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::{BaseCstProposal, FileKey};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Advance { DuringPrepare, AfterCommit, Never }
+
+    fn restage(project: &Path, obsolete: SourceAttempt) {
+        let mut concurrent = SqliteSourceState::open(project, CLIENT).unwrap();
+        assert!(concurrent.abandon("app", obsolete).unwrap());
+        let replacement = concurrent.stage("app").unwrap().pending.unwrap();
+        assert_eq!(replacement.root(), obsolete.root());
+        assert_ne!(replacement.generation(), obsolete.generation());
+    }
+
+    async fn compose(
+        local: &mut SqliteSourceState, worker: &SourceStorageWorker, project: &Path,
+        attempt: SourceAttempt, advance: Advance,
+    ) -> PendingBasePublication {
+        let canonical = RefCell::<Option<Weak<BaseCstProposal>>>::new(None);
+        let acknowledged = Cell::new(false);
+        let observed_before = &canonical;
+        let observed_after = &canonical;
+        let committed = &acknowledged;
+        let result = local.prepare_then_publish_pending_base("app", attempt,
+            |binding, proposal| async move {
+                assert!(Arc::strong_count(&proposal) >= 2);
+                observed_before.replace(Some(Arc::downgrade(&proposal)));
+                let request = RootedClosedComptimeRequest {
+                    profile: "dev".into(),
+                    file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+                    id: "fixture".into(), evaluator_layout: ScalarTargetLayout::NATIVE64,
+                    source_limits: LIMITS, output_bytes: 1 << 20,
+                };
+                let prepared = worker.prepare_pending_first_comptime(binding, proposal, request, 1 << 20, TTL).await?;
+                assert_eq!(prepared.base().admission().validated_files, 1);
+                assert!(matches!(prepared.projection(), Some(PendingFirstComptimeProjection::Candidate(
+                    RootedClosedComptimeProjection::Emitted(_)))));
+                if advance == Advance::DuringPrepare { restage(project, attempt); }
+                Ok(prepared)
+            },
+            |binding, proposal, prepared| async move {
+                assert!(Arc::strong_count(&proposal) >= 2);
+                assert!(Weak::ptr_eq(observed_after.borrow().as_ref().unwrap(), &Arc::downgrade(&proposal)));
+                let receipt = worker.publish_prepared_first_comptime_source(binding, proposal, prepared, LIMITS).await?;
+                assert_eq!(receipt.authored_reparsed_files, 0);
+                committed.set(true);
+                if advance == Advance::AfterCommit { restage(project, attempt); }
+                Ok(receipt.source)
+            },
+        ).await.unwrap();
+        assert_eq!(acknowledged.get(), advance != Advance::DuringPrepare);
+        result
+    }
+
+    let fixture = Scratch::new();
+    let project = fixture.0.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("wosy.toml"), MANIFEST).unwrap();
+    let entry = project.join("main.w");
+    fs::write(&entry, "%%start\ni32 answer = 14;\n%%end\n").unwrap();
+
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut local = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let initial = local.stage("app").unwrap();
+        let replay = local.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(initial.root, &replay.source.delta).await.unwrap();
+        assert!(local.acknowledge("app", initial.pending.unwrap()).unwrap());
+
+        fs::write(&entry, COMPTIME_LIB).unwrap();
+        let obsolete = local.stage("app").unwrap().pending.unwrap();
+        assert!(matches!(compose(&mut local, &worker, &project, obsolete, Advance::DuringPrepare).await,
+            PendingBasePublication::StaleAttempt));
+        assert!(store.snapshot(obsolete.root()).unwrap().is_none());
+        assert_eq!(local.acknowledged_build_source("app").unwrap().unwrap().root, initial.root);
+
+        let current = local.selection("app").unwrap().pending.unwrap();
+        let matched = compose(&mut local, &worker, &project, current, Advance::Never).await;
+        let PendingBasePublication::Applied(receipt) = matched else { panic!("expected exact acknowledgement"); };
+        assert_eq!(receipt.binding.attempt, current.generation());
+        assert_eq!(local.acknowledged_build_source("app").unwrap().unwrap().root, current.root());
+        assert!(store.snapshot(current.root()).unwrap().is_some());
+
+        fs::write(&entry, COMPTIME_LIB.replace("= 7", "= 8")).unwrap();
+        let next = local.stage("app").unwrap().pending.unwrap();
+        assert!(matches!(compose(&mut local, &worker, &project, next, Advance::AfterCommit).await,
+            PendingBasePublication::StaleAttempt));
+        assert!(store.snapshot(next.root()).unwrap().is_some());
+        let still_pending = local.selection("app").unwrap();
+        assert_eq!(still_pending.selected, Some(current.root()));
+        assert_ne!(still_pending.pending.unwrap().generation(), next.generation());
+        assert_eq!(still_pending.pending.unwrap().root(), next.root());
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}
