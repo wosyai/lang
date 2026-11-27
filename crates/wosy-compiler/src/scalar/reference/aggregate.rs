@@ -108,19 +108,12 @@ struct CertifiedInputFork {
     parent: Option<(usize, usize)>,
 }
 
-// Bound both recursion and ownership IR expansion. A receipt supports at
-// most two consumption sites, so their ancestor paths contribute at most
-// 2 * depth - 1 merges (the enclosing root fork is shared). Sequential forks
-// start at depth one and do not spend one another's nesting budget.
-const MAX_RECEIPT_FORK_DEPTH: usize = 32;
 pub(super) const MAX_LOCAL_CHOICE_LEAVES: usize = 8;
-const MAX_MERGES_PER_RECEIPT: usize = 2 * MAX_RECEIPT_FORK_DEPTH - 1;
 
 struct ConditionalInputCertificate {
     paths: Vec<ConditionalPath>,
     forks: Vec<CertifiedInputFork>,
     lexical_scopes: BTreeMap<usize, (CfgPointId, CfgPointId)>,
-    depth_limit_reached: bool,
 }
 
 fn linear_successor(points: &[ReferenceFlowPoint], from: CfgPointId) -> Option<CfgPointId> {
@@ -137,7 +130,6 @@ impl ConditionalInputCertificate {
             paths: vec![ConditionalPath::Outside; points.len()],
             forks: Vec::new(),
             lexical_scopes: BTreeMap::new(),
-            depth_limit_reached: false,
         };
         let mut entries = BTreeMap::<usize, CfgPointId>::new();
         for point in points {
@@ -161,7 +153,7 @@ impl ConditionalInputCertificate {
             }
             let Some(region) = regions.get(&point) else { break };
             let certified = certificate.forks.len();
-            if !certificate.certify_fork(points, regions, barriers, region, points[point.0].scope, None, 1) {
+            if !certificate.certify_fork(points, regions, barriers, region, points[point.0].scope) {
                 // Partially walked descendants cannot authorize a transfer.
                 certificate.forks.truncate(certified);
                 break;
@@ -173,49 +165,62 @@ impl ConditionalInputCertificate {
 
     fn certify_fork(
         &mut self, points: &[ReferenceFlowPoint], regions: &BTreeMap<CfgPointId, ConditionalInputRegion>,
-        barriers: &BTreeSet<CfgPointId>, region: &ConditionalInputRegion,
-        scope: ReferenceScopeId, parent: Option<(usize, usize)>, depth: usize,
+        barriers: &BTreeSet<CfgPointId>, region: &ConditionalInputRegion, scope: ReferenceScopeId,
     ) -> bool {
-        if depth > MAX_RECEIPT_FORK_DEPTH {
-            self.depth_limit_reached = true;
-            return false;
+        enum Step {
+            Fork { region: ConditionalInputRegion, scope: ReferenceScopeId, parent: Option<(usize, usize)> },
+            Arm { point: CfgPointId, end: CfgPointId, fork: usize, side: usize },
         }
-        if points[region.branch.0].scope != scope || points[region.join.0].scope != scope
-            || region.branch >= region.join
-            || points[region.branch.0].successors.as_slice() != region.entries
-        {
-            return false;
-        }
-        let fork = self.forks.len();
-        self.forks.push(CertifiedInputFork { region: *region, parent });
-        for (side, (entry, end)) in region.entries.into_iter().zip(region.terminals).enumerate() {
-            if side == 1 && entry == region.join && end == region.branch {
-                continue; // A Unit conditional's implicit else is the direct bypass.
-            }
-            let arm_scope = points[entry.0].scope;
-            if entry <= region.branch || entry >= region.join || end >= region.join
-                || arm_scope == scope || points[end.0].scope != arm_scope
-                || points[end.0].successors.as_slice() != [region.join]
-            {
-                return false;
-            }
-            let mut point = entry;
-            loop {
-                if point > end || barriers.contains(&point) || self.paths[point.0] != ConditionalPath::Outside {
-                    return false;
-                }
-                self.paths[point.0] = ConditionalPath::Arm { fork, side };
-                if point == end { break; }
-                if let Some(next) = linear_successor(points, point) {
-                    point = next;
-                } else if let Some(child) = regions.get(&point) {
-                    if child.join > end || !self.certify_fork(points, regions, barriers, child, points[point.0].scope, Some((fork, side)), depth + 1) {
+        // Resume the current arm at the child join, after both child arms have
+        // been walked. The LIFO order keeps parents ahead of their descendants
+        // in the certificate and the first arm ahead of its sibling.
+        let mut pending = vec![Step::Fork { region: *region, scope, parent: None }];
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Fork { region, scope, parent } => {
+                    if points[region.branch.0].scope != scope || points[region.join.0].scope != scope
+                        || region.branch >= region.join
+                        || points[region.branch.0].successors.as_slice() != region.entries
+                    {
                         return false;
                     }
-                    point = child.join;
-                } else {
-                    return false;
+                    let fork = self.forks.len();
+                    self.forks.push(CertifiedInputFork { region, parent });
+                    for side in [1, 0] {
+                        let entry = region.entries[side];
+                        let end = region.terminals[side];
+                        if side == 1 && entry == region.join && end == region.branch {
+                            continue; // A Unit conditional's implicit else is the direct bypass.
+                        }
+                        let arm_scope = points[entry.0].scope;
+                        if entry <= region.branch || entry >= region.join || end >= region.join
+                            || arm_scope == scope || points[end.0].scope != arm_scope
+                            || points[end.0].successors.as_slice() != [region.join]
+                        {
+                            return false;
+                        }
+                        pending.push(Step::Arm { point: entry, end, fork, side });
+                    }
                 }
+                Step::Arm { mut point, end, fork, side } => loop {
+                    if point > end || barriers.contains(&point) || self.paths[point.0] != ConditionalPath::Outside {
+                        return false;
+                    }
+                    self.paths[point.0] = ConditionalPath::Arm { fork, side };
+                    if point == end { break; }
+                    if let Some(next) = linear_successor(points, point) {
+                        point = next;
+                    } else if let Some(child) = regions.get(&point) {
+                        if child.join > end { return false; }
+                        pending.push(Step::Arm { point: child.join, end, fork, side });
+                        pending.push(Step::Fork {
+                            region: *child, scope: points[point.0].scope, parent: Some((fork, side)),
+                        });
+                        break;
+                    } else {
+                        return false;
+                    }
+                },
             }
         }
         true
@@ -274,13 +279,12 @@ impl ConditionalInputCertificate {
         }
         let mut merges = Vec::new();
         while let Some((fork, gates)) = pending.pop_last() {
-            if merges.len() == MAX_MERGES_PER_RECEIPT {
-                return None;
-            }
             let propagated = if gates[0] == gates[1] { gates[0] } else { ReceiptGate::Guard(fork) };
             merges.push((fork, gates));
             if fork != first.2 {
-                set(self.forks[fork].parent?, propagated, &mut pending)?;
+                let parent = self.forks.get(fork)?.parent?;
+                if parent.0 >= fork { return None; }
+                set(parent, propagated, &mut pending)?;
             }
         }
         Some(merges)
@@ -404,7 +408,7 @@ fn nested_conditional_input_coverage_rejects_overlapping_or_opaque_arms() {
 
 #[cfg(test)]
 #[test]
-fn conditional_input_nesting_budget_bounds_merge_work_without_limiting_serial_forks() {
+fn conditional_input_merges_follow_authored_nesting_and_ignore_serial_forks() {
     let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
     let span = ByteSpan::new(0, 1);
     let point = |id, scope| ReferenceFlowPoint {
@@ -448,14 +452,13 @@ fn conditional_input_nesting_budget_bounds_merge_work_without_limiting_serial_fo
     let classify = |depth, serial| {
         let (points, regions, consumer, exit) = chain(depth, serial);
         let certificate = ConditionalInputCertificate::build(&points, &regions, &BTreeSet::new());
-        let work = certificate.consuming_arm(&points, CfgPointId(1), consumer, Some(exit))
+        certificate.consuming_arm(&points, CfgPointId(1), consumer, Some(exit))
             .and_then(|site| certificate.merge_transfers(site, None))
-            .map(|merges| merges.len());
-        (certificate.depth_limit_reached, work)
+            .map(|merges| merges.len())
     };
-    assert_eq!(classify(MAX_RECEIPT_FORK_DEPTH, 1), (false, Some(MAX_RECEIPT_FORK_DEPTH)));
-    assert_eq!(classify(MAX_RECEIPT_FORK_DEPTH + 1, 1), (true, None));
-    assert_eq!(classify(1, MAX_MERGES_PER_RECEIPT + 1), (false, Some(1)));
+    assert_eq!(classify(33, 1), Some(33));
+    assert_eq!(classify(80, 1), Some(80));
+    assert_eq!(classify(1, 80), Some(1));
 }
 
 #[cfg(test)]
@@ -4777,13 +4780,17 @@ impl Body<'_> {
         };
         let mut result = StructuredOwnerReturn { local: BTreeMap::new(), named: BTreeMap::new(), output, binding, leaves: BTreeSet::new(), complete };
         let calls: BTreeMap<_, _> = facts.calls.iter().map(|(&point, &ordinal)| (ordinal.0, point)).collect();
-        let mut pending = vec![(structure.root, conditional, 0)];
-        while let Some((block, expression, depth)) = pending.pop() {
-            if depth > MAX_RECEIPT_FORK_DEPTH { result.complete = false; }
+        let mut pending = vec![(structure.root, conditional)];
+        let mut visited = HashSet::new();
+        while let Some((block, expression)) = pending.pop() {
+            if !visited.insert(expression) {
+                result.complete = false;
+                continue;
+            }
             if let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&expression) {
                 for block in [*else_block, *then_block] {
                     if let Some(child) = output_at(block) {
-                        pending.push((block, child, depth + 1));
+                        pending.push((block, child));
                     } else {
                         result.complete = false;
                     }
@@ -10066,17 +10073,9 @@ fn closed_aggregates<'a>(
                     let certificate = conditional_certificate.get_or_insert_with(|| {
                         ConditionalInputCertificate::build(points, &facts.conditional_input_regions, &facts.conditional_input_barriers)
                     });
-                    let uncovered = || {
-                        let mut message = format!(
-                            "aggregate input transfer does not cover every owning path in {:?}", body.source
-                        );
-                        if certificate.depth_limit_reached {
-                            message.push_str(&format!(
-                                "; structured receipt certification reached its nesting limit of {MAX_RECEIPT_FORK_DEPTH}"
-                            ));
-                        }
-                        message
-                    };
+                    let uncovered = || format!(
+                        "aggregate input transfer does not cover every owning path in {:?}", body.source
+                    );
                     if returning || !ordinary_producer || endpoints.next().is_some() {
                         return Err(uncovered());
                     }

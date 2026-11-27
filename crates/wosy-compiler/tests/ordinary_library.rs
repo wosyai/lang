@@ -292,6 +292,35 @@ u64 result = drive(2);
 }
 
 #[test]
+fn deeply_nested_aggregate_input_transfer_uses_each_authored_merge() {
+    const DEPTH: usize = 80;
+    let app = source("workbench", "src/deep_conditional_transfer.w");
+    let fixture = include_str!("fixtures/conditional-aggregate-transfer.w");
+    let nested = format!("{}result = accept_packet(packet);{}", "if (take) { ".repeat(DEPTH), " };".repeat(DEPTH));
+    let text = fixture.replace("if (take) { result = accept_packet(packet); };", &nested);
+    assert_ne!(fixture, text);
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap_or_else(|error| panic!("{target}: {error}")).to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+        assert_eq!(
+            ir.lines().filter(|line| line.contains("aggregate_receipt_active") && line.contains(" = phi i1 ")).count(),
+            DEPTH, "{target}: one receipt guard per authored merge"
+        );
+    }
+}
+
+#[test]
 fn conditional_aggregate_input_transfer_leaves_the_other_arm_owning() {
     let app = source("workbench", "src/conditional_aggregate_transfer.w");
     let text = include_str!("fixtures/conditional-aggregate-transfer.w");
@@ -1412,6 +1441,58 @@ fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
         let interrupted = text.replace("    read_amount(&moved);", "    length;");
         let error = emit(&interrupted).expect_err("an interrupted chain lacks a root handoff certificate");
         assert!(error.contains("recommitted aggregate return has no exact root binding"), "{target}: {error}");
+    }
+}
+
+#[test]
+fn deeply_nested_structured_owner_return_keeps_every_result_path() {
+    const DEPTH: usize = 40;
+    let app = source("workbench", "src/deep_structured_owner_return.w");
+    let fixture = include_str!("fixtures/structured-owner-factory.w");
+    let original = "if (choose) { make_packet(length) } else { make_alt(length) }";
+    let wrap = |ungrounded: bool| {
+        let nested = (0..DEPTH).fold(original.to_owned(), |value, index| {
+            // The first wrapper is deepest after the fold. Its else is
+            // reachable at length 1, through all enclosing tests.
+            let fallback = if ungrounded && index == 0 { "no_seed" } else { "make_alt" };
+            let threshold = index + 1;
+            format!("if (length != {threshold}) {{ {value} }} else {{ {fallback}(length) }}")
+        });
+        let text = fixture.replace(original, &nested);
+        assert_ne!(fixture, text);
+        if ungrounded {
+            text.replace("Packet(u64, u64, bool) factory",
+                "Packet(u64) no_seed = fn(length) { no_seed(length) };\nPacket(u64, u64, bool) factory")
+        } else {
+            text
+        }
+    };
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(&wrap(false)).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let factory = module.get_function(&function_with_suffix(&module, "factory")).unwrap();
+        let result_merges = factory.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|row| row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains(" = phi ptr "))
+            .count();
+        assert_eq!(result_merges, DEPTH + 2, "{target}: each authored structured result merge");
+        let error = emit(&wrap(true)).expect_err("a deep ungrounded owning leaf must still be rejected");
+        assert!(error.contains("structured aggregate return is not closed on every result path"), "{target}: {error}");
     }
 }
 

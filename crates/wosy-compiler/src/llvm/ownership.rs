@@ -71,12 +71,12 @@ pub(super) fn fresh_return_outputs(
         // address already has an ABI owner slot. Its lexical slot must track
         // assignments just like a local-allocation/borrowed join.
         if external_fresh && borrowed && !local && !projected {
-            if let Some(metadata) = function.body.final_output_values.get(output) {
+            if let Some((expression, metadata)) = function.body.final_expression(output) {
                 let read = &reference_cfg.points[value_point.0];
                 if let (
                     ScalarExpression::Name { name, .. },
                     CfgPointKind::Read { binding },
-                ) = (&metadata.value, &read.kind) {
+                ) = (expression, &read.kind) {
                     if function.body.span == binding.block_span
                         && binding.function_span == function.span
                         && binding.source == point.source_span.source
@@ -131,15 +131,12 @@ pub(super) fn fresh_return_outputs(
             )?;
             continue;
         }
-        let final_output = function
-            .body
-            .final_output_values
-            .get(*output)
+        let (final_output, _) = function.body.final_expression(*output)
             .ok_or_else(|| format!("missing return output {output}"))?;
         record_return_branches(
             function,
             reference_cfg,
-            &final_output.value,
+            final_output,
             *output,
             &mut branches,
         )?;
@@ -472,11 +469,12 @@ fn record_return_branches(
         ));
     };
     for branch in [then_branch, else_branch] {
-        let [value] = branch.final_output_values.as_slice() else {
+        if branch.final_output_values.len() != 1 {
             return Err(format!("return branch has no unique output {output}"));
-        };
-        if matches!(value.value, ScalarExpression::If { .. }) {
-            record_return_branches(function, reference_cfg, &value.value, output, branches)?;
+        }
+        let (expression, value) = branch.final_expression(0).expect("unique output");
+        if matches!(expression, ScalarExpression::If { .. }) {
+            record_return_branches(function, reference_cfg, expression, output, branches)?;
             continue;
         }
         let points = reference_cfg
@@ -484,7 +482,7 @@ fn record_return_branches(
             .iter()
             .filter(|point| {
                 point.source_span.range == value.span
-                    && match &value.value {
+                    && match expression {
                         ScalarExpression::CheckedAddress { .. } => {
                             matches!(point.kind, CfgPointKind::Borrow { .. })
                         }
@@ -516,7 +514,7 @@ fn record_return_branches(
             function,
             reference_cfg,
             branch,
-            &value.value,
+            expression,
             value.span,
             point,
             output,
@@ -693,18 +691,18 @@ pub(super) fn function_runtime_array_result_provenance(
     if !matches!(outputs.outputs.first()?.ty, ScalarType::RuntimeArray { .. }) {
         return None;
     }
-    let expression = function.body.final_output_values.first()?.value.clone();
+    let (expression, _) = function.body.final_expression(0)?;
     match expression {
         ScalarExpression::Call { .. } => Some(RuntimeArrayResultProvenance::FreshCall),
         ScalarExpression::Name { name, .. } => {
-            if function.parameters.contains(&name) {
+            if function.parameters.contains(name) {
                 return Some(RuntimeArrayResultProvenance::ParameterAlias);
             }
             function.body.items.iter().find_map(|item| match item {
                 ScalarBlockItem::LocalBinding(binding)
                     if binding_receivers(binding)
                         .iter()
-                        .any(|(receiver, _)| receiver == &name) =>
+                        .any(|(receiver, _)| receiver == name) =>
                 {
                     if binding.is_allocation {
                         Some(RuntimeArrayResultProvenance::LocalOwner)
@@ -1110,11 +1108,10 @@ fn escaped_runtime_array_owners_in_block(
     let mut local_bindings = bindings.clone();
     local_bindings.extend(return_bindings(block));
     block
-        .final_output_values
-        .iter()
-        .fold(BTreeSet::new(), |mut owners, output| {
+        .final_expressions()
+        .fold(BTreeSet::new(), |mut owners, (expression, _)| {
             owners.extend(escaped_runtime_array_owners(
-                &output.value,
+                expression,
                 &local_bindings,
                 visited,
             ));

@@ -143,9 +143,6 @@ fn resolve_block_types(
             }
         }
     }
-    for output in &mut block.final_output_values {
-        resolve_expression_types(&mut output.value, names, generics);
-    }
 }
 
 fn resolve_expression_types(
@@ -474,17 +471,6 @@ fn resolve_block_places(
     for item in &mut block.items {
         resolve_item_places(
             item,
-            scope,
-            program,
-            names,
-            unsafe_context,
-            overloads,
-            owners,
-        );
-    }
-    for output in &mut block.final_output_values {
-        resolve_expression_places(
-            &mut output.value,
             scope,
             program,
             names,
@@ -962,9 +948,6 @@ fn resolve_block_types_project(
     for item in &mut block.items {
         resolve_item_types_project(item, declarations, current_module, generics);
     }
-    for output in &mut block.final_output_values {
-        resolve_expression_types_project(&mut output.value, declarations, current_module, generics);
-    }
 }
 
 fn resolve_expression_types_project(
@@ -1358,20 +1341,6 @@ fn resolve_block_module_places(
     for item in &mut block.items {
         resolve_item_module_places(
             item,
-            scope,
-            module,
-            modules,
-            names,
-            unsafe_context,
-            declarations,
-            current_module,
-            overloads,
-            owners,
-        );
-    }
-    for output in &mut block.final_output_values {
-        resolve_expression_module_places(
-            &mut output.value,
             scope,
             module,
             modules,

@@ -1177,7 +1177,7 @@ pub(super) mod tests {
             name: "inert".into(), name_span: span,
             signature: ScalarType::Callable { parameters: vec![], outputs: ScalarOutputSequence { outputs: vec![], span } },
             parameters: vec![], parameter_spans: vec![],
-            body: ScalarBlock { items: vec![], terminated_items: vec![], expressions: vec![], final_output_values: vec![], span, unsafe_context: false },
+            body: ScalarBlock { items: vec![], terminated_items: vec![], final_output_values: vec![], span, unsafe_context: false },
             span, generic_parameters: vec![], overload_arms: vec![],
             reference_cfg: ScalarReferenceCfg {
                 facts: vec![], points: vec![], initial_points: vec![], allocations: BTreeSet::new(),

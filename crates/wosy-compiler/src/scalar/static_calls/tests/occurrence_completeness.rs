@@ -36,18 +36,18 @@ fn nested_conditional_retains_signed_float_literal_and_contextual_result_types()
             let ScalarItem::Function(function) = &items[0] else {
                 panic!("delta function");
             };
-            let ScalarExpression::If { else_branch, .. } = &function.body.final_output_values[0].value else {
+            let ScalarExpression::If { else_branch, .. } = function.body.final_expression(0).unwrap().0 else {
                 panic!("outer conditional");
             };
-            let ScalarExpression::If { then_branch, else_branch, span, .. } = &else_branch.final_output_values[0].value else {
+            let ScalarExpression::If { then_branch, else_branch, span, .. } = else_branch.final_expression(0).unwrap().0 else {
                 panic!("nested conditional");
             };
-            let ScalarExpression::Binary { left, .. } = &then_branch.final_output_values[0].value else {
+            let ScalarExpression::Binary { left, .. } = then_branch.final_expression(0).unwrap().0 else {
                 panic!("division");
             };
             for (literal, expected, negative) in [
                 (left.as_ref(), "-1.0", -1.0_f64),
-                (&else_branch.final_output_values[0].value, "-0.0", -0.0_f64),
+                (else_branch.final_expression(0).unwrap().0, "-0.0", -0.0_f64),
             ] {
                 let ScalarExpression::Float { value, spelling, span } = literal else {
                     panic!("signed float literal");

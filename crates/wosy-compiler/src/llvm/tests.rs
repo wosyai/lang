@@ -1243,18 +1243,12 @@ i32 nested = unsafe { echo(33) };
         else {
             panic!("expected function and two bindings");
         };
-        let ScalarExpression::Block(block) = &mut nested.value else {
-            panic!("expected initializer block");
+        assert!(matches!(&nested.value, ScalarExpression::Block(_)));
+        let mirror = &mut binding.output_values[0];
+        mirror.value = ScalarExpression::Integer {
+            value: 99.into(),
+            span: mirror.span,
         };
-        for mirror in [
-            &mut binding.output_values[0],
-            &mut block.final_output_values[0],
-        ] {
-            mirror.value = ScalarExpression::Integer {
-                value: 99.into(),
-                span: mirror.span,
-            };
-        }
 
         let region = prepared.initialization_region(0).unwrap();
         let input = super::GenericInitializerInput::PreparedRows(build.prepared());
@@ -8441,7 +8435,7 @@ unit(*?Grid) marker_address = fn(pointer) {
 }
 
 #[test]
-fn raw_final_output_ignores_redundant_expression_and_uses_actual_suffix() {
+fn raw_final_output_uses_canonical_suffix_before_and_after_json_roundtrip() {
     let text = "%%start
 i32(i32) first = fn(n) { n };
 i32(i32) second = fn(n) { n + 1 };
@@ -8476,20 +8470,17 @@ i32(i32) relay = fn(n) { first(n) };
                 panic!("relay");
             };
             let body = &mut relay.body;
-            let value = if actual_suffix {
+            if actual_suffix {
                 let crate::ScalarBlockItem::Expression(expression) = body.items.last_mut().unwrap()
                 else {
                     panic!("canonical suffix");
                 };
-                expression
-            } else {
-                &mut body.final_output_values[0].value
-            };
-            let crate::ScalarExpression::Call { name, .. } = value else {
-                panic!("final expression call");
-            };
-            assert_eq!(name, "first");
-            *name = "second".into();
+                let crate::ScalarExpression::Call { name, .. } = expression else {
+                    panic!("final expression call");
+                };
+                assert_eq!(name, "first");
+                *name = "second".into();
+            }
 
             let project_input = project(&changed.program);
             let raw_decoded =

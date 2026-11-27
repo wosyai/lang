@@ -536,7 +536,7 @@ fn missing_aggregate_policy_table_reports_spanned_invariant() {
         panic!("function")
     };
     let mut function = function.clone();
-    let read_span = expression_span(&function.body.expressions[0]);
+    let read_span = expression_span(function.body.expressions().next().unwrap());
     let calls =
         reference::test_function_call_sites(&validated.program.source, &function, &HashMap::new());
     let errors = record_function_reference_origins(
@@ -1149,7 +1149,7 @@ fn indexed_dereference_of_fixed_array_is_a_canonical_read_place() {
         ScalarItem::Function(function) => Some(function),
         _ => None,
     }).unwrap();
-    let expression = function.body.expressions.last().unwrap();
+    let expression = function.body.expressions().last().unwrap();
     assert!(matches!(expression, ScalarExpression::IndexedRead {
         place: ScalarPlace::Index { base, index, .. }, ..
     } if matches!(base.as_ref(), ScalarPlace::Dereference { pointer, .. }
@@ -1490,20 +1490,20 @@ fn terminal_unsafe_block_derives_one_final_output() {
             assert_eq!(body.final_output_values.len(), 1);
             assert_eq!(body.items.len(), item_count);
             assert_eq!(body.terminated_items, vec![false; item_count]);
-            assert_eq!(body.expressions.len(), item_count);
-            let output = &body.final_output_values[0];
+            assert_eq!(body.expressions().count(), item_count);
+            let (expression, output) = body.final_expression(0).unwrap();
             assert_eq!(output.position, 0);
             let start = source_text.rfind(final_expression).expect("final unsafe") as u32;
             assert_eq!(
                 output.span,
                 ByteSpan::new(start, start + final_expression.len() as u32)
             );
-            assert_eq!(
-                body.items.last(),
-                Some(&ScalarBlockItem::Expression(output.value.clone()))
-            );
+            let Some(ScalarBlockItem::Expression(canonical)) = body.items.last() else {
+                panic!("expected canonical expression");
+            };
+            assert!(std::ptr::eq(expression, canonical));
             assert!(matches!(
-                &output.value,
+                expression,
                 ScalarExpression::Block(block)
                     if block.unsafe_context && block.final_output_values.len() == 1
             ));
@@ -5409,11 +5409,50 @@ fn unsafe_statement_and_unit_output_remain_statements_in_both_pipelines() {
             };
             let body = &function.body;
             assert_eq!(body.items.len(), body.terminated_items.len());
-            assert_eq!(body.items.len(), body.expressions.len());
+            assert_eq!(body.items.len(), body.expressions().count());
+            for (expression, item) in body.expressions().zip(&body.items) {
+                let ScalarBlockItem::Expression(original) = item else { panic!("expected expression") };
+                assert!(std::ptr::eq(expression, original));
+            }
+            let wire = serde_json::to_value(body).unwrap();
+            assert_eq!(
+                wire["expressions"],
+                serde_json::to_value(body.expressions().collect::<Vec<_>>()).unwrap(),
+            );
+            let mut legacy_wire = wire.clone();
+            legacy_wire["expressions"] = serde_json::json!([]);
+            for (index, (expression, _)) in body.final_expressions().enumerate() {
+                assert_eq!(
+                    wire["final_output_values"][index]["value"],
+                    serde_json::to_value(expression).unwrap(),
+                );
+                legacy_wire["final_output_values"][index]["value"] = serde_json::json!(null);
+            }
+            assert_eq!(serde_json::from_value::<ScalarBlock>(wire).unwrap(), *body);
+            assert_eq!(serde_json::from_value::<ScalarBlock>(legacy_wire).unwrap(), *body);
             assert_eq!(body.final_output_values.len(), final_output_count);
             assert_eq!(body.terminated_items, terminated_items);
         }
     }
+}
+
+#[test]
+fn malformed_final_block_json_projection_returns_an_error() {
+    let result = validate_text("%%start\nu8(u8) f = fn(v) { u8 copy = v; copy };\n%%end");
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let ScalarItem::Function(function) = &result.program.items[0] else {
+        panic!("expected function");
+    };
+    let mut missing = function.body.clone();
+    missing.items.clear();
+    assert!(
+        serde_json::to_value(&missing).unwrap_err().to_string().contains("count exceeds")
+    );
+    let mut wrong_suffix = function.body.clone();
+    wrong_suffix.items.pop();
+    assert!(
+        serde_json::to_value(&wrong_suffix).unwrap_err().to_string().contains("not an expression")
+    );
 }
 
 #[test]
@@ -8013,7 +8052,7 @@ fn validates_direct_pointer_cast_dereference_in_single_file_and_project() {
                     let ScalarExpression::Dereference {
                         place: ScalarPlace::Field { base, field, .. },
                         ..
-                    } = &block.final_output_values[0].value
+                    } = block.final_expression(0).unwrap().0
                     else {
                         panic!("field read");
                     };
@@ -11007,11 +11046,11 @@ fn derives_local_pair_returns_in_source_order() {
     assert_eq!(function.body.final_output_values[1].position, 1);
     assert_eq!(function.body.final_output_values[1].ty, ScalarType::Bool);
     assert!(matches!(
-        &function.body.final_output_values[0].value,
+        function.body.final_expression(0).unwrap().0,
         ScalarExpression::Name { ref name, .. } if name == "local"
     ));
     assert!(matches!(
-        &function.body.final_output_values[1].value,
+        function.body.final_expression(1).unwrap().0,
         ScalarExpression::Boolean { value: true, .. }
     ));
 }

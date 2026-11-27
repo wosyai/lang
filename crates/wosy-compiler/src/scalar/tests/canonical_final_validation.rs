@@ -294,7 +294,6 @@ fn canonical_final_validation_borrows_mixed_forwarded_and_conditional_roots_on_b
                     metadata,
                     &function.body.final_output_values[position]
                 ));
-                assert!(!std::ptr::eq(expression, &metadata.value));
             }
         }
         let single = typecheck_scalar_program(declarations, target);

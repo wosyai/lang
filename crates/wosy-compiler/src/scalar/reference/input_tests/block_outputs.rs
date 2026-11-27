@@ -454,7 +454,7 @@ fn assert_roles(block: &ScalarBlock) {
     assert_eq!(roles.len(), 3);
     for (position, (item, role)) in roles.into_iter().enumerate() {
         assert!(std::ptr::eq(item, &block.items[position]));
-        let ScalarBlockItem::Expression(expression) = item else {
+        let ScalarBlockItem::Expression(_) = item else {
             panic!("canonical expression item")
         };
         match role {
@@ -462,7 +462,6 @@ fn assert_roles(block: &ScalarBlock) {
             ScalarBlockItemRole::FinalOutput { output, metadata } => {
                 assert_eq!(output, position - 1);
                 assert!(std::ptr::eq(metadata, &block.final_output_values[output]));
-                assert!(!std::ptr::eq(expression, &metadata.value));
                 assert_eq!(metadata.position, output);
                 assert_eq!(metadata.ty, ScalarType::U8);
             }
@@ -498,16 +497,10 @@ fn block_output_roles_borrow_actual_suffix_items_and_preserve_return_point_order
             }
         });
         let mut structural_probe = function.body.clone();
-        let shared = expression_span(&structural_probe.final_output_values[0].value);
+        let shared = expression_span(structural_probe.final_expression(0).unwrap().0);
         for item in structural_probe.items.iter_mut().skip(1) {
             let ScalarBlockItem::Expression(ScalarExpression::Call { span, .. }) = item else {
                 panic!("final call")
-            };
-            *span = shared;
-        }
-        for metadata in &mut structural_probe.final_output_values {
-            let ScalarExpression::Call { span, .. } = &mut metadata.value else {
-                panic!("final output projection")
             };
             *span = shared;
         }

@@ -594,9 +594,6 @@ fn record_block_overload_selections(
     for item in &mut block.items {
         record_block_item_overload_selections(item, &mut scope, overloads);
     }
-    for output in &mut block.final_output_values {
-        record_expression_overload_selection(&mut output.value, None, &scope, overloads);
-    }
 }
 
 fn record_block_item_overload_selections(

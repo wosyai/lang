@@ -66,7 +66,7 @@ fn prepared_branch_regions_preserve_polarity_continuations_and_inherited_query_e
             assert_eq!(region.evaluate_right_when, polarity);
             assert_eq!(region.bypass, bypass);
             assert_eq!(region.join, ordinal);
-            assert_eq!(region.span, expression_span(&function.body.expressions[0]));
+            assert_eq!(region.span, expression_span(function.body.expressions().next().unwrap()));
             assert_eq!(
                 row.structure.edges[&(Parent::Expression(ordinal), Edge::BinaryLeft)],
                 Node::Expression(region.left)
