@@ -1826,9 +1826,12 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         copies: Some((&storage, passive_generation)), maximum_depth: 0,
                     };
                     let value = preparation.node(outputs.primary, ty, expression, 0).ok_or(ProjectCheck::Unsupported)?;
+                    let value = match value {
+                        PassiveLiteral::Copy(value) => value,
+                        literal => std::rc::Rc::new(literal),
+                    };
                     InitializerValue::PassiveAggregate {
-                        ty, generation: passive_generation, depth: preparation.maximum_depth,
-                        value: std::rc::Rc::new(value),
+                        ty, generation: passive_generation, depth: preparation.maximum_depth, value,
                     }
                 }
                 #[cfg(feature = "internal-checker")]
@@ -2451,6 +2454,7 @@ enum InitializerValue<'a> {
 fn passive_startup_initializer(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     match (ty, expression) {
         (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. }) => true,
+        (ScalarType::Array { .. } | ScalarType::Struct(_), ScalarExpression::Name { .. }) => true,
         (ScalarType::Array { element, .. }, ScalarExpression::ArrayLiteral { .. }) =>
             is_integer_type(element) || matches!(element.as_ref(), ScalarType::Array { .. } | ScalarType::Struct(_)
                 | ScalarType::F32 | ScalarType::F64),
@@ -2495,7 +2499,7 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
         charge_call_work(self.work, 1)?;
         let typed = self.topology.structure.checked_types.expressions.get(&at)?;
         self.maximum_depth = self.maximum_depth.max(depth);
-        if depth != 0 && matches!(expression, ScalarExpression::Name { .. })
+        if matches!(expression, ScalarExpression::Name { .. })
             && matches!(ty, ScalarType::Array { .. } | ScalarType::Struct(_))
         {
             let (storage, current_generation) = self.copies?;
@@ -18600,9 +18604,11 @@ mod tests {
         let owner = source("src/main.w", "passive-integer-startup-arrays");
         let cells = (0..96).map(|index| if index == 95 { "255" } else { "0" })
             .collect::<Vec<_>>().join(",");
-        let program = |claim: &str| format!(r#"%%start
+        let program = |claim: &str, barrier: &str| format!(r#"%%start
             u8[96] line=[{cells}];
-            u8[96][2] layer=[line,line];
+            {barrier}
+            u8[96] duplicate=line;
+            u8[96][2] layer=[duplicate,line];
             u8[96][2][2] grid=[layer,layer];
             core.require({claim},{OUTPUT});
         %%end"#);
@@ -18612,14 +18618,20 @@ mod tests {
                 ScalarPreparationInputs { target_layout }, scope, Vec::new(),
             ).unwrap_or_else(|error| panic!("typed integer array preparation: {error:?}"));
             for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
-                let good = program("true");
-                let bad = program("false");
+                let good = program("true", "");
+                let bad = program("false", "");
                 let (valid, _) = prepare(&good, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
                 assert!(valid.active && valid.directives.is_empty());
                 assert!(prepare(&good, scope).run().unwrap().directives.is_empty());
                 let (invalid, _) = prepare(&bad, scope).run_private_authored_root(NonZeroUsize::MIN).unwrap();
                 assert_eq!(invalid.directives.len(), 1);
                 assert_eq!(invalid.directives, prepare(&bad, scope).run().unwrap().directives);
+                // Crossing an executable item invalidates the stored copy
+                // generation; the new direct lane must not reuse stale values.
+                let separated = program("true", &format!("core.require(true,{OUTPUT});"));
+                assert!(matches!(prepare(&separated, scope).run_private_authored_root(NonZeroUsize::MIN),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                assert!(matches!(prepare(&separated, scope).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
     }
