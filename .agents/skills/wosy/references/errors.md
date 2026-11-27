@@ -29,6 +29,7 @@ Each diagnostic carries a code, a message, and labeled spans.
 `wosy build` rejects these cases before producing an executable:
 
 - `B0003 read or move of unavailable place`: the value or a field was moved, or the access conflicts with a live borrow. If shown, check the secondary span labeled `origin of conflicting place or loan`. Read from the binding that received the move, or finish using the overlapping borrow before moving or writing to its owner.
+- `B0003 a field of a temporary is not an assignable or borrowable place`: you can read `(make(42)).value`. To assign to or borrow that field, bind the returned struct to a local first.
 - `B0003 array elements cannot be moved individually`: the element is not a Copy value. Borrow the element instead of moving it, or move the whole array.
 - `B0003 fallible allocation requires an exact proven null guard for its local binding`: guard the original fallible binding against `null` before reading it.
 
