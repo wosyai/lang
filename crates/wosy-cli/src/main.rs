@@ -30,6 +30,10 @@ use wosy_project::{
 use wosy_compiler::parse_source;
 use wosy_syntax::SourceIdentity;
 
+#[cfg(all(test, target_os = "linux", feature = "native-diagnostics"))]
+#[path = "main_tests/native_executable_inputs.rs"]
+mod native_executable_inputs;
+
 #[derive(Parser)]
 #[command(name = "wosy")]
 struct Arguments {
