@@ -2162,13 +2162,13 @@ fn try_observed_projected_storage_call(
                 let frame = if node == target {
                     super::checker_flow::projected_integer_storage_frame_after_prefix(body,
                         plan.as_ref().map_or(0, |plan| plan.bindings.len()), &prefix_reads, &prefix_calls)
-                } else { super::checker_flow::projected_integer_storage_frame(body) };
-                let Some(has_storage) = frame else { return Ok(false); };
+                } else { super::checker_flow::projected_integer_storage_frame_after_prefix(body,0,&HashSet::new(),&HashSet::new()) };
+                let Some((has_storage, scalar_calls)) = frame else { return Ok(false); };
                 if has_callable_obligations(body) { return Ok(false); }
                 writes_or_reads_storage |= has_storage;
                 todo.push(Event::Exit(node));
                 for (site, &child) in &body.structure.checker_direct_targets {
-                    if node == target && prefix_calls.contains(site) { continue; }
+                    if scalar_calls.contains(site) { continue; }
                     if child.0 != target.0 { return Ok(false); }
                     todo.push(Event::Enter(child));
                 }
@@ -2200,7 +2200,7 @@ fn try_observed_projected_storage_call(
     let mut prefix_history = None;
     if let Some(plan) = &plan {
         let mut prefix_work = work.get();
-        let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, HashMap::new(), |declaration, index, field| {
+        let (values, evaluated) = ordered_float_prefix::evaluate_observed_prefix(plan, None, HashMap::new(), |declaration, index, field| {
             match (index, field) {
                 (None, None) => storage.observed_atom(declaration),
                 (index, Some(field)) if &declaration.source == source && storage.has_observed_aggregate(declaration) => {
@@ -2219,6 +2219,40 @@ fn try_observed_projected_storage_call(
         prefix.extend(plan.bindings.iter().zip(values).map(|(fact, value)| (&fact.slot, &fact.ty, value)));
         prefix_history = evaluated;
     }
+    // Scoped to this observed activation. Plan leaves never contain runtime
+    // storage and are indexed by authenticated target identity and bits.
+    let math_plans = RefCell::new(HashMap::new());
+    let math_traces = RefCell::new(Vec::<Rc<ordered_float_prefix::ObservedTrace>>::new());
+    let math_interned = RefCell::new(HashMap::<Rc<ordered_float_prefix::ObservedTrace>,usize>::new());
+    let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
+        use std::collections::hash_map::Entry;
+        let signature = body.checked_call_signatures.get(&site)?;
+        let child = symbolic_math_effect_target(actual, target.0, body, site, signature)?;
+        let mut plans = math_plans.borrow_mut();
+        let (plan, root): &mut (ordered_float_prefix::PrefixCertificate, ordered_float_prefix::FunctionEffects) = match plans.entry(child) {
+            Entry::Occupied(plan) => plan.into_mut(),
+            Entry::Vacant(slot) => slot.insert(ordered_float_prefix::plan_observed_math_call(actual.project, actual.calls, child)?),
+        };
+        if args.len() != root.formals.len() || !root.formals.iter().all(|(_, ty)| *ty == ScalarType::F32) { return None; }
+        let values = root.formals.iter().zip(args).map(|((id,_),value)| (id.clone(), ObservedExactValue::F32(value))).collect();
+        let mut work = 0;
+        let (returned, nested) = ordered_float_prefix::evaluate_observed_prefix(plan, Some(root), values,
+            |_,_,_| None, trace.is_some(), &mut work, |owner,at| {
+                if owner.0 != target.0 { return None; }
+                Some(wosy_syntax::SourceSpan::new(source.clone(), body_of(owner)?.occurrences.get(at.0)?.span))
+            })?;
+        let [ObservedExactValue::F32(value)] = returned.as_slice() else { return None; };
+        let trace = nested.map(|trace| {
+            let trace = Rc::new(trace);
+            *math_interned.borrow_mut().entry(Rc::clone(&trace)).or_insert_with(|| {
+                let mut traces = math_traces.borrow_mut();
+                let id = traces.len();
+                traces.push(trace);
+                id
+            })
+        });
+        Some((*value,trace,work))
+    };
     let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
         use super::checker_flow::CallableHistoryStep;
         use failure_search::PathStep;
@@ -2233,6 +2267,7 @@ fn try_observed_projected_storage_call(
                 CallableHistoryStep::Call(range) => PathStep::Call(convert(range)),
                 CallableHistoryStep::Return(range) => PathStep::Return(convert(range)),
                 CallableHistoryStep::MatchArm(range) => PathStep::MatchArm(convert(range)),
+                CallableHistoryStep::ObservedFloatTrace(id) => PathStep::ObservedPrefix(Rc::clone(math_traces.borrow().get(id)?)),
                 _ => return None, // This cohort never crosses source owners.
             };
             search.append(step)?;
@@ -2240,7 +2275,7 @@ fn try_observed_projected_storage_call(
         search.append(PathStep::Return(span.clone()))
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&math_call),
         body_of, |parent, body, site, signature| {
             symbolic_history_call_target(actual.project, actual.calls, parent.0, parent.1, body, site, signature)
         }, |_, _, _| None);
@@ -2249,6 +2284,23 @@ fn try_observed_projected_storage_call(
     }
     *storage = Rc::unwrap_or_clone(current);
     Ok(true)
+}
+
+#[cfg(feature = "internal-checker")]
+fn symbolic_math_effect_target(
+    actual: &CheckedCalls<'_, impl ActualIntegerObserver>, owner: usize,
+    body: &FunctionCallSites, site: OccurrenceOrdinal, signature: &CheckedCallSignature,
+) -> Option<PreparedCallable> {
+    if !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::F32)
+        || signature.parameters.iter().any(|ty| *ty != ScalarType::F32) { return None; }
+    let &target = body.structure.checker_direct_targets.get(&site)?;
+    if target.0 != owner { return None; }
+    let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }
+        = &body.resolved_call_site(site)?.target else { return None; };
+    let (checked, _, _, function) = actual.validated_direct_body(&body.structure, site, source, *declaration_span).ok()?;
+    if checked != target || !function.boundary.parameters.iter().map(|parameter| &parameter.ty).eq(signature.parameters.iter())
+        || !matches!(function.boundary.results.as_slice(), [result] if result.ty == ScalarType::F32) { return None; }
+    Some(target)
 }
 
 fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
@@ -12154,7 +12206,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -19849,7 +19901,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             assert_eq!(plan.bindings.len(), 1);
             let mut reads = 0usize;
             let expected = ExactF32::checked_bits(0.25f32.to_bits()).unwrap();
-            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index, field| {
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, None, HashMap::new(), |declaration, index, field| {
                 if field.is_some() || index.is_some() || declaration.source != source { return None; }
                 reads += 1;
                 (reads <= 2).then_some(ExactValue::F32(expected))
@@ -19891,7 +19943,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let plan = ordered_float_prefix::plan_prefix::<false>(project, calls, (0,item)).unwrap();
             let mut reads = 0usize;
             let mut work = 0usize;
-            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, HashMap::new(), |declaration, index, field| {
+            let (values, trace) = ordered_float_prefix::evaluate_observed_prefix(&plan, None, HashMap::new(), |declaration, index, field| {
                 if field.is_some() || index.is_some() || declaration.source != source { return None; }
                 reads += 1;
                 Some(ExactValue::F32(ExactF32::checked_bits(0.25f32.to_bits())?))
@@ -19944,6 +19996,63 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let offset = text.find(nested).unwrap() as u32;
                 let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
                 assert_eq!(trace.contains_return(&site), age == "0");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn observed_pose_activation_carries_alpha_through_guard_blend_wrap_and_successive_state() {
+        let app = source("src/main.w", "observed-flight-mixed-alpha-pose");
+        let program = r#"%%start
+            struct copy RenderPose { f32 x; f32 heading; }
+            RenderPose prior = {.x=0.0;.heading=0.25;};
+            RenderPose next = {.x=2.0;.heading=0.75;};
+            RenderPose[2] previous_pose = [prior,prior];
+            RenderPose[2] poses = [next,next];
+            RenderPose[2] presented_pose = [prior,prior];
+            i16 status = 5;
+            f32(f32,f32,f32) blend = fn(a,b,r) { a+(b-a)*r };
+            f32(f32) wrap = fn(a) { if (a > 3.14159265) { a-6.28318530 } else { if (a < -3.14159265) { a+6.28318530 } else { a } } };
+            unit(u64,f32) present_pose = fn(lane,alpha) {
+                if (alpha >= 1.0) {
+                    presented_pose[lane].x = poses[lane].x;
+                    presented_pose[lane].heading = poses[lane].heading;
+                } else {
+                    presented_pose[lane].x = blend(previous_pose[lane].x,poses[lane].x,alpha);
+                    f32 prev_heading = previous_pose[lane].heading;
+                    presented_pose[lane].heading = wrap(prev_heading+wrap(poses[lane].heading-prev_heading)*alpha);
+                };
+            };
+            unit() update = fn { present_pose(0,1.0); present_pose(0,0.5); };
+            unit() frame = fn {
+                f32 heading = presented_pose[0].heading;
+                f32 x = presented_pose[0].x;
+                bool active = heading == 0.5 && x == 1.0;
+                if (active) { status = 37; } else { status = 19; };
+            };
+            update(); frame();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (route, expected) in [("present_pose(0,1.0); present_pose(0,0.5);", 37),
+                ("present_pose(0,0.5); present_pose(0,1.0);", 19), ("present_pose(0,1.0); present_pose(1,0.5);", 19)] {
+                let text = program.replace("present_pose(0,1.0); present_pose(0,0.5);", route);
+                let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap();
+                let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+                let report = prepare().run().unwrap();
+                let touches = super::super::checker_flow::take_observed_storage_delta_visits();
+                assert_eq!(touches, 5*17);
+                let (capped, _, trace, _) = prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+                assert_eq!(capped, report.directives);
+                assert_eq!(capped[0].code(), &BigInt::from(expected));
+                let nested = "wrap(poses[lane].heading-prev_heading)";
+                let start = text.find(nested).unwrap() as u32;
+                assert!(trace.contains_return(&wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(start, start+nested.len() as u32))));
+                eprintln!("observed mixed pose route={route} out={expected} sparse visits={touches}");
             }
         }
     }
@@ -20088,7 +20197,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             let run = |age: i32, entered: Option<bool>, alpha: Option<u32>| {
                 let formals = alpha.and_then(ExactF32::checked_bits).map(|value| (formal.clone(), ExactValue::F32(value))).into_iter().collect();
                 let mut reads = 0;
-                let result = ordered_float_prefix::evaluate_observed_prefix(&plan, formals, |decl, index, field| {
+                let result = ordered_float_prefix::evaluate_observed_prefix(&plan, None, formals, |decl, index, field| {
                     if field.is_some() || index.is_some() || decl.source != source { return None; }
                     reads += 1;
                     match &text[decl.range.start as usize..decl.range.end as usize] {

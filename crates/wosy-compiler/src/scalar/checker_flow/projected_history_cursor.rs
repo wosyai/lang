@@ -26,7 +26,8 @@ impl<'a> Machine<'a> {
         }
     }
     fn enter(body: &'a FunctionCallSites, tracker: &'a RefCell<CallableHistories<'a>>, entry: Option<CallableHistoryEntry>,
-        field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>) -> Option<Self> {
+        field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
+        math_call: Option<&'a ObservedFloatCall<'a>>) -> Option<Self> {
         tracker.borrow().charge(body.occurrences.len().saturating_add(body.boundary.parameters.len()))?;
         if !body.checker_returns_unit() {
             let [result] = body.boundary.results.as_slice() else { return None; };
@@ -46,7 +47,7 @@ impl<'a> Machine<'a> {
         let ids = body.boundary.checker_parameter_bindings.as_deref()?;
         if ids.len() != body.boundary.parameters.len() { return None; }
         let snapshots = !body.structure.checker_selected_snapshots.is_empty();
-        let mut roots = IntegerRoots { callable_history: Some(tracker), observed_float_field_read: field_read, allow_snapshot_history: snapshots,
+        let mut roots = IntegerRoots { callable_history: Some(tracker), observed_float_field_read: field_read, observed_float_call: math_call, allow_snapshot_history: snapshots,
             allow_ordinary_affine_overwrites: snapshots,
             allow_ordinary_contextual_places: !snapshots && body.structure.has_ordinary_contextual_places(),
             ..IntegerRoots::default() };
@@ -71,6 +72,7 @@ pub(in super::super) fn drive_finite_history<'p>(
     mut actual_storage: Option<(&mut Rc<ProjectedStorage>, &mut dyn FnMut(Vec<CallableHistoryStep>) -> Option<()>)>,
     observed_prefix: &[(&'p ReferenceBindingId, &'p ScalarType, super::super::checker_project::ObservedExactValue)],
     field_read: Option<&dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
+    math_call: Option<&ObservedFloatCall<'_>>,
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
     mut record: impl FnMut(Target, IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
@@ -86,7 +88,7 @@ pub(in super::super) fn drive_finite_history<'p>(
         row.storage = Some(Rc::clone(storage));
         Some(CallableHistoryEntry(row))
     } else { None };
-    let mut machine = Machine::enter(body, &histories, entry, field_read)?;
+    let mut machine = Machine::enter(body, &histories, entry, field_read, math_call)?;
     if !observed_prefix.is_empty() {
         if actual_storage.is_none() { return None; }
         let Machine::Unit { roots, block } = &mut machine else { return None; };
@@ -97,9 +99,12 @@ pub(in super::super) fn drive_finite_history<'p>(
             let value = match value {
                 ObservedExactValue::Boolean(b) => BigInt::from(u8::from(*b)),
                 ObservedExactValue::Integer(_, value) => value.clone(),
-                // Readonly Float results are already consumed by the exact prefix.
-                // Later reads are not assumed: they remain unsupported in the suffix.
-                ObservedExactValue::F32(_) => continue,
+                // Preserve the exact observed prefix value outside the
+                // compact integer axes for later typed Float uses.
+                ObservedExactValue::F32(value) => {
+                    row.install_observed_float((*id).clone(), *value)?;
+                    continue;
+                },
             };
             roots.add(id, ty);
             row.cells.push(Rc::new(IntegerSet::singleton(&value)));
@@ -148,8 +153,21 @@ pub(in super::super) fn drive_finite_history<'p>(
                 entry.0.storage = caller_row.storage.clone();
                 drop(tracker);
                 let child = resolve(target, body, site, signature)?;
+                let child_body = body_of(child)?;
+                if matches!(pending.effect, ExactCallEffect::Unit(_)) && caller_row.has_projected_storage() {
+                    let ids = child_body.boundary.checker_parameter_bindings.as_deref()?;
+                    if ids.len() != signature.parameters.len() { return None; }
+                    for (slot, (ty,id)) in signature.parameters.iter().zip(ids).enumerate() {
+                        if *ty != ScalarType::F32 { continue; }
+                        let OccurrenceNode::Expression(arg) = body.structure.edges.get(&(
+                            OccurrenceParent::Expression(site), OccurrenceEdge::CallArgument(slot),
+                        ))? else { return None; };
+                        let value = exact_observed_float_operand(body, *arg, caller_row)?;
+                        entry.0.install_observed_float(id.clone(), value)?;
+                    }
+                }
                 pending.row += 1;
-                stack.push(Frame { target: child, machine: Machine::enter(body_of(child)?, &histories, Some(entry), field_read)?, pending: None });
+                stack.push(Frame { target: child, machine: Machine::enter(child_body, &histories, Some(entry), field_read, math_call)?, pending: None });
                 continue;
             }
             if pending.row != cursor.path.0.len() || pending.receipts.len() != pending.row { return None; }

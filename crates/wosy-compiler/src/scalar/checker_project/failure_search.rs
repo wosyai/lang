@@ -196,6 +196,7 @@ impl StartUpSearch {
                 CallableHistoryStep::Return(span) => PathStep::Return(at(span)),
                 CallableHistoryStep::ProviderCall(owner, span) => PathStep::Call(provider_at(owner, span)?),
                 CallableHistoryStep::ProviderReturn(owner, span) => PathStep::Return(provider_at(owner, span)?),
+                CallableHistoryStep::ObservedFloatTrace(_) => return None,
             });
         }
         self.select(FailurePath { steps, directive })

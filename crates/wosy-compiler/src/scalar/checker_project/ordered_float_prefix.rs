@@ -645,8 +645,23 @@ impl From<&ExactValue> for MemoValue {
 
 type ObservedResult = (Vec<ExactValue>, Option<ObservedTrace>);
 
+pub(super) fn plan_observed_math_call(project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable)
+    -> Option<(PrefixCertificate, FunctionEffects)> {
+    let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
+    let mut installed = Vec::new();
+    planner.seal_dependencies(vec![target], &mut installed)?;
+    // This math callback has no mutable/snapshot dependencies: even a typed
+    // module read is rejected here and may not be equated to a constant.
+    if planner.certificate.effects.iter().any(|effect| matches!(effect.operation, Effect::Read { .. } | Effect::Field { .. })) {
+        return None;
+    }
+    let root = planner.certificate.callees.remove(&target)?;
+    Some((planner.certificate, root))
+}
+
 pub(super) fn evaluate_observed_prefix(
     certificate: &PrefixCertificate,
+    returning: Option<&FunctionEffects>,
     mut formals: HashMap<ReferenceBindingId, ExactValue>,
     mut read: impl FnMut(&SourceSpan, Option<u64>, Option<&super::super::ScalarStructFieldId>) -> Option<ExactValue>,
     trace: bool,
@@ -686,7 +701,7 @@ pub(super) fn evaluate_observed_prefix(
             _ => return None,
         })
     }
-    charge_call_work(work, formals.len().saturating_add(certificate.bindings.len().saturating_mul(3)))?;
+    charge_call_work(work, formals.len().saturating_add(returning.map_or(certificate.bindings.len(), |function| function.bindings.len()).saturating_mul(3)))?;
     let locals = Rc::new(RefCell::new(std::mem::take(&mut formals)));
     let mut pending = Vec::new();
     let mut values = Vec::new();
@@ -701,8 +716,13 @@ pub(super) fn evaluate_observed_prefix(
     let mut trace_stack = trace.then(|| vec![Vec::new()]);
     let mut interned = HashMap::new();
     let mut segments = Vec::new();
-    for fact in certificate.bindings.iter().rev() {
+    let bindings = returning.map_or(certificate.bindings.as_slice(), |function| {
         pending.push(Work::Publish);
+        pending.push(Work::Eval(function.returned, Rc::clone(&locals)));
+        function.bindings.as_slice()
+    });
+    for fact in bindings.iter().rev() {
+        pending.push(if returning.is_some() { Work::DropLocalResult } else { Work::Publish });
         pending.push(Work::Bind(fact, Rc::clone(&locals)));
         pending.push(Work::Eval(fact.returning_effect, Rc::clone(&locals)));
     }

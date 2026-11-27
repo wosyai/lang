@@ -267,6 +267,7 @@ pub(super) enum CallableHistoryStep {
     Return(wosy_syntax::ByteSpan),
     ProviderCall(usize, wosy_syntax::ByteSpan),
     ProviderReturn(usize, wosy_syntax::ByteSpan),
+    ObservedFloatTrace(usize),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1901,6 +1902,8 @@ struct IntegerRow {
     #[cfg(feature = "internal-checker")]
     storage: Option<Rc<ProjectedStorage>>,
     #[cfg(feature = "internal-checker")]
+    observed_floats: Option<Rc<HashMap<ReferenceBindingId, projected_f32::ExactF32>>>,
+    #[cfg(feature = "internal-checker")]
     closed_radix: Option<Rc<ClosedRadixAxes>>,
 }
 
@@ -1911,8 +1914,16 @@ impl IntegerRow {
         #[cfg(feature = "internal-checker")]
         storage: None,
         #[cfg(feature = "internal-checker")]
+        observed_floats: None,
+        #[cfg(feature = "internal-checker")]
         closed_radix: None,
     } }
+
+    #[cfg(feature = "internal-checker")]
+    fn install_observed_float(&mut self, name: ReferenceBindingId, value: projected_f32::ExactF32) -> Option<()> {
+        Rc::make_mut(self.observed_floats.get_or_insert_with(Default::default)).insert(name, value);
+        Some(())
+    }
 
     fn has_projected_storage(&self) -> bool {
         #[cfg(feature = "internal-checker")]
@@ -2266,6 +2277,8 @@ impl FromIterator<Rc<IntegerSet>> for IntegerRow {
 struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     observed_float_field_read: Option<&'a dyn Fn(&ProjectedStorage, &FloatFieldCell) -> Option<projected_f32::ExactF32>>,
+    #[cfg(feature = "internal-checker")]
+    observed_float_call: Option<&'a ObservedFloatCall<'a>>,
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
@@ -5445,6 +5458,11 @@ fn projected_unit_operands<'a>(
                 OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
             ))? else { return None; };
             if calls.structure.checked_types.expressions.get(arg)? != parameter { return None; }
+            if row.has_projected_storage() && *parameter == ScalarType::F32 {
+                // Exact values for these prepared slots travel through the
+                // observed Unit entry, not the compact integer operands.
+                continue;
+            }
             let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*arg)? else { return None; };
             if !calls.boundary.checker_parameter_bindings.as_ref()?.iter().zip(&calls.boundary.parameters)
                 .any(|(id, formal)| id == binding && &formal.ty == parameter) { return None; }
@@ -5458,6 +5476,14 @@ fn projected_unit_operands<'a>(
         operands.push(operand);
     }
     Some(operands)
+}
+
+#[cfg(feature = "internal-checker")]
+fn exact_observed_float_operand(calls: &FunctionCallSites, at: OccurrenceOrdinal, row: &IntegerRow) -> Option<projected_f32::ExactF32> {
+    if calls.structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
+    if let Some(bits) = calls.structure.projected_f32_literals.get(&at) { return projected_f32::ExactF32::checked_bits(*bits); }
+    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(at)? else { return None; };
+    row.observed_floats.as_ref()?.get(binding).copied()
 }
 
 enum NestedIntegerOperand<'a> {
@@ -7920,6 +7946,20 @@ impl IntegerInputs {
         Some(Some(rows))
     }
 
+    fn observed_float_guard(&self, calls: &FunctionCallSites, site: OccurrenceOrdinal, roots: &IntegerRoots<'_>) -> Option<Option<[Self; 2]>> {
+        if roots.observed_float_field_read.is_none() { return Some(None); }
+        let Some((left, op, right)) = calls.structure.projected_f32_comparisons.get(&site) else { return Some(None); };
+        let relation = IntegerRelation::from_operator(op)?;
+        let mut rows = [Self::default(), Self::default()];
+        for row in &self.0 {
+            let left = exact_observed_float_operand(calls, *left, row)?;
+            let right = exact_observed_float_operand(calls, *right, row)?;
+            let accepted = relation.accepts(f32::from_bits(left.0).partial_cmp(&f32::from_bits(right.0))?);
+            rows[usize::from(accepted)].0.push(row.clone());
+        }
+        Some(Some(rows))
+    }
+
     fn ordinary_predicate_at(
         &self, structure: &OccurrenceStructure, condition: OccurrenceOrdinal, roots: &mut IntegerRoots<'_>,
         selected: [bool; 2],
@@ -8803,7 +8843,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if let Some(compound) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
+                        let comparison = if let Some(projected) = path.observed_float_guard(calls, *condition, roots)? {
+                            Some(projected)
+                        } else if let Some(compound) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
                             Some(compound)
                         } else if evaluated_guard.0.is_some() {
                             evaluated_guard.0
@@ -9194,6 +9236,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             let assigned = match &value {
                                 ObservedFloatRhs::Literal(value) => *value,
                                 ObservedFloatRhs::Field(place) => read(storage, &place.cell(roots, row)?)?,
+                                ObservedFloatRhs::Expression(at) => evaluate_current_float(calls, *at, roots, row)?,
                             };
                             Rc::make_mut(row.storage.as_mut()?).overwrite_observed_field(destination, assigned)?;
                         }
@@ -9360,6 +9403,17 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 path = path.overwrite(axis, value, preserve_entry);
             }
             BlockItemKind::Binding(ref binding) => {
+                #[cfg(feature = "internal-checker")]
+                if roots.observed_float_field_read.is_some() {
+                    if let Some(id) = structure.projected_f32_locals.get(&(block, item.position)) {
+                        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        for row in &mut path.0 {
+                            let result = evaluate_current_float(calls, outputs.primary, roots, row)?;
+                            row.install_observed_float(id.clone(), result)?;
+                        }
+                        continue;
+                    }
+                }
                 #[cfg(feature = "internal-checker")]
                 if roots.callable_history.is_some() {
                     if let ([receiver], BindingInitialization::Outputs(outputs)) = (binding.receivers(), &binding.initialization) {
@@ -12175,13 +12229,13 @@ fn checked_literal_assignment(
 // declaration alone does not authorize all its uses (e.g. taking its address).
 #[cfg(feature = "internal-checker")]
 pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Option<bool> {
-    projected_integer_storage_frame_after_prefix(calls, 0, &HashSet::new(), &HashSet::new())
+    projected_integer_storage_frame_after_prefix(calls, 0, &HashSet::new(), &HashSet::new()).map(|(state, _)| state)
 }
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallSites, prefix: usize,
     prefix_reads: &HashSet<(wosy_syntax::SourceSpan, OccurrenceOrdinal, super::reference::ModuleStorageRole)>, prefix_calls: &HashSet<OccurrenceOrdinal>,
-) -> Option<bool> {
+) -> Option<(bool, HashSet<OccurrenceOrdinal>)> {
     use super::reference::ModuleStorageRole;
     if !calls.checker_returns_unit() || calls.contextual_formal().is_some()
         || !calls.arms.is_empty() || !calls.callable_escapes.is_empty()
@@ -12189,11 +12243,12 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
         || calls.structure.blocks.iter().any(|block| block.unsafe_context)
         || !calls.structure.checker_selected_snapshots.is_empty()
         || !calls.structure.checker_ordinary_directive_calls.is_empty()
-        || calls.boundary.parameters.iter().any(|parameter| !is_integer_type(&parameter.ty))
+        || calls.boundary.parameters.iter().any(|parameter| !is_integer_type(&parameter.ty) && parameter.ty != ScalarType::F32)
         || calls.call_occurrences.iter().any(|site| !prefix_calls.contains(&site.ordinal) && !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) {
         return None;
     }
     let mut covered = std::collections::HashSet::new();
+    let mut scalar_calls = prefix_calls.clone();
     let mut writes = false;
     for (ordinal, block) in calls.structure.blocks.iter().enumerate() {
         for (position, item) in block.items.iter().enumerate() {
@@ -12202,8 +12257,12 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                 BlockItemKind::Assignment { group } => {
                     if let Some((target, value)) = observed_float_write(calls, *group) {
                         covered.insert((target.declaration.clone(), target.site, ModuleStorageRole::Replace));
-                        if let ObservedFloatRhs::Field(field) = value {
-                            covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                        match value {
+                            ObservedFloatRhs::Field(field) => { covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project)); }
+                            ObservedFloatRhs::Expression(at) => observed_float_expr_sites(calls, at, |field| {
+                                covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                            }, |at| { scalar_calls.insert(at); })?,
+                            _ => {}
                         }
                         writes = true;
                         continue;
@@ -12228,6 +12287,10 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
                         if !is_integer_type(&receiver.ty)
                             || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
+                    } else if receiver.ty == ScalarType::F32 && calls.structure.projected_f32_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) {
+                        observed_float_expr_sites(calls, outputs.primary, |field| {
+                            covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                        }, |at| { scalar_calls.insert(at); })?;
                     } else if let Some((operand, _, _)) = calls.structure.checker_module_integer_comparisons.get(&outputs.primary) {
                         if receiver.ty != ScalarType::Bool || !calls.structure.checker_module_integer_comparison_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
                         let ty = calls.structure.checked_types.expressions.get(operand)?;
@@ -12244,7 +12307,106 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
             || prefix_reads.contains(&(declaration.clone(), *site, *role)))) {
         return None;
     }
-    Some(writes || !covered.is_empty() || !prefix_reads.is_empty())
+    Some((writes || !covered.is_empty() || !prefix_reads.is_empty(), scalar_calls))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) type ObservedFloatCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal, Vec<projected_f32::ExactF32>)
+    -> Option<(projected_f32::ExactF32, Option<usize>, usize)> + 'a;
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_expr_sites<'a>(calls: &'a FunctionCallSites, at: OccurrenceOrdinal,
+    mut read: impl FnMut(ObservedFloatPlace<'a>), mut call: impl FnMut(OccurrenceOrdinal)) -> Option<()> {
+    let mut agenda = vec![at];
+    while let Some(at) = agenda.pop() {
+        let structure = &calls.structure;
+        if structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
+        if structure.projected_f32_literals.contains_key(&at) || matches!(calls.prepared_plain_name(at), Some(PlainNameIdentity::Lexical(_))) { continue; }
+        if let Some(place) = observed_float_read_expr(calls, at) { read(place); continue; }
+        if let Some((left, _, right)) = structure.projected_f32_math.get(&at) {
+            agenda.push(*right);
+            agenda.push(*left);
+            continue;
+        }
+        let args = observed_float_call_args(calls, at)?;
+        call(at);
+        agenda.extend(args.into_iter().rev());
+    }
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_read_expr(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<ObservedFloatPlace<'_>> {
+    if calls.structure.checked_types.expressions.get(&at)? != &ScalarType::F32 { return None; }
+    if let Some((declaration, field)) = calls.prepared_module_direct_member(at) {
+        return Some(ObservedFloatPlace { declaration, site: at, field, index: None });
+    }
+    let OccurrenceNode::Place(place) = calls.structure.edges.get(&(OccurrenceParent::Expression(at), OccurrenceEdge::ExpressionPlace))? else { return None; };
+    observed_float_place(calls, *place)
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_call_args(calls: &FunctionCallSites, at: OccurrenceOrdinal) -> Option<Vec<OccurrenceOrdinal>> {
+    let signature = calls.checked_call_signatures.get(&at)?;
+    if !calls.structure.checker_direct_targets.contains_key(&at) || !signature.parameters.iter().all(|ty| *ty == ScalarType::F32)
+        || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::F32) { return None; }
+    signature.parameters.iter().enumerate().map(|(slot, ty)| {
+        let OccurrenceNode::Expression(arg) = calls.structure.edges.get(&(OccurrenceParent::Expression(at), OccurrenceEdge::CallArgument(slot)))? else { return None; };
+        (calls.structure.checked_types.expressions.get(arg)? == ty).then_some(*arg)
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
+fn evaluate_current_float(calls: &FunctionCallSites, at: OccurrenceOrdinal, roots: &IntegerRoots<'_>, row: &mut IntegerRow)
+    -> Option<projected_f32::ExactF32>
+{
+    use projected_f32::ExactF32;
+    enum Work<'a> { Eval(OccurrenceOrdinal), Binary(&'a BinaryOperator), Call(OccurrenceOrdinal, usize) }
+    let tracker = roots.callable_history?;
+    let mut pending = vec![Work::Eval(at)];
+    let mut values = Vec::<ExactF32>::new();
+    while let Some(work) = pending.pop() {
+        tracker.borrow().charge(1)?;
+        match work {
+            Work::Eval(at) => {
+                if let Some(value) = exact_observed_float_operand(calls, at, row) { values.push(value); continue; }
+                if let Some(place) = observed_float_read_expr(calls, at) {
+                    values.push(roots.observed_float_field_read?(row.storage.as_ref()?, &place.cell(roots,row)?)?);
+                    continue;
+                }
+                if let Some((left,op,right)) = calls.structure.projected_f32_math.get(&at) {
+                    pending.push(Work::Binary(op));
+                    pending.push(Work::Eval(*right));
+                    pending.push(Work::Eval(*left));
+                    continue;
+                }
+                let args = observed_float_call_args(calls, at)?;
+                tracker.borrow().charge(args.len())?;
+                pending.push(Work::Call(at, args.len()));
+                pending.extend(args.into_iter().rev().map(Work::Eval));
+            }
+            Work::Binary(op) => {
+                let right = values.pop()?;
+                let left = values.pop()?;
+                values.push(left.binary(op, right)?);
+            }
+            Work::Call(at, arity) => {
+                let args = values.split_off(values.len().checked_sub(arity)?);
+                let (value, trace, cost) = roots.observed_float_call?(calls, at, args)?;
+                tracker.borrow().charge(cost)?;
+                let span = calls.occurrences.get(at.0)?.span;
+                let mut tracker = tracker.borrow_mut();
+                let start = tracker.boundary(span, false);
+                tracker.append(row, start);
+                if let Some(trace) = trace { tracker.append(row, CallableHistoryStep::ObservedFloatTrace(trace)); }
+                let end = tracker.boundary(span, true);
+                tracker.append(row, end);
+                values.push(value);
+            }
+        }
+    }
+    let [value] = values.as_slice() else { return None; };
+    Some(*value)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -12314,7 +12476,7 @@ fn observed_float_place(calls: &FunctionCallSites, field_site: OccurrenceOrdinal
 }
 
 #[cfg(feature = "internal-checker")]
-enum ObservedFloatRhs<'a> { Literal(projected_f32::ExactF32), Field(ObservedFloatPlace<'a>) }
+enum ObservedFloatRhs<'a> { Literal(projected_f32::ExactF32), Field(ObservedFloatPlace<'a>), Expression(OccurrenceOrdinal) }
 
 #[cfg(feature = "internal-checker")]
 fn observed_float_write(calls: &FunctionCallSites, position: BlockPosition) -> Option<(ObservedFloatPlace<'_>, ObservedFloatRhs<'_>)> {
@@ -12328,10 +12490,9 @@ fn observed_float_write(calls: &FunctionCallSites, position: BlockPosition) -> O
         ObservedFloatRhs::Literal(projected_f32::ExactF32::checked_bits(*bits)?)
     } else if let Some((declaration, field)) = calls.prepared_module_direct_member(rhs.expression) {
         ObservedFloatRhs::Field(ObservedFloatPlace { declaration, site: rhs.expression, field, index: None })
-    } else {
-        let OccurrenceNode::Place(at) = calls.structure.edges.get(&(OccurrenceParent::Expression(rhs.expression), OccurrenceEdge::ExpressionPlace))? else { return None; };
-        ObservedFloatRhs::Field(observed_float_place(calls, *at)?)
-    };
+    } else if let Some(place) = observed_float_read_expr(calls, rhs.expression) {
+        ObservedFloatRhs::Field(place)
+    } else { ObservedFloatRhs::Expression(rhs.expression) };
     Some((target, value))
 }
 

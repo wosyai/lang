@@ -6487,6 +6487,12 @@ pub(super) struct OccurrenceStructure {
     pub(super) projected_place_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     #[cfg(feature = "internal-checker")]
     pub(super) projected_f32_literals: HashMap<OccurrenceOrdinal, u32>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_f32_comparisons: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_f32_math: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_f32_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -6687,6 +6693,12 @@ impl OccurrenceStructure {
             projected_place_fields: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_f32_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_f32_comparisons: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_f32_math: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_f32_locals: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -8529,7 +8541,6 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 }));
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
-            && matches!(edge, OccurrenceEdge::AssignmentRhs { .. })
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::F32) {
             if let ScalarExpression::Float { value, .. } = expression {
                 let exact = *value as f32;
@@ -9383,6 +9394,16 @@ impl StructuralWalker<'_, '_> {
                     self.expression_at(right, names, types, parent, OccurrenceEdge::BinaryRight)?;
                 #[cfg(feature = "internal-checker")]
                 if self.occurrence_typing.checker_directives_enabled() && matches!(self.mode, WalkMode::Callable(_)) {
+                    if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
+                        && [left,right].iter().all(|value| self.structure.checked_types.expressions.get(value) == Some(&ScalarType::F32))
+                        && super::symbolic_integer::IntegerRelation::from_operator(operator).is_some() {
+                        self.structure.projected_f32_comparisons.insert(ordinal, (left, operator.clone(), right));
+                    }
+                    if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::F32)
+                        && [left,right].iter().all(|value| self.structure.checked_types.expressions.get(value) == Some(&ScalarType::F32))
+                        && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide) {
+                        self.structure.projected_f32_math.insert(ordinal, (left, operator.clone(), right));
+                    }
                     if let Some(comparison) = super::checker_flow::IntegerComparison::from_expression(expression) {
                         let ty = self.structure.checked_types.expressions.get(&left);
                         if matches!(&self.plain_names, PlainNameFacts::Prepared(names)
@@ -10174,6 +10195,12 @@ impl StructuralWalker<'_, '_> {
                 }
                 #[cfg(feature = "internal-checker")]
                 if let (WalkMode::Callable(callable), BindingInitialization::Outputs(outputs)) = (&self.mode, &initialization) {
+                    if binding.receivers.len() == 1 && receiver.ty == ScalarType::F32 && outputs.secondary.is_empty()
+                        && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&ScalarType::F32) {
+                        let resolver = callable.target_resolver;
+                        self.structure.projected_f32_locals.insert((position.block, position.item),
+                            lexical.reference_id(resolver.source, resolver.function_span));
+                    }
                     if binding.receivers.len() == 1 && receiver.ty == ScalarType::Bool && outputs.secondary.is_empty()
                         && self.structure.checker_module_integer_comparisons.contains_key(&outputs.primary) {
                         let resolver = callable.target_resolver;
