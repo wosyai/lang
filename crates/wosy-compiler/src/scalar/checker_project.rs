@@ -23,6 +23,8 @@ mod ranked_float;
 #[cfg(feature = "internal-checker")]
 mod range_envelopes;
 #[cfg(feature = "internal-checker")]
+mod source_call_census;
+#[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
 mod ordered_float_prefix;
 #[cfg(feature = "internal-checker")]
@@ -20306,6 +20308,82 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 // A separate symbolic call cannot take the seed proof.
                 assert!(envelopes.close_guarded_formals(scan).is_none());
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn source_call_census_separates_initializer_calls_arms_values_and_boundaries() {
+        use source_call_census::{SourceCallCensus, SourceOwner, SourceUseKind};
+        let identity = source("src/main.w", "prepared-use-census");
+        let text = r#"%%start
+            host = extern wasm "device" { unit(i32) output; };
+            unit(i32) reached = fn(x) { host.output(x); };
+            unit(i32) dormant = fn(x) { host.output(x); };
+            unit(unit(i32),i32) dispatch = fn(action, x) { action(x); };
+            route = overload {
+                unit(i32) => fn(value) { reached(value); };
+                unit(i64) => fn(value) { reached(core.int_trunc<i32>(value)); };
+            };
+            unit(i32) ordinary = fn(value) { reached(value); dispatch(reached,value); };
+            reached(1);
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_checker_project(vec![(declarations(&identity,text),vec![])], vec![identity.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let item = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let (reached,dormant,route,ordinary) = (item("reached"),item("dormant"),item("route"),item("ordinary"));
+            let result = SourceCallCensus::build(project,calls,[reached,dormant]).unwrap();
+            let used = &result.uses[&reached];
+            let unused = &result.uses[&dormant];
+            assert_eq!(used.sites.len(),4);
+            assert!(used.sites.iter().all(|use_| use_.kind == SourceUseKind::Direct && use_.site.is_some()
+                && use_.signature.as_ref().is_some_and(|sig| sig.parameters == [ScalarType::I32])));
+            assert!(used.sites.iter().any(|use_| use_.owner == SourceOwner::Initialization(0)));
+            for arm in 0..2 {
+                assert!(used.sites.iter().any(|use_| use_.owner == (SourceOwner::Function { declaration:route,arms:vec![arm] })));
+            }
+            assert_eq!(used.escapes, vec![SourceOwner::Function { declaration:ordinary,arms:Vec::new() }]);
+            assert!(unused.sites.is_empty() && unused.escapes.is_empty());
+            assert!(result.foreign_or_indirect >= 3);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_source_census_keeps_all_direct_publish_routes_separate_from_host() {
+        use source_call_census::{SourceCallCensus, SourceOwner, SourceUseKind};
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap());
+        let text = std::fs::read_to_string(path).unwrap();
+        let identity = source("src/engine.w","pinned-pocket-source-census");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepared = prepare_checker_project(vec![(declarations(&identity,&text),vec![])], vec![identity.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = prepared.parts();
+            let item = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let (publish,rebuild,retire_row) = (item("publish_chunk"),item("rebuild_chunk"),item("retire_terrain_row"));
+            let result = SourceCallCensus::build(project,calls,[publish,rebuild,retire_row]).unwrap();
+            let used = &result.uses[&publish];
+            assert!(used.escapes.is_empty());
+            assert_eq!(used.sites.len(),2);
+            for caller in [rebuild,retire_row] {
+                let entries = used.sites.iter().filter(|site| site.owner == (SourceOwner::Function {
+                    declaration:caller,arms:Vec::new(),
+                })).collect::<Vec<_>>();
+                let [call] = entries.as_slice() else { panic!("one genuine publish edge"); };
+                assert_eq!(call.kind,SourceUseKind::Direct);
+                assert!(call.site.is_some());
+                assert!(call.signature.as_ref().is_some_and(|sig| sig.parameters.as_slice() == [ScalarType::I32, ScalarType::I32, ScalarType::I32]));
+                assert!(text[call.span.start as usize..call.span.end as usize].starts_with("publish_chunk("));
+            }
+            assert_eq!(result.uses[&rebuild].sites.len(),3);
+            assert_eq!(result.uses[&retire_row].sites.len(),2);
+            // Source tables do not certify that an opaque host won't reenter.
+            assert!(result.foreign_or_indirect > 0);
         }
     }
 
