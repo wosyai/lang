@@ -32,8 +32,29 @@ impl Envelope {
             Add => Self { low: self.low + rhs.low, high: self.high + rhs.high },
             Subtract => Self { low: self.low - rhs.high, high: self.high - rhs.low },
             Multiply if self.low == self.high && rhs.low == rhs.high => Self::exact(self.low * rhs.low),
-            Divide if self.low == self.high && rhs.low == rhs.high && rhs.low.bits() != 0 => Self::exact(self.low / rhs.low),
-            Remainder if self.low == self.high && rhs.low == rhs.high && rhs.low.bits() != 0 => Self::exact(self.low % rhs.low),
+            Divide | Remainder if rhs.low == rhs.high && rhs.low.bits() != 0 => {
+                // Signed division truncates toward zero. A negative divisor
+                // reverses the endpoints; never infer from MIN / -1.
+                let entire = Self::whole(ty)?;
+                if rhs.low == BigInt::from(-1) && self.low <= entire.low {
+                    return Some(entire);
+                }
+                if matches!(op, Divide) {
+                    let a = self.low / &rhs.low;
+                    let b = self.high / &rhs.low;
+                    if a <= b { Self { low: a, high: b } } else { Self { low: b, high: a } }
+                } else if self.low == self.high {
+                    Self::exact(self.low % rhs.low)
+                } else {
+                    // The remainder has the dividend's sign and magnitude
+                    // strictly smaller than the absolute divisor.
+                    let zero = BigInt::from(0);
+                    let limit = if rhs.low < zero { -rhs.low } else { rhs.low } - 1u8;
+                    let low = self.low.min(zero.clone()).max(-&limit);
+                    let high = self.high.max(zero).min(limit);
+                    Self { low, high }
+                }
+            }
             Multiply | Divide | Remainder => Self::whole(ty)?,
             _ => return None,
         };
@@ -465,7 +486,6 @@ impl<'a> PreparedEnvelopes<'a> {
     }
 
     fn requirements_in_envelope(&mut self, target: PreparedCallable, entry: Inputs) -> Option<Vec<ByteSpan>> {
-        use crate::scalar::reference::CheckerOrdinaryBoolean;
         let frame = self.frame_without_formal_mutation(target)?;
         let b = frame.body;
         let st = &b.structure;
@@ -478,30 +498,96 @@ impl<'a> PreparedEnvelopes<'a> {
         for (&expression,directive) in &st.checker_directives {
             if directive.operation != CheckerOperation::Require { return None; }
             let inputs = self.refine_at_site(frame,expression,&parents,&mut known)??;
-            let accepts = |c: &super::super::checker_flow::IntegerPredicate| {
-                let axis = frame.ids.iter().position(|id| id == &c.binding)?;
-                let range = inputs.get(axis)?.as_ref()?;
-                if b.boundary.parameters.get(axis)?.ty != c.ty { return None; }
-                IntegerRelation::from_operator(&c.operator)?
-                    .accepts_closed(&range.low,&range.high,&c.bound).then_some(())
-            };
-            match directive.predicate.as_ref() {
-                Some(CheckerPredicate::Integer(c)) => accepts(c)?,
-                None => {
-                    let mut todo = vec![st.checker_ordinary_booleans.get(&expression)?];
-                    while let Some(p) = todo.pop() {
-                        match p {
-                            CheckerOrdinaryBoolean::Integer(c) => accepts(c)?,
-                            CheckerOrdinaryBoolean::And(pair) => todo.extend(pair.iter().rev()),
-                            _ => return None,
-                        }
-                    }
-                }
-                _ => return None,
-            }
+            self.requirement_accepts(frame,expression,&inputs)?;
             covered.push(b.occurrences.get(expression.0)?.span);
         }
         Some(covered)
+    }
+
+    fn requirement_accepts(&self, frame: Frame<'a>, site: OccurrenceOrdinal, input: &Inputs) -> Option<()> {
+        use crate::scalar::reference::CheckerOrdinaryBoolean;
+        let b = frame.body;
+        let st = &b.structure;
+        let directive = st.checker_directives.get(&site)?;
+        if directive.operation != CheckerOperation::Require { return None; }
+        let accepts = |c: &super::super::checker_flow::IntegerPredicate| {
+            let axis = frame.ids.iter().position(|id| id == &c.binding)?;
+            let range = input.get(axis)?.as_ref()?;
+            if b.boundary.parameters.get(axis)?.ty != c.ty { return None; }
+            IntegerRelation::from_operator(&c.operator)?
+                .accepts_closed(&range.low,&range.high,&c.bound).then_some(())
+        };
+        match directive.predicate.as_ref() {
+            Some(CheckerPredicate::Integer(c)) => accepts(c),
+            None => {
+                let mut todo = vec![st.checker_ordinary_booleans.get(&site)?];
+                while let Some(p) = todo.pop() {
+                    match p {
+                        CheckerOrdinaryBoolean::Integer(c) => accepts(c)?,
+                        CheckerOrdinaryBoolean::And(pair) => todo.extend(pair.iter().rev()),
+                        _ => return None,
+                    }
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    /// An exact literal edge does not depend on caller storage, preceding
+    /// host calls, or the guard leading to it. It is conditional on the actual
+    /// call being reached and says nothing about other ways into its callee.
+    pub(super) fn literal_call_seeds(&self, caller: PreparedCallable, callee: PreparedCallable) -> Option<Vec<IncomingRangeEdge>> {
+        let body = self.calls.function_body(caller.0,caller.1,None)?;
+        let st = &body.structure;
+        let mut edges = Vec::new();
+        for call in &body.call_occurrences {
+            let site = call.ordinal;
+            if st.checker_direct_targets.get(&site) != Some(&callee) { continue; }
+            let sig = body.checked_call_signatures.get(&site)?;
+            if super::authenticate_prepared_direct_edge(self.project,self.calls,caller.0,body,site,sig)? != callee { return None; }
+            let inputs = sig.parameters.iter().enumerate().map(|(slot,ty)| {
+                let OccurrenceNode::Expression(argument) = st.edges.get(&(
+                    OccurrenceParent::Expression(site),OccurrenceEdge::CallArgument(slot)))? else { return None; };
+                if st.checked_types.expressions.get(argument)? != ty || !is_integer_type(ty) { return None; }
+                let value = st.prepared_range_literals.get(argument)?;
+                integer_literal_fits_type(value,ty).then(|| Some(Envelope::exact(value.clone())))
+            }).collect::<Option<Inputs>>()?;
+            edges.push(IncomingRangeEdge { caller,callee,site,inputs:Some(inputs) });
+        }
+        (!edges.is_empty()).then_some(edges)
+    }
+
+    /// Ranges on a direct child edge of this activation only. Opaque effects
+    /// elsewhere cannot be used to claim no indirect reentry or termination.
+    pub(super) fn forward_incoming_edge(&mut self, incoming: &IncomingRangeEdge, callee: PreparedCallable)
+        -> Option<Vec<IncomingRangeEdge>> {
+        self.direct_edge_envelopes(incoming.callee,callee,incoming.inputs.as_ref()?)
+    }
+
+    /// Induction covers the original self-call edges and derives the child
+    /// bound on every direct site in those iterations. No dynamic callback
+    /// route or separately seeded activation borrows this result.
+    pub(super) fn forward_inductive_edges(&mut self, seed: &IncomingRangeEdge, invariant: &Inputs, callee: PreparedCallable)
+        -> Option<(Vec<OccurrenceOrdinal>,Vec<IncomingRangeEdge>)> {
+        let steps = self.guarded_self_induction(seed.callee,invariant,seed)?;
+        Some((steps,self.direct_edge_envelopes(seed.callee,callee,invariant)?))
+    }
+
+    /// Prove only the first directive, before any possible effect. A later
+    /// unsafe host call is not used as evidence or covered by this proof.
+    pub(super) fn incoming_entry_requirement(&self, edge: &IncomingRangeEdge) -> Option<ByteSpan> {
+        let body = self.calls.function_body(edge.callee.0,edge.callee.1,None)?;
+        let input = edge.inputs.as_ref()?;
+        if !body.checker_returns_unit() || !body.arms.is_empty() || body.contextual_formal().is_some()
+            || !contained(&initial_inputs(body)?,input) { return None; }
+        let ids = body.boundary.checker_parameter_bindings.as_deref()?;
+        if ids.len() != body.boundary.parameters.len() { return None; }
+        let block = body.structure.blocks.get(body.structure.root.0)?;
+        if block.unsafe_context { return None; }
+        let BlockItemKind::Evaluation { expression } = block.items.first()?.kind else { return None; };
+        self.requirement_accepts(Frame { body,target:edge.callee,ids },expression,input)?;
+        Some(body.occurrences.get(expression.0)?.span)
     }
 
     /// A returning or nonreturning activation at one specific incoming
@@ -611,4 +697,32 @@ fn intersect_comparison(
         }
     }
     Some(())
+}
+
+#[test]
+fn signed_fixed_divisor_envelopes_cover_every_returning_value() {
+    use super::super::BinaryOperator::{Divide, Remainder};
+    let range = |low: i32, high: i32| Envelope { low: low.into(), high: high.into() };
+    for divisor in [-12i32, -4, -1, 1, 4, 12] {
+        for lo in -9..=9 {
+            for hi in lo..=9 {
+                let argument = range(lo, hi);
+                let denominator = range(divisor, divisor);
+                let quo = argument.clone().binary(&Divide, denominator.clone(), &ScalarType::I32).unwrap();
+                let rem = argument.binary(&Remainder, denominator, &ScalarType::I32).unwrap();
+                let quotients = [lo / divisor, hi / divisor];
+                assert_eq!(quo, range(*quotients.iter().min().unwrap(), *quotients.iter().max().unwrap()));
+                for x in lo..=hi {
+                    let exact = BigInt::from(x % divisor);
+                    assert!(rem.low <= exact && exact <= rem.high);
+                }
+            }
+        }
+    }
+    for operation in [Divide,Remainder] {
+        assert_eq!(range(i32::MIN,i32::MIN).binary(&operation,range(-1,-1),&ScalarType::I32),
+            Some(range(i32::MIN,i32::MAX)));
+        assert_eq!(range(1,9).binary(&operation,range(0,0),&ScalarType::I32),
+            Some(range(i32::MIN,i32::MAX)));
+    }
 }

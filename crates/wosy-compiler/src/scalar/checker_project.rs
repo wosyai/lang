@@ -20311,6 +20311,80 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_creative_loop_proves_the_original_publish_prefix_on_its_own_route() {
+        use range_envelopes::{Envelope, PreparedEnvelopes};
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap());
+        let text = std::fs::read_to_string(path).unwrap();
+        let identity = source("src/engine.w","pinned-pocket-creative");
+        let range = |low, high| Some(Envelope { low: BigInt::from(low), high: BigInt::from(high) });
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let owner = prepare_checker_project(vec![(declarations(&identity,&text), Vec::new())],
+                vec![identity.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = owner.parts();
+            let function = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let (rebuild, loop_target, rebuild_chunk, publish) = (function("rebuild"),
+                function("rebuild_chunks"),function("rebuild_chunk"),function("publish_chunk"));
+            let mut bounds = PreparedEnvelopes::new(project,calls);
+            let seeds = bounds.literal_call_seeds(rebuild,loop_target).unwrap();
+            let [seed] = seeds.as_slice() else { panic!("one original creative seed"); };
+            assert_eq!(seed.inputs.as_ref().unwrap(), &vec![range(0,0)]);
+            assert!(bounds.forward_inductive_edges(seed, &vec![range(0,15)], rebuild_chunk).is_none());
+            let (steps, edges) = bounds.forward_inductive_edges(seed,&vec![range(0,16)],rebuild_chunk).unwrap();
+            assert_eq!(steps.len(),1);
+            let [edge] = edges.as_slice() else { panic!("one recursive grid to chunk edge"); };
+            assert_eq!(edge.inputs.as_ref().unwrap(),&vec![range(0,3),range(0,3)]);
+            let edges = bounds.forward_incoming_edge(edge,publish).unwrap();
+            let [edge] = edges.as_slice() else { panic!("one forwarded publication"); };
+            assert_eq!(edge.inputs.as_ref().unwrap(),&vec![range(i32::MIN,i32::MAX),range(0,3),range(0,3)]);
+            let obligation = bounds.incoming_entry_requirement(edge).unwrap();
+            assert!(text[obligation.start as usize..obligation.end as usize].starts_with("core.require"));
+            assert_eq!(text.as_bytes()[..obligation.start as usize].iter().filter(|&&b| b == b'\n').count()+1,1145);
+            // This must not clear the unseeded owner or any other incoming route.
+            assert!(bounds.close_guarded_formals(publish).is_none());
+            eprintln!("Pocket creative seed={:?} recursive={:?} publish-boundary={:?}",seed.site,steps,obligation);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn entry_requirement_covers_only_the_pinned_arrival_before_opaque_effects() {
+        use range_envelopes::{Envelope, PreparedEnvelopes};
+        let identity = source("src/main.w","incoming-prefix-authored");
+        let program = r#"%%start
+            host = extern wasm "device" { unsafe unit(i32) output; };
+            unit(i32) publish = fn(x) {
+                core.require(x >= 0 && x < 4, {.stdout="";.stderr="outside";.code=19;.files=[];});
+                unsafe { host.output(x); };
+            };
+            unit() ready = fn { publish(3); };
+            unit() wrong = fn { publish(4); };
+        %%end"#;
+        let early = "unsafe { host.output(x); };";
+        let before = program.replace(early,"").replace("core.require", &format!("{early}
+                core.require"));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (text, permitted) in [(program,true),(before.as_str(),false)] {
+                let owner = prepare_checker_project(vec![(declarations(&identity,text), Vec::new())],
+                    vec![identity.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let (project,calls) = owner.parts();
+                let function = |name| (0,project.modules[0].items.iter().position(|item|
+                    matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+                let (publish, ready, wrong) = (function("publish"),function("ready"),function("wrong"));
+                let mut solver = PreparedEnvelopes::new(project,calls);
+                let good = solver.literal_call_seeds(ready,publish).unwrap();
+                let bad = solver.literal_call_seeds(wrong,publish).unwrap();
+                assert_eq!(good[0].inputs.as_ref().unwrap(),&vec![Some(Envelope { low:3.into(), high:3.into() })]);
+                assert_eq!(solver.incoming_entry_requirement(&good[0]).is_some(),permitted);
+                assert!(solver.incoming_entry_requirement(&bad[0]).is_none());
+                assert!(solver.close_guarded_formals(publish).is_none());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     #[ignore = "requires independently pinned unmodified Orbital Wosy sources"]
     fn pinned_orbital_controls_induction_checks_the_source_activation() {
         let dir = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
