@@ -6990,6 +6990,14 @@ impl FunctionCallSites {
             .map(|call| &self.sites[call.site].target)
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn discarded_float_formal_read(&self, arg: OccurrenceOrdinal) -> bool {
+        let Some(ty @ (ScalarType::F32 | ScalarType::F64)) = self.structure.checked_types.expressions.get(&arg) else { return false; };
+        let Some(PlainNameIdentity::Lexical(id)) = self.prepared_plain_name(arg) else { return false; };
+        self.boundary.checker_parameter_bindings.as_deref().is_some_and(|ids|
+            ids.iter().zip(&self.boundary.parameters).any(|(formal, param)| formal == id && &param.ty == ty))
+    }
+
     pub(super) fn prepared_plain_name(
         &self,
         ordinal: OccurrenceOrdinal,

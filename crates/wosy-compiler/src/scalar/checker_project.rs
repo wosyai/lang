@@ -11702,7 +11702,7 @@ fn forwarded_float_history_frame(body: &FunctionCallSites) -> bool {
     // A bare read of a by-value lexical formal as a discarded statement has no effect.
     for ((parent, edge), node) in &body.structure.edges {
         if let (OccurrenceParent::Block(_), OccurrenceEdge::ExpressionItem { .. }, OccurrenceNode::Expression(arg)) = (parent, edge, node) {
-            if matches!(body.prepared_plain_name(*arg), Some(PlainNameIdentity::Lexical(id)) if formals.contains_key(id)) {
+            if body.discarded_float_formal_read(*arg) {
                 forwarded.insert(*arg);
             }
         }
@@ -21416,7 +21416,7 @@ unit(f32,u8) entry = fn(dt,x) {
     #[test]
     fn forwarded_mixed_history_exhausts_deep_finite_graph_without_duplicate_diagnostics() {
         let src = source("src/main.w", "deep-mixed-unit-history");
-        let mut text = String::from("%%start\nunit(f32,u8) layer0 = fn(dt,x) { dt; x; };\n");
+        let mut text = String::from("%%start\nunit(f32,u8) layer0 = fn(dt,x) { dt; if (x < 128) { }; };\n");
         for level in 1..=32 {
             let prior = level - 1;
             text.push_str(&format!("unit(f32,u8) layer{level} = fn(dt,x) {{ layer{prior}(dt,x); }};\n"));
