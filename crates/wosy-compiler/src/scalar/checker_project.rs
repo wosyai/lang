@@ -1375,10 +1375,12 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        if !Proof::ENABLED && super::checker_flow::supports_mixed_float_guard_root(body) {
+        if let Some(plan) = (!Proof::ENABLED).then(|| mixed_guard_plan(project, calls, (ordinal, item), body,
+            completed_visits.and_then(|visits| visits.get(ordinal)) == Some(&InitializationVisit::Completed))).flatten()
+        {
             let work = std::cell::Cell::new(0);
             let Some(super::checker_flow::CallableHistoryCompletion::Exhausted(observed)) =
-                super::checker_flow::search_mixed_float_guard_root(body, &work) else {
+                super::checker_flow::search_mixed_float_guard_root(body, &plan, &work) else {
                     return Err(ProjectCheck::Unsupported);
                 };
             active |= observed;
@@ -11202,7 +11204,7 @@ fn plan_closed_authored_roots(
             mandatory_startup_scalars.push((item, function.name_span));
             continue;
         }
-        if allow_startup_scalars && (super::checker_flow::supports_mixed_float_guard_root(body)
+        if allow_startup_scalars && (mixed_guard_plan(project, calls, (module, item), body, module < startup_count).is_some()
             || closed_dormant_float_plan(project, calls, (module, item), body, module < startup_count).is_some()) {
             super::checker_flow::charge_call_work(&mut history_work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
         } else if !body.checker_returns_unit() || closed_callable_history_height(project, calls, (module, item), &mut history_heights,
@@ -11479,6 +11481,141 @@ fn closed_module_float_leaf(source: &SourceIdentity, body: &FunctionCallSites, s
     matches!(body.structure.checked_types.expressions.get(&site), Some(ScalarType::F32 | ScalarType::F64))
         && matches!(body.prepared_plain_name(site), Some(PlainNameIdentity::ModuleValue(declaration))
             if &declaration.source == source)
+}
+
+#[cfg(feature = "internal-checker")]
+fn mixed_guard_plan(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    body: &FunctionCallSites, initialized: bool,
+) -> Option<super::checker_flow::MixedGuardPlan> {
+    use super::reference::CheckerOrdinaryBoolean;
+    if !super::checker_flow::has_mixed_float_guard_root_shape(body) { return None; }
+    let mut plan = super::checker_flow::MixedGuardPlan::default();
+    let guards = body.conditionals.values().filter_map(|region| match region {
+        ConditionalRegion::Value { condition, .. } => Some(*condition),
+        _ => None,
+    }).collect::<HashSet<_>>();
+    for site in body.structure.checker_direct_targets.keys().copied() {
+        if !initialized || !guards.contains(&site)
+            || !matches!(body.structure.checker_ordinary_booleans.get(&site),
+                Some(CheckerOrdinaryBoolean::Call(call)) if *call == site)
+        { return None; }
+        check_readonly_bool_guard(project, calls, target, body, site)?;
+        plan.readonly_bool_calls.insert(site);
+    }
+    super::checker_flow::supports_mixed_float_guard_root(body, &plan).then_some(plan)
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_readonly_bool_guard(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    body: &FunctionCallSites, site: OccurrenceOrdinal,
+) -> Option<()> {
+    use super::reference::{NamedPlaceRootIdentity, OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let signature = body.checked_call_signatures.get(&site)?;
+    if !signature.parameters.is_empty()
+        || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Bool)
+        || body.structure.checked_types.expressions.get(&site)? != &ScalarType::Bool
+    { return None; }
+    let (ordinal, item) = *body.structure.checker_direct_targets.get(&site)?;
+    if ordinal != target.0 || item == target.1 { return None; }
+    let module = project.modules.get(ordinal)?;
+    let ScalarItem::Function(function) = module.items.get(item)? else { return None; };
+    let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+        &body.resolved_call_site(site)?.target else { return None; };
+    if *source != module.source || *declaration_span != function.name_span
+        || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+    { return None; }
+    let leaf = calls.function_body(ordinal, item, None)?;
+    let structure = &leaf.structure;
+    if !leaf.boundary.parameters.is_empty() || leaf.contextual_formal().is_some()
+        || !matches!(leaf.boundary.results.as_slice(), [output] if output.ty == ScalarType::Bool)
+        || !leaf.call_occurrences.is_empty() || !structure.checker_direct_targets.is_empty()
+        || !structure.checker_directives.is_empty() || !leaf.assignments.is_empty()
+        || !leaf.callable_escapes.is_empty() || !leaf.allocation_length_calls.is_empty()
+    { return None; }
+    let [ScalarBlockItem::Expression(tail)] = function.body.items.as_slice() else { return None; };
+    let root = structure.blocks.get(structure.root.0)?;
+    let [item] = root.items.as_slice() else { return None; };
+    let BlockItemKind::FinalOutput(output) = item.kind else { return None; };
+    if root.unsafe_context || output.output != 0
+        || structure.checked_types.expressions.get(&output.expression)? != &ScalarType::Bool
+        || structure.edges.get(&(OccurrenceParent::Block(structure.root), OccurrenceEdge::FinalOutput {
+            item: output.item, output: 0,
+        })) != Some(&OccurrenceNode::Expression(output.expression))
+    { return None; }
+
+    let region = calls.initialization_region(ordinal)?;
+    let ModuleInitializationDetail::Occurrences(init) = &region.detail else { return None; };
+    let module_value = |span: &wosy_syntax::SourceSpan, expected: &ScalarType| {
+        (&span.source == source && init.structure.blocks.get(init.structure.root.0)?.items.iter()
+            .any(|row| matches!(&row.kind, BlockItemKind::Binding(binding)
+                if binding.receivers().iter().any(|receiver| receiver.span == span.range
+                    && receiver.contextual_storage.is_none() && super::scalar_type_equal(&receiver.ty, expected)))))
+            .then_some(())
+    };
+    let edges = &structure.edges;
+    let expression_child = |parent, edge| match edges.get(&(OccurrenceParent::Expression(parent), edge))? {
+        OccurrenceNode::Expression(child) => Some(*child),
+        _ => None,
+    };
+    let mut pending = vec![(output.expression, tail)];
+    while let Some((at, expr)) = pending.pop() {
+        let ty = structure.checked_types.expressions.get(&at)?;
+        if leaf.occurrences.get(at.0)?.span != super::typecheck::expression_span(expr)
+            || !(*ty == ScalarType::Bool || is_integer_type(ty))
+        { return None; }
+        match expr {
+            ScalarExpression::Name { .. } => {
+                let PlainNameIdentity::ModuleValue(span) = leaf.prepared_plain_name(at)? else { return None; };
+                module_value(span, ty)?;
+            }
+            ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {}
+            ScalarExpression::Binary { operator, left, right, .. } if *ty == ScalarType::Bool => {
+                let lhs = expression_child(at, OccurrenceEdge::BinaryLeft)?;
+                let rhs = expression_child(at, OccurrenceEdge::BinaryRight)?;
+                let kind = structure.checked_types.expressions.get(&lhs)?;
+                if structure.checked_types.expressions.get(&rhs)? != kind || !match operator {
+                    BinaryOperator::And | BinaryOperator::Or => *kind == ScalarType::Bool,
+                    BinaryOperator::Equal | BinaryOperator::NotEqual => *kind == ScalarType::Bool || is_integer_type(kind),
+                    BinaryOperator::Greater | BinaryOperator::GreaterEqual | BinaryOperator::Less | BinaryOperator::LessEqual => is_integer_type(kind),
+                    _ => false,
+                } { return None; }
+                // Verify every may-evaluated operand in original order. The
+                // predicate value is not used as a confirmed concrete path.
+                pending.push((rhs, right));
+                pending.push((lhs, left));
+            }
+            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } if *ty == ScalarType::Bool => {
+                let operand_at = expression_child(at, OccurrenceEdge::UnaryOperand)?;
+                if structure.checked_types.expressions.get(&operand_at)? != &ScalarType::Bool { return None; }
+                pending.push((operand_at, operand));
+            }
+            ScalarExpression::IndexedRead { place, .. } => {
+                let super::ScalarPlace::Index { base, index, .. } = place else { return None; };
+                if !matches!(base.as_ref(), super::ScalarPlace::Name { .. }) { return None; }
+                let OccurrenceNode::Place(place) = edges.get(&(OccurrenceParent::Expression(at), OccurrenceEdge::ExpressionPlace))?
+                    else { return None; };
+                let parent = OccurrenceParent::Place(*place);
+                let OccurrenceNode::Place(base) = edges.get(&(parent, OccurrenceEdge::PlaceBase))? else { return None; };
+                let OccurrenceNode::Expression(index_at) = edges.get(&(parent, OccurrenceEdge::PlaceIndex))? else { return None; };
+                let base_type = structure.checked_types.places.get(base)?;
+                let ScalarType::Array { element, length, .. } = base_type else { return None; };
+                let constant = concrete_integer_literal(index)?;
+                if !super::scalar_type_equal(element, ty) || structure.checked_types.places.get(place)? != ty
+                    || structure.checked_types.expressions.get(index_at)? != &ScalarType::U64
+                    || leaf.occurrences.get(index_at.0)?.span != super::typecheck::expression_span(index)
+                    || u64::try_from(constant.as_ref()).ok().is_none_or(|index| index >= *length)
+                { return None; }
+                let NamedPlaceRootIdentity::ModuleValue(span) = leaf.prepared_named_place_root(*base)? else { return None; };
+                module_value(span, base_type)?;
+            }
+            _ => {
+                if !is_integer_type(ty) || !integer_literal_fits_type(concrete_integer_literal(expr)?.as_ref(), ty) { return None; }
+            }
+        }
+    }
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11999,8 +12136,10 @@ fn collect_unreached_authored_paths(
         let graph = ClosedAuthoredHistories { project, calls, visits: &initialization.visits, work: &work,
             observed: &nested_active, record: &record };
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::Unsupported)?;
-        let result = if super::checker_flow::supports_mixed_float_guard_root(body) {
-            super::checker_flow::search_mixed_float_guard_root(body, &work)
+        let result = if let Some(plan) = mixed_guard_plan(project, calls, (ordinal, item), body,
+            expected == InitializationVisit::Completed)
+        {
+            super::checker_flow::search_mixed_float_guard_root(body, &plan, &work)
         } else if let Some(plan) = closed_dormant_float_plan(project, calls, (ordinal, item), body,
             expected == InitializationVisit::Completed) {
             search_closed_dormant_float(body, &plan, &work, |failure, steps| record((ordinal, item), failure, &[], steps))
@@ -19102,6 +19241,55 @@ mod tests {
                     program("flag>=0 && flag<=1", &format!("core.require(false,{OUTPUT}); 1")),
                 ] {
                     assert!(matches!(run(&program, capped), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_readonly_bool_guards_retain_typed_module_bounds_and_refuse_unknown_effects() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "mixed-readonly-bool-guards");
+        let program = |index: &str, before_guard: &str, claim: &str, extra: &str| format!(r#"%%start
+            i32 gate_flash=-1;
+            i32 gate_flash_until=2;
+            i32[3] stage_tick=[0,1,2];
+            bool wreck_active=false;
+            {extra}
+            bool() wreck_playing=fn {{ wreck_active }};
+            bool() ring_celebrating=fn {{
+                {before_guard}
+                gate_flash >= 0 && stage_tick[{index}] < gate_flash_until
+            }};
+            unit(i32,f32) frame=fn(step,weight) {{
+                i32 display_weight=if (weight>0.0) {{ 1 }} else {{ 0 }};
+                i32 ring_celebration_code=if (ring_celebrating()) {{ 1 }} else {{ 0 }};
+                i32 replay_view_code=if (wreck_playing()) {{ 1 }} else {{ if (display_weight==1) {{ 2 }} else {{ 0 }} }};
+                if (step>=0) {{ core.require({claim},{OUTPUT}); }};
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, capped: bool| {
+                let prepared = prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&owner, text), Vec::new())], [], vec![owner.clone()],
+                    ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+                ).unwrap_or_else(|error| panic!("readonly guard preparation {target_layout:?} capped={capped}: {error:?}\n{text}"));
+                if capped { prepared.run_private_authored_root(NonZeroUsize::MIN).map(|(report, _)| report) }
+                else { prepared.run() }
+            };
+            let claim = "ring_celebration_code>=0 && ring_celebration_code<=1 && replay_view_code>=0 && replay_view_code<=2";
+            for capped in [true, false] {
+                let good = program("0", "", claim, "");
+                let report = run(&good, capped).unwrap_or_else(|error| panic!("readonly guards {target_layout:?} capped={capped}: {error:?}"));
+                assert!(report.active && report.directives.is_empty());
+                for unsupported in [
+                    program("selected_tick", "", claim, "u64 selected_tick=0;"),
+                    program("0", "gate_flash=1;", claim, ""),
+                    program("0", &format!("core.require(false,{OUTPUT});"), claim, ""),
+                    program("0", "", "ring_celebration_code==0 && replay_view_code>=0", ""),
+                ] {
+                    assert!(matches!(run(&unsupported, capped), Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 }
             }
         }

@@ -158,7 +158,7 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     fn discards_closed_float_output(self) -> bool { false }
     #[cfg(feature = "internal-checker")]
-    fn uses_mixed_float_guards(self) -> bool { false }
+    fn mixed_guard_plan(self) -> Option<&'a MixedGuardPlan> { None }
     #[cfg(feature = "internal-checker")]
     fn closed_unary_effect(self, _: OccurrenceOrdinal, _: ClosedUnaryKind) -> Option<&'a ClosedUnaryEffect> { None }
     #[cfg(feature = "internal-checker")]
@@ -339,7 +339,13 @@ impl CallableHistories<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-pub(super) enum HistoryFrameEffects<'a> { None, Snapshot, LexicalContext, ClosedFloatRoot(&'a ClosedFloatPlan), MixedFloatGuards }
+pub(super) enum HistoryFrameEffects<'a> { None, Snapshot, LexicalContext, ClosedFloatRoot(&'a ClosedFloatPlan), MixedFloatGuards(&'a MixedGuardPlan) }
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+pub(super) struct MixedGuardPlan {
+    pub(super) readonly_bool_calls: std::collections::HashSet<OccurrenceOrdinal>,
+}
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -384,7 +390,10 @@ impl<'a> ScopedAuthoredReturn<'a> for TrackCallableHistory<'a> {
     fn callable_history(self) -> Option<&'a std::cell::RefCell<CallableHistories<'a>>> { Some(self.0) }
     fn allows_snapshot_history(self) -> bool { matches!(self.1, HistoryFrameEffects::Snapshot) }
     fn discards_closed_float_output(self) -> bool { matches!(self.1, HistoryFrameEffects::ClosedFloatRoot(_)) }
-    fn uses_mixed_float_guards(self) -> bool { matches!(self.1, HistoryFrameEffects::MixedFloatGuards) }
+    fn mixed_guard_plan(self) -> Option<&'a MixedGuardPlan> {
+        let HistoryFrameEffects::MixedFloatGuards(plan) = self.1 else { return None; };
+        Some(plan)
+    }
     fn closed_unary_effect(self, site: OccurrenceOrdinal, kind: ClosedUnaryKind) -> Option<&'a ClosedUnaryEffect> {
         let HistoryFrameEffects::ClosedFloatRoot(plan) = self.1 else { return None; };
         let index = plan.calls.binary_search_by_key(&site.0, |effect| effect.site.0).ok()?;
@@ -2148,7 +2157,7 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     closed_float_guards: bool,
     #[cfg(feature = "internal-checker")]
-    mixed_float_guards: bool,
+    mixed_guard_plan: Option<&'a MixedGuardPlan>,
     #[cfg(feature = "internal-checker")]
     allow_snapshot_history: bool,
     #[cfg(feature = "internal-checker")]
@@ -7064,13 +7073,13 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         proof_reflexive_branches,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
-            || authored_return.discards_closed_float_output() || authored_return.uses_mixed_float_guards(),
+            || authored_return.discards_closed_float_output() || authored_return.mixed_guard_plan().is_some(),
         #[cfg(feature = "internal-checker")]
         allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals() || authored_return.discards_closed_float_output(),
         #[cfg(feature = "internal-checker")]
         closed_float_guards: authored_return.discards_closed_float_output(),
         #[cfg(feature = "internal-checker")]
-        mixed_float_guards: authored_return.uses_mixed_float_guards(),
+        mixed_guard_plan: authored_return.mixed_guard_plan(),
         #[cfg(feature = "internal-checker")]
         allow_symbolic_contextual_bool: COLLECT && !USE_IMPORTED_BOUND
             && authored_return.allows_extended_scalar_locals() && calls.structure.checker_has_bool_contextual_declaration,
@@ -7083,7 +7092,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             && calls.structure.has_ordinary_contextual_places(),
         #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: ((Authored::ALLOW_ORDINARY_INTEGER_LOCALS
-            || authored_return.discards_closed_float_output() || authored_return.uses_mixed_float_guards()
+            || authored_return.discards_closed_float_output() || authored_return.mixed_guard_plan().is_some()
             || authored_return.allows_imported_condition_comparisons())
             && calls.structure.has_ordinary_predicates()).then_some(0),
         #[cfg(feature = "internal-checker")]
@@ -7096,7 +7105,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         #[cfg(feature = "internal-checker")]
-        if roots.mixed_float_guards && matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
+        if roots.mixed_guard_plan.is_some() && matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
             continue;
         }
         roots.add(binding, &parameter.ty);
@@ -9595,8 +9604,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 path = bind_enum_match_value(roots, path, transfer, &receiver.ty)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
-                                if !roots.allow_extended_scalar_locals && !roots.mixed_float_guards { return None; }
-                                path = if (authored_return.discards_closed_float_output() || roots.mixed_float_guards) && is_integer_type(&receiver.ty) {
+                                if !roots.allow_extended_scalar_locals && roots.mixed_guard_plan.is_none() { return None; }
+                                path = if (authored_return.discards_closed_float_output() || roots.mixed_guard_plan.is_some()) && is_integer_type(&receiver.ty) {
                                     bind_closed_integer_conditional_local(calls, roots, path, origin.source, &receiver.ty)?
                                 } else {
                                     bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?
@@ -11500,30 +11509,37 @@ fn mixed_float_guard_formal(calls: &FunctionCallSites, condition: OccurrenceOrdi
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn supports_mixed_float_guard_root(calls: &FunctionCallSites) -> bool {
-    // No effect summary exists yet for arbitrary calls, mutable storage,
-    // unsafe access, or callbacks. Leave them to the normal fail-closed lane.
-    calls.checker_returns_unit() && calls.arms.is_empty()
-        && calls.boundary.generics.is_empty() && calls.contextual_formal().is_none()
+pub(super) fn has_mixed_float_guard_root_shape(calls: &FunctionCallSites) -> bool {
+    // Arbitrary effects, mutable storage in the caller, unsafe access, and
+    // callbacks remain in the incumbent lane unless independently analyzed.
+    calls.checker_returns_unit()
+        && calls.boundary.parameters.iter().any(|parameter| matches!(parameter.ty, ScalarType::F32 | ScalarType::F64))
+        && calls.boundary.parameters.iter().any(|parameter| is_integer_type(&parameter.ty))
+        && calls.boundary.parameters.iter().all(|parameter|
+            is_integer_type(&parameter.ty) || matches!(parameter.ty, ScalarType::F32 | ScalarType::F64))
+        && calls.arms.is_empty() && calls.boundary.generics.is_empty() && calls.contextual_formal().is_none()
         && calls.allocation_length_calls.is_empty() && calls.assignments.is_empty()
         && calls.callable_escapes.is_empty() && calls.structure.module_storage_uses.is_empty()
         && calls.structure.blocks.iter().all(|block| !block.unsafe_context)
-        && calls.call_occurrences.iter().all(|site| calls.structure.checker_directives.contains_key(&site.ordinal))
-        && calls.structure.checker_direct_targets.is_empty()
-        && calls.boundary.parameters.iter().all(|parameter|
-            is_integer_type(&parameter.ty) || matches!(parameter.ty, ScalarType::F32 | ScalarType::F64))
-        && calls.boundary.parameters.iter().any(|parameter| is_integer_type(&parameter.ty))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn supports_mixed_float_guard_root(calls: &FunctionCallSites, plan: &MixedGuardPlan) -> bool {
+    has_mixed_float_guard_root_shape(calls)
+        && calls.call_occurrences.iter().all(|site| calls.structure.checker_directives.contains_key(&site.ordinal)
+            || plan.readonly_bool_calls.contains(&site.ordinal))
+        && calls.structure.checker_direct_targets.keys().all(|site| plan.readonly_bool_calls.contains(site))
         && calls.conditionals.values().any(|region| matches!(region, ConditionalRegion::Value { condition, .. }
-            if mixed_float_guard_formal(calls, *condition)))
+            if mixed_float_guard_formal(calls, *condition) || plan.readonly_bool_calls.contains(condition)))
 }
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn search_mixed_float_guard_root(
-    calls: &FunctionCallSites, work: &std::cell::Cell<usize>,
+    calls: &FunctionCallSites, plan: &MixedGuardPlan, work: &std::cell::Cell<usize>,
 ) -> Option<CallableHistoryCompletion> {
-    if !supports_mixed_float_guard_root(calls) { return None; }
+    if !supports_mixed_float_guard_root(calls, plan) { return None; }
     search_callable_history_frame(calls, IntegerRequirementEntry::Arbitrary, work, None, false,
-        HistoryFrameEffects::MixedFloatGuards, None, |_, _| None).map(|(completion, _)| completion)
+        HistoryFrameEffects::MixedFloatGuards(plan), None, |_, _| None).map(|(completion, _)| completion)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11556,11 +11572,23 @@ fn bind_closed_integer_conditional_local(
                 || structure.edges.get(&(parent, OccurrenceEdge::ThenBranch)) != Some(&OccurrenceNode::Block(*then_block))
                 || structure.edges.get(&(parent, OccurrenceEdge::ElseBranch)) != Some(&OccurrenceNode::Block(*else_block))
             { return None; }
-            let [mut no, mut yes] = if roots.mixed_float_guards && mixed_float_guard_formal(calls, *condition) {
-                // The checked comparison of an arbitrary float and its literal
-                // has no calls, writes, or trap. Both edges overapproximate the
-                // returning input; no failing witness may use these assumptions.
+            let readonly_call = roots.mixed_guard_plan.is_some_and(|plan| plan.readonly_bool_calls.contains(condition));
+            let [mut no, mut yes] = if readonly_call || (roots.mixed_guard_plan.is_some() && mixed_float_guard_formal(calls, *condition)) {
+                // These exact typed guards return without writes or authored effects.
+                // Both normal-return outcomes are retained; no failure witness is
+                // published from this overapproximation.
                 charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len())?;
+                if readonly_call {
+                    let span = calls.occurrences.get(condition.0)?.span;
+                    let mut history = tracker.borrow_mut();
+                    let call = history.boundary(span, false);
+                    let returned = history.boundary(span, true);
+                    history.charge(path.0.len().saturating_mul(2))?;
+                    for row in &mut path.0 {
+                        history.append(row, call);
+                        history.append(row, returned);
+                    }
+                }
                 [IntegerInputs(path.0.clone()), path]
             } else if let Some(rows) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
                 rows
