@@ -3,9 +3,10 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 use super::{
     git_sync::{Stage, Staging},
-    snapshot::MANIFEST,
-    valid_package_name, GitDirectory, PackageLock, ProjectSnapshot, LOCKFILE,
+    valid_package_name, GitDirectory, ProjectSnapshot,
 };
+#[cfg(any(target_os = "linux", test))]
+use super::{snapshot::MANIFEST, PackageLock, LOCKFILE};
 #[cfg(target_os = "linux")]
 use std::{
     ffi::OsString,
@@ -70,30 +71,111 @@ fn init_linux(root: &Path) -> Result<(), String> {
     publish_scaffold(stage, &project.directory, |_| {})
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy)]
+enum ScaffoldHost {
+    Posix,
+    #[cfg(test)]
+    Windows,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn scaffold_files(name: &str, host: ScaffoldHost) -> Vec<(&'static str, String)> {
+    let (command, suffix) = match host {
+        ScaffoldHost::Posix => (r#""sh""#, ""),
+        #[cfg(test)]
+        ScaffoldHost::Windows => (
+            r#""powershell.exe", "-NoProfile", "-NonInteractive", "-File""#,
+            ".ps1",
+        ),
+    };
+    let manifest = include_str!("init_templates/project.toml")
+        .replace("@package@", name)
+        .replace("@script_command@", command)
+        .replace("@script_suffix@", suffix);
+    let mut files = vec![
+        (MANIFEST, manifest),
+        (LOCKFILE, PackageLock::default().render()),
+        ("wosy.meta.json", "{}\n".into()),
+        (".gitignore", "/deps/\n/.wosy/\n/references/wosy/\n".into()),
+        ("src/main.w", include_str!("init_templates/main.w").into()),
+        ("scripts/start.ll", include_str!("init_templates/start.ll").into()),
+    ];
+    let scripts: &[(&str, &str)] = match host {
+        ScaffoldHost::Posix => &[
+            ("scripts/build-native", include_str!("init_templates/build-native")),
+            ("scripts/run-native", include_str!("init_templates/run-native")),
+            ("scripts/build-wasm", include_str!("init_templates/build-wasm")),
+            ("scripts/run-wasmtime", include_str!("init_templates/run-wasmtime")),
+        ],
+        #[cfg(test)]
+        ScaffoldHost::Windows => &[
+            ("scripts/build-native.ps1", include_str!("init_templates/build-native.ps1")),
+            ("scripts/run-native.ps1", include_str!("init_templates/run-native.ps1")),
+            ("scripts/build-wasm.ps1", include_str!("init_templates/build-wasm.ps1")),
+            ("scripts/run-wasmtime.ps1", include_str!("init_templates/run-wasmtime.ps1")),
+            ("scripts/run-program.ps1", include_str!("init_templates/run-program.ps1")),
+        ],
+    };
+    files.extend(scripts.iter().copied().map(|(path, text)| (path, text.into())));
+    files
+}
+
 #[cfg(target_os = "linux")]
 fn write_scaffold(stage: &Stage, name: &str) -> Result<(), String> {
     for directory in ["src", "scripts"] {
         fs::create_dir(stage.path.join(directory))
             .map_err(|error| format!("cannot stage {directory}: {error}"))?;
     }
-    let manifest = include_str!("init_templates/project.toml").replace("@package@", name);
-    let lock = PackageLock::default().render();
-    for (path, text) in [
-        (MANIFEST, manifest.as_str()),
-        (LOCKFILE, lock.as_str()),
-        ("wosy.meta.json", "{}\n"),
-        (".gitignore", "/deps/\n/.wosy/\n/references/wosy/\n"),
-        ("src/main.w", include_str!("init_templates/main.w")),
-        ("scripts/build-native", include_str!("init_templates/build-native")),
-        ("scripts/run-native", include_str!("init_templates/run-native")),
-        ("scripts/build-wasm", include_str!("init_templates/build-wasm")),
-        ("scripts/run-wasmtime", include_str!("init_templates/run-wasmtime")),
-        ("scripts/start.ll", include_str!("init_templates/start.ll")),
-    ] {
+    for (path, text) in scaffold_files(name, ScaffoldHost::Posix) {
         fs::write(stage.path.join(path), text)
             .map_err(|error| format!("cannot stage {path}: {error}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod scaffold_tests {
+    use super::*;
+
+    #[test]
+    fn stock_scripts_match_their_host_manifest() {
+        for (host, prefix, suffix) in [
+            (ScaffoldHost::Posix, &["sh"][..], ""),
+            (ScaffoldHost::Windows, &["powershell.exe", "-NoProfile", "-NonInteractive", "-File"][..], ".ps1"),
+        ] {
+            let files = scaffold_files("test_app", host);
+            let content = |path: &str| {
+                files.iter().find(|(name, _)| *name == path).unwrap().1.as_str()
+            };
+            let manifest = content(MANIFEST).parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(manifest["package"]["name"].as_str(), Some("test_app"));
+            assert_eq!(content(LOCKFILE), PackageLock::default().render());
+            assert_eq!(content("wosy.meta.json"), "{}\n");
+            assert_eq!(manifest["targets"]["app"]["artifacts"]["main"]["profiles"]["dev"]["output"].as_str(), Some("native"));
+            assert_eq!(manifest["targets"]["app"]["artifacts"]["main"]["profiles"]["wasm"]["output"].as_str(), Some("wasm-wasip1"));
+            for (section, profile, name) in [
+                ("builders", "native", "build-native"),
+                ("builders", "llvm_wasm", "build-wasm"),
+                ("runners", "native", "run-native"),
+                ("runners", "wasmtime", "run-wasmtime"),
+            ] {
+                let path = format!("scripts/{name}{suffix}");
+                let command = manifest[section][profile]["command"].as_array().unwrap();
+                let actual = command.iter().map(|value| value.as_str().unwrap()).collect::<Vec<_>>();
+                let expected = prefix.iter().copied().chain([path.as_str()]).collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                assert!(!content(&path).is_empty());
+            }
+        }
+        for (path, text) in scaffold_files("test_app", ScaffoldHost::Windows) {
+            if path.starts_with("scripts/build-") {
+                assert!(text.contains("$Artifact.executable"));
+            } else if path == "scripts/run-native.ps1" || path == "scripts/run-wasmtime.ps1" {
+                assert!(text.contains("$env:WOSY_ARTIFACT_EXECUTABLE"));
+            }
+        }
+    }
 }
 
 // A rename does not change file identity, mode or contents. Remember the
