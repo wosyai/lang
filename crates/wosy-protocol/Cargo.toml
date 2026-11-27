@@ -20,4 +20,4 @@ wosy-project.workspace = true
 wosy-syntax.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
