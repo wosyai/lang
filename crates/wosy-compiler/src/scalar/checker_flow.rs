@@ -9227,6 +9227,23 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
                 if roots.callable_history.is_some() {
+                    if let Some(write) = observed_float_struct_write(calls, group) {
+                        for row in &mut path.0 {
+                            if !row.storage.as_ref()?.has_observed_aggregate(write.declaration) { return None; }
+                            roots.callable_history?.borrow().charge(write.fields.len())?;
+                            // Evaluate every source field in order before publishing any
+                            // destination cell, so a later RHS may read the old object.
+                            let values = write.fields.iter().map(|(field, at)| {
+                                Some((field.index, evaluate_current_float(calls, *at, roots, row)?))
+                            }).collect::<Option<Vec<_>>>()?;
+                            let storage = Rc::make_mut(row.storage.as_mut()?);
+                            for (field, value) in values {
+                                storage.overwrite_observed_field(FloatFieldCell { declaration: write.declaration.clone(),
+                                    index: None, structure: write.structure.clone(), field }, value)?;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some((target, value)) = observed_float_write(calls, group) {
                         let read = roots.observed_float_field_read?;
                         for row in &mut path.0 {
@@ -12255,6 +12272,16 @@ pub(super) fn projected_integer_storage_frame_after_prefix(calls: &FunctionCallS
             if BlockOrdinal(ordinal) == calls.structure.root && position < prefix { continue; }
             match &item.kind {
                 BlockItemKind::Assignment { group } => {
+                    if let Some(write) = observed_float_struct_write(calls, *group) {
+                        covered.insert((write.declaration.clone(), write.place, ModuleStorageRole::Replace));
+                        for (_, at) in write.fields {
+                            observed_float_expr_sites(calls, at, |field| {
+                                covered.insert((field.declaration.clone(), field.site, ModuleStorageRole::Project));
+                            }, |at| { scalar_calls.insert(at); })?;
+                        }
+                        writes = true;
+                        continue;
+                    }
                     if let Some((target, value)) = observed_float_write(calls, *group) {
                         covered.insert((target.declaration.clone(), target.site, ModuleStorageRole::Replace));
                         match value {
@@ -12473,6 +12500,38 @@ fn observed_float_place(calls: &FunctionCallSites, field_site: OccurrenceOrdinal
         ObservedFloatIndex::Lexical(binding)
     };
     Some(ObservedFloatPlace { declaration, site: array, field, index: Some((*length, selector)) })
+}
+
+#[cfg(feature = "internal-checker")]
+struct ObservedFloatStructWrite<'a> {
+    declaration: &'a wosy_syntax::SourceSpan,
+    place: OccurrenceOrdinal,
+    structure: &'a super::ScalarStructId,
+    fields: Vec<(&'a super::ScalarStructFieldId, OccurrenceOrdinal)>,
+}
+
+#[cfg(feature = "internal-checker")]
+fn observed_float_struct_write(calls: &FunctionCallSites, position: BlockPosition) -> Option<ObservedFloatStructWrite<'_>> {
+    let group = calls.assignments.get(&(position.block, position.item))?;
+    let [rhs] = group.rhs_evaluations().as_slice() else { return None; };
+    let [destination] = group.destinations().as_slice() else { return None; };
+    if group.projected_outputs().len() != 0 { return None; }
+    let AssignmentReplacement::Resolved(ScalarType::Struct(structure)) = &destination.replacement else { return None; };
+    let DirectDestinationIdentity::Module(declaration) = calls.prepared_direct_destination(destination.destination)? else { return None; };
+    if calls.structure.checked_types.expressions.get(&rhs.expression)? != &ScalarType::Struct(structure.clone()) { return None; }
+    let count = *calls.structure.projected_struct_literals.get(&rhs.expression)?;
+    let mut seen = HashSet::new();
+    let mut fields = Vec::with_capacity(count);
+    for position in 0..count {
+        let OccurrenceNode::Expression(at) = calls.structure.edges.get(&(
+            OccurrenceParent::Expression(rhs.expression), OccurrenceEdge::AggregateField(position),
+        ))? else { return None; };
+        let field = calls.structure.literal_fields.get(at)?;
+        if &field.structure != structure || !seen.insert(field.index) || calls.structure.checked_types.expressions.get(at)? != &ScalarType::F32 { return None; }
+        fields.push((field, *at));
+    }
+    if fields.is_empty() || !(0..fields.len()).all(|index| seen.contains(&index)) { return None; }
+    Some(ObservedFloatStructWrite { declaration, place: destination.destination, structure, fields })
 }
 
 #[cfg(feature = "internal-checker")]

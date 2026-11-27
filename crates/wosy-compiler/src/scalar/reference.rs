@@ -6493,6 +6493,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) projected_f32_math: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
     #[cfg(feature = "internal-checker")]
     pub(super) projected_f32_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) projected_struct_literals: HashMap<OccurrenceOrdinal, usize>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -6699,6 +6701,8 @@ impl OccurrenceStructure {
             projected_f32_math: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_f32_locals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            projected_struct_literals: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -9525,6 +9529,8 @@ impl StructuralWalker<'_, '_> {
                 }
             }
             ScalarExpression::StructLiteral { fields, .. } => {
+                #[cfg(feature = "internal-checker")]
+                let mut all_fields_are_f32 = !fields.is_empty();
                 for (position, field) in fields.iter().enumerate() {
                     let ordinal = self.expression_at(
                         &field.value,
@@ -9536,6 +9542,12 @@ impl StructuralWalker<'_, '_> {
                     if let Some(id) = self.occurrence_typing.take_literal_field(&field.value) {
                         self.structure.literal_fields.insert(ordinal, id);
                     }
+                    #[cfg(feature = "internal-checker")]
+                    { all_fields_are_f32 &= self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::F32); }
+                }
+                #[cfg(feature = "internal-checker")]
+                if matches!(self.mode, WalkMode::Callable(_)) && all_fields_are_f32 {
+                    self.structure.projected_struct_literals.insert(ordinal, fields.len());
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {

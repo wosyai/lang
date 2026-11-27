@@ -2035,7 +2035,16 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
-                        if matches!(ty, ScalarType::Struct(_)) || matches!(ty, ScalarType::Array { element, .. } if matches!(element.as_ref(), ScalarType::Struct(_))) {
+                        let nominal = match ty {
+                            ScalarType::Struct(id) => Some(id),
+                            ScalarType::Array { element, .. } => match element.as_ref() {
+                                ScalarType::Struct(id) => Some(id),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if nominal.is_some_and(|id| &id.source == source && module.structs.get(id.index)
+                            .is_some_and(|structure| &structure.id == id && structure.copy_policy == super::CopyPolicy::Copy)) {
                             projected_storage.observe_aggregate(declaration.clone());
                         }
                         if let Some(cells) = flat_passive_integer_array(value, ty) {
@@ -20014,6 +20023,57 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let site = wosy_syntax::SourceSpan::new(app.clone(), ByteSpan::new(offset, offset+nested.len() as u32));
                 assert_eq!(trace.contains_return(&site), age == "0");
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn whole_observed_parcel_camera_write_keeps_old_rhs_and_preserves_field_order() {
+        let app = source("src/main.w", "observed-flight-camera-literal-write");
+        let program = r#"%%start
+            struct copy ParcelCamera { f32 heading; f32 pitch; f32 roll; }
+            ParcelCamera published_parcel_camera = {.heading=0.25;.pitch=0.0;.roll=0.0;};
+            i16 status = 5;
+            f32(f32) carry = fn(value) { value };
+            unit() publish = fn {
+                published_parcel_camera = {
+                    .roll=carry(0.5);
+                    .heading=carry(0.75);
+                    .pitch=carry(published_parcel_camera.heading);
+                };
+            };
+            unit() frame = fn {
+                f32 heading = published_parcel_camera.heading;
+                f32 pitch = published_parcel_camera.pitch;
+                f32 roll = published_parcel_camera.roll;
+                bool valid = heading == 0.75 && pitch == 0.25 && roll == 0.5;
+                if (valid) { status = 37; } else { status = 19; };
+            };
+            publish(); frame();
+            core.narrow(false, {.stdout="";.stderr="";.code=status;.files=[];});
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |text: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let _ = super::super::checker_flow::take_observed_storage_delta_visits();
+            let report = prepare(program).run().unwrap();
+            assert_eq!(super::super::checker_flow::take_observed_storage_delta_visits(), 4*17);
+            let (capped, _, trace, _) = prepare(program).search_startup_authored_path(std::num::NonZeroUsize::MIN).unwrap();
+            assert_eq!(capped, report.directives);
+            assert_eq!(capped[0].code(), &BigInt::from(37));
+            let call_text = ["carry(0.5)", "carry(0.75)", "carry(published_parcel_camera.heading)"];
+            let paths = trace.call_paths();
+            assert!(paths.iter().any(|path| {
+                let order = call_text.map(|call| {
+                    let start = program.find(call).unwrap() as u32;
+                    path.iter().position(|site| site.source == app && site.range == ByteSpan::new(start,start+call.len() as u32))
+                });
+                matches!(order, [Some(roll),Some(heading),Some(pitch)] if roll < heading && heading < pitch)
+            }));
+            let invalid = program.replace(".pitch=carry(published_parcel_camera.heading);", ".pitch=1.0/carry(0.0);");
+            assert!(prepare(&invalid).run().is_err());
         }
     }
 
