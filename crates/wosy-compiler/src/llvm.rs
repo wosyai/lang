@@ -1537,6 +1537,27 @@ impl LlvmPartition {
         String::from_utf8(bytes).expect("LLVM partition text is UTF-8")
     }
 
+    /// Bound retained text while using the same canonical serializer. This
+    /// does not limit temporary allocations in LLVM or its formatter.
+    pub fn to_bounded_text_bytes(&self, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io;
+        struct PartitionBytes { bytes: Vec<u8>, limit: usize }
+        impl io::Write for PartitionBytes {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() > self.limit - self.bytes.len() {
+                    return Err(io::Error::other("LLVM partition exceeds the output byte budget"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+
+        let mut output = PartitionBytes { bytes: Vec::new(), limit };
+        self.write_text(&mut output)?;
+        Ok(output.bytes)
+    }
+
     pub fn write_text(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if !self.declarations.is_empty() {
             let mut declarations = self

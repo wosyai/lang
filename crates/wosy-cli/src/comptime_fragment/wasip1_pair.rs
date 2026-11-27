@@ -1,8 +1,12 @@
 //! Private local manifest for the selected WASIp1 tool pair.
 //! Staging never authenticates tools, invokes them, or accepts a result.
-use super::{ClosedComptimeInvocation, ProvisionedWasip1Comptime};
+use super::{provision::EvaluatorFiles, selected_builder_invocation, selected_runner_invocation,
+    ClosedComptimeInvocation, ProvisionedWasip1Comptime, StagedEvaluatorIr};
+use crate::source_state::PendingPairComptimeInputObservation;
 use serde::Serialize;
-use std::{collections::BTreeMap, io, path::Path};
+use std::{collections::BTreeMap, io::{self, Write}, path::Path};
+use wosy_compiler::{BoundedPairStartupWasip1Output, BoundedStartupWasip1Evaluator, ScalarType};
+use wosy_project::SelectedComptimeTools;
 
 #[derive(Serialize)]
 struct ResolvedPrivateManifest<'a> {
@@ -25,13 +29,8 @@ impl ProvisionedWasip1Comptime {
     /// This first private handoff has no representation for authored
     /// parameter declarations. Other project paths remain unchanged.
     pub fn stage_tool_pair(self) -> io::Result<StagedWasip1ToolPair> {
-        if self.preparation().has_declared_parameters() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "the private WASIp1 pair needs empty resolved parameters"));
-        }
-        let manifest = ResolvedPrivateManifest {
-            executable: self.expected_module_path(), parameters: BTreeMap::new(), permissions: [], mounts: [],
-        };
-        serde_json::to_writer(self.create_private_manifest()?, &manifest).map_err(io::Error::other)?;
+        require_no_parameters(self.preparation().has_declared_parameters())?;
+        write_private_manifest(self.create_private_manifest()?, self.expected_module_path())?;
         Ok(StagedWasip1ToolPair { provision: self })
     }
 }
@@ -40,4 +39,81 @@ impl StagedWasip1ToolPair {
     pub fn provision(&self) -> &ProvisionedWasip1Comptime { &self.provision }
     pub fn builder(&self) -> ClosedComptimeInvocation<'_> { self.provision.builder_invocation() }
     pub fn runner(&self) -> ClosedComptimeInvocation<'_> { self.provision.runner_invocation() }
+}
+
+
+fn require_no_parameters(has_parameters: bool) -> io::Result<()> {
+    if has_parameters {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "the private WASIp1 pair needs empty resolved parameters"));
+    }
+    Ok(())
+}
+
+fn write_private_manifest(file: std::fs::File, module: &Path) -> io::Result<()> {
+    let manifest = ResolvedPrivateManifest { executable: module, parameters: BTreeMap::new(), permissions: [], mounts: [] };
+    serde_json::to_writer(file, &manifest).map_err(io::Error::other)
+}
+
+/// Disposable slots for the exact evaluator indices in the authenticated
+/// local pending plan. This is not portable authority or a promise that the
+/// selection, lease, files on disk, or tool executables remain current.
+pub struct StagedPendingPairWasip1<'plan> {
+    observation: PendingPairComptimeInputObservation,
+    plan: &'plan BoundedPairStartupWasip1Output,
+    files: Vec<EvaluatorFiles>,
+}
+
+pub struct StagedPendingPairWasip1Evaluator<'a> {
+    project: &'a Path,
+    tools: &'a SelectedComptimeTools,
+    files: &'a EvaluatorFiles,
+    evaluator: &'a BoundedStartupWasip1Evaluator,
+}
+
+impl<'plan> StagedPendingPairWasip1<'plan> {
+    pub(crate) fn create(
+        observation: PendingPairComptimeInputObservation, plan: &'plan BoundedPairStartupWasip1Output,
+        private_parent: &Path, max_ir_bytes: usize,
+    ) -> io::Result<Self> {
+        require_no_parameters(!observation.declarations().parameters().is_empty())?;
+        if plan.ir_bytes() > max_ir_bytes.min(1 << 20) {
+            return Err(io::Error::other("closed comptime evaluator IR exceeds byte budget"));
+        }
+        let mut files = Vec::with_capacity(plan.evaluators().len());
+        for evaluator in plan.evaluators() {
+            let ir = evaluator.bytes();
+            let own = EvaluatorFiles::create(private_parent, |file| {
+                file.write_all(ir)?;
+                Ok(StagedEvaluatorIr { bytes: ir.len(), blake3: blake3::hash(ir) })
+            })?;
+            write_private_manifest(own.create_manifest()?, own.module_path())?;
+            files.push(own);
+        }
+        Ok(Self { observation, plan, files })
+    }
+
+    pub fn observation(&self) -> &PendingPairComptimeInputObservation { &self.observation }
+    pub fn plan(&self) -> &BoundedPairStartupWasip1Output { self.plan }
+    pub fn evaluators(&self) -> impl ExactSizeIterator<Item = StagedPendingPairWasip1Evaluator<'_>> {
+        let project = Path::new(&self.observation.binding().selected.project);
+        let tools = self.observation.declarations().tools();
+        self.files.iter().zip(self.plan.evaluators()).map(move |(files, evaluator)| {
+            StagedPendingPairWasip1Evaluator { project, tools, files, evaluator }
+        })
+    }
+}
+
+impl StagedPendingPairWasip1Evaluator<'_> {
+    pub fn evaluator_ir(&self) -> &StagedEvaluatorIr { self.files.ir() }
+    pub fn result_type(&self) -> &ScalarType { self.evaluator.result_type() }
+    pub fn manifest_path(&self) -> &Path { self.files.manifest_path() }
+    pub fn expected_module_path(&self) -> &Path { self.files.module_path() }
+
+    pub fn builder(&self) -> ClosedComptimeInvocation<'_> {
+        selected_builder_invocation(self.project, self.tools, self.files.builder_paths())
+    }
+
+    pub fn runner(&self) -> ClosedComptimeInvocation<'_> {
+        selected_runner_invocation(self.project, self.tools, self.manifest_path())
+    }
 }

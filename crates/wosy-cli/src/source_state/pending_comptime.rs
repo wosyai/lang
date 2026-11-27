@@ -5,6 +5,8 @@ use crate::source_preparation::{source_configuration_inputs, PreparedComptimeWat
 use rusqlite::TransactionBehavior;
 use std::{collections::BTreeMap, path::Path};
 use wosy_compiler::PairStartupCallGraphEvidence;
+#[cfg(target_os = "linux")]
+use {crate::comptime_fragment::StagedPendingPairWasip1, wosy_compiler::BoundedPairStartupWasip1Output};
 use wosy_project::{packages::{observe_local_comptime_inputs, ComptimeWatchLimits, LocalComptimeInputScope},
     ObservedClosedComptimeProfile};
 use wosy_protocol::{BaseCstProposalBinding, FileEntry, NodeId, SourceConfig};
@@ -16,6 +18,17 @@ pub struct TrustedPreparedPairComptime<'plan> {
     pub authored_cst: NodeId,
     pub profile: &'plan str,
     pub graph: &'plan PairStartupCallGraphEvidence,
+}
+
+/// The same existing live local adapter, with the entire opaque compiler
+/// graph + emitted P1 result binding from that owner, not independent bytes
+/// or result types selected by the callback.
+#[cfg(target_os = "linux")]
+pub struct TrustedPreparedPairWasip1<'plan> {
+    pub binding: &'plan BaseCstProposalBinding,
+    pub authored_cst: NodeId,
+    pub profile: &'plan str,
+    pub output: &'plan BoundedPairStartupWasip1Output,
 }
 
 /// Exact configuration and currently observed owning watch identities,
@@ -46,11 +59,39 @@ impl SqliteSourceState {
         &mut self, binding: &BaseCstProposalBinding, profile: &str, watch_limits: ComptimeWatchLimits,
         trusted_plan: impl FnOnce() -> Option<TrustedPreparedPairComptime<'plan>>,
     ) -> Result<Option<PendingPairComptimeInputObservation>> {
+        self.use_pending_pair_comptime_inputs(binding, profile, watch_limits,
+            || trusted_plan().map(|plan| (plan, ())), |observation, ()| Ok(observation))
+    }
+
+    /// Materialize the 3/1 tool descriptions and their private slots only.
+    /// The borrowed owner already compiled these exact P1 evaluators. No
+    /// command runs, no new source is parsed, and no result is accepted.
+    #[cfg(target_os = "linux")]
+    pub fn stage_pending_pair_wasip1<'plan>(
+        &mut self, binding: &BaseCstProposalBinding, profile: &str, watch_limits: ComptimeWatchLimits,
+        private_parent: &Path, max_ir_bytes: usize,
+        trusted_plan: impl FnOnce() -> Option<TrustedPreparedPairWasip1<'plan>>,
+    ) -> Result<Option<StagedPendingPairWasip1<'plan>>> {
+        self.use_pending_pair_comptime_inputs(binding, profile, watch_limits, || trusted_plan().map(|plan| {
+            (TrustedPreparedPairComptime {
+                binding: plan.binding, authored_cst: plan.authored_cst, profile: plan.profile, graph: plan.output.evidence(),
+            }, plan.output)
+        }), |observation, output| Ok(StagedPendingPairWasip1::create(observation, output, private_parent, max_ir_bytes)?))
+    }
+
+    /// Check the attempt before borrowing trusted facts, and again after
+    /// the watch/optional scratch operation. An obsolete completion drops
+    /// the staged private files; the SQLite transaction does not span I/O.
+    fn use_pending_pair_comptime_inputs<'plan, T, R>(
+        &mut self, binding: &BaseCstProposalBinding, profile: &str, watch_limits: ComptimeWatchLimits,
+        trusted_plan: impl FnOnce() -> Option<(TrustedPreparedPairComptime<'plan>, T)>,
+        finish: impl FnOnce(PendingPairComptimeInputObservation, T) -> Result<R>,
+    ) -> Result<Option<R>> {
         let Some((configuration, file)) = self.pending_pair_comptime_entry(binding)? else { return Ok(None); };
         if !configuration.profiles.contains_key(profile) {
             return Err("profile is not selected by the pending source".into());
         }
-        let Some(plan) = trusted_plan() else { return Ok(None); };
+        let Some((plan, payload)) = trusted_plan() else { return Ok(None); };
         let site = plan.graph.site();
         let source = &file.metadata.source;
         if plan.binding != binding || plan.profile != profile || plan.authored_cst != file.authored
@@ -68,16 +109,18 @@ impl SqliteSourceState {
             }
             Ok(())
         });
+        let completed: Result<R> = observed.map_err(Into::into).and_then(|(declarations, files)| {
+            let watches = PreparedComptimeWatches {
+                target: binding.selected.target.clone(), profile: profile.to_owned(), id: plan.graph.site_id().to_owned(),
+                site: site.clone(), files,
+            };
+            finish(PendingPairComptimeInputObservation {
+                binding: binding.clone(), authored_cst: file.authored,
+                configuration_inputs: configuration.inputs, declarations, watches,
+            }, payload)
+        });
         if !self.pending_base_is_current(binding)? { return Ok(None); }
-        let (declarations, files) = observed?;
-        let watches = PreparedComptimeWatches {
-            target: binding.selected.target.clone(), profile: profile.to_owned(), id: plan.graph.site_id().to_owned(),
-            site: site.clone(), files,
-        };
-        Ok(Some(PendingPairComptimeInputObservation {
-            binding: binding.clone(), authored_cst: file.authored,
-            configuration_inputs: configuration.inputs, declarations, watches,
-        }))
+        completed.map(Some)
     }
 
     fn pending_pair_comptime_entry(&mut self, binding: &BaseCstProposalBinding) -> Result<Option<(SourceConfig, FileEntry)>> {

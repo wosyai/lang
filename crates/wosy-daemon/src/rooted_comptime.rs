@@ -13,7 +13,7 @@ use wosy_compiler::{
     ClosedComptimeRejection, ComptimeParameter, ComptimeParameterRejection, DirectStartupComptimePlan,
     derive_pair_startup_call_graph_comptime_plan, derive_pair_startup_call_graph_wasip1_stdout,
     DirectStartupComptimeUse, InspectedDirectComptimeCall,
-    PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
+    BoundedPairStartupWasip1Output, PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
     CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
@@ -132,12 +132,23 @@ impl<const ARITY: usize> RootedDirectStartupComptimePlan<ARITY> {
 
 #[derive(Debug)]
 pub struct RootedStartupComptimeEvaluator {
-    bytes: Vec<u8>,
+    bytes: StartupEvaluatorBytes,
     digest: NodeId,
 }
 
+#[derive(Debug)]
+enum StartupEvaluatorBytes {
+    Detached(Vec<u8>),
+    Wasip1(std::sync::Arc<Vec<u8>>),
+}
+
 impl RootedStartupComptimeEvaluator {
-    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn bytes(&self) -> &[u8] {
+        match &self.bytes {
+            StartupEvaluatorBytes::Detached(bytes) => bytes,
+            StartupEvaluatorBytes::Wasip1(bytes) => bytes.as_slice(),
+        }
+    }
     pub fn digest(&self) -> NodeId { self.digest }
 }
 
@@ -171,9 +182,14 @@ pub enum RootedForwardedPairStartupComptimeProjection {
 #[derive(Debug)]
 pub struct RootedPairCallGraphComptimePlan {
     source: RootedComptimeIdentity,
-    max_wasip1_stdout: Option<usize>,
-    evidence: PairStartupCallGraphEvidence,
+    typed: PairCallGraphDelivery,
     evaluators: Vec<RootedStartupComptimeEvaluator>,
+}
+
+#[derive(Debug)]
+enum PairCallGraphDelivery {
+    Detached(PairStartupCallGraphEvidence),
+    Wasip1(BoundedPairStartupWasip1Output),
 }
 
 impl RootedPairCallGraphComptimePlan {
@@ -182,10 +198,21 @@ impl RootedPairCallGraphComptimePlan {
     pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
     pub fn target(&self) -> &str { &self.source.target }
     pub fn profile(&self) -> &str { &self.source.profile }
-    pub fn id(&self) -> &str { self.evidence.site_id() }
-    pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    pub fn id(&self) -> &str { self.evidence().site_id() }
+    pub fn evidence(&self) -> &PairStartupCallGraphEvidence {
+        match &self.typed {
+            PairCallGraphDelivery::Detached(evidence) => evidence,
+            PairCallGraphDelivery::Wasip1(plan) => plan.evidence(),
+        }
+    }
     /// Present only for the explicitly requested preview1 stdout delivery.
-    pub fn max_wasip1_stdout(&self) -> Option<usize> { self.max_wasip1_stdout }
+    pub fn max_wasip1_stdout(&self) -> Option<usize> { self.wasip1_output().map(|plan| plan.max_stdout()) }
+    pub fn wasip1_output(&self) -> Option<&BoundedPairStartupWasip1Output> {
+        match &self.typed {
+            PairCallGraphDelivery::Wasip1(plan) => Some(plan),
+            PairCallGraphDelivery::Detached(_) => None,
+        }
+    }
     pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
 }
 
@@ -258,7 +285,7 @@ fn bounded_evaluators(
     for fragment in fragments {
         let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), remaining)?;
         remaining -= bytes.len();
-        evaluators.push(RootedStartupComptimeEvaluator { bytes, digest });
+        evaluators.push(RootedStartupComptimeEvaluator { bytes: StartupEvaluatorBytes::Detached(bytes), digest });
     }
     Ok(evaluators)
 }
@@ -301,9 +328,19 @@ impl SourceStore {
             Ok(plan) => plan,
             Err(reason) => return Ok(RootedPairCallGraphComptimeProjection::Refused(compiler_refusal(reason))),
         };
-        let (evidence, fragments) = plan.into_parts();
+        let (typed, evaluators) = if max_wasip1_stdout.is_some() {
+            let plan = plan.into_bounded_wasip1_output(request.output_bytes.min(MAX_EVALUATOR_IR_BYTES))?;
+            let evaluators = plan.evaluators().iter().map(|evaluator| RootedStartupComptimeEvaluator {
+                bytes: StartupEvaluatorBytes::Wasip1(evaluator.shared_ir()),
+                digest: NodeId(*blake3::hash(evaluator.bytes()).as_bytes()),
+            }).collect();
+            (PairCallGraphDelivery::Wasip1(plan), evaluators)
+        } else {
+            let (evidence, fragments) = plan.into_parts();
+            (PairCallGraphDelivery::Detached(evidence), bounded_evaluators(fragments, request.output_bytes)?)
+        };
         Ok(RootedPairCallGraphComptimeProjection::Emitted(RootedPairCallGraphComptimePlan {
-            source, max_wasip1_stdout, evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
+            source, typed, evaluators,
         }))
     }
 

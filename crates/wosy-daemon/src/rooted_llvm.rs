@@ -9,7 +9,7 @@ use super::{
     storage_worker::{QueryPhases, QueryWorker},
     validate_file_using, BaseCstAdmissionLimits, FileTree, Result, SourceStore,
 };
-use std::{collections::{BTreeMap, HashMap}, io::{self, Write}, sync::Arc, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, HashMap}, io, sync::Arc, time::{Duration, Instant}};
 use surrealkv::Mode;
 use tokio::{sync::{Mutex, OwnedMutexGuard}, time::{sleep_until, Instant as TokioInstant}};
 use wosy_compiler::{
@@ -531,28 +531,9 @@ fn project_authored(
 pub(super) fn bounded_partition_bytes(
     partition: &wosy_compiler::LlvmPartition, limit: usize,
 ) -> io::Result<(Vec<u8>, NodeId)> {
-    let mut output = PartitionBytes { bytes: Vec::new(), limit };
-    partition.write_text(&mut output)?;
-    let digest = NodeId(*blake3::hash(&output.bytes).as_bytes());
-    Ok((output.bytes, digest))
-}
-
-// Limit retained egress, not temporary LLVM allocations during emission.
-struct PartitionBytes {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-
-impl Write for PartitionBytes {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.limit - self.bytes.len() {
-            return Err(partition_budget_error());
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    let bytes = partition.to_bounded_text_bytes(limit)?;
+    let digest = NodeId(*blake3::hash(&bytes).as_bytes());
+    Ok((bytes, digest))
 }
 
 fn partition_budget_error() -> io::Error {

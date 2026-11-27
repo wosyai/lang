@@ -402,6 +402,40 @@ impl PairStartupCallGraphEvidence {
 pub struct PairStartupCallGraphComptimePlan {
     evidence: PairStartupCallGraphEvidence,
     evaluators: Vec<ClosedComptimeFragment>,
+    max_wasip1_stdout: Option<usize>,
+}
+
+/// Same bound graph, exact compiler-produced P1 IR and resolved result type
+/// at each evaluator index. Construction consumes the compiler's own plan:
+/// neither loose adapter inputs nor previously detached IR can become P1.
+#[derive(Debug)]
+pub struct BoundedPairStartupWasip1Output {
+    evidence: PairStartupCallGraphEvidence,
+    evaluators: Vec<BoundedStartupWasip1Evaluator>,
+    ir_bytes: usize,
+    max_stdout: usize,
+}
+
+#[derive(Debug)]
+pub struct BoundedStartupWasip1Evaluator {
+    ir: std::sync::Arc<Vec<u8>>,
+    result_type: ScalarType,
+}
+
+impl BoundedPairStartupWasip1Output {
+    pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
+    pub fn evaluators(&self) -> &[BoundedStartupWasip1Evaluator] { &self.evaluators }
+    pub fn ir_bytes(&self) -> usize { self.ir_bytes }
+    pub fn max_stdout(&self) -> usize { self.max_stdout }
+}
+
+impl BoundedStartupWasip1Evaluator {
+    pub fn bytes(&self) -> &[u8] { self.ir.as_slice() }
+    pub fn result_type(&self) -> &ScalarType { &self.result_type }
+
+    /// An additional read-only view of the already emitted text. The owning
+    /// typed plan retains its allocation; modifying a new view cannot alter it.
+    pub fn shared_ir(&self) -> std::sync::Arc<Vec<u8>> { self.ir.clone() }
 }
 
 impl PairStartupCallGraphComptimePlan {
@@ -418,6 +452,23 @@ impl PairStartupCallGraphComptimePlan {
 
     pub fn into_parts(self) -> (PairStartupCallGraphEvidence, Vec<ClosedComptimeFragment>) {
         (self.evidence, self.evaluators)
+    }
+
+    /// Bound aggregate retained IR while serializing the ordinary emitted text.
+    /// This is still a non-executable compiler projection, not readback.
+    pub fn into_bounded_wasip1_output(self, max_ir_bytes: usize) -> std::io::Result<BoundedPairStartupWasip1Output> {
+        let max_stdout = self.max_wasip1_stdout.ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::Unsupported, "the startup graph did not emit WASIp1 stdout"))?;
+        let mut remaining = max_ir_bytes;
+        let mut evaluators = Vec::with_capacity(self.evaluators.len());
+        for ClosedComptimeFragment { llvm, result_type, .. } in self.evaluators {
+            let bytes = llvm.to_bounded_text_bytes(remaining)?;
+            remaining -= bytes.len();
+            evaluators.push(BoundedStartupWasip1Evaluator { ir: std::sync::Arc::new(bytes), result_type });
+        }
+        Ok(BoundedPairStartupWasip1Output {
+            evidence: self.evidence, evaluators, ir_bytes: max_ir_bytes - remaining, max_stdout,
+        })
     }
 }
 
@@ -459,7 +510,7 @@ fn derive_pair_startup_graph_with_delivery(
             };
             let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls, max_wasip1_stdout)?.into_parts();
             let evidence = PairStartupCallGraphEvidence { site_id: id.to_owned(), site, layout, calls, hops, selectors, paths, order };
-            Ok(PairStartupCallGraphComptimePlan { evidence, evaluators })
+            Ok(PairStartupCallGraphComptimePlan { evidence, evaluators, max_wasip1_stdout })
         })
 }
 

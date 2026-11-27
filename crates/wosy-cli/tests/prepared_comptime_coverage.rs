@@ -908,3 +908,126 @@ main_artifact = "main"
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
+    use std::{os::unix::fs::DirBuilderExt, path::Path};
+    use wosy_cli::source_state::TrustedPreparedPairWasip1;
+    use wosy_compiler::{ScalarTargetLayout, ScalarType};
+    use wosy_daemon::{PendingPairCallGraphComptimeProjection, PreparedPendingPairCallGraphComptime,
+        RootedClosedComptimeRequest, RootedPairCallGraphComptimeProjection};
+    use wosy_project::{packages::ComptimeWatchLimits, PackageRelativePath};
+    use wosy_protocol::FileKey;
+
+    fn trusted(owner: &PreparedPendingPairCallGraphComptime) -> Option<TrustedPreparedPairWasip1<'_>> {
+        let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+            owner.projection() else { return None; };
+        Some(TrustedPreparedPairWasip1 {
+            binding: owner.binding(), authored_cst: plan.authored_cst(), profile: plan.profile(), output: plan.wasip1_output()?,
+        })
+    }
+
+    const SOURCE: &str = r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32 first = solve(7, 37);
+u32 repeated = solve(7, 37);
+u32 different = solve(7, 13);
+%%end
+"#;
+    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+        .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []")
+        + "\n[comptime.prepare]\nwatch = [\"watch.txt\"]\n";
+    let fixture = Scratch::new();
+    let project = fixture.0.join("project");
+    let private = fixture.0.join("private");
+    fs::create_dir(&project).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    fs::write(project.join("wosy.toml"), manifest).unwrap();
+    fs::write(project.join("watch.txt"), b"watched input").unwrap();
+    let entry = project.join("main.w");
+    fs::write(&entry, "%%start\nu32 answer = 14;\n%%end\n").unwrap();
+
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let initial = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(initial.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", initial.pending.unwrap()).unwrap());
+
+        fs::write(&entry, SOURCE).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), proposal, RootedClosedComptimeRequest {
+            profile: "dev".into(), file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+            id: "prepare".into(), evaluator_layout: ScalarTargetLayout::WASM32, source_limits: LIMITS, output_bytes: 1 << 20,
+        }, 1 << 20, TTL, 11).await.unwrap();
+        assert_eq!(owner.base().admission().validated_files, 1);
+        let held = trusted(&owner).expect("same private compiler-issued output");
+        let [first, distinct] = held.output.evaluators() else { panic!("one module per typed tuple"); };
+        assert_eq!(held.output.evidence().calls().map(|(call, _)| call.evaluator_index()).collect::<Vec<_>>(), [0, 0, 1]);
+        assert_ne!(first.bytes(), distinct.bytes());
+        let total = first.bytes().len() + distinct.bytes().len();
+
+        // The staging cut uses the captured CST, not re-authored input.
+        fs::write(&entry, "%%start\nu32 answer = 41;\n%%end\n").unwrap();
+        let limits = ComptimeWatchLimits::default();
+        let staging = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total,
+            || trusted(&owner)).unwrap().unwrap();
+        assert!(std::ptr::eq(staging.plan(), held.output));
+        assert_eq!(staging.plan().max_stdout(), 11);
+        assert_eq!(staging.observation().binding(), &binding);
+        assert_eq!(staging.observation().watches().files[0].revision.0, blake3::hash(b"watched input").to_hex().as_str());
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 2);
+        for (stage, exact) in staging.evaluators().zip([first, distinct]) {
+            assert_eq!(stage.result_type(), &ScalarType::U32);
+            let build = stage.builder();
+            let run = stage.runner();
+            assert_eq!(build.working_directory, project);
+            assert_eq!(run.working_directory, project);
+            assert_eq!(build.executable, "fixture-must-not-build");
+            assert_eq!(run.executable, "fixture-must-not-run");
+            let [ir, output, manifest] = build.arguments.as_slice() else { panic!("three builder paths"); };
+            assert_eq!(run.arguments.as_slice(), &[*manifest]);
+            assert_eq!(Path::new(output), stage.expected_module_path().parent().unwrap());
+            let actual = fs::read(ir).unwrap();
+            assert_eq!(actual, exact.bytes());
+            assert_eq!(stage.evaluator_ir().blake3, blake3::hash(&actual));
+            let document: serde_json::Value = serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+            assert_eq!(document, serde_json::json!({
+                "executable": stage.expected_module_path(), "parameters": {}, "permissions": [], "mounts": []
+            }));
+            assert!(!stage.expected_module_path().exists());
+        }
+        drop(staging);
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+
+        // A budget that admits the first slot but not both writes neither.
+        let denied = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, first.bytes().len(),
+            || trusted(&owner)).err().unwrap();
+        assert!(denied.to_string().contains("exceeds byte budget"));
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+
+        fs::write(&entry, SOURCE).unwrap();
+        let stale = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total, || {
+            let mut writer = SqliteSourceState::open(&project, CLIENT).unwrap();
+            assert!(writer.abandon("app", attempt).unwrap());
+            let replacement = writer.stage("app").unwrap().pending.unwrap();
+            assert_eq!(replacement.root(), attempt.root());
+            assert_ne!(replacement.generation(), attempt.generation());
+            trusted(&owner)
+        }).unwrap();
+        assert!(stale.is_none());
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+        assert!(client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total,
+            || panic!("do not call the owner for an already superseded attempt")).unwrap().is_none());
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, initial.root);
+        drop(owner);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

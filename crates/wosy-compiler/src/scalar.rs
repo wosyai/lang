@@ -2544,6 +2544,7 @@ pub use comptime::{
     inspect_direct_function_comptime,
     DirectComptimeArgument, DirectComptimeInput, DirectFunctionComptimeFragment, DirectStartupComptimePlan,
     DirectStartupComptimeUse, ForwardedPairStartupComptimePlan, InspectedDirectComptimeCall,
+    BoundedPairStartupWasip1Output, BoundedStartupWasip1Evaluator,
     PairStartupBranch, PairStartupBranchSelection, PairStartupBypass, PairStartupCallGraphComptimePlan,
     PairStartupCallGraphEvidence, PairStartupCallHop, PairStartupCallPath, PairStartupForwarding,
     PairStartupHopInput, PairStartupOccurrence, PairStartupSelector, StartupArgumentOrigin,

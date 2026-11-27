@@ -22,6 +22,8 @@ mod pins;
 mod pin_reconciliation;
 pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
 pub use pending_comptime::{PendingPairComptimeInputObservation, TrustedPreparedPairComptime};
+#[cfg(target_os = "linux")]
+pub use pending_comptime::TrustedPreparedPairWasip1;
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use diagnostic_report::{
     AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryBuilderInputs, AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer,

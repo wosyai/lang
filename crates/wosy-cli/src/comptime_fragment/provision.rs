@@ -27,7 +27,7 @@ pub struct ProvisionedWasip1Comptime {
     files: EvaluatorFiles,
 }
 
-struct EvaluatorFiles {
+pub(super) struct EvaluatorFiles {
     scratch: ComptimeScratch,
     ir: StagedEvaluatorIr,
     ir_path: PathBuf,
@@ -96,12 +96,12 @@ impl ProvisionedWasip1Comptime {
 impl ProvisionedWasip1Comptime {
     // The held directory already owns cleanup of the reserved manifest slot.
     pub(super) fn create_private_manifest(&self) -> io::Result<std::fs::File> {
-        self.files.scratch.create_manifest()
+        self.files.create_manifest()
     }
 }
 
 impl EvaluatorFiles {
-    fn create(private_parent: &Path, write_ir: impl FnOnce(&mut std::fs::File) -> io::Result<StagedEvaluatorIr>)
+    pub(super) fn create(private_parent: &Path, write_ir: impl FnOnce(&mut std::fs::File) -> io::Result<StagedEvaluatorIr>)
         -> io::Result<Self>
     {
         let scratch = ComptimeScratch::create(private_parent)?;
@@ -114,7 +114,15 @@ impl EvaluatorFiles {
         })
     }
 
-    fn builder_paths(&self) -> ClosedComptimePaths<'_> {
+    pub(super) fn ir(&self) -> &StagedEvaluatorIr { &self.ir }
+    pub(super) fn module_path(&self) -> &Path { &self.module_path }
+    pub(super) fn manifest_path(&self) -> &Path { &self.manifest_path }
+
+    pub(super) fn create_manifest(&self) -> io::Result<std::fs::File> {
+        self.scratch.create_manifest()
+    }
+
+    pub(super) fn builder_paths(&self) -> ClosedComptimePaths<'_> {
         ClosedComptimePaths { evaluator_ir: &self.ir_path, output_dir: self.scratch.output_dir(), manifest: &self.manifest_path }
     }
 
