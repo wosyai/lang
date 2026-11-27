@@ -278,6 +278,72 @@ fn finite_wildcard_scan_finishes_even_when_the_old_pattern_retry_budget_would_hi
 }
 
 #[test]
+fn raised_watch_budgets_are_honored_by_both_observation_paths() {
+    use wosy_project::packages::{observe_local_comptime_inputs, LocalComptimeInputScope};
+
+    let fixture = Fixture::new();
+    let app = fixture.app();
+    let defaults = ComptimeWatchLimits::default();
+    let sparse_bytes = defaults.content_bytes + 1;
+    fixture.put("assets/wosy.toml", PACKAGE.replace(
+        "watch = [\"schemas/**/*.json\", \"schemas/root.json\", \"schemas/caf?.txt\"]",
+        "watch = [\"scan/*.watched\"]",
+    ));
+    fixture.put("app/wosy.toml", APP.replace(
+        "watch_add = [\"recordings/**/*.json\", \"recordings/./unsupported.txt\"]",
+        "watch_add = [\"more/extra.watched\"]",
+    ));
+    fixture.put("app/more/extra.watched", "x");
+    for index in 0..defaults.entries {
+        let extension = if index < defaults.files { "watched" } else { "ignored" };
+        fixture.put(&format!("assets/scan/item_{index:04}.{extension}"), "");
+    }
+    let sparse = fixture.0.join("assets/scan/item_0000.watched");
+    fs::OpenOptions::new().write(true).open(&sparse).unwrap().set_len(sparse_bytes).unwrap();
+
+    let exact = ComptimeWatchLimits { entries: defaults.entries + 3, files: defaults.files + 1,
+        content_bytes: sparse_bytes + 1 };
+    let observe = |limits| prepare_comptime_watches(&app, "app", "dev", "assets", "prepare", limits);
+    let (_, watched) = observe(exact).unwrap();
+    assert_eq!(watched.files.len(), exact.files);
+    let zeroes = [0u8; 8192];
+    let mut hash = blake3::Hasher::new();
+    for _ in 0..sparse_bytes / zeroes.len() as u64 { hash.update(&zeroes); }
+    hash.update(&zeroes[..(sparse_bytes % zeroes.len() as u64) as usize]);
+    let digest = hash.finalize().to_hex().to_string();
+    let expected = rows(&watched);
+    assert_eq!(expected[0], (WatchRoot::OwningPackage, Path::new("scan/item_0000.watched"), digest));
+    assert_eq!(*expected.last().unwrap(), content(WatchRoot::ConsumingProject, "more/extra.watched", "x"));
+    for (limits, message) in [
+        (ComptimeWatchLimits { entries: exact.entries - 1, ..exact }, "entry limit"),
+        (ComptimeWatchLimits { files: exact.files - 1, ..exact }, "matched file limit"),
+        (ComptimeWatchLimits { content_bytes: exact.content_bytes - 1, ..exact }, "file byte limit"),
+    ] {
+        assert!(observe(limits).err().unwrap().contains(message));
+    }
+
+    // Reuse the actual fixture data in the dependency-free anchored path;
+    // the authorization callback still receives the exact raw manifest.
+    fs::rename(fixture.0.join("assets/scan"), app.join("scan")).unwrap();
+    let manifest = with_evaluator_tools()
+        .replace("[dependencies.assets]\npath = \"../assets\"\n", "")
+        .replace("watch = [\"local/*.txt\"]", "watch = [\"scan/*.watched\"]");
+    fixture.put("app/wosy.toml", &manifest);
+    fixture.put("app/src/main.w", APP_SOURCE.replace("payload = namespace assets \"main.w\";\n", ""));
+    let local = |content_bytes| observe_local_comptime_inputs(&app, LocalComptimeInputScope {
+        target: "app", profile: "dev", site: "prepare",
+        watch_limits: ComptimeWatchLimits { entries: defaults.entries + 1, files: defaults.files, content_bytes },
+    }, |raw| {
+        assert_eq!(raw, manifest);
+        Ok(())
+    });
+    let (_, local_watches) = local(sparse_bytes).unwrap();
+    assert_eq!(local_watches.as_slice(), &watched.files[..defaults.files]);
+    assert!(local(sparse_bytes - 1).err().unwrap().contains("file byte limit"));
+    assert!(!app.join(".wosy").exists());
+}
+
+#[test]
 fn checks_selected_site_glob_dialect_and_shared_budget_without_ordinary_side_effects() {
     let fixture = Fixture::new();
     let app = fixture.app();

@@ -95,7 +95,7 @@ mod linux {
         let globs = declarations(&document, scope.site, "watch")?;
         let mut result = Vec::new();
         if !globs.is_empty() {
-            let mut budget = watch_budget(scope.watch_limits);
+            let mut budget = scope.watch_limits;
             resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut result)?;
             order_watches(&mut result);
         }
@@ -113,15 +113,6 @@ mod linux {
         Ok(Some(bytes))
     }
 
-    fn watch_budget(limits: ComptimeWatchLimits) -> ComptimeWatchLimits {
-        let maximum = ComptimeWatchLimits::default();
-        ComptimeWatchLimits {
-            entries: limits.entries.min(maximum.entries),
-            files: limits.files.min(maximum.files),
-            content_bytes: limits.content_bytes.min(maximum.content_bytes),
-        }
-    }
-
     fn order_watches(result: &mut [WatchedComptimeFile]) {
         result.sort_unstable_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
     }
@@ -132,7 +123,7 @@ mod linux {
         consumer_root: &Path, consumer_package: &str, configuration: &ProjectConfiguration,
         consumer_manifest: &ImDocument<String>, owner: &str, site: &str, limits: ComptimeWatchLimits,
     ) -> Result<Vec<WatchedComptimeFile>, String> {
-        let mut budget = watch_budget(limits);
+        let mut budget = limits;
         let mut result = Vec::new();
         if owner == consumer_package {
             let globs = declarations(consumer_manifest, site, "watch")?;
