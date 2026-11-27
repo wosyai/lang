@@ -4,12 +4,12 @@ use super::{builder_error, dynamic_return_outputs, memory, ScalarFunction, Scala
     ScalarStruct, ScalarTargetLayout, ScalarType};
 use crate::scalar::{layout::ScalarLayoutIndex, ScalarStructFieldId, ScalarStructId};
 use wosy_syntax::{SourceIdentity, SourceSpan};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use inkwell::{
     builder::Builder, context::Context, module::{Linkage, Module},
     types::{BasicTypeEnum, FunctionType, IntType},
-    values::{BasicValue, FunctionValue, IntValue, PointerValue},
-    attributes::AttributeLoc, IntPredicate,
+    values::{BasicValue, FunctionValue, IntValue, PhiValue, PointerValue},
+    attributes::AttributeLoc, basic_block::BasicBlock, IntPredicate,
 };
 
 macro_rules! ir { ($instruction:expr) => { $instruction.map_err(builder_error)? }; }
@@ -49,63 +49,98 @@ enum Wire {
     Bool,
     Int { signed: bool },
     Utf8 { data: u32, length: u32 },
-    Struct(Vec<(u32, Arc<Wire>)>),
-    Fixed { count: u32, stride: u32, element: Arc<Wire> },
+    Struct(Vec<(u32, usize)>),
+    Fixed { count: u32, stride: u32, element: usize },
 }
 
-// One typed plan associates actual compiler field offsets with semantic
-// wire reads; padding itself is never part of the output.
+struct WirePlan {
+    nodes: Vec<Wire>,
+    root: usize,
+    bound: u32,
+}
+
+// Typed offsets and array strides come from the ordinary compiler layout.
+// Postorder rows own only earlier indices, including shared nominal shapes.
 fn wire(
     ty: &ScalarType, layouts: &ScalarLayoutIndex<'_>, structs: &[&ScalarStruct],
-    output: Wasip1ComptimeOutput<'_>, memo: &mut HashMap<ScalarStructId, (Arc<Wire>, u32)>,
-) -> Result<(Arc<Wire>, u32), String> {
+    output: Wasip1ComptimeOutput<'_>,
+) -> Result<WirePlan, String> {
+    enum Task<'a> { Enter(&'a ScalarType), Struct(&'a ScalarStruct), Array(u64) }
+    #[derive(Clone, Copy)]
+    struct Row { id: usize, bound: u32, allocation: u64 }
+    enum Visit { Active, Done(Row) }
+
     let overflow = || "comptime stdout shape exceeds its WASI representation".to_owned();
     let offset = |id: &ScalarStructFieldId| layouts.field(id).and_then(|layout| layout.offset)
         .and_then(|offset| u32::try_from(offset).ok()).ok_or_else(overflow);
-    match ty {
-        ScalarType::Bool => Ok((Arc::new(Wire::Bool), 5)),
-        ScalarType::I32 => Ok((Arc::new(Wire::Int { signed: true }), 11)),
-        ScalarType::U32 => Ok((Arc::new(Wire::Int { signed: false }), 10)),
-        ScalarType::Struct(id) => {
-            if let Some(cached) = memo.get(id) { return Ok(cached.clone()); }
-            if let Some([data, length]) = output.text_fields.get(id) {
-                // The closed typed body has no mechanism to manufacture
-                // or extend text bytes. Reserve worst-case escaping of
-                // the largest literal anywhere in this evaluator.
-                let maximum = output.max_text_bytes.checked_mul(6).and_then(|n| n.checked_add(2))
-                    .ok_or_else(overflow)?;
-                let planned = (Arc::new(Wire::Utf8 { data: offset(data)?, length: offset(length)? }), maximum);
-                memo.insert(id.clone(), planned.clone());
-                return Ok(planned);
+    let structs: HashMap<_, _> = structs.iter().map(|structure| (&structure.id, *structure)).collect();
+    let allocation = |ty| memory::allocation_layout(ty, layouts, ScalarTargetLayout::WASM32).map(|(size, _)| size);
+    let mut memo = HashMap::new();
+    let mut tasks = vec![Task::Enter(ty)];
+    let mut rows: Vec<Row> = Vec::new();
+    let mut nodes = Vec::new();
+    while let Some(task) = tasks.pop() {
+        let (node, bound, size, done) = match task {
+            Task::Enter(kind) => match kind {
+                ScalarType::Bool => (Wire::Bool, 5, allocation(kind)?, None),
+                ScalarType::I32 => (Wire::Int { signed: true }, 11, allocation(kind)?, None),
+                ScalarType::U32 => (Wire::Int { signed: false }, 10, allocation(kind)?, None),
+                ScalarType::Struct(id) => {
+                    match memo.get(id) {
+                        Some(Visit::Active) => return Err("cyclic comptime result layout".into()),
+                        Some(Visit::Done(row)) => { rows.push(*row); continue; }
+                        None => {}
+                    }
+                    if let Some([data, length]) = output.text_fields.get(id) {
+                        let maximum = output.max_text_bytes.checked_mul(6).and_then(|n| n.checked_add(2))
+                            .ok_or_else(overflow)?;
+                        (Wire::Utf8 { data: offset(data)?, length: offset(length)? }, maximum, allocation(kind)?, Some(id))
+                    } else {
+                        let structure = *structs.get(id).ok_or("missing comptime result type")?;
+                        memo.insert(id, Visit::Active);
+                        tasks.push(Task::Struct(structure));
+                        tasks.extend(structure.fields.iter().rev().map(|field| Task::Enter(&field.ty)));
+                        continue;
+                    }
+                }
+                ScalarType::Array { element, length, .. } => {
+                    tasks.push(Task::Array(*length));
+                    tasks.push(Task::Enter(element));
+                    continue;
+                }
+                _ => return Err("comptime WASI stdout bridge supports bool, i32, u32, std.utf8 and fixed aggregates of those values".into()),
+            },
+            Task::Struct(structure) => {
+                let start = rows.len() - structure.fields.len();
+                let mut fields = Vec::with_capacity(structure.fields.len());
+                let mut bound = 2u32;
+                for (field, child) in structure.fields.iter().zip(rows.drain(start..)) {
+                    bound = bound.checked_add(child.bound)
+                        .and_then(|n| n.checked_add(u32::from(!fields.is_empty()))).ok_or_else(overflow)?;
+                    fields.push((offset(&field.id)?, child.id));
+                }
+                let size = layouts.aggregate(&structure.id).and_then(|structure| structure.layout.as_ref())
+                    .map(|layout| layout.size).ok_or("missing comptime result allocation layout")?;
+                (Wire::Struct(fields), bound, size, Some(&structure.id))
             }
-            let shape = structs.iter().find(|s| &s.id == id)
-                .ok_or("missing comptime result type")?;
-            let mut fields = Vec::with_capacity(shape.fields.len());
-            let mut maximum = 2u32;
-            for field in &shape.fields {
-                let offset = offset(&field.id)?;
-                let (field, size) = wire(&field.ty, layouts, structs, output, memo)?;
-                maximum = maximum.checked_add(size).and_then(|n| n.checked_add(u32::from(!fields.is_empty())))
-                    .ok_or_else(overflow)?;
-                fields.push((offset, field));
+            Task::Array(length) => {
+                let child = rows.pop().expect("array element row is complete");
+                let count = u32::try_from(length).map_err(|_| overflow())?;
+                let stride = u32::try_from(child.allocation).map_err(|_| overflow())?;
+                let size = u64::from(stride.checked_mul(count).ok_or_else(overflow)?);
+                let bound = child.bound.checked_mul(count)
+                    .and_then(|n| n.checked_add(count.saturating_sub(1)))
+                    .and_then(|n| n.checked_add(2)).ok_or_else(overflow)?;
+                (Wire::Fixed { count, stride, element: child.id }, bound, size, None)
             }
-            let planned = (Arc::new(Wire::Struct(fields)), maximum);
-            memo.insert(id.clone(), planned.clone());
-            Ok(planned)
-        }
-        ScalarType::Array { element, length, .. } => {
-            let (kind, maximum) = wire(element, layouts, structs, output, memo)?;
-            let count = u32::try_from(*length).map_err(|_| overflow())?;
-            let (size, _) = memory::allocation_layout(element, layouts, ScalarTargetLayout::WASM32)?;
-            let stride = u32::try_from(size).map_err(|_| overflow())?;
-            stride.checked_mul(count).ok_or_else(overflow)?;
-            let maximum = maximum.checked_mul(count)
-                .and_then(|n| n.checked_add(count.saturating_sub(1)))
-                .and_then(|n| n.checked_add(2)).ok_or_else(overflow)?;
-            Ok((Arc::new(Wire::Fixed { count, stride, element: kind }), maximum))
-        }
-        _ => Err("comptime WASI stdout bridge supports bool, i32, u32, std.utf8 and fixed aggregates of those values".into()),
+        };
+        let row = Row { id: nodes.len(), bound, allocation: size };
+        if let Some(id) = done { memo.insert(id, Visit::Done(row)); }
+        nodes.push(node);
+        rows.push(row);
     }
+    let [row] = rows.as_slice() else { unreachable!("one completed wire root"); };
+    Ok(WirePlan { nodes, root: row.id, bound: row.bound })
 }
 
 pub(super) fn emit<'ctx>(
@@ -129,8 +164,8 @@ pub(super) fn emit<'ctx>(
     if abi.count_param_types() != 0 || abi.get_return_type() != Some(storage) {
         return Err("comptime stdout bridge does not support this ordinary return ABI".into());
     }
-    let (wire, bound) = wire(output.ty, layouts, structs, output, &mut HashMap::new())?;
-    let bound = bound.checked_add(1).ok_or("comptime stdout line exceeds its WASI representation")?;
+    let wire = wire(output.ty, layouts, structs, output)?;
+    let bound = wire.bound.checked_add(1).ok_or("comptime stdout line exceeds its WASI representation")?;
     if (bound as usize) > output.max_stdout { return Err("comptime stdout shape exceeds the selected byte budget".into()); }
 
     let ptr = context.ptr_type(inkwell::AddressSpace::default());
@@ -297,68 +332,89 @@ impl<'ctx> Encoder<'_, 'ctx> {
         Ok(value.into_int_value())
     }
 
-    fn value(&self, value: &Wire, from: PointerValue<'ctx>) -> Result<(), String> {
+    fn value(&self, plan: &WirePlan, from: PointerValue<'ctx>) -> Result<(), String> {
+        enum Task<'a, 'ctx> {
+            Value(usize, PointerValue<'ctx>),
+            Fields(&'a [(u32, usize)], PointerValue<'ctx>, bool),
+            ArrayEnd(PhiValue<'ctx>, IntValue<'ctx>, BasicBlock<'ctx>, BasicBlock<'ctx>),
+        }
         let b = self.builder;
-        match value {
-            Wire::Bool => {
-                let condition = self.load(from, self.context.bool_type())?;
-                let no = ir!(b.build_not(condition, "wire.false"));
-                self.then(condition, || b"true".iter().try_for_each(|&byte| self.constant(byte)))?;
-                self.then(no, || b"false".iter().try_for_each(|&byte| self.constant(byte)))?;
-            }
-            Wire::Int { signed } => {
-                let mut value = self.load(from, self.context.i32_type())?;
-                if *signed {
-                    let negative = ir!(b.build_int_compare(IntPredicate::SLT, value, self.word(0), "wire.negative"));
-                    self.then(negative, || self.constant(b'-'))?;
-                    // Unsigned magnitude, including i32::MIN; no nsw flag.
-                    let negated = ir!(b.build_int_sub(self.word(0), value, "wire.magnitude"));
-                    value = ir!(b.build_select(negative, negated, value, "wire.absolute")).into_int_value();
+        let mut tasks = vec![Task::Value(plan.root, from)];
+        while let Some(task) = tasks.pop() {
+            let (value, from) = match task {
+                Task::Value(value, from) => (&plan.nodes[value], from),
+                Task::Fields(fields, from, comma) => {
+                    if let Some(((offset, field), rest)) = fields.split_first() {
+                        if comma { self.constant(b',')?; }
+                        tasks.push(Task::Fields(rest, from, true));
+                        tasks.push(Task::Value(*field, self.address(from, self.word(*offset))?));
+                    } else {
+                        self.constant(b']')?;
+                    }
+                    continue;
                 }
-                ir!(b.build_call(self.decimal, &[value.into(), self.buffer.into(), self.cursor.into()], ""));
-            }
-            Wire::Utf8 { data, length } => {
-                let data = self.load(self.address(from, self.word(*data))?, self.context.i32_type())?;
-                let length = self.load(self.address(from, self.word(*length))?, self.context.i64_type())?;
-                let data = ir!(b.build_int_to_ptr(data, self.context.ptr_type(inkwell::AddressSpace::default()), "utf8.data"));
-                // Every admitted descriptor refers to an authored literal
-                // bounded by the selected closed source, far below u32::MAX.
-                let length = ir!(b.build_int_truncate(length, self.context.i32_type(), "utf8.length"));
-                let quote = self.quote.ok_or("missing WASI comptime text encoder")?;
-                ir!(b.build_call(quote, &[data.into(), length.into(), self.buffer.into(), self.cursor.into()], ""));
-            }
-            Wire::Struct(fields) => {
-                self.constant(b'[')?;
-                for (index, (offset, field)) in fields.iter().enumerate() {
-                    if index != 0 { self.constant(b',')?; }
-                    self.value(field, self.address(from, self.word(*offset))?)?;
+                Task::ArrayEnd(step, index, check, end) => {
+                    let next = ir!(b.build_int_add(index, self.word(1), "wire.array.next"));
+                    let body = b.get_insert_block().ok_or("missing wire loop body")?;
+                    ir!(b.build_unconditional_branch(check));
+                    step.add_incoming(&[(&next, body)]);
+                    b.position_at_end(end);
+                    self.constant(b']')?;
+                    continue;
                 }
-                self.constant(b']')?;
-            }
-            Wire::Fixed { count, stride, element } => {
-                self.constant(b'[')?;
-                let before = b.get_insert_block().ok_or("missing wire loop predecessor")?;
-                let check = self.context.append_basic_block(self.function, "wire.array.check");
-                let item = self.context.append_basic_block(self.function, "wire.array.element");
-                let end = self.context.append_basic_block(self.function, "wire.array.end");
-                ir!(b.build_unconditional_branch(check));
-                b.position_at_end(check);
-                let step = ir!(b.build_phi(self.context.i32_type(), "wire.array.index"));
-                step.add_incoming(&[(&self.word(0), before)]);
-                let index = step.as_basic_value().into_int_value();
-                let more = ir!(b.build_int_compare(IntPredicate::ULT, index, self.word(*count), "wire.array.more"));
-                ir!(b.build_conditional_branch(more, item, end));
-                b.position_at_end(item);
-                let comma = ir!(b.build_int_compare(IntPredicate::NE, index, self.word(0), "wire.array.comma"));
-                self.then(comma, || self.constant(b','))?;
-                let offset = ir!(b.build_int_mul(index, self.word(*stride), "wire.array.offset"));
-                self.value(element, self.address(from, offset)?)?;
-                let next = ir!(b.build_int_add(index, self.word(1), "wire.array.next"));
-                let body = b.get_insert_block().ok_or("missing wire loop body")?;
-                ir!(b.build_unconditional_branch(check));
-                step.add_incoming(&[(&next, body)]);
-                b.position_at_end(end);
-                self.constant(b']')?;
+            };
+            match value {
+                Wire::Bool => {
+                    let condition = self.load(from, self.context.bool_type())?;
+                    let no = ir!(b.build_not(condition, "wire.false"));
+                    self.then(condition, || b"true".iter().try_for_each(|&byte| self.constant(byte)))?;
+                    self.then(no, || b"false".iter().try_for_each(|&byte| self.constant(byte)))?;
+                }
+                Wire::Int { signed } => {
+                    let mut value = self.load(from, self.context.i32_type())?;
+                    if *signed {
+                        let negative = ir!(b.build_int_compare(IntPredicate::SLT, value, self.word(0), "wire.negative"));
+                        self.then(negative, || self.constant(b'-'))?;
+                        // Unsigned magnitude, including i32::MIN; no nsw flag.
+                        let negated = ir!(b.build_int_sub(self.word(0), value, "wire.magnitude"));
+                        value = ir!(b.build_select(negative, negated, value, "wire.absolute")).into_int_value();
+                    }
+                    ir!(b.build_call(self.decimal, &[value.into(), self.buffer.into(), self.cursor.into()], ""));
+                }
+                Wire::Utf8 { data, length } => {
+                    let data = self.load(self.address(from, self.word(*data))?, self.context.i32_type())?;
+                    let length = self.load(self.address(from, self.word(*length))?, self.context.i64_type())?;
+                    let data = ir!(b.build_int_to_ptr(data, self.context.ptr_type(inkwell::AddressSpace::default()), "utf8.data"));
+                    // Every admitted descriptor refers to an authored literal
+                    // bounded by the selected closed source, far below u32::MAX.
+                    let length = ir!(b.build_int_truncate(length, self.context.i32_type(), "utf8.length"));
+                    let quote = self.quote.ok_or("missing WASI comptime text encoder")?;
+                    ir!(b.build_call(quote, &[data.into(), length.into(), self.buffer.into(), self.cursor.into()], ""));
+                }
+                Wire::Struct(fields) => {
+                    self.constant(b'[')?;
+                    tasks.push(Task::Fields(fields, from, false));
+                }
+                Wire::Fixed { count, stride, element } => {
+                    self.constant(b'[')?;
+                    let before = b.get_insert_block().ok_or("missing wire loop predecessor")?;
+                    let check = self.context.append_basic_block(self.function, "wire.array.check");
+                    let item = self.context.append_basic_block(self.function, "wire.array.element");
+                    let end = self.context.append_basic_block(self.function, "wire.array.end");
+                    ir!(b.build_unconditional_branch(check));
+                    b.position_at_end(check);
+                    let step = ir!(b.build_phi(self.context.i32_type(), "wire.array.index"));
+                    step.add_incoming(&[(&self.word(0), before)]);
+                    let index = step.as_basic_value().into_int_value();
+                    let more = ir!(b.build_int_compare(IntPredicate::ULT, index, self.word(*count), "wire.array.more"));
+                    ir!(b.build_conditional_branch(more, item, end));
+                    b.position_at_end(item);
+                    let comma = ir!(b.build_int_compare(IntPredicate::NE, index, self.word(0), "wire.array.comma"));
+                    self.then(comma, || self.constant(b','))?;
+                    let offset = ir!(b.build_int_mul(index, self.word(*stride), "wire.array.offset"));
+                    tasks.push(Task::ArrayEnd(step, index, check, end));
+                    tasks.push(Task::Value(*element, self.address(from, offset)?));
+                }
             }
         }
         Ok(())
@@ -412,5 +468,53 @@ impl<'ctx> Encoder<'_, 'ctx> {
         b.position_at_end(done);
         ir!(b.build_return(Some(&self.word(0))));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inkwell::types::BasicType;
+    use super::*;
+    use crate::scalar::{derive_scalar_declarations_from_cst, prepare_scalar_project, ScalarPreparationInputs};
+    use std::fmt::Write;
+    use wosy_syntax::ByteSpan;
+
+    #[test]
+    fn deep_nominal_wasip1_wire_lowers_using_checked_offsets_and_stride() {
+        let mut authored = "%%start\nstruct copy Level0 { u32 value; }\n".to_owned();
+        for index in 1..72 {
+            writeln!(authored, "struct copy Level{index} {{ Level{} inner; }}", index - 1).unwrap();
+        }
+        authored.push_str("struct copy Top { Level71[2] values; }\n%%end\n");
+        let source = SourceIdentity::new("wire".into(), "app".into(), "main.w".into(), "fixture".into());
+        let fresh = wosy_syntax::parse_with_snapshot(source.clone(), authored, &[]);
+        assert!(fresh.result().is_valid());
+        let layout = ScalarTargetLayout::WASM32;
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(fresh.result().canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+        ).unwrap_or_else(|error| panic!("{:?}", error.into_ordered_diagnostics()));
+        let project = prepared.project();
+        let layouts = ScalarLayoutIndex::project(&project.modules);
+        let structs: Vec<_> = project.modules.iter().flat_map(|module| &module.structs).collect();
+        let top = structs.iter().find(|structure| structure.name == "Top").unwrap();
+        let ty = ScalarType::Struct(top.id.clone());
+        let site = SourceSpan::new(source, ByteSpan { start: 0, end: 0 });
+        let output = Wasip1ComptimeOutput { site: &site, ty: &ty, max_stdout: 314,
+            text_fields: &HashMap::new(), max_text_bytes: 0 };
+        let plan = wire(&ty, &layouts, &structs, output).unwrap();
+        assert_eq!((plan.nodes.len(), plan.bound), (75, 313));
+        let Wire::Struct(fields) = &plan.nodes[plan.root] else { panic!("nominal outer type"); };
+        assert_eq!(fields[0].0, 0);
+        assert!(matches!(plan.nodes[fields[0].1], Wire::Fixed { count: 2, stride: 4, .. }));
+
+        let context = Context::create();
+        let module = context.create_module("wire-depth-fixture");
+        let main = module.add_function("main", context.i32_type().fn_type(&[], false), None);
+        let storage = memory::storage_type(&context, &ty, &layouts, layout).unwrap();
+        let evaluate = module.add_function("fixture_value", storage.fn_type(&[], false), None);
+        emit(&context, &module, &layouts, &structs, layout, main, evaluate, output).unwrap();
+        assert!(module.verify().is_ok());
+        assert!(module.print_to_string().to_string().contains("wire.array.offset = mul i32 %wire.array.index, 4"));
     }
 }
