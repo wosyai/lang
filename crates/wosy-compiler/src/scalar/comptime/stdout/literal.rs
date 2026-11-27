@@ -4,12 +4,15 @@ use crate::{ScalarExpression, UnaryOperator};
 use std::{collections::HashMap, io::{self, Write}};
 
 #[derive(Debug)]
-pub(super) enum LiteralStdout {
+pub(super) struct LiteralStdout(Vec<LiteralItem>);
+
+#[derive(Debug)]
+enum LiteralItem {
     Bool(bool),
     I32(i32),
     U32(u32),
     Utf8(Vec<u8>),
-    Collection(Vec<LiteralStdout>),
+    Delimiter(u8),
 }
 
 impl LiteralStdout {
@@ -17,52 +20,62 @@ impl LiteralStdout {
     /// compiler already checked the exact expected type and all fields.
     pub(super) fn from_checked(plan: &ShapePlan, index: usize, expr: &ScalarExpression) -> Option<Self> {
         use ScalarExpression as Expr;
-        match (&plan.nodes[index], expr) {
-            (Shape::Bool, Expr::Boolean { value, .. }) => Some(Self::Bool(*value)),
-            (Shape::I32, Expr::Integer { value, .. }) => i32::try_from(value).ok().map(Self::I32),
-            (Shape::I32, Expr::Unary { operator: UnaryOperator::Negate, operand, .. }) => {
-                // A negative integer spelling, not arithmetic evaluation.
-                let Expr::Integer { value, .. } = operand.as_ref() else { return None; };
-                i32::try_from(-value).ok().map(Self::I32)
-            }
-            (Shape::U32, Expr::Integer { value, .. }) => u32::try_from(value).ok().map(Self::U32),
-            (Shape::Utf8, Expr::Utf8 { value, .. }) => Some(Self::Utf8(value.clone())),
-            (Shape::Array { element, .. }, Expr::ArrayLiteral { elements, .. }) => elements.iter()
-                .map(|value| Self::from_checked(plan, *element, value)).collect::<Option<_>>().map(Self::Collection),
-            (Shape::Struct(expected), Expr::StructLiteral { fields, .. }) => {
-                // The source may designate fields in any order. The output
-                // always uses the already resolved declaration order.
-                let values: HashMap<_, _> = fields.iter().map(|field| (field.name.as_str(), &field.value)).collect();
-                expected.iter().map(|(name, ty)| Self::from_checked(plan, *ty, values.get(name.as_str())?))
-                    .collect::<Option<_>>().map(Self::Collection)
-            }
-            _ => None,
+        enum Task<'a> { Value(usize, &'a Expr), Delimiter(u8) }
+        let mut tasks = vec![Task::Value(index, expr)];
+        let mut output = Vec::new();
+        while let Some(task) = tasks.pop() {
+            let (index, expr) = match task {
+                Task::Delimiter(byte) => { output.push(LiteralItem::Delimiter(byte)); continue; }
+                Task::Value(index, expr) => (index, expr),
+            };
+            let item = match (&plan.nodes[index], expr) {
+                (Shape::Bool, Expr::Boolean { value, .. }) => LiteralItem::Bool(*value),
+                (Shape::I32, Expr::Integer { value, .. }) => LiteralItem::I32(i32::try_from(value).ok()?),
+                (Shape::I32, Expr::Unary { operator: UnaryOperator::Negate, operand, .. }) => {
+                    let Expr::Integer { value, .. } = operand.as_ref() else { return None; };
+                    LiteralItem::I32(i32::try_from(-value).ok()?)
+                }
+                (Shape::U32, Expr::Integer { value, .. }) => LiteralItem::U32(u32::try_from(value).ok()?),
+                (Shape::Utf8, Expr::Utf8 { value, .. }) => LiteralItem::Utf8(value.clone()),
+                (Shape::Array { element, .. }, Expr::ArrayLiteral { elements, .. }) => {
+                    tasks.push(Task::Delimiter(b']'));
+                    for (index, value) in elements.iter().enumerate().rev() {
+                        tasks.push(Task::Value(*element, value));
+                        if index != 0 { tasks.push(Task::Delimiter(b',')); }
+                    }
+                    LiteralItem::Delimiter(b'[')
+                }
+                (Shape::Struct(expected), Expr::StructLiteral { fields, .. }) => {
+                    // Designators can be written in any order.
+                    let values: HashMap<_, _> = fields.iter().map(|field| (field.name.as_str(), &field.value)).collect();
+                    tasks.push(Task::Delimiter(b']'));
+                    for (index, (name, ty)) in expected.iter().enumerate().rev() {
+                        tasks.push(Task::Value(*ty, values.get(name.as_str())?));
+                        if index != 0 { tasks.push(Task::Delimiter(b',')); }
+                    }
+                    LiteralItem::Delimiter(b'[')
+                }
+                _ => return None,
+            };
+            output.push(item);
         }
+        Some(Self(output))
     }
 
     pub(super) fn write_line(&self, out: &mut impl Write, limit: usize) -> io::Result<usize> {
         let mut writer = BudgetedWriter { out, remaining: limit };
-        self.write_value(&mut writer)?;
-        writer.write_all(b"\n")?;
-        Ok(limit - writer.remaining)
-    }
-
-    fn write_value(&self, out: &mut impl Write) -> io::Result<()> {
-        match self {
-            Self::Bool(true) => out.write_all(b"true"),
-            Self::Bool(false) => out.write_all(b"false"),
-            Self::I32(value) => write!(out, "{value}"),
-            Self::U32(value) => write!(out, "{value}"),
-            Self::Utf8(text) => write_text(text, out),
-            Self::Collection(values) => {
-                out.write_all(b"[")?;
-                for (index, value) in values.iter().enumerate() {
-                    if index != 0 { out.write_all(b",")?; }
-                    value.write_value(out)?;
-                }
-                out.write_all(b"]")
+        for item in &self.0 {
+            match item {
+                LiteralItem::Bool(true) => writer.write_all(b"true")?,
+                LiteralItem::Bool(false) => writer.write_all(b"false")?,
+                LiteralItem::I32(value) => write!(writer, "{value}")?,
+                LiteralItem::U32(value) => write!(writer, "{value}")?,
+                LiteralItem::Utf8(text) => write_text(text, &mut writer)?,
+                LiteralItem::Delimiter(byte) => writer.write_all(&[*byte])?,
             }
         }
+        writer.write_all(b"\n")?;
+        Ok(limit - writer.remaining)
     }
 }
 

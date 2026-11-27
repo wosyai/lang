@@ -545,18 +545,122 @@ fn parse_scalar(ty: &ScalarType, span: ByteSpan, stdout: &[u8], max_bytes: usize
 }
 
 fn parse(shape: &ShapePlan, span: ByteSpan, stdout: &[u8], budget: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
+    let decoded = decode(shape, stdout, budget)?;
+    Ok(decoded.into_expression(span))
+}
+
+/// A validated wire record borrows its nominal names from the exact plan
+/// rather than accepting caller-supplied field identifiers. Until validation
+/// completes, nothing owns nested ordinary AST values.
+enum DecodedItem {
+    Bool(bool),
+    I32(i32),
+    U32(u32),
+    Utf8(Vec<u8>),
+    EndCollection(usize),
+}
+
+struct DecodedRecord<'plan> {
+    plan: &'plan ShapePlan,
+    items: Vec<DecodedItem>,
+}
+
+impl DecodedRecord<'_> {
+    fn into_expression(self, span: ByteSpan) -> ScalarExpression {
+        let mut values = Vec::new();
+        for item in self.items {
+            let value = match item {
+                DecodedItem::Bool(value) => ScalarExpression::Boolean { value, span },
+                DecodedItem::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+                DecodedItem::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+                DecodedItem::Utf8(value) => ScalarExpression::Utf8 { value, span },
+                DecodedItem::EndCollection(index) => match &self.plan.nodes[index] {
+                    Shape::Array { count, .. } => {
+                        let first = values.len() - count;
+                        ScalarExpression::ArrayLiteral { elements: values.drain(first..).collect(), span }
+                    }
+                    Shape::Struct(expected) => {
+                        let first = values.len() - expected.len();
+                        let fields = expected.iter().zip(values.drain(first..)).map(|((name, _), value)| {
+                            ScalarStructLiteralField { name: name.clone(), name_span: span, span, value }
+                        }).collect();
+                        ScalarExpression::StructLiteral { fields, span }
+                    }
+                    _ => unreachable!("decoded collection has authenticated aggregate type"),
+                },
+            };
+            values.push(value);
+        }
+        let [value] = <[_; 1]>::try_from(values).ok().expect("validated record has exactly one root");
+        value
+    }
+}
+
+fn decode<'plan>(shape: &'plan ShapePlan, stdout: &[u8], budget: usize) -> Result<DecodedRecord<'plan>, ComptimeStdoutError> {
     use ComptimeStdoutError as Error;
     if stdout.len() > budget { return Err(Error::ByteLimit); }
     let line = stdout.strip_suffix(b"\n").ok_or(Error::NonCanonical)?;
-    let mut parser = Parser { input: line, span, field_bytes: budget };
-    let value = parser.value(shape, shape.root)?;
+    let mut parser = Parser { input: line, field_bytes: budget };
+    enum Task {
+        Value(usize),
+        Child { collection: usize, index: usize },
+        FieldBytes(usize),
+    }
+    let mut tasks = vec![Task::Value(shape.root)];
+    let mut decoded = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Value(index) => {
+                let item = match &shape.nodes[index] {
+                    Shape::Bool => {
+                        if parser.input.starts_with(b"true") {
+                            parser.eat(b"true")?;
+                            DecodedItem::Bool(true)
+                        } else {
+                            parser.eat(b"false")?;
+                            DecodedItem::Bool(false)
+                        }
+                    }
+                    Shape::I32 => DecodedItem::I32(i32::try_from(parser.decimal(true)?).map_err(|_| Error::OutOfRange)?),
+                    Shape::U32 => DecodedItem::U32(u32::try_from(parser.decimal(false)?).map_err(|_| Error::OutOfRange)?),
+                    Shape::Utf8 => DecodedItem::Utf8(parser.text()?),
+                    Shape::Array { .. } | Shape::Struct(_) => {
+                        parser.eat(b"[")?;
+                        tasks.push(Task::Child { collection: index, index: 0 });
+                        continue;
+                    }
+                };
+                decoded.push(item);
+            }
+            Task::Child { collection, index } => {
+                let (child, name) = match &shape.nodes[collection] {
+                    Shape::Array { count, element } => ((index < *count).then_some(*element), None),
+                    Shape::Struct(fields) => fields.get(index).map_or((None, None), |(name, child)| {
+                        (Some(*child), Some(name.len()))
+                    }),
+                    _ => unreachable!("children only for authenticated aggregates"),
+                };
+                if let Some(child) = child {
+                    if index != 0 { parser.eat(b",")?; }
+                    tasks.push(Task::Child { collection, index: index + 1 });
+                    if let Some(bytes) = name { tasks.push(Task::FieldBytes(bytes)); }
+                    tasks.push(Task::Value(child));
+                } else {
+                    parser.eat(b"]")?;
+                    decoded.push(DecodedItem::EndCollection(collection));
+                }
+            }
+            Task::FieldBytes(bytes) => {
+                parser.field_bytes = parser.field_bytes.checked_sub(bytes).ok_or(Error::ByteLimit)?;
+            }
+        }
+    }
     if !parser.input.is_empty() { return Err(Error::NonCanonical); }
-    Ok(value)
+    Ok(DecodedRecord { plan: shape, items: decoded })
 }
 
 struct Parser<'a> {
     input: &'a [u8],
-    span: ByteSpan,
     // Materializing ordinary named AST fields copies these names. Do not
     // allow repeated short records to amplify them beyond the same budget.
     field_bytes: usize,
@@ -566,54 +670,6 @@ impl Parser<'_> {
     fn eat(&mut self, text: &[u8]) -> Result<(), ComptimeStdoutError> {
         self.input = self.input.strip_prefix(text).ok_or(ComptimeStdoutError::NonCanonical)?;
         Ok(())
-    }
-
-    fn value(&mut self, plan: &ShapePlan, index: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
-        use ComptimeStdoutError as Error;
-        let span = self.span;
-        match &plan.nodes[index] {
-            Shape::Bool => {
-                let value = if self.input.starts_with(b"true") {
-                    self.eat(b"true")?;
-                    true
-                } else {
-                    self.eat(b"false")?;
-                    false
-                };
-                Ok(ScalarExpression::Boolean { value, span })
-            }
-            Shape::I32 => {
-                let value = i32::try_from(self.decimal(true)?).map_err(|_| Error::OutOfRange)?.into();
-                Ok(ScalarExpression::Integer { value, span })
-            }
-            Shape::U32 => {
-                let value = u32::try_from(self.decimal(false)?).map_err(|_| Error::OutOfRange)?.into();
-                Ok(ScalarExpression::Integer { value, span })
-            }
-            Shape::Utf8 => Ok(ScalarExpression::Utf8 { value: self.text()?, span }),
-            Shape::Array { count, element } => {
-                self.eat(b"[")?;
-                let mut elements = Vec::new();
-                for index in 0..*count {
-                    if index != 0 { self.eat(b",")?; }
-                    elements.push(self.value(plan, *element)?);
-                }
-                self.eat(b"]")?;
-                Ok(ScalarExpression::ArrayLiteral { elements, span })
-            }
-            Shape::Struct(expected) => {
-                self.eat(b"[")?;
-                let mut fields = Vec::new();
-                for (index, (name, shape)) in expected.iter().enumerate() {
-                    if index != 0 { self.eat(b",")?; }
-                    let value = self.value(plan, *shape)?;
-                    self.field_bytes = self.field_bytes.checked_sub(name.len()).ok_or(Error::ByteLimit)?;
-                    fields.push(ScalarStructLiteralField { name: name.clone(), name_span: span, span, value });
-                }
-                self.eat(b"]")?;
-                Ok(ScalarExpression::StructLiteral { fields, span })
-            }
-        }
     }
 
     fn decimal(&mut self, signed: bool) -> Result<i64, ComptimeStdoutError> {
@@ -776,6 +832,18 @@ mod continuation_tests {
                 cursor = *child;
             }
             assert!(matches!(plan.nodes[cursor], Shape::U32));
+            let branch = format!("{}7{}", "[".repeat(72), "]".repeat(72));
+            let line = format!("[{branch},{branch}]\n");
+            let decoded = decode(&plan, line.as_bytes(), 4096).ok().expect("deep canonical decoded rows");
+            assert_eq!(decoded.items.len(), 147);
+            assert!(matches!(decoded.items.first(), Some(DecodedItem::U32(7))));
+            assert!(matches!(decoded.items.last(), Some(DecodedItem::EndCollection(root)) if *root == plan.root));
+            let corrupt = line.replacen('7', "false", 1);
+            assert!(matches!(decode(&plan, corrupt.as_bytes(), 4096), Err(ComptimeStdoutError::NonCanonical)));
+            let late_corrupt = line.replacen("]\n", ",7]\n", 1);
+            assert!(matches!(decode(&plan, late_corrupt.as_bytes(), 4096), Err(ComptimeStdoutError::NonCanonical)));
+            assert!(matches!(decode(&plan, line.as_bytes(), line.len() - 1), Err(ComptimeStdoutError::ByteLimit)));
+
         }
     }
 
