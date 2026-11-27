@@ -19093,6 +19093,49 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn dormant_float_demand_keeps_guard_arithmetic_and_real_branch_require() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "dormant-float-demanded-terminal");
+        let guard = |limit: i32| format!(r#"%%start
+            f32(i32,i32,i32) inspect = fn(count,start,row) {{
+                if (count=={limit} && start==1) {{
+                    core.require(true, {OUTPUT});
+                    if (row<0 && row>=count-start) {{ 1.0 }} else {{ 0.0 }}
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        let obligation = format!(r#"%%start
+            f32(i32) inspect = fn(row) {{
+                if (row>0 && row<2) {{
+                    core.require(row!=1, {OUTPUT}); 1.0
+                }} else {{ 0.0 }}
+            }};
+        %%end"#);
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}\n{program}"));
+            let valid = guard(i32::MIN + 1);
+            let (cap, _) = prepare(&valid).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let full = prepare(&valid).run().unwrap();
+            assert!(cap.active && full.active && cap.directives.is_empty() && full.directives.is_empty());
+            let overflow = guard(i32::MIN);
+            assert!(matches!(prepare(&overflow).run_private_authored_root(NonZeroUsize::MIN),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(prepare(&overflow).run(), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+
+            let (cap, _) = prepare(&obligation).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            assert_eq!(cap.directives, prepare(&obligation).run().unwrap().directives);
+            let [failed] = cap.directives.as_slice() else { panic!("one branch-local authored failure"); };
+            assert_eq!(failed.witness.axes().len(), 1);
+            let one = BigInt::from(1u8);
+            assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn dormant_float_row_guard_preserves_difference_and_correlated_witness() {
         use std::num::NonZeroUsize;
         let owner = source("src/main.w", "dormant-float-row-guard");

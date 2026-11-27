@@ -7619,13 +7619,13 @@ impl IntegerInputs {
     }
 
     fn callable_compound_branch(
-        &self, calls: &FunctionCallSites, condition: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+        &self, calls: &FunctionCallSites, condition: OccurrenceOrdinal, roots: &IntegerRoots<'_>, selected: [bool; 2],
     ) -> Option<Option<[Self; 2]>> {
         let Some(tracker) = roots.callable_history else { return Some(None); };
         let Some(tree) = calls.structure.checker_ordinary_booleans.get(&condition) else { return Some(None); };
         if !call_free_history_boolean_with_difference(tree, roots.closed_float_guards) { return Some(None); }
         let mut work = tracker.borrow().work.get();
-        let rows = self.ordinary_boolean(tree, roots, [true, true], &mut work, Some((calls, condition, tracker)))?;
+        let rows = self.ordinary_boolean(tree, roots, selected, &mut work, Some((calls, condition, tracker)))?;
         tracker.borrow().work.set(work);
         Some(Some(rows))
     }
@@ -7924,6 +7924,19 @@ impl IntegerBlockCursor {
             guard: None,
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn closed_literal_float_arm(structure: &OccurrenceStructure, block: BlockOrdinal, expected: &ScalarType) -> bool {
+    let Some(region) = structure.blocks.get(block.0) else { return false; };
+    let [item] = region.items.as_slice() else { return false; };
+    let BlockItemKind::FinalOutput(slot) = item.kind else { return false; };
+    !region.unsafe_context && slot.output == 0 && matches!(expected, ScalarType::F32 | ScalarType::F64)
+        && structure.checked_types.expressions.get(&slot.expression) == Some(expected)
+        && structure.checker_literal_float_outputs.contains(&slot.expression)
+        && structure.edges.get(&(OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput {
+            item: slot.item, output: 0,
+        })) == Some(&OccurrenceNode::Expression(slot.expression))
 }
 
 fn plain_typed_return<'a>(
@@ -8487,7 +8500,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if let Some(compound) = path.callable_compound_branch(calls, *condition, roots)? {
+                        let comparison = if let Some(compound) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
                             Some(compound)
                         } else if evaluated_guard.0.is_some() {
                             evaluated_guard.0
@@ -8584,15 +8597,22 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 {
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
+                    let selected = if !SUSPEND_CALL && returns.is_none() && authored_return.discards_closed_float_output() {
+                        [*else_block, *then_block].map(|arm| !closed_literal_float_arm(structure, arm, expected))
+                    } else { [true, true] };
+                    #[cfg(feature = "internal-checker")]
                     let ordinary = {
                         let comparison = if evaluated_guard.0.is_some() {
                             evaluated_guard.0
                         } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
                         } else if authored_return.discards_closed_float_output() {
-                            match path.callable_compound_branch(calls, *condition, roots)? {
+                            // Demand only branches that still have work to prove.
+                            // Every reached guard operand is still evaluated by
+                            // the same checked short-circuit Boolean transfer.
+                            match path.callable_compound_branch(calls, *condition, roots, selected)? {
                                 Some(rows) => Some(rows),
-                                None => path.ordinary_predicate_at(structure, *condition, roots, [true, true])?,
+                                None => path.ordinary_predicate_at(structure, *condition, roots, selected)?,
                             }
                         } else {
                             path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
@@ -8633,6 +8653,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         let at = calls.occurrences.get(condition.0)?.span;
                         trace.try_borrow_mut().ok()?.branch(wosy_syntax::SourceSpan::new((*source).clone(), at), !yes.is_unreachable())?;
                     }
+                    #[cfg(feature = "internal-checker")]
+                    let (no, yes) = (
+                        if selected[0] { no } else { IntegerInputs::default() },
+                        if selected[1] { yes } else { IntegerInputs::default() },
+                    );
                     #[cfg(feature = "internal-checker")]
                     let (yes, no) = if let Some(histories) = roots.callable_history {
                         let mut yes = yes;
@@ -11492,7 +11517,7 @@ fn bind_closed_integer_conditional_local(
                 || structure.edges.get(&(parent, OccurrenceEdge::ThenBranch)) != Some(&OccurrenceNode::Block(*then_block))
                 || structure.edges.get(&(parent, OccurrenceEdge::ElseBranch)) != Some(&OccurrenceNode::Block(*else_block))
             { return None; }
-            let [mut no, mut yes] = if let Some(rows) = path.callable_compound_branch(calls, *condition, roots)? {
+            let [mut no, mut yes] = if let Some(rows) = path.callable_compound_branch(calls, *condition, roots, [true, true])? {
                 rows
             } else if let Some(rows) = path.ordinary_predicate_at(structure, *condition, roots, [true, true])? {
                 rows
