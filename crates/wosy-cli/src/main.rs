@@ -246,6 +246,13 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
     Ok(output.diagnostics.is_empty())
 }
 
+fn artifact_executable_name(windows: bool, backend: &str, output: &str) -> &'static str {
+    match (windows, backend, output) {
+        (true, "llvm", "native") => "main.exe",
+        _ => "main",
+    }
+}
+
 fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
@@ -284,7 +291,11 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         source_identity,
         llvm_input_identity,
     )?;
-    let executable = output_dir.join("main");
+    let executable = output_dir.join(artifact_executable_name(
+        cfg!(windows),
+        &artifact_profile.backend,
+        &artifact_profile.output,
+    ));
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
         identity,
@@ -1816,6 +1827,19 @@ mod routing_observations {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_windows_native_llvm_uses_an_exe_suffix() {
+        use super::artifact_executable_name;
+
+        assert_eq!(artifact_executable_name(true, "llvm", "native"), "main.exe");
+        assert_eq!(artifact_executable_name(false, "llvm", "native"), "main");
+        for output in ["wasm-wasip1", "wasm-wasip2", "wasm-web"] {
+            assert_eq!(artifact_executable_name(true, "llvm", output), "main");
+            assert_eq!(artifact_executable_name(false, "llvm", output), "main");
+        }
+        assert_eq!(artifact_executable_name(true, "custom", "native"), "main");
+    }
+
     use super::*;
 
     fn snapshot_test_path(name: &str) -> std::path::PathBuf {
