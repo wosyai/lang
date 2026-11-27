@@ -1752,7 +1752,12 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 (enumeration == expected).then_some((enumeration, *tag))
             });
             #[cfg(feature = "internal-checker")]
-            if !passive_literal && passive_integer.is_none() { passive_generation = generation + 1; }
+            let passive_scalar = passive_integer.is_some() || passive_float.is_some() || passive_enum.is_some()
+                || passive_receiver.is_some_and(|receiver| matches!((&receiver.ty, &binding.value),
+                    (ScalarType::Bool, ScalarExpression::Boolean { .. })
+                    | (ScalarType::Char, ScalarExpression::Char { .. })));
+            #[cfg(feature = "internal-checker")]
+            if !passive_literal && !passive_scalar { passive_generation = generation + 1; }
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures) && !passive_literal
                 && passive_float.is_none() && passive_integer.is_none() && passive_enum.is_none()
@@ -18607,6 +18612,10 @@ mod tests {
         let program = |claim: &str, barrier: &str| format!(r#"%%start
             u8[96] line=[{cells}];
             {barrier}
+            bool dirty=true;
+            f32 float_slot=-0.0;
+            enum copy Mode {{ idle; ready; }}
+            Mode mode=Mode::ready;
             u8[96] duplicate=line;
             u8[96][2] layer=[duplicate,line];
             u8[96][2][2] grid=[layer,layer];
