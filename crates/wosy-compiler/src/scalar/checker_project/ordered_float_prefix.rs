@@ -138,6 +138,41 @@ fn prepare_prefix<const GUARDED: bool>(
     (!planner.certificate.bindings.is_empty()).then_some(planner.certificate)
 }
 
+/// Authenticate the complete effect of a prepared zero-argument Bool guard.
+/// The ordered caller owns the position and returning alternatives. This
+/// receipt does not supply a predicate outcome, availability or a witness.
+pub(super) fn readonly_boolean_leaf(
+    project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
+    work: &mut usize,
+) -> Option<()> {
+    let mut planner = Planner { project, calls, owner: target.0, certificate: PrefixCertificate::default() };
+    let frame = planner.frame(target)?;
+    let body = frame.prepared;
+    let structure = &body.structure;
+    if !body.boundary.parameters.is_empty()
+        || !matches!(body.boundary.results.as_slice(), [output] if output.ty == ScalarType::Bool)
+        || !body.call_occurrences.is_empty() || !structure.checker_direct_targets.is_empty()
+        || !structure.checker_directives.is_empty() || !body.assignments.is_empty()
+        || !body.callable_escapes.is_empty() || !body.allocation_length_calls.is_empty()
+    { return None; }
+    super::super::checker_flow::charge_call_work(work, body.occurrences.len())?;
+    let (closed, dependencies) = planner.complete_callee(target)?;
+    if !dependencies.is_empty() || !closed.bindings.is_empty() { return None; }
+    // Keep the existing integer/Bool-only public guard lane. The camera's
+    // general float effects are not production evidence of guard outcomes.
+    for effect in &planner.certificate.effects {
+        let at = match effect.operation {
+            Effect::Sequence { at, .. } | Effect::Read { at, .. } | Effect::ShortCircuit { at, .. } => at,
+            _ => return None,
+        };
+        let ty = structure.checked_types.expressions.get(&at)?;
+        if !(*ty == ScalarType::Bool || is_integer_type(ty)) { return None; }
+        if matches!(&effect.operation, Effect::Sequence { operands, .. } if !operands.is_empty())
+            && *ty != ScalarType::Bool { return None; }
+    }
+    Some(())
+}
+
 impl<'a> Planner<'a> {
     fn frame(&self, target: PreparedCallable) -> Option<Frame<'a>> {
         if target.0 != self.owner { return None; }
@@ -379,8 +414,9 @@ impl<'a> Planner<'a> {
                                     { return None; }
                                     Work::Short(at, conjunction)
                                 }
-                                Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
-                                    if *ty == ScalarType::Bool && value_type(kind) => Work::Sequence(at, 2),
+                                Equal | NotEqual if *ty == ScalarType::Bool && value_type(kind) => Work::Sequence(at, 2),
+                                Less | LessEqual | Greater | GreaterEqual
+                                    if *ty == ScalarType::Bool && (is_integer_type(kind) || float_type(kind)) => Work::Sequence(at, 2),
                                 Add | Subtract | Multiply | Divide if float_type(ty) && kind == ty => Work::Sequence(at, 2),
                                 _ => return None,
                             };

@@ -11498,12 +11498,14 @@ fn mixed_guard_plan(
         ConditionalRegion::Value { condition, .. } => Some(*condition),
         _ => None,
     }).collect::<HashSet<_>>();
+    let mut work = 0;
+    let mut returning = HashSet::new();
     for site in body.structure.checker_direct_targets.keys().copied() {
         if !initialized || !guards.contains(&site)
             || !matches!(body.structure.checker_ordinary_booleans.get(&site),
                 Some(CheckerOrdinaryBoolean::Call(call)) if *call == site)
         { return None; }
-        check_readonly_bool_guard(project, calls, target, body, site)?;
+        check_readonly_bool_guard(project, calls, target, body, site, &mut returning, &mut work)?;
         plan.readonly_bool_calls.insert(site);
     }
     super::checker_flow::supports_mixed_float_guard_root(body, &plan).then_some(plan)
@@ -11513,8 +11515,8 @@ fn mixed_guard_plan(
 fn check_readonly_bool_guard(
     project: &ScalarProject, calls: &ProjectCallSiteResults, target: PreparedCallable,
     body: &FunctionCallSites, site: OccurrenceOrdinal,
+    returning: &mut HashSet<PreparedCallable>, work: &mut usize,
 ) -> Option<()> {
-    use super::reference::{NamedPlaceRootIdentity, OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
     let signature = body.checked_call_signatures.get(&site)?;
     if !signature.parameters.is_empty()
         || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Bool)
@@ -11529,94 +11531,9 @@ fn check_readonly_bool_guard(
     if *source != module.source || *declaration_span != function.name_span
         || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
     { return None; }
-    let leaf = calls.function_body(ordinal, item, None)?;
-    let structure = &leaf.structure;
-    if !leaf.boundary.parameters.is_empty() || leaf.contextual_formal().is_some()
-        || !matches!(leaf.boundary.results.as_slice(), [output] if output.ty == ScalarType::Bool)
-        || !leaf.call_occurrences.is_empty() || !structure.checker_direct_targets.is_empty()
-        || !structure.checker_directives.is_empty() || !leaf.assignments.is_empty()
-        || !leaf.callable_escapes.is_empty() || !leaf.allocation_length_calls.is_empty()
-    { return None; }
-    let [ScalarBlockItem::Expression(tail)] = function.body.items.as_slice() else { return None; };
-    let root = structure.blocks.get(structure.root.0)?;
-    let [item] = root.items.as_slice() else { return None; };
-    let BlockItemKind::FinalOutput(output) = item.kind else { return None; };
-    if root.unsafe_context || output.output != 0
-        || structure.checked_types.expressions.get(&output.expression)? != &ScalarType::Bool
-        || structure.edges.get(&(OccurrenceParent::Block(structure.root), OccurrenceEdge::FinalOutput {
-            item: output.item, output: 0,
-        })) != Some(&OccurrenceNode::Expression(output.expression))
-    { return None; }
-
-    let region = calls.initialization_region(ordinal)?;
-    let ModuleInitializationDetail::Occurrences(init) = &region.detail else { return None; };
-    let module_value = |span: &wosy_syntax::SourceSpan, expected: &ScalarType| {
-        (&span.source == source && init.structure.blocks.get(init.structure.root.0)?.items.iter()
-            .any(|row| matches!(&row.kind, BlockItemKind::Binding(binding)
-                if binding.receivers().iter().any(|receiver| receiver.span == span.range
-                    && receiver.contextual_storage.is_none() && super::scalar_type_equal(&receiver.ty, expected)))))
-            .then_some(())
-    };
-    let edges = &structure.edges;
-    let expression_child = |parent, edge| match edges.get(&(OccurrenceParent::Expression(parent), edge))? {
-        OccurrenceNode::Expression(child) => Some(*child),
-        _ => None,
-    };
-    let mut pending = vec![(output.expression, tail)];
-    while let Some((at, expr)) = pending.pop() {
-        let ty = structure.checked_types.expressions.get(&at)?;
-        if leaf.occurrences.get(at.0)?.span != super::typecheck::expression_span(expr)
-            || !(*ty == ScalarType::Bool || is_integer_type(ty))
-        { return None; }
-        match expr {
-            ScalarExpression::Name { .. } => {
-                let PlainNameIdentity::ModuleValue(span) = leaf.prepared_plain_name(at)? else { return None; };
-                module_value(span, ty)?;
-            }
-            ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {}
-            ScalarExpression::Binary { operator, left, right, .. } if *ty == ScalarType::Bool => {
-                let lhs = expression_child(at, OccurrenceEdge::BinaryLeft)?;
-                let rhs = expression_child(at, OccurrenceEdge::BinaryRight)?;
-                let kind = structure.checked_types.expressions.get(&lhs)?;
-                if structure.checked_types.expressions.get(&rhs)? != kind || !match operator {
-                    BinaryOperator::And | BinaryOperator::Or => *kind == ScalarType::Bool,
-                    BinaryOperator::Equal | BinaryOperator::NotEqual => *kind == ScalarType::Bool || is_integer_type(kind),
-                    BinaryOperator::Greater | BinaryOperator::GreaterEqual | BinaryOperator::Less | BinaryOperator::LessEqual => is_integer_type(kind),
-                    _ => false,
-                } { return None; }
-                // Verify every may-evaluated operand in original order. The
-                // predicate value is not used as a confirmed concrete path.
-                pending.push((rhs, right));
-                pending.push((lhs, left));
-            }
-            ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } if *ty == ScalarType::Bool => {
-                let operand_at = expression_child(at, OccurrenceEdge::UnaryOperand)?;
-                if structure.checked_types.expressions.get(&operand_at)? != &ScalarType::Bool { return None; }
-                pending.push((operand_at, operand));
-            }
-            ScalarExpression::IndexedRead { place, .. } => {
-                let super::ScalarPlace::Index { base, index, .. } = place else { return None; };
-                if !matches!(base.as_ref(), super::ScalarPlace::Name { .. }) { return None; }
-                let OccurrenceNode::Place(place) = edges.get(&(OccurrenceParent::Expression(at), OccurrenceEdge::ExpressionPlace))?
-                    else { return None; };
-                let parent = OccurrenceParent::Place(*place);
-                let OccurrenceNode::Place(base) = edges.get(&(parent, OccurrenceEdge::PlaceBase))? else { return None; };
-                let OccurrenceNode::Expression(index_at) = edges.get(&(parent, OccurrenceEdge::PlaceIndex))? else { return None; };
-                let base_type = structure.checked_types.places.get(base)?;
-                let ScalarType::Array { element, length, .. } = base_type else { return None; };
-                let constant = concrete_integer_literal(index)?;
-                if !super::scalar_type_equal(element, ty) || structure.checked_types.places.get(place)? != ty
-                    || structure.checked_types.expressions.get(index_at)? != &ScalarType::U64
-                    || leaf.occurrences.get(index_at.0)?.span != super::typecheck::expression_span(index)
-                    || u64::try_from(constant.as_ref()).ok().is_none_or(|index| index >= *length)
-                { return None; }
-                let NamedPlaceRootIdentity::ModuleValue(span) = leaf.prepared_named_place_root(*base)? else { return None; };
-                module_value(span, base_type)?;
-            }
-            _ => {
-                if !is_integer_type(ty) || !integer_literal_fits_type(concrete_integer_literal(expr)?.as_ref(), ty) { return None; }
-            }
-        }
+    if !returning.contains(&(ordinal, item)) {
+        ordered_float_prefix::readonly_boolean_leaf(project, calls, (ordinal, item), work)?;
+        returning.insert((ordinal, item));
     }
     Some(())
 }
