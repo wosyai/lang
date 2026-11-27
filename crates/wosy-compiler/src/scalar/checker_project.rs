@@ -420,6 +420,7 @@ struct CheckedInitialization<'a> {
     reached: HashSet<(usize, usize)>,
     ordinals: HashMap<&'a SourceIdentity, usize>,
     had_obligations: bool,
+    #[cfg(feature = "internal-checker")] projected_storage: super::checker_flow::ProjectedStorage,
 }
 
 fn has_callable_obligations(body: &FunctionCallSites) -> bool {
@@ -1073,7 +1074,7 @@ fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool,
 ) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let dormant = &project.modules[startup_count..];
-    let CheckedInitialization { visits, reached, ordinals, mut had_obligations } = initialization;
+    let CheckedInitialization { visits, reached, ordinals, mut had_obligations, .. } = initialization;
     let mut ordinary_local_callers = HashSet::new();
     let mut ordered_roots = if COLLECT {
         close_ordered_symbolic_roots(std::mem::take(&mut authored_roots), || {
@@ -1687,9 +1688,12 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
     }
     #[cfg(feature = "internal-checker")]
     let mut completed_passive = HashMap::new();
+    #[cfg(feature = "internal-checker")]
+    let mut projected_storage = super::checker_flow::ProjectedStorage::default();
     let outcome = walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
         project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures,
-        #[cfg(feature = "internal-checker")] &mut completed_passive);
+        #[cfg(feature = "internal-checker")] &mut completed_passive,
+        #[cfg(feature = "internal-checker")] &mut projected_storage);
     #[cfg(feature = "internal-checker")]
     if outcome.is_ok() {
         if let Some(tap) = failures.as_ref().and_then(|effects| effects.mixed_startup.as_ref()) {
@@ -1698,7 +1702,8 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
             }
         }
     }
-    (outcome.map(|_| CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }),
+    (outcome.map(|_| CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations,
+        #[cfg(feature = "internal-checker")] projected_storage }),
         actual.observer)
 }
 
@@ -1714,6 +1719,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
     source: &SourceIdentity,
     failures: &mut Option<&mut OrderedFailures>,
     #[cfg(feature = "internal-checker")] completed_passive: &mut CompletedPassiveStorage<'a>,
+    #[cfg(feature = "internal-checker")] projected_storage: &mut super::checker_flow::ProjectedStorage,
 ) -> Result<StartupLane, ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
     match visits[ordinal] {
@@ -1754,6 +1760,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             if walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(
                 project, calls, ordinals, visits, actual, target, failures,
                 #[cfg(feature = "internal-checker")] completed_passive,
+                #[cfg(feature = "internal-checker")] projected_storage,
             )? == StartupLane::Empty {
                 return Ok(StartupLane::Empty);
             }
@@ -1817,6 +1824,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 // Namespace completion alone does not guarantee a value is
                 // unchanged across a later executable initializer.
                 completed_passive.clear();
+                projected_storage.forget();
             }
             #[cfg(feature = "internal-checker")]
             if startup_trace_requested(failures) && !passive_literal && passive_return.is_none()
@@ -2016,6 +2024,20 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                 }
                 _ => return Err(ProjectCheck::Unsupported),
             };
+            #[cfg(feature = "internal-checker")]
+            if COLLECT {
+                let declaration = wosy_syntax::SourceSpan::new(source.clone(), receiver.span);
+                match &value {
+                    InitializerValue::Integer { ty, value } => projected_storage.observe_scalar(declaration, ty, value),
+                    InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
+                    InitializerValue::PassiveAggregate { ty, value, .. } => {
+                        if let Some(cells) = flat_passive_integer_array(value, ty) {
+                            projected_storage.observe_array(declaration, ty, cells.into_iter());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             storage.insert(receiver.span, value);
             continue;
         }
@@ -2027,6 +2049,28 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
         {
             passive_generation = generation + 1;
             completed_passive.clear();
+            if COLLECT && try_observed_projected_storage_call(actual, topology, source, *expression,
+                visits, projected_storage, failures)? {
+                for (span, value) in &mut storage {
+                    let declaration = wosy_syntax::SourceSpan::new(source.clone(), *span);
+                    match value {
+                        InitializerValue::Integer { ty, value } => {
+                            *value.to_mut() = projected_storage.exact_scalar(&declaration, ty)
+                                .ok_or(ProjectCheck::Unsupported)?.clone();
+                        }
+                        InitializerValue::FixedArray { ty, cells } => {
+                            *cells = projected_storage.exact_array(&declaration, ty).ok_or(ProjectCheck::Unsupported)?;
+                        }
+                        InitializerValue::PassiveAggregate { ty, .. } if matches!(ty, ScalarType::Array { element, .. } if is_integer_type(element)) => {
+                            let selected = projected_storage.exact_array(&declaration, ty).ok_or(ProjectCheck::Unsupported)?;
+                            *value = InitializerValue::FixedArray { ty, cells: selected };
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            projected_storage.forget();
         }
         if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(topology, actual, source, &storage, *expression, 0, failures, visits)? == StartupLane::Empty {
             return Ok(StartupLane::Empty);
@@ -2043,6 +2087,93 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
         if !storage.is_empty() { completed_passive.insert(ordinal, storage); }
     }
     Ok(StartupLane::Feasible)
+}
+
+#[cfg(feature = "internal-checker")]
+fn try_observed_projected_storage_call(
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    topology: &ModuleInitializationTopology,
+    source: &SourceIdentity,
+    site: OccurrenceOrdinal,
+    visits: &[InitializationVisit],
+    storage: &mut super::checker_flow::ProjectedStorage,
+    failures: &mut Option<&mut OrderedFailures>,
+) -> Result<bool, ProjectCheck> {
+    let Some(ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }) =
+        topology.call_targets.get(&site) else { return Ok(false); };
+    let Some(signature) = topology.checked_call_signatures.get(&site) else { return Ok(false); };
+    if &declaration.source != source || !signature.parameters.is_empty()
+        || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit) {
+        return Ok(false);
+    }
+    let (target, _, _, _) = actual.validated_direct_body(&topology.structure, site, source, declaration.range)?;
+    let body_of = |(module, item)| actual.calls.function_body(module, item, None);
+    // Keep existing authoring/reporting routes for this first storage cohort:
+    // only an ordinary state update, not a second source of diagnostics.
+    enum Event { Enter(PreparedCallable), Exit(PreparedCallable) }
+    let mut todo = vec![Event::Enter(target)];
+    let mut visiting = HashSet::new();
+    let mut complete = HashSet::new();
+    let mut writes_or_reads_storage = false;
+    while let Some(event) = todo.pop() {
+        match event {
+            Event::Enter(node) if !complete.contains(&node) => {
+                if !visiting.insert(node) { return Ok(false); }
+                let Some(body) = body_of(node) else { return Ok(false); };
+                let Some(has_storage) = super::checker_flow::projected_integer_storage_frame(body) else { return Ok(false); };
+                if has_callable_obligations(body) { return Ok(false); }
+                writes_or_reads_storage |= has_storage;
+                todo.push(Event::Exit(node));
+                for &child in body.structure.checker_direct_targets.values() {
+                    if child.0 != target.0 { return Ok(false); }
+                    todo.push(Event::Enter(child));
+                }
+            }
+            Event::Exit(node) => { visiting.remove(&node); complete.insert(node); }
+            _ => {}
+        }
+    }
+    if !writes_or_reads_storage { return Ok(false); }
+    if visits.get(target.0) != Some(&InitializationVisit::Started) { return Err(ProjectCheck::Unsupported); }
+    let work = std::cell::Cell::new(0);
+    let observed = std::cell::Cell::new(false);
+    let trace = failures.as_ref().and_then(|effects| effects.startup_search.clone());
+    if let Some(trace) = &trace {
+        let search = trace.borrow();
+        if !search.proof_free_scalar_initializers || search.proof_only_continuation() {
+            return Ok(false);
+        }
+    }
+    let span = wosy_syntax::SourceSpan::new(source.clone(), topology.occurrences.get(site.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span);
+    let mut record_return = |history: Vec<super::checker_flow::CallableHistoryStep>| {
+        use super::checker_flow::CallableHistoryStep;
+        use failure_search::PathStep;
+        let Some(trace) = &trace else { return Some(()); };
+        let mut search = trace.borrow_mut();
+        search.append(PathStep::Call(span.clone()))?;
+        for step in history {
+            let convert = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
+            let step = match step {
+                CallableHistoryStep::Branch(range, accepted) => PathStep::Branch { condition: convert(range), accepted },
+                CallableHistoryStep::Call(range) => PathStep::Call(convert(range)),
+                CallableHistoryStep::Return(range) => PathStep::Return(convert(range)),
+                CallableHistoryStep::MatchArm(range) => PathStep::MatchArm(convert(range)),
+                _ => return None, // This cohort never crosses source owners.
+            };
+            search.append(step)?;
+        }
+        search.append(PathStep::Return(span.clone()))
+    };
+    let mut current = Rc::new(std::mem::take(storage));
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)),
+        body_of, |parent, body, site, signature| {
+            symbolic_history_call_target(actual.project, actual.calls, parent.0, parent.1, body, site, signature)
+        }, |_, _, _| None);
+    if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    *storage = Rc::unwrap_or_clone(current);
+    Ok(true)
 }
 
 fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
@@ -2572,6 +2703,20 @@ enum PassiveLiteral<'a> {
     Nominal(&'a super::ScalarStructId, Box<[Self]>),
     // Share immutable semantic data, not Wosy locations or runtime storage.
     Copy(std::rc::Rc<Self>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn flat_passive_integer_array<'v>(mut value: &'v PassiveLiteral<'_>, ty: &ScalarType) -> Option<Vec<&'v BigInt>> {
+    let ScalarType::Array { element, length, .. } = ty else { return None; };
+    if !is_integer_type(element) { return None; }
+    while let PassiveLiteral::Copy(original) = value { value = original; }
+    let PassiveLiteral::Array(cells) = value else { return None; };
+    if u64::try_from(cells.len()).ok()? != *length { return None; }
+    cells.iter().map(|mut cell| {
+        while let PassiveLiteral::Copy(original) = cell { cell = original; }
+        let PassiveLiteral::Integer(actual, value) = cell else { return None; };
+        (element.as_ref() == *actual).then_some(value)
+    }).collect()
 }
 
 #[cfg(feature = "internal-checker")]
@@ -11884,7 +12029,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -22439,6 +22584,29 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.witness.axes().len(), 0);
             assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
             assert_eq!(failure.files()[1].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn selected_startup_receipt_sees_nested_scalar_and_array_effects_in_source_order() {
+        let app = source("src/main.w", "startup-ordered-integer-state");
+        let program = r#"%%start
+            i16 status = 5;
+            i16[2] checkpoints = [8, 13];
+            unit() record = fn { status = 37; checkpoints[0] = 41; };
+            unit() update = fn { record(); checkpoints[1] = 43; };
+            update();
+            core.narrow(false, { .stdout = ""; .stderr = ""; .code = status; .files = []; });
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, program), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            let ordinary = prepare().run().unwrap();
+            assert_eq!(ordinary.directives.len(), 1);
+            assert_eq!(ordinary.directives[0].code(), &BigInt::from(37));
         }
     }
 

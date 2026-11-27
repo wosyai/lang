@@ -1771,6 +1771,58 @@ struct ClosedRadixAxes {
     normalized: Option<[Option<Rc<IntegerSet>>; 3]>,
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ProjectedStorage {
+    // Whole cells are immutable until a write on this symbolic path.
+    // A canonical prepared declaration, not a spelling, identifies the allocation.
+    scalars: HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<IntegerSet>)>,
+    fixed_arrays: HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ProjectedStorage {
+    pub(super) fn forget(&mut self) { self.scalars.clear(); self.fixed_arrays.clear(); }
+
+    fn overwrite_scalar(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) -> Option<()> {
+        let (observed_type, cell) = self.scalars.get_mut(declaration)?;
+        if observed_type != ty { return None; }
+        *cell = Rc::new(IntegerSet::singleton(value));
+        Some(())
+    }
+
+    fn overwrite_array_element(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, index: usize, value: &BigInt) -> Option<()> {
+        let (ScalarType::Array { element, .. }, cells) = self.fixed_arrays.get_mut(declaration)? else { return None; };
+        if element.as_ref() != ty { return None; }
+        *Rc::make_mut(cells).get_mut(index)? = Rc::new(IntegerSet::singleton(value));
+        Some(())
+    }
+
+    pub(super) fn exact_scalar(&self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType) -> Option<&BigInt> {
+        let (observed, value) = self.scalars.get(declaration)?;
+        (ty == observed).then_some(())?;
+        value.singleton_value()
+    }
+
+    pub(super) fn exact_array(&self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType) -> Option<Vec<BigInt>> {
+        let (observed, cells) = self.fixed_arrays.get(declaration)?;
+        super::scalar_type_equal(ty, observed).then_some(())?;
+        cells.iter().map(|value| value.singleton_value().cloned()).collect()
+    }
+
+    pub(super) fn observe_scalar(&mut self, declaration: wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) {
+        self.scalars.insert(declaration, (ty.clone(), Rc::new(IntegerSet::singleton(value))));
+    }
+
+    pub(super) fn observe_array<'v>(&mut self, declaration: wosy_syntax::SourceSpan, ty: &ScalarType, cells: impl ExactSizeIterator<Item = &'v BigInt>) {
+        let ScalarType::Array { element, length, .. } = ty else { return; };
+        if !is_integer_type(element) || u64::try_from(cells.len()).ok() != Some(*length) { return; }
+        let cells = cells.map(|value| super::typecheck::integer_literal_fits_type(value, element)
+            .then(|| Rc::new(IntegerSet::singleton(value)))).collect::<Option<Vec<_>>>();
+        if let Some(cells) = cells { self.fixed_arrays.insert(declaration, (ty.clone(), Rc::new(cells))); }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
@@ -1781,6 +1833,8 @@ struct IntegerRow {
     #[cfg(feature = "internal-checker")]
     callable_history: usize,
     #[cfg(feature = "internal-checker")]
+    storage: Option<Rc<ProjectedStorage>>,
+    #[cfg(feature = "internal-checker")]
     closed_radix: Option<Rc<ClosedRadixAxes>>,
 }
 
@@ -1789,8 +1843,17 @@ impl IntegerRow {
         #[cfg(feature = "internal-checker")]
         callable_history: 0,
         #[cfg(feature = "internal-checker")]
+        storage: None,
+        #[cfg(feature = "internal-checker")]
         closed_radix: None,
     } }
+
+    fn has_projected_storage(&self) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { self.storage.is_some() }
+        #[cfg(not(feature = "internal-checker"))]
+        { false }
+    }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
         self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
@@ -2713,7 +2776,8 @@ impl IntegerInputs {
             let left = &mut self.0[0];
             let right = &other.0[0];
             let canonical = left.canonical_axis(axis);
-            if left.affine.is_none() && right.affine.is_none() && !left.has_closed_radix() && !right.has_closed_radix()
+            if !left.has_projected_storage() && !right.has_projected_storage()
+                && left.affine.is_none() && right.affine.is_none() && !left.has_closed_radix() && !right.has_closed_radix()
                 && left.projected_from == right.projected_from && left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
                 left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
@@ -2772,7 +2836,8 @@ impl IntegerInputs {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
         for row in rows {
-            if row.affine.is_some() || row.has_closed_radix() {
+            if row.has_projected_storage() || row.affine.is_some() || row.has_closed_radix() {
+                // Keep a value row attached to its exact storage version.
                 joined.0.push(row);
                 continue;
             }
@@ -2904,6 +2969,32 @@ impl IntegerInputs {
                 })
         })
     }
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn compaction_keeps_branch_specific_module_cells_with_their_input_domain() {
+    use wosy_syntax::{SourceIdentity, SourceSpan};
+    let declaration = SourceSpan::new(
+        SourceIdentity { project: "local".into(), package: "app".into(), path: "src/main.w".into(), revision: "storage-join".into() },
+        super::ByteSpan { start: 8, end: 9 },
+    );
+    let make_row = |entry: u8, stored: u8| {
+        let mut storage = ProjectedStorage::default();
+        storage.observe_scalar(declaration.clone(), &ScalarType::U8, &BigInt::from(stored));
+        let mut row = IntegerRow::new(vec![Rc::new(IntegerSet::singleton(&BigInt::from(entry)))]);
+        row.storage = Some(Rc::new(storage));
+        row
+    };
+    let input = IntegerInputs(vec![make_row(0, 11)]).join_equal(IntegerInputs(vec![make_row(1, 37)]), Some(0));
+    assert_eq!(input.0.len(), 2);
+    let compacted = IntegerInputs::compact_axis(input.0, 0);
+    let actual = compacted.0.iter().map(|row| {
+        let inputs = row.cells[0].singleton_value().unwrap().clone();
+        let output = row.storage.as_ref().unwrap().scalars[&declaration].1.singleton_value().unwrap().clone();
+        (inputs, output)
+    }).collect::<Vec<_>>();
+    assert_eq!(actual, [(BigInt::from(0), BigInt::from(11)), (BigInt::from(1), BigInt::from(37))]);
 }
 
 fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
@@ -3854,6 +3945,7 @@ pub(super) enum CallableHistoryCompletion {
 
 #[cfg(feature = "internal-checker")]
 pub(super) struct UnitHistoryPiece {
+    storage: Option<Rc<ProjectedStorage>>,
     domains: Vec<Rc<IntegerSet>>,
     steps: ReturnHistory,
 }
@@ -7286,7 +7378,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
                     let domains = row.cells.get(..arity)?;
                     let cost = domains.iter().try_fold(arity, |cost, domain| cost.checked_add(domain.interval_count()))?;
                     tracker.charge(cost)?;
-                    pieces.push(UnitHistoryPiece { domains: domains.to_vec(), steps: tracker.retained(row.callable_history)? });
+                    pieces.push(UnitHistoryPiece { storage: row.storage.clone(), domains: domains.to_vec(), steps: tracker.retained(row.callable_history)? });
                 }
                 tracker.unit_return_paths = Some(pieces);
             }
@@ -8553,6 +8645,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 if piece.domains.len() != domains_count { return None; }
                                 tracker.charge(original.len().saturating_add(1))?;
                                 let mut next = original.clone();
+                                next.storage = piece.storage;
                                 let mut applied = HashMap::<usize, Rc<IntegerSet>>::new();
                                 for (operand, domain) in operands.iter().copied().zip(piece.domains) {
                                     tracker.charge(domain.interval_count().saturating_add(1))?;
@@ -8993,6 +9086,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.callable_history.is_some() {
+                    if let Some(write) = projected_integer_storage_write(calls, group) {
+                        for row in &mut path.0 {
+                            write.apply(Rc::make_mut(row.storage.as_mut()?))?;
+                        }
+                        continue;
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
                 if roots.allow_extended_scalar_locals && roots.allow_ordinary_contextual_places
                     && matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
                 {
@@ -9146,6 +9248,22 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 path = path.overwrite(axis, value, preserve_entry);
             }
             BlockItemKind::Binding(ref binding) => {
+                #[cfg(feature = "internal-checker")]
+                if roots.callable_history.is_some() {
+                    if let ([receiver], BindingInitialization::Outputs(outputs)) = (binding.receivers(), &binding.initialization) {
+                        if receiver.contextual_storage.is_none() && outputs.secondary.is_empty() && is_integer_type(&receiver.ty) {
+                            if let Some(place) = projected_integer_storage_read(calls, outputs.primary, &receiver.ty) {
+                                let identity = structure.checker_integer_locals.get(&(block, item.position))?;
+                                for row in &mut path.0 {
+                                    let value = place.read(row.storage.as_deref()?)?;
+                                    row.cells.push(Rc::clone(value));
+                                }
+                                roots.add(identity, &receiver.ty);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if USE_IMPORTED_BOUND && block == structure.root
                     && imports.first().and_then(Option::as_ref).is_some_and(|local| local.position == item.position)
                 {
@@ -11923,6 +12041,146 @@ fn checked_literal_assignment(
 ) -> Option<(&ReferenceBindingId, &ScalarType, &BigInt)> {
     let (binding, ty, rhs, _) = checked_scalar_assignment(calls, position)?;
     Some((binding, ty, calls.structure.checker_integer_literals.get(&rhs)?))
+}
+
+// Verify complete coverage before any stateful call is selected. A known
+// declaration alone does not authorize all its uses (e.g. taking its address).
+#[cfg(feature = "internal-checker")]
+pub(super) fn projected_integer_storage_frame(calls: &FunctionCallSites) -> Option<bool> {
+    use super::reference::ModuleStorageRole;
+    if !calls.checker_returns_unit() || calls.contextual_formal().is_some()
+        || !calls.arms.is_empty() || !calls.callable_escapes.is_empty()
+        || !calls.allocation_length_calls.is_empty()
+        || calls.structure.blocks.iter().any(|block| block.unsafe_context)
+        || !calls.structure.checker_selected_snapshots.is_empty()
+        || !calls.structure.checker_ordinary_directive_calls.is_empty()
+        || calls.boundary.parameters.iter().any(|parameter| !is_integer_type(&parameter.ty))
+        || calls.call_occurrences.iter().any(|site| !calls.structure.checker_direct_targets.contains_key(&site.ordinal)) {
+        return None;
+    }
+    let mut covered = std::collections::HashSet::new();
+    let mut writes = false;
+    for (ordinal, block) in calls.structure.blocks.iter().enumerate() {
+        for item in &block.items {
+            match &item.kind {
+                BlockItemKind::Assignment { group } => {
+                    let write = projected_integer_storage_write(calls, *group)?;
+                    let assignment = calls.assignments.get(&(group.block, group.item))?;
+                    let [destination] = assignment.destinations().as_slice() else { return None; };
+                    let site = if write.index.is_some() {
+                        let Some(OccurrenceNode::Place(base)) = calls.structure.edges.get(&(
+                            OccurrenceParent::Place(destination.destination), OccurrenceEdge::PlaceBase,
+                        )) else { return None; };
+                        *base
+                    } else { destination.destination };
+                    covered.insert((write.declaration.clone(), site, ModuleStorageRole::Replace));
+                    writes = true;
+                }
+                BlockItemKind::Binding(binding) => {
+                    let ([receiver], BindingInitialization::Outputs(outputs)) =
+                        (binding.receivers(), &binding.initialization) else { return None; };
+                    if receiver.contextual_storage.is_some() || !outputs.secondary.is_empty() { return None; }
+                    if let Some(read) = projected_integer_storage_read(calls, outputs.primary, &receiver.ty) {
+                        if !is_integer_type(&receiver.ty)
+                            || !calls.structure.checker_integer_locals.contains_key(&(BlockOrdinal(ordinal), item.position)) { return None; }
+                        covered.insert((read.declaration.clone(), read.site, if read.index.is_some() { ModuleStorageRole::Project } else { ModuleStorageRole::Read }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !calls.structure.module_storage_uses.iter().all(|(declaration, uses)|
+        uses.iter().all(|(site, role)| covered.contains(&(declaration.clone(), *site, *role)))) {
+        return None;
+    }
+    Some(writes || !covered.is_empty())
+}
+
+#[cfg(feature = "internal-checker")]
+struct ProjectedIntegerStoragePlace<'a> {
+    site: OccurrenceOrdinal,
+    declaration: &'a wosy_syntax::SourceSpan,
+    index: Option<usize>,
+    ty: &'a ScalarType,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ProjectedIntegerStoragePlace<'_> {
+    fn read<'s>(&self, storage: &'s ProjectedStorage) -> Option<&'s Rc<IntegerSet>> {
+        match self.index {
+            Some(index) => {
+                let (ScalarType::Array { element, .. }, cells) = storage.fixed_arrays.get(self.declaration)? else { return None; };
+                if element.as_ref() != self.ty { return None; }
+                cells.get(index)
+            }
+            None => {
+                let (observed, cell) = storage.scalars.get(self.declaration)?;
+                (observed == self.ty).then_some(cell)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn projected_integer_storage_read<'a>(calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, ty: &'a ScalarType) -> Option<ProjectedIntegerStoragePlace<'a>> {
+    if calls.structure.checked_types.expressions.get(&expression)? != ty { return None; }
+    if let Some(PlainNameIdentity::ModuleValue(declaration)) = calls.prepared_plain_name(expression) {
+        return Some(ProjectedIntegerStoragePlace { site: expression, declaration, index: None, ty });
+    }
+    let Some(OccurrenceNode::Place(place)) = calls.structure.edges.get(&(
+        OccurrenceParent::Expression(expression), OccurrenceEdge::ExpressionPlace,
+    )) else { return None; };
+    projected_integer_storage_index(calls, *place, ty)
+}
+
+#[cfg(feature = "internal-checker")]
+fn projected_integer_storage_index<'a>(calls: &'a FunctionCallSites, site: OccurrenceOrdinal, ty: &'a ScalarType) -> Option<ProjectedIntegerStoragePlace<'a>> {
+    use super::reference::NamedPlaceRootIdentity;
+    let parent = OccurrenceParent::Place(site);
+    let Some(OccurrenceNode::Place(base)) = calls.structure.edges.get(&(parent, OccurrenceEdge::PlaceBase)) else { return None; };
+    let Some(OccurrenceNode::Expression(index)) = calls.structure.edges.get(&(parent, OccurrenceEdge::PlaceIndex)) else { return None; };
+    let Some(NamedPlaceRootIdentity::ModuleValue(declaration)) = calls.prepared_named_place_root(*base) else { return None; };
+    let Some(ScalarType::Array { element, .. }) = calls.structure.checked_types.places.get(base) else { return None; };
+    if element.as_ref() != ty { return None; }
+    if calls.structure.checked_types.places.get(&site)? != ty || calls.structure.checked_types.expressions.get(index)? != &ScalarType::U64 { return None; }
+    let index = usize::try_from(calls.structure.checker_integer_literals.get(index)?).ok()?;
+    Some(ProjectedIntegerStoragePlace { site: *base, declaration, index: Some(index), ty })
+}
+
+#[cfg(feature = "internal-checker")]
+struct ProjectedIntegerStorageWrite<'a> {
+    declaration: &'a wosy_syntax::SourceSpan,
+    index: Option<usize>,
+    ty: &'a ScalarType,
+    value: &'a BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ProjectedIntegerStorageWrite<'_> {
+    fn apply(&self, storage: &mut ProjectedStorage) -> Option<()> {
+        match self.index {
+            Some(index) => storage.overwrite_array_element(self.declaration, self.ty, index, self.value),
+            None => storage.overwrite_scalar(self.declaration, self.ty, self.value),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn projected_integer_storage_write(calls: &FunctionCallSites, position: BlockPosition) -> Option<ProjectedIntegerStorageWrite<'_>> {
+    let group = calls.assignments.get(&(position.block, position.item))?;
+    let [rhs] = group.rhs_evaluations().as_slice() else { return None; };
+    let [destination] = group.destinations().as_slice() else { return None; };
+    if group.projected_outputs().len() != 0 { return None; }
+    let AssignmentReplacement::Resolved(ty) = &destination.replacement else { return None; };
+    let value = calls.structure.checker_integer_literals.get(&rhs.expression)?;
+    if !is_integer_type(ty) || !super::typecheck::integer_literal_fits_type(value, ty) { return None; }
+    let site = destination.destination;
+    if let Some(DirectDestinationIdentity::Module(declaration)) = calls.prepared_direct_destination(site) {
+        return Some(ProjectedIntegerStorageWrite { declaration, index: None, ty, value });
+    }
+    let place = projected_integer_storage_index(calls, site, ty)?;
+    Some(ProjectedIntegerStorageWrite { declaration: place.declaration, index: place.index, ty, value })
 }
 
 pub(super) fn checked_scalar_assignment(

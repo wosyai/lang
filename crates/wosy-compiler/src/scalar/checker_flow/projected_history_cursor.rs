@@ -67,6 +67,7 @@ enum Outcome<'a> { Park(ExactCallEffect<'a>), Return(CallableHistoryCall) }
 
 pub(in super::super) fn drive_finite_history<'p>(
     root: Target, work: &Cell<usize>, observed: &Cell<bool>,
+    mut actual_storage: Option<(&mut Rc<ProjectedStorage>, &mut dyn FnMut(Vec<CallableHistoryStep>) -> Option<()>)>,
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
     mut record: impl FnMut(Target, IntegerCheckFailure<'_>, Vec<CallableHistoryStep>) -> Option<bool>,
@@ -75,7 +76,14 @@ pub(in super::super) fn drive_finite_history<'p>(
         shared: true, work, nodes: Vec::new(), interned: HashMap::new(), step_owner: None, stopped: false,
         outgoing_call: None, scalar_return_steps: None, unit_return_arity: None, unit_return_paths: None, received_unit_paths: None,
     });
-    let mut stack = vec![Frame { target: root, machine: Machine::enter(body_of(root)?, &histories, None)?, pending: None }];
+    let body = body_of(root)?;
+    let entry = if let Some((storage, _)) = actual_storage.as_ref() {
+        if !body.boundary.parameters.is_empty() || !body.checker_returns_unit() { return None; }
+        let mut row = IntegerRow::new(Vec::new());
+        row.storage = Some(Rc::clone(storage));
+        Some(CallableHistoryEntry(row))
+    } else { None };
+    let mut stack = vec![Frame { target: root, machine: Machine::enter(body, &histories, entry)?, pending: None }];
     loop {
         let frame = stack.last_mut()?;
         let target = frame.target;
@@ -111,7 +119,9 @@ pub(in super::super) fn drive_finite_history<'p>(
                     }
                     _ => return None,
                 };
-                entry.0.callable_history = path.0.first()?.callable_history;
+                let caller_row = path.0.first()?;
+                entry.0.callable_history = caller_row.callable_history;
+                entry.0.storage = caller_row.storage.clone();
                 drop(tracker);
                 let child = resolve(target, body, site, signature)?;
                 pending.row += 1;
@@ -162,7 +172,7 @@ pub(in super::super) fn drive_finite_history<'p>(
                         for row in path.0 {
                             let domains = row.cells.get(..roots.parameters)?;
                             histories.borrow().charge(domains.iter().map(|d| 1+d.interval_count()).sum())?;
-                            pieces.push(UnitHistoryPiece { domains: domains.to_vec(), steps: ReturnHistory::Shared(row.callable_history) });
+                            pieces.push(UnitHistoryPiece { storage: row.storage, domains: domains.to_vec(), steps: ReturnHistory::Shared(row.callable_history) });
                         }
                         Outcome::Return(CallableHistoryCall::UnitPartitions(pieces))
                     }
@@ -189,7 +199,16 @@ pub(in super::super) fn drive_finite_history<'p>(
             Outcome::Return(receipt) => {
                 stack.pop()?;
                 if let Some(parent) = stack.last_mut() { parent.pending.as_mut()?.receipts.push_back(receipt); }
-                else { return Some(CallableHistoryCompletion::Exhausted(observed.get())); }
+                else {
+                    if let Some((storage, record_return)) = actual_storage.take() {
+                        let CallableHistoryCall::UnitPartitions(pieces) = receipt else { return None; };
+                        let [piece] = pieces.as_slice() else { return None; };
+                        let ReturnHistory::Shared(node) = piece.steps else { return None; };
+                        record_return(histories.borrow().steps(node)?)?;
+                        *storage = Rc::clone(piece.storage.as_ref()?);
+                    }
+                    return Some(CallableHistoryCompletion::Exhausted(observed.get()));
+                }
             }
         }
     }
