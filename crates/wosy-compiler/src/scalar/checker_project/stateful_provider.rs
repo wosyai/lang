@@ -113,47 +113,76 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
 }
 
 #[derive(Clone,Copy)]
-pub(super) struct RangeRank { begin:usize, finish:usize }
+enum RangeBound { Formal(usize), Literal(i32) }
 
-/// Tie a structurally terminal source recurrence to its checked two-formal
-/// comparison and replacement edges. Runtime still checks the live rank.
-pub(super) fn advancing_range_plan(body:&FunctionCallSites, target:PreparedCallable, condition:OccurrenceOrdinal) -> Option<RangeRank> {
+#[derive(Clone,Copy)]
+pub(super) struct RangeRank { begin:usize, finish:RangeBound }
+
+/// Locate the unique terminal self-edge through prepared Unit branches.
+/// Only an enclosing admitted comparison can authorize the advancing axis.
+pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallable) -> Option<RangeRank> {
     let st=&body.structure;
     let ids=body.boundary.checker_parameter_bindings.as_deref()?;
-    if ids.len()!=2 || !body.boundary.parameters.iter().all(|p| p.ty==ScalarType::I32) { return None; }
-    let cut=body.short_circuits.get(&condition)?;
-    if !cut.evaluate_right_when || cut.bypass { return None; }
-    let (left,BinaryOperator::Less,right)=st.prepared_range_binary.get(&cut.left)? else { return None; };
+    if !body.checker_returns_unit() || ids.len()!=2 || has_callable_obligations(body)
+        || !body.boundary.parameters.iter().all(|p| p.ty==ScalarType::I32) { return None; }
+    let mut sites=st.checker_direct_targets.iter().filter_map(|(&site,&child)| (child==target).then_some(site));
+    let backedge=sites.next()?;
+    if sites.next().is_some() { return None; }
     let formal=|at| match body.prepared_plain_name(at)? {
         PlainNameIdentity::Lexical(id)=>ids.iter().position(|p| p==id),
         _=>None,
     };
-    let (begin,finish)=(formal(*left)?,formal(*right)?);
-    if begin==finish { return None; }
-    let [item]=st.blocks.get(st.root.0)?.items.as_slice() else { return None; };
-    let BlockItemKind::Evaluation { expression }=item.kind else { return None; };
-    let ConditionalRegion::Unit { condition:actual,then_block,.. }=body.conditionals.get(&expression)? else { return None; };
-    if *actual!=condition { return None; }
-    let BlockItemKind::Evaluation { expression:backedge }=st.blocks.get(then_block.0)?.items.last()?.kind else { return None; };
-    if st.checker_direct_targets.get(&backedge)!=Some(&target)
-        || st.checker_direct_targets.iter().any(|(&site,&child)| child==target && site!=backedge) { return None; }
     let argument=|slot| match st.edges.get(&(OccurrenceParent::Expression(backedge),OccurrenceEdge::CallArgument(slot)))? {
         OccurrenceNode::Expression(at)=>Some(*at), _=>None,
     };
-    let (old,BinaryOperator::Add,one)=st.prepared_range_binary.get(&argument(begin)?)? else { return None; };
-    if formal(*old)!=Some(begin) || formal(argument(finish)?)!=Some(finish)
-        || st.prepared_range_literals.get(one)?!=&BigInt::from(1)
-        || st.checked_types.expressions.get(&argument(begin)?)?!=&ScalarType::I32
-    { return None; }
-    Some(RangeRank { begin,finish })
+    let (begin,old)= (0..ids.len()).find_map(|slot| {
+        let arg=argument(slot)?;
+        let (old,BinaryOperator::Add,one)=st.prepared_range_binary.get(&arg)? else { return None; };
+        (formal(*old)==Some(slot) && st.prepared_range_literals.get(one)?==&BigInt::from(1)
+            && st.checked_types.expressions.get(&arg)?==&ScalarType::I32).then_some((slot,*old))
+    })?;
+    let bound=|mut condition| {
+        // A positive conjunction proves its left predicate before any right
+        // effects. The path must actually select its true branch below.
+        while let Some(cut)=body.short_circuits.get(&condition) {
+            if !cut.evaluate_right_when || cut.bypass { return None; }
+            condition=cut.left;
+        }
+        let (left,BinaryOperator::Less,right)=st.prepared_range_binary.get(&condition)? else { return None; };
+        if formal(*left)!=formal(old) || st.checked_types.expressions.get(right)?!=&ScalarType::I32 { return None; }
+        if let Some(slot)=formal(*right) {
+            (slot!=begin && formal(argument(slot)?)==Some(slot)).then_some(RangeBound::Formal(slot))
+        } else {
+            Some(RangeBound::Literal(i32::try_from(st.prepared_range_literals.get(right)?).ok()?))
+        }
+    };
+    let mut pending=vec![(st.root,None)];
+    while let Some((block,limit))=pending.pop() {
+        let Some(item)=st.blocks.get(block.0)?.items.last() else { continue; };
+        let BlockItemKind::Evaluation {expression}=item.kind else { continue; };
+        if expression==backedge { return Some(RangeRank {begin,finish:limit?}); }
+        if st.checked_types.expressions.get(&expression)!=Some(&ScalarType::Unit) { continue; }
+        match body.conditionals.get(&expression) {
+            Some(ConditionalRegion::Unit {condition,then_block,..})=>
+                pending.push((*then_block,bound(*condition).or(limit))),
+            Some(ConditionalRegion::Value {condition,then_block,else_block,..})=>{
+                pending.push((*else_block,limit));
+                pending.push((*then_block,bound(*condition).or(limit)));
+            }
+            None=>{}
+        }
+    }
+    None
 }
 
 impl RangeRank {
     fn decreases(self, slots:&HashMap<ReferenceBindingId,ExactValue>,ids:&[ReferenceBindingId],args:&[ExactValue]) -> Option<()> {
         let begin=rank_value(slots.get(ids.get(self.begin)?)?)?;
-        let finish=rank_value(slots.get(ids.get(self.finish)?)?)?;
         let next=rank_value(args.get(self.begin)?)?;
-        let next_finish=rank_value(args.get(self.finish)?)?;
+        let (finish,next_finish)=match self.finish {
+            RangeBound::Formal(slot)=>(rank_value(slots.get(ids.get(slot)?)?)?,rank_value(args.get(slot)?)?),
+            RangeBound::Literal(value)=>(value,value),
+        };
         // Compute the true mathematical distance in i64, not a potentially
         // overflowing difference in the source i32 coordinate type.
         let distance=i64::from(finish)-i64::from(begin);
@@ -176,16 +205,22 @@ pub(super) fn needs_unit_runner(body:&FunctionCallSites) -> bool {
                 && observed_f32_array::typed_place(body,destination.destination,&ScalarType::U16).is_some()))
 }
 
-/// Restrict productive recursion to a prepared chain that actually carries
-/// a completed owner's U16 storage effect. A syntactic edge is not an
-/// execution fact; every selected call is checked again by the cursor.
+/// Restrict new recursive entries to a prepared chain with completed-owner
+/// storage: a U16 provider handoff or an authenticated F32 backing write.
+/// A syntactic edge is not an execution fact; the cursor checks each call.
 pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCallSiteResults,start:PreparedCallable,
-    visits:&[InitializationVisit]) -> bool {
+    visits:&[InitializationVisit], completed_local_f32:bool) -> bool {
     let mut seen=HashSet::new();
     let mut pending=vec![start];
     while let Some(target)=pending.pop() {
         if !seen.insert(target) { continue; }
         let Some(body)=calls.function_body(target.0,target.1,None) else { continue; };
+        if completed_local_f32 && target.0==start.0 && body.assignments.values().any(|group|
+            group.destinations().any(|destination|
+                matches!(destination.replacement,AssignmentReplacement::Resolved(ScalarType::F32))
+                    && observed_f32_array::typed_place(body,destination.destination,&ScalarType::F32).is_some())) {
+            return true;
+        }
         for (&site,&child) in &body.structure.checker_direct_targets {
             if child==target { continue; }
             let Some(signature)=body.checked_call_signatures.get(&site) else { continue; };
@@ -211,6 +246,7 @@ pub(super) struct Dispatch<'a> {
     declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
     pure_plans:HashMap<PreparedCallable,Option<(ordered_float_prefix::PrefixCertificate,ordered_float_prefix::FunctionEffects)>>,
     latest_pure:HashMap<PreparedCallable,(Vec<u32>,ExactValue,Option<Rc<ObservedTrace>>)>,
+    range_ranks:HashMap<PreparedCallable,Option<RangeRank>>,
 }
 
 pub(super) fn run<'a>(
@@ -498,7 +534,9 @@ pub(super) fn run<'a>(
                 }
                 let rank=if child==frame.target {
                     let bindings=body.boundary.checker_parameter_bindings.as_deref()?;
-                    if let Some(rank)=ranges.get(&child) {
+                    if out.ty==ScalarType::Unit {
+                        let rank=ranges.get(&child).copied().or_else(||
+                            *dispatch.range_ranks.entry(child).or_insert_with(|| advancing_range_plan(body,child)))?;
                         rank.decreases(&frame.slots,bindings,&args)?;
                         None
                     } else {

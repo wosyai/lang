@@ -1869,11 +1869,24 @@ impl ProjectedStorage {
         Some(())
     }
 
+    pub(super) fn observed_flat_i32(&self,cell:&observed_f32_array::Cell) -> Option<i32> {
+        let [index]=cell.indices.as_ref() else { return None; };
+        let index=usize::try_from(*index).ok()?;
+        let (ScalarType::Array {element,..},cells)=self.fixed_arrays.get(&cell.declaration)? else { return None; };
+        if **element!=ScalarType::I32 { return None; }
+        let known=cells.get(index)?;
+        let current=self.changes.get(&(cell.declaration.clone(),Some(index))).unwrap_or(known);
+        i32::try_from(current.singleton_value()?).ok()
+    }
+
     pub(super) fn observed_i32_array_element(&self, cell: &observed_f32_array::Cell) -> Option<i32> {
         self.i32_array_updates.get(cell).copied()
     }
 
     pub(super) fn overwrite_i32_array_element(&mut self, cell: observed_f32_array::Cell, value: i32) -> Option<()> {
+        if let [index]=cell.indices.as_ref() {
+            return self.overwrite_array_element(&cell.declaration,&ScalarType::I32,usize::try_from(*index).ok()?,&value.into());
+        }
         if !self.has_observed_aggregate(&cell.declaration) { return None; }
         self.i32_array_updates.insert(cell,value);
         Some(())

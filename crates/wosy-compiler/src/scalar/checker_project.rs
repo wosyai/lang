@@ -2298,13 +2298,17 @@ fn try_observed_projected_storage_call(
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
                 observed_owners.insert(body as *const FunctionCallSites,node.0);
-                if node.0!=target.0 && visits.get(node.0)==Some(&InitializationVisit::Completed)
-                    && stateful_provider::needs_unit_runner(body) {
-                    provider_units.insert(node);
-                    writes_or_reads_storage = true;
-                    visiting.remove(&node);
-                    complete.insert(node);
-                    continue;
+                if node.0!=target.0 && visits.get(node.0)==Some(&InitializationVisit::Completed) {
+                    let padding=stateful_provider::advancing_range_plan(body,node).filter(|_|
+                        stateful_provider::qualified_store_reachable(actual.project,actual.calls,node,visits,true));
+                    if stateful_provider::needs_unit_runner(body) || padding.is_some() {
+                        if let Some(rank)=padding { productive_ranges.insert(node,rank); }
+                        provider_units.insert(node);
+                        writes_or_reads_storage = true;
+                        visiting.remove(&node);
+                        complete.insert(node);
+                        continue;
+                    }
                 }
                 if node != target {
                     let recursive_sites = body.structure.checker_direct_targets.iter()
@@ -2316,8 +2320,8 @@ fn try_observed_projected_storage_call(
                             let Some(getter) = admit_getter(node,body,site,child,signature) else { return Ok(false); };
                             getters.insert((body as *const FunctionCallSites,site),getter);
                         }
-                        if let Some(rank)=stateful_provider::advancing_range_plan(body,node,condition).filter(|_|
-                            stateful_provider::qualified_store_reachable(actual.project,actual.calls,node,visits)) {
+                        if let Some(rank)=stateful_provider::advancing_range_plan(body,node).filter(|_|
+                            stateful_provider::qualified_store_reachable(actual.project,actual.calls,node,visits,false)) {
                             productive_ranges.insert(node,rank);
                             provider_units.insert(node);
                             writes_or_reads_storage=true;
@@ -2388,6 +2392,9 @@ fn try_observed_projected_storage_call(
     };
     let read_array_atom = |storage: &super::checker_flow::ProjectedStorage,
         cell: &super::checker_flow::observed_f32_array::Cell, ty:&ScalarType| {
+        if *ty==ScalarType::I32 && cell.indices.len()==1 {
+            return storage.observed_flat_i32(cell).map(|value|(ObservedExactValue::Integer(ScalarType::I32,value.into()),1));
+        }
         if !storage.has_observed_aggregate(&cell.declaration) { return None; }
         let overlay = match ty {
             ScalarType::F32 => storage.observed_f32_array_element(cell).map(ObservedExactValue::F32),
@@ -25246,6 +25253,106 @@ unit(u8) parent = fn(a) {
             assert_eq!(recursions,3);
             assert!(matches!(prepare(&outside).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             eprintln!("Orbital original moving_partition {target_layout:?}: 3 strictly decreasing live steps, indices [37,37,38], unique 2, no out-of-bounds outcome");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_prepared_mask_packs_selected_slots_before_original_padding() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        use super::super::checker_flow::take_observed_u16_writes as writes;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let range=fragment("unit(i32,i32) index_range=", "unit(i32,i32) static_partition=");
+        let moving=fragment("unit(i32) moving_partition=", "i32(i32,i32) pack_moving=");
+        let prepared=fragment("unit(i32,i32) pack_prepared=", "f32 r =");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let text=format!(r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            {mesh}
+            i32 count=4098;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32[5] motion_first=[4098,0,4101,0,0];
+            i32[5] motion_size=[3,0,3,0,0];
+            i32[5] motion_base=[37,0,45,0,0];
+            i32[5] motion_unique=[0,77,0,0,0];
+            i32 first=0; i32 skipped=0; i32 second=0;
+            i32 before_pad=0; i32 after_pad=0; i32 after_retry=0; i32 flag=0;
+            {pt}
+            {range}
+            {moving}
+            {prepared}
+            unit() launch=fn {{
+                packing.start();
+                pt(1.125,-2.25,3.5,-4.5); pt(1.125,-2.25,3.5,-4.5); pt(9.125,-2.25,3.5,-4.5);
+                pt(3.125,-2.25,3.5,-4.5); pt(4.125,-2.25,3.5,-4.5); pt(4.125,-2.25,3.5,-4.5);
+                pack_prepared(5,0);
+                first=motion_unique[0]; skipped=motion_unique[1]; second=motion_unique[2];
+                before_pad=packing.end();
+                packing.pad(45,46);
+                after_pad=packing.end();
+                index_vertex(4104,1,0,0,5);
+                after_retry=packing.end();
+                packing.pad(46,45);
+                if(packing.ok()){{flag=1;}};
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=after_retry;.files=[
+                {{.path="first.json";.state=first;}},{{.path="skipped.json";.state=skipped;}},
+                {{.path="second.json";.state=second;}},{{.path="before.json";.state=before_pad;}},
+                {{.path="after.json";.state=after_pad;}},{{.path="ok.json";.state=flag;}}
+            ];}});
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-original-prepared-mask");
+        let provider=source("src/indexed-pack.w","pinned-orbital-original-pad-provider");
+        fn span(source:&SourceIdentity,text:&str,snippet:&str)->SourceSpan {
+            let start=text.find(snippet).unwrap() as u32;
+            SourceSpan::new(source.clone(),ByteSpan::new(start,start+snippet.len() as u32))
+        }
+        let ns=span(&app,&text,r#"packing=namespace demo "indexed-pack.w";"#);
+        let next_mask=span(&app,&text,"pack_prepared(mask/2,id+1)");
+        let pad_call=span(&app,&text,"packing.pad(45,46)");
+        let next_pad=span(&provider,&packing,"pad(lo+1,hi)");
+        let zero_vertex=span(&provider,&packing,"write_vertex(lo,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0)");
+        let check_writes=|| {
+            let items=writes();
+            assert_eq!(items.len(),7);
+            for ((cell,value),(index,expected)) in items.iter().zip([(2,37),(3,37),(4,38),(5,45),(6,46),(7,46),(8,47)]) {
+                assert_eq!(cell.declaration.source,provider);
+                assert_eq!(cell.indices.as_ref(),[1,0,0,index]);
+                assert_eq!(*value,expected);
+            }
+        };
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,&text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ns.range,
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            writes();
+            let all=prepare().run().unwrap();
+            check_writes();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(48));
+            assert_eq!(report.files().len(),6);
+            for (file,expected) in report.files().iter().zip([2,77,2,47,47,0]) {
+                assert_eq!(file.text.as_ref(),format!("{{\"type\":{{\"kind\":\"i32\"}},\"value\":{expected}}}\n").as_bytes());
+            }
+            let (capped,_,trace,_)=prepare().search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            check_writes();
+            assert_eq!(all.directives,capped);
+            for site in [&next_mask,&pad_call,&next_pad,&zero_vertex] { assert!(trace.contains_return(site),"{site:?}"); }
+            eprintln!("Orbital original pack_prepared/pad {target_layout:?}: mask5 selects 0 and 2 only, 7 sparse index writes; pad retains end and subsequent duplicate allocates 47");
         }
     }
 
