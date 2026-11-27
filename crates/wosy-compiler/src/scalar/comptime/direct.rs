@@ -4,7 +4,7 @@ use super::{
     emit_closed_evaluator, prepare_scalar_project, span_of,
     ClosedComptimeFragment, ClosedComptimeRejection, ComptimeStdoutError, ScalarBlock,
     ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs, ScalarTargetLayout,
-    ScalarType, CLOSED_COMPTIME_MAX_SOURCE_BYTES,
+    ScalarType,
 };
 use super::super::{
     control::{
@@ -715,7 +715,6 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
         return Err(Error::UnsupportedLayout);
     }
     if !parsed.is_valid() { return Err(Error::InvalidParse); }
-    if parsed.text.len() > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(Error::SourceLimit); }
     let scope = |span| SourceSpan::new(parsed.source.clone(), span);
     let mut sites = parsed.root.descendants().filter_map(|node| {
         let site = ComptimeCst::from_node(&node)?;

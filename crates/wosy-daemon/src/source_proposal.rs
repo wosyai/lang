@@ -21,7 +21,6 @@ use wosy_protocol::{
     CstExpansionBudget, Delta, FileEntry, FileKey, Kind, Node, NodeId, SourceConfig, SourceDeltaCommit,
     SourceDeltaPublication, BASE_CST_DELTA_VERSION,
 };
-use wosy_compiler::{ClosedComptimeRejection, CLOSED_COMPTIME_MAX_SOURCE_BYTES};
 use wosy_syntax::{CstNode, FreshParseResult, SyntaxKind};
 
 /// Logical bounds for the selected closure plus the proposal, and for actual
@@ -231,9 +230,6 @@ impl ValidatedProposal {
         }
         if self.index.files.len() != 1 {
             return Err(PendingEntryRefusal::RequiresSingleModule);
-        }
-        if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-            return Err(Refused(Refusal::Compiler(ClosedComptimeRejection::SourceLimit)));
         }
         let Some((fresh, authored_comptime)) = self.selected_changed_parse.take() else {
             return Err(PendingEntryRefusal::EntryUnchanged);
@@ -621,7 +617,7 @@ fn validate(
             let tree = if publish.is_some() { FileTree::Both } else { FileTree::Authored };
             let (checked, fresh, present) = grammar_checked_file(tx, file, categories, tree, &mut work)?;
             authored_reparsed_files += 1;
-            if selected_file == Some(&key) && file.metadata.bytes as usize <= CLOSED_COMPTIME_MAX_SOURCE_BYTES {
+            if selected_file == Some(&key) {
                 selected_changed_parse = Some((fresh, present));
             }
             (checked, present)

@@ -358,7 +358,8 @@ async fn direct_evaluator_binds_the_call_to_the_exact_leased_singleton_root() {
     let worker = worker(&store);
     let old = worker.open_build_diagnostics(initial.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
 
-    let changed_text = DIRECT_SOURCE.replace("solve(7)", "solve(9)");
+    let changed_text = DIRECT_SOURCE.replace("solve(7)", "solve(9)").replace("%%end",
+        &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
     fs::write(project.join("src/main.w"), &changed_text).unwrap();
     let changed = publish(&mut client, &store).await;
     let current = worker.open_build_diagnostics(changed.clone(), Duration::from_secs(20)).await.unwrap().unwrap();
@@ -368,13 +369,20 @@ async fn direct_evaluator_binds_the_call_to_the_exact_leased_singleton_root() {
         // query must reconstruct the actual old immutable call in the lease.
         let retained = emitted_direct(old.project_direct_function_comptime(request("value", layout)).await.unwrap());
         assert_direct_evidence(&retained, initial.root, layout, DIRECT_SOURCE, 7);
-        let next = emitted_direct(current.project_direct_function_comptime(request("value", layout)).await.unwrap());
+        let mut expanded = request("value", layout);
+        expanded.source_limits.authored_bytes = changed_text.len();
+        let mut tight = request("value", layout);
+        tight.source_limits.authored_bytes = changed_text.len() - 1;
+        assert!(current.project_direct_function_comptime(tight).await.unwrap_err().to_string()
+            .contains("authored byte budget"));
+        let next = emitted_direct(current.project_direct_function_comptime(expanded).await.unwrap());
         assert_direct_evidence(&next, changed.root, layout, &changed_text, 9);
         assert_eq!(retained.rooted().compiler_image, next.rooted().compiler_image);
         assert_ne!(retained.rooted().authored_cst, next.rooted().authored_cst);
         assert_ne!(retained.rooted().digest, next.rooted().digest);
     }
     let mut capped = request("value", ScalarTargetLayout::WASM32);
+    capped.source_limits.authored_bytes = changed_text.len();
     capped.output_bytes = 1;
     assert!(current.project_direct_function_comptime(capped).await.unwrap_err().to_string().contains("output byte budget"));
     drop(current);

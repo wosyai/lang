@@ -151,7 +151,6 @@ fn with_closed_comptime_occurrence<R>(
         return Err(ClosedComptimeRejection::UnsupportedLayout);
     }
     if !parsed.is_valid() { return Err(ClosedComptimeRejection::InvalidParse); }
-    if parsed.text.len() > CLOSED_COMPTIME_MAX_SOURCE_BYTES { return Err(ClosedComptimeRejection::SourceLimit); }
     let scope = |range| SourceSpan::new(parsed.source.clone(), range);
     let unsupported = |range, feature| ClosedComptimeRejection::Unsupported { site: scope(range), feature };
     let mut matches = parsed.root.descendants().filter_map(|node| {

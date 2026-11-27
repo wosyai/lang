@@ -14,7 +14,6 @@ use wosy_compiler::{
     derive_pair_startup_call_graph_comptime_plan, derive_pair_startup_call_graph_wasip1_stdout,
     DirectStartupComptimeUse, InspectedDirectComptimeCall,
     BoundedPairStartupWasip1Output, PairStartupCallGraphEvidence, PairStartupForwarding, ScalarTargetLayout, ScalarType,
-    CLOSED_COMPTIME_MAX_SOURCE_BYTES,
 };
 use wosy_protocol::{source_preparation_parts, CstKindEncoding, FileKey, NodeId};
 use wosy_syntax::{FreshParseResult, SourceSpan};
@@ -470,9 +469,6 @@ impl SourceStore {
         }
         if scope == SiteScope::DirectTargetCall && index.files.len() != 1 {
             return Ok(Err(Refusal::DirectCallRequiresSingleModule));
-        }
-        if file.metadata.bytes as usize > CLOSED_COMPTIME_MAX_SOURCE_BYTES {
-            return Ok(Err(Refusal::Compiler(ClosedComptimeRejection::SourceLimit)));
         }
         let mut work = limits.cst_work();
         let checked = validate_file_using(file, &config.parser.categories, FileTree::Authored,

@@ -943,6 +943,7 @@ u32 repeated = solve(7, bypass);
 u32 different = solve(7, 13);
 %%end
 "#;
+    let source = SOURCE.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
     let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
         .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []")
         + "\n[comptime.prepare]\nwatch = [\"watch.txt\"]\n";
@@ -966,13 +967,20 @@ u32 different = solve(7, 13);
         store.publish(initial.root, &replay.source.delta).await.unwrap();
         assert!(client.acknowledge("app", initial.pending.unwrap()).unwrap());
 
-        fs::write(&entry, SOURCE).unwrap();
+        fs::write(&entry, &source).unwrap();
         let attempt = client.stage("app").unwrap().pending.unwrap();
         let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
-        let owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), proposal, RootedClosedComptimeRequest {
+        let request = |authored_bytes| RootedClosedComptimeRequest {
             profile: "dev".into(), file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
-            id: "prepare".into(), evaluator_layout: ScalarTargetLayout::WASM32, source_limits: LIMITS, output_bytes: 1 << 20,
-        }, 1 << 20, TTL, 11).await.unwrap();
+            id: "prepare".into(), evaluator_layout: ScalarTargetLayout::WASM32,
+            source_limits: BaseCstAdmissionLimits { authored_bytes, ..LIMITS }, output_bytes: 1 << 20,
+        };
+        let proposal = Arc::new(proposal);
+        let denied = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), Arc::clone(&proposal),
+            request(source.len() - 1), 1 << 20, TTL, 11).await.err().expect("one byte over explicit admission budget");
+        assert!(denied.to_string().contains("authored byte budget"));
+        let owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), proposal,
+            request(source.len()), 1 << 20, TTL, 11).await.unwrap();
         assert_eq!(owner.base().admission().validated_files, 1);
         let held = trusted(&owner).expect("same private compiler-issued output");
         let [first, distinct] = held.output.evaluators() else { panic!("one module per typed tuple"); };
@@ -996,8 +1004,8 @@ u32 different = solve(7, 13);
         let ordinary = staging.plan().ordinary_continuation();
         let exact_site = staging.plan().evidence().site();
         assert_eq!(ordinary.canonical_cst().source, exact_site.source);
-        assert_eq!(ordinary.canonical_cst().root.text().to_string(), SOURCE);
-        assert_eq!(staging.plan().authored_source_bytes(), SOURCE.len());
+        assert_eq!(ordinary.canonical_cst().root.text().to_string(), source);
+        assert_eq!(staging.plan().authored_source_bytes(), source.len());
         let site_node = ordinary.comptime_site();
         let tail = ordinary.callable_tail();
         assert_eq!(byte_span(&site_node), exact_site.range);
@@ -1018,7 +1026,7 @@ u32 different = solve(7, 13);
             };
             let span = byte_span(&expression);
             assert!(span.start <= call.range.start && call.range.end <= span.end);
-            assert_eq!(&SOURCE[span.start as usize..span.end as usize], spelling);
+            assert_eq!(&source[span.start as usize..span.end as usize], spelling);
             selections.push(evaluator_index);
         }
         assert_eq!(selections, [None, Some(0), Some(0), Some(1)]);
@@ -1073,7 +1081,7 @@ u32 different = solve(7, 13);
         for (((node, observed), (original, case)), spelling) in projected.iter().zip(exact.initializers()).zip(initializers) {
             assert_eq!(byte_span(node), byte_span(&original));
             assert_eq!(node.text().to_string(), spelling);
-            assert_eq!(node.ancestors().last().unwrap().text().to_string(), SOURCE);
+            assert_eq!(node.ancestors().last().unwrap().text().to_string(), source);
             match (observed, case) {
                 (PendingPairWasip1Occurrence::Bypass(seen), PairStartupOccurrence::Bypass(authored)) => {
                     assert!(std::ptr::eq(*seen, authored));
@@ -1132,7 +1140,7 @@ u32 different = solve(7, 13);
         assert!(denied.to_string().contains("exceeds byte budget"));
         assert_eq!(fs::read_dir(&private).unwrap().count(), 2);
 
-        fs::write(&entry, SOURCE).unwrap();
+        fs::write(&entry, &source).unwrap();
         let stale = client.stage_pending_pair_wasip1(&binding, "dev", limits, &private, total, || {
             let mut writer = SqliteSourceState::open(&project, CLIENT).unwrap();
             assert!(writer.abandon("app", attempt).unwrap());
