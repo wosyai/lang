@@ -805,6 +805,11 @@ mod routing_observations {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    mod executable_plan_finalizer {
+        include!("main_tests/executable_plan_finalizer.rs");
+    }
+
     fn snapshot_test_path(name: &str) -> std::path::PathBuf {
         let current_thread = std::thread::current();
         let thread_name = current_thread.name().expect("named test thread");
