@@ -141,11 +141,13 @@ impl PreparedPendingFirstComptime {
 /// for a source commit or a semantic result.
 pub struct PreparedPendingPairCallGraphComptime {
     base: PreparedBaseDeclarations,
+    binding: BaseCstProposalBinding,
     projection: PendingPairCallGraphComptimeProjection,
 }
 
 impl PreparedPendingPairCallGraphComptime {
     pub fn base(&self) -> &PreparedBaseDeclarations { &self.base }
+    pub fn binding(&self) -> &BaseCstProposalBinding { &self.binding }
 
     pub fn projection(&self) -> Option<&PendingPairCallGraphComptimeProjection> {
         self.base.lease.finish_current(|| &self.projection)
@@ -442,6 +444,7 @@ impl SourceStorageWorker {
         request: RootedClosedComptimeRequest, declaration_bytes: usize, lifetime: Duration,
     ) -> Result<PreparedPendingPairCallGraphComptime> {
         request.check_selector_bytes()?;
+        let captured_binding = binding.clone();
         let (base, projection) = self.prepare_base_cst_observing(binding, proposal.into(), request.source_limits,
             declaration_bytes, AdmissionLease::Open(lifetime), Some(request.file.clone()), move |store, valid| {
                 let projection = valid.pending_pair_call_graph(store, &request)?;
@@ -452,7 +455,7 @@ impl SourceStorageWorker {
                 };
                 Ok((projection, bytes))
             }).await?;
-        Ok(PreparedPendingPairCallGraphComptime { base, projection })
+        Ok(PreparedPendingPairCallGraphComptime { base, binding: captured_binding, projection })
     }
 
     async fn prepare_base_cst_observing<T: Send + 'static>(

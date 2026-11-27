@@ -24,7 +24,8 @@ pub use add::add_dependency;
 pub use anchored::GitDirectory;
 #[cfg(target_os = "linux")]
 pub use comptime_scratch::ComptimeScratch;
-pub use comptime_watches::{observe_comptime_watches, ComptimeWatchLimits, WatchedComptimeFile, WatchRoot};
+pub use comptime_watches::{observe_comptime_watches, observe_local_comptime_inputs, ComptimeWatchLimits,
+    LocalComptimeInputScope, WatchedComptimeFile, WatchRoot};
 pub use init::init_project;
 pub use lifecycle::{snapshot_dependencies, update_dependencies};
 pub use patches::PatchStackId;

@@ -169,7 +169,6 @@ pub enum RootedForwardedPairStartupComptimeProjection {
 #[derive(Debug)]
 pub struct RootedPairCallGraphComptimePlan {
     source: RootedComptimeIdentity,
-    id: String,
     evidence: PairStartupCallGraphEvidence,
     evaluators: Vec<RootedStartupComptimeEvaluator>,
 }
@@ -180,7 +179,7 @@ impl RootedPairCallGraphComptimePlan {
     pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
     pub fn target(&self) -> &str { &self.source.target }
     pub fn profile(&self) -> &str { &self.source.profile }
-    pub fn id(&self) -> &str { &self.id }
+    pub fn id(&self) -> &str { self.evidence.site_id() }
     pub fn evidence(&self) -> &PairStartupCallGraphEvidence { &self.evidence }
     pub fn evaluators(&self) -> &[RootedStartupComptimeEvaluator] { &self.evaluators }
 }
@@ -293,7 +292,7 @@ impl SourceStore {
         };
         let (evidence, fragments) = plan.into_parts();
         Ok(RootedPairCallGraphComptimeProjection::Emitted(RootedPairCallGraphComptimePlan {
-            source, id: request.id.clone(), evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
+            source, evidence, evaluators: bounded_evaluators(fragments, request.output_bytes)?,
         }))
     }
 

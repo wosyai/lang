@@ -33,6 +33,15 @@ pub use comptime_inputs::{
 
 pub type Files = BTreeMap<FileKey, FileEntry>;
 
+/// The same exact configuration input identity on fresh observation and
+/// on the selected, dependency-free pending input cut.
+pub(crate) fn source_configuration_inputs(
+    manifest: &str, packages: &BTreeMap<String, wosy_project::ResolvedPackage>,
+) -> Result<NodeId, String> {
+    let bytes = serde_json::to_vec(&(manifest, packages)).map_err(|error| error.to_string())?;
+    Ok(NodeId(blake3::derive_key("wosy source configuration inputs v2", &bytes)))
+}
+
 pub struct PreparedSources {
     pub root: NodeId,
     pub delta: Delta,
@@ -417,9 +426,7 @@ fn prepare_from_observation(
         categories: ctx.comment_categories.clone(),
     };
     let policy = parser.id();
-    let input = serde_json::to_vec(&(manifest.raw(), &cfg.resolved_packages))
-        .map_err(|error| error.to_string())?;
-    let inputs = NodeId(blake3::derive_key("wosy source configuration inputs v2", &input));
+    let inputs = source_configuration_inputs(manifest.raw(), &cfg.resolved_packages)?;
     let mut namespaces: BTreeMap<_, _> = cfg.resolved_packages.iter().map(|(name, p)| {
         let git = if let Some(locked) = &p.git_pin_identity {
             let patches = p.patch_stack_id

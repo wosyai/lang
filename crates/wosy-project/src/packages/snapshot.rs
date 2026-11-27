@@ -25,6 +25,24 @@ impl ProjectSnapshot {
         Self::open(root, false)
     }
 
+    /// The local comptime observer already owns its exact canonical
+    /// workspace path. Do not recanonicalize or reopen its directory by name.
+    #[cfg(target_os = "linux")]
+    pub(super) fn anchored_compiler_reader(root: &Path) -> Result<(Self, GitDirectory), String> {
+        if !root.is_absolute() { return Err("selected project path must be absolute".into()); }
+        let file = GitDirectory::open_absolute(root).map_err(|error| error.to_string())?;
+        file.lock_shared().map_err(|error| error.to_string())?;
+        let anchored = GitDirectory::new(file.try_clone().map_err(|error| error.to_string())?)?;
+        Ok((Self {
+            root: root.to_path_buf(), directory_lock: Some(file), lock: Ok(None), parsed: OnceCell::new(),
+        }, anchored))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_observed_lock(&mut self, lock: Option<Vec<u8>>) {
+        self.lock = Ok(lock);
+    }
+
     pub(super) fn writer(root: &Path) -> Result<Self, String> {
         Self::open(root, true)
     }

@@ -555,6 +555,12 @@ impl ProjectConfiguration {
         let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
             toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
+        Self::from_snapshot_manifest(root, &snapshot, document)
+    }
+
+    fn from_snapshot_manifest(
+        root: &Path, snapshot: &packages::ProjectSnapshot, document: ParsedProjectManifest,
+    ) -> Result<(Self, ParsedProjectManifest), String> {
         let package = document
             .get("package")
             .and_then(Item::as_table)
@@ -571,7 +577,7 @@ impl ProjectConfiguration {
             })
             .transpose()?;
         let dependencies = project_dependencies(root, &package_name, &document)?;
-        let resolved_packages = packages::resolve_installed(&snapshot, root, &package_name, &dependencies)?;
+        let resolved_packages = packages::resolve_installed(snapshot, root, &package_name, &dependencies)?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;

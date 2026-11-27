@@ -17,9 +17,11 @@ mod diagnostics;
 mod diagnostic_report;
 mod delta;
 mod current_view;
+mod pending_comptime;
 mod pins;
 mod pin_reconciliation;
 pub use delta::{PendingBasePublication, PendingGitBaseProjection, ProjectedGitBaseFile};
+pub use pending_comptime::{PendingPairComptimeInputObservation, TrustedPreparedPairComptime};
 pub use diagnostics::{CapturedBuildDiagnostics, DiagnosticExchange, RequiredSourceReplay};
 pub use diagnostic_report::{
     AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryBuilderInputs, AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer,

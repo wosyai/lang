@@ -686,3 +686,105 @@ u32 carried = choose(false, 1, seed_value);
         Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_pending_graph_observes_only_exact_consumer_config_and_live_watch_inputs() {
+    use std::path::Path;
+    use wosy_cli::source_state::TrustedPreparedPairComptime;
+    use wosy_compiler::ScalarTargetLayout;
+    use wosy_daemon::{PendingPairCallGraphComptimeProjection, PreparedPendingPairCallGraphComptime,
+        RootedClosedComptimeRequest, RootedPairCallGraphComptimeProjection};
+    use wosy_project::{packages::{ComptimeWatchLimits, WatchRoot}, DeclaredComptimeParameter, PackageRelativePath};
+    use wosy_protocol::FileKey;
+
+    fn trusted(owner: &PreparedPendingPairCallGraphComptime) -> Option<TrustedPreparedPairComptime<'_>> {
+        let Some(PendingPairCallGraphComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
+            owner.projection() else { return None; };
+        Some(TrustedPreparedPairComptime {
+            binding: owner.binding(), authored_cst: plan.authored_cst(), profile: plan.profile(), graph: plan.evidence(),
+        })
+    }
+
+    const SOURCE: &str = "%%start\n# WHY: perfil válido\nu32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };\nu32 sample = solve(4, 9);\n%%end\n";
+    let manifest = MANIFEST.replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []")
+        + "\n[targets.app.profiles.dev.params]\nlimit = 77\n[comptime.prepare]\nwatch = [\"watched/value.txt\"]\n";
+    let fixture = Scratch::new();
+    let project = fixture.0.join("project");
+    let wm = project.join("wosy.toml");
+    let entry = project.join("main.w");
+    let watched = project.join("watched/value.txt");
+    fs::create_dir_all(project.join("watched")).unwrap();
+    fs::write(&wm, &manifest).unwrap();
+    fs::write(&entry, "%%start\nu32 answer = 14;\n%%end\n").unwrap();
+    fs::write(&watched, "first-watch").unwrap();
+
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("cache"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let initial = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(initial.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", initial.pending.unwrap()).unwrap());
+
+        fs::write(&entry, SOURCE).unwrap();
+        let attempt = client.stage("app").unwrap().pending.unwrap();
+        let (binding, proposal) = client.pending_base_cst_proposal("app", attempt).unwrap();
+        let owner = worker.prepare_pending_pair_call_graph_comptime(binding.clone(), proposal, RootedClosedComptimeRequest {
+            profile: "dev".into(), file: FileKey { package: "app".into(), path: PackageRelativePath::new("main.w".into()).unwrap() },
+            id: "prepare".into(), evaluator_layout: ScalarTargetLayout::WASM32, source_limits: LIMITS, output_bytes: 1 << 20,
+        }, 1 << 20, TTL).await.unwrap();
+        let plan = trusted(&owner).expect("real compiler-derived pending plan");
+        assert_eq!(plan.graph.site_id(), "prepare");
+        // Valid live source no longer contains the site. It must not
+        // supply or disturb this immutable pending graph's input evidence.
+        fs::write(&entry, "%%start\nu32 answer = 41;\n%%end\n").unwrap();
+        let limits = ComptimeWatchLimits::default();
+        let first = client.observe_pending_pair_comptime_inputs(&binding, "dev", limits, || trusted(&owner)).unwrap().unwrap();
+        assert_eq!(first.binding(), &binding);
+        assert_eq!(first.authored_cst(), plan.authored_cst);
+        assert_eq!(first.watches().site, *plan.graph.site());
+        assert_eq!(first.watches().id, "prepare");
+        let tools = first.declarations().tools();
+        assert_eq!(tools.builder().0, "nominal");
+        assert_eq!(tools.runner().0, "nominal");
+        assert_eq!(first.declarations().parameters().get("limit"), Some(&DeclaredComptimeParameter::Integer(77)));
+        let [observed] = first.watches().files.as_slice() else { panic!("only the configured owning watch"); };
+        assert_eq!(observed.root, WatchRoot::OwningPackage);
+        assert_eq!(observed.path.as_path(), Path::new("watched/value.txt"));
+        assert_eq!(observed.revision.0, blake3::hash(b"first-watch").to_hex().as_str());
+
+        fs::write(project.join("watched/unselected.txt"), "not observed").unwrap();
+        let unchanged = client.observe_pending_pair_comptime_inputs(&binding, "dev", limits, || trusted(&owner)).unwrap().unwrap();
+        assert_eq!(unchanged.watches().files, first.watches().files);
+        fs::write(&watched, "updated-watch").unwrap();
+        let changed = client.observe_pending_pair_comptime_inputs(&binding, "dev", limits, || trusted(&owner)).unwrap().unwrap();
+        assert_eq!(changed.configuration_inputs(), first.configuration_inputs());
+        assert_eq!(changed.authored_cst(), first.authored_cst());
+        assert_eq!(changed.watches().files[0].revision.0, blake3::hash(b"updated-watch").to_hex().as_str());
+
+        fs::write(&wm, manifest.replace("watched/value.txt", "watched/not-created.txt")).unwrap();
+        let changed_manifest = client.observe_pending_pair_comptime_inputs(&binding, "dev", limits, || trusted(&owner)).err().unwrap();
+        assert_eq!(changed_manifest.to_string(), "local comptime configuration changed after source staging");
+        fs::write(&wm, &manifest).unwrap();
+        fs::write(&entry, SOURCE).unwrap();
+        let stale = client.observe_pending_pair_comptime_inputs(&binding, "dev", limits, || {
+            let mut current = SqliteSourceState::open(&project, CLIENT).unwrap();
+            assert!(current.abandon("app", attempt).unwrap());
+            let replacement = current.stage("app").unwrap().pending.unwrap();
+            assert_eq!(replacement.root(), attempt.root());
+            assert_ne!(replacement.generation(), attempt.generation());
+            trusted(&owner)
+        }).unwrap();
+        assert!(stale.is_none());
+        assert!(client.observe_pending_pair_comptime_inputs(&binding, "dev", limits,
+            || panic!("do not call the local owner for an already stale attempt")).unwrap().is_none());
+        assert!(store.snapshot(attempt.root()).unwrap().is_none());
+        assert_eq!(client.acknowledged_build_source("app").unwrap().unwrap().root, initial.root);
+        drop(owner);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}

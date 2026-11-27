@@ -367,6 +367,7 @@ enum PairStartupOrder {
 /// Typed startup proof without retained evaluator modules or result authority.
 #[derive(Debug)]
 pub struct PairStartupCallGraphEvidence {
+    site_id: String,
     site: SourceSpan,
     layout: ScalarTargetLayout,
     calls: Vec<DirectStartupComptimeUse<2>>,
@@ -377,6 +378,8 @@ pub struct PairStartupCallGraphEvidence {
 }
 
 impl PairStartupCallGraphEvidence {
+    pub fn site_id(&self) -> &str { &self.site_id }
+
     /// The authored site still exists when no startup occurrence reaches it.
     pub fn site(&self) -> &SourceSpan { &self.site }
     pub fn layout(&self) -> ScalarTargetLayout { self.layout }
@@ -440,7 +443,7 @@ pub fn derive_pair_startup_call_graph_comptime_plan(
                 return Err(ClosedComptimeRejection::Emitter("verified call graph disappeared".into()));
             };
             let (calls, evaluators) = emit_startup_plan(id, layout, body, name_span, calls)?.into_parts();
-            let evidence = PairStartupCallGraphEvidence { site, layout, calls, hops, selectors, paths, order };
+            let evidence = PairStartupCallGraphEvidence { site_id: id.to_owned(), site, layout, calls, hops, selectors, paths, order };
             Ok(PairStartupCallGraphComptimePlan { evidence, evaluators })
         })
 }

@@ -42,6 +42,11 @@ pub enum PendingBasePublication {
     StaleAttempt,
 }
 
+pub(super) fn pending_base_matches(state: &super::SourceSelection, binding: &BaseCstProposalBinding) -> bool {
+    state.selected == Some(binding.selected.root)
+        && state.pending == Some(SourceAttempt::new(binding.proposed, binding.attempt))
+}
+
 impl SqliteSourceState {
     /// Construct a sparse proposal for the exact still-pending base source
     /// attempt, without observing live source, parsing, or acknowledging it.
@@ -142,10 +147,8 @@ impl SqliteSourceState {
         self.finish_pending_base_publication(&binding, response)
     }
 
-    fn pending_base_is_current(&self, binding: &BaseCstProposalBinding) -> Result<bool> {
-        let state = read_selection(&self.db, &binding.selected.target)?;
-        Ok(state.selected == Some(binding.selected.root)
-            && state.pending == Some(SourceAttempt::new(binding.proposed, binding.attempt)))
+    pub(super) fn pending_base_is_current(&self, binding: &BaseCstProposalBinding) -> Result<bool> {
+        Ok(pending_base_matches(&read_selection(&self.db, &binding.selected.target)?, binding))
     }
 
     fn finish_pending_base_publication(
