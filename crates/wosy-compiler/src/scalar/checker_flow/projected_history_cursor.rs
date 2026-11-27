@@ -80,6 +80,7 @@ pub(in super::super) fn drive_finite_history<'p>(
     math_call: Option<&ObservedFloatCall<'_>>,
     scalar_getter: Option<&ObservedScalarGetter<'_>>,
     provider_call: Option<&ObservedProviderCall<'_>>,
+    provider_units: Option<&HashSet<Target>>,
     guard_frontiers: Option<&HashMap<Target, OccurrenceOrdinal>>,
     body_of: impl Fn(Target) -> Option<&'p FunctionCallSites>,
     resolve: impl Fn(Target, &FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature) -> Option<Target>,
@@ -177,6 +178,30 @@ pub(in super::super) fn drive_finite_history<'p>(
                 }
                 if !computed.is_empty() { pending.computed.push_back((pending.row,computed)); }
                 pending.row += 1;
+                if is_unit && provider_units.is_some_and(|units| units.contains(&child)) {
+                    use super::super::checker_project::ObservedExactValue;
+                    let ids=child_body.boundary.checker_parameter_bindings.as_ref()?;
+                    let mut integer=entry.0.cells.iter();
+                    let args=ids.iter().zip(&signature.parameters).map(|(id,ty)| {
+                        match ty {
+                            ScalarType::I32=>Some(ObservedExactValue::Integer(ScalarType::I32,integer.next()?.singleton_value()?.clone())),
+                            ScalarType::F32=>Some(ObservedExactValue::F32(entry.0.read_observed_float(id)?)),
+                            _=>None,
+                        }
+                    }).collect::<Option<Vec<_>>>()?;
+                    if integer.next().is_some() || ids.len()!=signature.parameters.len() { return None; }
+                    let row=&mut entry.0;
+                    let (None,trace,cost)=provider_call?(body,site,args,Rc::make_mut(row.storage.as_mut()?))?
+                        else { return None; };
+                    let mut tracker=histories.borrow_mut();
+                    tracker.charge(cost.saturating_add(1))?;
+                    if let Some(trace)=trace { tracker.append(row,CallableHistoryStep::ObservedFloatTrace(trace)); }
+                    pending.receipts.push_back(CallableHistoryCall::UnitPartitions(vec![UnitHistoryPiece {
+                        storage:row.storage.take(),domains:std::mem::take(&mut row.cells),
+                        steps:ReturnHistory::Shared(row.callable_history),
+                    }]));
+                    continue;
+                }
                 stack.push(Frame { target: child, machine: Machine::enter(child_body, &histories, Some(entry), field_read, array_read, math_call, scalar_getter, provider_call)?, pending: None });
                 continue;
             }

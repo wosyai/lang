@@ -1787,6 +1787,16 @@ pub(super) mod observed_f32_array;
 #[cfg(feature = "internal-checker")]
 use storage_delta::StorageDelta;
 #[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static OBSERVED_U16_WRITES: std::cell::RefCell<Vec<(observed_f32_array::Cell,u16)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn take_observed_u16_writes() -> Vec<(observed_f32_array::Cell,u16)> {
+    OBSERVED_U16_WRITES.with(|writes| std::mem::take(&mut *writes.borrow_mut()))
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
 pub(super) fn take_observed_storage_delta_visits() -> usize { storage_delta::take_path_visits() }
 
 
@@ -1812,6 +1822,7 @@ pub(super) struct ProjectedStorage {
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
     f32_array_updates: StorageDelta<observed_f32_array::Cell, projected_f32::ExactF32>,
     i32_array_updates: StorageDelta<observed_f32_array::Cell, i32>,
+    u16_array_updates: StorageDelta<observed_f32_array::Cell, u16>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1843,6 +1854,16 @@ impl ProjectedStorage {
                 *scalar = value;
             }
         }
+        Some(())
+    }
+
+    pub(super) fn observed_u16_array_element(&self, cell:&observed_f32_array::Cell) -> Option<u16> {
+        self.u16_array_updates.get(cell).copied()
+    }
+
+    pub(super) fn overwrite_u16_array_element(&mut self, cell:observed_f32_array::Cell, value:u16) -> Option<()> {
+        if !self.has_observed_aggregate(&cell.declaration) { return None; }
+        self.u16_array_updates.insert(cell,value);
         Some(())
     }
 
@@ -12871,7 +12892,7 @@ fn evaluate_observed_getter(calls: &FunctionCallSites, site: OccurrenceOrdinal, 
 #[cfg(feature = "internal-checker")]
 pub(super) type ObservedProviderCall<'a> = dyn Fn(&FunctionCallSites, OccurrenceOrdinal,
     Vec<super::checker_project::ObservedExactValue>, &mut ProjectedStorage)
-    -> Option<(super::checker_project::ObservedExactValue, Option<usize>, usize)> + 'a;
+    -> Option<(Option<super::checker_project::ObservedExactValue>, Option<usize>, usize)> + 'a;
 
 #[cfg(feature = "internal-checker")]
 fn observed_mixed_provider_arguments(calls:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<Vec<(OccurrenceOrdinal,&ScalarType)>> {
@@ -12904,7 +12925,7 @@ fn evaluate_observed_provider(calls:&FunctionCallSites,at:OccurrenceOrdinal,
             _=>return None,
         });
     }
-    let (ObservedExactValue::Integer(ScalarType::I32,value),trace,work)=
+    let (Some(ObservedExactValue::Integer(ScalarType::I32,value)),trace,work)=
         roots.observed_provider_call?(calls,at,values,Rc::make_mut(row.storage.as_mut()?))? else { return None; };
     append_observed_scalar_call(calls,at,roots,row,trace,work)?;
     Some(value)

@@ -1,7 +1,7 @@
 //! Execute an authenticated scalar call on the current observed row. There
 //! is no speculative state, ambient entry or external effects in this lane.
 use super::*;
-use super::ordered_float_prefix::{ExactValue,ObservedStep,ObservedTrace};
+use super::ordered_float_prefix::{self,ExactValue,ObservedStep,ObservedTrace};
 use super::super::checker_flow::{ProjectedStorage,apply_observed_integer_operator,charge_call_work,observed_f32_array};
 use super::super::reference::{BlockOrdinal,OccurrenceEdge,OccurrenceNode,OccurrenceParent,PlainNameIdentity};
 use super::super::control::AssignmentReplacement;
@@ -17,7 +17,7 @@ struct Place {
 impl Place {
     fn indexed(body:&FunctionCallSites,site:OccurrenceOrdinal,ty:&ScalarType,owner:&SourceIdentity) -> Option<Self> {
         let checked=observed_f32_array::typed_place(body,site,ty)?;
-        if !matches!(ty,ScalarType::I32|ScalarType::F32) || &checked.declaration.source!=owner { return None; }
+        if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::U16) || &checked.declaration.source!=owner { return None; }
         Some(Self { declaration:checked.declaration.clone(),selectors:checked.selectors,ty:ty.clone() })
     }
 
@@ -112,14 +112,35 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-pub(super) fn run(
-    project:&ScalarProject,calls:&ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
-    storage:&mut ProjectedStorage, trace:bool,
+/// The common Unit cursor keeps its established lane for ordinary scopes.
+/// A mixed, directly prepared Unit with a nested U16 store needs this
+/// state-returning runner. The store itself is checked again on execution.
+pub(super) fn needs_unit_runner(body:&FunctionCallSites) -> bool {
+    if !body.checker_returns_unit() || has_callable_obligations(body) { return false; }
+    let parameters=&body.boundary.parameters;
+    parameters.iter().any(|p| p.ty==ScalarType::I32)
+        && parameters.iter().any(|p| p.ty==ScalarType::F32)
+        && parameters.iter().all(|p| matches!(p.ty,ScalarType::I32|ScalarType::F32))
+        && body.assignments.values().any(|group| group.destinations().any(|destination|
+            matches!(destination.replacement,AssignmentReplacement::Resolved(ScalarType::U16))
+                && observed_f32_array::typed_place(body,destination.destination,&ScalarType::U16).is_some()))
+}
+
+#[derive(Default)]
+pub(super) struct Dispatch<'a> {
+    declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
+    pure_plans:HashMap<PreparedCallable,Option<(ordered_float_prefix::PrefixCertificate,ordered_float_prefix::FunctionEffects)>>,
+    latest_pure:HashMap<PreparedCallable,(Vec<u32>,ExactValue,Option<Rc<ObservedTrace>>)>,
+}
+
+pub(super) fn run<'a>(
+    project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
+    storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
     read_array:impl Fn(&ProjectedStorage,&observed_f32_array::Cell,&ScalarType)->Option<(ExactValue,usize)>,
-) -> Option<(ExactValue,Option<ObservedTrace>,usize)> {
+) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize)> {
     let owner=&project.modules.get(target.0)?.source;
     let mut active=HashSet::new();
-    let mut declarations=HashMap::new();
+    let mut latest_segment=HashMap::<PreparedCallable,(Rc<ObservedTrace>,usize)>::new();
     let mut values=Vec::new();
     let mut stack=Vec::<Activation>::new();
     let mut tasks=Vec::new();
@@ -140,14 +161,15 @@ pub(super) fn run(
         { return None; }
         Some(Activation { target, slots:ids.iter().cloned().zip(args).collect(),rank,value_base })
     }
-    let (_,body,ret)=get_symbol(&mut declarations,target)?;
+    let (_,body,ret)=get_symbol(&mut dispatch.declarations,target)?;
     stack.push(enter(body,target,args,None,0)?);
     active.insert(target);
-    tasks.extend([Task::Finish(None,ret),Task::Block(body.structure.root,0,Output::Scalar)]);
+    let output=if ret==ScalarType::Unit { Output::Unit } else { Output::Scalar };
+    tasks.extend([Task::Finish(None,ret),Task::Block(body.structure.root,0,output)]);
     while let Some(task)=tasks.pop() {
         charge_call_work(&mut work,1)?;
         let frame=stack.last_mut()?;
-        let (function,body,_) = get_symbol(&mut declarations,frame.target)?;
+        let (function,body,_) = get_symbol(&mut dispatch.declarations,frame.target)?;
         let st=&body.structure;
         let edge=|at,edge| match st.edges.get(&(OccurrenceParent::Expression(at),edge))? {
             OccurrenceNode::Expression(found)=>Some(*found),
@@ -192,7 +214,7 @@ pub(super) fn run(
                         if assignment.projected_outputs().len()!=0 || st.checked_types.expressions.get(&rhs.expression)?!=ty
                             || st.checked_types.places.get(&destination.destination)?!=ty { return None; }
                         let p=if let Some(DirectDestinationIdentity::Module(declaration))=body.prepared_direct_destination(destination.destination) {
-                            if &declaration.source!=owner || *ty!=ScalarType::I32 { return None; }
+                            if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool) { return None; }
                             Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone() }
                         } else { Place::indexed(body,destination.destination,ty,owner)? };
                         tasks.extend([Task::WritePlace(p),Task::Eval(rhs.expression)]);
@@ -283,6 +305,10 @@ pub(super) fn run(
                         storage.overwrite_scalar(&cell.declaration,&ScalarType::I32,&value)?,
                     ExactValue::Integer(ScalarType::I32,value)=>
                         storage.overwrite_i32_array_element(cell,i32::try_from(&value).ok()?)?,
+                    ExactValue::Boolean(value) if cell.indices.is_empty()=>
+                        storage.overwrite_scalar(&cell.declaration,&ScalarType::Bool,&BigInt::from(u8::from(value)))?,
+                    ExactValue::Integer(ScalarType::U16,value) if !cell.indices.is_empty()=>
+                        storage.overwrite_u16_array_element(cell,u16::try_from(&value).ok()?)?,
                     _=>return None,
                 }
             }
@@ -326,8 +352,66 @@ pub(super) fn run(
                     values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::U64,value.into())));
                     continue;
                 }
+                if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::IntTrunc) {
+                    let [ExactValue::Integer(ScalarType::I32,value)]=args.as_slice() else { return None; };
+                    if out.ty!=ScalarType::U16 { return None; }
+                    let value=i32::try_from(value).ok()? as u16;
+                    values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::U16,value.into())));
+                    continue;
+                }
                 let child=authenticate_prepared_direct_edge(project,calls,target.0,body,site,signature)?;
                 if child.0!=target.0 { return None; }
+                // Reuse the independently sealed pure engine for precisely
+                // scoped F32-input functions. Its certificate forbids all
+                // state reads/writes and opaque calls; never try it for find.
+                if child!=frame.target && !args.is_empty() && signature.parameters.iter().all(|ty| *ty==ScalarType::F32)
+                    && out.ty!=ScalarType::Unit {
+                    charge_call_work(&mut work,n)?;
+                    let bits=args.iter().map(|value| match value { ExactValue::F32(v)=>Some(v.0),_=>None })
+                        .collect::<Option<Vec<_>>>()?;
+                    let cached=dispatch.latest_pure.get(&child).filter(|(key,_,_)| key==&bits)
+                        .map(|(_,value,trace)| (value.clone(),trace.clone()));
+                    let (value,inner)=if let Some(cached)=cached { cached } else {
+                        let (plan,function)=dispatch.pure_plans.entry(child).or_insert_with(||
+                            ordered_float_prefix::plan_observed_math_call(project,calls,child)).as_ref()?;
+                        let locals=function.formals.iter().zip(args).map(|((id,_),value)| (id.clone(),value)).collect();
+                        let (mut returned,inner)=ordered_float_prefix::evaluate_observed_prefix(plan,Some(function),locals,
+                            |_,_,_| None,trace,&mut work,|func,at| {
+                                if func.0!=target.0 { return None; }
+                                let owner_body=calls.function_body(func.0,func.1,None)?;
+                                Some(SourceSpan::new(owner.clone(),owner_body.occurrences.get(at.0)?.span))
+                            })?;
+                        if returned.len()!=1 { return None; }
+                        let value=returned.pop()?;
+                        let inner=inner.map(Rc::new);
+                        dispatch.latest_pure.insert(child,(bits,value.clone(),inner.clone()));
+                        (value,inner)
+                    };
+                    if value.ty()!=out.ty { return None; }
+                    if let (Some(stacks),Some(inner))=(&mut traces,inner) {
+                        let nested=if let Some((_,id))=latest_segment.get(&child).filter(|(known,_)| Rc::ptr_eq(known,&inner)) {
+                            *id
+                        } else {
+                            let base=segments.len();
+                            let offset_steps=|steps:&[ObservedStep]| -> Option<Vec<ObservedStep>> {
+                                steps.iter().map(|step| Some(match step {
+                                    ObservedStep::Call {site,nested}=>ObservedStep::Call {site:site.clone(),nested:base.checked_add(*nested)?},
+                                    _=>step.clone(),
+                                })).collect()
+                            };
+                            charge_call_work(&mut work,inner.physical_cost)?;
+                            for block in &inner.segments { segments.push(offset_steps(block)?); }
+                            let nested=segments.len();
+                            segments.push(offset_steps(&inner.root)?);
+                            latest_segment.insert(child,(inner,nested));
+                            nested
+                        };
+                        charge_call_work(&mut work,1)?;
+                        stacks.last_mut()?.push(ObservedStep::Call {site:span(site)?,nested});
+                    }
+                    values.push(ResultValue::Scalar(value));
+                    continue;
+                }
                 let rank=if child==frame.target {
                     if !matches!(tasks.last(),Some(Task::Finish(..))) { return None; }
                     let bindings=body.boundary.checker_parameter_bindings.as_deref()?;
@@ -343,7 +427,7 @@ pub(super) fn run(
                     if !active.insert(child) { return None; }
                     None
                 };
-                let (_,callee,result)=get_symbol(&mut declarations,child)?;
+                let (_,callee,result)=get_symbol(&mut dispatch.declarations,child)?;
                 let output=if result==ScalarType::Unit { Output::Unit } else { Output::Scalar };
                 if let Some(traces)=&mut traces { traces.push(Vec::new()); }
                 tasks.extend([Task::Finish(Some(span(site)?),result),Task::Block(callee.structure.root,0,output)]);
@@ -375,5 +459,6 @@ pub(super) fn run(
         if !traces.is_empty() { return None; }
         Some(ObservedTrace::new(root,segments,&mut work)?)
     } else { None };
-    Some((scalar(values.pop()?)?,trace,work))
+    let value=match values.pop()? { ResultValue::Scalar(v)=>Some(v),ResultValue::Unit=>None };
+    Some((value,trace,work))
 }

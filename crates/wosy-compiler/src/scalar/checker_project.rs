@@ -2281,6 +2281,7 @@ fn try_observed_projected_storage_call(
     let mut complete = HashSet::new();
     let mut admitted = HashMap::new();
     let mut observed_owners = HashMap::new();
+    let mut provider_units = HashSet::new();
     let mut getters = HashMap::new();
     let mut frontiers = HashMap::new();
     let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
@@ -2296,6 +2297,14 @@ fn try_observed_projected_storage_call(
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
                 observed_owners.insert(body as *const FunctionCallSites,node.0);
+                if node.0!=target.0 && visits.get(node.0)==Some(&InitializationVisit::Completed)
+                    && stateful_provider::needs_unit_runner(body) {
+                    provider_units.insert(node);
+                    writes_or_reads_storage = true;
+                    visiting.remove(&node);
+                    complete.insert(node);
+                    continue;
+                }
                 if node != target {
                     let recursive_sites = body.structure.checker_direct_targets.iter()
                         .filter_map(|(&site,&child)| (child == node).then_some(site));
@@ -2375,6 +2384,7 @@ fn try_observed_projected_storage_call(
         let overlay = match ty {
             ScalarType::F32 => storage.observed_f32_array_element(cell).map(ObservedExactValue::F32),
             ScalarType::I32 => storage.observed_i32_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::I32,n.into())),
+            ScalarType::U16 => storage.observed_u16_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::U16,n.into())),
             _ => return None,
         };
         if let Some(atom) = overlay { return Some((atom,1)); }
@@ -2424,6 +2434,7 @@ fn try_observed_projected_storage_call(
             id
         })
     };
+    let provider_dispatch = RefCell::new(stateful_provider::Dispatch::default());
     let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage| {
         let signature=body.checked_call_signatures.get(&site)?;
         let caller=*observed_owners.get(&(body as *const FunctionCallSites))?;
@@ -2432,7 +2443,7 @@ fn try_observed_projected_storage_call(
         // finished initialization and shares this exact storage row.
         if child.0==caller || !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
-        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),&read_array_atom)?;
+        let (value,result,cost)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),&mut provider_dispatch.borrow_mut(),&read_array_atom)?;
         Some((value,result.map(&intern_trace),cost))
     };
     let math_call = |body: &FunctionCallSites, site, args: Vec<super::checker_flow::projected_f32::ExactF32>| {
@@ -2505,7 +2516,7 @@ fn try_observed_projected_storage_call(
         getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
     };
     let mut current = Rc::new(std::mem::take(storage));
-    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&frontiers),
+    let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&provider_units), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -3104,7 +3115,7 @@ fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
 fn observed_nested_array_leaf(mut ty: &ScalarType) -> Option<&ScalarType> {
     if !matches!(ty,ScalarType::Array { .. }) { return None; }
     while let ScalarType::Array { element,.. } = ty { ty = element; }
-    matches!(ty,ScalarType::I32 | ScalarType::F32).then_some(ty)
+    matches!(ty,ScalarType::I32 | ScalarType::F32 | ScalarType::U16).then_some(ty)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3127,8 +3138,8 @@ fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64],
     let atom = match (ty,value) {
         (ScalarType::F32,PassiveLiteral::Float(ranked_float::Atom::Single(bits))) =>
             ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?),
-        (ScalarType::I32,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
-            ObservedExactValue::Integer(ScalarType::I32,value.clone()),
+        (ScalarType::I32|ScalarType::U16,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
+            ObservedExactValue::Integer(ty.clone(),value.clone()),
         _ => return None,
     };
     Some((atom,work))
@@ -12610,7 +12621,7 @@ struct ClosedAuthoredHistories<'run> {
 #[cfg(feature = "internal-checker")]
 impl ClosedAuthoredHistories<'_> {
     fn visit_unit(&self, root: PreparedCallable) -> Option<super::checker_flow::CallableHistoryCompletion> {
-        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
+        super::checker_flow::drive_finite_history(root, self.work, self.observed, None, &[], None, None, None, None, None, None, None, |target| self.calls.function_body(target.0, target.1, None),
             |parent, body, site, signature| {
                 let child = symbolic_history_call_target(self.project, self.calls, parent.0, parent.1, body, site, signature)?;
                 if child.0 != parent.0 && !completed_history_namespace(self.project, parent.0, child.0, self.visits) { return None; }
@@ -25031,6 +25042,103 @@ unit(u8) parent = fn(a) {
                 assert!(matches!(prepare(program).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
             eprintln!("Orbital original find {target_layout:?}: insert 37, duplicate 37, wrap/probe 38, end 39, exhausted and capacity -1");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_pt_index_vertex_put_updates_current_u16_indices_and_failure() {
+        use std::num::NonZeroUsize;
+        use wosy_syntax::SourceSpan;
+        use super::super::checker_flow::take_observed_u16_writes as writes;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let vertex=fragment("unit(i32,u64,u64,u64,u64) index_vertex=", "unit(i32,i32) static_partition=");
+        let pt=fragment("bool robot_turn=false;", "\nunit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let text=format!(r#"%%start
+            packing=namespace demo "indexed-pack.w";
+            {mesh}
+            i32 count=4097;
+            f32 r=0.125; f32 g=0.25; f32 b=0.375; f32 lit=0.625;
+            i32 before_failure=0; i32 was_ok=0; i32 after_failure=0; i32 still_ok=0;
+            {pt}
+            {vertex}
+            unit() launch=fn {{
+                packing.start(); packing.partition(37,40);
+                pt(1.125,-2.25,3.5,-4.5);
+                index_vertex(4097,1,0,0,1);
+                index_vertex(4098,1,0,0,1);
+                count=4098;
+                pt(9.125,-2.25,3.5,-4.5);
+                index_vertex(4099,1,0,0,2);
+                before_failure=packing.end();
+                if(packing.ok()){{was_ok=1;}};
+                packing.put(4100,100000.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                packing.put(4101,4.125,-2.25,3.5,0.125,0.25,0.375,-4.5,0.625);
+                after_failure=packing.end();
+                if(packing.ok()){{still_ok=1;}};
+            }};
+            launch();
+            core.narrow(false,{{.stdout="";.stderr="";.code=after_failure;.files=[
+                {{.path="before_failure.json";.state=before_failure;}},
+                {{.path="was_ok.json";.state=was_ok;}},
+                {{.path="still_ok.json";.state=still_ok;}}
+            ];}});
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-production-put");
+        let provider=source("src/indexed-pack.w","pinned-orbital-original-put-provider");
+        fn span(source:&SourceIdentity, text:&str, snippet:&str) -> SourceSpan {
+            let start=text.find(snippet).unwrap() as u32;
+            SourceSpan::new(source.clone(),ByteSpan::new(start,start+snippet.len() as u32))
+        }
+        let ns=span(&app,&text,r#"packing=namespace demo "indexed-pack.w";"#);
+        let indices=span(&provider,&packing,"indices=[ipage");
+        let recurse=span(&provider,&packing,"find((at+1)&32767,remaining-1,x,y,z,r,g,b,s,l)");
+        let enclosing=span(&provider,&packing,"find(bin(x,y,z,r,g,b,s,l),32768,x,y,z,r,g,b,s,l)");
+        let short=span(&provider,&packing,"if(!failed){").range.start+3;
+        let short=SourceSpan::new(provider.clone(),ByteSpan::new(short,short+7));
+        let check_writes=|| {
+            let written=writes();
+            assert_eq!(written.len(),3);
+            for ((cell,value),(index,expected)) in written.iter().zip([(1,37),(2,37),(3,38)]) {
+                assert_eq!(cell.declaration.source,provider);
+                assert_eq!(cell.declaration.range,ByteSpan::new(indices.range.start,indices.range.start+7));
+                assert_eq!(cell.indices.as_ref(),[1,0,0,index]);
+                assert_eq!(*value,expected);
+            }
+        };
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,&text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ns.range,
+                }]),(declarations(&provider,&packing),Vec::new())],[],
+                vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
+                ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            writes();
+            let all=prepare().run().unwrap();
+            check_writes();
+            let [report]=all.directives.as_slice() else { panic!("one report"); };
+            assert_eq!(report.code(),&BigInt::from(39));
+            assert_eq!(report.files().len(),3);
+            for (file,expected) in report.files().iter().zip([39,1,0]) {
+                assert_eq!(file.text.as_ref(),format!("{{\"type\":{{\"kind\":\"i32\"}},\"value\":{expected}}}\n").as_bytes());
+            }
+            let (capped,_,trace,_)=prepare().search_startup_authored_path(NonZeroUsize::MIN).unwrap();
+            check_writes();
+            assert_eq!(all.directives,capped);
+            assert!(trace.contains_return(&enclosing));
+            assert!(trace.contains_return(&recurse));
+            assert!(trace.contains_branch(short.clone(),true));
+            assert!(trace.contains_branch(short.clone(),false));
+            eprintln!("Orbital original pt/index_vertex/put {target_layout:?}: indices [37,37,38], end 39, invalid data sets flag and later put skips");
         }
     }
 
