@@ -112,6 +112,14 @@ impl Drop for Stage {
 
 impl PreparedFiles {
     pub(super) fn new(root: &Path, requests: &[(&Path, &[u8])]) -> io::Result<Self> {
+        Self::prepare(root, requests, preflight_clone_volume)
+    }
+
+    fn prepare(
+        root: &Path,
+        requests: &[(&Path, &[u8])],
+        preflight: impl FnOnce(&OwnedFd) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let project = project_directory(root)?;
         let state = output_directory(&project, ".wosy")?;
         let output = output_directory(&state, "outputs")?;
@@ -123,6 +131,7 @@ impl PreparedFiles {
                 Err(error) => return Err(error.into()),
             }
         }
+        preflight(&destination)?;
         let mut stage = Stage::new(output)?;
         // Exclusive creation on the same filesystem also catches names
         // that alias on a case-insensitive or normalization-insensitive volume.
@@ -139,6 +148,64 @@ impl PreparedFiles {
 
 fn file_identity(stat: fs::Stat) -> (u64, u64) {
     (stat.st_dev as u64, stat.st_ino as u64)
+}
+
+// Unknown capability bits are not an advertisement of support.
+fn require_clone_support(capabilities: u32, valid: u32, clone: u32) -> io::Result<()> {
+    if capabilities & valid & clone != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "check output volume does not support file cloning"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn preflight_clone_volume(destination: &OwnedFd) -> io::Result<()> {
+    #[repr(C)]
+    struct VolumeCapabilities {
+        length: u32,
+        attr: libc::vol_capabilities_attr_t,
+    }
+
+    let mut request = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut response = VolumeCapabilities {
+        length: 0,
+        attr: libc::vol_capabilities_attr_t { capabilities: [0; 4], valid: [0; 4] },
+    };
+    let size = std::mem::size_of::<VolumeCapabilities>();
+    // SAFETY: the live destination descriptor identifies the volume, and
+    // both C-layout buffers remain valid for the duration of the call.
+    let result = unsafe {
+        libc::fgetattrlist(
+            destination.as_raw_fd(),
+            (&mut request as *mut libc::attrlist).cast(),
+            (&mut response as *mut VolumeCapabilities).cast(),
+            size,
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if response.length as usize != size {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "check output volume did not report clone capabilities"));
+    }
+    let group = libc::VOL_CAPABILITIES_INTERFACES;
+    require_clone_support(response.attr.capabilities[group], response.attr.valid[group], libc::VOL_CAP_INT_CLONE)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn preflight_clone_volume(_: &OwnedFd) -> io::Result<()> {
+    // Linux tests emulate publication with a descriptor hard link.
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -177,6 +244,33 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
         }
+    }
+
+    #[test]
+    fn clone_capability_must_be_advertised_and_valid() {
+        let clone = 1 << 16;
+        for (capabilities, valid) in [(0, clone), (clone, 0), (!clone, !clone)] {
+            assert_eq!(require_clone_support(capabilities, valid, clone).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        }
+        require_clone_support(clone, clone, clone).unwrap();
+    }
+
+    #[test]
+    fn clone_preflight_uses_destination_and_rejects_before_staging() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = temp();
+        let output = root.join(".wosy/outputs");
+        let result = PreparedFiles::prepare(&root, &[(Path::new("report.json"), b"report")], |fd| {
+            let pinned = rustix::fs::fstat(fd).unwrap();
+            let named = fs::metadata(output.join("check")).unwrap();
+            assert_eq!(file_identity(pinned), (named.dev(), named.ino()));
+            require_clone_support(0, 1, 1)
+        });
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read_dir(output.join("check")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(output).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
