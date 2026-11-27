@@ -21,6 +21,9 @@ mod ranked;
 #[cfg(feature = "internal-checker")]
 mod ranked_float;
 #[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod ordered_float_prefix;
+#[cfg(feature = "internal-checker")]
 mod rewrite;
 
 use super::{
@@ -19292,6 +19295,91 @@ mod tests {
                     assert!(matches!(run(&unsupported, capped), Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_float_prefix_preserves_original_flight_calls_branches_and_checked_field_read() {
+        use ordered_float_prefix::Effect;
+        let owner = source("src/main.w", "flight-ordered-readonly-frame-prefix");
+        let excerpt = r#"%%start
+struct copy RenderPose {
+    f32 x; f32 y; f32 z; f32 heading; f32 pitch; f32 roll;
+}
+RenderPose empty_presentation = {
+    .x = 0.0; .y = 0.0; .z = 0.0; .heading = 0.0; .pitch = 0.0; .roll = 0.0;
+};
+RenderPose[2] presented_pose = [empty_presentation, empty_presentation];
+i32 wreck_age = -1;
+bool wreck_entered = false;
+f32(f32, f32, f32) clamp = fn(v, lo, hi) { if (v < lo) { lo } else { if (v > hi) { hi } else { v } } };
+f32(i32) float_i = fn(a) { core.sint_to_float<f32>(a) };
+f32(f32) eased_unit = fn(value) {
+    f32 t = clamp(value,0.0,1.0);
+    t*t*(3.0-2.0*t)
+};
+unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
+    bool wrecking = wreck_age >= 0;
+    f32 wreck_time = if (wrecking && !wreck_entered) { float_i(wreck_age)+wreck_alpha } else { 0.0 };
+    f32 wreck_blend = eased_unit(wreck_time/13.0);
+    f32 orbit = eased_unit(wreck_time/34.0);
+    f32 p_heading = presented_pose[0].heading;
+    core.require(mail_status>=0 || wreck_blend<0.0 || orbit<0.0 || p_heading<0.0,
+        {.stdout="";.stderr="unconsumed suffix";.code=9;.files=[];});
+};
+%%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, count: usize| {
+                let prepared = prepare_checker_project(
+                    vec![(declarations(&owner, text), Vec::new())], vec![owner.clone()], ScalarPreparationInputs { target_layout },
+                ).unwrap_or_else(|error| panic!("ordered frame preparation: {error:?}
+{text}"));
+                let (project, _) = prepared.parts();
+                let module = &project.modules[0];
+                let item = module.items.iter().position(|item| matches!(item, ScalarItem::Function(f) if f.name == "frame")).unwrap();
+                let (root, ordinals) = package_startup_order(project, &project.modules).unwrap();
+                let mut effects = OrderedFailures::default();
+                let (initialization, _) = check_package_initialization_observing_with_policy::<_, true, true>(
+                    &prepared, root, ordinals, ProofFreeOrderedEvidence, Some(&mut effects),
+                ).expect("real ordered module initialization completes before the readonly certificate");
+                let prefix = ordered_float_prefix::prepare_readonly_prefix(&prepared, &initialization, (0,item))
+                    .expect("at least the initial typed read is complete");
+                let names: Vec<_> = prefix.bindings.iter().map(|binding| {
+                    let span = binding.slot.declaration_span;
+                    &text[span.start as usize..span.end as usize]
+                }).collect();
+                assert_eq!(names, &["wrecking","wreck_time","wreck_blend","orbit","p_heading"][..count]);
+                let function_name = |target: PreparedCallable| {
+                    match &project.modules[target.0].items[target.1] {
+                        ScalarItem::Function(function) => function.name.as_str(),
+                        _ => panic!("checked direct declaration"),
+                    }
+                };
+                assert!(prefix.effects.iter().any(|record| record.owner == (0,item)
+                    && matches!(record.operation, Effect::ShortCircuit { conjunction: true, .. })));
+                let root_calls: Vec<_> = prefix.effects.iter().filter_map(|record| {
+                    if record.owner != (0,item) { return None; }
+                    match &record.operation {
+                        Effect::Call { function: Some(target), .. } => Some(function_name(*target)),
+                        _ => None,
+                    }
+                }).collect();
+                assert_eq!(root_calls, if count >= 4 { vec!["float_i","eased_unit","eased_unit"] } else { vec!["float_i"] });
+                assert_eq!(prefix.callees.len(), if count >= 4 { 3 } else { 1 });
+                if count == 5 {
+                    let last = prefix.bindings.last().unwrap();
+                    let Effect::Field { field, receiver, .. } = &prefix.effects[last.returning_effect].operation
+                        else { panic!("exact field projection"); };
+                    assert_eq!(module.structs[field.structure.index].fields[field.index].name, "heading");
+                    assert!(matches!(prefix.effects[*receiver].operation, Effect::Read { index: Some(0), .. }));
+                }
+            };
+            run(excerpt, 5);
+            run(&excerpt.replace("f32 t = clamp", "wreck_age=2; f32 t = clamp"), 2);
+            run(&excerpt.replace("f32 t = clamp",
+                r#"core.require(false,{.stdout="";.stderr="nested obligation";.code=7;.files=[];}); f32 t = clamp"#), 2);
+            run(&excerpt.replace("presented_pose[0].heading", "presented_pose[core.int_extend<u64>(mail_status)].heading"), 4);
         }
     }
 
