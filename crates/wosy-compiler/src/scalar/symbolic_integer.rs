@@ -1248,8 +1248,8 @@ pub(super) fn signed_radix_projection(
     for negative in [false, true] {
         let (operator, boundary) =
             if negative { (BinaryOperator::LessEqual, &minus_one) } else { (BinaryOperator::GreaterEqual, &zero) };
-        charge_call_work(work, input.interval_count().checked_add(quotient.interval_count())?
-            .checked_add(remainder.interval_count())?.checked_add(1)?)?;
+        charge_call_work(work, input.interval_count().saturating_add(quotient.interval_count())
+            .saturating_add(remainder.interval_count()).saturating_add(1))?;
         let input = input.keep(&operator, boundary)?.affine_unit(negative, &zero, false);
         let quotient = quotient.affine_unit(negative, &zero, false);
         let residues = remainder.affine_unit(negative, &zero, false);
@@ -1266,7 +1266,7 @@ pub(super) fn signed_radix_projection(
             let (ql0, qh0) = (input_lo / radix, input_hi / radix);
             for (allowed_lo, allowed_hi) in quotient.intervals() {
                 let lookup = residues.interval_count().checked_ilog2().unwrap_or(0) as usize + 1;
-                charge_call_work(work, lookup.checked_mul(4)?.checked_add(1)?)?;
+                charge_call_work(work, lookup.saturating_mul(4).saturating_add(1))?;
                 let mut ql = ql0.clone().max(allowed_lo.clone());
                 let mut qh = qh0.clone().min(allowed_hi.clone());
                 if ql > qh { continue; }
@@ -1336,7 +1336,7 @@ fn last_intersection_point<'a>(set: &'a IntegerSet, low: &BigInt, high: &'a BigI
 #[cfg(feature = "internal-checker")]
 fn metered_radix_union(components: &[IntegerSet], work: &mut usize) -> Option<IntegerSet> {
     let n = components.iter().try_fold(0usize, |n, component| n.checked_add(component.interval_count()))?;
-    super::checker_flow::charge_call_work(work, n.checked_mul(n.checked_ilog2().unwrap_or(0) as usize + 1)?.checked_add(1)?)?;
+    super::checker_flow::charge_call_work(work, n.saturating_mul(n.checked_ilog2().unwrap_or(0) as usize + 1).saturating_add(1))?;
     Some(IntegerSet::union(components))
 }
 

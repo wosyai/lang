@@ -7149,7 +7149,7 @@ impl ProjectCallSiteResults {
                 }
             }
             let ModuleInitializationDetail::Occurrences(startup) = &module.initialization.detail else { return None; };
-            charge_call_work(&mut work, startup.call_targets.len().checked_add(startup.callable_escapes.len())?)?;
+            charge_call_work(&mut work, startup.call_targets.len().saturating_add(startup.callable_escapes.len()))?;
             if startup.callable_escapes.iter().any(|span| candidate(span, &startup_uses)) { return None; }
             for (&site, call) in &startup.call_targets {
                 match call {
@@ -7173,8 +7173,8 @@ impl ProjectCallSiteResults {
             for (&item, function) in &module.functions {
                 charge_call_work(&mut work, function.arms.len())?;
                 for body in std::iter::once(function).chain(&function.arms) {
-                    charge_call_work(&mut work, body.sites.len().checked_add(body.allocation_length_call_targets.len())?
-                        .checked_add(body.callable_escapes.len())?)?;
+                    charge_call_work(&mut work, body.sites.len().saturating_add(body.allocation_length_call_targets.len())
+                        .saturating_add(body.callable_escapes.len()))?;
                     dormant_has_authored_callable |= is_dormant && !body.structure.checker_directives.is_empty();
                     if body.callable_escapes.iter().any(|span| candidate(span, &startup_uses))
                         || body.sites.iter().any(|site| {
@@ -7240,7 +7240,7 @@ impl ProjectCallSiteResults {
         if !pending.is_empty() && self.nested_scalar_routes.exhausted { return None; }
         while let Some(target) = pending.pop() {
             let callers = self.nested_scalar_routes.callers.get(&target).map_or(&[][..], Vec::as_slice);
-            super::checker_flow::charge_call_work(work, callers.len().checked_add(1)?)?;
+            super::checker_flow::charge_call_work(work, callers.len().saturating_add(1))?;
             pending.extend(callers.iter().copied().filter(|&caller| routed.insert(caller)));
         }
         Some(routed)
@@ -10339,7 +10339,7 @@ impl StructuralWalker<'_, '_> {
                 }.reference_id(resolver.source, resolver.function_span);
                 let Some(shape) = self.checker_snapshot_shape(
                     expression, occurrence, (ty, &identity), resolver.declarations,
-                    super::checker_flow::MAX_FIXED_ARRAY_RETURN_CELLS + 1,
+                    self.occurrences.len(),
                 ) else { return; };
                 CheckerArrayReturn::Constructor(shape)
             }

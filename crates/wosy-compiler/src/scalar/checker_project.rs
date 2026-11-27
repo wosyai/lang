@@ -100,7 +100,7 @@ pub struct ScalarCheckerIntegerWitness {
 impl ScalarCheckerIntegerWitness {
     fn remove_snapshot_axes(&mut self, work: &mut usize) -> Option<()> {
         let hidden = |id: &ReferenceBindingId| matches!(id.kind, super::ReferenceBindingKind::CheckerSnapshotField(_));
-        super::checker_flow::charge_call_work(work, self.axes.len().checked_mul(2)?)?;
+        super::checker_flow::charge_call_work(work, self.axes.len().saturating_mul(2))?;
         if !self.axes.iter().any(|(id, _)| hidden(id)) { return Some(()); }
         let mut next = 0;
         let mapping = self.axes.iter().map(|(id, _)| (!hidden(id)).then(|| {
@@ -1301,7 +1301,7 @@ impl<const ORDINARY_PROJECTIONS: bool, const NAMED_PARTITIONS: bool> ActualInteg
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
 
     fn charge_named_pair_activation(&mut self, body: &FunctionCallSites) -> Option<()> {
-        super::checker_flow::charge_call_work(&mut self.named_pair_work, body.occurrences.len().checked_add(1)?)
+        super::checker_flow::charge_call_work(&mut self.named_pair_work, body.occurrences.len().saturating_add(1))
     }
 
     fn named_mixed_pair(&self) -> bool { self.named_mixed_pair }
@@ -2487,7 +2487,7 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
         &mut self, at: OccurrenceOrdinal, ty: &'a ScalarType, expression: &ScalarExpression, depth: usize,
     ) -> Option<PassiveLiteral<'a>> {
         use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
-        use super::analysis_budget::{charge_call_work, MAX_PARTITION_TRANSFER_WORK};
+        use super::analysis_budget::charge_call_work;
         const MAX_DEPTH: usize = 16;
         if depth > MAX_DEPTH || self.topology.occurrences.get(at.0)?.span != super::typecheck::expression_span(expression) {
             return None;
@@ -2517,14 +2517,13 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
             ))? else { return None; };
             Some(at)
         };
-        let remaining = MAX_PARTITION_TRANSFER_WORK.checked_sub(*self.work)?;
         match (ty, typed, expression) {
             (ScalarType::Array { element, length, .. },
                 ScalarType::Array { element: typed_element, length: typed_length, .. },
                 ScalarExpression::ArrayLiteral { elements, .. }) =>
             {
                 if elements.is_empty() || u64::try_from(elements.len()).ok()? != *length
-                    || typed_length != length || elements.len() > remaining
+                    || typed_length != length
                     || !passive_type_equal(element, typed_element, MAX_DEPTH - depth)
                 { return None; }
                 let mut cells = Vec::with_capacity(elements.len());
@@ -2540,7 +2539,7 @@ impl<'a> PassiveLiteralPreparation<'a, '_> {
                 let owner = self.project.modules.get(*self.ordinals.get(&id.source)?)?;
                 let declared = owner.structs.get(id.index).filter(|item| item.id == *id)?;
                 if declared.copy_policy != super::CopyPolicy::Copy || fields.is_empty()
-                    || fields.len() != declared.fields.len() || fields.len() > remaining
+                    || fields.len() != declared.fields.len()
                 { return None; }
                 let mut values: Vec<_> = std::iter::repeat_with(|| None).take(fields.len()).collect();
                 for (position, field) in fields.iter().enumerate() {
@@ -3917,7 +3916,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 frames.first().ok_or(ProjectCheck::Unsupported)?.source.clone(),
                                 named_root.ok_or(ProjectCheck::Unsupported)?.outer,
                             );
-                            let cost = frames.len().checked_add(proof_work).ok_or(ProjectCheck::Unsupported)?;
+                            let cost = frames.len().saturating_add(proof_work);
                             self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
                             let intermediate = frames.windows(2)
                                 .map(|edge| edge[1].named_site.as_ref()
@@ -4188,7 +4187,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
                 super::checker_flow::charge_call_work(
                     &mut ordered.failures.borrow_mut().contextual_call_work,
-                    body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?,
+                    body.occurrences.len().saturating_add(1),
                 ).ok_or(ProjectCheck::Unsupported)?;
                 let origin = if matches!(binding.kind, super::ReferenceBindingKind::ContextualFormal) {
                     parent.contextual_origin.ok_or(ProjectCheck::Unsupported)?
@@ -5747,7 +5746,7 @@ fn render_authored_output(
             }
             _ => return None,
         };
-        charge_call_work(work, values.interval_count().checked_add(1)?)?;
+        charge_call_work(work, values.interval_count().saturating_add(1))?;
         Some(Rc::new(values.affine_unit(true, &offset, false)))
     };
     let selected_code = match &prepared.code_value {
@@ -5766,16 +5765,16 @@ fn render_authored_output(
         None => None,
     };
     let count = prepared.text_files.len().checked_add(prepared.state_files.len())?;
-    let mut copied_bytes = prepared.stdout_bytes.len().checked_add(prepared.stderr_bytes.len())?;
+    let mut copied_bytes = prepared.stdout_bytes.len().saturating_add(prepared.stderr_bytes.len());
     for file in prepared.text_files.iter() {
         charge_call_work(work, 1)?;
-        copied_bytes = copied_bytes.checked_add(file.path.len())?.checked_add(file.text.len())?;
+        copied_bytes = copied_bytes.saturating_add(file.path.len()).saturating_add(file.text.len());
     }
     for file in prepared.state_files.iter() {
         charge_call_work(work, 1)?;
-        copied_bytes = copied_bytes.checked_add(file.path.len())?;
+        copied_bytes = copied_bytes.saturating_add(file.path.len());
     }
-    charge_call_work(work, count.checked_add(copied_bytes.div_ceil(32))?)?;
+    charge_call_work(work, count.saturating_add(copied_bytes.div_ceil(32)))?;
     let mut text = prepared.text_files.iter();
     let mut selected = prepared.state_files.iter().peekable();
     let mut files = Vec::with_capacity(count);
@@ -5818,7 +5817,7 @@ fn render_authored_output(
                 _ => return None,
             };
             // Each file owns its bytes; meter both copying and publication.
-            charge_call_work(work, bytes.len().div_ceil(32).checked_mul(2)?)?;
+            charge_call_work(work, bytes.len().div_ceil(32).saturating_mul(2))?;
             files.push(ScalarCheckerTextFile {
                 path: file.path.clone(), path_span: file.path_span, text_span: file.state_span, text: bytes.clone(),
             });
@@ -5842,7 +5841,7 @@ fn project_authored_scalar(
     witness: &ScalarCheckerIntegerWitness, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
 ) -> Option<Rc<IntegerSet>> {
     use super::checker_flow::charge_call_work;
-    charge_call_work(work, witness.axes.len().checked_add(1)?)?;
+    charge_call_work(work, witness.axes.len().saturating_add(1))?;
     let axis = witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
     let values = witness.state.project_axis_bounded(axis, work)?;
     charge_call_work(work, values.interval_count())?;
@@ -5882,12 +5881,12 @@ fn encode_snapshot_node(
             json.push_str("]}");
         }
         CheckerSnapshotNode::Nominal { name, fields } => {
-            charge_call_work(work, 1usize.checked_add(name.len().div_ceil(32).checked_mul(6)?)?)?;
+            charge_call_work(work, 1usize.saturating_add(name.len().div_ceil(32).saturating_mul(6)))?;
             json.push_str(r#"{"type":{"kind":"struct","name":"#);
             json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
             json.push_str(r#"},"value":{"#);
             for (index, (name, child)) in fields.iter().enumerate() {
-                charge_call_work(work, 1usize.checked_add(name.len().div_ceil(32).checked_mul(6)?)?)?;
+                charge_call_work(work, 1usize.saturating_add(name.len().div_ceil(32).saturating_mul(6)))?;
                 if index != 0 { json.push(','); }
                 json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
                 json.push(':');
@@ -5913,7 +5912,7 @@ fn encode_snapshot_type(
             write!(json, r#"{{"kind":"{kind}"}}"#).ok()?;
         }
         CheckerSnapshotNode::Nominal { name, .. } => {
-            charge_call_work(work, name.len().div_ceil(32).checked_mul(6)?)?;
+            charge_call_work(work, name.len().div_ceil(32).saturating_mul(6))?;
             json.push_str(r#"{"kind":"struct","name":"#);
             json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
             json.push('}');
@@ -7184,8 +7183,7 @@ impl SelectedSymbolicProof<'_, '_> {
         use super::checker_flow::{charge_call_work, collect_result_pair_proofs, ResultPairCheck, ResultPairEntry, SymbolicResultPairWitness};
         let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
         let count = rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
-        charge_call_work(&mut self.snapshot_work, calls.occurrences.len().checked_add(count.checked_mul(3)
-            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut self.snapshot_work, calls.occurrences.len().saturating_add(count.saturating_mul(3))).ok_or(ProjectCheck::Unsupported)?;
         let common = first.filter;
         let mut checks = Vec::with_capacity(count);
         for proof in std::iter::once(first).chain(rest) {
@@ -7244,8 +7242,7 @@ impl SelectedSymbolicProof<'_, '_> {
             MainFlowProofCases::Bare { rest, .. } => rest.len().checked_add(1),
             MainFlowProofCases::Authored(cases) => Some(cases.len()),
         }.ok_or(ProjectCheck::Unsupported)?;
-        charge_call_work(&mut self.snapshot_work, calls.occurrences.len().checked_add(count.checked_mul(3)
-            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut self.snapshot_work, calls.occurrences.len().saturating_add(count.saturating_mul(3))).ok_or(ProjectCheck::Unsupported)?;
         let mut checked = Vec::with_capacity(count);
         match &group.cases {
             MainFlowProofCases::Bare { first, rest } =>
@@ -7418,7 +7415,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             .ok_or(ProjectCheck::Unsupported)?;
         if intervals == 0 { return Ok(Some(false)); }
         let depth = (usize::BITS - intervals.leading_zeros()) as usize;
-        let union_cost = intervals.checked_mul(depth.saturating_mul(2).saturating_add(4)).ok_or(ProjectCheck::Unsupported)?;
+        let union_cost = intervals.saturating_mul(depth.saturating_mul(2).saturating_add(4));
         charge_call_work(&mut work, union_cost).ok_or(ProjectCheck::Unsupported)?;
         let union = IntegerSet::union(domains.iter());
         // One independent canonical capture, before using any proof
@@ -7468,7 +7465,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 |declaration, active, work| {
                     let index = *cohort.peers.get(&declaration)?;
                     let cited = &domains[index];
-                    charge_call_work(work, 1usize.checked_add(active.interval_count())?.checked_add(cited.interval_count())?)?;
+                    charge_call_work(work, 1usize.saturating_add(active.interval_count()).saturating_add(cited.interval_count()))?;
                     active.is_subset_of(cited).then_some(verdicts[index].established)
                 })?;
         }
@@ -8453,12 +8450,12 @@ impl<'a> MainFlowProofBound<'a> {
             QuantifiedExclusionOrigins::Single(origin) => {
                 let excluded = claim.exclusions()?;
                 let depth = (usize::BITS - excluded.interval_count().leading_zeros()) as usize + 1;
-                super::checker_flow::charge_call_work(work, depth.checked_add(2)?)?;
+                super::checker_flow::charge_call_work(work, depth.saturating_add(2))?;
                 excluded.covers_closed(returned, returned).then_some(origin)
             }
             QuantifiedExclusionOrigins::Indexed(index) => {
                 let depth = (usize::BITS - index.interval_count().leading_zeros()) as usize + 1;
-                super::checker_flow::charge_call_work(work, depth.checked_add(3)?)?;
+                super::checker_flow::charge_call_work(work, depth.saturating_add(3))?;
                 index.containing_origin(returned)
             }
         };
@@ -8587,11 +8584,6 @@ fn prepare_flat_rewrite_shows<'a>(
     {
         return Err(ProjectCheck::Unsupported);
     }
-    let count = items.len();
-    let depth = (usize::BITS - count.leading_zeros()) as usize;
-    let cost = count.checked_mul(depth.checked_add(5).ok_or(ProjectCheck::Unsupported)?)
-        .ok_or(ProjectCheck::Unsupported)?;
-    super::checker_flow::charge_call_work(&mut 0, cost).ok_or(ProjectCheck::Unsupported)?;
     if !plan.steps.terminated_items.iter().all(|terminated| *terminated) {
         return Err(ProjectCheck::Unsupported);
     }
@@ -11180,7 +11172,7 @@ fn closed_dormant_float_plan(
     let source = &project.modules.get(target.0)?.source;
     for (block_ordinal, block) in body.structure.blocks.iter().enumerate() {
         if block.unsafe_context { return None; }
-        super::checker_flow::charge_call_work(&mut work, block.items.len().checked_add(1)?)?;
+        super::checker_flow::charge_call_work(&mut work, block.items.len().saturating_add(1))?;
         for item in &block.items {
             if let BlockItemKind::Binding(binding) = &item.kind {
                 if let Some(origin) = body.structure.checker_integer_call_locals.get(&(super::reference::BlockOrdinal(block_ordinal), item.position)) {
@@ -11339,7 +11331,7 @@ fn closed_readonly_float_tail(
         || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
     { return None; }
     let leaf = calls.function_body(ordinal, item, None)?;
-    super::checker_flow::charge_call_work(work, leaf.occurrences.len().checked_add(4)?)?;
+    super::checker_flow::charge_call_work(work, leaf.occurrences.len().saturating_add(4))?;
     if !leaf.checker_pure_calling_frame() || leaf.contextual_formal().is_some() || !leaf.callable_escapes.is_empty()
         || !leaf.structure.module_storage_uses.is_empty() || !leaf.call_occurrences.is_empty()
         || !leaf.structure.checker_direct_targets.is_empty()
@@ -11533,7 +11525,7 @@ fn projected_history_scalar_height(
             if matches!(body.structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))))
     { return None; }
     super::checker_flow::charge_call_work(work, body.structure.checker_integer_call_locals.len()
-        .checked_add(body.call_occurrences.len())?)?;
+        .saturating_add(body.call_occurrences.len()))?;
     let bindings = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
     if bindings.len() != body.call_occurrences.len() { return None; }
     let mut height = 1;
@@ -11595,8 +11587,8 @@ fn closed_callable_history_height(
     }
     if !active.insert(target) { return None; }
     super::checker_flow::charge_call_work(work, body.occurrences.len()
-        .checked_add(body.structure.checker_integer_call_locals.len())?
-        .checked_add(body.structure.checker_direct_targets.len())?)?;
+        .saturating_add(body.structure.checker_integer_call_locals.len())
+        .saturating_add(body.structure.checker_direct_targets.len()))?;
     if !closed_callable_history_body(body) && !closed_affine_snapshot_history(body) { return None; }
     let scalar_sites = body.structure.checker_integer_call_locals.values().map(|local| local.call).collect::<HashSet<_>>();
     let mut height = 1;
@@ -11639,7 +11631,7 @@ impl ClosedAuthoredHistories<'_> {
         if depth >= MAX_PROJECTED_HISTORY_DEPTH { return None; }
         let body = self.calls.function_body(target.0, target.1, None)?;
         let mut meter = self.work.get();
-        super::checker_flow::charge_call_work(&mut meter, body.occurrences.len().checked_add(prefix.len())?)?;
+        super::checker_flow::charge_call_work(&mut meter, body.occurrences.len().saturating_add(prefix.len()))?;
         self.work.set(meter);
         let mut nested = |caller: &FunctionCallSites, site, signature: &CheckedCallSignature,
             argument: NestedIntegerArgument<'_>, steps: Vec<super::checker_flow::CallableHistoryStep>| {
@@ -11655,7 +11647,7 @@ impl ClosedAuthoredHistories<'_> {
             }
             let entry = IntegerRequirementEntry::UnitHistory(argument.callable_history_entry(&signature.parameters, self.work)?);
             let mut meter = self.work.get();
-            super::checker_flow::charge_call_work(&mut meter, prefix.len().checked_add(steps.len())?)?;
+            super::checker_flow::charge_call_work(&mut meter, prefix.len().saturating_add(steps.len()))?;
             self.work.set(meter);
             let child_prefix = prefix.iter().copied().chain(steps).collect::<Vec<_>>();
             let (completion, pieces) = self.visit_unit(child, entry, origin, depth + 1, &child_prefix)?;
@@ -11912,7 +11904,7 @@ fn prepare_private_contextual_roster(
                     || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
                     || body.contextual_argument(expression).is_none()
                 { return Err(ProjectCheck::Unsupported); }
-                charge_call_work(&mut work, chain.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+                charge_call_work(&mut work, chain.len().saturating_add(1))
                     .ok_or(ProjectCheck::Unsupported)?;
                 let mut child_chain = chain.clone();
                 child_chain.push(child);
@@ -13416,7 +13408,7 @@ impl<'a> CallingPeerNode<'a> {
     ) -> Result<(), ProjectCheck> {
         use super::checker_flow::charge_call_work;
         // This covers indexing, edge binding, and typed implication.
-        charge_call_work(work, nodes.len().checked_mul(2).ok_or(ProjectCheck::Unsupported)?)
+        charge_call_work(work, nodes.len().saturating_mul(2))
             .ok_or(ProjectCheck::Unsupported)?;
         let by_declaration = nodes.iter().enumerate().map(|(index, node)| (node.declaration, index))
             .collect::<HashMap<_, _>>();
@@ -13492,7 +13484,7 @@ impl<'a> ExactCallingTopology<'a> {
         use super::checker_flow::charge_call_work;
         // Fresh invocation state and a linear acyclic-path walk only. The
         // observer separately charges the authored guards and goal/show checks.
-        charge_call_work(work, cases.len().checked_mul(4).ok_or(ProjectCheck::Unsupported)?)
+        charge_call_work(work, cases.len().saturating_mul(4))
             .ok_or(ProjectCheck::Unsupported)?;
         let admitted = cases.iter().map(|(proof, _)| proof.guard.accepts(arguments)).collect::<Vec<_>>();
         let mut peer_states = self.nodes.iter().zip(&admitted).map(|(node, &admitted)| node.entry_state(admitted))
@@ -14951,7 +14943,7 @@ impl CheckedIntegerGuardSlots<'_> {
         }
         if let Some((index, actual)) = self.domain {
             let slot = domains.get_mut(index)?;
-            charge_call_work(work, actual.interval_count().checked_add(1)?)?;
+            charge_call_work(work, actual.interval_count().saturating_add(1))?;
             match slot.intersection(actual) {
                 IntegerIntersection::Unchanged => {}
                 IntegerIntersection::Empty => {
@@ -14963,7 +14955,7 @@ impl CheckedIntegerGuardSlots<'_> {
         }
         for cmp in &self.comparisons {
             let slot = domains.get_mut(cmp.slot)?;
-            charge_call_work(work, slot.interval_count().checked_add(1)?)?;
+            charge_call_work(work, slot.interval_count().saturating_add(1))?;
             *slot = slot.keep_relation(cmp.relation, cmp.bound);
             if slot.is_empty() { break; }
         }
@@ -15746,7 +15738,7 @@ fn typed_named_repeated_universal<const DEPENDENT: bool>(
                 continue;
             };
             let (_, existential, _) = admission.ok_or(ProjectCheck::Unsupported)?;
-            let cost = image.interval_count().checked_add(existential.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            let cost = image.interval_count().saturating_add(existential.interval_count());
             super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
             Some(image)
         } else { None };
@@ -16200,7 +16192,7 @@ fn typed_named_dependent_witness(
                 .ok_or(ProjectCheck::Unsupported)?)
         } else { Cow::Borrowed(&universal_domain) };
         if shift.is_some() {
-            let cost = image.interval_count().checked_add(existential_domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            let cost = image.interval_count().saturating_add(existential_domain.interval_count());
             super::checker_flow::charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
         }
         if let Some(missing) = image.first_uncovered_from(&existential_domain) {
@@ -18675,9 +18667,10 @@ mod tests {
             Nominal(id, Box::new([Integer(&ScalarType::I32, 2.into()), Float(ranked_float::Atom::Single(0.1f32.to_bits()))])),
         ]))])));
         assert_eq!(work, 8);
-        let mut exhausted = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK - 1;
-        assert!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
-            .node(outputs.primary, &slot.ty, &binding.value, 0).is_none());
+        let mut exhausted = super::super::analysis_budget::FORMER_TRANSFER_CEILING - 1;
+        assert_eq!(PassiveLiteralPreparation { topology, project, ordinals: &ordinals, work: &mut exhausted, copies: None, maximum_depth: 0 }
+            .node(outputs.primary, &slot.ty, &binding.value, 0), Some(prepared));
+        assert_eq!(exhausted, super::super::analysis_budget::FORMER_TRANSFER_CEILING + 7);
     }
 
     #[cfg(feature = "internal-checker")]
@@ -19130,6 +19123,59 @@ mod tests {
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
                 assert!(matches!(prepare(&refused).run(),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn checker_closes_and_refutes_wide_finite_dormant_history_past_old_work_ceiling() {
+        use std::num::NonZeroUsize;
+        let owner = source("src/main.w", "large-finite-dormant-history");
+        let keep = format!("core.require(value>=0, {OUTPUT});\n");
+        let violate = format!("core.require(value<0, {OUTPUT});\n");
+        let text = |tail: &str| format!(r#"%%start
+            f32(i32) inspect = fn(value) {{
+                if (value>=0) {{ {} {tail} 1.0 }} else {{ 0.0 }}
+            }};
+        %%end"#, keep.repeat(768));
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepare = |program: &str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&owner, program), Vec::new())], [], vec![owner.clone()],
+                ScalarPreparationInputs { target_layout }, ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap_or_else(|error| panic!("fixture preparation failed: {error:?}"));
+            let valid = text("");
+            let prepared = prepare(&valid);
+            let owner = match &prepared.owner {
+                PreparedConfiguredCheck::Plain { owner, .. } => owner,
+                PreparedConfiguredCheck::Named { owner, .. } => &owner.prepared,
+                _ => panic!("proof-free dormant fixture"),
+            };
+            let (project, calls) = owner.parts();
+            let index = project.modules[0].items.iter().position(|item|
+                matches!(item, ScalarItem::Function(function) if function.name == "inspect")).unwrap();
+            let body = calls.function_body(0, index, None).unwrap();
+            let plan = closed_dormant_float_plan(project, calls, (0, index), body, true).unwrap();
+            let work = std::cell::Cell::new(0);
+            assert!(matches!(search_closed_dormant_float(body, &plan, &work, |_, _| panic!("valid authored path")),
+                Some(super::super::checker_flow::CallableHistoryCompletion::Exhausted(true))));
+            assert!(work.get() > super::super::analysis_budget::FORMER_TRANSFER_CEILING,
+                "fixture must exercise real work beyond the old cutoff, got {}", work.get());
+            let (cap, _) = prepared.run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let full = prepare(&valid).run().unwrap();
+            assert!(cap.active && full.active && cap.directives.is_empty() && full.directives.is_empty());
+
+            let bad = text(&violate.repeat(2));
+            let (cap, _) = prepare(&bad).run_private_authored_root(NonZeroUsize::MIN).unwrap();
+            let full = prepare(&bad).run().unwrap();
+            assert_eq!(cap.directives.len(), 1);
+            assert_eq!(full.directives.len(), 2);
+            assert_eq!(cap.directives, full.directives[..1]);
+            for failure in &full.directives {
+                assert_eq!(failure.witness.axes().len(), 1);
+                let zero = BigInt::ZERO;
+                let maximum = BigInt::from(i32::MAX);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &maximum)]));
             }
         }
     }
@@ -26708,7 +26754,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 matches!(item, ScalarItem::Function(function) if function.name == name)).unwrap();
             named_exact_frame_cost(calls.function_body(0, index, None).unwrap()).unwrap()
         };
-        let cap = super::super::checker_flow::MAX_PARTITION_TRANSFER_WORK;
+        let cap = super::super::checker_flow::FORMER_TRANSFER_CEILING;
         for extra in [0, 1] {
             let mut observer = MainFlowProofObserver::from_first_plan(scope, &app, &plan).unwrap();
             observer.finish_plans(&prepared.prepared, scope).unwrap();
@@ -26722,13 +26768,9 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             observer.named_exact_work = cap - remaining + extra;
             let result = run_prepared_ordered_check(&prepared.prepared, scope, 1, OrderedReachPolicy::Closed,
                 NamedOrderedEvidence { observed: observer });
-            if extra == 0 {
-                let report = result.unwrap();
-                assert!(report.active && report.directives.is_empty() && report.actual.observed.diagnostics.is_empty());
-                assert_eq!(report.actual.observed.named_exact_work, cap);
-            } else {
-                assert!(matches!(result, Err(ProjectCheck::Unsupported)));
-            }
+            let report = result.unwrap();
+            assert!(report.active && report.directives.is_empty() && report.actual.observed.diagnostics.is_empty());
+            assert_eq!(report.actual.observed.named_exact_work, cap + extra);
         }
     }
 
@@ -34639,17 +34681,14 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         );
         let mut isolated = 0;
         assert_eq!(prepare(&mut isolated).unwrap().len(), 3);
-        let budget = super::super::analysis_budget::MAX_PARTITION_TRANSFER_WORK;
+        let budget = super::super::analysis_budget::FORMER_TRANSFER_CEILING;
         let mut shared = 0;
-        let mut count = 0;
-        for _ in 0..budget {
-            match prepare(&mut shared) {
-                Ok(branches) => { assert_eq!(branches.len(), 3); count += 1; }
-                Err(ProjectCheck::Unsupported) => break,
-                Err(_) => panic!("valid proof reached an unexpected pre-cohort result"),
-            }
+        let count = budget / isolated + 1;
+        for _ in 0..count {
+            assert_eq!(prepare(&mut shared).unwrap().len(), 3);
         }
-        assert!(count > 1 && shared > budget);
+        assert_eq!(shared, count * isolated);
+        assert!(shared > budget);
         assert_eq!(prepare(&mut 0).unwrap().len(), 3);
     }
 

@@ -158,7 +158,7 @@ impl StartUpSearch {
     }
 
     pub(super) fn admit(&mut self, directive: SourceSpan) -> Option<Admission> {
-        super::super::checker_flow::charge_call_work(&mut self.work, self.prefix.len().checked_add(1)?)?;
+        super::super::checker_flow::charge_call_work(&mut self.work, self.prefix.len().saturating_add(1))?;
         self.select(FailurePath { steps: self.prefix.clone(), directive })
     }
 
@@ -238,7 +238,7 @@ impl StartUpSearch {
     }
 
     pub(super) fn charge_formal_replay(&mut self, activations: usize, per_activation: usize) -> Option<()> {
-        super::super::checker_flow::charge_call_work(&mut self.work, activations.checked_mul(per_activation)?)
+        super::super::checker_flow::charge_call_work(&mut self.work, activations.saturating_mul(per_activation))
     }
 
     pub(super) fn allows_qualified_scalar_proof(&self, caller: &SourceIdentity, site: OccurrenceOrdinal, target: (usize, usize)) -> bool {

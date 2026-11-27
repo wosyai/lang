@@ -384,15 +384,9 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{BindingInitialization, BlockItemKind, ModuleInitializationCallTarget, ModuleInitializationDetail};
-    const MAX_WORK: usize = 4096;
-    let mut work = 0usize;
-    let mut charge = |amount| {
-        work = work.checked_add(amount).filter(|&cost| cost <= MAX_WORK).ok_or(Unsupported)?;
-        Ok(())
-    };
+
     let root = initialization_order.first().ok_or(Unsupported)?;
     if sources.len() != initialization_order.len() { return Err(Unsupported); }
-    charge(sources.len().checked_add(queries.len()).ok_or(Unsupported)?)?;
     let allowed: HashSet<_> = initialization_order.iter().collect();
     if allowed.len() != sources.len() { return Err(Unsupported); }
     let root_module = sources.iter().position(|(source, _)| source.source() == root).ok_or(Unsupported)?;
@@ -406,8 +400,6 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
             || namespaces.iter().any(|edge| !allowed.contains(&edge.target))
         { return Err(Unsupported); }
         let places = &mut source.contextual_places;
-        charge(places.declarations.len().saturating_add(places.inherited.len())
-            .saturating_add(source.items.len()).saturating_add(namespaces.len()))?;
         let mut lexical_by_owner = HashMap::<ByteSpan, Vec<(u32, ByteSpan, ByteSpan)>>::new();
         for storage in &places.declarations {
             if !typecheck::is_integer_type(&storage.ty) { return Err(Unsupported); }
@@ -443,7 +435,6 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
         if !checker_directives || allow_empty_startup || queries.is_empty() || queries.len() != calls.checker_targets.len() {
             return Err(Unsupported);
         }
-        charge(queries.len())?;
         queries.iter().zip(&calls.checker_targets).map(|(query, resolved)| {
             let resolved = resolved.as_ref().ok_or(Unsupported)?;
             let ResolvedCallTarget::ModuleCallable {
@@ -538,12 +529,9 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
         let mut lexical = lexical[module_index].0.remove(&function.span).unwrap_or_default();
         // Activation order differs from declaration-entry order when a
         // declaration initializer contains another lexical block.
-        let sort_work = |len: usize| len.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
-        charge(sort_work(lexical.len()))?;
         lexical.sort_unstable_by_key(|&(active_after, scope, _)| (active_after, std::cmp::Reverse(scope.end)));
         let mut activation = lexical.into_iter().peekable();
         let mut active = Vec::<(ByteSpan, ByteSpan)>::new();
-        charge(sort_work(body.call_occurrences.len()))?;
         let mut ordered = Vec::with_capacity(body.call_occurrences.len());
         for call in &body.call_occurrences {
             let span = body.occurrences.get(call.ordinal.0).ok_or(Unsupported)?.span;
@@ -565,10 +553,8 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
             }
             let callee = *by_target.get(&(source, *declaration_span)).ok_or(Unsupported)?;
             while activation.peek().is_some_and(|&(start, _, _)| start <= occurrence.start) {
-                charge(1)?;
                 let (start, scope, binding) = activation.next().ok_or(Unsupported)?;
                 while active.last().is_some_and(|&(outer, _)| outer.end <= start) {
-                    charge(1)?;
                     active.pop();
                 }
                 if active.last().is_some_and(|&(outer, _)| scope.end > outer.end || scope.start < outer.start) {
@@ -577,7 +563,6 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
                 active.push((scope, binding));
             }
             while active.last().is_some_and(|&(scope, _)| scope.end <= occurrence.start) {
-                charge(1)?;
                 active.pop();
             }
             let binding = match active.last() {
@@ -601,7 +586,6 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
     // Propagate a single named demand over authenticated reverse edges.
     // Cycles cannot revisit a function that already requires the same name.
     while let Some(callee) = pending.pop() {
-        charge(parents[callee].len())?;
         for &caller in &parents[callee] {
             if !std::mem::replace(&mut needs[caller], true) { pending.push(caller); }
         }
@@ -617,7 +601,6 @@ pub(super) fn prepare_contextual_transport_graph_with_targets(
     let startup;
     let ordered_calls = if mixed_scalar_bindings {
         if root_checked.next().is_some() { return Err(Unsupported); }
-        charge(topology.calls.len())?;
         let mut root_call = None;
         for &occurrence in &topology.calls {
             if scalar_initializers.remove(&occurrence) {

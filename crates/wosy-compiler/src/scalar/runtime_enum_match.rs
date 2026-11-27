@@ -439,7 +439,7 @@ impl Plan {
         if !self.initializer || self.prefix.len() > 4 || self.outputs.len() != 1 { return None; }
         // This is projection of already-typed leaves, not evaluation. Check
         // never silently omits effects or unsupported computations in a case.
-        analysis_budget::charge_call_work(work, self.arms.len().checked_add(1)?)?;
+        analysis_budget::charge_call_work(work, self.arms.len().saturating_add(1))?;
         for arm in &self.arms {
             match arm.results.as_slice() {
                 [ArmResult::Literal { .. } | ArmResult::Payload { .. }] => {}
@@ -450,7 +450,7 @@ impl Plan {
         }
         let value = |selector: &TypedSelector, work: &mut usize| {
             let TypedSelector::Constructor { tag, payload, .. } = selector else { return None; };
-            analysis_budget::charge_call_work(work, self.arms.len().checked_add(payload.len())?.checked_add(1)?)?;
+            analysis_budget::charge_call_work(work, self.arms.len().saturating_add(payload.len()).saturating_add(1))?;
             let arm = self.arms.iter().find(|arm| arm.tag == *tag)?;
             let [result] = arm.results.as_slice() else { return None; };
             let lane = |output| Some(MatchLane { arm_scope: arm.scope, output });

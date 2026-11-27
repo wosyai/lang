@@ -62,7 +62,7 @@ impl Claim<'_> {
             Self::Payload { slot, facts } => {
                 let equal = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
                 for (leaf, payload) in facts.iter() {
-                    let cost = leaf.interval_count().checked_add(domain.interval_count())?.checked_add(1)?;
+                    let cost = leaf.interval_count().saturating_add(domain.interval_count()).saturating_add(1);
                     charge_call_work(work, cost)?;
                     let active = intersect(domain, leaf);
                     if active.is_empty() { continue; }
@@ -434,7 +434,7 @@ fn compile<'a>(
     if depth == MAX_ACTUAL_CALL_DEPTH || block.terminated_items.len() != block.items.len() {
         return Err(ProjectCheck::Unsupported);
     }
-    charge_call_work(&mut work.preparation, block.items.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+    charge_call_work(&mut work.preparation, block.items.len().saturating_add(1))
         .ok_or(ProjectCheck::Unsupported)?;
     charge_call_work(&mut work.observation, 1).ok_or(ProjectCheck::Unsupported)?;
     let mut steps = Vec::with_capacity(block.items.len());
@@ -525,7 +525,7 @@ fn check_partitions<'body>(
             }
             Step::Match(arms) => {
                 for (arm, steps) in arms {
-                    let cost = domain.interval_count().checked_add(arm.interval_count())?.checked_add(1)?;
+                    let cost = domain.interval_count().saturating_add(arm.interval_count()).saturating_add(1);
                     charge_call_work(work, cost)?;
                     let active = intersect(domain, arm);
                     let verdict = check_partitions(steps, producer, returned, &active, work, cite)?;
@@ -536,8 +536,8 @@ fn check_partitions<'body>(
             Step::Split(Condition::Boolean(guard), yes, no) =>
                 check_partitions(if *guard { yes } else { no }, producer, returned, domain, work, cite)?,
             Step::Split(Condition::Partition { yes: positive, no: negative }, yes, no) => {
-                let cost = domain.interval_count().checked_mul(2)?
-                    .checked_add(positive.interval_count())?.checked_add(negative.interval_count())?;
+                let cost = domain.interval_count().saturating_mul(2)
+                    .saturating_add(positive.interval_count()).saturating_add(negative.interval_count());
                 charge_call_work(work, cost)?;
                 let admitted = intersect(domain, positive);
                 let verdict = check_partitions(yes, producer, returned, &admitted, work, cite)?;

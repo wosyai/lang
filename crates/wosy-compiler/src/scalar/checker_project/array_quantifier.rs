@@ -149,7 +149,7 @@ impl<'a> ArrayProof<'a> {
                         Cow::Borrowed(domain) => domain.interval_count(),
                         Cow::Owned(_) => 0,
                     };
-                    charge_call_work(work, clone_cost.checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+                    charge_call_work(work, clone_cost.saturating_add(1))
                         .ok_or(ProjectCheck::Unsupported)?;
                     branches.push(Self {
                         proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(&goal_node),
@@ -249,7 +249,7 @@ fn compile_witness_branches(
         return Ok(());
     }
     let cost = active.iter().try_fold(1usize, |total, filter| total.checked_add(match filter {
-        CheckerPredicate::EntryDomain { values, .. } => values.interval_count().checked_add(1)?,
+        CheckerPredicate::EntryDomain { values, .. } => values.interval_count().saturating_add(1),
         _ => 1,
     })).ok_or(ProjectCheck::Unsupported)?;
     charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
@@ -285,7 +285,7 @@ fn dependent_witness_image<'a>(
     work: &mut usize,
 ) -> Result<(Cow<'a, IntegerSet>, Option<BigInt>), ProjectCheck> {
     let (image, shift) = checked_quantified_witness_translation(argument, universal, domain, &ScalarType::U64, work)?;
-    let cost = image.interval_count().checked_add(target.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+    let cost = image.interval_count().saturating_add(target.interval_count());
     charge_call_work(work, cost).ok_or(ProjectCheck::Unsupported)?;
     if !image.is_subset_of(target) { return Err(ProjectCheck::Unsupported); }
     Ok((image, shift))
@@ -537,7 +537,7 @@ impl<'plan, 'proof> Evidence<'plan, 'proof> {
         let mut guards = Vec::with_capacity(cohort.plans.len());
         for plan in &cohort.plans {
             let filter = plan.entry_filter.as_deref().unwrap_or_default();
-            charge_call_work(&mut work, filter.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+            charge_call_work(&mut work, filter.len().saturating_add(1))
                 .ok_or(ProjectCheck::Unsupported)?;
             guards.push(checked_scalar_guard_slots::<true>(plan.body, filter, false, true));
         }
@@ -711,7 +711,7 @@ impl Symbolic<'_, '_, '_> {
                     _ => 1,
                 })
             }).ok_or(ProjectCheck::Unsupported)?;
-            charge_call_work(&mut self.work, guards.checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+            charge_call_work(&mut self.work, guards.saturating_add(1))
                 .ok_or(ProjectCheck::Unsupported)?;
             if common != filter { same = false; break; }
         }
