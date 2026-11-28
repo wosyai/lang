@@ -26343,6 +26343,82 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned original Orbital engine"]
+    fn pinned_orbital_prepare_actuator_preserves_ranked_scalar_return_and_local_assignment() {
+        use super::super::checker_flow::ProjectedStorage;
+        use super::ordered_float_prefix::ObservedStep;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let from=engine.find("bool(i32,i32) prepare_actuators=").unwrap();
+        let until=from+engine[from..].find("unit(i32,i32) upload_actuators=").unwrap();
+        let original=&engine[from..until];
+        // Only emission geometry is replaced by a small closed companion.
+        // The actual ordered selection, storage reads, true/false test,
+        // recursive assignment, state and returned value are original.
+        let text=format!(r#"%%start
+            i32 count=0;
+            i32[5] motion_first=[4098,0,4101,0,0];
+            i32[5] motion_size=[3,0,3,0,0];
+            unit(i32) emit_actuator=fn(id){{if(id==2){{count=count+4;}}else{{count=count+3;}};}};
+            {original}
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-prepare-actuators");
+        let integer=|n:i32| ObservedExactValue::Integer(ScalarType::I32,n.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (text,valid_rank) in [
+                (text.clone(),true),
+                (text.replacen("prepare_actuators(mask/2,id+1)","prepare_actuators(mask/2,id-1)",1),false),
+                (text.replacen("if(id<5 && mask>0)","if(mask>0)",1),false),
+            ] {
+            let prepared=prepare_checker_project(vec![(declarations(&app,&text),Vec::new())],vec![app.clone()],
+                ScalarPreparationInputs {target_layout}).unwrap();
+            let (project,calls)=prepared.parts();
+            let module=&project.modules[0];
+            let target=(0,module.items.iter().position(|item|matches!(item,ScalarItem::Function(f)
+                if f.name=="prepare_actuators")).unwrap());
+            let recurse=text.find("prepare_actuators(mask/2,").unwrap() as u32;
+            let backedge=wosy_syntax::SourceSpan::new(app.clone(),ByteSpan::new(recurse,
+                recurse+"prepare_actuators(mask/2,id+1)".len() as u32));
+            let declaration=|name:&str| module.items.iter().find_map(|item|match item {
+                ScalarItem::Binding(global) if global.name==name=>Some(wosy_syntax::SourceSpan::new(app.clone(),global.name_span)),
+                _=>None,
+            }).unwrap();
+            let cases:&[(i32,bool,i32,bool)]=if valid_rank {
+                &[(0,true,0,false),(1,true,4101,true),(5,false,4105,true),(32,true,0,true)]
+            } else { &[(1,true,0,true)] };
+            for &(mask,accepted,expected_count,recursive) in cases {
+                let mut state=ProjectedStorage::default();
+                state.observe_scalar(declaration("count"),&ScalarType::I32,&0.into());
+                for (name,values) in [("motion_first",[4098,0,4101,0,0]),("motion_size",[3,0,3,0,0])] {
+                    let marker=declaration(name);
+                    let ty=ScalarType::Array {element:Box::new(ScalarType::I32),length:5,
+                        length_span:marker.range,span:marker.range};
+                    state.observe_array(marker,&ty,values.map(BigInt::from).iter());
+                }
+                let outcome=stateful_provider::run(project,calls,target,vec![integer(mask),integer(0)],
+                    &mut state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                    false,&std::cell::Cell::new(false),|state,cell,ty| {
+                        if *ty!=ScalarType::I32 { return None; }
+                        Some((integer(state.observed_flat_i32(cell)?),1))
+                    },|_,_,_|None);
+                if !valid_rank {
+                    assert!(outcome.is_none(),"unranked scalar continuation must refuse");
+                    assert_eq!(state.observed_atom(&declaration("count")),Some(integer(0)));
+                    continue;
+                }
+                let (returned,trace,_,selection)=outcome.unwrap();
+                assert_eq!(returned,Some(ObservedExactValue::Boolean(accepted)));
+                let trace=trace.unwrap();
+                assert_eq!(trace.root.iter().chain(trace.segments.iter().flatten()).any(|step|
+                    matches!(step,ObservedStep::Call {site,..} if site==&backedge)),recursive);
+                assert_eq!(state.observed_atom(&declaration("count")),Some(integer(expected_count)));
+                assert!(selection.is_none());
+            }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
     fn pinned_orbital_upload_reports_original_false_requirement_only_at_valid_cap() {
         use std::num::NonZeroUsize;

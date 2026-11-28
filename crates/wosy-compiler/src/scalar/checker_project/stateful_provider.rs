@@ -66,6 +66,7 @@ enum Task {
     DropUnit,
     DropInteger(ScalarType),
     Bind(ReferenceBindingId,ScalarType),
+    ReplaceLocal(ReferenceBindingId,ScalarType),
     Read(Place),
     WritePlace(Place),
     Write(Place,ExactValue),
@@ -209,7 +210,7 @@ pub(super) struct RangeRank { begin:usize, finish:RangeBound, inclusive:bool }
 pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallable) -> Option<RangeRank> {
     let st=&body.structure;
     let ids=body.boundary.checker_parameter_bindings.as_deref()?;
-    if !body.checker_returns_unit() || ids.len()!=body.boundary.parameters.len()
+    if ids.len()!=body.boundary.parameters.len()
         || (has_callable_obligations(body) && !supports_requirements(body)) { return None; }
     let mut sites=st.checker_direct_targets.iter().filter_map(|(&site,&child)| (child==target).then_some(site));
     let backedge=sites.next()?;
@@ -246,21 +247,40 @@ pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallab
         };
         Some((finish,inclusive))
     };
-    let mut pending=vec![(st.root,None)];
-    while let Some((block,limit))=pending.pop() {
-        let Some(item)=st.blocks.get(block.0)?.items.last() else { continue; };
-        let BlockItemKind::Evaluation {expression}=item.kind else { continue; };
-        if expression==backedge { let (finish,inclusive)=limit?; return Some(RangeRank {begin,finish,inclusive}); }
-        if st.checked_types.expressions.get(&expression)!=Some(&ScalarType::Unit) { continue; }
-        match body.conditionals.get(&expression) {
-            Some(ConditionalRegion::Unit {condition,then_block,..})=>
-                pending.push((*then_block,bound(*condition).or(limit))),
-            Some(ConditionalRegion::Value {condition,then_block,else_block,..})=>{
-                pending.push((*else_block,limit));
-                pending.push((*then_block,bound(*condition).or(limit)));
+    if body.checker_returns_unit() {
+        let mut pending=vec![(st.root,None)];
+        while let Some((block,limit))=pending.pop() {
+            let Some(item)=st.blocks.get(block.0)?.items.last() else { continue; };
+            let BlockItemKind::Evaluation {expression}=item.kind else { continue; };
+            if expression==backedge { let (finish,inclusive)=limit?; return Some(RangeRank {begin,finish,inclusive}); }
+            if st.checked_types.expressions.get(&expression)!=Some(&ScalarType::Unit) { continue; }
+            match body.conditionals.get(&expression) {
+                Some(ConditionalRegion::Unit {condition,then_block,..})=>
+                    pending.push((*then_block,bound(*condition).or(limit))),
+                Some(ConditionalRegion::Value {condition,then_block,else_block,..})=>{
+                    pending.push((*else_block,limit));
+                    pending.push((*then_block,bound(*condition).or(limit)));
+                }
+                None=>{}
             }
-            None=>{}
         }
+        return None;
+    }
+    // A value-returning recursive call may be consumed by a local
+    // assignment, then return that value. The VM retains the exact
+    // continuation; termination needs the enclosing true guard, not tail
+    // position. Use the same typed occurrence parents as range proofs.
+    let parents = super::range_envelopes::occurrence_parents(body)?;
+    let mut cursor=OccurrenceParent::Expression(backedge);
+    while cursor!=OccurrenceParent::Block(st.root) {
+        let &(parent,edge)=parents.get(&cursor)?;
+        if let (OccurrenceParent::Expression(at),OccurrenceEdge::ThenBranch)=(parent,edge) {
+            let condition=match body.conditionals.get(&at)? {
+                ConditionalRegion::Unit {condition,..} | ConditionalRegion::Value {condition,..}=>*condition,
+            };
+            if let Some((finish,inclusive))=bound(condition) { return Some(RangeRank {begin,finish,inclusive}); }
+        }
+        cursor=parent;
     }
     None
 }
@@ -667,17 +687,32 @@ pub(super) fn run<'a>(
                         let AssignmentReplacement::Resolved(ty)=&destination.replacement else { return None; };
                         if assignment.projected_outputs().len()!=0 || st.checked_types.expressions.get(&rhs.expression)?!=ty
                             || st.checked_types.places.get(&destination.destination)?!=ty { return None; }
-                        let p=if let Some(DirectDestinationIdentity::Module(declaration))=body.prepared_direct_destination(destination.destination) {
-                            if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool) { return None; }
-                            Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone(),field:None }
-                        } else { Place::indexed(body,destination.destination,ty,owner)? };
-                        tasks.extend([Task::WritePlace(p),Task::Eval(rhs.expression)]);
+                        match body.prepared_direct_destination(destination.destination) {
+                            Some(DirectDestinationIdentity::Existing(id)) => {
+                                let formals=body.boundary.checker_parameter_bindings.as_ref()?;
+                                if formals.contains(id) || frame.slots.get(id)?.ty()!=*ty { return None; }
+                                tasks.extend([Task::ReplaceLocal(id.clone(),ty.clone()),Task::Eval(rhs.expression)]);
+                            }
+                            direct => {
+                                let p=if let Some(DirectDestinationIdentity::Module(declaration))=direct {
+                                    if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool) { return None; }
+                                    Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone(),field:None }
+                                } else { Place::indexed(body,destination.destination,ty,owner)? };
+                                tasks.extend([Task::WritePlace(p),Task::Eval(rhs.expression)]);
+                            }
+                        }
                     }
                     _=>return None,
                 }
             }
             Task::DropUnit => if !matches!(values.pop()?,ResultValue::Unit) { return None; },
             Task::DropInteger(ty) => if scalar(values.pop()?)?.ty()!=ty { return None; },
+            Task::ReplaceLocal(id,ty) => {
+                let value=scalar(values.pop()?)?;
+                let slot=frame.slots.get_mut(&id)?;
+                if value.ty()!=ty || slot.ty()!=ty { return None; }
+                *slot=value;
+            }
             Task::Bind(id,ty) => {
                 let value=scalar(values.pop()?)?;
                 if value.ty()!=ty || frame.slots.insert(id,value).is_some() { return None; }
@@ -959,13 +994,13 @@ pub(super) fn run<'a>(
                 }
                 let rank=if child==frame.target {
                     let bindings=body.boundary.checker_parameter_bindings.as_deref()?;
-                    if out.ty==ScalarType::Unit {
-                        let rank=ranges.get(&child).copied().or_else(||
-                            *dispatch.range_ranks.entry(child).or_insert_with(|| advancing_range_plan(body,child)))?;
+                    let advancing=ranges.get(&child).copied().or_else(||
+                        *dispatch.range_ranks.entry(child).or_insert_with(|| advancing_range_plan(body,child)));
+                    if let Some(rank)=advancing {
                         rank.decreases(&frame.slots,bindings,&args)?;
                         None
                     } else {
-                    if !matches!(tasks.last(),Some(Task::Finish(..))) { return None; }
+                    if out.ty==ScalarType::Unit || !matches!(tasks.last(),Some(Task::Finish(..))) { return None; }
                     let use_rank=|slot| -> Option<usize> {
                         let id=bindings.get(slot)?;
                         rank_argument(body,site,slot,id)?;

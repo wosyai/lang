@@ -449,19 +449,6 @@ impl<'a> PreparedEnvelopes<'a> {
         Some(Some(args))
     }
 
-    fn parents(frame: Frame<'a>) -> Option<HashMap<OccurrenceParent,(OccurrenceParent,OccurrenceEdge)>> {
-        let mut parents = HashMap::new();
-        for (&(parent,edge), &child) in &frame.body.structure.edges {
-            let child = match child {
-                OccurrenceNode::Expression(at) => OccurrenceParent::Expression(at),
-                OccurrenceNode::Place(at) => OccurrenceParent::Place(at),
-                OccurrenceNode::Block(at) => OccurrenceParent::Block(at),
-            };
-            if parents.insert(child,(parent,edge)).is_some() { return None; }
-        }
-        Some(parents)
-    }
-
     /// All call sites here are prepared identities of this one frame, not
     /// an assertion that all ways to enter its callee have been enumerated.
     pub(super) fn direct_edge_envelopes(
@@ -482,7 +469,7 @@ impl<'a> PreparedEnvelopes<'a> {
         let mut frame = self.frame_without_formal_mutation(owner)?;
         frame.arrival = arrival;
         if !contained(&initial_inputs(frame.body)?,input) { return None; }
-        let parents = Self::parents(frame)?;
+        let parents = occurrence_parents(frame.body)?;
         let mut known = HashMap::from([(OccurrenceParent::Block(frame.body.structure.root),Some(Rc::new(input.clone())))]);
         let mut edges = Vec::new();
         for site in &frame.body.call_occurrences {
@@ -526,7 +513,7 @@ impl<'a> PreparedEnvelopes<'a> {
         if st.checker_directives.is_empty() || b.conditionals.is_empty()
             || !contained(&initial_inputs(b)?,&entry)
         { return None; }
-        let parents = Self::parents(frame)?;
+        let parents = occurrence_parents(frame.body)?;
         let mut known = HashMap::from([(OccurrenceParent::Block(st.root),Some(Rc::new(entry)))]);
         let mut covered = Vec::new();
         for (&expression,directive) in &st.checker_directives {
@@ -723,6 +710,19 @@ impl<'a> PreparedEnvelopes<'a> {
         if !matches!(frame.body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool) { return None; }
         self.facts(&frame, frame.output(frame.body.structure.root)?, want, input)
     }
+}
+
+pub(super) fn occurrence_parents(body:&FunctionCallSites) -> Option<HashMap<OccurrenceParent,(OccurrenceParent,OccurrenceEdge)>> {
+    let mut parents = HashMap::new();
+    for (&(parent,edge), &child) in &body.structure.edges {
+        let child = match child {
+            OccurrenceNode::Expression(at) => OccurrenceParent::Expression(at),
+            OccurrenceNode::Place(at) => OccurrenceParent::Place(at),
+            OccurrenceNode::Block(at) => OccurrenceParent::Block(at),
+        };
+        if parents.insert(child,(parent,edge)).is_some() { return None; }
+    }
+    Some(parents)
 }
 
 fn contained(outer: &Inputs, inner: &Inputs) -> bool {
