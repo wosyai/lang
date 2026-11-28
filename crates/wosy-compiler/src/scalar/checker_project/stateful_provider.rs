@@ -34,7 +34,7 @@ impl Place {
             return (&declaration.source==owner).then(|| Self { declaration:declaration.clone(), selectors, ty:ty.clone(),field:Some(field.clone()) });
         }
         let checked=observed_f32_array::typed_provider_place(body,site,ty)?;
-        if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::U16|ScalarType::U8) || &checked.declaration.source!=owner { return None; }
+        if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::F64|ScalarType::U16|ScalarType::U8) || &checked.declaration.source!=owner { return None; }
         Some(Self { declaration:checked.declaration.clone(),selectors:checked.selectors,ty:ty.clone(),field:None })
     }
 
@@ -73,6 +73,7 @@ enum Task {
     Binary(BinaryOperator),
     Not,
     Negate(ScalarType),
+    NegateF32,
     Requirement(OccurrenceOrdinal),
     Branch(OccurrenceOrdinal,BlockOrdinal,Option<BlockOrdinal>,Output),
     Short(OccurrenceOrdinal,bool,OccurrenceOrdinal),
@@ -359,6 +360,49 @@ pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCal
         }
     }
     false
+}
+
+/// A locally entered provider with typed direct F32 storage effects and
+/// no opaque or authored exit. Exact completed namespace calls are part
+/// of the same known row. This only admits dispatch: writes, guards and
+/// terminating edges must still execute.
+pub(super) fn closed_local_f32_store_route(project:&ScalarProject,calls:&ProjectCallSiteResults,
+    start:PreparedCallable, visits:&[InitializationVisit]) -> Option<()> {
+    let (_,root,returned)=direct_symbol(project,calls,start)?;
+    if returned!=ScalarType::Unit || root.boundary.parameters.iter()
+        .any(|p| !matches!(p.ty,ScalarType::I32|ScalarType::F32))
+    { return None; }
+    let owner=&project.modules.get(start.0)?.source;
+    let mut seen=HashSet::new();
+    let mut pending=vec![start];
+    let mut writes=false;
+    while let Some(target)=pending.pop() {
+        if !seen.insert(target) { continue; }
+        let (_,body,_)=direct_symbol(project,calls,target)?;
+        if has_callable_obligations(body) || !body.allocation_length_call_targets.is_empty()
+            || body.structure.blocks.iter().any(|block| block.unsafe_context)
+            || !body.structure.prepared_callable_value_uses.is_empty()
+        { return None; }
+        writes |= body.assignments.values().any(|group| group.destinations().any(|destination|
+            matches!(destination.replacement,AssignmentReplacement::Resolved(ScalarType::F32))
+                && matches!(body.prepared_direct_destination(destination.destination),
+                    Some(DirectDestinationIdentity::Module(declaration)) if &declaration.source==owner)));
+        for call in &body.call_occurrences {
+            let site=call.ordinal;
+            match body.resolved_call_site(site)?.target {
+                ResolvedCallTarget::Core(_) => {}
+                ResolvedCallTarget::ModuleCallable {..} => {
+                    let signature=body.checked_call_signatures.get(&site)?;
+                    let child=authenticate_prepared_direct_edge(project,calls,target.0,body,site,signature)?;
+                    if child.0!=target.0 && !completed_namespace_owner(&project.modules.get(target.0)?.source,
+                        &project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
+                    pending.push(child);
+                }
+                _=>return None,
+            }
+        }
+    }
+    writes.then_some(())
 }
 
 /// A reached prepared expression, not an executed foreign operation.
@@ -695,7 +739,7 @@ pub(super) fn run<'a>(
                             }
                             direct => {
                                 let p=if let Some(DirectDestinationIdentity::Module(declaration))=direct {
-                                    if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool) { return None; }
+                                    if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool|ScalarType::F32) { return None; }
                                     Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone(),field:None }
                                 } else { Place::indexed(body,destination.destination,ty,owner)? };
                                 tasks.extend([Task::WritePlace(p),Task::Eval(rhs.expression)]);
@@ -771,6 +815,8 @@ pub(super) fn run<'a>(
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
                 } else if let Some(operand)=st.observed_bool_negations.get(&at) {
                     tasks.extend([Task::Not,Task::Eval(*operand)]);
+                } else if let Some(operand)=st.observed_f32_negations.get(&at) {
+                    tasks.extend([Task::NegateF32,Task::Eval(*operand)]);
                 } else if let Some(operand)=st.observed_integer_negations.get(&at) {
                     tasks.extend([Task::Negate(ty.clone()),Task::Eval(*operand)]);
                 } else {
@@ -814,7 +860,8 @@ pub(super) fn run<'a>(
                     continue;
                 }
                 match value {
-                    ExactValue::F32(value) if !cell.indices.is_empty()=>storage.overwrite_f32_array_element(cell,value)?,
+                    ExactValue::F32(value) if cell.indices.is_empty()=>storage.overwrite_f32_scalar(cell.declaration,value)?,
+                    ExactValue::F32(value)=>storage.overwrite_f32_array_element(cell,value)?,
                     ExactValue::Integer(ScalarType::I32,value) if cell.indices.is_empty()=>
                         storage.overwrite_scalar(&cell.declaration,&ScalarType::I32,&value)?,
                     ExactValue::Integer(ScalarType::I32,value)=>
@@ -836,6 +883,10 @@ pub(super) fn run<'a>(
             Task::Not => {
                 let ExactValue::Boolean(value)=scalar(values.pop()?)? else { return None; };
                 values.push(ResultValue::Scalar(ExactValue::Boolean(!value)));
+            }
+            Task::NegateF32 => {
+                let ExactValue::F32(value)=scalar(values.pop()?)? else { return None; };
+                values.push(ResultValue::Scalar(ExactValue::F32(value.negate())));
             }
             Task::Negate(expected) => {
                 let ExactValue::Integer(ty,value)=scalar(values.pop()?)? else { return None; };
@@ -913,6 +964,21 @@ pub(super) fn run<'a>(
                     values.push(ResultValue::Scalar(ExactValue::F32(value)));
                     continue;
                 }
+                if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::FloatTrunc) {
+                    let [ExactValue::F64(bits)]=args.as_slice() else { return None; };
+                    if out.ty!=ScalarType::F32 { return None; }
+                    let value=f64::from_bits(*bits);
+                    if !value.is_finite() { return None; }
+                    let narrowed=super::super::checker_flow::projected_f32::ExactF32::checked_bits((value as f32).to_bits())?;
+                    values.push(ResultValue::Scalar(ExactValue::F32(narrowed)));
+                    continue;
+                }
+                if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::FloatToSintTrunc) {
+                    let [ExactValue::F32(value)]=args.as_slice() else { return None; };
+                    if out.ty!=ScalarType::I32 { return None; }
+                    values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::I32,value.truncate_to_i32()?.into())));
+                    continue;
+                }
                 if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::IntExtend) {
                     let [ExactValue::Integer(input,value)]=args.as_slice() else { return None; };
                     let value=match (input,&out.ty) {
@@ -943,16 +1009,20 @@ pub(super) fn run<'a>(
                 // Reuse the independently sealed pure engine for precisely
                 // scoped F32-input functions. Its certificate forbids all
                 // state reads/writes and opaque calls; never try it for find.
-                if child!=frame.target && !args.is_empty() && signature.parameters.iter().all(|ty| *ty==ScalarType::F32)
-                    && out.ty!=ScalarType::Unit {
+                let pure=if child!=frame.target && !args.is_empty()
+                    && signature.parameters.iter().all(|ty| *ty==ScalarType::F32) && out.ty!=ScalarType::Unit {
+                    dispatch.pure_plans.entry(child).or_insert_with(||
+                        ordered_float_prefix::plan_observed_math_call(project,calls,child)).as_ref()
+                } else { None };
+                // A declined pure certificate is not a result. Only the
+                // ordinary interpreter below may observe its actual effects.
+                if let Some((plan,function))=pure {
                     charge_call_work(&mut work,n)?;
                     let bits=args.iter().map(|value| match value { ExactValue::F32(v)=>Some(v.0),_=>None })
                         .collect::<Option<Vec<_>>>()?;
                     let cached=dispatch.latest_pure.get(&child).filter(|(key,_,_)| key==&bits)
                         .map(|(_,value,trace)| (value.clone(),trace.clone()));
                     let (value,inner)=if let Some(cached)=cached { cached } else {
-                        let (plan,function)=dispatch.pure_plans.entry(child).or_insert_with(||
-                            ordered_float_prefix::plan_observed_math_call(project,calls,child)).as_ref()?;
                         let locals=function.formals.iter().zip(args).map(|((id,_),value)| (id.clone(),value)).collect();
                         let (mut returned,inner)=ordered_float_prefix::evaluate_observed_prefix(plan,Some(function),locals,
                             |_,_,_| None,trace,&mut work,|func,at| {

@@ -2145,6 +2145,18 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     }
                     Some(())
                 }).ok_or(ProjectCheck::Unsupported)?;
+                // Any failed settlement invalidates the whole initialization
+                // result; neither storage representation is reused on error.
+                projected_storage.settle_f32(|declaration, value| {
+                    if &declaration.source != source {
+                        let provider = *ordinals.get(&declaration.source)?;
+                        return (visits.get(provider) == Some(&InitializationVisit::Completed)).then_some(());
+                    }
+                    let InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) }
+                        = storage.get_mut(&declaration.range)? else { return None; };
+                    *bits=value.0;
+                    Some(())
+                }).ok_or(ProjectCheck::Unsupported)?;
                 continue;
             }
             if !topology.structure.checker_directives.contains_key(expression) {
@@ -2291,6 +2303,7 @@ fn try_observed_projected_storage_call(
     let mut observed_owners = HashMap::new();
     let mut provider_units = HashSet::new();
     let mut provider_scalars = HashSet::new();
+    let mut local_float_units = HashSet::new();
     let mut productive_ranges = HashMap::new();
     let mut authored_units=HashSet::new();
     let mut getters = HashMap::new();
@@ -2312,6 +2325,16 @@ fn try_observed_projected_storage_call(
                     let Some(rank)=stateful_provider::advancing_range_plan(body,node) else { return Ok(false); };
                     productive_ranges.insert(node,rank);
                     authored_units.insert(node);
+                    provider_units.insert(node);
+                    writes_or_reads_storage=true;
+                    visiting.remove(&node);
+                    complete.insert(node);
+                    continue;
+                }
+                if node!=target && node.0==target.0
+                    && root_body.structure.checker_direct_targets.values().any(|child| *child==node)
+                    && stateful_provider::closed_local_f32_store_route(actual.project,actual.calls,node,visits).is_some() {
+                    local_float_units.insert(node);
                     provider_units.insert(node);
                     writes_or_reads_storage=true;
                     visiting.remove(&node);
@@ -2428,6 +2451,7 @@ fn try_observed_projected_storage_call(
         if !storage.has_observed_aggregate(&cell.declaration) { return None; }
         let overlay = match ty {
             ScalarType::F32 => storage.observed_f32_array_element(cell).map(ObservedExactValue::F32),
+            ScalarType::F64 => None, // Only immutable observed backing is installed in this lane.
             ScalarType::I32 => storage.observed_i32_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::I32,n.into())),
             ScalarType::U8 => storage.observed_u8_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::U8,n.into())),
             ScalarType::U16 => storage.observed_u16_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::U16,n.into())),
@@ -2531,7 +2555,7 @@ fn try_observed_projected_storage_call(
         // Do not observe an ambient owner. The real namespace provider has
         // finished initialization and shares this exact storage row.
         if child.0==caller {
-            if !(productive_ranges.contains_key(&child)||provider_scalars.contains(&child))
+            if !(productive_ranges.contains_key(&child)||provider_scalars.contains(&child)||local_float_units.contains(&child))
                 || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
@@ -3272,7 +3296,7 @@ fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
 fn observed_nested_array_leaf(mut ty: &ScalarType) -> Option<&ScalarType> {
     if !matches!(ty,ScalarType::Array { .. }) { return None; }
     while let ScalarType::Array { element,.. } = ty { ty = element; }
-    matches!(ty,ScalarType::I32 | ScalarType::F32 | ScalarType::U16 | ScalarType::U8).then_some(ty)
+    matches!(ty,ScalarType::I32 | ScalarType::F32 | ScalarType::F64 | ScalarType::U16 | ScalarType::U8).then_some(ty)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3305,6 +3329,8 @@ fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64],
     let atom = match (ty,value) {
         (ScalarType::F32,PassiveLiteral::Float(ranked_float::Atom::Single(bits))) =>
             ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?),
+        (ScalarType::F64,PassiveLiteral::Float(ranked_float::Atom::Double(bits))) if f64::from_bits(*bits).is_finite() =>
+            ObservedExactValue::F64(*bits),
         (ScalarType::I32|ScalarType::U16|ScalarType::U8,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
             ObservedExactValue::Integer(ty.clone(),value.clone()),
         _ => return None,
@@ -26338,6 +26364,283 @@ unit(u8) parent = fn(a) {
             assert_eq!(all.directives,capped);
             for site in [&next_mask,&pad_call,&next_pad,&zero_vertex] { assert!(trace.contains_return(site),"{site:?}"); }
             eprintln!("Orbital original pack_prepared/pad {target_layout:?}: mask5 selects 0 and 2 only, 7 sparse index writes; pad retains end and subsequent duplicate allocates 47");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine and material provider"]
+    fn pinned_orbital_airlock_full_body_preserves_material_and_active_geometry() {
+        use super::super::checker_flow::observed_f32_array::Cell;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let folder=std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
+        let material=std::fs::read_to_string(folder.join("station-material.w")).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let paint_to_box=fragment("f32 r =", "unit(i32) rib =");
+        let waves=fragment("f32(f32) wave =", "unit(f32,f32,f32,f32,f32,f32,i32) lower_rail_tube");
+        let bolts_and_locator=fragment("unit(i32) airlock_bolts =", "unit() airlock_pressure_face=");
+        let blend=fragment("f32() lock_blend =", "f32() cargo_lock_y =");
+        let lock=fragment("f32() hatch_lock_y =", "f32(i32) transfer_ease =");
+        let airlock=fragment("unit() airlock = fn", "f32(f32,f32,f32) lamp_field");
+        let emit=fragment("unit(i32) emit_actuator=fn", "    if(id==1){suspended_cargo();};");
+        let measure=fragment("unit(i32) measure_actuator=fn", "i32 HATCH_GEOMETRY=");
+        let binding=r#"material_scene=namespace demo "station-material.w";"#;
+        let a=source("src/main.w","pinned-orbital-entire-airlock");
+        let provider=source("src/station-material.w","pinned-orbital-original-station-material");
+        let integer=|n:i32| ObservedExactValue::Integer(ScalarType::I32,n.into());
+        for layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for pose in [0,4,7] {
+                let text=format!(r#"%%start
+                    {binding}
+                    i32 count=0; i32 observation=0; i32 alignment_stage={pose}; i32 lock_kind=2; i32 lock_pose=2;
+                    i32[5] motion_first=[0,7,0,0,0]; i32[5] motion_size=[0,9,0,0,0];
+                    {mesh}{paint_to_box}{waves}{blend}{lock}{bolts_and_locator}{airlock}{emit}}};{measure}
+                    unit() launch=fn{{measure_actuator(0);}};
+                    unit() inspect=fn{{
+                        if(motion_first[0]==0 && motion_size[0]==2556 && motion_first[1]==7 && motion_size[1]==9){{observation=71;}};
+                    }};
+                    launch(); inspect();
+                    core.narrow(false,{{.stdout="";.stderr="";.code=observation;.files=[{{.path="count.json";.state=count;}}];}});
+                %%end"#);
+                let at=text.find(binding).unwrap() as u32;
+                let prepare=|| prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&a,&text),vec![ScalarNamespaceBinding {
+                        binding:"material_scene".into(),target:provider.clone(),span:ByteSpan::new(at,at+binding.len() as u32),
+                    }]),(declarations(&provider,&material),Vec::new())],[],vec![a.clone(),provider.clone()],
+                    ScalarPreparationInputs {target_layout:layout},ScalarCheckerScope::MainFlowOnly,Vec::new(),
+                ).unwrap();
+                let ordinary=prepare().run().expect("the public configured current path must complete before inspecting its row");
+                let [witness]=ordinary.directives.as_slice() else { panic!("one ordered exact vertex witness"); };
+                assert_eq!(witness.code(),&BigInt::from(71));
+                let [file]=witness.files() else { panic!("expected the measured vertex count"); };
+                assert_eq!(file.text.as_ref(),b"{\"type\":{\"kind\":\"i32\"},\"value\":2556}\n");
+                let prepared=prepare();
+                let PreparedConfiguredCheck::Plain { owner, .. }=&prepared.owner else { panic!("exact prepared geometry"); };
+                let project=owner.parts().0;
+                let app=project.modules.iter().find(|module| module.source==a).unwrap();
+                let declaration=|name:&str| app.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(b) if b.name==name=>Some(wosy_syntax::SourceSpan::new(a.clone(),b.name_span)),
+                    _=>None,
+                }).unwrap();
+                let (root,ordinals)=package_initialization_order(project).unwrap();
+                let mut effects=OrderedFailures::default();
+                let (checked,_)=check_package_initialization_observing_with_policy::<ProofFreeOrderedEvidence,true,true>(
+                    owner,root,ordinals,ProofFreeOrderedEvidence,Some(&mut effects),
+                ).expect("full known airlock is a closed projected startup path");
+                let row=&checked.projected_storage;
+                assert_eq!(row.observed_atom(&declaration("count")),Some(integer(2556)));
+                let bound_cell=|name:&str,index:u64|Cell {declaration:declaration(name),indices:vec![index].into_boxed_slice()};
+                assert_eq!(row.observed_flat_i32(&bound_cell("motion_first",0)),Some(0));
+                assert_eq!(row.observed_flat_i32(&bound_cell("motion_size",0)),Some(2556));
+                assert_eq!(row.observed_flat_i32(&bound_cell("motion_first",1)),Some(7));
+                assert_eq!(row.observed_flat_i32(&bound_cell("motion_size",1)),Some(9));
+                let mesh=declaration("mesh");
+                let read=|index:u64,lane:u64|row.observed_f32_array_element(&Cell {
+                    declaration:mesh.clone(),indices:vec![0,(index/256)%16,(index/16)%16,index%16,lane].into_boxed_slice(),
+                }).map(|value|value.0);
+                assert_eq!(read(0,2),Some((-1.7941265106201172f32).to_bits()));
+                assert_eq!(read(0,6),Some((-26903.0f32).to_bits()));
+                assert_eq!(read(1,6),Some((-27950.0f32).to_bits()));
+                assert_eq!(read(240,7),Some(0.71925f32.to_bits()));
+                assert_eq!(read(599,7),Some(0.71925f32.to_bits()));
+                assert_eq!(read(600,7),Some(0.26f32.to_bits()));
+                // First alignment-only paint follows 600 base vertices,
+                // 180 more shell vertices, 288 bolt vertices, and six boxes.
+                let palette=match pose {7=>[0.28f32,0.99,0.58,0.96],4=>[1.0,0.61,0.22,0.96],_=>[0.37,0.78,0.69,0.92]};
+                for (lane,value) in [3,4,5,7].into_iter().zip(palette) {
+                    assert_eq!(read(1284,lane),Some(value.to_bits()));
+                }
+                assert_eq!(read(2555,7),Some(0.34f32.to_bits()));
+                assert_eq!(read(2556,7),None);
+                if pose==0 {
+                    let wrong=text.replace("motion_size[0]==2556","motion_size[0]==2557");
+                    assert_ne!(wrong,text);
+                    let counter=prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&a,&wrong),vec![ScalarNamespaceBinding {
+                            binding:"material_scene".into(),target:provider.clone(),span:ByteSpan::new(at,at+binding.len() as u32),
+                        }]),(declarations(&provider,&material),Vec::new())],[],vec![a.clone(),provider.clone()],
+                        ScalarPreparationInputs {target_layout:layout},ScalarCheckerScope::MainFlowOnly,Vec::new(),
+                    ).unwrap().run().unwrap();
+                    assert_eq!(counter.directives[0].code(),&BigInt::from(0));
+                    assert_eq!(counter.directives[0].files()[0].text.as_ref(),file.text.as_ref());
+                    let bad=material.replace("airlock_alloy=fn{value(75)}","airlock_alloy=fn{value(113)}");
+                    assert_ne!(bad,material);
+                    let unusable=prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&a,&text),vec![ScalarNamespaceBinding {
+                            binding:"material_scene".into(),target:provider.clone(),span:ByteSpan::new(at,at+binding.len() as u32),
+                        }]),(declarations(&provider,&bad),Vec::new())],[],vec![a.clone(),provider.clone()],
+                        ScalarPreparationInputs {target_layout:layout},ScalarCheckerScope::MainFlowOnly,Vec::new(),
+                    ).unwrap().run();
+                    assert!(matches!(unusable,Err(ScalarOrderedCheckerOutcome::Unsupported)));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine"]
+    fn pinned_orbital_airlock_first_shells_emit_real_colored_vertices() {
+        use super::super::checker_flow::{ProjectedStorage,observed_f32_array::Cell};
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let mark=fragment("f32 r =", "unit(f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32,f32) quad");
+        let waves=fragment("f32(f32) wave =", "unit(f32,f32,f32,f32,f32,f32,f32,f32,i32,i32,i32) sweep");
+        let shell=fragment("f32(f32) abs_cell", "unit(f32,f32,f32,f32,f32,f32,i32) lower_rail_tube");
+        let front=fragment("unit() airlock = fn", "    paint(0.66,0.66,0.61,material_scene.airlock_alloy())");
+        let emit=fragment("unit(i32) emit_actuator=fn", "    if(id==1){suspended_cargo();};");
+        // Close each source prefix at its next unobserved statement. All
+        // operations called by this prefix use their original source.
+        let text=format!("%%start
+ i32 count=0;
+{mesh}{mark}{waves}{shell}{front}}};
+{emit}}};
+%%end");
+        let app=source("src/main.w","pinned-orbital-airlock-first-shell");
+        let int=|n:i32| ObservedExactValue::Integer(ScalarType::I32,n.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&app,&text),Vec::new())],vec![app.clone()],
+                ScalarPreparationInputs {target_layout}).unwrap();
+            let (project,calls)=owner.parts();
+            let items=&project.modules[0].items;
+            let emit=(0,items.iter().position(|item|matches!(item,ScalarItem::Function(f)
+                if f.name=="emit_actuator")).unwrap());
+            let decl=|name:&str| items.iter().find_map(|item|match item {
+                ScalarItem::Binding(b) if b.name==name=>Some(wosy_syntax::SourceSpan::new(app.clone(),b.name_span)),
+                _=>None,
+            }).unwrap();
+            let fresh=|| {
+                let mut row=ProjectedStorage::default();
+                row.observe_scalar(decl("count"),&ScalarType::I32,&0.into());
+                row.observe_aggregate(decl("mesh"));
+                for (name,n) in [("r",0.0f32),("g",0.0),("b",0.0),("lit",0.0),("robot_px",0.0),
+                    ("robot_py",0.0),("robot_c",1.0),("robot_s",0.0)] {
+                    row.observe_f32(decl(name),n.to_bits());
+                }
+                row
+            };
+            let run=|state:&mut ProjectedStorage,actuator| stateful_provider::run(project,calls,emit,vec![int(actuator)],
+                state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                false,&std::cell::Cell::new(false),|_,_,_|None,|_,_,_|None);
+            let mut refused=fresh(); // unknown robot_turn after paint; no partial commit
+            assert!(run(&mut refused,0).is_none());
+            assert_eq!(refused,fresh());
+            let mut state=fresh();
+            state.observe_boolean(decl("robot_turn"),false);
+            let mut inactive=state.clone();
+            assert!(run(&mut inactive,1).is_some()); // first source branch not selected
+            assert_eq!(inactive,state);
+            let (_,history,_,selected)=run(&mut state,0).expect("first two observed shells complete");
+            assert!(selected.is_none() && history.is_some());
+            assert_eq!(state.observed_atom(&decl("count")),Some(int(240)));
+            let mesh=decl("mesh");
+            let read=|index:u64,lane:u64| {
+                state.observed_f32_array_element(&Cell {declaration:mesh.clone(),
+                    indices:vec![0,0,index/16,index%16,lane].into_boxed_slice()}).map(|v|v.0)
+            };
+            for vertex in 0..240 {
+                let palette=if vertex<120 {[(3,0.28f32),(4,0.37),(5,0.40),(7,0.65)]}
+                    else {[(3,0.49f32),(4,0.53),(5,0.54),(7,0.62)]};
+                for (lane,value) in palette {
+                    assert_eq!(read(vertex,lane),Some(value.to_bits()));
+                }
+                assert!(f32::from_bits(read(vertex,6).unwrap()) < 0.0);
+            }
+            assert_eq!(read(0,0),Some((-1.56f32).to_bits()));
+            assert_eq!(read(0,1),Some(0.27f32.to_bits()));
+            assert_eq!(read(2,0),Some((-1.39f32).to_bits()));
+            assert_ne!(read(0,2),read(1,2));
+            assert_eq!(read(120,0),Some((-1.39f32).to_bits()));
+            assert_eq!(read(122,0),Some((-1.282f32).to_bits()));
+            for lane in 0..8 {
+                assert_eq!(read(0,lane),read(3,lane));
+                assert_eq!(read(2,lane),read(4,lane));
+                assert_eq!(read(240,lane),None);
+            }
+
+            let with_startup=text.strip_suffix("%%end").unwrap().to_owned()+r#"
+                i32 proof_state=0;
+                f32(f32) tint=fn(bias){r+bias};
+                unit() observe=fn{
+                    f32 current=tint(0.0);
+                    if(current==0.0){proof_state=1;};
+                    if(current==0.49){proof_state=proof_state+10;};
+                };
+                unit() launch=fn{emit_actuator(0);};
+                observe(); launch(); observe();
+                core.narrow(false,{.stdout="";.stderr="";.code=proof_state;.files=[];});
+            %%end"#;
+            let checked=prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,&with_startup),Vec::new())],Vec::new(),vec![app.clone()],
+                ScalarPreparationInputs {target_layout},ScalarCheckerScope::MainFlowOnly,Vec::new()
+            ).unwrap().run().expect("ordered startup admits genuine direct provider route");
+            let [witness]=checked.directives.as_slice() else { panic!("expected one startup witness") };
+            assert_eq!(witness.code(),&BigInt::from(11));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned original Orbital engine"]
+    fn pinned_orbital_airlock_paint_writes_exact_f32_and_rolls_back_refusal() {
+        use super::super::checker_flow::{ProjectedStorage,projected_f32::ExactF32};
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let at=engine.find("unit(f32,f32,f32,f32) paint").unwrap();
+        let body=&engine[at..][..engine[at..].find("};").unwrap()+2];
+        let at=engine.find("unit() airlock = fn").unwrap();
+        let first=&engine[at..][..engine[at..].find(';').unwrap()+1];
+        let text=format!(r#"%%start
+            f32 r=0.0; f32 g=0.0; f32 b=0.0; f32 lit=0.0; f32 untouched=0.75;
+            bool unknown=false;
+            {body}
+            {first} if(unknown&&untouched==0.75){{lit=r;}}; }};
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-airlock-paint");
+        let float=|v:f32| ObservedExactValue::F32(ExactF32(v.to_bits()));
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&app,&text),Vec::new())],vec![app.clone()],
+                ScalarPreparationInputs {target_layout}).unwrap();
+            let (project,calls)=owner.parts();
+            let items=&project.modules[0].items;
+            let target=(0,items.iter().position(|item|matches!(item,ScalarItem::Function(f) if f.name=="airlock")).unwrap());
+            let decl=|name:&str| items.iter().find_map(|item|match item {
+                ScalarItem::Binding(b) if b.name==name=>Some(wosy_syntax::SourceSpan::new(app.clone(),b.name_span)),
+                _=>None,
+            }).unwrap();
+            let mut baseline=ProjectedStorage::default();
+            for name in ["r","g","b","lit"] { baseline.observe_f32(decl(name),0.0f32.to_bits()); }
+            baseline.observe_f32(decl("untouched"),0.75f32.to_bits());
+            let run=|state:&mut ProjectedStorage| stateful_provider::run(project,calls,target,Vec::new(),
+                state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                false,&std::cell::Cell::new(false),|_,_,_|None,|_,_,_|None);
+            let mut refused=baseline.clone();
+            assert!(run(&mut refused).is_none()); // known writes, unknown following condition
+            assert_eq!(refused,baseline);
+            for (replace,glow) in [(false,0.65),(true,0.28)] {
+                let mut state=baseline.clone();
+                state.observe_boolean(decl("unknown"),replace);
+                assert!(run(&mut state).is_some());
+                let mut settled=HashMap::new();
+                state.settle_f32(|key,value| { settled.insert(key.clone(),value); Some(()) }).unwrap();
+                assert_eq!(state.observed_atom(&decl("untouched")),Some(float(0.75)));
+                assert!(!settled.contains_key(&decl("untouched")));
+                for (name,expect) in [("r",0.28),("g",0.37),("b",0.40),("lit",glow)] {
+                    let key=decl(name);
+                    assert_eq!(state.observed_atom(&key),Some(float(expect)));
+                    assert_eq!(settled[&key].0,expect.to_bits());
+                    assert_eq!(baseline.observed_atom(&key),Some(float(0.0)));
+                }
+            }
         }
     }
 

@@ -1826,6 +1826,7 @@ pub(super) struct ProjectedStorage {
     fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
     changes: StorageDelta<(wosy_syntax::SourceSpan, Option<usize>), Rc<IntegerSet>>,
     f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
+    f32_changes: StorageDelta<wosy_syntax::SourceSpan, projected_f32::ExactF32>,
     enum_initial: Rc<HashMap<wosy_syntax::SourceSpan, (super::ScalarEnumId,u32)>>,
     aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
@@ -1960,13 +1961,32 @@ impl ProjectedStorage {
         }
     }
 
+    pub(super) fn overwrite_f32_scalar(&mut self, declaration: wosy_syntax::SourceSpan,
+        value: projected_f32::ExactF32) -> Option<()> {
+        if !self.f32_initial.contains_key(&declaration) { return None; }
+        self.f32_changes.insert(declaration,value);
+        Some(())
+    }
+
+    pub(super) fn settle_f32(&mut self,
+        mut touched: impl FnMut(&wosy_syntax::SourceSpan, projected_f32::ExactF32) -> Option<()>,
+    ) -> Option<()> {
+        for (declaration, value) in std::mem::take(&mut self.f32_changes).into_entries() {
+            touched(&declaration,value)?;
+            *Rc::make_mut(&mut self.f32_initial).get_mut(&declaration)? = value;
+        }
+        Some(())
+    }
+
     pub(super) fn observe_enum(&mut self, declaration:wosy_syntax::SourceSpan, id:super::ScalarEnumId, tag:u32) {
         Rc::make_mut(&mut self.enum_initial).insert(declaration,(id,tag));
     }
 
     pub(super) fn observed_atom(&self, declaration: &wosy_syntax::SourceSpan) -> Option<super::checker_project::ObservedExactValue> {
         use super::checker_project::ObservedExactValue as Value;
-        if let Some(value) = self.f32_initial.get(declaration) { return Some(Value::F32(*value)); }
+        if let Some(value) = self.f32_changes.get(declaration).or_else(|| self.f32_initial.get(declaration)) {
+            return Some(Value::F32(*value));
+        }
         if let Some((id,tag)) = self.enum_initial.get(declaration) { return Some(Value::Enum(id.clone(),*tag)); }
         let (ty, base) = self.scalars.get(declaration)?;
         let value = self.changes.get(&(declaration.clone(), None)).unwrap_or(base).singleton_value()?;

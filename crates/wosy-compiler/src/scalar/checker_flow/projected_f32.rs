@@ -25,6 +25,12 @@ impl ExactF32 {
         Self::checked_bits(computed.to_bits())
     }
 
+    pub(in super::super) fn truncate_to_i32(self) -> Option<i32> {
+        // Widen exactly before checking bounds: i32::MAX rounds up in f32.
+        let value = f64::from(f32::from_bits(self.0)).trunc();
+        (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value).then(|| value as i32)
+    }
+
     pub(in super::super) fn negate(self) -> Self { Self(self.0 ^ (1 << 31)) }
 }
 
@@ -53,4 +59,20 @@ fn exact_signed_conversion_and_add_preserve_ieee_rounding_and_zero() {
     assert_eq!(positive_zero.binary(&Divide, positive_zero), None);
     assert_eq!(negative_zero.negate(), positive_zero);
     assert_eq!(positive_zero.negate(), negative_zero);
+}
+
+#[cfg(test)]
+#[test]
+fn truncation_checks_signed_limits_before_conversion() {
+    let exact = |value:f32| ExactF32::checked_bits(value.to_bits()).unwrap();
+    assert_eq!(exact(-2147483648.0).truncate_to_i32(),Some(i32::MIN));
+    assert_eq!(exact(f32::from_bits(2147483648.0f32.to_bits()-1)).truncate_to_i32(),Some(2147483520));
+    assert_eq!(exact(2147483648.0).truncate_to_i32(),None);
+    assert_eq!(exact(f32::from_bits((-2147483648.0f32).to_bits()+1)).truncate_to_i32(),None);
+    assert_eq!(exact( 0.0).negate().0,(-0.0f32).to_bits());
+    assert_eq!(exact(-0.0).truncate_to_i32(),Some(0));
+    assert_eq!(exact(-42.875).truncate_to_i32(),Some(-42));
+    for value in [f32::NAN,f32::INFINITY,f32::NEG_INFINITY] {
+        assert!(ExactF32::checked_bits(value.to_bits()).is_none());
+    }
 }
