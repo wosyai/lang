@@ -23619,6 +23619,37 @@ i32(i32) transform=fn(x) { x };
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn startup_callback_does_not_discharge_independent_entry() {
+        let app = source("src/main.w", "mixed-startup-and-independent-entry");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (declaration, expected) in [("", 0), ("unit(u8) independent = fn(value) { target(value); };", 1)] {
+                let text = format!(r#"%%start
+                    unit(u8) target = fn(value) {{ core.require(value < 4, {OUTPUT}); }};
+                    unit((unit(u8)),u8) dispatch = fn(callback, input) {{ callback(input); }};
+                    {declaration}
+                    dispatch(target, 1);
+                %%end"#);
+                for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                    let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                        vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                        ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                    ).unwrap();
+                    let uncapped = prepare().run().unwrap();
+                    let (capped, _) = prepare().run_private_authored_root(std::num::NonZeroUsize::MIN).unwrap();
+                    assert_eq!(uncapped.directives, capped.directives);
+                    assert_eq!(capped.directives.len(), if scope == ScalarCheckerScope::CurrentPackage { expected } else { 0 });
+                    if let [failure] = capped.directives.as_slice() {
+                        let value = BigInt::from(4);
+                        let max = BigInt::from(255);
+                        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&value, &max)]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn prepared_actual_callable_formal_preserves_callback_guard() {
         let app = source("src/main.w", "prepared-actual-callable-formal");
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
