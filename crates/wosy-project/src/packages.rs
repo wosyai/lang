@@ -11,6 +11,8 @@ mod anchored;
 mod artifact_generation;
 #[cfg(target_os = "linux")]
 mod comptime_scratch;
+#[cfg(target_os = "linux")]
+mod comptime_process;
 mod comptime_watches;
 mod git_sync;
 mod git_wire;
@@ -28,7 +30,11 @@ pub use anchored::GitDirectory;
 pub use artifact_generation::{PreparedArtifactGeneration, SelectedArtifactGeneration, StagedArtifactGeneration};
 #[cfg(target_os = "linux")]
 pub use comptime_scratch::ComptimeScratch;
-pub use comptime_watches::{observe_comptime_watches, observe_local_comptime_inputs, ComptimeWatchLimits,
+#[cfg(target_os = "linux")]
+pub use comptime_process::{empty_wasip1_comptime_manifest, execute_selected_comptime_tool, ComptimeToolInvocation, OwnedComptimeToolResult, OwnedStagedComptimePair, StagedComptimePairInputs,
+    execute_observed_comptime_set, ComptimeEvaluatorStage, ComptimeExecutionAttempt, OwnedLocalComptimeExecution, PreparedComptimeExecutionSeal};
+pub use comptime_watches::{compiler_source_configuration_identity, observe_comptime_watches, observe_local_comptime_inputs,
+    observe_owned_local_comptime_inputs, OwnedLocalComptimeInputs, ComptimeWatchLimits,
     LocalComptimeInputScope, WatchedComptimeFile, WatchRoot};
 pub use init::init_project;
 pub use lifecycle::{snapshot_dependencies, update_dependencies};

@@ -38,8 +38,7 @@ pub type Files = BTreeMap<FileKey, FileEntry>;
 pub(crate) fn source_configuration_inputs(
     manifest: &str, packages: &BTreeMap<String, wosy_project::ResolvedPackage>,
 ) -> Result<NodeId, String> {
-    let bytes = serde_json::to_vec(&(manifest, packages)).map_err(|error| error.to_string())?;
-    Ok(NodeId(blake3::derive_key("wosy source configuration inputs v2", &bytes)))
+    wosy_project::packages::compiler_source_configuration_identity(manifest, packages).map(NodeId)
 }
 
 pub struct PreparedSources {

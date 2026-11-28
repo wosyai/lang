@@ -2,8 +2,7 @@ use super::{selected_builder_invocation, selected_runner_invocation, ClosedCompt
     ClosedComptimePaths, ClosedComptimeStaging, StagedEvaluatorIr};
 use crate::source_preparation::PreparedWasip1ComptimeInputs;
 use std::{
-    io::{self, Read},
-    os::unix::fs::MetadataExt,
+    io,
     path::{Path, PathBuf},
 };
 use wosy_compiler::ScalarType;
@@ -126,54 +125,19 @@ impl EvaluatorFiles {
         ClosedComptimePaths { evaluator_ir: &self.ir_path, output_dir: self.scratch.output_dir(), manifest: &self.manifest_path }
     }
 
-    pub(super) fn verify_inputs(&self, manifest: &[u8]) -> io::Result<()> {
-        let ir = self.scratch.open_ir()?;
-        let mut bytes = Vec::new();
-        ir.take(self.ir.bytes as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() != self.ir.bytes || blake3::hash(&bytes) != self.ir.blake3 {
-            return Err(io::Error::other("staged evaluator LLVM changed"));
-        }
-        bytes.clear();
-        self.scratch.open_manifest()?.take(manifest.len() as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes != manifest { return Err(io::Error::other("staged evaluator manifest changed")); }
-        Ok(())
-    }
+    pub(super) fn scratch(&self) -> &ComptimeScratch { &self.scratch }
 
     /// Bind bounded module bytes in the predeclared slot to this exact
     /// provision, not to a path, type or digest claimed by a producer.
-    pub(super) fn observe_module(&self, max_bytes: u64) -> io::Result<ObservedModule> {
-        let (mut module, metadata) = self.scratch.open_module()?;
-        let limit = max_bytes.min(MAX_MODULE_BYTES);
-        let expected = metadata.len();
-        if expected == 0 || expected > limit {
-            return Err(io::Error::other("evaluator module is empty or exceeds its observation budget"));
-        }
-        // Cap reads independently of the initial file size. Use one extra
-        // byte to refuse a file that grows while being read.
-        let mut bytes = 0;
-        let mut buffer = [0; 8192];
-        let mut hash = blake3::Hasher::new();
-        let mut input = (&mut module).take(expected + 1);
-        loop {
-            let n = input.read(&mut buffer)?;
-            if n == 0 { break; }
-            bytes += n as u64;
-            hash.update(&buffer[..n]);
-        }
-        let last = module.metadata()?;
-        let version = |meta: &std::fs::Metadata| {
-            (meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec(), meta.nlink())
-        };
-        if bytes != expected || version(&metadata) != version(&last) {
-            return Err(io::Error::other("evaluator module changed during observation"));
-        }
-        Ok(ObservedModule { bytes, digest: hash.finalize() })
+    fn observe_module(&self, max_bytes: u64) -> io::Result<ObservedModule> {
+        let (bytes, digest) = self.scratch.observe_module_digest(max_bytes.min(MAX_MODULE_BYTES))?;
+        Ok(ObservedModule { bytes, digest })
     }
 }
 
-pub(super) struct ObservedModule {
+struct ObservedModule {
     bytes: u64,
-    pub(super) digest: blake3::Hash,
+    digest: blake3::Hash,
 }
 
 /// Module bytes read from one exact owned output slot. This is file

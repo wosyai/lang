@@ -30,6 +30,48 @@ impl Default for ComptimeWatchLimits {
     }
 }
 
+/// Exact client-minted declared inputs for the dependency-free local
+/// comptime corridor. Not a statement about undeclared tool inputs.
+pub struct OwnedLocalComptimeInputs {
+    project: std::path::PathBuf,
+    site: String,
+    configuration_identity: [u8; 32],
+    declarations: ObservedClosedComptimeProfile,
+    watches: Vec<WatchedComptimeFile>,
+}
+
+impl OwnedLocalComptimeInputs {
+    pub fn project(&self) -> &Path { &self.project }
+    pub fn site(&self) -> &str { &self.site }
+    pub fn configuration_identity(&self) -> [u8; 32] { self.configuration_identity }
+    pub fn declarations(&self) -> &ObservedClosedComptimeProfile { &self.declarations }
+    pub fn watches(&self) -> &[WatchedComptimeFile] { &self.watches }
+}
+
+pub fn compiler_source_configuration_identity(
+    manifest: &str, packages: &std::collections::BTreeMap<String, crate::ResolvedPackage>,
+) -> Result<[u8; 32], String> {
+    let bytes = serde_json::to_vec(&(manifest, packages)).map_err(|error| error.to_string())?;
+    Ok(blake3::derive_key("wosy source configuration inputs v2", &bytes))
+}
+
+/// Uses the existing anchored path/watch observer; no caller-supplied
+/// command, watch list or source-input digest is accepted.
+pub fn observe_owned_local_comptime_inputs(
+    root: &Path, scope: LocalComptimeInputScope<'_>, expected: [u8; 32],
+) -> Result<OwnedLocalComptimeInputs, String> {
+    let site = scope.site.to_owned();
+    let (declarations, watches) = observe_local_comptime_inputs(root, scope, |manifest| {
+        if compiler_source_configuration_identity(manifest, &std::collections::BTreeMap::new())? != expected {
+            return Err("local comptime configuration changed after source staging".into());
+        }
+        Ok(())
+    })?;
+    Ok(OwnedLocalComptimeInputs {
+        project: root.to_owned(), site, configuration_identity: expected, declarations, watches,
+    })
+}
+
 /// The local consumer selection for read-only input observations.
 pub struct LocalComptimeInputScope<'a> {
     pub target: &'a str,

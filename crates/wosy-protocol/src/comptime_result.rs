@@ -127,6 +127,19 @@ pub enum ComptimeIdentityError {
     ForeignTargetOrProfile,
 }
 
+impl std::fmt::Display for ComptimeIdentityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoding(error) => error.fmt(formatter),
+            Self::DuplicateWatch => formatter.write_str("one comptime watch identity has conflicting content"),
+            Self::ConflictingResult => formatter.write_str("one comptime specialization has conflicting values"),
+            Self::ForeignTargetOrProfile => formatter.write_str("comptime result belongs to a different target or profile"),
+        }
+    }
+}
+
+impl std::error::Error for ComptimeIdentityError {}
+
 impl From<serde_json::Error> for ComptimeIdentityError {
     fn from(error: serde_json::Error) -> Self { Self::Encoding(error) }
 }

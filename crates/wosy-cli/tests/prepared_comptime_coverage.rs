@@ -940,6 +940,7 @@ fn exercise_pending_pair(run_tools: bool) {
             owner.projection() else { return None; };
         Some(TrustedPreparedPairWasip1 {
             binding: owner.binding(), authored_cst: plan.authored_cst(), profile: plan.profile(), output: plan.wasip1_output()?,
+            execution_seal: owner.execution_seal(),
         })
     }
 
@@ -996,7 +997,7 @@ u32 different = solve(7, 13);
         let denied = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), Arc::clone(&proposal),
             request(source.len() - 1), 1 << 20, TTL, 11).await.err().expect("one byte over explicit admission budget");
         assert!(denied.to_string().contains("authored byte budget"));
-        let owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), proposal,
+        let owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(binding.clone(), Arc::clone(&proposal),
             request(source.len()), 1 << 20, TTL, 11).await.unwrap();
         assert_eq!(owner.base().admission().validated_files, 1);
         let held = trusted(&owner).expect("same private compiler-issued output");
@@ -1152,6 +1153,26 @@ u32 different = solve(7, 13);
             assert_eq!(executed.readback().scalar_results(), accepted.scalar_results());
             assert_eq!(executed.modules().len(), 2);
             assert_ne!(executed.modules()[0], executed.modules()[1]);
+            let admitted = owner.prepare_owned_result_intake(executed.execution())
+                .unwrap().expect("the exact live source owns both observed results");
+            assert_eq!(admitted.prepared(), owner.base().identity());
+            assert_eq!(admitted.binding(), &binding);
+            assert_eq!(admitted.modules().iter().map(|id| id.0).collect::<Vec<_>>(),
+                executed.modules().iter().map(|digest| *digest.as_bytes()).collect::<Vec<_>>());
+            assert_eq!(admitted.values().len(), 2);
+            assert!(matches!(&admitted.values()[0], ScalarExpression::Integer { value, .. } if u32::try_from(value) == Ok(34)));
+            assert!(matches!(&admitted.values()[1], ScalarExpression::Integer { value, .. } if u32::try_from(value) == Ok(10)));
+            let same = owner.prepare_owned_result_intake(executed.execution()).unwrap().unwrap();
+            assert_eq!(admitted.root(), same.root());
+            let unrelated_owner = worker.prepare_pending_pair_call_graph_wasip1_stdout(
+                binding.clone(), Arc::clone(&proposal), request(source.len()), 1 << 20, TTL, 11,
+            ).await.unwrap();
+            assert_eq!(unrelated_owner.base().identity(), owner.base().identity());
+            assert!(unrelated_owner.prepare_owned_result_intake(executed.execution())
+                .err().unwrap().to_string().contains("different prepared attempt"));
+
+            assert!(store.snapshot(attempt.root()).unwrap().is_none(), "intake does not commit base source");
+
         }
 
         let watch = project.join("watch.txt");

@@ -1836,7 +1836,6 @@ dependencies = [
  "blake3",
  "clap",
  "codespan-reporting",
- "libc",
  "rowan",
  "rusqlite",
  "serde",
