@@ -59,7 +59,7 @@ impl SelectedArtifactGeneration {
             return Ok(None);
         };
         let mut bytes = Vec::new();
-        read_manifest_file(pointer, &mut bytes)?;
+        read_manifest_file(pointer, &mut bytes, ManifestLink::Current)?;
         let manifest: ArtifactManifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         let relative = manifest.executable.strip_prefix(parent_path).map_err(io::Error::other)?;
         let mut components = relative.components();
@@ -81,7 +81,7 @@ impl SelectedArtifactGeneration {
             return Err(io::Error::other("current artifact generation manifest is missing"));
         };
         let mut generation_bytes = Vec::new();
-        read_manifest_file(generation, &mut generation_bytes)?;
+        read_manifest_file(generation, &mut generation_bytes, ManifestLink::Retained)?;
         if bytes != generation_bytes {
             return Err(io::Error::other("current artifact pointer differs from its generation manifest"));
         }
@@ -206,9 +206,17 @@ fn open_parent(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn read_manifest_file(mut file: File, bytes: &mut Vec<u8>) -> io::Result<()> {
+enum ManifestLink { Current, Retained }
+
+fn read_manifest_file(mut file: File, bytes: &mut Vec<u8>, link: ManifestLink) -> io::Result<()> {
     let meta = file.metadata()?;
-    if meta.uid() != owner() || meta.nlink() != 1 {
+    let valid_links = match link {
+        // A concurrent committed selection can unlink the old current
+        // pointer while its open descriptor still supplies the old bytes.
+        ManifestLink::Current => meta.nlink() <= 1,
+        ManifestLink::Retained => meta.nlink() == 1,
+    };
+    if meta.uid() != owner() || !valid_links {
         return Err(io::Error::other("expected a manifest owned only by this artifact store"));
     }
     file.read_to_end(bytes)?;
@@ -312,7 +320,13 @@ mod tests {
         fs::write(&next.executable, b"second fixture output").unwrap();
         let prepared = two.prepare(&next).unwrap();
         assert_eq!(fs::read(&pointer).unwrap(), old_bytes);
+        let opened_pointer = File::open(&pointer).unwrap();
+        assert_eq!(opened_pointer.metadata().unwrap().nlink(), 1);
         let new_path = prepared.publish().unwrap();
+        assert_eq!(opened_pointer.metadata().unwrap().nlink(), 0);
+        let mut held_bytes = Vec::new();
+        read_manifest_file(opened_pointer, &mut held_bytes, ManifestLink::Current).unwrap();
+        assert_eq!(held_bytes, old_bytes);
         assert_ne!(old_path, new_path);
         assert_eq!(load_artifact_manifest(&pointer).unwrap(), next);
         let next_selection = SelectedArtifactGeneration::open(&scratch.0).unwrap().unwrap();
