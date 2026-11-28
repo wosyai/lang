@@ -1826,6 +1826,7 @@ pub(super) struct ProjectedStorage {
     fixed_arrays: Rc<HashMap<wosy_syntax::SourceSpan, (ScalarType, Rc<Vec<Rc<IntegerSet>>>)>>,
     changes: StorageDelta<(wosy_syntax::SourceSpan, Option<usize>), Rc<IntegerSet>>,
     f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
+    enum_initial: Rc<HashMap<wosy_syntax::SourceSpan, (super::ScalarEnumId,u32)>>,
     aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
     integer_field_updates: StorageDelta<IntegerFieldCell, (ScalarType, i32)>,
@@ -1959,9 +1960,14 @@ impl ProjectedStorage {
         }
     }
 
+    pub(super) fn observe_enum(&mut self, declaration:wosy_syntax::SourceSpan, id:super::ScalarEnumId, tag:u32) {
+        Rc::make_mut(&mut self.enum_initial).insert(declaration,(id,tag));
+    }
+
     pub(super) fn observed_atom(&self, declaration: &wosy_syntax::SourceSpan) -> Option<super::checker_project::ObservedExactValue> {
         use super::checker_project::ObservedExactValue as Value;
         if let Some(value) = self.f32_initial.get(declaration) { return Some(Value::F32(*value)); }
+        if let Some((id,tag)) = self.enum_initial.get(declaration) { return Some(Value::Enum(id.clone(),*tag)); }
         let (ty, base) = self.scalars.get(declaration)?;
         let value = self.changes.get(&(declaration.clone(), None)).unwrap_or(base).singleton_value()?;
         if *ty == ScalarType::Bool { return Some(Value::Boolean(bool_result_lane(value)? == 1)); }

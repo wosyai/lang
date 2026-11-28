@@ -2078,6 +2078,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     InitializerValue::Integer { ty, value } => projected_storage.observe_scalar(declaration, ty, value),
                     InitializerValue::Boolean(value) => projected_storage.observe_boolean(declaration, *value),
                     InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
+                    InitializerValue::PassiveEnum { _enumeration:id,_tag:tag } => projected_storage.observe_enum(declaration,(*id).clone(),*tag),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
                         let mut leaf = *ty;
@@ -21216,6 +21217,76 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             assert!(empty.observed_f32_array_element(&vertex(36,0)).is_none());
             assert!(occupied_work>mesh_work);
             eprintln!("Pocket real halo {target_layout:?}: 16 writes; empty 2304 mesh cells; occupied 6 faces/36 vertices; ordered work {fill_work}/{mesh_work}/{occupied_work}");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_rebuild_checks_real_publication_before_opaque_host() {
+        use crate::scalar::checker_flow::{ProjectedStorage,observed_f32_array::Cell};
+        let text=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap()).unwrap();
+        let source=source("src/engine.w","pinned-pocket-rebuild-publication");
+        let required=ByteSpan::new(41777,41933);
+        let integer=|value:i32| ObservedExactValue::Integer(ScalarType::I32,value.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&source,&text),Vec::new())],vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls)=owner.parts();
+            let module=&project.modules[0];
+            let function=|name:&str| (0,module.items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let declaration=|wanted| {
+                let binding=module.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
+                }).unwrap();
+                wosy_syntax::SourceSpan::new(source.clone(),binding.name_span)
+            };
+            let phase=module.enums.iter().find(|item|item.name=="BeaconPhase").unwrap();
+            let sandbox=phase.variants().iter().find(|item|item.name=="sandbox").unwrap();
+            let world=declaration("world");
+            let mut entry=ProjectedStorage::default();
+            for name in ["world","mesh_halo","vertices"] { entry.observe_aggregate(declaration(name)); }
+            entry.observe_scalar(declaration("write_position"),&ScalarType::I32,&BigInt::from(27));
+            entry.observe_scalar(declaration("loose_count"),&ScalarType::I32,&BigInt::from(0));
+            entry.observe_boolean(declaration("archipelago_hunt"),false);
+            let run=|state:&mut ProjectedStorage,x:i32,z:i32| {
+                let hits=std::cell::Cell::new(0usize);
+                let reached=std::cell::Cell::new(false);
+                let outcome=stateful_provider::run(project,calls,function("rebuild_chunk"),vec![integer(x),integer(z)],
+                    state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                    false,&reached,|state,cell,ty| {
+                        if *ty!=ScalarType::U8 { return None; }
+                        let byte=state.observed_u8_array_element(cell)?;
+                        if cell.declaration==world { hits.set(hits.get()+1); }
+                        Some((ObservedExactValue::Integer(ScalarType::U8,byte.into()),1))
+                    },|_,_,_|None);
+                (outcome.is_none(),reached.get(),hits.get())
+            };
+            let mut unresolved=entry.clone();
+            let before=unresolved.clone();
+            stateful_provider::take_requirement_results();
+            assert_eq!(run(&mut unresolved,1,1),(true,false,0));
+            assert!(stateful_provider::take_requirement_results().is_empty());
+            assert_eq!(unresolved,before);
+            let mut before_host=entry;
+            before_host.observe_enum(declaration("beacon_phase"),phase.id.clone(),sandbox.tag);
+            for y in 0..16 { for z in 11..=24 { for x in 11..=24 {
+                let at=Cell { declaration:world.clone(),indices:vec![y,z,x].into_boxed_slice() };
+                before_host.overwrite_u8_array_element(at,if (y,z,x)==(0,12,12) { 3 } else { 0 }).unwrap();
+            } } }
+            let before=before_host.clone();
+            assert_eq!(run(&mut before_host,1,1),(true,true,3136));
+            let observed=stateful_provider::take_requirement_results();
+            assert_eq!(observed,vec![(wosy_syntax::SourceSpan::new(source.clone(),required),true)]);
+            // The opaque suffix still prevents *any* caller-visible output or
+            // writeback, including the mesh built earlier in the activation.
+            assert_eq!(before_host,before);
+            assert_eq!(run(&mut before_host,-33,1),(true,true,0));
+            assert_eq!(stateful_provider::take_requirement_results(),
+                vec![(wosy_syntax::SourceSpan::new(source.clone(),required),false)]);
+            assert_eq!(before_host,before);
+            eprintln!("Pocket rebuild {target_layout:?}: 3136 current world reads to exact true publication; false preserved; no host or returned row");
         }
     }
 

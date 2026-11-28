@@ -6494,6 +6494,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_literals: HashMap<OccurrenceOrdinal, bool>,
     #[cfg(feature = "internal-checker")]
+    pub(super) observed_enum_tags: HashMap<OccurrenceOrdinal, (super::ScalarEnumId,u32)>,
+    pub(super) observed_enum_comparisons: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal,BinaryOperator,OccurrenceOrdinal)>,
     pub(super) observed_integer_negations: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
     pub(super) observed_bool_negations: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
     #[cfg(feature = "internal-checker")]
@@ -6717,6 +6719,8 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             observed_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
+            observed_enum_tags: HashMap::new(),
+            observed_enum_comparisons: HashMap::new(),
             observed_integer_negations: HashMap::new(),
             observed_bool_negations: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -8733,6 +8737,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             });
             let selection = self.occurrence_typing.take_member(expression);
             match &selection {
+                #[cfg(feature = "internal-checker")]
+                Some(CheckedMember::Enum { enumeration,tag }) if self.structure.checked_types.expressions.get(&ordinal)
+                    .is_some_and(|ty| matches!(ty,ScalarType::Enum(id) if id==enumeration)) => {
+                    self.structure.observed_enum_tags.insert(ordinal,(enumeration.clone(),*tag));
+                }
                 Some(CheckedMember::Module(target)) => {
                     let ScalarExpression::Member { name, .. } = expression else {
                         unreachable!("prepared member occurrence");
@@ -9481,6 +9490,9 @@ impl StructuralWalker<'_, '_> {
                         } else if is_integer_type(lhs) && lhs==rhs && lhs==output
                             && matches!(operator,BinaryOperator::BitAnd|BinaryOperator::BitXor|BinaryOperator::BitOr|BinaryOperator::ShiftRight) {
                             self.structure.prepared_integer_bitwise.insert(ordinal,(left,operator.clone(),right));
+                        } else if lhs==rhs && matches!(lhs,ScalarType::Enum(_)) && *output==ScalarType::Bool
+                            && matches!(operator,BinaryOperator::Equal|BinaryOperator::NotEqual) {
+                            self.structure.observed_enum_comparisons.insert(ordinal,(left,operator.clone(),right));
                         }
                     }
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)

@@ -114,7 +114,7 @@ pub(in super::super) fn drive_finite_history<'p>(
                     row.install_observed_float((*id).clone(), *value)?;
                     continue;
                 },
-                ObservedExactValue::F64(_) => return None,
+                ObservedExactValue::F64(_) | ObservedExactValue::Enum(..) => return None,
             };
             roots.add(id, ty);
             row.cells.push(Rc::new(IntegerSet::singleton(&value)));

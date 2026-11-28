@@ -611,6 +611,7 @@ fn is_signed_integer(ty: &ScalarType) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in super::super) enum ExactValue {
     Boolean(bool),
+    Enum(super::super::ScalarEnumId,u32),
     Integer(ScalarType, BigInt),
     F32(super::super::checker_flow::projected_f32::ExactF32),
     F64(u64),
@@ -620,6 +621,7 @@ impl ExactValue {
     pub(in super::super) fn ty(&self) -> ScalarType {
         match self {
             Self::Boolean(_) => ScalarType::Bool,
+            Self::Enum(id,_) => ScalarType::Enum(id.clone()),
             Self::Integer(ty, _) => ty.clone(),
             Self::F32(_) => ScalarType::F32,
             Self::F64(_) => ScalarType::F64,
@@ -669,12 +671,13 @@ impl std::hash::Hash for ObservedTrace {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum MemoValue { Bool(bool), Int(BigInt), F32(u32), F64(u64) }
+enum MemoValue { Bool(bool), Enum(SourceIdentity,usize,u32), Int(BigInt), F32(u32), F64(u64) }
 
 impl From<&ExactValue> for MemoValue {
     fn from(value: &ExactValue) -> Self {
         match value {
             ExactValue::Boolean(value) => Self::Bool(*value),
+            ExactValue::Enum(id,tag) => Self::Enum(id.source.clone(),id.index,*tag),
             ExactValue::Integer(_, value) => Self::Int(value.clone()),
             ExactValue::F32(value) => Self::F32(value.0),
             ExactValue::F64(bits) => Self::F64(*bits),

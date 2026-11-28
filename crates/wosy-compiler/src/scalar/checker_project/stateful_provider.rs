@@ -94,6 +94,11 @@ fn ordinary_binary(op:&BinaryOperator,l:ExactValue,r:ExactValue) -> Option<Exact
             if let Some(relation)=IntegerRelation::from_operator(op) { return Some(Boolean(relation.accepts(l.cmp(&r)))); }
             Some(Integer(t.clone(),apply_observed_integer_operator(&t,op,l,r)?))
         }
+        (Enum(l,a),Enum(r,b)) if l==r => match op {
+            BinaryOperator::Equal=>Some(Boolean(a==b)),
+            BinaryOperator::NotEqual=>Some(Boolean(a!=b)),
+            _=>None,
+        },
         (F32(l),F32(r)) => {
             if let Some(relation)=IntegerRelation::from_operator(op) {
                 return Some(Boolean(relation.accepts(f32::from_bits(l.0).partial_cmp(&f32::from_bits(r.0))?)));
@@ -110,7 +115,7 @@ fn direct_symbol<'a>(project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,
     let body=calls.function_body(target.0,target.1,None)?;
     if !function.generic_parameters.is_empty() || !body.arms.is_empty() || !body.callable_escapes.is_empty()
         || body.contextual_formal().is_some() || !body.allocation_length_calls.is_empty()
-        || (has_callable_obligations(body) && !supports_requirements(body))
+        || (has_callable_obligations(body) && !supports_observed_requirements(body,false))
     { return None; }
     let [return_slot]=body.boundary.results.as_slice() else { return None; };
     Some((function,body,return_slot.ty.clone()))
@@ -132,7 +137,7 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<OccurrenceOrdinal> {
+fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<(OccurrenceOrdinal,bool)> {
     let st=&body.structure;
     let directive=st.checker_directives.get(&at)?;
     if directive.operation!=CheckerOperation::Require || !directive.output.state_files.is_empty()
@@ -163,12 +168,17 @@ fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option
             indexed=true;
         } else { return None; }
     }
-    indexed.then_some(*condition)
+    Some((*condition,indexed))
+}
+
+fn supports_observed_requirements(body:&FunctionCallSites,indexed:bool) -> bool {
+    body.checker_returns_unit() && body.arms.is_empty() && !body.structure.checker_directives.is_empty()
+        && body.structure.checker_directives.keys().all(|&site|
+            requirement_condition(body,site).is_some_and(|(_,projects)| !indexed || projects))
 }
 
 pub(super) fn supports_requirements(body:&FunctionCallSites) -> bool {
-    body.checker_returns_unit() && body.arms.is_empty() && !body.structure.checker_directives.is_empty()
-        && body.structure.checker_directives.keys().all(|&site| requirement_condition(body,site).is_some())
+    supports_observed_requirements(body,true)
 }
 
 #[cfg(test)]
@@ -425,9 +435,8 @@ pub(super) fn run<'a>(
                     }
                     BlockItemKind::Evaluation { expression } => {
                         if st.checker_directives.contains_key(expression) {
-                            if !allow_single_failure { return None; }
                             let condition=(*dispatch.requirement_conditions.entry((frame.target,*expression))
-                                .or_insert_with(|| requirement_condition(body,*expression)))?;
+                                .or_insert_with(|| requirement_condition(body,*expression).map(|(condition,_)| condition)))?;
                             tasks.extend([Task::DropUnit,Task::Requirement(*expression),Task::Eval(condition)]);
                         } else {
                             let ty=st.checked_types.expressions.get(expression)?;
@@ -472,6 +481,9 @@ pub(super) fn run<'a>(
                     values.push(ResultValue::Scalar(ExactValue::F32(super::super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?)));
                 } else if let Some(value)=st.observed_bool_literals.get(&at) {
                     values.push(ResultValue::Scalar(ExactValue::Boolean(*value)));
+                } else if let Some((id,tag))=st.observed_enum_tags.get(&at) {
+                    if !matches!(ty,ScalarType::Enum(expected) if expected==id) { return None; }
+                    values.push(ResultValue::Scalar(ExactValue::Enum(id.clone(),*tag)));
                 } else if let Some(name)=body.prepared_plain_name(at) {
                     let value=match name {
                         PlainNameIdentity::Lexical(id)=>frame.slots.get(id)?.clone(),
@@ -496,7 +508,7 @@ pub(super) fn run<'a>(
                 } else if let Some(cut)=body.short_circuits.get(&at) {
                     if *ty!=ScalarType::Bool || cut.evaluate_right_when==cut.bypass { return None; }
                     tasks.extend([Task::Short(cut.left,cut.evaluate_right_when,cut.right),Task::Eval(cut.left)]);
-                } else if let Some((l,op,r))=st.prepared_range_binary.get(&at).or_else(|| st.prepared_integer_bitwise.get(&at)) {
+                } else if let Some((l,op,r))=st.prepared_range_binary.get(&at).or_else(|| st.prepared_integer_bitwise.get(&at)).or_else(|| st.observed_enum_comparisons.get(&at)) {
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
                 } else if let Some((l,op,r))=st.projected_f32_comparisons.get(&at).or_else(|| st.projected_f32_math.get(&at)) {
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
@@ -589,6 +601,7 @@ pub(super) fn run<'a>(
                     values.push(ResultValue::Unit);
                     continue;
                 }
+                if !allow_single_failure { return None; }
                 let owner=frame.target;
                 let mut paths=traces.take()?;
                 if paths.len()!=stack.len() { return None; }
