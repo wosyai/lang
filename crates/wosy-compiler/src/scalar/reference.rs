@@ -6494,6 +6494,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_literals: HashMap<OccurrenceOrdinal, bool>,
     #[cfg(feature = "internal-checker")]
+    pub(super) observed_integer_negations: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
     pub(super) observed_bool_negations: HashMap<OccurrenceOrdinal, OccurrenceOrdinal>,
     #[cfg(feature = "internal-checker")]
     pub(super) projected_f32_literals: HashMap<OccurrenceOrdinal, u32>,
@@ -6716,6 +6717,7 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             observed_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
+            observed_integer_negations: HashMap::new(),
             observed_bool_negations: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             projected_f32_literals: HashMap::new(),
@@ -9530,6 +9532,14 @@ impl StructuralWalker<'_, '_> {
                     && [ordinal, child].iter().all(|site| self.structure.checked_types.expressions.get(site) == Some(&ScalarType::Bool))
                 {
                     self.structure.observed_bool_negations.insert(ordinal, child);
+                }
+                #[cfg(feature = "internal-checker")]
+                if self.occurrence_typing.checker_directives_enabled() && matches!(self.mode, WalkMode::Callable(_))
+                    && *operator == super::UnaryOperator::Negate
+                    && self.structure.checked_types.expressions.get(&ordinal).is_some_and(|ty|
+                        is_integer_type(ty) && self.structure.checked_types.expressions.get(&child)==Some(ty))
+                {
+                    self.structure.observed_integer_negations.insert(ordinal,child);
                 }
                 let _ = (operator, child);
             }

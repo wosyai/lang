@@ -70,6 +70,7 @@ enum Task {
     Write(Place,ExactValue),
     Binary(BinaryOperator),
     Not,
+    Negate(ScalarType),
     Requirement(OccurrenceOrdinal),
     Branch(OccurrenceOrdinal,BlockOrdinal,Option<BlockOrdinal>,Output),
     Short(OccurrenceOrdinal,bool,OccurrenceOrdinal),
@@ -110,7 +111,6 @@ fn direct_symbol<'a>(project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,
     if !function.generic_parameters.is_empty() || !body.arms.is_empty() || !body.callable_escapes.is_empty()
         || body.contextual_formal().is_some() || !body.allocation_length_calls.is_empty()
         || (has_callable_obligations(body) && !supports_requirements(body))
-        || body.structure.blocks.iter().any(|block| block.unsafe_context)
     { return None; }
     let [return_slot]=body.boundary.results.as_slice() else { return None; };
     Some((function,body,return_slot.ty.clone()))
@@ -488,6 +488,8 @@ pub(super) fn run<'a>(
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
                 } else if let Some(operand)=st.observed_bool_negations.get(&at) {
                     tasks.extend([Task::Not,Task::Eval(*operand)]);
+                } else if let Some(operand)=st.observed_integer_negations.get(&at) {
+                    tasks.extend([Task::Negate(ty.clone()),Task::Eval(*operand)]);
                 } else {
                     let signature=body.checked_call_signatures.get(&at)?;
                     if !matches!(signature.outputs.outputs.as_slice(),[out] if &out.ty==ty) { return None; }
@@ -549,6 +551,13 @@ pub(super) fn run<'a>(
             Task::Not => {
                 let ExactValue::Boolean(value)=scalar(values.pop()?)? else { return None; };
                 values.push(ResultValue::Scalar(ExactValue::Boolean(!value)));
+            }
+            Task::Negate(expected) => {
+                let ExactValue::Integer(ty,value)=scalar(values.pop()?)? else { return None; };
+                if ty!=expected { return None; }
+                let value= -value;
+                if !integer_literal_fits_type(&value,&ty) { return None; }
+                values.push(ResultValue::Scalar(ExactValue::Integer(ty,value)));
             }
             Task::Requirement(site) => {
                 reached_requirement.set(true);

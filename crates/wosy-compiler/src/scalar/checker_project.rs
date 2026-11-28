@@ -20998,6 +20998,135 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn observed_edit_checks_only_selected_unsafe_branch_and_checked_negation() {
+        let app=source("src/main.w","observed-edit-opaque-boundary");
+        let text=r#"%%start
+            sink=extern wasm "showcase" { unsafe unit(i32) emit; };
+            struct copy Cell { i32 value; }
+            Cell origin={.value=0;};
+            Cell[2] cells=[origin,origin];
+            i32 result=0;
+            i32(i32,i32,i32,i32) edit=fn(index,input,visible,rest) {
+                u64 ix=core.int_extend<u64>(index);
+                cells[ix].value=-input;
+                if (visible>0) { unsafe { sink.emit(rest); }; };
+                cells[ix].value
+            };
+            unit() launch=fn { result=edit(0,-4,0,9); };
+            launch();
+            core.narrow(false,{.stdout="";.stderr="";.code=result;.files=[];});
+        %%end"#;
+        let visible=text.replace("edit(0,-4,0,9)","edit(0,-4,1,9)");
+        let overflow=text.replace("edit(0,-4,0,9)","edit(0,-2147483648,0,9)");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),Vec::new())],[],vec![app.clone()],
+                ScalarPreparationInputs { target_layout },ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let report=prepare(text).run().expect("the unselected branch is not an effect");
+            assert_eq!(report.directives.len(),1);
+            assert_eq!(report.directives[0].code(),&BigInt::from(4));
+            for alternative in [&visible,&overflow] {
+                assert!(matches!(prepare(alternative).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_seeded_material_cache_miss_then_hit_retains_exact_current_row() {
+        use crate::scalar::checker_flow::{IntegerFieldCell,ProjectedStorage,observed_f32_array::Cell};
+        use ordered_float_prefix::ObservedStep;
+        let text=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap()).unwrap();
+        let source=source("src/engine.w","pinned-pocket-current-cache");
+        let (x,y,z)=(110i32,5i32,40i32);
+        let slot=((x*2531011)^(z*1752193)^(y*2654439)^(x>>5)^(z>>2))&2047;
+        let position=vec![(slot/256) as u64,((slot/16)%16) as u64,(slot%16) as u64].into_boxed_slice();
+        let integer=|value:i32| ObservedExactValue::Integer(ScalarType::I32,value.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&source,&text),Vec::new())],vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls)=owner.parts();
+            let module=&project.modules[0];
+            let declaration=|wanted| {
+                let binding=module.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
+                }).unwrap();
+                wosy_syntax::SourceSpan::new(source.clone(),binding.name_span)
+            };
+            let function=|name:&str| (0,module.items.iter().position(|item|matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let edit=function("store_exterior_edit");
+            let nominal=module.structs.iter().find(|item|item.name=="TerrainEdit").unwrap();
+            let terrain=declaration("terrain_edits");
+            let field=|name| IntegerFieldCell { cell:Cell {declaration:terrain.clone(),indices:position.clone()},
+                structure:nominal.id.clone(),field:nominal.fields.iter().find(|f|f.name==name).unwrap().id.index };
+            let cache_cell=|name| Cell { declaration:declaration(name),indices:vec![0,14].into_boxed_slice() };
+            let caches=["cache_x","cache_z","cache_seed","cache_height","cache_passage"];
+            let mut entry=ProjectedStorage::default();
+            for name in caches.into_iter().chain(["terrain_edits","edit_hints"]) {
+                entry.observe_aggregate(declaration(name));
+            }
+            for name in ["archipelago_hunt","target_dirty","ground_contact_dirty","terrain_window_active"] {
+                entry.observe_boolean(declaration(name),false);
+            }
+            for (name,value) in [("edit_epoch",1),("exterior_edits",0),("world_seed",471),("terrain_chunk_x",9),("terrain_chunk_z",3)] {
+                entry.observe_scalar(declaration(name),&ScalarType::I32,&value.into());
+            }
+            for name in caches { entry.overwrite_i32_array_element(cache_cell(name),0).unwrap(); }
+            entry.overwrite_integer_field(field("epoch"),ScalarType::I32,0).unwrap();
+            let run=|state:&mut ProjectedStorage,material| {
+                stateful_provider::run(project,calls,edit,vec![integer(x),integer(y),integer(z),integer(material)],
+                    state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                    false,&std::cell::Cell::new(false),|state,cell,ty|{
+                        if *ty!=ScalarType::I32 { return None; }
+                        Some((integer(state.observed_i32_array_element(cell)?),1))
+                    },|state,cell,ty|{
+                        let value=state.observed_integer_field(cell,ty)?;
+                        Some((ObservedExactValue::Integer(ty.clone(),value.into()),1))
+                    })
+            };
+            let mut visible=entry.clone();
+            visible.overwrite_scalar(&declaration("terrain_window_active"),&ScalarType::Bool,&BigInt::from(1)).unwrap();
+            let old_visible=visible.clone();
+            let (Some(miss),Some(miss_path),miss_work,None)=run(&mut entry,4).expect("real seeded cache miss") else { panic!("expected normal cache miss"); };
+            assert_eq!(miss,integer(1));
+            // At seed 471, independent integer evaluation of the source
+            // terrain yields noise 215/67, height 8, passage-lookup noise
+            // 54, and original material 3 for this coordinate.
+            for (name,value) in caches.into_iter().zip([x,z,471,8,0]) {
+                assert_eq!(entry.observed_i32_array_element(&cache_cell(name)),Some(value));
+            }
+            assert_eq!(entry.observed_integer_field(&field("material"),&ScalarType::U8),Some(4));
+            assert_eq!(entry.observed_atom(&declaration("exterior_edits")),Some(integer(1)));
+            let (Some(hit),Some(hit_path),hit_work,None)=run(&mut entry,3).expect("real seeded cache hit") else { panic!("expected normal cache hit"); };
+            assert_eq!(hit,integer(1));
+            assert_eq!(entry.observed_integer_field(&field("y"),&ScalarType::I32),Some(-1));
+            assert_eq!(entry.observed_atom(&declaration("exterior_edits")),Some(integer(0)));
+            let returned=|path:&ordered_float_prefix::ObservedTrace,name:&str| {
+                let callee=function(name);
+                let mut spans=HashSet::new();
+                for (item,_) in module.items.iter().enumerate() {
+                    let Some(body)=calls.function_body(0,item,None) else { continue; };
+                    spans.extend(body.structure.checker_direct_targets.iter().filter(|(_,target)| **target==callee)
+                        .map(|(at,_)| body.occurrences[at.0].span));
+                }
+                path.root.iter().chain(path.segments.iter().flatten())
+                    .any(|event| matches!(event,ObservedStep::Call {site,..} if spans.contains(&site.range)))
+            };
+            assert!(returned(&miss_path,"archipelago_height") && returned(&miss_path,"archipelago_passage"));
+            assert!(!returned(&hit_path,"archipelago_height") && !returned(&hit_path,"archipelago_passage"));
+            assert!(miss_work>hit_work);
+            // Selecting the real visible rebuild must not report a return
+            // without its required current mesh state (including the host).
+            assert!(run(&mut visible,4).is_none());
+            assert_eq!(visible,old_visible);
+            eprintln!("Pocket seeded cache {target_layout:?}: miss {miss_work}, hit {hit_work}, height 8, visible unresolved");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn arrival_bounds_use_the_type_of_unknown_cells_without_adopting_initial_values() {
         use range_envelopes::{Envelope, PreparedEnvelopes};
         let identity = source("src/main.w","unknown-current-arrivals");
