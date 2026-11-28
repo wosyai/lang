@@ -12,7 +12,7 @@ mod comptime_tools;
 pub mod packages;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
-pub use packages::{PreparedArtifactGeneration, StagedArtifactGeneration};
+pub use packages::{PreparedArtifactGeneration, SelectedArtifactGeneration, StagedArtifactGeneration};
 pub use comptime_tools::{
     declared_comptime_parameters, ComptimeBuildMountDeclaration, ComptimeMountAccess,
     DeclaredComptimeParameter, ObservedClosedComptimeProfile, SelectedComptimeTools,

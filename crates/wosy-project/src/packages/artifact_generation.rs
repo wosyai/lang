@@ -7,7 +7,7 @@ use super::GitDirectory;
 use crate::ArtifactManifest;
 use std::{
     fs::{self, File, Metadata, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -39,15 +39,69 @@ pub struct StagedArtifactGeneration {
 #[doc(hidden)]
 pub struct PreparedArtifactGeneration(StagedArtifactGeneration);
 
+/// A reader's selected generation. Committed generations are retained by
+/// this storage protocol; this handle is not a GC lease or a tool authority.
+#[doc(hidden)]
+pub struct SelectedArtifactGeneration {
+    _directory: GitDirectory,
+    manifest_path: PathBuf,
+    manifest: ArtifactManifest,
+}
+
+impl SelectedArtifactGeneration {
+    /// Resolve the controlled store's current pointer once. Ignore any next
+    /// pointer update, then pass this generation's path to a controlled runner.
+    /// The caller still validates source, configuration and runner identity.
+    pub fn open(parent_path: &Path) -> io::Result<Option<Self>> {
+        let file = open_parent(parent_path)?;
+        let parent = GitDirectory::new(file).map_err(io::Error::other)?;
+        let Some(pointer) = parent.source(Path::new(MANIFEST)).map_err(io::Error::other)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        read_manifest_file(pointer, &mut bytes)?;
+        let manifest: ArtifactManifest = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let relative = manifest.executable.strip_prefix(parent_path).map_err(io::Error::other)?;
+        let mut components = relative.components();
+        let name = match (components.next(), components.next(), components.next()) {
+            (Some(std::path::Component::Normal(name)), Some(std::path::Component::Normal(binary)), None)
+                if binary == OUTPUT => name,
+            _ => return Err(io::Error::other("current artifact pointer does not identify a generation")),
+        };
+        let id = name.to_str().and_then(|name| name.strip_prefix("build-"))
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .filter(|id| id.get_version_num() == 7)
+            .ok_or_else(|| io::Error::other("current artifact pointer has an invalid generation name"))?;
+        if name != std::ffi::OsStr::new(&format!("build-{id}")) {
+            return Err(io::Error::other("current artifact pointer has a noncanonical generation name"));
+        }
+        let directory = parent.directory(Path::new(name)).map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("current artifact generation is missing"))?;
+        let Some(generation) = directory.source(Path::new(MANIFEST)).map_err(io::Error::other)? else {
+            return Err(io::Error::other("current artifact generation manifest is missing"));
+        };
+        let mut generation_bytes = Vec::new();
+        read_manifest_file(generation, &mut generation_bytes)?;
+        if bytes != generation_bytes {
+            return Err(io::Error::other("current artifact pointer differs from its generation manifest"));
+        }
+        Ok(Some(Self {
+            _directory: directory,
+            manifest_path: parent_path.join(name).join(MANIFEST),
+            manifest,
+        }))
+    }
+
+    pub fn manifest_path(&self) -> &Path { &self.manifest_path }
+
+    pub fn manifest(&self) -> &ArtifactManifest { &self.manifest }
+}
+
 impl StagedArtifactGeneration {
     /// Open a preselected, owner-private directory exclusive to this service.
     /// Hold its cooperative writer reservation for this generation.
     pub fn create(parent_path: &Path) -> io::Result<Self> {
-        if !parent_path.is_absolute() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "artifact generation parent must be absolute"));
-        }
-        let writer = GitDirectory::open_absolute(parent_path)?;
-        require_private(&writer.metadata()?)?;
+        let writer = open_parent(parent_path)?;
         writer.lock()?;
         let parent = GitDirectory::new(writer.try_clone()?).map_err(io::Error::other)?;
         let parent_descriptor = parent.descriptor_path()?;
@@ -143,6 +197,24 @@ impl Drop for StagedArtifactGeneration {
     }
 }
 
+fn open_parent(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "artifact generation parent must be absolute"));
+    }
+    let file = GitDirectory::open_absolute(path)?;
+    require_private(&file.metadata()?)?;
+    Ok(file)
+}
+
+fn read_manifest_file(mut file: File, bytes: &mut Vec<u8>) -> io::Result<()> {
+    let meta = file.metadata()?;
+    if meta.uid() != owner() || meta.nlink() != 1 {
+        return Err(io::Error::other("expected a manifest owned only by this artifact store"));
+    }
+    file.read_to_end(bytes)?;
+    Ok(())
+}
+
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     OpenOptions::new().write(true).create_new(true).mode(0o600)
         .custom_flags(libc::O_NOFOLLOW).open(path)?.write_all(bytes)
@@ -165,7 +237,7 @@ fn require_private(meta: &Metadata) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::{load_artifact_manifest, ArtifactIdentity};
-    use std::{io::Read, os::unix::fs::DirBuilderExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     struct Scratch(PathBuf);
 
@@ -212,7 +284,11 @@ mod tests {
         fs::write(&first.executable, b"first fixture output").unwrap();
         let prepared = one.prepare(&first).unwrap();
         assert!(!pointer.exists());
+        assert!(SelectedArtifactGeneration::open(&scratch.0).unwrap().is_none());
         let old_path = prepared.publish().unwrap();
+        let first_selection = SelectedArtifactGeneration::open(&scratch.0).unwrap().unwrap();
+        assert_eq!(first_selection.manifest_path(), old_path);
+        assert_eq!(first_selection.manifest(), &first);
         let old_bytes = fs::read(&pointer).unwrap();
         assert_eq!(load_artifact_manifest(&old_path).unwrap(), first);
         assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
@@ -239,7 +315,11 @@ mod tests {
         let new_path = prepared.publish().unwrap();
         assert_ne!(old_path, new_path);
         assert_eq!(load_artifact_manifest(&pointer).unwrap(), next);
-        assert_eq!(load_artifact_manifest(&new_path).unwrap(), next);
+        let next_selection = SelectedArtifactGeneration::open(&scratch.0).unwrap().unwrap();
+        assert_eq!(next_selection.manifest_path(), new_path);
+        assert_eq!(next_selection.manifest(), &next);
+        assert_eq!(first_selection.manifest_path(), old_path);
+        assert_eq!(first_selection.manifest(), &first);
         assert_eq!(load_artifact_manifest(&old_path).unwrap(), first);
         let mut old_output = Vec::new();
         old_reader.read_to_end(&mut old_output).unwrap();

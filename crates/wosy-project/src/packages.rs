@@ -25,7 +25,7 @@ pub(crate) use snapshot::ProjectSnapshot;
 pub use add::add_dependency;
 pub use anchored::GitDirectory;
 #[cfg(target_os = "linux")]
-pub use artifact_generation::{PreparedArtifactGeneration, StagedArtifactGeneration};
+pub use artifact_generation::{PreparedArtifactGeneration, SelectedArtifactGeneration, StagedArtifactGeneration};
 #[cfg(target_os = "linux")]
 pub use comptime_scratch::ComptimeScratch;
 pub use comptime_watches::{observe_comptime_watches, observe_local_comptime_inputs, ComptimeWatchLimits,
