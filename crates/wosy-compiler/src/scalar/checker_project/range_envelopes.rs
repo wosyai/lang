@@ -632,6 +632,17 @@ impl<'a> PreparedEnvelopes<'a> {
         self.direct_edge_envelopes(incoming.callee,callee,incoming.inputs.as_ref()?)
     }
 
+    /// Transport the incoming by-value row to this activation's ordinary
+    /// child sites. Reads of unmodeled captured storage use their types,
+    /// never startup values; the owner must still have immutable formals.
+    /// The result is conditional on arrival, not a history or a return proof.
+    pub(super) fn forward_arrival_edge(&mut self, incoming: &IncomingRangeEdge, callee: PreparedCallable)
+        -> Option<Vec<IncomingRangeEdge>> {
+        // Empty arms were proven unreachable at the preceding site.
+        let Some(inputs) = incoming.inputs.as_ref() else { return Some(Vec::new()); };
+        self.direct_arrival_edge_envelopes(incoming.callee,callee,inputs)
+    }
+
     /// Induction covers the original self-call edges and derives the child
     /// bound on every direct site in those iterations. No dynamic callback
     /// route or separately seeded activation borrows this result.

@@ -20829,6 +20829,44 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn pinned_pocket_edit_preserves_chunk_bounds_on_normal_arrival_after_rebuild_effects() {
+        use range_envelopes::{Envelope, PreparedEnvelopes};
+        let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap());
+        let text = std::fs::read_to_string(path).unwrap();
+        let identity = source("src/engine.w","pinned-pocket-edit");
+        let range = |low,high| Some(Envelope { low: BigInt::from(low), high: BigInt::from(high) });
+        let top = range(i32::MIN,i32::MAX);
+        let world = range(-32,39);
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner = prepare_checker_project(vec![(declarations(&identity,&text),Vec::new())],
+                vec![identity.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls) = owner.parts();
+            let function = |name| (0,project.modules[0].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let mut solver = PreparedEnvelopes::new(project,calls);
+            let parents = solver.direct_arrival_edge_envelopes(function("store_exterior_edit"),
+                function("rebuild_near"),&vec![top.clone();4]).unwrap();
+            let [parent] = parents.as_slice() else { panic!("one authored rebuild after a successful edit"); };
+            assert_eq!(parent.inputs.as_deref(), Some([top.clone(),top.clone()].as_slice()));
+            let near = solver.forward_arrival_edge(parent,function("refresh_visible_terrain")).unwrap();
+            assert_eq!(near.len(),5);
+            let mut arrival_sites = HashSet::new();
+            for arrived in &near {
+                assert!(arrival_sites.insert(arrived.site));
+                let chunk = solver.forward_arrival_edge(arrived,function("rebuild_chunk")).unwrap();
+                let [chunk] = chunk.as_slice() else { panic!("one guarded rebuild"); };
+                assert_eq!(chunk.inputs.as_deref(),Some([world.clone(),world.clone()].as_slice()));
+                let publication = solver.forward_arrival_edge(chunk,function("publish_chunk")).unwrap();
+                let [publication] = publication.as_slice() else { panic!("one authored publication"); };
+                assert_eq!(publication.inputs.as_ref().unwrap()[1..],[world.clone(),world.clone()]);
+                assert_eq!(solver.incoming_entry_requirement(publication),Some(ByteSpan::new(41777,41933)));
+            }
+            assert!(solver.close_guarded_formals(function("publish_chunk")).is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn arrival_bounds_use_the_type_of_unknown_cells_without_adopting_initial_values() {
         use range_envelopes::{Envelope, PreparedEnvelopes};
         let identity = source("src/main.w","unknown-current-arrivals");
