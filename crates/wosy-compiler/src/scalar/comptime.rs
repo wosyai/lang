@@ -13,6 +13,8 @@ use wosy_syntax::{
 const FUNCTION: &str = "evaluate";
 
 mod direct;
+mod ordered;
+pub use ordered::{prepare_ordered_closed_wasip1, OrderedClosedWasip1, OrderedClosedWasip1Site};
 mod stdout;
 pub use stdout::{
     prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,

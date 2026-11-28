@@ -109,6 +109,27 @@ pub(crate) fn execute_selected_pair_wasip1(
         &evaluator_stages(&files, max_module_bytes, plan.max_stdout()), deadline, cancelled)
 }
 
+/// Run exactly the selected closed site's one evaluator using the same
+/// ordinary three-input builder and one-input runner as the paired route.
+pub(crate) fn execute_selected_closed_wasip1(
+    evaluator: &wosy_compiler::OrderedClosedWasip1Site, project: &Path,
+    scope: wosy_project::packages::LocalComptimeInputScope<'_>,
+    expected_config: [u8; 32], attempt: wosy_project::packages::ComptimeExecutionAttempt,
+    watches: &[wosy_project::packages::WatchedComptimeFile],
+    private_parent: &Path, max_module_bytes: u64,
+    deadline: std::time::Instant, cancelled: &impl Fn() -> bool,
+) -> io::Result<wosy_project::packages::OwnedLocalComptimeExecution> {
+    let ir = evaluator.ir();
+    let file = EvaluatorFiles::create(private_parent, |file| {
+        file.write_all(ir)?;
+        Ok(StagedEvaluatorIr { bytes: ir.len(), blake3: blake3::hash(ir) })
+    })?;
+    write_private_manifest(file.create_manifest()?, file.module_path())?;
+    wosy_project::packages::execute_observed_comptime_set(project, scope, expected_config, attempt, watches,
+        &evaluator_stages(std::slice::from_ref(&file), max_module_bytes, wosy_compiler::OrderedClosedWasip1::MAX_STDOUT),
+        deadline, cancelled)
+}
+
 impl<'plan> StagedPendingPairWasip1<'plan> {
     pub(crate) fn create(
         observation: PendingPairComptimeInputObservation, plan: &'plan BoundedPairStartupWasip1Output,

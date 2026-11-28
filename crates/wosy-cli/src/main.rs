@@ -19,7 +19,7 @@ use wosy_compiler::{
     parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
     LlvmPartition, ParseOutput, ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_cli::artifact_inputs::{compiler_identity, llvm_identity, pending_builder_inputs,
+use wosy_cli::artifact_inputs::{compiler_identity, expected_artifact_compiler_identity, llvm_identity, pending_builder_inputs,
     project_configuration_identity, BuilderInputPaths, PendingBuilderInputs};
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,
@@ -400,7 +400,7 @@ fn validate_run_manifest<'a>(
             != serde_json::to_string(builder).map_err(|error| error.to_string())?
         || identity.runner_identity
             != serde_json::to_string(runner).map_err(|error| error.to_string())?
-        || identity.compiler_identity != compiler_identity()
+        || identity.compiler_identity != expected_artifact_compiler_identity(manifest.comptime.as_ref())
         || identity.llvm_identity != llvm_identity()
         || identity.builder_toolchain_identity != builder.toolchain_identity
     {

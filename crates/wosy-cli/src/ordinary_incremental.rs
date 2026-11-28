@@ -112,7 +112,7 @@ pub(super) fn try_selected_comptime(
     config_identity: &str, artifact_identity_name: &str,
 ) -> Result<bool, String> {
     use wosy_cli::source_state::SelectedPairToolBudget;
-    use wosy_daemon::{SelectedPairComptimePreparation, SourceStorageWorker};
+    use wosy_daemon::{SelectedComptimePreparation, SourceStorageWorker};
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
     const LIFETIME: Duration = Duration::from_secs(120);
 
@@ -148,20 +148,23 @@ pub(super) fn try_selected_comptime(
             expanded_record_bytes: usize::MAX, cst_occurrences: usize::MAX, cst_depth: usize::MAX,
             authored_bytes: usize::MAX,
         };
-        let SelectedPairComptimePreparation::Ready(owner) = session.prepare_unique_selected_pair_wasip1(
-            profile.to_owned(), limits, usize::MAX,
-            // The supported scalar pair uses one decimal/Bool line.
-            b"-2147483648\n".len(),
-        ).await? else { return Ok(None); };
-        admitted = true;
-        let result = state.prepare_selected_pair_ordinary_inputs(
-            &owner, &store_path, &paths.output, SelectedPairToolBudget {
-                watch_limits: wosy_project::packages::ComptimeWatchLimits {
-                    entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX,
-                },
-                evaluator_ir_bytes: usize::MAX, evaluator_module_bytes: u64::MAX, timeout: LIFETIME,
-            }, || false,
-        )?;
+        let budget = SelectedPairToolBudget {
+            watch_limits: wosy_project::packages::ComptimeWatchLimits {
+                entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX,
+            },
+            evaluator_ir_bytes: usize::MAX, evaluator_module_bytes: u64::MAX, timeout: LIFETIME,
+        };
+        let result = match session.prepare_selected_wasip1_comptime(profile.to_owned(), limits, usize::MAX).await? {
+            SelectedComptimePreparation::Pair(owner) => {
+                admitted = true;
+                state.prepare_selected_pair_ordinary_inputs(&owner, &store_path, &paths.output, budget, || false)?
+            }
+            SelectedComptimePreparation::Ordered(owner) => {
+                admitted = true;
+                state.prepare_selected_ordered_ordinary_inputs(&owner, &store_path, &paths.output, budget, || false)?
+            }
+            SelectedComptimePreparation::Refused(_) => return Ok(None),
+        };
         Ok::<_, BoxError>(result.map(|result| (state, result)))
     });
     if let Some(store) = Arc::into_inner(store) {

@@ -237,6 +237,29 @@ struct RootedComptimeIdentity {
     profile: String,
 }
 
+#[cfg(target_os = "linux")]
+pub(super) enum RootedSelectedComptime {
+    Pair(RootedPairCallGraphComptimePlan),
+    Ordered(RootedOrderedComptime),
+}
+
+#[cfg(target_os = "linux")]
+pub struct RootedOrderedComptime {
+    source: RootedComptimeIdentity,
+    pub(crate) evaluator: wosy_compiler::OrderedClosedWasip1,
+}
+
+#[cfg(target_os = "linux")]
+impl RootedOrderedComptime {
+    pub fn project(&self) -> &str { &self.evaluator.evaluators()[0].source_span().source.project }
+    pub fn source_root(&self) -> NodeId { self.source.root }
+    pub fn authored_cst(&self) -> NodeId { self.source.authored_cst }
+    pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
+    pub fn target(&self) -> &str { &self.source.target }
+    pub fn profile(&self) -> &str { &self.source.profile }
+    pub fn evaluators(&self) -> &[wosy_compiler::OrderedClosedWasip1Site] { self.evaluator.evaluators() }
+}
+
 impl RootedComptimeIdentity {
     fn fragment(self, fragment: ClosedComptimeFragment, output_bytes: usize) -> Result<RootedClosedComptimeFragment> {
         let (bytes, digest) = bounded_partition_bytes(fragment.llvm(), output_bytes.min(MAX_EVALUATOR_IR_BYTES))?;
@@ -405,6 +428,57 @@ impl SourceStore {
         };
         request.check_selector_bytes()?;
         self.project_selected_pair_wasip1_for_lease(lease, request, max_stdout, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn project_selected_wasip1_for_lease(
+        &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize,
+    ) -> Result<SelectedComptime<(NodeId, RootedSelectedComptime)>> {
+        let (tx, _read) = self.begin_leased_source(lease.grant(), Mode::ReadOnly)?
+            .ok_or(BuildRequestRejection::Expired)?;
+        let mut records = bounded_source_records(&tx, limits);
+        let (_, config) = checked_source_header_using(lease.grant().root, &mut records)?;
+        let request = RootedClosedComptimeRequest {
+            profile, file: config.entry, id: String::new(), evaluator_layout: ScalarTargetLayout::WASM32,
+            source_limits: limits, output_bytes,
+        };
+        request.check_selector_bytes()?;
+        self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+            if input.artifact.backend != "llvm" || input.artifact.output != "wasm-wasip1"
+                || input.artifact.exports.is_some()
+            {
+                return Ok(Err(RootedClosedComptimeRefusal::ProfileNotWasip1));
+            }
+            let mut sites = input.fresh.result().canonical_cst().root.descendants().filter_map(|node| {
+                let site = wosy_syntax::ComptimeCst::from_node(&node)?;
+                Some((node, site.id.text().to_owned()))
+            });
+            let Some((first, id)) = sites.next() else {
+                return Ok(Err(RootedClosedComptimeRefusal::Compiler(ClosedComptimeRejection::SiteNotFound)));
+            };
+            if wosy_compiler::OrderedClosedWasip1::is_root_initializer(&first) || sites.next().is_some() {
+                return Ok(match wosy_compiler::prepare_ordered_closed_wasip1(&input.fresh, request.output_bytes) {
+                    Ok(evaluator) => Ok((input.configuration_inputs, RootedSelectedComptime::Ordered(
+                        RootedOrderedComptime { source: input.source, evaluator },
+                    ))),
+                    Err(reason) => Err(compiler_refusal(reason)),
+                });
+            }
+            let automatic = RootedClosedComptimeRequest {
+                profile: request.profile.clone(), file: request.file.clone(), id,
+                evaluator_layout: request.evaluator_layout, source_limits: request.source_limits,
+                output_bytes: request.output_bytes,
+            };
+            automatic.check_selector_bytes()?;
+            Ok(match self.project_pair_call_graph_from_verified_parse(
+                input.source.root, input.source.authored_cst, input.source.target, &automatic,
+                &input.fresh, Some(wosy_compiler::OrderedClosedWasip1::MAX_STDOUT),
+            )? {
+                RootedPairCallGraphComptimeProjection::Emitted(plan) =>
+                    Ok((input.configuration_inputs, RootedSelectedComptime::Pair(plan))),
+                RootedPairCallGraphComptimeProjection::Refused(reason) => Err(reason),
+            })
+        })
     }
 
     pub(super) fn project_closed_comptime_for_lease(

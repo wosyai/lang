@@ -32,7 +32,7 @@ attributes #0 = { noreturn "wasm-import-module"="wasi_snapshot_preview1" "wasm-i
         subprocess.run(["wasm-ld", "--no-entry", "--export=_start", "--export-memory",
                         f"--allow-undefined-file={allowed}", directory / "evaluator.o",
                         directory / "start.o", "-o", module], check=True)
-elif operation in ("artifact-check", "artifact-build", "artifact-build-min"):
+elif operation in ("artifact-check", "artifact-build", "artifact-build-min", "artifact-build-ordered"):
     if operation == "artifact-check":
         ir, runtime, output = map(Path, args[:3])
         expected = int(args[3])
@@ -43,6 +43,17 @@ elif operation in ("artifact-check", "artifact-build", "artifact-build-min"):
         expected = -2147483648 if operation == "artifact-build-min" else 10
         if Path("refuse-final-builder").is_file():
             sys.exit(72)
+    if operation == "artifact-build-ordered":
+        checks = [("first", 14), ("second", 10), ("tied", 4)]
+    else:
+        checks = [("bypass", 37), ("first", 34), ("repeated", 34), ("different", expected)]
+    checker = []
+    previous = "true"
+    for index, (binding, value) in enumerate(checks):
+        checker.append(f"  %v{index} = load i32, ptr @{binding}")
+        checker.append(f"  %q{index} = icmp eq i32 %v{index}, {value}")
+        checker.append(f"  %all{index} = and i1 {previous}, %q{index}")
+        previous = f"%all{index}"
     with tempfile.TemporaryDirectory(dir=output.parent) as temp:
         directory = Path(temp)
         observed = directory / "observed.ll"
@@ -50,18 +61,8 @@ elif operation in ("artifact-check", "artifact-build", "artifact-build-min"):
 ; Test-only observer in the same module as the ordinary private globals.
 define i32 @wosy_test_startup_values() {{
 entry:
-    %a = load i32, ptr @bypass
-    %b = load i32, ptr @first
-    %c = load i32, ptr @repeated
-    %d = load i32, ptr @different
-    %qa = icmp eq i32 %a, 37
-    %qb = icmp eq i32 %b, 34
-    %qc = icmp eq i32 %c, 34
-    %qd = icmp eq i32 %d, {expected}
-    %ab = and i1 %qa, %qb
-    %cd = and i1 %qc, %qd
-    %all = and i1 %ab, %cd
-    %status = select i1 %all, i32 0, i32 73
+{chr(10).join(checker)}
+    %status = select i1 {previous}, i32 0, i32 73
     ret i32 %status
 }}
 """)
@@ -97,6 +98,18 @@ elif operation == "artifact-run":
     assert separator == "--"
     module = json.loads(Path(manifest).read_text())["executable"]
     sys.exit(subprocess.run(["wasmtime", "run", "-C", "cache=n", module]).returncode)
+elif operation == "ordered-run":
+    manifest, = map(Path, args)
+    module = json.loads(manifest.read_text())["executable"]
+    completed = subprocess.run(["wasmtime", "run", "-C", "cache=n", module], capture_output=True)
+    sys.stderr.buffer.write(completed.stderr)
+    if not completed.returncode:
+        with Path("evaluator-order").open("ab") as log:
+            log.write(completed.stdout)
+        if completed.stdout == b"10\n" and Path("refuse-second-evaluator").exists():
+            sys.exit(74)
+    sys.stdout.buffer.write(completed.stdout)
+    sys.exit(completed.returncode)
 elif operation == "run":
     manifest, = map(Path, args)
     module = json.loads(manifest.read_text())["executable"]

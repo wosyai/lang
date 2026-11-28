@@ -1128,21 +1128,32 @@ pub struct ArtifactIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactComptimeSiteObservation {
+    pub site: String,
+    pub watches: Vec<packages::WatchedComptimeFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactComptimeObservation {
     pub source_root: [u8; 32],
     pub result_root: [u8; 32],
     pub configuration_inputs: [u8; 32],
     pub site: String,
     pub watches: Vec<packages::WatchedComptimeFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_sites: Vec<ArtifactComptimeSiteObservation>,
 }
 
 impl ArtifactComptimeObservation {
     #[cfg(target_os = "linux")]
     pub fn matches_current(&self, project: &Path, target: &str, profile: &str) -> bool {
-        packages::observe_owned_local_comptime_inputs(project, packages::LocalComptimeInputScope {
-            target, profile, site: &self.site,
-            watch_limits: packages::ComptimeWatchLimits { entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX },
-        }, self.configuration_inputs).is_ok_and(|current| current.watches() == self.watches)
+        let (sites, expected): (Vec<_>, Vec<_>) = std::iter::once((self.site.as_str(), self.watches.as_slice()))
+            .chain(self.additional_sites.iter().map(|site| (site.site.as_str(), site.watches.as_slice())))
+            .unzip();
+        packages::observe_owned_local_comptime_watch_batch(project, target, profile, &sites,
+            packages::ComptimeWatchLimits { entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX },
+            self.configuration_inputs,
+        ).is_ok_and(|(_, current)| current.iter().map(Vec::as_slice).eq(expected))
     }
 }
 

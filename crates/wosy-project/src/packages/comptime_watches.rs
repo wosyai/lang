@@ -73,6 +73,21 @@ pub fn observe_owned_local_comptime_inputs(
     })
 }
 
+/// Capture every selected watch list against one anchored manifest/profile
+/// read. The result preserves site order and does not grant process authority.
+#[cfg(target_os = "linux")]
+pub fn observe_owned_local_comptime_watch_batch(
+    root: &Path, target: &str, profile: &str, sites: &[&str],
+    limits: ComptimeWatchLimits, expected: [u8; 32],
+) -> Result<(ObservedClosedComptimeProfile, Vec<Vec<WatchedComptimeFile>>), String> {
+    linux::observe_local_comptime_sites(root, target, profile, sites, limits, |manifest| {
+        if compiler_source_configuration_identity(manifest, &std::collections::BTreeMap::new())? != expected {
+            return Err("local comptime configuration changed after source staging".into());
+        }
+        Ok(())
+    })
+}
+
 /// The local consumer selection for read-only input observations.
 pub struct LocalComptimeInputScope<'a> {
     pub target: &'a str,
@@ -121,6 +136,16 @@ mod linux {
     pub fn observe_local_comptime_inputs(
         root: &Path, scope: LocalComptimeInputScope<'_>, authorize_manifest: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(ObservedClosedComptimeProfile, Vec<WatchedComptimeFile>), String> {
+        let (profile, mut watches) = observe_local_comptime_sites(
+            root, scope.target, scope.profile, &[scope.site], scope.watch_limits, authorize_manifest,
+        )?;
+        Ok((profile, watches.pop().expect("one requested watch list")))
+    }
+
+    pub(super) fn observe_local_comptime_sites(
+        root: &Path, target: &str, profile: &str, sites: &[&str], limits: ComptimeWatchLimits,
+        authorize_manifest: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(ObservedClosedComptimeProfile, Vec<Vec<WatchedComptimeFile>>), String> {
         use super::super::{snapshot::MANIFEST, ProjectSnapshot, LOCKFILE};
         let (mut snapshot, directory) = ProjectSnapshot::anchored_compiler_reader(root)?;
         let bytes = observed_metadata(&directory, MANIFEST)?.ok_or("watched-project manifest is missing")?;
@@ -133,16 +158,20 @@ mod linux {
         snapshot.set_observed_lock(observed_metadata(&directory, LOCKFILE)?);
         let (configuration, document) = ProjectConfiguration::from_snapshot_manifest(root, &snapshot, document)?;
         let selected = ObservedClosedComptimeProfile::observe_input_declarations(
-            &configuration, &document, scope.target, scope.profile,
+            &configuration, &document, target, profile,
         )?;
-        let globs = declarations(&document, scope.site, "watch")?;
-        let mut result = Vec::new();
-        if !globs.is_empty() {
-            let mut budget = scope.watch_limits;
-            resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut result)?;
-            order_watches(&mut result);
+        let mut results = Vec::with_capacity(sites.len());
+        for site in sites {
+            let globs = declarations(&document, site, "watch")?;
+            let mut watches = Vec::new();
+            if !globs.is_empty() {
+                let mut budget = limits;
+                resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut watches)?;
+                order_watches(&mut watches);
+            }
+            results.push(watches);
         }
-        Ok((selected, result))
+        Ok((selected, results))
     }
 
     fn observed_metadata(directory: &GitDirectory, name: &str) -> Result<Option<Vec<u8>>, String> {

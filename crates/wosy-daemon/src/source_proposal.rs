@@ -289,16 +289,105 @@ pub(super) struct PairDecodedResults {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn decode_ordered_closed_result(
+    plan: &super::RootedOrderedComptime, evaluator: &wosy_compiler::OrderedClosedWasip1Site,
+    config: NodeId, generation: i64, seal: &wosy_project::packages::PreparedComptimeExecutionSeal,
+    executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+) -> Result<(wosy_protocol::ComptimeResult, wosy_compiler::ScalarExpression)> {
+    use wosy_project::packages::WatchRoot;
+    use wosy_protocol::{ComptimeInputs, ComptimeValue, ComptimeWatchIdentity};
+    let attempt = executed.attempt();
+    let scope = executed.observed();
+    let declarations = scope.declarations();
+    let tools = declarations.tools();
+    if !seal.same_owner(&attempt.seal) || attempt.root != plan.source_root().0
+        || attempt.generation != generation || attempt.authored_cst != plan.authored_cst().0
+        || scope.project() != std::path::Path::new(&evaluator.source_span().source.project)
+        || scope.site() != evaluator.id() || scope.configuration_identity() != config.0
+        || tools.target() != plan.target() || tools.profile() != plan.profile()
+        || !declarations.parameters().is_empty()
+    {
+        return Err("selected comptime execution does not belong to the exact authored site".into());
+    }
+    let [receipt] = executed.pairs() else { return Err("expected one result for the selected closed site".into()); };
+    let (_, builder) = tools.builder();
+    let (_, runner) = tools.runner();
+    let fragment_ir = NodeId(*blake3::hash(evaluator.ir()).as_bytes());
+    if fragment_ir.0 != *receipt.ir().as_bytes()
+        || !matches_owned_comptime_tool(scope.project(), receipt.builder(), &builder.command, &builder.args, 3)
+        || !matches_owned_comptime_tool(scope.project(), receipt.runner(), &runner.command, &runner.args, 1)
+    {
+        return Err("selected comptime terminal differs from the selected evaluator or invocation".into());
+    }
+    let stdout = receipt.runner().stdout();
+    let decoded = evaluator.read_stdout(stdout)?;
+    let (type_name, value) = canonical_comptime_scalar(evaluator.result_type(), &decoded)?;
+    let mut watches = Vec::with_capacity(scope.watches().len());
+    for watch in scope.watches() {
+        let root_tag = match watch.root { WatchRoot::OwningPackage => 0u8, WatchRoot::ConsumingProject => 1 };
+        watches.push(ComptimeWatchIdentity {
+            input: comptime_digest("Wosy resolved comptime watch v1", &(root_tag, &watch.path))?,
+            content: NodeId::parse_hex(&watch.revision.0)?,
+        });
+    }
+    let key = ComptimeInputs {
+        fragment_ir,
+        function: comptime_digest("Wosy authored comptime function v1", &(plan.authored_cst(), evaluator.id()))?,
+        specialization: comptime_digest("Wosy concrete comptime specialization v1", &Vec::<wosy_protocol::ComptimeScalarValue>::new())?,
+        concrete_values: Vec::new(),
+        target: plan.target().to_owned(), profile: plan.profile().to_owned(), compiler_image: plan.compiler_image(),
+        builder: comptime_digest("Wosy declared comptime builder v1", &tools.builder())?,
+        runner: comptime_digest("Wosy declared comptime runner v1", &tools.runner())?,
+        toolchain: comptime_digest("Wosy declared comptime toolchain v1", &builder.toolchain_identity)?,
+        params: comptime_digest("Wosy empty comptime parameters v1", &())?,
+        permissions: comptime_digest("Wosy empty comptime permissions v1", &())?,
+        watches,
+    }.key()?;
+    let result = key.identify_result(
+        comptime_digest("Wosy resolved comptime scalar type v1", &type_name)?, &ComptimeValue::Scalar(value),
+    )?;
+    Ok((result, decoded))
+}
+
+#[cfg(target_os = "linux")]
+fn matches_owned_comptime_tool(
+    working_directory: &std::path::Path, actual: &wosy_project::packages::OwnedComptimeToolResult,
+    command: &[String], args: &[String], suffix: usize,
+) -> bool {
+    use std::ffi::OsStr;
+    let Some((executable, fixed)) = command.split_first() else { return false; };
+    actual.status().success() && actual.working_directory() == working_directory
+        && actual.executable() == OsStr::new(executable)
+        && actual.arguments().len() == fixed.len() + args.len() + suffix
+        && actual.arguments().iter().zip(fixed.iter().chain(args))
+            .all(|(actual, declared)| actual == OsStr::new(declared))
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_comptime_scalar(
+    expected: &wosy_compiler::ScalarType, decoded: &wosy_compiler::ScalarExpression,
+) -> Result<(&'static str, wosy_protocol::ComptimeScalarValue)> {
+    use wosy_compiler::{ScalarExpression as Expression, ScalarType};
+    use wosy_protocol::ComptimeScalarValue as Value;
+    Ok(match (expected, decoded) {
+        (ScalarType::Bool, Expression::Boolean { value, .. }) => ("bool", Value::Bool(*value)),
+        (ScalarType::I32, Expression::Integer { value, .. }) => ("i32", Value::Signed { width: 32,
+            value: i32::try_from(value).map_err(|_| "invalid owned comptime i32")?.into() }),
+        (ScalarType::U32, Expression::Integer { value, .. }) => ("u32", Value::Unsigned { width: 32,
+            value: u32::try_from(value).map_err(|_| "invalid owned comptime u32")?.into() }),
+        _ => return Err("owned comptime typed result has no supported canonical identity".into()),
+    })
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn decode_owned_pair_results(
     plan: &super::RootedPairCallGraphComptimePlan, project: &std::path::Path,
     configuration_inputs: NodeId, expected_generation: i64,
     seal: &wosy_project::packages::PreparedComptimeExecutionSeal,
     executed: &wosy_project::packages::OwnedLocalComptimeExecution,
 ) -> Result<PairDecodedResults> {
-    use std::ffi::OsStr;
-    use wosy_compiler::{ScalarExpression as Expression, ScalarType};
-    use wosy_project::packages::{OwnedComptimeToolResult, WatchRoot};
-    use wosy_protocol::{ComptimeInputs, ComptimeResultRoot, ComptimeScalarValue as Value, ComptimeValue, ComptimeWatchIdentity};
+    use wosy_project::packages::WatchRoot;
+    use wosy_protocol::{ComptimeInputs, ComptimeResultRoot, ComptimeValue, ComptimeWatchIdentity};
 
     let output = plan.wasip1_output().ok_or("expected a selected WASIp1 plan")?;
     let evaluators = pair_evaluator_shapes(plan).ok_or("incomplete selected evaluator plan")?;
@@ -323,14 +412,6 @@ pub(super) fn decode_owned_pair_results(
 
     let (_, builder) = tools.builder();
     let (_, runner) = tools.runner();
-    let matches_tool = |actual: &OwnedComptimeToolResult, command: &[String], args: &[String], suffix: usize| {
-        let Some((executable, fixed)) = command.split_first() else { return false; };
-        actual.status().success() && actual.working_directory() == observed.project()
-            && actual.executable() == OsStr::new(executable)
-            && actual.arguments().len() == fixed.len() + args.len() + suffix
-            && actual.arguments().iter().zip(fixed.iter().chain(args))
-                .all(|(actual, declared)| actual == OsStr::new(declared))
-    };
     let mut watches = Vec::with_capacity(observed.watches().len());
     for watch in observed.watches() {
         let root_tag = match watch.root { WatchRoot::OwningPackage => 0u8, WatchRoot::ConsumingProject => 1 };
@@ -351,21 +432,14 @@ pub(super) fn decode_owned_pair_results(
     let mut modules = Vec::with_capacity(executions.len());
     for ((expected, evaluator), receipt) in evaluators.iter().zip(output.evaluators()).zip(executions) {
         if expected.fragment_ir.0 != *receipt.ir().as_bytes()
-            || !matches_tool(receipt.builder(), &builder.command, &builder.args, 3)
-            || !matches_tool(receipt.runner(), &runner.command, &runner.args, 1)
+            || !matches_owned_comptime_tool(observed.project(), receipt.builder(), &builder.command, &builder.args, 3)
+            || !matches_owned_comptime_tool(observed.project(), receipt.runner(), &runner.command, &runner.args, 1)
         {
             return Err("owned comptime terminal differs from the selected evaluator or invocation".into());
         }
         let decoded = evaluator.parse_stdout(receipt.runner().stdout(), output.max_stdout())
             .map_err(|error| format!("owned comptime stdout failed typed decoding: {error:?}"))?;
-        let (type_name, value) = match (&expected.result_type, &decoded) {
-            (ScalarType::Bool, Expression::Boolean { value, .. }) => ("bool", Value::Bool(*value)),
-            (ScalarType::I32, Expression::Integer { value, .. }) => ("i32", Value::Signed { width: 32,
-                value: i32::try_from(value).map_err(|_| "invalid owned comptime i32")?.into() }),
-            (ScalarType::U32, Expression::Integer { value, .. }) => ("u32", Value::Unsigned { width: 32,
-                value: u32::try_from(value).map_err(|_| "invalid owned comptime u32")?.into() }),
-            _ => return Err("owned comptime typed result has no supported canonical identity".into()),
-        };
+        let (type_name, value) = canonical_comptime_scalar(&expected.result_type, &decoded)?;
         let specialization = comptime_digest("Wosy concrete comptime specialization v1", &expected.concrete_values)?;
         let key = ComptimeInputs {
             fragment_ir: expected.fragment_ir, function, specialization,

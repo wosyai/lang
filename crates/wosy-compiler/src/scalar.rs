@@ -2360,13 +2360,37 @@ fn derive_scalar_declarations_with_embedding(
     canonical: &CanonicalCstRoot,
     embedded: Option<EmbeddedComptimeExpression<'_>>,
 ) -> ScalarSourceDeclarations {
+    derive_scalar_declarations_with_embeddings(canonical, embedded.as_slice())
+}
+
+fn derive_scalar_declarations_with_embeddings(
+    canonical: &CanonicalCstRoot,
+    embeddings: &[EmbeddedComptimeExpression<'_>],
+) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
     let mut struct_prefix = Vec::new();
     let mut enum_prefix = Vec::new();
     let mut struct_descendants = Vec::new();
     let mut enum_descendants = Vec::new();
-    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, embedded.as_ref().map(|value| value.site), |node| {
+    // Each insertion is selected by its original Rowan declaration, never
+    // by spelling or by an offset from a different tree.
+    let mut by_item = HashMap::new();
+    let mut by_site = HashMap::new();
+    for embedding in embeddings {
+        by_site.insert(embedding.site.text_range().start(), embedding.site);
+        if let Some(owner) = embedding.site.ancestors().find(|node| {
+            matches!(node.kind(), SyntaxKind::BindingDecl | SyntaxKind::FunctionDecl)
+        }) {
+            by_item.insert(owner.text_range().start(), (owner, embedding));
+        }
+    }
+    let embedding_for = |node: &CstNode| by_item.get(&node.text_range().start())
+        .filter(|(owner, _)| owner == node).map(|(_, embedding)| *embedding);
+    let (diagnostics, invalid_projection) = collect_scalar_diagnostics_with(
+        canonical,
+        |site| by_site.get(&site.text_range().start()).is_some_and(|original| *original == site),
+        |node| {
         let Some(root) = source_root.as_ref() else { return };
         let (prefix, descendants) = match node.kind() {
             SyntaxKind::StructDecl => (&mut struct_prefix, &mut struct_descendants),
@@ -2402,9 +2426,9 @@ fn derive_scalar_declarations_with_embedding(
         match node.kind() {
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
-            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, embedded.as_ref()))),
+            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, embedding_for(&node)))),
             SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node, embedded.as_ref())))
+                items.push(ScalarItem::Function(derive_function(&node, embedding_for(&node))))
             }
             SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node))),
             SyntaxKind::GenericFunctionDecl => {
@@ -2425,10 +2449,10 @@ fn derive_scalar_declarations_with_embedding(
                             items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
                         SyntaxKind::BindingDecl => {
-                            items.push(ScalarItem::Binding(derive_binding(&item, embedded.as_ref())))
+                            items.push(ScalarItem::Binding(derive_binding(&item, embedding_for(&item))))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item, embedded.as_ref())))
+                            items.push(ScalarItem::Function(derive_function(&item, embedding_for(&item))))
                         }
                         SyntaxKind::OverloadDecl => {
                             items.push(ScalarItem::Function(derive_overload(&item)))
@@ -2528,6 +2552,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 
 mod declarations;
 mod comptime;
+pub use comptime::{prepare_ordered_closed_wasip1, OrderedClosedWasip1, OrderedClosedWasip1Site};
 pub use comptime::{
     prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
     prepare_wasip1_comptime_continuation, ComptimeStdoutError,
@@ -2583,6 +2608,14 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
 fn collect_scalar_diagnostics(
     canonical: &CanonicalCstRoot,
     embedded_comptime_site: Option<&CstNode>,
+    record_declaration: impl FnMut(CstNode),
+) -> (Vec<Diagnostic>, bool) {
+    collect_scalar_diagnostics_with(canonical, |site| embedded_comptime_site == Some(site), record_declaration)
+}
+
+fn collect_scalar_diagnostics_with(
+    canonical: &CanonicalCstRoot,
+    admits_comptime_site: impl Fn(&CstNode) -> bool,
     mut record_declaration: impl FnMut(CstNode),
 ) -> (Vec<Diagnostic>, bool) {
     let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
@@ -2645,7 +2678,7 @@ fn collect_scalar_diagnostics(
             NodeOrToken::Node(node)
                 if node.kind() == SyntaxKind::InvalidTemporaryPlace
                     || (node.kind() == SyntaxKind::ComptimeExpr
-                        && embedded_comptime_site != Some(&node))
+                        && !admits_comptime_site(&node))
                     || (node.kind() == SyntaxKind::ValueField
                         && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
             {

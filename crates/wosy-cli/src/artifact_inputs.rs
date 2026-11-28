@@ -144,6 +144,16 @@ fn artifact_identity<'a>(
     }, builder))
 }
 
+/// Older CLI builds ignored unknown manifest fields. Force them to reject
+/// the multi-site generation instead of running after checking only site 1.
+pub fn expected_artifact_compiler_identity(comptime: Option<&wosy_project::ArtifactComptimeObservation>) -> String {
+    let mut identity = compiler_identity();
+    if comptime.is_some_and(|observed| !observed.additional_sites.is_empty()) {
+        identity.push_str(":ordered-comptime-v1");
+    }
+    identity
+}
+
 pub fn compiler_identity() -> String {
     wosy_compiler::COMPILER_IDENTITY.to_owned()
 }

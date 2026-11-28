@@ -5,7 +5,7 @@ use super::{
     RequiredSourceReplay, Result, SourceReplay, SqliteSourceState, StoredNodes,
 };
 use crate::{
-    artifact_inputs::{pending_builder_inputs, BuilderInputPaths, ObservedBuilderBasis, PendingBuilderInputs},
+    artifact_inputs::{expected_artifact_compiler_identity, pending_builder_inputs, BuilderInputPaths, ObservedBuilderBasis, PendingBuilderInputs},
     project_sources::LiveSourceReader, source_preparation::verify_live_source,
 };
 use codespan_reporting::term::termcolor::WriteColor;
@@ -644,6 +644,7 @@ fn matches_ordinary_builder(
             let _ = observation;
             return Ok(false);
         }
+        recomputed.manifest.identity.compiler_identity = expected_artifact_compiler_identity(Some(observation));
         recomputed.manifest.comptime = Some(observation.clone());
     }
     Ok(recomputed.manifest == ordinary.manifest && recomputed.builder == ordinary.builder)
@@ -741,7 +742,94 @@ impl SqliteSourceState {
             configuration_inputs: owner.configuration_inputs().0,
             site: plan.id().to_owned(),
             watches: watches.watches().to_vec(),
+            additional_sites: Vec::new(),
         });
+        Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+    }
+
+    /// Execute all closed sites before one ordinary continuation. Observe
+    /// every site before the first child and again after the last child.
+    pub fn prepare_selected_ordered_ordinary_inputs(
+        &mut self, owner: &wosy_daemon::SelectedOrderedComptimeOwner<'_>,
+        private_parent: &Path, output: &Path, budget: SelectedPairToolBudget,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<SelectedPairOrdinaryInputs>> {
+        use wosy_project::{ArtifactComptimeObservation, ArtifactComptimeSiteObservation};
+        use wosy_project::packages::{observe_owned_local_comptime_watch_batch, ComptimeExecutionAttempt, LocalComptimeInputScope};
+        let Some(plan) = owner.plan() else { return Ok(None); };
+        let deadline = llvm_deadline(plan.profile(), budget.timeout)?;
+        let Ok(initial) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else {
+            return Ok(None);
+        };
+        let source = initial.captured.source;
+        let configuration_inputs = owner.configuration_inputs().0;
+        if source.selection().root != plan.source_root() || source.selection().project != plan.project()
+            || self.project != Path::new(plan.project()) || initial.builder.is_none() || cancelled()
+        {
+            return Ok(None);
+        }
+        let scope = |ordinal: usize| LocalComptimeInputScope {
+            target: plan.target(), profile: plan.profile(), site: plan.evaluators()[ordinal].id(),
+            watch_limits: budget.watch_limits,
+        };
+        let mut remaining_ir = budget.evaluator_ir_bytes;
+        for evaluator in plan.evaluators() {
+            remaining_ir = remaining_ir.checked_sub(evaluator.ir().len()).ok_or("selected evaluator IR exceeds requested budget")?;
+        }
+        require_diagnostic_time(deadline)?;
+        let sites = plan.evaluators().iter().map(|item| item.id()).collect::<Vec<_>>();
+        let (declarations, watch_sets) = observe_owned_local_comptime_watch_batch(
+            &self.project, plan.target(), plan.profile(), &sites, budget.watch_limits, configuration_inputs,
+        )?;
+        if !declarations.parameters().is_empty() {
+            // This corridor admits only closed values, not parameterized tool manifests.
+            return Ok(None);
+        }
+        let initial_watches = sites.into_iter().zip(watch_sets).map(|(site, watches)| {
+            ArtifactComptimeSiteObservation { site: site.to_owned(), watches }
+        }).collect::<Vec<_>>();
+        let mut executions = Vec::with_capacity(plan.evaluators().len());
+        for (ordinal, (evaluator, before)) in plan.evaluators().iter().zip(&initial_watches).enumerate() {
+            if cancelled() || owner.plan().is_none() { return Ok(None); }
+            executions.push(crate::comptime_fragment::execute_selected_closed_wasip1(
+                evaluator, &self.project, scope(ordinal), configuration_inputs,
+                ComptimeExecutionAttempt {
+                    seal: owner.execution_seal().clone(), root: plan.source_root().0,
+                    generation: source.generation(), authored_cst: plan.authored_cst().0,
+                }, &before.watches, private_parent, budget.evaluator_module_bytes, deadline.into_std(), &cancelled,
+            )?);
+        }
+        let Some(emitted) = owner.emit_owned_results(source.generation(), &executions)? else { return Ok(None); };
+        let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
+        if current.captured.selection() != source.selection()
+            || current.captured.source.generation() != source.generation()
+            || emitted.source_root != source.selection().root || cancelled()
+        {
+            return Ok(None);
+        }
+        let mut watches = initial_watches.into_iter();
+        let first = watches.next().ok_or("selected comptime batch has no site")?;
+        let observation = ArtifactComptimeObservation {
+            source_root: emitted.source_root.0, result_root: emitted.result_root.identity().0, configuration_inputs,
+            site: first.site, watches: first.watches, additional_sites: watches.collect(),
+        };
+        if !observation.matches_current(&self.project, plan.target(), plan.profile())
+            || !current.captured.is_current(self)? || owner.plan().is_none()
+        {
+            return Ok(None);
+        }
+        require_diagnostic_time(deadline)?;
+        let observed = current.builder.ok_or("selected comptime artifact has no live builder inputs")?;
+        let (_, artifact, profile, _) = observed.configuration.artifact_profile(plan.target(), plan.profile())?;
+        let runtime = wosy_compiler::core_runtime(&profile.backend, &profile.output)?;
+        let mut partition = Vec::new();
+        emitted.partition.write_text(&mut partition)?;
+        let mut inputs = pending_builder_inputs(
+            &observed.configuration, observed.configuration_identity, plan.target(), plan.profile(), artifact, profile,
+            observed.source, blake3::hash(&partition).to_hex().to_string(), output,
+        )?;
+        inputs.manifest.identity.compiler_identity = expected_artifact_compiler_identity(Some(&observation));
+        inputs.manifest.comptime = Some(observation);
         Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
     }
 

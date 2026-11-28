@@ -34,6 +34,7 @@ pub use scalar::{
     prepare_wasip1_comptime_continuation, ComptimeStdoutError,
     PreparedComptimeStdout, PreparedComptimeStdoutEvaluator, PreparedWasip1ComptimeContinuation,
 };
+pub use scalar::{prepare_ordered_closed_wasip1, OrderedClosedWasip1, OrderedClosedWasip1Site};
 pub use scalar::{derive_closed_comptime_fragment, derive_first_source_initializer_comptime, ClosedComptimeFragment,
     ClosedComptimeRejection,
     ComptimeParameter, ComptimeParameterOrigin, ComptimeParameterRejection, ComptimeParameterUse, ComptimeParameterValue,

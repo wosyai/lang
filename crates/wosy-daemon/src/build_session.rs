@@ -80,6 +80,56 @@ impl SelectedPairComptimeOwner<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub enum SelectedComptimePreparation<'a> {
+    Pair(SelectedPairComptimeOwner<'a>),
+    Ordered(SelectedOrderedComptimeOwner<'a>),
+    Refused(super::RootedClosedComptimeRefusal),
+}
+
+#[cfg(target_os = "linux")]
+pub struct SelectedOrderedComptimeOwner<'a> {
+    lease: &'a SourceLease,
+    configuration_inputs: NodeId,
+    plan: super::RootedOrderedComptime,
+    execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedOrderedComptimeOwner<'_> {
+    pub fn configuration_inputs(&self) -> NodeId { self.configuration_inputs }
+    pub fn execution_seal(&self) -> &wosy_project::packages::PreparedComptimeExecutionSeal { &self.execution_seal }
+    pub fn plan(&self) -> Option<&super::RootedOrderedComptime> {
+        self.lease.finish_current(|| &self.plan)
+    }
+
+    pub fn emit_owned_results(
+        &self, generation: i64, executions: &[wosy_project::packages::OwnedLocalComptimeExecution],
+    ) -> Result<Option<SelectedPairComptimeEmission>> {
+        let Some(plan) = self.plan() else { return Ok(None); };
+        if plan.evaluators().len() != executions.len() {
+            return Err("selected comptime set is incomplete".into());
+        }
+        let mut identities = Vec::with_capacity(executions.len());
+        let mut values = Vec::with_capacity(executions.len());
+        for (evaluator, executed) in plan.evaluators().iter().zip(executions) {
+            let (identity, value) = super::source_proposal::decode_ordered_closed_result(
+                plan, evaluator, self.configuration_inputs, generation, &self.execution_seal, executed,
+            )?;
+            identities.push(identity);
+            values.push(value);
+        }
+        let result_root = wosy_protocol::ComptimeResultRoot::identify(
+            plan.source_root(), plan.target(), plan.profile(), identities,
+        )?;
+        let partition = plan.evaluator.emit_with_values(values)
+            .map_err(|error| format!("ordered comptime continuation rejected: {error:?}"))?;
+        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
+            source_root: plan.source_root(), result_root, partition,
+        }))
+    }
+}
+
 pub enum BuildSourceOpening<'a> {
     ReplayRequired { root: NodeId },
     Opened { session: BuildDiagnosticSession<'a>, restored: Option<SourceReconciliation> },
@@ -314,6 +364,33 @@ impl BuildDiagnosticSession<'_> {
             store.project_unique_selected_pair_for_lease(&lease, profile, limits, output_bytes, max_stdout)
         }).await??;
         self.selected_pair_owner(answer)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_selected_wasip1_comptime(
+        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize,
+    ) -> Result<SelectedComptimePreparation<'_>> {
+        use super::rooted_comptime::RootedSelectedComptime;
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        let answer = self.worker.spawn_reserved(slot, move |store| {
+            store.project_selected_wasip1_for_lease(&lease, profile, limits, output_bytes)
+        }).await??;
+        Ok(match answer {
+            Err(reason) => SelectedComptimePreparation::Refused(reason),
+            Ok((configuration_inputs, plan)) => {
+                self.lease.finish_current(|| ()).ok_or("selected comptime source lease expired")?;
+                let execution_seal = wosy_project::packages::PreparedComptimeExecutionSeal::fresh();
+                match plan {
+                    RootedSelectedComptime::Pair(plan) => SelectedComptimePreparation::Pair(SelectedPairComptimeOwner {
+                        lease: self.lease.as_ref(), configuration_inputs, plan, execution_seal,
+                    }),
+                    RootedSelectedComptime::Ordered(plan) => SelectedComptimePreparation::Ordered(SelectedOrderedComptimeOwner {
+                        lease: self.lease.as_ref(), configuration_inputs, plan, execution_seal,
+                    }),
+                }
+            }
+        })
     }
 
     #[cfg(target_os = "linux")]

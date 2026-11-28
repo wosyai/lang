@@ -540,7 +540,7 @@ impl BoundedStartupWasip1Evaluator {
     }
 }
 
-fn parse_scalar(ty: &ScalarType, span: ByteSpan, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
+pub(super) fn parse_scalar(ty: &ScalarType, span: ByteSpan, stdout: &[u8], max_bytes: usize) -> Result<ScalarExpression, ComptimeStdoutError> {
     let shape = Shape::scalar(ty).ok_or(ComptimeStdoutError::UnsupportedResultType)?;
     parse(&ShapePlan::scalar(shape), span, stdout, max_bytes)
 }

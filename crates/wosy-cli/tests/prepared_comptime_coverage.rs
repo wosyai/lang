@@ -1544,6 +1544,7 @@ u32 different = solve(7, 13);
     check("build");
     let first = chosen();
     let original = first.manifest().comptime.as_ref().expect("selected comptime observation");
+    assert_eq!(first.manifest().identity.compiler_identity, wosy_cli::artifact_inputs::compiler_identity());
     assert_eq!(original.site, "prepare");
     assert_eq!(original.watches.len(), 1);
     let original_wasm = fs::read(&first.manifest().executable).unwrap();
@@ -1583,4 +1584,135 @@ u32 different = solve(7, 13);
     fs::write(root.join("wosy.toml"), manifest.replace("\"artifact-build\"", "\"artifact-build-min\"")).unwrap();
     check("build");
     check("run");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires ordinary clang, wasm-ld, python3 and wasmtime on PATH"]
+fn ordinary_cli_compiles_all_closed_sites_in_source_order_and_publishes_once() {
+    use std::process::Command;
+    use wosy_project::SelectedArtifactGeneration;
+
+    let fixture = Scratch::new();
+    let root = &fixture.0;
+    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+        .replace(r#""fixture-must-not-build""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-build-ordered""#)
+        .replace(r#""fixture-must-not-run""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-run""#)
+        .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"closed\"\ncomptime_runner = \"closed\"\nbuild_permissions = []\nbuild_mounts = []")
+        + r#"
+[builders.closed]
+command = ["python3", "ordinary_wasip1_pair.py", "build"]
+toolchain_identity = "ordinary ordered WASI fixture"
+[runners.closed]
+command = ["python3", "ordinary_wasip1_pair.py", "ordered-run"]
+[comptime.zeta]
+watch = ["first.txt"]
+[comptime.alpha]
+watch = ["second.txt"]
+"#;
+    fs::write(root.join("wosy.toml"), &manifest).unwrap();
+    fs::write(root.join("ordinary_wasip1_pair.py"), include_str!("fixtures/ordinary_wasip1_pair.py")).unwrap();
+    fs::write(root.join("first.txt"), b"first watched contents").unwrap();
+    let watch = root.join("second.txt");
+    fs::write(&watch, b"second watched contents").unwrap();
+    let source = r#"%%start
+u32 first = comptime zeta { u32 seed = 7; seed ^ 9 };
+u32 second = comptime alpha { u32 base = 13; base ^ 7 };
+u32 tied = first ^ second;
+%%end
+"#;
+    let source_path = root.join("main.w");
+    fs::write(&source_path, source).unwrap();
+    let order = root.join("evaluator-order");
+    // Same authored bytes and config do not permit crossing project owners.
+    // The source root itself already contains project identity; verify both
+    // clients have a committed selected root before invoking the wrong owner.
+    let twin = Scratch::new();
+    fs::write(twin.0.join("wosy.toml"), &manifest).unwrap();
+    fs::write(twin.0.join("main.w"), source).unwrap();
+    let receipts = Scratch::new();
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        use wosy_cli::local_build_daemon::establish_local_build_source;
+        use wosy_cli::source_state::SelectedPairToolBudget;
+        use wosy_daemon::SelectedComptimePreparation;
+        let store = Arc::new(SourceStore::open(&receipts.0.join("cas"), 8 << 20).unwrap());
+        let mut actual = SqliteSourceState::open(root, CLIENT).unwrap();
+        let mut other = SqliteSourceState::open(&twin.0, CLIENT).unwrap();
+        assert!(establish_local_build_source(&mut actual, &store, "app").await.unwrap());
+        assert!(establish_local_build_source(&mut other, &store, "app").await.unwrap());
+        let actual_selection = actual.acknowledged_build_source("app").unwrap().unwrap();
+        let other_selection = other.acknowledged_build_source("app").unwrap().unwrap();
+        assert_ne!(actual_selection.root, other_selection.root);
+        assert_ne!(actual_selection.project, other_selection.project);
+        let one = NonZeroUsize::MIN;
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let session = worker.open_build_diagnostics(other_selection, TTL).await.unwrap().unwrap();
+        let SelectedComptimePreparation::Ordered(owner) = session.prepare_selected_wasip1_comptime(
+            "dev".into(), LIMITS, usize::MAX,
+        ).await.unwrap() else { panic!("other valid selected owner"); };
+        assert!(actual.prepare_selected_ordered_ordinary_inputs(
+            &owner, &receipts.0, &root.join("must-not-publish"), SelectedPairToolBudget {
+                watch_limits: wosy_project::packages::ComptimeWatchLimits::default(),
+                evaluator_ir_bytes: usize::MAX, evaluator_module_bytes: u64::MAX, timeout: TTL,
+            }, || false,
+        ).unwrap().is_none());
+        assert!(!order.exists());
+        assert!(!root.join("must-not-publish").exists());
+        drop(owner);
+        drop(session);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+
+    let command = |verb: &str| Command::new(env!("CARGO_BIN_EXE_wosy"))
+        .current_dir(root).env("WOSY_INCREMENTAL", "1").args([verb, "app"]).output().unwrap();
+    let checked = |verb: &str| {
+        let output = command(verb);
+        assert!(output.status.success(), "{verb}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    let chosen = || SelectedArtifactGeneration::open(&root.join(".wosy/artifacts/app/dev/main/incremental"))
+        .unwrap().unwrap();
+
+    checked("build");
+    checked("run");
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n");
+    let first = chosen();
+    let original = first.manifest().comptime.as_ref().unwrap();
+    assert_ne!(first.manifest().identity.compiler_identity, wosy_cli::artifact_inputs::compiler_identity());
+    assert!(first.manifest().identity.compiler_identity.ends_with(":ordered-comptime-v1"));
+    assert_eq!(original.site, "zeta");
+    assert_eq!(original.additional_sites.iter().map(|site| site.site.as_str()).collect::<Vec<_>>(), ["alpha"]);
+    let retained = fs::read(&first.manifest().executable).unwrap();
+
+    fs::write(&watch, b"changed second site only").unwrap();
+    let stale = command("run");
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("artifact comptime inputs are stale"));
+
+    let refuse = root.join("refuse-second-evaluator");
+    fs::write(&refuse, b"the first evaluator succeeds; publication must not happen").unwrap();
+    let failed = command("build");
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("selected comptime runner failed"));
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n");
+    assert_eq!(chosen().manifest_path(), first.manifest_path());
+    fs::remove_file(&refuse).unwrap();
+
+    checked("build");
+    checked("run");
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n");
+    let current = chosen();
+    let observation = current.manifest().comptime.as_ref().unwrap();
+    assert_ne!(current.manifest_path(), first.manifest_path());
+    assert_eq!(observation.watches, original.watches);
+    assert_ne!(observation.additional_sites[0].watches, original.additional_sites[0].watches);
+    assert_ne!(observation.result_root, original.result_root);
+    assert_eq!(fs::read(&first.manifest().executable).unwrap(), retained);
+
+    // A second body capturing the first is outside the closed plan; do
+    // not run any of the batch or admit a result for the supported prefix.
+    fs::write(&source_path, source.replace("base ^ 7", "base ^ first")).unwrap();
+    assert!(!command("build").status.success());
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n");
+    assert_eq!(chosen().manifest_path(), current.manifest_path());
 }
