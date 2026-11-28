@@ -340,31 +340,65 @@ pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCal
     false
 }
 
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct ObservedExecutionSite {
-    pub(super) owner: SourceSpan,
-    pub(super) site: SourceSpan,
-    pub(super) incoming: Vec<SourceSpan>,
+/// A reached prepared expression, not an executed foreign operation.
+/// The unsafe argument evaluation, external outcome and foreign memory
+/// effects have not been modeled, so no continuation row can be derived.
+#[derive(Debug, PartialEq)]
+pub(super) struct PendingExternalCall {
+    pub(super) call: SourceSpan,
+    pub(super) declaration: SourceSpan,
+    pub(super) signature: CheckedCallSignature,
+    pub(super) invocation: Vec<SourceSpan>,
+}
+
+fn pending_external_call(
+    body: &FunctionCallSites, owner: &SourceIdentity, block: BlockOrdinal,
+) -> Option<PendingExternalCall> {
+    let region = body.structure.blocks.get(block.0)?;
+    let [item] = region.items.as_slice() else { return None; };
+    if !region.unsafe_context { return None; }
+    let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
+    let ResolvedCallTarget::ExternCallable { source, declaration_span } =
+        &body.resolved_call_site(expression)?.target else { return None; };
+    let signature = body.checked_call_signatures.get(&expression)?;
+    if signature.overload.is_some() || signature.overload_origin.is_some() { return None; }
+    Some(PendingExternalCall {
+        call: SourceSpan::new(owner.clone(), body.occurrences.get(expression.0)?.span),
+        declaration: SourceSpan::new(source.clone(), *declaration_span),
+        signature: signature.clone(),
+        invocation: Vec::new(),
+    })
 }
 
 #[cfg(test)]
 thread_local! {
-    static EXECUTION_SITE: RefCell<Option<ObservedExecutionSite>> = const { RefCell::new(None) };
+    static EXTERNAL_PENDING: RefCell<Option<PendingExternalCall>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
-pub(super) fn take_execution_site() -> Option<ObservedExecutionSite> {
-    EXECUTION_SITE.with(|boundary| boundary.borrow_mut().take())
+pub(super) fn take_external_pending() -> Option<PendingExternalCall> {
+    EXTERNAL_PENDING.with(|pending| pending.borrow_mut().take())
 }
 
 #[derive(Default)]
 pub(super) struct Dispatch<'a> {
+    pending_external_call: Option<PendingExternalCall>,
     declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
     pure_plans:HashMap<PreparedCallable,Option<(ordered_float_prefix::PrefixCertificate,ordered_float_prefix::FunctionEffects)>>,
     latest_pure:HashMap<PreparedCallable,(Vec<u32>,ExactValue,Option<Rc<ObservedTrace>>)>,
     range_ranks:HashMap<PreparedCallable,Option<RangeRank>>,
     requirement_conditions:HashMap<(PreparedCallable,OccurrenceOrdinal),Option<OccurrenceOrdinal>>,
+}
+
+impl Dispatch<'_> {
+    pub(super) fn take_pending_external_call(&mut self) -> Option<PendingExternalCall> {
+        self.pending_external_call.take()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn observe_external_pending(pending: PendingExternalCall) {
+    EXTERNAL_PENDING.with(|observed| *observed.borrow_mut() = Some(pending));
 }
 
 /// This is capability selection only. The actual call still needs a current,
@@ -420,6 +454,7 @@ pub(super) fn run<'a>(
 ) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize,Option<SelectedRequirement>)> {
     // Keep each activation transactional. No partial state escapes if a
     // later operation is unsupported or a selected requirement stops it.
+    dispatch.pending_external_call = None;
     let mut next_storage=caller_storage.clone();
     let storage=&mut next_storage;
     let mut active=HashSet::new();
@@ -451,8 +486,6 @@ pub(super) fn run<'a>(
     tasks.extend([Task::Finish(None,ret),Task::Block(body.structure.root,0,output)]);
     while let Some(task)=tasks.pop() {
         charge_call_work(&mut work,1)?;
-        #[cfg(test)]
-        let incoming = stack.iter().filter_map(|activation| activation.entered_at.clone()).collect::<Vec<_>>();
         let frame=stack.last_mut()?;
         let (function,body,_) = get_symbol(&mut dispatch.declarations,frame.target)?;
         let owner=&project.modules.get(frame.target.0)?.source;
@@ -465,15 +498,7 @@ pub(super) fn run<'a>(
         match task {
             Task::Block(block,index,output) => {
                 let region=st.blocks.get(block.0)?;
-                if region.unsafe_context {
-                    #[cfg(test)]
-                    EXECUTION_SITE.with(|boundary| *boundary.borrow_mut() = Some(ObservedExecutionSite {
-                        owner: SourceSpan::new(owner.clone(), function.name_span),
-                        site: SourceSpan::new(owner.clone(), region.span),
-                        incoming,
-                    }));
-                    return None;
-                }
+                if region.unsafe_context { return None; }
                 let Some(item)=region.items.get(index) else {
                     if !matches!(output,Output::Unit) { return None; }
                     values.push(ResultValue::Unit);
@@ -534,13 +559,16 @@ pub(super) fn run<'a>(
                 if value.ty()!=ty || frame.slots.insert(id,value).is_some() { return None; }
             }
             Task::Eval(at) => {
-                #[cfg(test)]
-                EXECUTION_SITE.with(|trace| *trace.borrow_mut() = Some(ObservedExecutionSite {
-                    owner: SourceSpan::new(owner.clone(), function.name_span),
-                    site: span(at).expect("prepared eval occurrence"),
-                    incoming,
-                }));
                 let ty=st.checked_types.expressions.get(&at)?;
+                if let Some(OccurrenceNode::Block(block)) = st.edges.get(&(
+                    OccurrenceParent::Expression(at), OccurrenceEdge::BlockBody,
+                )) {
+                    if let Some(mut pending) = pending_external_call(body, owner, *block) {
+                        pending.invocation.extend(stack.iter().filter_map(|activation| activation.entered_at.clone()));
+                        dispatch.pending_external_call = Some(pending);
+                        return None;
+                    }
+                }
                 if st.checker_contextual_occurrences.contains(&at) { return None; }
                 if let Some(value)=st.prepared_range_literals.get(&at) {
                     if !integer_literal_fits_type(value,ty) { return None; }

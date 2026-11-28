@@ -2531,8 +2531,20 @@ fn try_observed_projected_storage_call(
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
         let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
-        let (value,result,cost,failure)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
-            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom,&read_integer_field)?;
+        let outcome=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
+            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom,&read_integer_field);
+        if let Some(pending) = provider_dispatch.borrow_mut().take_pending_external_call() {
+            // Do not turn an authored pre-host prefix into a completed call,
+            // even if its last requirement was proved. Nothing crosses the
+            // external boundary without a sound effect/continuation model.
+            #[cfg(test)]
+            stateful_provider::observe_external_pending(pending);
+            #[cfg(not(test))]
+            drop(pending);
+            return None;
+        }
+        let (value,result,cost,failure) = outcome?;
+
         if let Some(failure)=failure {
             use failure_search::{Admission,PathStep};
             if !allow_failure || failure.target.0!=target.0 { return None; }
@@ -26276,7 +26288,7 @@ unit(u8) parent = fn(a) {
     fn pinned_orbital_upload_reports_original_false_requirement_only_at_valid_cap() {
         use std::num::NonZeroUsize;
         use wosy_syntax::SourceSpan;
-        use super::stateful_provider::{take_requirement_results as outcomes, take_execution_site};
+        use super::stateful_provider::{take_requirement_results as outcomes, take_external_pending};
         let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
         let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
         let fragment=|from:&str,until:&str| {
@@ -26333,7 +26345,7 @@ unit(u8) parent = fn(a) {
                 ScalarCheckerScope::MainFlowOnly,Vec::new(),
             ).unwrap();
             outcomes();
-            take_execution_site();
+            take_external_pending();
             let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert_eq!(outcomes(),[(authored.clone(),false)]);
             assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
@@ -26345,20 +26357,18 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
             assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
             assert!(!trace.contains_return(&upload_call));
-            let stopped = take_execution_site().expect("false guard evaluated its prepared expression");
-            assert_eq!(stopped.owner.source, app);
+            assert!(take_external_pending().is_none());
 
             assert!(matches!(prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN),Err(ProjectCheck::Unsupported)));
             assert_eq!(outcomes(),[(authored.clone(),true)]);
-            let refused = take_execution_site().expect("original transmit reaching exact prepared expression after the true guard");
-            let original = if refused.site.source == provider { &packing } else { &passing };
-            eprintln!("actual last owner {:?}, expression {:?}, path {:?}", refused.owner,
-                &original[refused.site.range.start as usize..refused.site.range.end as usize], refused.incoming);
-            assert_eq!(refused.owner.source, provider);
-            assert_eq!(&packing[refused.owner.range.start as usize..refused.owner.range.end as usize], "transmit");
-            let block = &packing[refused.site.range.start as usize..refused.site.range.end as usize];
-            assert!(block.contains("bridge.indexed"));
-            assert!(refused.incoming.iter().any(|site| site.source == app
+            let pending = take_external_pending().expect("typed prepared indexed call is pending, not executed");
+            assert_eq!(pending.call.source, provider);
+            assert_eq!(pending.declaration.source, provider);
+            assert_eq!(&packing[pending.declaration.range.start as usize..pending.declaration.range.end as usize], "indexed");
+            let call = &packing[pending.call.range.start as usize..pending.call.range.end as usize];
+            assert!(call.starts_with("bridge.indexed("));
+            assert_eq!(pending.signature.parameters.len(), 7);
+            assert!(pending.invocation.iter().any(|site| site.source == app
                 && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
             assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));
             assert!(matches!(prepare(&text).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
