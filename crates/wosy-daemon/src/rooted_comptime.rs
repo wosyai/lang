@@ -453,16 +453,14 @@ impl SourceStore {
     pub(super) fn project_selected_wasip1_for_lease(
         &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize,
     ) -> Result<SelectedComptime<(NodeId, RootedSelectedComptime)>> {
-        let (tx, _read) = self.begin_leased_source(lease.grant(), Mode::ReadOnly)?
-            .ok_or(BuildRequestRejection::Expired)?;
-        let mut records = bounded_source_records(&tx, limits);
-        let (_, config) = checked_source_header_using(lease.grant().root, &mut records)?;
-        let request = RootedClosedComptimeRequest {
-            profile, file: config.entry, id: String::new(), evaluator_layout: ScalarTargetLayout::WASM32,
-            source_limits: limits, output_bytes,
-        };
-        request.check_selector_bytes()?;
-        self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+        self.project_comptime_with_request_for_lease(lease, limits, SiteScope::DirectTargetCall, |config| {
+            let request = RootedClosedComptimeRequest {
+                profile, file: config.entry.clone(), id: String::new(), evaluator_layout: ScalarTargetLayout::WASM32,
+                source_limits: limits, output_bytes,
+            };
+            request.check_selector_bytes()?;
+            Ok(request)
+        }, |input, request| {
             if input.artifact.backend != "llvm" || input.artifact.output != "wasm-wasip1" {
                 return Ok(Err(RootedClosedComptimeRefusal::ProfileNotWasip1));
             }
@@ -591,26 +589,38 @@ impl SourceStore {
         &self, lease: &SourceLease, request: RootedClosedComptimeRequest, scope: SiteScope,
         project: impl FnOnce(VerifiedComptimeSource, &RootedClosedComptimeRequest) -> Result<SelectedComptime<T>>,
     ) -> Result<SelectedComptime<T>> {
+        self.project_comptime_with_request_for_lease(lease, request.source_limits, scope, |_| Ok(request), project)
+    }
+
+    fn project_comptime_with_request_for_lease<T>(
+        &self, lease: &SourceLease, limits: BaseCstAdmissionLimits, scope: SiteScope,
+        select: impl FnOnce(&wosy_protocol::SourceConfig) -> Result<RootedClosedComptimeRequest>,
+        project: impl FnOnce(VerifiedComptimeSource, &RootedClosedComptimeRequest) -> Result<SelectedComptime<T>>,
+    ) -> Result<SelectedComptime<T>> {
         let grant = lease.grant();
         let (tx, _read) = self.begin_leased_source(grant, Mode::ReadOnly)?
             .ok_or(BuildRequestRejection::Expired)?;
-        let answer = self.verified_comptime_source(&tx, grant.root, &request, scope)
-            .and_then(|verified| match verified {
+        let answer = (|| {
+            let mut records = bounded_source_records(&tx, limits);
+            let (top, config) = checked_source_header_using(grant.root, &mut records)?;
+            let request = select(&config)?;
+            match self.verified_comptime_source(&tx, grant.root, top, config, records, &request, scope)? {
                 Ok(input) => project(input, &request),
                 Err(reason) => Ok(Err(reason)),
-            });
+            }
+        })();
         lease.finish_current(|| ()).ok_or(BuildRequestRejection::Expired)?;
         answer
     }
 
     fn verified_comptime_source(
-        &self, tx: &Transaction, root: NodeId, request: &RootedClosedComptimeRequest, scope: SiteScope,
+        &self, tx: &Transaction, root: NodeId, top: wosy_protocol::Node, config: wosy_protocol::SourceConfig,
+        records: impl FnMut(NodeId) -> Result<wosy_protocol::Node>,
+        request: &RootedClosedComptimeRequest, scope: SiteScope,
     ) -> Result<SelectedComptime<VerifiedComptimeSource>> {
         use RootedClosedComptimeRefusal as Refusal;
 
         let limits = request.source_limits;
-        let mut records = bounded_source_records(tx, limits);
-        let (top, config) = checked_source_header_using(root, &mut records)?;
         let parts = source_preparation_parts(&top).expect("checked source preparation");
         if parts.kind_encoding() != CstKindEncoding::Current {
             return Ok(Err(Refusal::UnsupportedSourceEpoch));

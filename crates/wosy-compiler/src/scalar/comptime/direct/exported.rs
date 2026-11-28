@@ -4,20 +4,13 @@ use crate::llvm::validate_wasm_root_export_roster;
 use std::collections::{BTreeMap, HashSet};
 
 pub struct ExportedPairWasip1 {
-    source: CanonicalExportSource,
+    declarations: crate::scalar::ScalarSourceDeclarations,
     site: SourceSpan,
     id: String,
     exports: BTreeMap<String, String>,
     uses: Vec<SelectedExportUse>,
     evaluators: Vec<BoundedStartupWasip1Evaluator>,
     tuples: Vec<[DirectComptimeArgument; 2]>,
-}
-
-struct CanonicalExportSource {
-    source: wosy_syntax::SourceIdentity,
-    tree: GreenNode,
-    site: SyntaxNodePtr<WosyLanguage>,
-    tail: SyntaxNodePtr<WosyLanguage>,
 }
 
 struct SelectedExportUse {
@@ -37,7 +30,7 @@ impl ExportedPairWasip1 {
     /// patched call sites. It never searches configuration or imports.
     pub fn selected_compiler_inputs(&self) -> Result<Vec<u8>, serde_json::Error> {
         let routes = self.uses.iter().map(|route| (route.declaration, route.call, route.evaluator)).collect::<Vec<_>>();
-        serde_json::to_vec(&(&self.source.source, "wasm32-wasip1", &self.exports, routes))
+        serde_json::to_vec(&(&self.declarations.source, "wasm32-wasip1", &self.exports, routes))
     }
 
 
@@ -51,16 +44,13 @@ impl ExportedPairWasip1 {
             concrete_scalar_literal(value, evaluator.result_type())
                 .ok_or_else(|| unsupported("selected export result type changed"))
         }).collect::<Result<Vec<_>, _>>()?;
-        let root = CstNode::new_root(self.source.tree.clone());
-        let node = self.source.site.to_node(&root);
-        let tail = self.source.tail.to_node(&root);
-        let scoped = ComptimeCst::from_node(&node).ok_or_else(|| unsupported("selected export site changed"))?;
-        let body = ScalarExpression::Block(derive_block(&scoped.block));
-        let mut declarations = derive_scalar_declarations_with_embedding(
-            &CanonicalCstRoot::new(self.source.source.clone(), root),
-            Some(EmbeddedComptimeExpression { site: &node, expression: &tail, value: &body }),
-        );
-        if !declarations.diagnostics.is_empty() { return Err(Error::OrdinaryDiagnostics(declarations.diagnostics)); }
+        let mut declarations = crate::scalar::ScalarSourceDeclarations {
+            source: self.declarations.source.clone(),
+            items: self.declarations.items.clone(),
+            structs: self.declarations.structs.clone(),
+            enums: self.declarations.enums.clone(),
+            diagnostics: self.declarations.diagnostics.clone(),
+        };
         let by_declaration = self.uses.iter().map(|route| (route.declaration.start, route))
             .collect::<std::collections::HashMap<_, _>>();
         let mut retained = Vec::with_capacity(self.uses.len());
@@ -91,12 +81,12 @@ impl ExportedPairWasip1 {
             return Err(unsupported("selected export set changed"));
         }
         declarations.items = retained;
-        let prepared = prepare_scalar_project(vec![(declarations, Vec::new())], vec![self.source.source.clone()],
+        let prepared = prepare_scalar_project(vec![(declarations, Vec::new())], vec![self.declarations.source.clone()],
             ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 })
             .map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
         let build = analyze_scalar_build(&prepared);
         if !build.diagnostics().is_empty() { return Err(Error::OrdinaryDiagnostics(build.diagnostics().to_vec())); }
-        crate::ScalarArtifactEmission::WasmRootExports(&self.source.source, &self.exports)
+        crate::ScalarArtifactEmission::WasmRootExports(&self.declarations.source, &self.exports)
             .emit(&build).map_err(Error::Emitter)
     }
 }
@@ -142,6 +132,20 @@ pub fn prepare_exported_pair_wasip1(
     if declarations.items.iter().any(|item| !matches!(item, ScalarItem::Function(_))) {
         return Err(unsupported("explicit scalar roots cannot omit ordinary startup items"));
     }
+    // Capture original, untyped declarations for the candidate exports only.
+    // Emit patches these same declarations, then runs ordinary resolution and
+    // analysis over the new program; no typed facts from before substitution
+    // authorize the transformed program.
+    let selected: HashSet<_> = exports.values().map(String::as_str).collect();
+    let selected_declarations = crate::scalar::ScalarSourceDeclarations {
+        source: declarations.source.clone(),
+        items: declarations.items.iter().filter(|item| matches!(
+            item, ScalarItem::Function(function) if selected.contains(function.name.as_str())
+        )).cloned().collect(),
+        structs: declarations.structs.clone(),
+        enums: declarations.enums.clone(),
+        diagnostics: declarations.diagnostics.clone(),
+    };
     let prepared = prepare_scalar_project(vec![(declarations, Vec::new())], vec![parsed.source.clone()],
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 })
         .map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
@@ -190,7 +194,6 @@ pub fn prepare_exported_pair_wasip1(
         formal_reads.push((operand, span, formal.declaration_span));
     }
 
-    let selected: HashSet<_> = exports.values().map(String::as_str).collect();
     let names: HashSet<_> = module.items.iter().filter_map(|item| match item {
         ScalarItem::Function(function) => Some(function.name.as_str()), _ => None,
     }).collect();
@@ -259,8 +262,7 @@ pub fn prepare_exported_pair_wasip1(
         evaluators.push(BoundedStartupWasip1Evaluator { ir: std::sync::Arc::new(bytes), result_type, output_span: site.range });
     }
     Ok(ExportedPairWasip1 {
-        source: CanonicalExportSource { source: parsed.source.clone(), tree: parsed.root.green().into_owned(),
-            site: SyntaxNodePtr::new(&node), tail: SyntaxNodePtr::new(&tail) },
+        declarations: selected_declarations,
         site: site_span, id: site.id.text().to_owned(), exports: exports.clone(), uses, evaluators, tuples,
     })
 }

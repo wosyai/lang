@@ -6,6 +6,7 @@ The second argument is the expected number of simultaneous stage directories.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import tempfile
 import time
 
 
-def main(compiler: Path, expected_stages: int) -> None:
+def main(compiler: Path, expected_stages: int, unselected: int = 0) -> None:
     modes = [
         "standby", "manual", "yaw_port", "yaw_starboard", "pitch_up", "pitch_down",
         "roll_port", "roll_starboard", "brake", "boost", "approach", "retreat",
@@ -60,6 +61,7 @@ run_runner = "artifact"
     source = "\n".join(
         ["%%start", "u32(u32, u32) solve = fn(left, right) { comptime calculate { right ^ left } };"]
         + [f"u32() {mode} = fn {{ solve({base}, {code}) }};" for mode, base, code in tuples]
+        + [f"u32() unused{i:04} = fn {{ {i} }};" for i in range(unselected)]
         + ["u32() nonliteral = fn { 1 };", "%%end\n"]
     )
     expected = {f"station_{mode}": base ^ code for mode, base, code in tuples}
@@ -122,10 +124,17 @@ run_runner = "artifact"
 
         sampled_cycle("cold", False, len(tuples))
         first = json.loads(pointer.read_text())
-        first_wasm = Path(first["executable"]).read_bytes()
+        first_output = Path(first["executable"])
+        first_wasm = first_output.read_bytes()
+        first_llvm = first_output.with_name("partition.ll").read_bytes()
+        print(json.dumps({"case": "cold_artifact_identity", "unselected": unselected,
+            "llvm_sha256": hashlib.sha256(first_llvm).hexdigest(),
+            "wasm_sha256": hashlib.sha256(first_wasm).hexdigest()}), flush=True)
         sampled_cycle("warm", True, len(tuples))
         current = pointer.read_bytes()
-        assert json.loads(current)["executable"] != first["executable"]
+        current_output = Path(json.loads(current)["executable"])
+        assert current_output != first_output
+        assert current_output.with_name("partition.ll").read_bytes() == first_llvm
         (root / "refuse-evaluator-output").write_text(f"{expected['station_failover']}\n")
         sampled_cycle("last_evaluator_failure", False, len(tuples), False)
         assert pointer.read_bytes() == current and Path(first["executable"]).read_bytes() == first_wasm
@@ -161,4 +170,4 @@ run_runner = "artifact"
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve(), int(sys.argv[2]))
+    main(Path(sys.argv[1]).resolve(), int(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 0)
